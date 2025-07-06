@@ -175,9 +175,10 @@ class MooncakeKVManager(BaseKVManager):
                 f"The environment variable SGLANG_DISAGGREGATION_THREAD_POOL_SIZE={transfer_thread_pool_size} must be "
                 f"greater than or equal to SGLANG_DISAGGREGATION_QUEUE_SIZE={transfer_queue_size}."
             )
+            self.thread_pool_size = transfer_thread_pool_size // transfer_queue_size
             self.executors = [
                 concurrent.futures.ThreadPoolExecutor(
-                    transfer_thread_pool_size // transfer_queue_size
+                    self.thread_pool_size
                 )
                 for _ in range(transfer_queue_size)
             ]
@@ -257,32 +258,49 @@ class MooncakeKVManager(BaseKVManager):
             for layer_id in range(num_layers)
         ]
 
-        # Worker function for processing a single layer
-        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            src_addr_list = []
-            dst_addr_list = []
-            length_list = []
+        # Group by transfer chunk size
+        src_addr_list_large_chunk, src_addr_list_small_chunk = [], []
+        dst_addr_list_large_chunk, dst_addr_list_small_chunk = [], []
+        length_list_large_chunk, length_list_small_chunk = [], []
+
+        for (src_ptr, dst_ptr, item_len) in layers_params:
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
-                src_addr_list.append(src_addr)
-                dst_addr_list.append(dst_addr)
-                length_list.append(length)
-            return self.engine.batch_transfer_sync(
-                mooncake_session_id, src_addr_list, dst_addr_list, length_list
-            )
-
-        futures = [
+                if length > get_int_env_var('SGLANG_DISAGGREGATION_LARGE_CHUNK', 20480):
+                    src_addr_list_large_chunk.append(src_addr)
+                    dst_addr_list_large_chunk.append(dst_addr)
+                    length_list_large_chunk.append(length)
+                else:
+                    src_addr_list_small_chunk.append(src_addr)
+                    dst_addr_list_small_chunk.append(dst_addr)
+                    length_list_small_chunk.append(length)
+        
+        large_chunks_transfer_futures = [
             executor.submit(
-                process_layer,
-                src_ptr,
-                dst_ptr,
-                item_len,
+                self.engine.batch_transfer_sync,
+                mooncake_session_id,
+                src_addr_list_large_chunk,
+                dst_addr_list_large_chunk,
+                length_list_large_chunk,
             )
-            for (src_ptr, dst_ptr, item_len) in layers_params
         ]
 
+        num_small_chunks = len(length_list_small_chunk)
+        micro_batch_size = max(num_small_chunks // self.thread_pool_size, self.thread_pool_size)
+        small_chunks_transfer_futures = [
+            executor.submit(
+                self.engine.batch_transfer_sync,
+                mooncake_session_id,
+                src_addr_list_small_chunk[i : i + micro_batch_size],
+                dst_addr_list_small_chunk[i : i + micro_batch_size],
+                length_list_small_chunk[i : i + micro_batch_size],
+            )
+            for i in range (0, num_small_chunks, micro_batch_size)
+        ]
+
+        futures = large_chunks_transfer_futures + small_chunks_transfer_futures
         for future in concurrent.futures.as_completed(futures):
             status = future.result()
             if status != 0:
@@ -337,7 +355,9 @@ class MooncakeKVManager(BaseKVManager):
             num_heads_to_send = heads_per_decode_rank
             dst_head_offset = 0
 
-        layer_transfer_params = []
+        src_addr_list = []
+        dst_addr_list = []
+        length_list = []
         for layer_id in range(num_layers):
             item_len_of_prefill_rank_page = self.kv_args.kv_item_lens[layer_id]
 
@@ -355,6 +375,9 @@ class MooncakeKVManager(BaseKVManager):
             dst_slice_offset = dst_head_offset * bytes_per_head
             slice_lens_per_page = num_heads_to_send * bytes_per_head
 
+            bytes_per_token_on_prefill = item_len_of_prefill_rank_page // page_size
+            bytes_per_token_on_decode = item_len_of_decode_rank_page // page_size
+
             # Sanity check: The data sub-slice to be sent should fit into the decode instance's page.
             # This means slice_lens_per_page <= item_len_of_decode_rank_page
             if slice_lens_per_page > item_len_of_decode_rank_page:
@@ -364,47 +387,15 @@ class MooncakeKVManager(BaseKVManager):
                     f"target page size ({item_len_of_decode_rank_page})"
                 )
                 return -1
-            layer_transfer_params.append(
-                (
-                    self.kv_args.kv_data_ptrs[layer_id],
-                    dst_kv_ptrs[layer_id],
-                    item_len_of_prefill_rank_page,
-                    item_len_of_decode_rank_page,
-                    src_slice_offset,
-                    dst_slice_offset,
-                    slice_lens_per_page,
-                )
-            )
-
-        def process_layer_tp_aware(layer_params):
-            (
-                src_ptr,
-                dst_ptr,
-                src_item_len,
-                dst_item_len,
-                src_offset,
-                dst_offset,
-                slice_lens_per_page,
-            ) = layer_params
-            src_addr_list = []
-            dst_addr_list = []
-            length_list = []
-
-            # Calculate strides for a single token slot
-            bytes_per_token_on_prefill = src_item_len // page_size
-            bytes_per_token_on_decode = dst_item_len // page_size
 
             for i in range(len(prefill_kv_indices)):
                 prefill_page_idx = int(prefill_kv_indices[i])
                 decode_page_idx = int(dst_kv_indices[i])
 
-                # Get the starting addresses for the current src and dst pages
-                src_page_start_addr = src_ptr + prefill_page_idx * src_item_len
-                dst_page_start_addr = dst_ptr + decode_page_idx * dst_item_len
+                src_page_start_addr = self.kv_args.kv_data_ptrs[layer_id] + prefill_page_idx * item_len_of_prefill_rank_page
+                dst_page_start_addr = dst_kv_ptrs[layer_id] + decode_page_idx * item_len_of_decode_rank_page
 
-                # Iterate through each valid token slot within the current page
                 for token_slot_in_page in range(page_size):
-                    # Calculate the start address of the current token slot
                     src_token_slot_start_addr = (
                         src_page_start_addr
                         + token_slot_in_page * bytes_per_token_on_prefill
@@ -415,29 +406,36 @@ class MooncakeKVManager(BaseKVManager):
                     )
 
                     # Calculate final src and dst addresses by applying head-slice offsets
-                    src_slice_addr = src_token_slot_start_addr + src_offset
-                    dst_slice_addr = dst_token_slot_start_addr + dst_offset
+                    src_slice_addr = src_token_slot_start_addr + src_slice_offset
+                    dst_slice_addr = dst_token_slot_start_addr + dst_slice_offset
 
                     src_addr_list.append(src_slice_addr)
                     dst_addr_list.append(dst_slice_addr)
                     length_list.append(slice_lens_per_page)
 
-                    logger.debug(
-                        f"SYNC: sid={mooncake_session_id}, "
-                        f"src={src_slice_addr}, dst={dst_slice_addr}, len={slice_lens_per_page}"
-                    )
-
-            return self.engine.batch_transfer_sync(
-                mooncake_session_id, src_addr_list, dst_addr_list, length_list
-            )
-
-        futures = [
-            executor.submit(
-                process_layer_tp_aware,
-                layer_params,
-            )
-            for layer_params in layer_transfer_params
-        ]
+        
+        if slice_lens_per_page > get_int_env_var('SGLANG_DISAGGREGATION_LARGE_CHUNK', 20480):
+            futures = [
+                executor.submit(
+                    self.engine.batch_transfer_sync,
+                    mooncake_session_id,
+                    src_addr_list,
+                    dst_addr_list,
+                    length_list,
+                )
+            ]
+        else:
+            micro_batch_size = max(len(length_list) // self.thread_pool_size, self.thread_pool_size)
+            futures = [
+                executor.submit(
+                    self.engine.batch_transfer_sync,
+                    mooncake_session_id,
+                    src_addr_list[i : i + micro_batch_size],
+                    dst_addr_list[i : i + micro_batch_size],
+                    length_list[i : i + micro_batch_size],
+                )
+                for i in range(0, len(length_list), micro_batch_size)
+            ]
 
         for future in concurrent.futures.as_completed(futures):
             status = future.result()
