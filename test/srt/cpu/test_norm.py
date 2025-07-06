@@ -41,10 +41,8 @@ class TestNorm(CustomTestCase):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
 
     def _gemma3_rmsnorm_native(
-        self,
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        variance_epsilon: float = 1e-6):
+        self, x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float = 1e-6
+    ):
         output = self._norm(x.float(), variance_epsilon)
         output = output * (1.0 + weight.float())
         return output.type_as(x)
@@ -92,17 +90,20 @@ class TestNorm(CustomTestCase):
         torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
     def _gemma3_rmsnorm_test(self, m, n, dtype):
-        x = torch.randn([m, n], dtype=dtype)
-        x = make_non_contiguous(x)
-        hidden_size = x.size(-1)
-        weight = torch.randn(hidden_size, dtype=dtype)
-        variance_epsilon = 1e-6
+        x_list = [
+            torch.randn([m, n], dtype=dtype),
+            torch.randn([1, m, 2, n], dtype=dtype),
+        ]
+        for x in x_list:
+            x = make_non_contiguous(x)
+            hidden_size = x.size(-1)
+            weight = torch.randn(hidden_size, dtype=dtype)
+            variance_epsilon = 1e-6
+            out = torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x, weight, variance_epsilon)
+            ref_out = self._gemma3_rmsnorm_native(x, weight, variance_epsilon)
 
-        out = torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x, weight, variance_epsilon)
-        ref_out = self._gemma3_rmsnorm_native(x, weight, variance_epsilon)
-
-        atol = rtol = precision[ref_out.dtype]
-        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
+            atol = rtol = precision[ref_out.dtype]
+            torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
     def test_norm(self):
         for params in itertools.product(self.M, self.N, self.dtype):
