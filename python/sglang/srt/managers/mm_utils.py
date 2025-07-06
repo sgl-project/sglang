@@ -2,14 +2,15 @@
 Multi-modality utils
 """
 
-import dataclasses
-import logging
+import hashlib
 from abc import abstractmethod
 from typing import Callable, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch import nn
 
+from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -124,74 +125,38 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
     e.g. <image><image>....<image>, or <audio><audio>...<audio>
     """
 
-    def __init__(self, token_ids: List[int]) -> None:
-        self.token_ids = token_ids
-
     def pad_input_tokens(
         self, input_ids: List[int], mm_inputs: MultimodalInputs
     ) -> List[int]:
         """
-        Finds contiguous regions of tokens matching `self.token_ids` in `input_ids`
-        and replaces each region with the corresponding `pad_value` from `mm_inputs.mm_items`.
+        Replaces multimodal tokens in input_ids with corresponding pad_values from mm_items.
+        Each modality (image, audio, video) is handled separately based on its token_id.
         """
-        pad_values = [item.pad_value for item in mm_inputs.mm_items]
-        if not pad_values:
-            # No multimodal items, return original input_ids
+        if not input_ids or not mm_inputs.mm_items:
             return input_ids
-        if not input_ids:
-            return []
 
         input_ids_tensor = torch.tensor(input_ids)
-        device = input_ids_tensor.device
-        token_ids_tensor = torch.tensor(self.token_ids, device=device)
-        mask = torch.isin(input_ids_tensor, token_ids_tensor)
 
-        if not mask.any():
-            # No tokens match token_ids, return original input_ids
-            return input_ids
+        # Create mapping of token_ids to pad_values for each modality
+        token_to_pad_mapping = {}
 
-        # Find contiguous regions
-        padded_mask = torch.cat(
-            (
-                torch.tensor([False], device=device),
-                mask,
-                torch.tensor([False], device=device),
-            )
-        )
-        # Find indices where the mask value changes
-        diff_indices = torch.where(padded_mask[1:] != padded_mask[:-1])[0]
-
-        # Start indices are where False changes to True
-        starts = diff_indices[::2]
-        # End indices are where True changes to False (exclusive index)
-        ends = diff_indices[1::2]
-
-        # Check if the number of regions matches the number of pad values
-        if len(starts) != len(pad_values):
-            # Maybe log a warning here?
-            num_regions = len(starts)
-            num_pad_values = len(pad_values)
-            if num_regions > 0 and num_pad_values > 0:
-                pad_values = (pad_values * (num_regions // num_pad_values + 1))[
-                    :num_regions
-                ]
-            else:  # If no regions or no pad_values, this loop won't run anyway.
-                pad_values = []  # Ensure pad_values is empty if starts is empty
-
-        # Create a copy to modify
-        output_ids_tensor = input_ids_tensor.clone()
-
-        # Replace tokens in each region with the corresponding pad value
-        # Ensure we don't iterate if pad_values became empty due to mismatch and num_regions=0
-        for i in range(min(len(starts), len(pad_values))):
-            start_idx = starts[i]
-            end_idx = ends[i]
-            pad_value = pad_values[i]
-            if pad_value is not None:  # Ensure pad_value is not None before assignment
-                output_ids_tensor[start_idx:end_idx] = pad_value
+        for item in mm_inputs.mm_items:
+            if item.is_image() and mm_inputs.im_token_id is not None:
+                token_to_pad_mapping[mm_inputs.im_token_id] = item.pad_value
+            elif item.is_audio() and mm_inputs.audio_token_id is not None:
+                token_to_pad_mapping[mm_inputs.audio_token_id] = item.pad_value
+            elif item.is_video() and mm_inputs.video_token_id is not None:
+                token_to_pad_mapping[mm_inputs.video_token_id] = item.pad_value
             else:
-                logger.warning(f"Skipping region {i} due to None pad_value.")
-        return output_ids_tensor.tolist()
+                raise ValueError(f"No multimodal token id provided for {item.modality}")
+
+        # Apply replacements for all tokens at once
+        for token_id, pad_value in token_to_pad_mapping.items():
+            input_ids_tensor[input_ids_tensor == token_id] = pad_value
+
+        ret_input_ids = input_ids_tensor.tolist()
+
+        return ret_input_ids
 
 
 embedding_cache = None
@@ -680,3 +645,52 @@ def get_multimodal_data_bounds(
     # Convert valid pairs to tensor
     valid_pairs_tensor = torch.tensor(valid_pairs, device=input_ids.device)
     return valid_pairs_tensor
+
+
+def data_hash(data) -> int:
+    hash_bytes = hashlib.sha256(data).digest()[:8]
+    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+
+
+def tensor_hash(tensor_list) -> int:
+    """
+    hash a tensor or a tensor list
+    """
+    tensor = tensor_list
+    if isinstance(tensor_list, list):
+        tensor_list = flatten_nested_list(tensor_list)
+        tensor_list = [
+            x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
+        ]
+        tensor = torch.concat(tensor_list)
+    if tensor.is_cuda:
+        return gpu_tensor_hash(tensor)
+    tensor = tensor.detach().contiguous()
+
+    if tensor.dtype == torch.bfloat16:
+        # memoryview() doesn't support PyTorch's BFloat16 dtype
+        tensor = tensor.float()
+
+    assert isinstance(tensor, torch.Tensor)
+    if tensor.is_cuda:
+        # TODO: improve this
+        tensor_cpu = tensor.cpu()
+    else:
+        tensor_cpu = tensor
+
+    mv = memoryview(tensor_cpu.numpy())
+    return data_hash(mv.tobytes())
+
+
+def hash_feature(f):
+    if isinstance(f, list):
+        if isinstance(f[0], torch.Tensor):
+            return tensor_hash(f)
+        return data_hash(tuple(flatten_nested_list(f)))
+    elif isinstance(f, np.ndarray):
+        arr = np.ascontiguousarray(f)
+        arr_bytes = arr.tobytes()
+        return data_hash(arr_bytes)
+    elif isinstance(f, torch.Tensor):
+        return tensor_hash([f])
+    return data_hash(f)

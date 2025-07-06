@@ -79,14 +79,12 @@ def initialize_dp_attention(
     )
 
     if enable_dp_attention:
-        local_rank = tp_rank % (tp_size // dp_size)
         _ATTN_DP_SIZE = dp_size
         if moe_dense_tp_size is None:
             _LOCAL_ATTN_DP_SIZE = _ATTN_DP_SIZE
         else:
             _LOCAL_ATTN_DP_SIZE = max(1, dp_size // (tp_size // moe_dense_tp_size))
     else:
-        local_rank = tp_rank
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
 
@@ -96,7 +94,7 @@ def initialize_dp_attention(
             list(range(head, head + _ATTN_TP_SIZE))
             for head in range(0, pp_size * tp_size, _ATTN_TP_SIZE)
         ],
-        local_rank,
+        tp_group.local_rank,
         torch.distributed.get_backend(tp_group.device_group),
         use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
         use_pymscclpp=False,
@@ -239,6 +237,10 @@ def _dp_gather(
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
+
+        # NOTE: During draft extend, the gathered_buffer is padded to num_tokens * (speculative_num_steps + 1).
+        # But the size of local_tokens is total accepted tokens. We need to reduce the local_num_tokens to the
+        # actual size of the accepted tokens.
         if forward_batch.forward_mode.is_draft_extend():
             shape_tensor = local_num_tokens.new_full((), local_tokens.shape[0])
             local_num_tokens = torch.minimum(local_num_tokens, shape_tensor)
@@ -293,6 +295,10 @@ def dp_scatter(
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
+
+        # NOTE: During draft extend, the gathered_buffer is padded to num_tokens * (speculative_num_steps + 1).
+        # But the size of local_tokens is total accepted tokens. We need to reduce the local_num_tokens to the
+        # actual size of the accepted tokens.
         if forward_batch.forward_mode.is_draft_extend():
             shape_tensor = local_num_tokens.new_full((), local_tokens.shape[0])
             local_num_tokens = torch.minimum(local_num_tokens, shape_tensor)

@@ -3,7 +3,6 @@ from typing import Callable, List, Optional, Tuple
 
 import einops
 import torch
-from sgl_kernel import silu_and_mul
 from torch.nn import Module
 
 from sglang.srt.custom_op import CustomOp
@@ -11,6 +10,8 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
@@ -40,21 +41,25 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_quant_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
-from sglang.srt.managers.expert_location import get_global_expert_location_metadata
-from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import (
     DeepEPMode,
+    ceil_div,
     dispose_tensor,
     get_bool_env_var,
     is_hip,
+    is_npu,
     set_weight_attrs,
 )
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if not _is_npu:
+    from sgl_kernel import silu_and_mul
 
 if _is_hip:
     from vllm._custom_ops import scaled_fp8_quant
@@ -1173,12 +1178,14 @@ class DeepEPMoE(EPMoE):
         masked_m: torch.Tensor,
         expected_m: int,
         num_recv_tokens_per_expert: List[int],
-        forward_mode: ForwardMode,
+        forward_batch: ForwardBatch,
     ):
         if _use_aiter:
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
             return self.forward_aiter(hidden_states, topk_idx, topk_weights)
-        resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
+        resolved_deepep_mode = self.deepep_mode.resolve(
+            forward_batch.is_extend_in_batch
+        )
         if resolved_deepep_mode == DeepEPMode.normal:
             if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
                 return self.forward_deepgemm_contiguous(
@@ -1370,10 +1377,19 @@ class DeepEPMoE(EPMoE):
                 device=hidden_states_fp8.device,
                 dtype=hidden_states_fp8.dtype,
             ),
-            torch.empty(
-                (all_tokens, K // 128),
-                device=hidden_states_fp8.device,
-                dtype=torch.float32,
+            (
+                # TODO check whether need `zeros`
+                torch.zeros(
+                    (ceil_div(K // 128, 4), all_tokens),
+                    device=hidden_states_fp8.device,
+                    dtype=torch.int,
+                ).transpose(0, 1)
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                else torch.empty(
+                    (all_tokens, K // 128),
+                    device=hidden_states_fp8.device,
+                    dtype=torch.float32,
+                )
             ),
         ]
         m_indices = torch.empty(
@@ -1399,6 +1415,7 @@ class DeepEPMoE(EPMoE):
             input_tensor[1],
             m_indices,
             output_index,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
         dispose_tensor(hidden_states_fp8)
 
@@ -1407,7 +1424,8 @@ class DeepEPMoE(EPMoE):
             device=hidden_states_fp8_device,
             dtype=torch.bfloat16,
         )
-        input_tensor[1] = tma_align_input_scale(input_tensor[1])
+        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            input_tensor[1] = tma_align_input_scale(input_tensor[1])
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             input_tensor, self.w13_weight_fp8, gateup_output, m_indices
         )
@@ -1428,10 +1446,15 @@ class DeepEPMoE(EPMoE):
             dtype=torch.bfloat16,
         )
         down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
-            down_input, scale_block_size
+            down_input,
+            scale_block_size,
+            column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
         del down_input
-        down_input_scale = tma_align_input_scale(down_input_scale)
+        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            down_input_scale = tma_align_input_scale(down_input_scale)
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
             self.w2_weight_fp8,
