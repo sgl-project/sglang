@@ -18,7 +18,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from transformers.utils import is_flash_attn_greater_or_equal_2_10
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
@@ -31,14 +30,17 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import MiniCPMScaledRotaryEmbedding, get_rope
+from sglang.srt.layers.rotary_embedding import (
+    Phi3LongRoPEScaledRotaryEmbedding,
+    get_rope,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, logger
+from sglang.srt.utils import add_prefix
 
 
 class MiniCPMMLP(nn.Module):
@@ -141,7 +143,8 @@ class MiniCPMAttention(nn.Module):
             rope_scaling=rope_scaling,
         )
         # set rope as fp32 instead of bf16
-        self.rotary_emb.cos_sin_cache = self.rotary_emb._compute_cos_sin_cache()
+        if not isinstance(self.rotary_emb, Phi3LongRoPEScaledRotaryEmbedding):
+            self.rotary_emb.cos_sin_cache = self.rotary_emb._compute_cos_sin_cache()
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -170,156 +173,8 @@ class MiniCPMAttention(nn.Module):
         return output
 
 
-class MiniCPMFlashAttention2(nn.Module):
-    """
-    MiniCPM flash attention module. This module inherits from `MiniCPMAttention` as the weights of the module stays
-    untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
-    flash attention and deal with padding tokens in case the input contains any of them.
-    """
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        **kwargs,
-    ):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_id
-        tp_size = get_tensor_model_parallel_world_size()
-        self.total_num_heads = config.num_attention_heads
-        num_kv_heads = config.num_key_value_heads
-        hidden_size = config.hidden_size
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.head_dim = hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        rope_theta = getattr(config, "rope_theta", 10000)
-        self.rope_theta = rope_theta
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.max_position_embeddings = max_position_embeddings
-
-        # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
-        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignment, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
-        # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
-        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
-
-        #  -------sparse-------
-
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("qkv_proj", prefix),
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("o_proj", prefix),
-        )
-        assert isinstance(config.sliding_window, list), type(config.sliding_window)
-        self.is_sliding = bool((layer_id + 1) % len(config.sliding_window))
-        self.sliding_window = (
-            (config.sliding_window[0] - 1, 0) if self.is_sliding else (-1, -1)
-        )
-        self.attn = RadixAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            sliding_window_size=self.sliding_window[0],
-            prefix=add_prefix("attn", prefix),
-        )
-        self.hidden_size = hidden_size
-        # set rope as fp32 instead of bf16
-        scaling_type = self.config.rope_scaling["rope_type"]
-        if scaling_type == "longrope":
-            self.rotary_emb = MiniCPMScaledRotaryEmbedding(
-                self.head_dim,
-                self.head_dim,
-                max_position_embeddings=self.max_position_embeddings,
-                short_factor=self.config.rope_scaling["short_factor"],
-                long_factor=self.config.rope_scaling["long_factor"],
-                base=self.rope_theta,
-                original_max_position_embeddings=self.config.rope_scaling[
-                    "original_max_position_embeddings"
-                ],
-            )
-        else:
-            raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
-        self.is_causal = True
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        positions: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        # MiniCPMFlashAttention2 attention does not support output_attentions
-
-        if hidden_states.dim() == 2:
-            hidden_states = hidden_states.unsqueeze(0)
-        bsz, q_len, _ = hidden_states.size()
-
-        qkv, _ = self.qkv_proj(hidden_states)
-
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        q = q.reshape(-1, self.num_heads, self.head_dim)
-        k = k.reshape(-1, self.num_kv_heads, self.head_dim)
-
-        q, k = self.rotary_emb(positions, q, k)
-
-        input_dtype = q.dtype
-        if input_dtype == torch.float32:
-            # Handle the case where the model is quantized
-            if hasattr(self.config, "_pre_quantization_dtype"):
-                target_dtype = self.config._pre_quantization_dtype
-            else:
-                target_dtype = next(self.qkv_proj.parameters()).dtype
-
-            logger.warning_once(
-                f"The input hidden states seems to be silently casted in float32, this might be related to"
-                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-                f" {target_dtype}."
-            )
-
-            q = q.to(target_dtype)
-            k = k.to(target_dtype)
-            v = v.to(target_dtype)
-
-        attn_output = self.attn(q, k, v, forward_batch)
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
-        attn_output, _ = self.o_proj(attn_output)
-
-        return attn_output
-
-
 MINICPM_ATTENTION_CLASSES = {
     "eager": MiniCPMAttention,
-    "flash_attention_2": MiniCPMFlashAttention2,
 }
 
 

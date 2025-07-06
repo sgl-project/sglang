@@ -1617,7 +1617,6 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata.max_seq_len_k + self.page_size - 1
                     ) // self.page_size
 
-
                     normal_decode_set_medadata(
                         metadata.cache_seqlens_int32,
                         metadata.cu_seqlens_k,
