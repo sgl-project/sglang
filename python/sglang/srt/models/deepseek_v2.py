@@ -210,8 +210,10 @@ class MoEGate(nn.Module):
         self,
         config,
         prefix: str = "",
+        is_nextn: bool = False,
     ):
         super().__init__()
+        self.is_nextn = is_nextn
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
@@ -233,8 +235,10 @@ class MoEGate(nn.Module):
                 True,  # is_vnni
             )
 
+        # NOTE: For some unknown reason, router_gemm seems degrade accept length.
         if (
             _is_cuda
+            and not self.is_nextn
             and hidden_states.shape[0] < 4
             and hidden_states.shape[1] == 7168
             and self.weight.shape[0] == 256
@@ -258,6 +262,7 @@ class DeepseekV2MoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -284,7 +289,9 @@ class DeepseekV2MoE(nn.Module):
                 "Only silu is supported for now."
             )
 
-        self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
+        self.gate = MoEGate(
+            config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
+        )
 
         self.experts = get_moe_impl_class()(
             num_experts=config.n_routed_experts
@@ -558,7 +565,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states=hidden_states,
                 topk_idx=topk_idx,
                 topk_weights=topk_weights,
-                forward_mode=forward_mode,
+                forward_batch=forward_batch,
             )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
@@ -569,14 +576,14 @@ class DeepseekV2MoE(nn.Module):
             masked_m=masked_m,
             expected_m=expected_m,
             num_recv_tokens_per_expert=num_recv_tokens_per_expert,
-            forward_mode=forward_mode,
+            forward_batch=forward_batch,
         )
         if self.ep_size > 1:
             final_hidden_states = self.deepep_dispatcher.combine(
                 hidden_states=final_hidden_states,
                 topk_idx=topk_idx,
                 topk_weights=topk_weights,
-                forward_mode=forward_mode,
+                forward_batch=forward_batch,
             )
 
         if shared_output is not None:
@@ -651,7 +658,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states=state.hidden_states_mlp_input,
                 topk_idx=state.pop("topk_idx_local"),
                 topk_weights=state.pop("topk_weights_local"),
-                forward_mode=state.forward_batch.forward_mode,
+                forward_batch=state.forward_batch,
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
@@ -683,7 +690,7 @@ class DeepseekV2MoE(nn.Module):
             masked_m=state.pop("masked_m"),
             expected_m=state.pop("expected_m"),
             num_recv_tokens_per_expert=state.pop("num_recv_tokens_per_expert"),
-            forward_mode=state.forward_batch.forward_mode,
+            forward_batch=state.forward_batch,
         )
 
     def op_combine_a(self, state):
@@ -692,7 +699,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states=state.pop("hidden_states_experts_output"),
                 topk_idx=state.pop("topk_idx_dispatched"),
                 topk_weights=state.pop("topk_weights_dispatched"),
-                forward_mode=state.forward_batch.forward_mode,
+                forward_batch=state.forward_batch,
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
@@ -913,7 +920,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
             and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
             and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
-            and is_cuda
+            and _is_cuda
             and _device_sm >= 90
         )
 
@@ -1776,6 +1783,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
+                is_nextn=is_nextn,
             )
         else:
             if enable_moe_dense_fully_dp():
@@ -1840,11 +1848,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
-            # NOTE: this line resolves the degradation of MTP reception rate for non-zero DP ranks.
-            # See discussion here (https://github.com/sgl-project/sglang/pull/6081#discussion_r2147452251).
-            hidden_states = hidden_states.clone()
-
         return hidden_states, residual
 
     def op_comm_prepare_attn(
@@ -1886,7 +1889,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             and hidden_states.shape[0] == 0
         ):
             state.hidden_states_mlp_output = self.mlp(
-                hidden_states, state.forward_batch.forward_mode
+                hidden_states, state.forward_batch
             )
         else:
             state.hidden_states_mlp_output = hidden_states
@@ -1935,7 +1938,7 @@ class DeepseekV2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            use_attn_tp_group=True,
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
