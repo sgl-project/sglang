@@ -154,8 +154,7 @@ class KimiVLForConditionalGeneration(nn.Module):
         return res
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        # Get all special token IDs
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens(mm_inputs.im_token_id)
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def forward(

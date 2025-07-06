@@ -20,7 +20,7 @@ import logging
 import os
 import random
 import tempfile
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Union
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -46,7 +46,9 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
+    skip_server_warmup: bool = False
     load_format: str = "auto"
+    model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
@@ -60,11 +62,13 @@ class ServerArgs:
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
+    hybrid_kvcache_ratio: Optional[float] = None
     impl: str = "auto"
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
+    nccl_port: Optional[int] = None
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -97,6 +101,7 @@ class ServerArgs:
     log_level_http: Optional[str] = None
     log_requests: bool = False
     log_requests_level: int = 0
+    crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
     bucket_time_to_first_token: Optional[List[float]] = None
@@ -128,7 +133,7 @@ class ServerArgs:
     preferred_sampling_params: Optional[str] = None
 
     # LoRA
-    lora_paths: Optional[List[str]] = None
+    lora_paths: Optional[Union[dict[str, str], List[str]]] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
 
@@ -152,6 +157,8 @@ class ServerArgs:
     ep_size: int = 1
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
+    enable_flashinfer_moe: bool = False
+    enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -236,6 +243,7 @@ class ServerArgs:
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
+    weight_loader_disable_mmap: bool = False
 
     def __post_init__(self):
         # Expert parallelism
@@ -244,7 +252,15 @@ class ServerArgs:
             logger.warning(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
-
+        if self.enable_flashinfer_moe:
+            assert (
+                self.quantization == "modelopt_fp4"
+            ), "modelopt_fp4 quantization is required for Flashinfer MOE"
+            os.environ["TRTLLM_ENABLE_PDL"] = "1"
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                f"Flashinfer MoE is enabled. Shared expert fusion is disabled."
+            )
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -303,6 +319,14 @@ class ServerArgs:
                 self.mem_fraction_static = round((gpu_mem - reserved_mem) / gpu_mem, 3)
             else:
                 self.mem_fraction_static = 0.88
+
+            # Lazy init to avoid circular import
+            from sglang.srt.configs.model_config import ModelConfig
+
+            # Multimodal models need more memory for the image processor
+            model_config = ModelConfig.from_server_args(self)
+            if model_config.is_multimodal:
+                self.mem_fraction_static *= 0.90
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
@@ -365,6 +389,12 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
 
+        if self.attention_backend == "ascend":
+            logger.warning(
+                "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
+            )
+            self.page_size = 128
+
         # Choose grammar backend
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
@@ -387,19 +417,11 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_attention. "
 
         # DeepEP MoE
-        self.enable_sp_layernorm = False
         if self.enable_deepep_moe:
-            if self.deepep_mode == "auto":
-                assert (
-                    not self.enable_dp_attention
-                ), "DeepEP MoE `auto` mode is not supported with DP Attention."
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
             self.ep_size = self.tp_size
-            self.enable_sp_layernorm = (
-                self.dp_size < self.tp_size if self.enable_dp_attention else True
-            )
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
@@ -478,12 +500,6 @@ class ServerArgs:
                     self.speculative_num_draft_tokens,
                 ) = auto_choose_speculative_params(self)
 
-            if self.page_size > 1 and self.speculative_eagle_topk > 1:
-                self.speculative_eagle_topk = 1
-                logger.warning(
-                    "speculative_eagle_topk is adjusted to 1 when page_size > 1"
-                )
-
             if (
                 self.speculative_eagle_topk == 1
                 and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
@@ -557,6 +573,7 @@ class ServerArgs:
         # Model and port args
         parser.add_argument(
             "--model-path",
+            "--model",
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
             required=True,
@@ -580,6 +597,12 @@ class ServerArgs:
             help="The port of the HTTP server.",
         )
         parser.add_argument(
+            "--nccl-port",
+            type=int,
+            default=ServerArgs.nccl_port,
+            help="The port for NCCL distributed environment setup. Defaults to a random port.",
+        )
+        parser.add_argument(
             "--tokenizer-mode",
             type=str,
             default=ServerArgs.tokenizer_mode,
@@ -592,6 +615,11 @@ class ServerArgs:
             "--skip-tokenizer-init",
             action="store_true",
             help="If set, skip init tokenizer and pass input_ids in generate request.",
+        )
+        parser.add_argument(
+            "--skip-server-warmup",
+            action="store_true",
+            help="If set, skip warmup.",
         )
         parser.add_argument(
             "--load-format",
@@ -625,6 +653,13 @@ class ServerArgs:
             '"layered" loads weights layer by layer so that one can quantize a '
             "layer before loading another to make the peak memory envelope "
             "smaller.",
+        )
+        parser.add_argument(
+            "--model-loader-extra-config",
+            type=str,
+            help="Extra config for model loader. "
+            "This will be passed to the model loader corresponding to the chosen load_format.",
+            default=ServerArgs.model_loader_extra_config,
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -802,6 +837,18 @@ class ServerArgs:
             default=ServerArgs.page_size,
             help="The number of tokens in a page.",
         )
+        parser.add_argument(
+            "--hybrid-kvcache-ratio",
+            nargs="?",
+            const=0.5,
+            type=float,
+            default=ServerArgs.hybrid_kvcache_ratio,
+            help=(
+                "Mix ratio in [0,1] between uniform and hybrid kv buffers "
+                "(0.0 = pure uniform: swa_size / full_size = 1)"
+                "(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length)"
+            ),
+        )
 
         # Other runtime options
         parser.add_argument(
@@ -905,8 +952,14 @@ class ServerArgs:
             "--log-requests-level",
             type=int,
             default=0,
-            help="0: Log metadata. 1. Log metadata and partial input/output. 2. Log every input/output.",
-            choices=[0, 1, 2],
+            help="0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial input/output. 3: Log every input/output.",
+            choices=[0, 1, 2, 3],
+        )
+        parser.add_argument(
+            "--crash-dump-folder",
+            type=str,
+            default=ServerArgs.crash_dump_folder,
+            help="Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled.",
         )
         parser.add_argument(
             "--show-time-cost",
@@ -1077,6 +1130,7 @@ class ServerArgs:
                 "flashmla",
                 "intel_amx",
                 "torch_native",
+                "ascend",
                 "triton",
             ],
             default=ServerArgs.attention_backend,
@@ -1165,6 +1219,16 @@ class ServerArgs:
             "--enable-ep-moe",
             action="store_true",
             help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-moe",
+            action="store_true",
+            help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP with --enable-ep-moe",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-allreduce-fusion",
+            action="store_true",
+            help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
         )
         parser.add_argument(
             "--enable-deepep-moe",
@@ -1589,6 +1653,11 @@ class ServerArgs:
             default=None,
             help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
         )
+        parser.add_argument(
+            "--weight-loader-disable-mmap",
+            action="store_true",
+            help="Disable mmap while loading weight using safetensors.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -1676,16 +1745,22 @@ class PortArgs:
     # The ipc filename for rpc call between Engine and Scheduler
     rpc_ipc_name: str
 
+    # The ipc filename for Scheduler to send metrics
+    metrics_ipc_name: str
+
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
-        port = server_args.port + random.randint(100, 1000)
-        while True:
-            if is_port_available(port):
-                break
-            if port < 60000:
-                port += 42
-            else:
-                port -= 43
+        if server_args.nccl_port is None:
+            port = server_args.port + random.randint(100, 1000)
+            while True:
+                if is_port_available(port):
+                    break
+                if port < 60000:
+                    port += 42
+                else:
+                    port -= 43
+        else:
+            port = server_args.nccl_port
 
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
@@ -1695,6 +1770,7 @@ class PortArgs:
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -1713,11 +1789,10 @@ class PortArgs:
             dist_init_host, dist_init_port = dist_init_addr
             port_base = int(dist_init_port) + 1
             if dp_rank is None:
-                scheduler_input_port = (
-                    port_base + 3
-                )  # TokenizerManager to DataParallelController
+                # TokenizerManager to DataParallelController
+                scheduler_input_port = port_base + 4
             else:
-                scheduler_input_port = port_base + 3 + 1 + dp_rank
+                scheduler_input_port = port_base + 4 + 1 + dp_rank
 
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
@@ -1725,6 +1800,7 @@ class PortArgs:
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
                 nccl_port=port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
+                metrics_ipc_name=f"tcp://{dist_init_host}:{port_base + 3}",
             )
 
 
