@@ -45,8 +45,7 @@ from sgl_kernel.gemm import (
     scaled_fp4_experts_quant,
     scaled_fp4_quant,
     sgl_per_tensor_quant_fp8,
-    sgl_per_token_group_quant_fp8,
-    sgl_per_token_group_quant_int8,
+    sgl_per_token_group_quant_8bit,
     sgl_per_token_quant_fp8,
     shuffle_rows,
 )

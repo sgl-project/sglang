@@ -124,7 +124,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-O3"
     "-Xcompiler"
     "-fPIC"
-    "-gencode=arch=compute_90,code=sm_90"
+    # "-gencode=arch=compute_90,code=sm_90"
     "-std=c++17"
     "-DFLASHINFER_ENABLE_F16"
     "-DCUTE_USE_PACKED_TUPLE=1"
@@ -165,10 +165,10 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
         "-gencode=arch=compute_100a,code=sm_100a"
-        "-gencode=arch=compute_101,code=sm_101"
-        "-gencode=arch=compute_101a,code=sm_101a"
-        "-gencode=arch=compute_120,code=sm_120"
-        "-gencode=arch=compute_120a,code=sm_120a"
+        # "-gencode=arch=compute_101,code=sm_101"
+        # "-gencode=arch=compute_101a,code=sm_101a"
+        # "-gencode=arch=compute_120,code=sm_120"
+        # "-gencode=arch=compute_120a,code=sm_120a"
     )
 else()
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -178,9 +178,9 @@ endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" OR SGL_KERNEL_ENABLE_SM90A)
     set(SGL_KERNEL_ENABLE_FA3 ON)
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_90a,code=sm_90a"
-    )
+    # list(APPEND SGL_KERNEL_CUDA_FLAGS
+    #     "-gencode=arch=compute_90a,code=sm_90a"
+    # )
 endif()
 
 if (SGL_KERNEL_ENABLE_BF16)
