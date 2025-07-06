@@ -704,6 +704,10 @@ class ShardedStateLoader(BaseModelLoader):
                         state_dict.pop(key)
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+
+        if hasattr(model, "post_load_weights"):
+            model.post_load_weights()
+
         return model.eval()
 
     @staticmethod
