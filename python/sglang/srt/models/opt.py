@@ -100,7 +100,6 @@ class OPTAttention(nn.Module):
         attn_output, _ = self.c_proj(attn_output)
         return attn_output
 
-
 class OPTMLP(nn.Module):
 
     def __init__(
