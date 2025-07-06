@@ -276,6 +276,19 @@ class LoRAManager:
                             weight_name, layer_id, LoRAType.LORA_B
                         ),
                     )
+        # call set_lora_info for embeddings
+        for module_name, module in self.lora_embeddings_modules.items():
+            if self.cur_max_extra_vocab_size > 0:
+                new_embeddings_buffer = self.memory_pool.get_embedding_tensor(module_name)
+            module.set_lora_info(
+                new_embeddings_buffer,
+                self.memory_pool.get_embedding_tensor(
+                    module_name, LoRAType.LORA_A
+                ),
+                self.memory_pool.get_embedding_tensor(
+                    module_name, LoRAType.LORA_B
+                ),
+            )
 
     def init_state(self):
         """
@@ -293,11 +306,15 @@ class LoRAManager:
         # Supported weight names (e.g., qkv_proj) for LoRA A and B respectively.
         self.lora_weight_names: Tuple[Set[str]] = (set(), set())
 
+        self.lora_embeddings_weight_names: Tuple[Set[str]] = (set(), set())
+
         # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
         self.lora_modules: Dict[int, Dict[str, BaseLayerWithLoRA]] = {
             i: {} for i in range(self.base_hf_config.num_hidden_layers)
         }
+
         self.max_extra_vocab_size: int = 0
+        # Look-up table that essentially maps (layer_name, module_name) to the corresponding LoRA embeddings module.
         self.lora_embeddings_modules: Dict[str, BaseLayerWithLoRA] = {}
 
         # Initialize memory pool
@@ -323,7 +340,7 @@ class LoRAManager:
         """
 
         # Target module names in huggingface lora configs.
-        # e.g., {"k_proj", "q_proj", "v_proj", "o_proj"}
+        # e.g., {"k_proj", "q_proj", "v_proj", "o_proj", "embed_tokens"}
         hf_target_module_names: Set[str] = set()
         for config in self.configs.values():
             hf_target_module_names.update(config.target_modules)
@@ -351,8 +368,12 @@ class LoRAManager:
         # Target lora weight names for lora_a and lora_b modules respectively.
         for module in hf_target_names:
             lora_A, lora_B = get_normalized_lora_weight_names(module)
-            self.lora_weight_names[0].update(lora_A)
-            self.lora_weight_names[1].update(lora_B)
+            if "embed_tokens" in module:
+                self.lora_embeddings_weight_names[0].update(lora_A)
+                self.lora_embeddings_weight_names[1].update(lora_B)
+            else:
+                self.lora_weight_names[0].update(lora_A)
+                self.lora_weight_names[1].update(lora_B)
 
     def update_lora_adapters(self):
         """
@@ -401,7 +422,7 @@ class LoRAManager:
         """
 
         self.memory_pool.init_buffers(
-            self.lora_weight_names, self.base_model, max_lora_dim, self.cur_max_extra_vocab_size
+            self.lora_weight_names, self.lora_embeddings_weight_names, self.base_model, max_lora_dim, self.cur_max_extra_vocab_size
         )
 
     def set_lora_module(self, module_name, module):

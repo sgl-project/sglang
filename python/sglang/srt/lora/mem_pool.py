@@ -44,12 +44,11 @@ class LoRAMemoryPool:
         self.A_buffer: Dict[str, List[torch.Tensor]] = {}
         self.B_buffer: Dict[str, List[torch.Tensor]] = {}
 
-        self.new_embeddings_buffer: Optional[Dict[str, torch.Tensor]] = None
-        self.embedding_A_buffer: Optional[Dict[str, torch.Tensor]] = None
-        self.embedding_B_buffer: Optional[Dict[str, torch.Tensor]] = None
+        self.new_embeddings_buffer: Dict[str, torch.Tensor] = {}
+        self.embedding_A_buffer: Dict[str, torch.Tensor] = {}
+        self.embedding_B_buffer: Dict[str, torch.Tensor] = {}
 
         self.embedding_dim: int = self.base_hf_config.hidden_size
-        self.base_vocab_size: int = self.base_hf_config.vocab_size
 
         # Lora uid -> buffer idx in memory pool
         self.uid_to_buffer_id: Dict[Optional[str], int] = {}
@@ -92,14 +91,31 @@ class LoRAMemoryPool:
             max_lora_dim,
         )
 
-    def get_embedding_shape(
-        self,
+    def get_embedding_lora_A_shape(
+        self, max_lora_dim: int
     ) -> Tuple[int]:
-        return (self.max_loras_per_batch, self.max_extra_vocab_size, self.embedding_dim)
+        base_vocab_size = self.base_hf_config.vocab_size
+        max_extra_vocab_size = base_vocab_size + self.max_extra_vocab_size
+        return (
+            self.max_loras_per_batch,
+            max_lora_dim,
+            max_extra_vocab_size,
+        )
+
+    def get_embedding_lora_B_shape(
+        self, max_lora_dim: int
+    ) -> Tuple[int]:
+        embedding_dim = self.base_hf_config.hidden_size
+        return (
+            self.max_loras_per_batch,
+            embedding_dim,
+            max_lora_dim,
+        )
 
     def init_buffers(
         self,
         lora_weight_names: Tuple[Set[str]],
+        lora_embeddings_weight_names: Tuple[Set[str]],
         base_model: torch.nn.Module,
         max_lora_dim: int,
         cur_max_extra_vocab_size: int,
@@ -107,47 +123,53 @@ class LoRAMemoryPool:
         # lora_weight_names is a set of name pairs indicating each pair of lora modules to load
         #   e.g., {("qkv_proj", "q_proj"), ("qkv_proj", "kv_proj"), ("o_proj", "o_proj")}
         self.lora_weight_names: Tuple[Set[str]] = lora_weight_names
+        self.lora_embeddings_weight_names: Tuple[Set[str]] = lora_embeddings_weight_names
         device = next(base_model.parameters()).device
-        max_vocab_size = self.base_vocab_size + cur_max_extra_vocab_size
 
         def update_buffer(
             buffer: Dict[str, List[torch.Tensor]],
             lora_weight_names: Set[str],
             get_lora_shape_fn: Callable[[str, torch.nn.Module, int], Tuple[int]],
         ):
-            if "embed_tokens" in lora_weight_names:
-
             new_weight_names = lora_weight_names - buffer.keys()
             for module_name in new_weight_names:
-                lora_shape = get_lora_shape_fn(module_name, base_model, max_lora_dim)
-                buffer[module_name] = [
-                    torch.empty(
+                if "embed_tokens" in module_name:
+                    lora_shape = get_lora_shape_fn(max_lora_dim)
+                    buffer[module_name] = torch.empty(
                         lora_shape,
                         dtype=self.dtype,
                         device=device,
                     )
-                    for _ in range(self.num_layer)
-                ]
-            
+                else:
+                    lora_shape = get_lora_shape_fn(module_name, base_model, max_lora_dim)
+                    buffer[module_name] = [
+                        torch.empty(
+                            lora_shape,
+                            dtype=self.dtype,
+                            device=device,
+                        )
+                        for _ in range(self.num_layer)
+                    ]
+
         if cur_max_extra_vocab_size != self.max_extra_vocab_size:
             self.max_extra_vocab_size = cur_max_extra_vocab_size
-            self.new_embeddings_buffer = {}
-            update_buffer(
-                self.new_embeddings_buffer,
-                set(["input_embeddings"]),
-                self.get_embedding_shape,
+            self.new_embeddings_buffer["input_embeddings"] = torch.empty(
+                (self.max_loras_per_batch, self.max_extra_vocab_size, self.embedding_dim),
+                dtype=self.dtype,
+                device=device,
             )
+            self.embedding_A_buffer.clear()
 
         update_buffer(
             self.embedding_A_buffer,
-            lora_weight_names[0],
-            self.get_embedding_shape,
+            lora_embeddings_weight_names[0],
+            self.get_embedding_lora_A_shape,
         )
 
         update_buffer(
             self.embedding_B_buffer,
-            lora_weight_names[1],
-            self.get_embedding_shape,
+            lora_embeddings_weight_names[1],
+            self.get_embedding_lora_B_shape,
         )
 
         update_buffer(
@@ -161,9 +183,7 @@ class LoRAMemoryPool:
             lora_weight_names[1],
             self.get_lora_B_shape,
         )
-
         
-
     def prepare_lora_batch(
         self,
         cur_uids: Set[Optional[str]],
@@ -279,6 +299,41 @@ class LoRAMemoryPool:
                     ]
                     check_lora_weight_shape(buffer_view, weights)
                     buffer_view.copy_(weights)
+        # Load embeddings weights to buffer
+        org_vocab_size = self.base_hf_config.vocab_size
+        extra_vocab_size = lora_adapter.extra_vocab_size
+        if lora_adapter.new_embeddings:
+            for name, weights in lora_adapter.new_embeddings.items():
+                if "input_embeddings" in name:
+                    buffer_view = self.new_embeddings_buffer["input_embeddings"][buffer_id, :extra_vocab_size]
+                    check_lora_weight_shape(buffer_view, weights)
+                    buffer_view.copy_(weights)
+        
+        if lora_adapter.weights:
+            for name, weights in lora_adapter.weights.items():
+                if "lora_embedding_A" in name:
+                    lora_weight_name = get_weight_name(
+                        name, self.lora_embeddings_weight_names, LoRAType.LORA_A
+                    )
+                    buffer_view = self.embedding_A_buffer[lora_weight_name][buffer_id, :lora_rank, :org_vocab_size+extra_vocab_size]
+                    check_lora_weight_shape(buffer_view, weights)
+                    buffer_view.copy_(weights)
+                elif "lora_embedding_B" in name:
+                    lora_weight_name = get_weight_name(
+                        name, self.lora_embeddings_weight_names, LoRAType.LORA_B
+                    )
+                    lora_b_weights = weights
+                    if self.tp_size > 1:
+                        cur_module = self.lora_embeddings_modules[lora_weight_name]
+                        for module_name, module in cur_module:
+                            weight_name = get_weight_name(
+                                module_name, self.lora_embeddings_weight_names, LoRAType.LORA_B
+                            )
+                            lora_b_weights = module.slice_lora_b_weights(lora_b_weights, self.tp_rank)
+                    
+                    buffer_view = self.embedding_B_buffer[lora_weight_name][buffer_id, :, :lora_rank]
+                    check_lora_weight_shape(buffer_view, lora_b_weights)
+                    buffer_view.copy_(lora_b_weights)
 
     def get_tensor(
         self, weight_name: str, layer_id: int, lora_type: LoRAType
@@ -287,6 +342,15 @@ class LoRAMemoryPool:
             return self.A_buffer[weight_name][layer_id]
 
         return self.B_buffer[weight_name][layer_id]
+
+    def get_embedding_tensor(
+        self, weight_name: str, lora_type: Optional[LoRAType] = None
+    ) -> torch.Tensor:
+        if lora_type is None:
+            return self.new_embeddings_buffer["input_embeddings"]
+        if lora_type == LoRAType.LORA_A:
+            return self.embedding_A_buffer[weight_name]
+        return self.embedding_B_buffer[weight_name]
 
     def get_buffer_id(self, lora_uid: str):
         return self.uid_to_buffer_id[lora_uid]

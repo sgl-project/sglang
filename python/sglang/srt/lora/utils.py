@@ -115,6 +115,7 @@ def get_normalized_lora_weight_names(name: str) -> Tuple[List[str], List[str]]:
         "q_proj": (["qkv_proj"], ["q_proj"]),
         "k_proj": (["qkv_proj"], ["kv_proj"]),
         "v_proj": (["qkv_proj"], ["kv_proj"]),
+        "embed_tokens": (["embed_tokens"], ["embed_tokens"]),
         "gate_proj": (["gate_up_proj"], ["gate_up_proj"]),
         "up_proj": (["gate_up_proj"], ["gate_up_proj"]),
         "qkv_proj": (["qkv_proj"], ["q_proj", "kv_proj"]),

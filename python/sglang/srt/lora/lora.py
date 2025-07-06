@@ -70,7 +70,7 @@ class LoRAAdapter(nn.Module):
         )
 
         self.weights: Dict[str, torch.Tensor] = {}
-        self.new_embeddings: (Dict[str, torch.Tensor]) = {}
+        self.new_embeddings: Dict[str, torch.Tensor] = {}
         self.extra_vocab_size: int = 0
 
     # initialize the LoRA weights to cpu

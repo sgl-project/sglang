@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import torch
 from torch import nn
@@ -80,28 +80,14 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         Apply LoRA to base embedding output.
         Formula: output = base_output + lora_a_embedding(input_) @ lora_b_weights
         """
-        # Use F.embedding for LoRA A lookup (no new triton ops needed)
         batch_info = self.lora_backend.batch_info
-        
-        # Create expanded input for all batch elements
-        # input_: (batch_size * seq_len,)
-        # Need to map each token to its corresponding LoRA adapter
-        
-        device = input_.device
-        total_tokens = input_.shape[0]
-        
-        # Get weight indices for each token based on batch_info
-        # This maps each token position to its LoRA adapter index
         token_weight_indices = self._get_token_weight_indices(input_, batch_info)
         
-        # Perform LoRA A embedding lookup using F.embedding
-        # We need to handle the batch dimension properly
         lora_a_output = self._run_lora_a_embedding(input_, token_weight_indices)
         
-        # Use existing sgemm_lora_b kernel for B matrix multiplication
         lora_b_output = self.lora_backend.run_lora_b_sgemm(
             lora_a_output,
-            self.embedding_B_buffer[0],  # Remove stacked dimension for embeddings
+            self.embedding_B_buffer,
             base_output=base_output if self.lora_backend.fuse_output_add else None,
         )
         
@@ -114,10 +100,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     def _get_token_weight_indices(self, input_: torch.Tensor, batch_info: LoRABatchInfo) -> torch.Tensor:
         """Map each token position to its corresponding LoRA adapter index."""
         device = input_.device
-        total_tokens = input_.shape[0]
-        
-        # Create weight indices for each token based on segment info
-        token_weight_indices = torch.zeros(total_tokens, dtype=torch.int32, device=device)
+        token_weight_indices = torch.zeros(input_.shape[0], dtype=torch.int32, device=device)
         
         current_pos = 0
         for i in range(batch_info.bs):
@@ -129,50 +112,29 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         return token_weight_indices
 
     def _run_lora_a_embedding(self, input_: torch.Tensor, weight_indices: torch.Tensor) -> torch.Tensor:
-        """
-        Perform LoRA A embedding lookup using F.embedding.
-        No new triton ops needed - use standard PyTorch operations.
-        """
         batch_info = self.lora_backend.batch_info
         device = input_.device
-        total_tokens = input_.shape[0]
-        max_rank = self.embedding_A_buffer.shape[1]
         
-        # Initialize output tensor
         lora_a_output = torch.zeros(
-            (total_tokens, max_rank), 
+            (input_.shape[0], self.embedding_A_buffer.shape[1]), 
             dtype=self.embedding_A_buffer.dtype, 
             device=device
         )
         
-        # Process each unique LoRA adapter
         unique_indices = torch.unique(weight_indices)
         
         for lora_idx in unique_indices:
-            if lora_idx == 0:  # Skip base model (no LoRA)
-                continue
-                
-            # Get mask for tokens using this LoRA adapter
             mask = weight_indices == lora_idx
             if not mask.any():
                 continue
                 
-            # Get the actual rank for this LoRA adapter
             actual_rank = batch_info.lora_ranks[lora_idx]
             if actual_rank == 0:
                 continue
                 
-            # Get tokens for this LoRA adapter
             lora_tokens = input_[mask]
-            
-            # Use F.embedding for lookup - this is efficient and uses existing ops
-            # embedding_A_buffer: (max_loras, max_rank, vocab_size + extra_vocab)
             lora_a_weights = self.embedding_A_buffer[lora_idx, :actual_rank, :]
-            
-            # Perform embedding lookup
             lora_a_result = F.embedding(lora_tokens, lora_a_weights.t())
-            
-            # Store result
             lora_a_output[mask, :actual_rank] = lora_a_result
             
         return lora_a_output
@@ -194,40 +156,29 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         base_token_mask = input_ < self.vocab_size
         added_token_mask = ~base_token_mask
         
-        # Process base tokens through base embedding
         base_input = input_.clone()
-        base_input[added_token_mask] = 0  # Mask added tokens for base embedding
+        base_input[added_token_mask] = 0
         base_output = self.base_layer.forward(base_input)
         
-        # Process added tokens if any exist
         if added_token_mask.any():
-            added_tokens = input_[added_token_mask] - self.vocab_size  # Adjust indices
+            added_tokens = input_[added_token_mask] - self.vocab_size
             batch_info = self.lora_backend.batch_info
             
-            # Get weight indices for added tokens
             token_weight_indices = self._get_token_weight_indices(input_, batch_info)
             added_weight_indices = token_weight_indices[added_token_mask]
-            
-            # Process each unique LoRA adapter for added tokens
             unique_indices = torch.unique(added_weight_indices)
             
             for lora_idx in unique_indices:
-                if lora_idx == 0:
-                    continue
-                    
                 lora_mask = added_weight_indices == lora_idx
                 if not lora_mask.any():
                     continue
                     
                 lora_added_tokens = added_tokens[lora_mask]
-                
-                # Use F.embedding for new embeddings lookup
                 new_embeddings = F.embedding(
                     lora_added_tokens, 
                     self.new_embeddings_buffer[lora_idx]
                 )
                 
-                # Update base output for added tokens
                 added_token_positions = torch.where(added_token_mask)[0][lora_mask]
                 base_output[added_token_positions] = new_embeddings
         
