@@ -2678,7 +2678,14 @@ def _export_static_state(model):
 def _import_static_state(model, static_params):
     self_named_buffers = dict(model.named_buffers())
     for name, tensor in static_params["buffers"]:
-        self_named_buffers[name][...] = tensor
+        try:
+            self_named_buffers[name][...] = tensor
+        except Exception as e:
+            print(f"Error restoring buffer {name}: {e}")
+            print(f"  Source tensor shape: {tensor.shape}")
+            print(f"  Destination buffer shape: {self_named_buffers[name].shape}")
+            print(f"  !! SHAPE MISMATCH DETECTED !!")
+            raise e
 
 
 def run_scheduler_process(
