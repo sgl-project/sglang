@@ -34,6 +34,7 @@ class HiRadixCache(RadixCache):
         hicache_ratio: float,
         hicache_size: int,
         hicache_write_policy: str,
+        hicache_io_backend: str,
     ):
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
@@ -56,6 +57,7 @@ class HiRadixCache(RadixCache):
             page_size,
             load_cache_event=self.load_cache_event,
             write_policy=hicache_write_policy,
+            io_backend=hicache_io_backend,
         )
 
         # record the nodes with ongoing write through
