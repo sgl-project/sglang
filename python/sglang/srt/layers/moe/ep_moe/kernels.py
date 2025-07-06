@@ -167,6 +167,7 @@ def pre_reorder_triton_kernel(
     gateup_input_ptr,
     src2dst_ptr,
     topk_ids_ptr,
+    topk_weights_ptr,
     a1_scales_ptr,
     start_expert_id,
     end_expert_id,
@@ -174,12 +175,14 @@ def pre_reorder_triton_kernel(
     hidden_size,
     BLOCK_SIZE: tl.constexpr,
     use_per_token_if_dynamic: tl.constexpr,
+    apply_router_weight_on_input: tl.constexpr,
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
 
     src_idx = tl.program_id(0)
     src2dst_ptr = src2dst_ptr + src_idx * topk
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
+    topk_weights_ptr = topk_weights_ptr + src_idx * topk
     src_ptr = input_ptr + src_idx * hidden_size
 
     vec = tl.arange(0, BLOCK_SIZE)
@@ -196,13 +199,18 @@ def pre_reorder_triton_kernel(
             else:
                 scale = 1.0
 
+            if apply_router_weight_on_input:
+                scale_with_topk_weight = scale * tl.load(topk_weights_ptr + idx)
+            else:
+                scale_with_topk_weight = scale
+
             dst_idx = tl.load(src2dst_ptr + idx)
             dst_ptr = gateup_input_ptr + dst_idx * hidden_size
             for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
                 offset = start_offset + vec
                 mask = offset < hidden_size
                 in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
-                out_data = (in_data * scale).to(OutDtype)
+                out_data = (in_data * scale_with_topk_weight).to(OutDtype)
                 tl.store(dst_ptr + offset, out_data, mask=mask)
 
 
@@ -479,6 +487,7 @@ def post_reorder_triton_kernel(
     hidden_size,
     dst_start,
     BLOCK_SIZE: tl.constexpr,
+    apply_router_weight_on_input: tl.constexpr,
 ):
     InDtype = down_output_ptr.dtype.element_ty
 
@@ -505,10 +514,13 @@ def post_reorder_triton_kernel(
                 dst_idx_int32 = tl.load(src2dst_ptr + idx)
                 dst_idx = dst_idx_int32.to(tl.int64)
                 dst_idx = dst_idx - dst_start
-                weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
                 load_ptr = down_output_ptr + dst_idx * hidden_size
                 in_data = tl.load(load_ptr + offset, mask=mask)
-                sum_vec += in_data * weigh_scale
+                if apply_router_weight_on_input:
+                    sum_vec += in_data
+                else:
+                    weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
+                    sum_vec += in_data * weigh_scale
         tl.store(store_ptr + offset, sum_vec, mask=mask)
 
     if computed == False:

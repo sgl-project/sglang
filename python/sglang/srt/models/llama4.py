@@ -27,6 +27,10 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.eplb.expert_location_dispatch import (
+    ExpertLocationDispatchInfo,
+    topk_ids_logical_to_physical,
+)
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
@@ -39,7 +43,9 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.topk import _mask_topk_ids_padded_region
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -73,18 +79,26 @@ class Llama4MoE(nn.Module):
         gating_output: torch.Tensor,
         topk: int,
         renormalize: bool,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         router_scores_aK, router_indices_aK = fast_topk(gating_output, topk, dim=-1)
         router_scores_aK = torch.sigmoid(router_scores_aK.float()).to(
             hidden_states.dtype
         )
+        router_indices_aK = router_indices_aK.to(torch.int32)
+        router_indices_aK = topk_ids_logical_to_physical(
+            router_indices_aK, expert_location_dispatch_info
+        )
+        _mask_topk_ids_padded_region(router_indices_aK, num_token_non_padded)
         return (
             router_scores_aK.view(-1).reshape(router_scores_aK.shape),
-            router_indices_aK.to(torch.int32),
+            router_indices_aK,
         )
 
     def __init__(
         self,
+        layer_id: int,
         config: Llama4TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -103,17 +117,24 @@ class Llama4MoE(nn.Module):
             prefix=add_prefix("router", prefix),
         )
 
-        self.experts = FusedMoE(
-            num_experts=config.num_local_experts,
+        moe_config = dict()
+        if global_server_args_dict["enable_deepep_moe"]:
+            raise NotImplementedError()
+        else:
+            moe_config["apply_router_weight_on_input"] = True
+
+        self.experts = get_moe_impl_class()(
+            num_experts=config.num_local_experts
+            + global_server_args_dict["ep_num_redundant_experts"],
             top_k=config.num_experts_per_tok,
+            layer_id=layer_id,
             hidden_size=config.hidden_size,
             custom_routing_function=Llama4MoE.custom_routing_function,
             intermediate_size=intermediate_size_moe,
-            reduce_results=False,
             renormalize=False,
             quant_config=quant_config,
-            apply_router_weight_on_input=True,
             prefix=add_prefix("experts", prefix),
+            **moe_config,
         )
 
         self.shared_expert = LlamaMLP(
@@ -373,6 +394,7 @@ class Llama4DecoderLayer(nn.Module):
         if is_moe_layer:
             self.feed_forward = Llama4MoE(
                 config=config,
+                layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("feed_forward", prefix),
             )
