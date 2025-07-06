@@ -203,7 +203,7 @@ class MultimodalDataItem:
 
     # the real data, pixel_values or audio_features
     # data: Union[List[torch.Tensor], List[np.ndarray]]
-    pixel_values: Union[torch.Tensor, np.ndarray] = None
+    pixel_values: Union[torch.Tensor, np.ndarray, "PIL.Image"] = None
     audio_features: Union[torch.Tensor, np.ndarray] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
     audio_offsets: Optional[List[Tuple[int, int]]] = None
@@ -244,15 +244,16 @@ class MultimodalDataItem:
         """
         from sglang.srt.managers.mm_utils import hash_feature
 
-        if self.precomputed_features is not None:
-            self.hash = hash_feature(self.precomputed_features)
-        elif self.is_audio():
-            if self.audio_features is not None:
-                self.hash = hash_feature(self.audio_features)
-            elif self.input_features is not None:
-                self.hash = hash_feature(self.input_features)
-        else:
-            self.hash = hash_feature(self.pixel_values)
+        if self.hash is None:
+            if self.precomputed_features is not None:
+                self.hash = hash_feature(self.precomputed_features)
+            elif self.is_audio():
+                if self.audio_features is not None:
+                    self.hash = hash_feature(self.audio_features)
+                elif self.input_features is not None:
+                    self.hash = hash_feature(self.input_features)
+            else:
+                self.hash = hash_feature(self.pixel_values)
 
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
@@ -294,6 +295,13 @@ class MultimodalDataItem:
         ret = MultimodalDataItem(modality=modality, **kwargs)
         ret.validate()
         return ret
+
+    def merge(self, other):
+        self.pixel_values += other.pixel_values
+        self.image_sizes += other.image_sizes
+        self.image_offsets += other.image_offsets
+        self.hash = hash((self.hash, other.hash))
+        self.set_pad_value()
 
 
 @dataclasses.dataclass
@@ -832,6 +840,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     is_extend_in_batch: bool = False
     tbo_split_seq_index: Optional[int] = None
@@ -1673,6 +1682,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             or global_server_args_dict["attention_backend"] == "flashmla"
             or global_server_args_dict["attention_backend"] == "cutlass_mla"
+            or global_server_args_dict["attention_backend"] == "ascend"
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
             seq_lens_cpu = (
@@ -1705,6 +1715,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_ids_logprobs=self.token_ids_logprobs,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            is_extend_in_batch=self.is_extend_in_batch,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             tbo_split_seq_index=self.tbo_split_seq_index,
             global_forward_mode=self.global_forward_mode,
@@ -1789,6 +1800,7 @@ class ModelWorkerBatch:
     # For DP attention
     global_num_tokens: Optional[List[int]]
     global_num_tokens_for_logprob: Optional[List[int]]
+    is_extend_in_batch: bool
     can_run_dp_cuda_graph: bool
     tbo_split_seq_index: Optional[int]
     global_forward_mode: Optional[ForwardMode]
@@ -1875,7 +1887,10 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    if global_server_args_dict["attention_backend"] != "torch_native":
+    if (
+        global_server_args_dict["attention_backend"] != "ascend"
+        and global_server_args_dict["attention_backend"] != "torch_native"
+    ):
         impl = get_last_loc_triton
     else:
         impl = get_last_loc_torch

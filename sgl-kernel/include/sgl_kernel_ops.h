@@ -222,10 +222,7 @@ void moe_align_block_size(
     bool pad_sorted_token_ids);
 
 void topk_softmax(
-    torch::Tensor& topk_weights,
-    torch::Tensor& topk_indices,
-    torch::Tensor& token_expert_indices,
-    torch::Tensor& gating_output);
+    torch::Tensor& topk_weights, torch::Tensor& topk_indices, torch::Tensor& gating_output, bool renormalize);
 
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
@@ -377,7 +374,8 @@ void build_tree_kernel_efficient(
     at::Tensor retrive_next_sibling,
     int64_t topk,
     int64_t depth,
-    int64_t draft_token_num);
+    int64_t draft_token_num,
+    int64_t tree_mask_mode);
 
 void segment_packbits(
     at::Tensor x,
@@ -469,6 +467,35 @@ void transfer_kv_all_layer_mla_direct(
     const at::Tensor dst_indices,
     int64_t page_size,
     int64_t num_layers);
+
+/*
+ * From csrc/moe/cutlass_moe/w4a8
+ */
+void get_cutlass_w4a8_moe_mm_data(
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_offsets,
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& problem_sizes2,
+    torch::Tensor& input_permutation,
+    torch::Tensor& output_permutation,
+    const int64_t num_experts,
+    const int64_t n,
+    const int64_t k);
+
+void cutlass_w4a8_moe_mm(
+    torch::Tensor& d_tensors,
+    torch::Tensor const& a_tensors,
+    torch::Tensor const& b_tensors,
+    torch::Tensor const& a_scales,
+    torch::Tensor const& b_scales,
+    torch::Tensor const& expert_offsets,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor const& a_strides,
+    torch::Tensor const& b_strides,
+    torch::Tensor const& d_strides,
+    torch::Tensor const& s_strides,
+    int64_t chunk_size,
+    int64_t topk);
 
 /*
  * From FlashInfer

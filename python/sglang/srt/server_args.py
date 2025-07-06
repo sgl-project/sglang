@@ -68,6 +68,7 @@ class ServerArgs:
     # Port for the HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
+    nccl_port: Optional[int] = None
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -319,6 +320,14 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
+            # Lazy init to avoid circular import
+            from sglang.srt.configs.model_config import ModelConfig
+
+            # Multimodal models need more memory for the image processor
+            model_config = ModelConfig.from_server_args(self)
+            if model_config.is_multimodal:
+                self.mem_fraction_static *= 0.90
+
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
             if gpu_mem is not None:
@@ -380,6 +389,12 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
 
+        if self.attention_backend == "ascend":
+            logger.warning(
+                "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
+            )
+            self.page_size = 128
+
         # Choose grammar backend
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
@@ -403,10 +418,6 @@ class ServerArgs:
 
         # DeepEP MoE
         if self.enable_deepep_moe:
-            if self.deepep_mode == "auto":
-                assert (
-                    not self.enable_dp_attention
-                ), "DeepEP MoE `auto` mode is not supported with DP Attention."
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
@@ -584,6 +595,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.port,
             help="The port of the HTTP server.",
+        )
+        parser.add_argument(
+            "--nccl-port",
+            type=int,
+            default=ServerArgs.nccl_port,
+            help="The port for NCCL distributed environment setup. Defaults to a random port.",
         )
         parser.add_argument(
             "--tokenizer-mode",
@@ -1113,6 +1130,7 @@ class ServerArgs:
                 "flashmla",
                 "intel_amx",
                 "torch_native",
+                "ascend",
                 "triton",
             ],
             default=ServerArgs.attention_backend,
@@ -1732,14 +1750,17 @@ class PortArgs:
 
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
-        port = server_args.port + random.randint(100, 1000)
-        while True:
-            if is_port_available(port):
-                break
-            if port < 60000:
-                port += 42
-            else:
-                port -= 43
+        if server_args.nccl_port is None:
+            port = server_args.port + random.randint(100, 1000)
+            while True:
+                if is_port_available(port):
+                    break
+                if port < 60000:
+                    port += 42
+                else:
+                    port -= 43
+        else:
+            port = server_args.nccl_port
 
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
