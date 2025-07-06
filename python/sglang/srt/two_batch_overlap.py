@@ -550,6 +550,8 @@ class TboForwardBatchPreparer:
                 top_p_normalized_logprobs=False,
                 top_p=None,
                 mm_inputs=None,
+                top_logprobs_nums=None,
+                token_ids_logprobs=None,
             )
         )
 
