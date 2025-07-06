@@ -2334,9 +2334,16 @@ class Scheduler(
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         tags = recv_req.tags
-        import subprocess
 
-        if tags is None:
+        # if self.tp_size != 1:
+        #     tags = broadcast_pyobj(
+        #         tags,
+        #         self.tp_group.rank,
+        #         self.tp_cpu_group,
+        #         src=self.tp_group.ranks[0],
+        #     )
+
+        if tags is None or len(tags) == 0:
             tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
@@ -2353,9 +2360,15 @@ class Scheduler(
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
-        import os
-        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
         tags = recv_req.tags
+        # if self.tp_size != 1:
+        #     tags = broadcast_pyobj(
+        #         tags,
+        #         self.tp_group.rank,
+        #         self.tp_cpu_group,
+        #         src=self.tp_group.ranks[0],
+        #     )
+
         if tags is None or len(tags) == 0:
             tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
