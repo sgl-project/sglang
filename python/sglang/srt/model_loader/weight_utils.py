@@ -224,6 +224,9 @@ def get_quant_config(
                     return ModelOptFp4Config.from_config(config)
                 else:
                     return quant_cls.from_config(config)
+        elif model_config.quantization == "modelopt_fp8":
+            if config["producer"]["name"] == "modelopt_fp8":
+                return quant_cls.from_config(config)
             else:
                 raise ValueError(
                     f"Unsupported quantization config"
