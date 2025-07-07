@@ -5,7 +5,6 @@ from abc import ABC, abstractmethod
 from typing import List, Optional
 
 import torch
-from torch import Tensor
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +18,9 @@ def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
     hasher.update(token_bytes)
 
     return hasher.hexdigest()
+
+
+# todo: batch API for better performance
 
 
 class HiCacheStorage(ABC):
@@ -78,12 +80,12 @@ class HiCacheFile(HiCacheStorage):
 
     def get(
         self, key: str, target_location: Optional[torch.Tensor] = None
-    ) -> Tensor | None:
+    ) -> torch.Tensor | None:
         tensor_path = f"{self.file_path}/{key}.bin"
         try:
-            # todo: fixing the target_location logic
-            loaded_tensor = torch.load(tensor_path, map_location=target_location)
-            if isinstance(loaded_tensor, Tensor):
+            # todo: fixing the target_location logic to enable in-place loading
+            loaded_tensor = torch.load(tensor_path)
+            if isinstance(loaded_tensor, torch.Tensor):
                 return loaded_tensor
             else:
                 logger.error(f"Loaded data for key {key} is not a tensor.")
@@ -91,7 +93,7 @@ class HiCacheFile(HiCacheStorage):
         except FileNotFoundError:
             return None
 
-    def set(self, key: str, value: Tensor) -> bool:
+    def set(self, key: str, value: torch.Tensor) -> bool:
         tensor_path = f"{self.file_path}/{key}.bin"
         if self.exists(key):
             logger.warning(
@@ -107,12 +109,10 @@ class HiCacheFile(HiCacheStorage):
     def delete(self, key: str) -> None:
         tensor_path = f"{self.file_path}/{key}.bin"
         try:
-            if self.exists(key):
-                os.remove(tensor_path)
-            else:
-                logger.warning(f"Key {key} does not exist. Cannot delete.")
-        except Exception as e:
-            logger.error(f"Failed to delete tensor {key}: {e}")
+            os.remove(tensor_path)
+        except FileNotFoundError:
+            logger.warning(f"Key {key} does not exist. Cannot delete.")
+            return
 
     def exists(self, key: str) -> bool:
         tensor_path = f"{self.file_path}/{key}.bin"

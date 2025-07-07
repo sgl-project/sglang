@@ -177,16 +177,8 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = []
 
-        self._done_flag = threading.Event()
-
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
-
-    def mark_done(self):
-        self._done_flag.set()
-
-    def is_done(self) -> bool:
-        return self._done_flag.is_set()
 
     def __lt__(self, other: "StorageOperation"):
         return self.id < other.id
@@ -201,7 +193,16 @@ class PrefetchOperation(StorageOperation):
         last_hash: Optional[str] = None,
     ):
         self.request_id = request_id
+
+        self._done_flag = threading.Event()
+
         super().__init__(host_indices, token_ids, last_hash)
+
+    def mark_done(self):
+        self._done_flag.set()
+
+    def is_done(self) -> bool:
+        return self._done_flag.is_set()
 
 
 class HiCacheController:
@@ -215,6 +216,7 @@ class HiCacheController:
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
+        prefetch_threshold: int = 1000,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -233,12 +235,12 @@ class HiCacheController:
             self.io_backend = io_backend
 
         # todo: move backend initialization to storage backend module
-        if storage_backend is "file":
+        if storage_backend == "file":
             self.storage_backend = HiCacheFile()
             # tracking prefetch operation progress
             self.ongoing_prefetch: dict[int, PrefetchOperation] = {}
             # todo: threshold policy for prefetching
-            self.prefetch_threshold = 1000
+            self.prefetch_threshold = prefetch_threshold
         else:
             raise NotImplementedError(
                 f"Unsupported storage backend: {self.storage_backend}"
@@ -509,9 +511,15 @@ class HiCacheController:
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 for h in operation.hash_value:
+                    self.mem_pool_host.set_from_flat_data_page(
+                        self.storage_backend.get(h)
+                    )
                     if operation.is_done():
-                        continue
-                    self.storage_backend.get(h, target_location=operation.host_indices)
+                        # operation terminated by controller, release pre-allocated memory
+                        self.mem_pool_host.free(
+                            operation.host_indices[operation.completed_tokens :]
+                        )
+                        break
                     operation.completed_tokens += self.page_size
             except Empty:
                 continue
@@ -590,12 +598,14 @@ class HiCacheController:
                     )
                     # todo, handle failures in storage backend
                     self.storage_backend.set(
-                        last_hash, operation.host_indices[i : i + self.page_size]
+                        last_hash,
+                        self.mem_pool_host.get_flat_data_page(
+                            operation.operation.host_indices[i]
+                        ),
                     )
                     operation.completed_tokens += self.page_size
                     operation.hash_value.append(last_hash)
 
-                operation.mark_done()
                 self.ack_backup_queue.put((operation.id, operation.hash_value))
 
             except Empty:
