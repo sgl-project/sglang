@@ -2231,11 +2231,24 @@ class Scheduler(
 
     def get_load(self):
         # TODO(lsyin): use dynamically maintained num_waiting_tokens
-        load = (
-            self.max_total_num_tokens
-            - self.token_to_kv_pool_allocator.available_size()
-            - self.tree_cache.evictable_size()
-        )
+        if self.model_config.is_hybrid:
+            load_full = (
+                self.full_tokens_per_layer
+                - self.token_to_kv_pool_allocator.full_available_size()
+                - self.tree_cache.full_evictable_size()
+            )
+            load_swa = (
+                self.swa_tokens_per_layer
+                - self.token_to_kv_pool_allocator.swa_available_size()
+                - self.tree_cache.swa_evictable_size()
+            )
+            load = max(load_full, load_swa)
+        else:
+            load = (
+                self.max_total_num_tokens
+                - self.token_to_kv_pool_allocator.available_size()
+                - self.tree_cache.evictable_size()
+            )
         load += sum(len(req.origin_input_ids) for req in self.waiting_queue)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             load += sum(
