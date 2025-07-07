@@ -159,6 +159,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         """Test that when some batch items have images and others None, parallel expansion works correctly."""
         req = copy.deepcopy(self.base_req)
         req.text = ["Prompt 1", "Prompt 2", "Prompt 3"]
+        req.rid = ["id1", "id2", "id3"]
         req.image_data = [
             ["image1.jpg"],
             None,

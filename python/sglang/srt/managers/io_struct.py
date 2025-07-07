@@ -326,7 +326,9 @@ class GenerateReqInput:
             new_rids = [f"{self.rid}_{i}" for i in range(num)]
             self.rid = new_rids
         elif isinstance(self.rid, list):
-            if len(self.rid) != num:
+            # Note: the length of rid shall be the same as the batch_size,
+            # as the rid would be expanded for parallel sampling in tokenizer_manager
+            if len(self.rid) != self.batch_size:
                 raise ValueError(
                     "The specified rids length mismatch with the batch_size for batch processing."
                 )
