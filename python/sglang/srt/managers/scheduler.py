@@ -259,7 +259,7 @@ class Scheduler(
         )
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
-        self.enable_hicache_storage = server_args.enable_hicache_storage is not None
+        self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.page_size = server_args.page_size
         self.dp_size = server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
