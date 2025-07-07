@@ -175,12 +175,33 @@ class StorageOperation:
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
+        self.hash_value = []
+
+        self._done_flag = threading.Event()
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
 
+    def mark_done(self):
+        self._done_flag.set()
+
+    def is_done(self) -> bool:
+        return self._done_flag.is_set()
+
     def __lt__(self, other: "StorageOperation"):
         return self.id < other.id
+
+
+class PrefetchOperation(StorageOperation):
+    def __init__(
+        self,
+        request_id: str,
+        host_indices: torch.Tensor,
+        token_ids: List[int],
+        last_hash: Optional[str] = None,
+    ):
+        self.request_id = request_id
+        super().__init__(host_indices, token_ids, last_hash)
 
 
 class HiCacheController:
@@ -215,8 +236,9 @@ class HiCacheController:
         if storage_backend is "file":
             self.storage_backend = HiCacheFile()
             # tracking prefetch operation progress
-            # todo: thread safe data structure
-            self.ongoing_prefetch = {}
+            self.ongoing_prefetch: dict[int, PrefetchOperation] = {}
+            # todo: threshold policy for prefetching
+            self.prefetch_threshold = 1000
         else:
             raise NotImplementedError(
                 f"Unsupported storage backend: {self.storage_backend}"
@@ -239,9 +261,6 @@ class HiCacheController:
         self.ack_write_queue = Queue()
         self.ack_load_queue = Queue()
 
-        self.prefetch_queue = Queue()
-        self.backup_queue = Queue()
-
         self.stop_event = threading.Event()
         self.write_buffer = TransferBuffer(self.stop_event)
         self.load_buffer = TransferBuffer(
@@ -257,17 +276,25 @@ class HiCacheController:
         self.load_thread = threading.Thread(
             target=self.load_thread_func_layer_by_layer, daemon=True
         )
-        self.prefetch_thread = threading.Thread(
-            target=self.prefetch_thread_func, daemon=True
-        )
-        self.backup_thread = threading.Thread(
-            target=self.backup_thread_func, daemon=True
-        )
 
         self.write_thread.start()
         self.load_thread.start()
-        self.prefetch_thread.start()
-        self.backup_thread.start()
+
+        if self.storage_backend is not None:
+            self.prefetch_thread = threading.Thread(
+                target=self.prefetch_thread_func, daemon=True
+            )
+            self.backup_thread = threading.Thread(
+                target=self.backup_thread_func, daemon=True
+            )
+            self.prefetch_queue = Queue()
+            self.backup_queue = Queue()
+
+            self.prefetch_revoke_queue = Queue()
+            self.ack_backup_queue = Queue()
+
+            self.prefetch_thread.start()
+            self.backup_thread.start()
 
     def reset(self):
         self.stop_event.set()
@@ -280,6 +307,13 @@ class HiCacheController:
         self.load_buffer.clear()
         self.ack_write_queue.queue.clear()
         self.ack_load_queue.queue.clear()
+        if self.storage_backend is not None:
+            self.prefetch_thread.join()
+            self.backup_thread.join()
+            self.prefetch_queue.queue.clear()
+            self.backup_queue.queue.clear()
+            self.prefetch_revoke_queue.queue.clear()
+            self.ack_backup_queue.queue.clear()
 
         self.write_thread = threading.Thread(
             target=self.write_thread_func_direct, daemon=True
@@ -290,6 +324,16 @@ class HiCacheController:
         self.stop_event.clear()
         self.write_thread.start()
         self.load_thread.start()
+
+        if self.storage_backend is not None:
+            self.prefetch_thread = threading.Thread(
+                target=self.prefetch_thread_func, daemon=True
+            )
+            self.backup_thread = threading.Thread(
+                target=self.backup_thread_func, daemon=True
+            )
+            self.prefetch_thread.start()
+            self.backup_thread.start()
 
     def write(
         self,
@@ -434,6 +478,7 @@ class HiCacheController:
 
     def prefetch(
         self,
+        request_id: str,
         host_indices: torch.Tensor,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
@@ -441,52 +486,117 @@ class HiCacheController:
         """
         Prefetch KV caches from storage backend to host memory.
         """
-        operation = StorageOperation(host_indices, new_input_tokens, last_hash)
-        self.prefetch_queue.put(operation)
-        self.ongoing_prefetch[operation.id] = operation
-        return operation.id
-
-    def terminate_prefetch(self, operation_id: int):
-        # todo: fix concurrency issues
-        operation = self.ongoing_prefetch.pop(operation_id)
-        assert operation is not None, f"Operation {operation_id} not found"
-        self.mem_pool_host.free(operation.host_indices[operation.completed_tokens :])
-        return (
-            operation.token_ids[: operation.completed_tokens],
-            operation.host_indices[: operation.completed_tokens],
+        operation = PrefetchOperation(
+            request_id, host_indices, new_input_tokens, last_hash
         )
+        self.ongoing_prefetch[request_id] = operation
+        self.prefetch_queue.put(operation)
+
+    def terminate_prefetch(self, request_id: str):
+        operation = self.ongoing_prefetch.pop(request_id, None)
+        if operation is None:
+            raise ValueError(
+                f"Request ID {request_id} not found in ongoing prefetches."
+            )
+        operation.mark_done()
+        return operation.completed_tokens, operation.hash_value
+
+    def prefetch_io_aux_func(self):
+        """
+        Auxiliary function conducting IO operations for prefetching.
+        """
+        while not self.stop_event.is_set():
+            try:
+                operation = self.prefetch_buffer.get(block=True, timeout=1)
+                for h in operation.hash_value:
+                    if operation.is_done():
+                        continue
+                    self.storage_backend.get(h, target_location=operation.host_indices)
+                    operation.completed_tokens += self.page_size
+            except Empty:
+                continue
 
     def prefetch_thread_func(self):
+        """
+        Manage prefetching operations from storage backend to host memory.
+        """
+        self.prefetch_buffer = Queue()
+        aux_thread = threading.Thread(target=self.prefetch_io_aux_func, daemon=True)
+        aux_thread.start()
         while (not self.stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
 
+                last_hash = operation.last_hash
                 tokens_to_fetch = operation.token_ids
-                host_indices = operation.host_indices
-                hash_value = get_hash_str(
-                    tokens_to_fetch[: self.page_size], operation.last_hash
-                )
-                if not self.storage_backend.exists(hash_value):
-                    # todo: release the host memory asap after figuring out exact amount of tokens to prefetch
+
+                storage_hit_count = 0
+                remaining_tokens = len(tokens_to_fetch)
+                hash_value = []
+                while remaining_tokens >= self.page_size:
+                    last_hash = get_hash_str(
+                        tokens_to_fetch[
+                            storage_hit_count : storage_hit_count + self.page_size
+                        ],
+                        last_hash,
+                    )
+                    if not self.storage_backend.exists(last_hash):
+                        if storage_hit_count < self.prefetch_threshold:
+                            # not to prefetch if not enough benefits
+                            self.prefetch_revoke_queue.put(operation.request_id)
+                            break
+                    else:
+                        storage_hit_count += self.page_size
+                    hash_value.append(last_hash)
+                    remaining_tokens -= self.page_size
+                else:
+                    operation.hash_value = hash_value
+                    self.prefetch_buffer.put(operation)
+
+            except Empty:
+                continue
+
+    def write_storage(
+        self,
+        host_indices: torch.Tensor,
+        token_ids: List[int],
+        last_hash: Optional[str] = None,
+    ) -> int:
+        """
+        Write KV caches from host memory to storage backend.
+        """
+        operation = StorageOperation(host_indices, token_ids, last_hash)
+        self.backup_queue.put(operation)
+        return operation.id
+
+    def backup_thread_func(self):
+        """
+        Manage backup operations from host memory to storage backend.
+        """
+        while not self.stop_event.is_set():
+            try:
+                operation = self.backup_queue.get(block=True, timeout=1)
+                if operation is None:
                     continue
 
-                while len(tokens_to_fetch) >= self.page_size:
-                    if operation.id not in self.ongoing_prefetch:
-                        # operation was terminated
-                        break
-                    target_indices = host_indices[: self.page_size]
-                    loaded_tensor = self.storage_backend.get(
-                        hash_value, self.mem_pool_host[target_indices]
+                last_hash = operation.last_hash
+                tokens_to_backup = operation.token_ids
+
+                for i in range(0, len(tokens_to_backup), self.page_size):
+                    last_hash = get_hash_str(
+                        tokens_to_backup[i : i + self.page_size], last_hash
                     )
-                    if loaded_tensor is None:
-                        break
+                    # todo, handle failures in storage backend
+                    self.storage_backend.set(
+                        last_hash, operation.host_indices[i : i + self.page_size]
+                    )
                     operation.completed_tokens += self.page_size
-                    tokens_to_fetch = tokens_to_fetch[self.page_size :]
-                    host_indices = host_indices[self.page_size :]
-                    hash_value = get_hash_str(
-                        tokens_to_fetch[: self.page_size], hash_value
-                    )
+                    operation.hash_value.append(last_hash)
+
+                operation.mark_done()
+                self.ack_backup_queue.put((operation.id, operation.hash_value))
+
             except Empty:
                 continue

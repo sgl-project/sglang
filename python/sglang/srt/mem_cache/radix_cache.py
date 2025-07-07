@@ -74,6 +74,21 @@ class TreeNode:
     def backuped(self):
         return self.host_value is not None
 
+    @property
+    def backuped_storage(self):
+        return self.hash_values is not None and len(self.hash_values) > 0
+
+    def protect_host(self):
+        """Protect the host value from eviction."""
+        self.host_ref_counter += 1
+
+    def release_host(self):
+        """Release the host value, allowing it to be evicted."""
+        if self.host_ref_counter > 0:
+            self.host_ref_counter -= 1
+        else:
+            raise RuntimeError("Host reference counter is already zero.")
+
     def last_hash_value(self) -> Optional[int]:
         """Returns the hash value of the last page in this node."""
         if self.hash_values is None or len(self.hash_values) == 0:

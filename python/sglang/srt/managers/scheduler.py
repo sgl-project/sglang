@@ -1225,7 +1225,7 @@ class Scheduler(
                 if (matched_len > 0 and last_hash is not None) or matched_len == 0:
                     new_input_tokens = req.fill_ids[matched_len:]
                     self.tree_cache.prefetch_from_storage(
-                        req.last_host_node, new_input_tokens, last_hash
+                        req.rid, req.last_host_node, new_input_tokens, last_hash
                     )
             self.waiting_queue.append(req)
 
@@ -1557,9 +1557,6 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
 
-            if self.enable_hicache_storage:
-                self.tree_cache.check_prefetch_progress()
-
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)
 
@@ -1606,6 +1603,9 @@ class Scheduler(
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     self.running_batch.batch_is_full = True
                     break
+
+            if self.enable_hicache_storage:
+                self.tree_cache.check_prefetch_progress(req.rid)
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
