@@ -1,7 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
 
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +27,7 @@ except ImportError:
 
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -64,7 +65,6 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.utils import (
-    _process_weight_after_loading,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
@@ -74,6 +74,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     print_warning_once,
     set_weight_attrs,
+    use_intel_amx_backend,
 )
 
 _is_hip = is_hip()
@@ -87,7 +88,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT")
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_hip:
+if _is_hip and (_use_aiter or _use_hip_int4):
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.fused_moe_bf16_asm import asm_moe, ck_moe_2stages
@@ -199,7 +200,7 @@ class Fp8LinearMethod(LinearMethodBase):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: Fp8Config):
+    def __init__(self, quant_config: Union["Fp8Config", "W4AFp8Config"]):
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
 
@@ -285,7 +286,10 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.quant_config.is_checkpoint_fp8_serialized:
             # WEIGHT SCALE
             if self.block_quant:
-                assert self.quant_config.activation_scheme == "dynamic"
+                if hasattr(self.quant_config, "activation_scheme"):
+                    assert self.quant_config.activation_scheme == "dynamic"
+                elif hasattr(self.quant_config, "linear_activation_scheme"):
+                    assert self.quant_config.linear_activation_scheme == "dynamic"
                 scale = BlockQuantScaleParameter(
                     data=torch.empty(
                         (output_size_per_partition + block_n - 1) // block_n,
@@ -307,7 +311,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("weight_scale", scale)
 
             # INPUT ACTIVATION SCALE
-            if self.quant_config.activation_scheme == "static":
+            if (
+                hasattr(self.quant_config, "activation_scheme")
+                and self.quant_config.activation_scheme == "static"
+            ) or (
+                hasattr(self.quant_config, "linear_activation_scheme")
+                and self.quant_config.linear_activation_scheme == "static"
+            ):
                 scale = PerTensorScaleParameter(
                     data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
                     weight_loader=weight_loader,
@@ -335,7 +345,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 assert (
                     _is_cpu_amx_available
                 ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
-                _process_weight_after_loading(layer, ["weight"])
+                _amx_process_weight_after_loading(layer, ["weight"])
                 return
             else:
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
@@ -370,7 +380,13 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale = torch.nn.Parameter(
                 layer.weight_scale.data, requires_grad=False
             )
-            if self.quant_config.activation_scheme == "static":
+            if (
+                hasattr(self.quant_config, "activation_scheme")
+                and self.quant_config.activation_scheme == "static"
+            ) or (
+                hasattr(self.quant_config, "linear_activation_scheme")
+                and self.quant_config.linear_activation_scheme == "static"
+            ):
                 layer.input_scale = torch.nn.Parameter(
                     layer.input_scale.data, requires_grad=False
                 )
@@ -404,7 +420,13 @@ class Fp8LinearMethod(LinearMethodBase):
             # Update layer with new values.
             layer.weight = Parameter(weight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-            if self.quant_config.activation_scheme == "static":
+            if (
+                hasattr(self.quant_config, "activation_scheme")
+                and self.quant_config.activation_scheme == "static"
+            ) or (
+                hasattr(self.quant_config, "linear_activation_scheme")
+                and self.quant_config.linear_activation_scheme == "static"
+            ):
                 layer.input_scale = Parameter(
                     layer.input_scale.max(), requires_grad=False
                 )
@@ -433,7 +455,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.block_quant:
-            if getattr(layer, "use_intel_amx_backend", False):
+            if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
                     x,
                     layer.weight,
@@ -769,7 +791,7 @@ class Fp8MoEMethod:
                 assert (
                     _is_cpu_amx_available
                 ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
-                _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+                _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 
             return
 
@@ -996,7 +1018,7 @@ class Fp8MoEMethod:
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        if getattr(layer, "use_intel_amx_backend", False):
+        if use_intel_amx_backend(layer):
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,

@@ -29,6 +29,7 @@ import torch.distributed as dist
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import (
     get_tp_group,
@@ -165,7 +166,6 @@ class ModelRunner:
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
         # Parse args
-        self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
         self.gpu_id = gpu_id
@@ -178,6 +178,7 @@ class ModelRunner:
         self.dp_size = server_args.dp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
@@ -450,11 +451,6 @@ class ModelRunner:
             self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
         if self.is_multimodal:
-            self.mem_fraction_static *= 0.90
-            logger.info(
-                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} "
-                f"because this is a multimodal model."
-            )
             if not self.is_multimodal_chunked_prefill_supported:
                 server_args.chunked_prefill_size = -1
                 logger.info(
@@ -604,6 +600,10 @@ class ModelRunner:
             download_dir=self.server_args.download_dir,
             model_loader_extra_config=self.server_args.model_loader_extra_config,
         )
+        if self.device == "cpu":
+            self.model_config = adjust_config_with_unaligned_cpu_tp(
+                self.model_config, self.load_config, self.tp_size
+            )
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
 

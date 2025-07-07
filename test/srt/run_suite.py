@@ -125,6 +125,7 @@ suites = {
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_function_call_parser.py", 10),
+        TestFile("test_fused_moe.py", 30),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_metrics.py", 32),
         TestFile("test_no_chunked_prefill.py", 108),
@@ -142,6 +143,7 @@ suites = {
         TestFile("test_vertex_endpoint.py", 31),
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         TestFile("test_reasoning_parser.py", 5),
+        TestFile("test_rope_rocm.py", 3),
     ],
     "per-commit-npu": [
         TestFile("test_ascend_attention_backend.py", 400),
@@ -198,6 +200,7 @@ suites = {
         TestFile("cpu/test_rope.py"),
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
+        TestFile("test_intel_amx_attention_backend.py"),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
