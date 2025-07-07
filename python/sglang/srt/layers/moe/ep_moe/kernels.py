@@ -177,7 +177,8 @@ def pre_reorder_triton_kernel(
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
 
-    src_idx = tl.program_id(0)
+    src_idx_int32 = tl.program_id(0)
+    src_idx = src_idx_int32.to(tl.int64)
     src2dst_ptr = src2dst_ptr + src_idx * topk
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
     src_ptr = input_ptr + src_idx * hidden_size
