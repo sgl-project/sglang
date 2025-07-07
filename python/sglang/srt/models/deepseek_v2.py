@@ -2363,7 +2363,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
-        if self.quant_config.get_name() == "w4afp8":
+        if self.quant_config and self.quant_config.get_name() == "w4afp8":
             expert_params_mapping += (
                 get_moe_impl_class().make_expert_input_scale_params_mapping(
                     num_experts=self.config.n_routed_experts
