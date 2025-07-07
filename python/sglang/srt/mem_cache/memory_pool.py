@@ -652,7 +652,7 @@ def set_mla_kv_buffer_npu(
     cache_k_rope: torch.Tensor,
 ):
     key_states = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
-    torch_npu.scatter_update_(kv_buffer, loc_tensor, key_states, axis=-2)
+    torch_npu.npu_scatter_nd_update_(kv_buffer, loc_tensor.view(-1, 1), key_states)
 
 
 class MLATokenToKVPool(KVCache):
@@ -777,12 +777,11 @@ class MLATokenToKVPool(KVCache):
                 self.store_dtype
             )
         else:
-            if _is_npu and len(loc.size()) > 0 and loc.ndim == 1:
-                torch_npu.scatter_update_(
-                    self.kv_buffer[layer_id - self.start_layer].unsqueeze(0),
-                    loc[0],
-                    cache_k.unsqueeze(0),
-                    axis=1,
+            if _is_npu and loc.ndim == 1:
+                torch_npu.npu_scatter_nd_update_(
+                    self.kv_buffer[layer_id - self.start_layer],
+                    loc.view(-1, 1),
+                    cache_k,
                 )
             else:
                 self.kv_buffer[layer_id - self.start_layer][loc] = cache_k

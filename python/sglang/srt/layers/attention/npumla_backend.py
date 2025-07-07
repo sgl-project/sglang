@@ -10,9 +10,9 @@ Enable speculative sampling in NpuMLA
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch_npu
-import numpy as np
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -35,7 +35,6 @@ if TYPE_CHECKING:
 
 
 PAGE_SIZE = 128
-BLOCK_SIZE = 128
 MAX_SEQ_LEN = 4096
 
 
@@ -56,7 +55,8 @@ class NpuMLADecodeMetadata:
         self.num_splits = num_splits
         self.block_kv_indices = block_kv_indices
         self.seq_lens_list = seq_lens_list if seq_lens_list is not None else [1]
-        self.seq_lens_list_cussum = np.cumsum(self.seq_lens_list).tolist() 
+        self.seq_lens_list_cumsum = np.cumsum(self.seq_lens_list).tolist()
+
 
 class NpuMLAIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
@@ -226,16 +226,15 @@ class NpuMLABackend(TorchNativeAttnBackend):
                 None,
                 None,
                 block_kv_indices,
-                forward_batch.seq_lens.cpu().tolist(),
+                forward_batch.seq_lens_cpu.tolist(),
             )
         else:
             self.forward_metadata = NpuMLADecodeMetadata(
                 None,
                 None,
                 None,
-                forward_batch.seq_lens.cpu().tolist(),
+                forward_batch.seq_lens_cpu.tolist(),
             )
-            self.forward_metadata.seq_lens_list = forward_batch.seq_lens.cpu().tolist()
 
     def init_cuda_graph_state(
         self,
@@ -455,20 +454,22 @@ class NpuMLABackend(TorchNativeAttnBackend):
                         input_layout="TND",
                         atten_mask=self.attn_mask,
                         sparse_mode=3,
-                        actual_seq_lengths=self.forward_metadata.seq_lens_list_cussum,
-                        actual_seq_lengths_kv=self.forward_metadata.seq_lens_list,
+                        actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
+                        actual_seq_lengths_kv=self.forward_metadata.seq_lens_list_cumsum,
                         scale=layer.scaling,
                         next_tokens=0,
                     )
                 else:
                     attn_ouput, _ = torch.ops.npu.npu_fused_infer_attention_score(
-                        q.unsqueeze(0),
-                        k.unsqueeze(0),
-                        v.unsqueeze(0),
+                        q,
+                        k,
+                        v,
                         num_heads=q_heads,
-                        input_layout="BSND",
+                        input_layout="TND",
                         atten_mask=self.attn_mask,
                         sparse_mode=3,
+                        actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
+                        actual_seq_lengths_kv=self.forward_metadata.seq_lens_list_cumsum,
                         scale=layer.scaling,
                         next_tokens=0,
                     )
@@ -489,7 +490,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
         _, k_heads, k_dim = k_cache.size()
 
         if q_rope is not None:  # MLA
-            k_cache = k_cache.view(-1, BLOCK_SIZE, k_dim)
+            k_cache = k_cache.view(-1, PAGE_SIZE, k_dim)
             # k_nope, k_rope = k_cache.split(
             #     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             # )  # todo, there is a bug
@@ -513,7 +514,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
                 block_table=self.forward_metadata.block_kv_indices[
                     : forward_batch.batch_size
                 ],
-                block_size=BLOCK_SIZE,
+                block_size=PAGE_SIZE,
                 actual_seq_lengths_kv=self.forward_metadata.seq_lens_list,
             )
         else:  # MHA
