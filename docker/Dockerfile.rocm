@@ -7,9 +7,15 @@
 
 # default base image
 #ARG BASE_IMAGE="rocm/sgl-dev:rocm7.0_preview_ubuntu_22.04"
-ARG BASE_IMAGE="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_sglang_0.4.6.post4_mi35X_prealpha"
+#ARG BASE_IMAGE="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_sglang_0.4.6.post4_mi35X_prealpha"
+ARG ARG_ARCH_CHOSEN
+ARG BASE_IMAGE_950="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.8.5_mi35X_prealpha"
+ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
 
-FROM $BASE_IMAGE AS base
+FROM $BASE_IMAGE_950 AS base_950
+FROM $BASE_IMAGE_942 AS base_942
+FROM $ARG_ARCH_CHOSEN AS TARGET_ARCH
+
 USER root
 
 ARG ARG_PYTORCH_ROCM_ARCH
@@ -17,13 +23,13 @@ ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 
 ARG BUILD_VLLM="1"
 ARG BUILD_TRITON="1"
-ARG BUILD_AITER_ALL="1"
+ARG BUILD_AITER_ALL="0"
 
 # Install some basic utilities
 RUN rm -rf /etc/apt/sources.list.d/*
-RUN apt-get update -q -y && apt-get install -q -y \
-    sqlite3 libsqlite3-dev libfmt-dev libmsgpack-dev libsuitesparse-dev \
-    apt-transport-https ca-certificates wget curl
+#RUN apt-get update -q -y && apt-get install -q -y \
+#    sqlite3 libsqlite3-dev libfmt-dev libmsgpack-dev libsuitesparse-dev \
+#    apt-transport-https ca-certificates wget curl
 RUN python3 -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python3 -m pip uninstall -y sccache; rm -f "$(which sccache)"
 
@@ -51,8 +57,10 @@ ARG BUILD_TYPE=all
 #ARG SGL_REPO="https://github.com/sgl-project/sglang"
 #ENV SGL_DEFAULT="main"
 # NEED TO FIX
-ARG SGL_REPO="https://github.com/sogalin/sglang"
-ENV SGL_DEFAULT="v0.4.7.post1-gfx950"
+ARG SGL_REPO="https://github.com/mqhc2020/sglang.git"
+#ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
+
+ENV SGL_DEFAULT="upstream-dockerfile"
 ARG SGL_BRANCH=${SGL_DEFAULT}
 
 ARG TRITON_REPO="https://github.com/ROCm/triton.git"
@@ -64,11 +72,7 @@ ARG AITER_COMMIT="v0.1.3"
 ARG CK_COMMIT="bb571a033019fd5a8ba6de31119395c3621a4235"
 ARG CK_REVERT="a4e1248dbaeb868bf5d95f90f844e3a9a58e85d5"
 
-ARG AMDGPU_TARGET=$PYTORCH_ROCM_ARCH
-
 WORKDIR /sgl-workspace/
-COPY patches/0001-fp8.patch .
-COPY patches/0002-amd-Opt-dsv3-moe-7160.patch .
 RUN git clone ${SGL_REPO} \
     && cd sglang \
     && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
@@ -78,8 +82,6 @@ RUN git clone ${SGL_REPO} \
          echo "Using ${SGL_BRANCH} branch."; \
          git checkout ${SGL_BRANCH}; \
        fi \
-    && git am -3 ../0001-fp8.patch \
-    && git am -3 ../0002-amd-Opt-dsv3-moe-7160.patch \
     && cd sgl-kernel \
     && rm -f pyproject.toml \
     && mv pyproject_rocm.toml pyproject.toml \
@@ -100,13 +102,11 @@ RUN pip install IPython \
     && pip install pybind11
 
 WORKDIR /sgl-workspace/
-COPY patches/0001-Add-functions-for-SGLang.patch .
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
         pip3 uninstall -y triton \
      && git clone ${TRITON_REPO} \
      && cd triton \
      && git checkout ${TRITON_COMMIT} \
-     && git am -3 ../0001-Add-functions-for-SGLang.patch \
      && python3 setup.py install; \
     fi
 
@@ -114,18 +114,16 @@ WORKDIR /sgl-workspace/
 RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO}
 WORKDIR /sgl-workspace/aiter
-COPY patches/0001-To-support-both-gfx942-and-gfx950.patch .
 RUN git checkout ${AITER_COMMIT} \
  && git submodule update --init --recursive \
- && git am -3 0001-To-support-both-gfx942-and-gfx950.patch \
  && cd 3rdparty/composable_kernel \
  && git checkout ${CK_COMMIT} \
  && git revert --no-edit ${CK_REVERT} \
  && cd ../../ \
- && GPU_ARCHS=$AMDGPU_TARGET python3 setup.py develop
+ && GPU_ARCHS=$PYTORCH_ROCM_ARCH python3 setup.py develop
 
 RUN if [ "$BUILD_AITER_ALL" = "1" ]; then \
-    PREBUILD_KERNELS=1 GPU_ARCHS=$AMDGPU_TARGET python3 setup.py develop; \
+    PREBUILD_KERNELS=1 GPU_ARCHS=$PYTORCH_ROCM_ARCH python3 setup.py develop; \
 fi
 
 WORKDIR /sgl-workspace/
