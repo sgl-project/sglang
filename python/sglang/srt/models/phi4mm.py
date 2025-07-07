@@ -24,7 +24,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, SiglipVisionConfig
 
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
@@ -60,8 +60,7 @@ def get_navit_vision_model():
         "intermediate_size": 4304,
         "model_type": "siglip_vision_model",
         "num_attention_heads": 16,
-        "num_hidden_layers": 26,
-        # Model is originally 27-layer, we only need the first 26 layers for feature extraction.
+        "num_hidden_layers": 26,  # Model is originally 27-layer, we only need the first 26 layers for feature extraction.
         "patch_size": 14,
     }
     model_config = SiglipVisionConfig(**vision_config)

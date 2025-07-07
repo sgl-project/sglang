@@ -64,13 +64,27 @@ class MultimodalSpecialTokens:
     video_token_regex: Optional[re.Pattern] = None
     audio_token_regex: Optional[re.Pattern] = None
 
-    def token_to_modality_map(self):
-        # returns a map, mapping token strings to Modality enum
-        return {
+    def get_modality_of_token(self, token) -> Optional[Modality]:
+        """
+        :return: the modality associated with the given token, if the token is a special_token or matches with the multimodal token regex
+        """
+        modality = {
             self.image_token: Modality.IMAGE,
             self.video_token: Modality.VIDEO,
             self.audio_token: Modality.AUDIO,
-        }
+        }.get(token)
+        if modality:
+            return modality
+
+        for regex, modality in [
+            (self.image_token_regex, Modality.IMAGE),
+            (self.video_token_regex, Modality.VIDEO),
+            (self.audio_token_regex, Modality.AUDIO)
+        ]:
+            if regex and regex.match(token):
+                return modality
+
+        return None
 
     def parse_regex(self):
         if self.image_token_regex is None and self.image_token is not None:
@@ -206,7 +220,7 @@ class BaseMultimodalProcessor(ABC):
         estimated_frames_list = []
         for image in image_data:
             if isinstance(image, str) and image.startswith("video:"):
-                path = image[len("video:") :]
+                path = image[len("video:"):]
                 # Estimate frames for the video
                 vr = VideoReader(path, ctx=cpu(0))
                 num_frames = len(vr)
@@ -221,7 +235,14 @@ class BaseMultimodalProcessor(ABC):
     def _load_single_item(
         data, modality: Modality, frame_count_limit=None, discard_alpha_channel=True
     ):
-        """Static method that can be pickled for multiprocessing"""
+        """
+        Load a single multimodal data.
+
+        If data is precomputed, returns directly.
+
+        Static method that can be pickled for multiprocessing"""
+        if isinstance(data, dict):
+            return data
         try:
             if modality == Modality.IMAGE:
                 img, _ = load_image(data)
@@ -243,16 +264,15 @@ class BaseMultimodalProcessor(ABC):
         image_estimated_frames_iter: Optional[iter] = None,
         image_scaling_factor: float = 1.0,
         max_image_frames: int = 30,
-    ):
+    ) -> Tuple[List, List]:
         """
         load multimodal data parallelly using iterators.
         """
         futures = []
         task_info = []
-        token_to_modality = multimodal_tokens.token_to_modality_map()
 
         for text_part in text_parts:
-            modality = token_to_modality.get(text_part)
+            modality = multimodal_tokens.get_modality_of_token(text_part)
             if modality is not None:
                 data_iterator = data_iterators.get(modality)
                 if data_iterator is None:
@@ -327,7 +347,6 @@ class BaseMultimodalProcessor(ABC):
         multimodal_tokens.convert_to_strs(self._processor)
         multimodal_tokens.parse_regex()
         multimodal_tokens_pattern = multimodal_tokens.combine_regex()
-
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
             prompt = self._processor.tokenizer.decode(prompt)
@@ -346,41 +365,63 @@ class BaseMultimodalProcessor(ABC):
             data_iterators[Modality.VIDEO] = iter(video_data)
         if multimodal_tokens.audio_token and audio_data:
             data_iterators[Modality.AUDIO] = iter(audio_data)
+
+        # futures: the futures of loaded data
+        # task_info: modality, raw_data, and other metadata of each data
         futures, task_info = self.submit_data_loading_tasks(
             text_parts=text_parts,
             multimodal_tokens=multimodal_tokens,
             data_iterators=data_iterators,
             discard_alpha_channel=discard_alpha_channel,
         )
+        task_info_iter = iter(task_info)
+        futures_iter = iter(futures)
 
         # Process results
         images, videos, audios = [], [], []
         new_text_parts = []
-        task_ptr = 0
         multimodal_token_list = multimodal_tokens.get_token_strings()
         for text_part in text_parts:
             try:
-                if text_part in multimodal_token_list:
-                    modality, data, frame_limit = task_info[task_ptr]
-                    result = futures[task_ptr].result()
-                    task_ptr += 1
+                if multimodal_tokens_pattern.match(text_part):
+                    modality, raw_data, frame_limit = next(task_info_iter)
+                    is_precomputed = isinstance(raw_data, dict)
+                    result = next(futures_iter).result()
 
                     if modality == Modality.IMAGE:
+                        # If data is already processed it will be a
+                        # dictionary(precomputed). In this case we want to keep the
+                        # expanded tokens in text_part. Otherwise, we will
+                        # call the processor code, so keep only a single image
+                        # token.
+                        mm_tokens = (
+                            text_part
+                            if is_precomputed
+                            else multimodal_tokens.image_token
+                        )
                         frames = [result] if not isinstance(result, list) else result
                         if frames:
                             # only for minicpmv
                             images += frames
-                            new_text_parts += [
-                                multimodal_tokens.image_token * len(frames)
-                            ]
+                            new_text_parts += mm_tokens * len(frames)
                     elif modality == Modality.VIDEO:
                         # load as video
+                        mm_tokens = (
+                            text_part
+                            if is_precomputed
+                            else multimodal_tokens.video_token
+                        )
                         videos += [result]
-                        new_text_parts += [text_part]
+                        new_text_parts += mm_tokens
                     elif modality == Modality.AUDIO:
                         # audio
+                        mm_tokens = (
+                            text_part
+                            if is_precomputed
+                            else multimodal_tokens.audio_token
+                        )
                         audios += [result]
-                        new_text_parts += [text_part]
+                        new_text_parts += mm_tokens
                 else:
                     # normal text
                     new_text_parts += [text_part]
