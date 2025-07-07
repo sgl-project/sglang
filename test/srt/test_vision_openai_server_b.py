@@ -140,7 +140,7 @@ class TestGemma3itServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.75",
+                "0.70",
                 "--enable-multimodal",
             ],
         )

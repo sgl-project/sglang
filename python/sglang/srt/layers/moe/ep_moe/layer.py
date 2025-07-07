@@ -42,7 +42,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import (
     DeepEPMode,
     ceil_div,
@@ -1178,12 +1178,14 @@ class DeepEPMoE(EPMoE):
         masked_m: torch.Tensor,
         expected_m: int,
         num_recv_tokens_per_expert: List[int],
-        forward_mode: ForwardMode,
+        forward_batch: ForwardBatch,
     ):
         if _use_aiter:
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
             return self.forward_aiter(hidden_states, topk_idx, topk_weights)
-        resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
+        resolved_deepep_mode = self.deepep_mode.resolve(
+            forward_batch.is_extend_in_batch
+        )
         if resolved_deepep_mode == DeepEPMode.normal:
             if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
                 return self.forward_deepgemm_contiguous(
