@@ -49,6 +49,10 @@ class MultimodalSpecialTokens:
     video_token: Optional[Union[int, str, List[str]]] = None
     audio_token: Optional[Union[int, str, List[str]]] = None
 
+    image_token_regex: Optional[re.Pattern] = None
+    video_token_regex: Optional[re.Pattern] = None
+    audio_token_regex: Optional[re.Pattern] = None
+
     def convert_to_str(self, token: Union[str, int], processor) -> str:
         if token is None:
             return token
@@ -60,10 +64,6 @@ class MultimodalSpecialTokens:
         self.image_token = self.convert_to_str(self.image_token, processor)
         self.video_token = self.convert_to_str(self.video_token, processor)
         self.audio_token = self.convert_to_str(self.audio_token, processor)
-
-    image_token_regex: Optional[re.Pattern] = None
-    video_token_regex: Optional[re.Pattern] = None
-    audio_token_regex: Optional[re.Pattern] = None
 
     @lru_cache(maxsize=16)
     def get_modality_of_token(self, token) -> Optional[Modality]:
@@ -216,7 +216,7 @@ class BaseMultimodalProcessor(ABC):
         estimated_frames_list = []
         for image in image_data:
             if isinstance(image, str) and image.startswith("video:"):
-                path = image[len("video:"):]
+                path = image[len("video:") :]
                 # Estimate frames for the video
                 vr = VideoReader(path, ctx=cpu(0))
                 num_frames = len(vr)
