@@ -42,7 +42,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import dump_to_file
+from sglang.srt.utils import dump_to_file, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
@@ -436,13 +436,13 @@ class LogitsProcessor(nn.Module):
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits_metadata.compute_dp_attention_metadata(hidden_states)
             hidden_states, local_hidden_states = (
-                logits_metadata.gathered_buffer,
-                hidden_states.clone(),
+                torch.empty_like(logits_metadata.gathered_buffer),
+                hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
         if hasattr(lm_head, "weight"):
-            if getattr(lm_head, "use_intel_amx_backend", False):
+            if use_intel_amx_backend(lm_head):
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),
                     lm_head.weight,

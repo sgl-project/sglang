@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import datetime
 import faulthandler
 import logging
 import os
@@ -149,6 +150,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_zmq_socket,
+    is_cpu,
     kill_itself_when_parent_died,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
@@ -166,6 +168,8 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
+
+_is_cpu = is_cpu()
 
 
 @dataclass
@@ -707,9 +711,6 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
-            # Metric for pre-allocation
-            self.num_tokens_pre_allocated = 0
-
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
@@ -928,7 +929,7 @@ class Scheduler(
                         point_to_point_pyobj(
                             recv_reqs,
                             self.pp_rank * self.tp_size + dp_offset,
-                            self.world_group.cpu_group,
+                            self.world_group.device_group,
                             self.pp_rank * self.tp_size + dp_offset,
                             (self.pp_rank + 1) * self.tp_size + dp_offset,
                         )
@@ -975,7 +976,7 @@ class Scheduler(
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
-                    self.world_group.cpu_group,
+                    self.world_group.device_group,
                     (self.pp_rank - 1) * self.tp_size + dp_offset,
                     self.pp_rank * self.tp_size + dp_offset,
                 )
@@ -1100,7 +1101,7 @@ class Scheduler(
                 recv_req.session_params is not None
                 and recv_req.session_params.id is not None
             ):
-                req.finished_reason = FINISH_ABORT(
+                req.set_finish_with_abort(
                     f"Invalid request: session id {recv_req.session_params.id} does not exist"
                 )
                 self._add_request_to_queue(req)
@@ -1313,10 +1314,12 @@ class Scheduler(
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
             f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)}, "
-            f += f"input throughput (token/s): {self.last_input_throughput:.2f} "
+            f += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
         else:
             f += f"#running-req: {running_bs}, "
-            f += f"#queue-req: {len(self.waiting_queue)}"
+            f += f"#queue-req: {len(self.waiting_queue)}, "
+
+        f += f"timestamp: {datetime.datetime.now().isoformat()}"
 
         logger.info(f)
 
@@ -1372,13 +1375,14 @@ class Scheduler(
             msg += f"accept len: {spec_accept_length:.2f}, "
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
-            msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
+            msg += f"pre-allocated usage: {self.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         msg += (
             f"cuda graph: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-            f"#queue-req: {len(self.waiting_queue)}"
+            f"#queue-req: {len(self.waiting_queue)}, "
+            f"timestamp: {datetime.datetime.now().isoformat()}"
         )
 
         logger.info(msg)
@@ -1490,7 +1494,7 @@ class Scheduler(
         if need_dp_attn_preparation and not self.spec_algorithm.is_none():
             # In speculative decoding, prefill batches and decode batches cannot be processed in the same DP attention group.
             # We prepare idle batches in advance to skip preparing decode batches when there are prefill batches in the group.
-            new_batch, _ = self.prepare_mlp_sync_batch(new_batch)
+            new_batch = self.prepare_mlp_sync_batch(new_batch)
             need_dp_attn_preparation = new_batch is None
 
         if new_batch is not None:
@@ -1506,7 +1510,7 @@ class Scheduler(
 
         # Handle DP attention
         if need_dp_attn_preparation:
-            ret, _ = self.prepare_mlp_sync_batch(ret)
+            ret = self.prepare_mlp_sync_batch(ret)
 
         return ret
 
@@ -1923,8 +1927,7 @@ class Scheduler(
             if not disable_cuda_graph:
                 local_batch.can_run_dp_cuda_graph = can_cuda_graph
 
-        # TODO(ch-wan): refactor: any(is_extend_in_batch) now is a part of local_batch. Remove it from here.
-        return local_batch, any(is_extend_in_batch)
+        return local_batch
 
     def get_idle_batch(self):
         idle_batch = ScheduleBatch.init_new(
@@ -2118,11 +2121,14 @@ class Scheduler(
             "kvcache": round(
                 self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
             ),
-            "cuda_graph": round(
-                self.tp_worker.worker.model_runner.cuda_graph_mem_usage, 2
-            ),
             "token_capacity": int(self.max_total_num_tokens),
         }
+
+        if not _is_cpu:
+            ret["memory_usage"]["cuda_graph"] = round(
+                self.tp_worker.worker.model_runner.cuda_graph_mem_usage, 2
+            )
+
         if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
             ret["avg_spec_accept_length"] = (
                 self.cum_spec_accept_length / self.cum_spec_accept_count
@@ -2211,7 +2217,7 @@ class Scheduler(
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
-            if req.rid.startswith(recv_req.rid):
+            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting
@@ -2228,7 +2234,7 @@ class Scheduler(
             # Abort method 2: call `set_finish_with_abort`
             # The request will still run one prefill forward pass.
             # In this case, we change the input_ids to be only one token to make this prefill cheap.
-            if req.rid.startswith(recv_req.rid):
+            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
                 if req.grammar:
                     req.grammar.cancel()
@@ -2241,7 +2247,9 @@ class Scheduler(
             reqs = self.running_batch.reqs + self.cur_batch.reqs
 
         for req in reqs:
-            if req.rid.startswith(recv_req.rid) and not req.finished():
+            if not req.finished() and (
+                recv_req.abort_all or req.rid.startswith(recv_req.rid)
+            ):
                 # Abort method 3: set `to_abort=True`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
@@ -2329,9 +2337,8 @@ class Scheduler(
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         tags = recv_req.tags
-        import subprocess
 
-        if tags is None:
+        if tags is None or len(tags) == 0:
             tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
@@ -2342,17 +2349,20 @@ class Scheduler(
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.worker.model_runner.model
             )
+            torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
         tags = recv_req.tags
+
         if tags is None or len(tags) == 0:
             tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
+            torch.distributed.barrier(self.tp_cpu_group)
             _import_static_state(
                 self.tp_worker.worker.model_runner.model,
                 self.stashed_model_static_state,
