@@ -686,18 +686,14 @@ class FusedMoE(torch.nn.Module):
                 shard_size,
                 not self.use_presharded_weights,
             )
-        if not self.use_presharded_weights:
-            if shard_size * tp_rank + shard_size > loaded_weight.shape[shard_dim]:
-                raise ValueError(
-                    f"Shard size {shard_size} at rank {tp_rank} exceeds loaded_weight dimension {loaded_weight.shape[shard_dim]}"
-                )
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
-            )
         else:
             if not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
+                if shard_size * tp_rank + shard_size > loaded_weight.shape[shard_dim]:
+                    raise ValueError(
+                        f"Shard size {shard_size} at rank {tp_rank} exceeds loaded_weight dimension {loaded_weight.shape[shard_dim]}"
+                    )
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )

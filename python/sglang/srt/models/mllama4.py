@@ -1,4 +1,5 @@
 import json as json_lib
+import logging
 import os
 from collections.abc import Iterable
 from typing import List, Optional, Set, Tuple
@@ -27,6 +28,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.utils import add_prefix
 
+logger = logging.getLogger(__name__)
+
 
 class Llama4ForConditionalGeneration(nn.Module):
     packed_modules_mapping = {
@@ -46,6 +49,11 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         # Check if this is a text-only model (modelopt fp8 llama4 has no vision components)
         self.has_vision = self._has_vision_weights(config)
+        if not self.has_vision:
+            logger.warning(
+                "No vision weights found in checkpoint. Model will run in text-only mode. "
+                "Multimodal capabilities (image processing) will be unavailable."
+            )
 
         if self.has_vision:
             self.vision_model = Llama4VisionModel(config.vision_config)
@@ -225,12 +233,10 @@ class Llama4ForConditionalGeneration(nn.Module):
         )
 
         for name, loaded_weight in weights:
-            if not self._should_load_weight(name):
+            if self._should_skip_weight(name):
                 continue
 
             name = self._transform_weight_name(name)
-            if name is None:
-                continue
 
             if "vision" not in name:
                 name, loaded_weight = self.permute_qk_weight_for_rotary(
@@ -252,9 +258,9 @@ class Llama4ForConditionalGeneration(nn.Module):
 
             self._handle_default_weight(name, loaded_weight, params_dict)
 
-    def _should_load_weight(self, name: str) -> bool:
-        """Check if we should load this weight."""
-        return not ("vision" in name and not self.has_vision)
+    def _should_skip_weight(self, name: str) -> bool:
+        """Check if we should skip loading this weight."""
+        return "vision" in name and not self.has_vision
 
     def _transform_weight_name(self, name: str) -> str:
         """Transform weight name by adding language_model prefix if needed."""
