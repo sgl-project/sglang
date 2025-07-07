@@ -263,8 +263,6 @@ class HunyuanDetector(BaseReasoningFormatDetector):
                 buffer = buffer[idx + len(self.answer_end) :]
                 continue
 
-            # Check for partial tags at end of buffer
-            partial_found = False
             for tag in [self.answer_start, self.answer_end]:
                 for i in range(1, min(len(tag), len(buffer) + 1)):
                     if buffer.endswith(tag[:i]):
