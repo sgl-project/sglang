@@ -258,7 +258,7 @@ class MultimodalDataItem:
                 elif self.input_features is not None:
                     self.hash = hash_feature(self.input_features)
             elif self.is_video():
-            self.hash = hash_feature(self.pixel_values_videos)
+                self.hash = hash_feature(self.pixel_values_videos)
         else:
             self.hash = hash_feature(self.pixel_values)
 

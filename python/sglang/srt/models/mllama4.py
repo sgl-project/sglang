@@ -6,7 +6,11 @@ from typing import List, Optional, Set, Tuple
 
 import torch
 from torch import nn
-from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
+from transformers import Llama4Config
+from transformers.models.llama4.modeling_llama4 import (
+    Llama4MultiModalProjector,
+    Llama4VisionModel,
+)
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
