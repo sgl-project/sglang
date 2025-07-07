@@ -273,7 +273,6 @@ class Scheduler(
         # Init inter-process communication
         context = zmq.Context(2)
         self.idle_sleeper = None
-
         if self.pp_rank == 0 and self.attn_tp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -1048,6 +1047,8 @@ class Scheduler(
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)
                 else:
+                    if recv_req.rids is not None:
+                        output.rids = recv_req.rids
                     self.send_to_tokenizer.send_pyobj(output)
 
     def handle_generate_request(
@@ -2739,7 +2740,6 @@ def run_scheduler_process(
             }
         )
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
-
         if disaggregation_mode == DisaggregationMode.NULL:
             if server_args.pp_size > 1:
                 scheduler.event_loop_pp()
