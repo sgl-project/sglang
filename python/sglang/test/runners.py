@@ -42,6 +42,21 @@ DEFAULT_PROMPTS = [
     # the output of gemma-2-2b from SRT is unstable on the commented prompt
     # "The capital of France is",
 ]
+TEST_RERANK_QUERY_DOCS = [
+    {
+        "query": "How many people live in Berlin?",
+        "documents": [
+            "Berlin is well known for its museums.",
+        ],
+    },
+    {
+        "query": "How many people live in Berlin?",
+        "documents": [
+            "Berlin had a population of 3,520,031 registered inhabitants in an area of 891.82 square kilometers.",
+            "Berlin is well known for its museums.",
+        ],
+    },
+]
 
 dirpath = os.path.dirname(__file__)
 with open(os.path.join(dirpath, "long_prompt.txt"), "r") as f:
@@ -241,7 +256,7 @@ class HFRunner:
                 self.model = _get_sentence_transformer_embedding_model(
                     model_path, torch_dtype
                 )
-        elif self.model_type == "reward":
+        elif self.model_type == "reward" or self.model_type == "cross_encoder":
             from transformers import AutoModelForSequenceClassification
 
             self.model = AutoModelForSequenceClassification.from_pretrained(
@@ -303,6 +318,15 @@ class HFRunner:
                     else:
                         logits = self.model.encode(prompts).tolist()
                     out_queue.put(ModelOutput(embed_logits=logits))
+                elif self.model_type == "cross_encoder":
+                    inputs = self.tokenizer(
+                        prompts, padding=True, return_tensors="pt"
+                    ).to("cuda")
+                    scores = self.model(**inputs).logits
+                    scores = scores.squeeze().tolist()
+                    if not isinstance(scores, list):
+                        scores = [scores]
+                    out_queue.put(ModelOutput(scores=scores))
 
                 elif self.model_type == "reward":
                     scores = []
@@ -322,7 +346,9 @@ class HFRunner:
 
     def forward(
         self,
-        prompts: Union[List[str], List[torch.Tensor]] = DEFAULT_PROMPTS,
+        prompts: Union[
+            List[List[str]], List[str], List[torch.Tensor]
+        ] = DEFAULT_PROMPTS,
         image_data: Optional[List[str]] = None,
         max_new_tokens: int = 8,
         lora_paths: Optional[List[str]] = None,
@@ -477,6 +503,8 @@ class SRTRunner:
         disable_overlap_schedule: bool = False,
         disable_custom_all_reduce: bool = False,
         torchao_config: Optional[str] = None,
+        cuda_graph_max_bs: int = 4,
+        sleep_on_idle=False,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -512,8 +540,9 @@ class SRTRunner:
             tokenizer_path=tokenizer_path,
             enable_ep_moe=enable_ep_moe,
             disable_overlap_schedule=disable_overlap_schedule,
-            cuda_graph_max_bs=4,
+            cuda_graph_max_bs=cuda_graph_max_bs,
             disable_custom_all_reduce=disable_custom_all_reduce,
+            sleep_on_idle=sleep_on_idle,
             **spec_kwargs,
         )
 
@@ -524,9 +553,17 @@ class SRTRunner:
         else:
             self.tokenizer = None
 
+    def load_lora_adapter(self, lora_name: str, lora_path: str):
+        return self.engine.load_lora_adapter(lora_name, lora_path)
+
+    def unload_lora_adapter(self, lora_name: str):
+        return self.engine.unload_lora_adapter(lora_name)
+
     def forward(
         self,
-        prompts: Union[List[str], List[torch.Tensor]] = DEFAULT_PROMPTS,
+        prompts: Union[
+            List[List[str]], List[str], List[torch.Tensor]
+        ] = DEFAULT_PROMPTS,
         image_data: Optional[List[str]] = None,
         max_new_tokens: int = 8,
         lora_paths: Optional[List[str]] = None,
@@ -552,6 +589,13 @@ class SRTRunner:
                 else:
                     logits = [response["embedding"]]
                 return ModelOutput(embed_logits=logits)
+            # cross encoder model
+            elif self.model_type == "cross_encoder":
+                response = self.engine.rerank(prompts)
+                if not isinstance(response, list):
+                    response = [response]
+                scores = [x["embedding"] for x in response]
+                return ModelOutput(scores=scores)
             # reward model
             else:
                 response = self.engine.encode(prompts)
