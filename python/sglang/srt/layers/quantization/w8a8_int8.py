@@ -1,4 +1,4 @@
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, cast
 
 import torch
 from torch.nn.parameter import Parameter
@@ -11,6 +11,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -34,8 +35,13 @@ class W8A8Int8Config(QuantizationConfig):
     - Activation: dynamic, per-token, symmetric
     """
 
-    def __init__(self):
-        pass
+    def __init__(
+        self,
+        ignore: List[str],
+        packed_modules_mapping: Dict[str, List[str]] = {},
+    ):
+        self.ignore = ignore
+        self.packed_modules_mapping = packed_modules_mapping
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -55,16 +61,22 @@ class W8A8Int8Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "W8A8Int8Config":
-        return cls()
+        ignore: List[str] = cast(List[str], config.get("ignore", []))
+        packed_modules_mapping = config.get("packed_modules_mapping", {})
+        return cls(ignore, packed_modules_mapping)
 
     def get_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
-        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
+        if should_ignore_layer(
+            prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+        ):
+            return UnquantizedLinearMethod()
         if isinstance(layer, LinearBase):
             return W8A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
