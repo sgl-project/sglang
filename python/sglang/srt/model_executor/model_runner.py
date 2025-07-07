@@ -646,7 +646,6 @@ class ModelRunner:
             if hasattr(self.model, "get_attention_sliding_window_size")
             else None
         )
-        # TODO: set self.full_tokens_per_layer and self.swa_tokens_per_layer in swa memory pool init
         self.dtype = self.model_config.dtype
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -989,8 +988,43 @@ class ModelRunner:
             )
             self.max_total_num_tokens = self.full_max_total_num_tokens
         else:
-            raise ValueError(
-                f"Unsupported model for hybrid cache: {self.model_config.hf_config.architectures}."
+            assert self.sliding_window_size is not None and self.sliding_window_size > 0
+            full_attention_layer_ids = []
+            swa_attention_layer_ids = []
+            for layer in self.model.model.layers:
+                if (
+                    layer.self_attn.attn.sliding_window_size is None
+                    or layer.self_attn.attn.sliding_window_size == -1
+                ):
+                    full_attention_layer_ids.append(layer.layer_id)
+                else:
+                    swa_attention_layer_ids.append(layer.layer_id)
+            self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
+            self.model_config.full_attention_layer_ids = full_attention_layer_ids
+
+            # Algorithm:
+            # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
+            # - Find total # of tokens available across layers.
+            # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
+            total_tokens = (
+                self.max_total_num_tokens * self.model_config.num_hidden_layers
+            )
+            full_layers_num = len(full_attention_layer_ids)
+            swa_layers_num = len(swa_attention_layer_ids)
+            swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
+
+            # Solve the equations:
+            # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
+            # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
+            denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
+            self.full_max_total_num_tokens = int(total_tokens / denominator)
+            self.swa_max_total_num_tokens = int(
+                self.full_max_total_num_tokens * swa_full_tokens_ratio
+            )
+            self.max_total_num_tokens = self.full_max_total_num_tokens
+
+            logger.info(
+                f"Use Sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
             )
 
     def init_memory_pool(

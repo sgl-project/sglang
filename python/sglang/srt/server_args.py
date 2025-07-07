@@ -63,6 +63,7 @@ class ServerArgs:
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
     hybrid_kvcache_ratio: Optional[float] = None
+    swa_full_tokens_ratio: float = 0.8
     impl: str = "auto"
 
     # Port for the HTTP server
@@ -851,6 +852,13 @@ class ServerArgs:
                 "(0.0 = pure uniform: swa_size / full_size = 1)"
                 "(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length)"
             ),
+        )
+        parser.add_argument(
+            "--swa-full-tokens-ratio",
+            type=float,
+            default=ServerArgs.swa_full_tokens_ratio,
+            help="The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. "
+            "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.",
         )
 
         # Other runtime options
