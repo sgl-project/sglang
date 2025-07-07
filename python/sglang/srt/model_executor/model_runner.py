@@ -232,9 +232,6 @@ class ModelRunner:
         # If it is a draft model, tp_group can be different
         self.initialize(min_per_gpu_memory)
 
-        if self.sliding_window_size is not None and self.sliding_window_size > 0:
-            self.is_hybrid = True
-
         # temporary cached values
         self.support_pp = (
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
@@ -277,6 +274,9 @@ class ModelRunner:
         # Load the model
         self.sampler = Sampler()
         self.load_model()
+
+        if self.sliding_window_size is not None and self.sliding_window_size > 0:
+            self.is_hybrid = self.model_config.is_hybrid = True
 
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(

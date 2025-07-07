@@ -391,7 +391,8 @@ class Scheduler(
         set_random_seed(self.random_seed)
 
         # Hybrid
-        if self.model_config.is_hybrid:
+        self.is_hybrid = self.tp_worker.is_hybrid
+        if self.is_hybrid:
             self.sliding_window_size = self.tp_worker.sliding_window_size
             self.full_tokens_per_layer, self.swa_tokens_per_layer = (
                 self.tp_worker.get_tokens_per_layer_info()
@@ -577,7 +578,7 @@ class Scheduler(
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
         ):
-            if self.model_config.is_hybrid:
+            if self.is_hybrid:
                 ChunkCacheClass = SWAChunkCache
             else:
                 ChunkCacheClass = ChunkCache
@@ -610,8 +611,10 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
-            elif self.model_config.is_hybrid:
-                assert self.server_args.disaggregation_mode == "null", "Hybrid mode does not support disaggregation yet"
+            elif self.is_hybrid:
+                assert (
+                    self.server_args.disaggregation_mode == "null"
+                ), "Hybrid mode does not support disaggregation yet"
                 self.tree_cache = SWARadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -1325,7 +1328,7 @@ class Scheduler(
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
 
-        if self.model_config.is_hybrid:
+        if self.is_hybrid:
             (
                 full_num_used,
                 swa_num_used,
@@ -1397,7 +1400,7 @@ class Scheduler(
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
-        if self.model_config.is_hybrid:
+        if self.is_hybrid:
             (
                 full_num_used,
                 swa_num_used,
@@ -1464,7 +1467,7 @@ class Scheduler(
         self._publish_kv_events()
 
     def check_memory(self):
-        if self.model_config.is_hybrid:
+        if self.is_hybrid:
             (
                 full_num_used,
                 swa_num_used,
@@ -1515,7 +1518,7 @@ class Scheduler(
             and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
-            if self.model_config.is_hybrid:
+            if self.is_hybrid:
                 (
                     full_num_used,
                     swa_num_used,
@@ -1541,7 +1544,7 @@ class Scheduler(
         self._publish_kv_events()
 
     def check_tree_cache(self):
-        if self.model_config.is_hybrid and isinstance(self.tree_cache, SWARadixCache):
+        if self.is_hybrid and isinstance(self.tree_cache, SWARadixCache):
             self.tree_cache.sanity_check()
 
     def _get_token_info(self):
@@ -2153,7 +2156,7 @@ class Scheduler(
 
         if not disable_request_logging():
             # Print batch size and memory pool info to check whether there are de-sync issues.
-            if self.model_config.is_hybrid:
+            if self.is_hybrid:
                 (
                     _,
                     _,
@@ -2231,7 +2234,7 @@ class Scheduler(
 
     def get_load(self):
         # TODO(lsyin): use dynamically maintained num_waiting_tokens
-        if self.model_config.is_hybrid:
+        if self.is_hybrid:
             load_full = (
                 self.full_tokens_per_layer
                 - self.token_to_kv_pool_allocator.full_available_size()
