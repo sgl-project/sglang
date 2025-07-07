@@ -1122,7 +1122,7 @@ class OpenAIMoeForCausalLM(nn.Module):
                         weight_loader = param.weight_loader
                         for expert_id in range(self.config.num_experts):
                             expert_data = loaded_weight[expert_id]
-                            weight_loader(param, expert_data, name, shard_id="w2", expert_id=expert_id)
+                            weight_loader(param, expert_data, name, shard_id="w2", expert_id=expert_id, checkpoint_weights_transposed=True)
                 else:
                     # Handle individual expert weights (traditional format)
                     for mapping in expert_params_mapping:

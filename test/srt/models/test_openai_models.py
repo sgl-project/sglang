@@ -23,8 +23,10 @@ class TestOpenAIMoE(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
+                "--chat-template",
+                "chatml",
                 "--tp",
-                "4",
+                "2",
             ],
         )
 
@@ -45,7 +47,7 @@ class TestOpenAIMoE(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
-        # self.assertGreater(metrics["accuracy"], 0.71)
+        # self.assertGreater(metrics["accuracy"], 0.71) # target
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -59,7 +61,7 @@ class TestOpenAIMoE(CustomTestCase):
         metrics = run_eval(args)
         print(f"Eval accuracy of MMLU: {metrics=}")
 
-        # self.assertGreaterEqual(metrics["score"], 0.759)
+        # self.assertGreaterEqual(metrics["score"], 0.759) # target
 
 
 if __name__ == "__main__":
