@@ -1105,7 +1105,9 @@ class ModelRunner:
         )
 
         # create token size for hybrid cache
-        if self.is_hybrid:
+        if self.is_hybrid or (
+            self.sliding_window_size is not None and self.sliding_window_size > 0
+        ):
             self.set_num_token_hybrid()
 
         if self.max_total_num_tokens <= 0:
@@ -1198,7 +1200,9 @@ class ModelRunner:
                 end_layer=self.end_layer,
             )
         else:
-            if self.is_hybrid:
+            if self.is_hybrid or (
+                self.sliding_window_size is not None and self.sliding_window_size > 0
+            ):
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
@@ -1230,7 +1234,10 @@ class ModelRunner:
 
         if self.token_to_kv_pool_allocator is None:
             if self.page_size == 1:
-                if self.is_hybrid:
+                if self.is_hybrid or (
+                    self.sliding_window_size is not None
+                    and self.sliding_window_size > 0
+                ):
                     self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                         self.full_max_total_num_tokens,
                         self.swa_max_total_num_tokens,
