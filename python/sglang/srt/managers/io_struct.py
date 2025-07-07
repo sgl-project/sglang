@@ -762,6 +762,15 @@ class UpdateWeightsFromDistributedReqOutput:
     success: bool
     message: str
 
+@dataclass
+class ConvertDisaggregationRoleReqInput:
+    pass
+
+@dataclass
+class ConvertDisaggregationRoleReqOutput:
+    """Converse PD disaggregation identity"""
+    success: bool
+    message: str
 
 @dataclass
 class UpdateWeightsFromTensorReqInput:

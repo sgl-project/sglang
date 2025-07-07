@@ -110,6 +110,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    ConvertDisaggregationRoleReqInput,
+    ConvertDisaggregationRoleReqOutput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
@@ -341,6 +343,9 @@ class TokenizerManager:
         self.update_lora_adapter_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.convert_pd_role_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -410,6 +415,10 @@ class TokenizerManager:
                 (
                     LoRAUpdateResult,
                     self.update_lora_adapter_communicator.handle_recv,
+                ),
+                (
+                    ConvertDisaggregationRoleReqOutput,
+                    self.convert_pd_role_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
@@ -1116,6 +1125,21 @@ class TokenizerManager:
             await self.set_internal_state_communicator(obj)
         )
         return [res.internal_state for res in responses]
+
+    async def convert_pd_role(self) -> Tuple[bool, str]:
+        
+        req= ConvertDisaggregationRoleReqInput()
+        responses: List[ConvertDisaggregationRoleReqOutput] = (
+            await self.convert_pd_role_communicator(req)
+        )
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # stop the bootstrap server then
+            self.bootstrap_server.close()
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            pass
+        else:
+            return False, "The role of this server is null, can not convert it."
+        return responses[0].success, responses[0].message
 
     def get_log_request_metadata(self):
         max_length = None

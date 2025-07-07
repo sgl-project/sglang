@@ -544,6 +544,18 @@ async def update_weights_from_distributed(
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
+@app.post("/convert_pd_role")
+async def convert_pd_role():
+    """Update model parameter from distributed online."""
+    success, message = (
+        await _global_state.tokenizer_manager.convert_pd_role()
+    )
+    logger.info(f"{message}")
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 @app.api_route("/get_weights_by_name", methods=["GET", "POST"])
 async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):

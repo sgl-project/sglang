@@ -513,6 +513,12 @@ class DecodePreallocQueue:
 
         return kv_loc
 
+    def __del__(self):
+        if len(self.queue) > 0 or len(self.retracted_queue) > 0:
+            raise RuntimeError(
+                "This could not happen, cause we should have flushed cache before releasing the queue"
+            )
+        del self.kv_manager
 
 class DecodeTransferQueue:
     """
@@ -640,6 +646,12 @@ class DecodeTransferQueue:
 
         return transferred_reqs
 
+    def __del__(self):
+        # when we release this, we have done flush_cache, so we can free all elements in queue
+        if len(self.queue) > 0:
+            raise RuntimeError(
+                "This could not happen, cause we should have flushed cache before releasing the queue"
+                )
 
 class SchedulerDisaggregationDecodeMixin:
 
@@ -647,7 +659,7 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
-        while True:
+        while not self.stop_decode_event.is_set():
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
@@ -693,7 +705,7 @@ class SchedulerDisaggregationDecodeMixin:
         self.last_batch: Optional[ScheduleBatch] = None
         self.last_batch_in_queue = False  # last batch is modified in-place, so we need another variable to track if it's extend
 
-        while True:
+        while not self.stop_decode_event.is_set():
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache

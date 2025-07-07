@@ -16,7 +16,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
-from sglang.srt.disaggregation.utils import PDRegistryRequest
+from sglang.srt.disaggregation.utils import PDRegistryRequest, PDConvertRequest
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64
@@ -60,6 +60,14 @@ class MiniLoadBalancer:
 
     def add_decode_server(self, new_decode_server: str):
         self.decode_servers.append(new_decode_server)
+
+    def remove_prefill_server(self, prefill_url: str):
+        index_to_remove = self.prefill_servers.index(prefill_url)
+        del self.prefill_configs[index_to_remove]
+        del self.prefill_servers[index_to_remove]
+
+    def remove_decode_server(self, decode_server: str):
+        self.decode_servers.remove(decode_server)
 
     def select_pair(self):
         # TODO: return some message instead of panic
@@ -399,6 +407,52 @@ async def register(obj: PDRegistryRequest):
 
     return Response(status_code=200)
 
+@app.post("/convert_pd_role")
+async def convert_pd_role(obj: PDConvertRequest):
+    """ Convert identity of a PD server """
+    server_url = obj.server_url
+    if server_url in load_balancer.prefill_servers:
+        logger.info(f"Converting prefill to decode : {server_url}")
+        if len(load_balancer.prefill_servers) <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot convert {server_url} to decode, at least one prefill server is required.",
+            )
+        current_role = "prefill"
+        load_balancer.remove_prefill_server(server_url)
+        logger.info(f"Stop sending req to {server_url}.Waiting for prefill to finish all reqs.")
+    elif server_url in load_balancer.decode_servers:
+        logger.info(f"Converting decode to prefill : {server_url}")
+        if len(load_balancer.decode_servers) <= 1:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Cannot convert {server_url} to prefill, at least one decode server is required.",
+            )
+        current_role = "decode"
+        load_balancer.remove_decode_server(server_url)
+        logger.info(f"Stop sending req to {server_url}.Waiting for decode to finish all reqs.")
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid URL:{server_url}. The server may be not registered.",
+        )
+    async with aiohttp.ClientSession() as session:
+        response = await session.post(f"{server_url}/convert_pd_role")
+    
+    content = await response.json()
+    if content["success"]:
+        if current_role == "prefill":
+            load_balancer.add_decode_server(server_url)
+            logger.info(f"Converted prefill server to decode: {server_url}")
+        else:
+            load_balancer.add_prefill_server(PrefillConfig(url=server_url, bootstrap_port=content["bootstrap_port"]))
+            logger.info(f"Converted decode server to prefill: {server_url}")
+        return Response(status_code=200)
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to convert identity for server: {server_url}",
+        )
 
 def run(prefill_configs, decode_addrs, host, port):
     global load_balancer

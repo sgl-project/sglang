@@ -107,6 +107,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    ConvertDisaggregationRoleReqInput,
+    ConvertDisaggregationRoleReqOutput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
@@ -159,7 +161,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-
+from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
@@ -511,6 +513,7 @@ class Scheduler(
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (ConvertDisaggregationRoleReqInput, self.convert_disaggregation_role),
             ]
         )
 
@@ -652,14 +655,15 @@ class Scheduler(
                 kv_events_config, self.attn_dp_rank
             )
 
-    def init_disaggregation(self):
+    def init_disaggregation(self,convert=None):
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
 
         if (
-            self.disaggregation_mode == DisaggregationMode.DECODE
+            self.disaggregation_mode == DisaggregationMode.DECODE or convert == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
+            self.stop_decode_event = threading.Event()
             buffer_size = (self.req_to_token_pool.size) * 2
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
@@ -710,8 +714,10 @@ class Scheduler(
             # Metric for pre-allocation
             self.num_tokens_pre_allocated = 0
 
-        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL or convert == DisaggregationMode.PREFILL:
             # *2 for the headroom.
+            self.stop_prefill_event = threading.Event()
+
             buffer_size = self.max_running_requests * 2
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
@@ -2635,6 +2641,68 @@ class Scheduler(
         else:
             del self.sessions[session_id]
 
+    def convert_disaggregation_role(self, recv_req: ConvertDisaggregationRoleReqInput):
+        """Convert the disaggregation role of the scheduler."""
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            logger.info("Converting the role of this server to DECODE.")
+            logger.info("Waiting for all requests to finish before converting the role...")
+            
+            while not (len(self.waiting_queue) == 0 and self.running_batch.is_empty() and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))):
+                continue
+
+            logger.info("All requests finished, reset related resources.")
+            # stop prefill event loop
+            self.stop_prefill_event.set()
+            # flush the memory resources
+            self.flush_cache()
+            self.flush_disaggregation_resources()
+            # reinitialize the disaggregation resources for decode
+            self.disaggregation_mode = DisaggregationMode.DECODE
+            self.init_disaggregation()
+            # send back the response
+            # then run_scheduler_process can restart the new event loop
+
+            return ConvertDisaggregationRoleReqOutput(
+                success=True,
+                message="The role of this server is now DECODE.",
+            )
+        else:
+            logger.info("Converting the role of this server to PREFILL.")
+            return ConvertDisaggregationRoleReqOutput(
+                success=False,
+                message="The role of this server is decode, currently can not convert it.",
+            )
+
+    def flush_disaggregation_resources(self):
+        logger.info("Flushing disaggregation resources...")
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # release queues and kv_manager
+            del self.disagg_prefill_bootstrap_queue
+            del self.disagg_prefill_inflight_queue
+            # resize buffers
+            torch.cuda.empty_cache()
+
+            # update the req-to-token-pool to DecodeReqToTokenPool
+            pool_size=self.req_to_token_pool.size
+            pool_max_context_len=self.req_to_token_pool.max_context_len
+            pool_device=self.req_to_token_pool.device
+            pre_alloc_size = pool_size * 2 if pool_size <= 32 else 0
+            del self.req_to_token_pool
+            self.req_to_token_pool = DecodeReqToTokenPool(
+                size=pool_size,
+                max_context_len=pool_max_context_len,
+                device=pool_device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                pre_alloc_size=pre_alloc_size,
+            )
+            self.tree_cache.req_to_token_pool = self.req_to_token_pool
+        else:
+            del self.disagg_decode_transfer_queue
+            del self.disagg_decode_prealloc_queue
+            del self.num_tokens_pre_allocated
+            torch.cuda.empty_cache()
+            pass
+                
     def get_print_prefix(self):
         prefix = ""
         if self.attn_dp_rank is not None:
@@ -2721,26 +2789,27 @@ def run_scheduler_process(
                 "max_req_input_len": scheduler.max_req_input_len,
             }
         )
-        disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
+        while True:
+            disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
 
-        if disaggregation_mode == DisaggregationMode.NULL:
-            if server_args.pp_size > 1:
-                scheduler.event_loop_pp()
-            elif scheduler.enable_overlap:
-                scheduler.event_loop_overlap()
-            else:
-                scheduler.event_loop_normal()
-        elif disaggregation_mode == DisaggregationMode.PREFILL:
-            if scheduler.enable_overlap:
-                scheduler.event_loop_overlap_disagg_prefill()
-            else:
-                scheduler.event_loop_normal_disagg_prefill()
+            if disaggregation_mode == DisaggregationMode.NULL:
+                if server_args.pp_size > 1:
+                    scheduler.event_loop_pp()
+                elif scheduler.enable_overlap:
+                    scheduler.event_loop_overlap()
+                else:
+                    scheduler.event_loop_normal()
+            elif disaggregation_mode == DisaggregationMode.PREFILL:
+                if scheduler.enable_overlap:
+                    scheduler.event_loop_overlap_disagg_prefill()
+                else:
+                    scheduler.event_loop_normal_disagg_prefill()
 
-        elif disaggregation_mode == DisaggregationMode.DECODE:
-            if scheduler.enable_overlap:
-                scheduler.event_loop_overlap_disagg_decode()
-            else:
-                scheduler.event_loop_normal_disagg_decode()
+            elif disaggregation_mode == DisaggregationMode.DECODE:
+                if scheduler.enable_overlap:
+                    scheduler.event_loop_overlap_disagg_decode()
+                else:
+                    scheduler.event_loop_normal_disagg_decode()
 
     except Exception:
         traceback = get_exception_traceback()

@@ -256,6 +256,13 @@ class PrefillBootstrapQueue:
         else:
             return bootstrapped_reqs, failed_reqs
 
+    def __del__(self):
+        if len(self.queue) > 0:
+            raise RuntimeError("This could not happen")
+        else:
+            del self.kv_manager
+            del self.req_to_metadata_buffer_idx_allocator
+            del self.metadata_buffers
 
 class SchedulerDisaggregationPrefillMixin:
     """
@@ -266,9 +273,11 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
 
-        while True:
+        while not self.stop_prefill_event.is_set():
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self.stop_prefill_event.is_set():
+                break
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -300,9 +309,11 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
 
-        while True:
+        while not self.stop_prefill_event.is_set():
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self.stop_prefill_event.is_set():
+                break
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )

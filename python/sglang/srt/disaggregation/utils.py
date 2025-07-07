@@ -305,6 +305,15 @@ class PDRegistryRequest:
                 f"Invalid mode: {self.mode}. Must be 'prefill' or 'decode'."
             )
 
+@dataclasses.dataclass
+class PDConvertRequest:
+    """A request to convert identity of a PD server"""
+    server_url: str
+    def __post_init__(self):
+        if not self.server_url:
+            raise ValueError("URL must be provided for PDConvertRequest.")
+        if not isinstance(self.server_url, str):
+            raise TypeError("URL must be a string.")
 
 def register_disaggregation_server(
     mode: str, server_port: int, bootstrap_port: int, pdlb_url: str
