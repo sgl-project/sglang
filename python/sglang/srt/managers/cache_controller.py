@@ -77,7 +77,6 @@ class CacheOperation:
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
-        self.data = None
 
         self.id = CacheOperation.counter
         CacheOperation.counter += 1
@@ -329,13 +328,17 @@ class HiCacheController:
             self.load_cache_event.clear()
             self.layer_done_counter.update_producer()
 
-            batch_operation = None
-            while self.load_queue.qsize() > 0:
-                op = self.load_queue.get(block=True)
-                if batch_operation is None:
-                    batch_operation = op
-                else:
+            if self.load_queue.empty():
+                continue
+
+            # Merge all operations in the queue
+            batch_operation = self.load_queue.get(block=False)
+            while not self.load_queue.empty():
+                try:
+                    op = self.load_queue.get(block=False)
                     batch_operation.merge(op)
+                except Empty:
+                    break
             if batch_operation is None:
                 continue
 
