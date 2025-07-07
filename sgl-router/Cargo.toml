@@ -36,6 +36,7 @@ metrics-exporter-prometheus = "0.17.0"
 # Added for request tracing
 uuid = { version = "1.10", features = ["v4", "serde"] }
 thiserror = "2.0.12"
+url = "2.5.4"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
