@@ -1,5 +1,6 @@
 // Essential PDLB types extracted for PD routing
 
+use crate::core::worker::{Worker, WorkerType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -28,51 +29,26 @@ pub enum PDRouterError {
     Timeout { url: String },
 }
 
-#[derive(Debug, Clone)]
-pub enum EngineType {
-    Prefill,
-    Decode,
+pub fn get_api_path(worker: &dyn Worker, api_path: &str) -> String {
+    if api_path.starts_with("/") {
+        format!("{}{}", worker.url(), api_path)
+    } else {
+        format!("{}/{}", worker.url(), api_path)
+    }
 }
 
-#[derive(Debug, Clone)]
-pub struct EngineInfo {
-    pub engine_type: EngineType,
-    pub url: String,
-    pub bootstrap_port: Option<u16>,
+pub fn get_hostname(worker: &dyn Worker) -> String {
+    let url = worker
+        .url()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    url.split(':').next().unwrap_or("localhost").to_string()
 }
 
-impl EngineInfo {
-    pub fn new_prefill(url: String, bootstrap_port: Option<u16>) -> Self {
-        EngineInfo {
-            engine_type: EngineType::Prefill,
-            url,
-            bootstrap_port,
-        }
-    }
-
-    pub fn new_decode(url: String) -> Self {
-        EngineInfo {
-            engine_type: EngineType::Decode,
-            url,
-            bootstrap_port: None,
-        }
-    }
-
-    pub fn api_path(&self, api_path: &str) -> String {
-        if api_path.starts_with("/") {
-            format!("{}{}", self.url, api_path)
-        } else {
-            format!("{}/{}", self.url, api_path)
-        }
-    }
-
-    pub fn get_hostname(&self) -> String {
-        // Simple hostname extraction without external dependencies
-        let url = self
-            .url
-            .trim_start_matches("http://")
-            .trim_start_matches("https://");
-        url.split(':').next().unwrap_or("localhost").to_string()
+pub fn get_bootstrap_port(worker: &dyn Worker) -> Option<u16> {
+    match worker.worker_type() {
+        WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+        _ => None,
     }
 }
 
@@ -112,12 +88,12 @@ pub trait Bootstrap: Send + Sync {
         bootstrap_room: BootstrapRoom,
     );
 
-    fn add_bootstrap_info(&mut self, prefill_info: &EngineInfo) -> Result<(), String> {
+    fn add_bootstrap_info(&mut self, prefill_info: &dyn Worker) -> Result<(), String> {
         let batch_size = self.get_batch_size()?;
         if let Some(batch_size) = batch_size {
             self.set_bootstrap_info(
-                BootstrapHost::Batch(vec![prefill_info.get_hostname(); batch_size]),
-                BootstrapPort::Batch(vec![prefill_info.bootstrap_port; batch_size]),
+                BootstrapHost::Batch(vec![get_hostname(prefill_info); batch_size]),
+                BootstrapPort::Batch(vec![get_bootstrap_port(prefill_info); batch_size]),
                 // Use high-quality random numbers to minimize collision risk
                 BootstrapRoom::Batch(
                     (0..batch_size)
@@ -132,8 +108,8 @@ pub trait Bootstrap: Send + Sync {
             );
         } else {
             self.set_bootstrap_info(
-                BootstrapHost::Single(prefill_info.get_hostname()),
-                BootstrapPort::Single(prefill_info.bootstrap_port),
+                BootstrapHost::Single(get_hostname(prefill_info)),
+                BootstrapPort::Single(get_bootstrap_port(prefill_info)),
                 BootstrapRoom::Single({
                     // Use high-quality random number for single requests too
                     let r1 = rand::random::<u64>();
