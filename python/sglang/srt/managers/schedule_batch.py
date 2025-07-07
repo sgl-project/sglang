@@ -52,7 +52,10 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator, SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -794,50 +797,6 @@ class Req:
         self.finished_reason = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
-    
-    def _evict_tree_cache_if_needed(
-        self,
-        num_tokens: int,
-    ) -> None:
-        if self.is_hybrid:
-            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-
-            if full_available_size < num_tokens or swa_available_size < num_tokens:
-                if self.tree_cache is not None:
-                    full_num_tokens = max(0, num_tokens - full_available_size)
-                    swa_num_tokens = max(0, num_tokens - swa_available_size)
-                    self.tree_cache.evict(full_num_tokens, swa_num_tokens)
-        else:
-            if self.token_to_kv_pool_allocator.available_size() < num_tokens:
-                if self.tree_cache is not None:
-                    self.tree_cache.evict(num_tokens)
-
-    def _is_available_size_sufficient(self, num_tokens: int) -> bool:
-        if self.is_hybrid:
-            return (
-                self.token_to_kv_pool_allocator.full_available_size() >= num_tokens
-                and self.token_to_kv_pool_allocator.swa_available_size() >= num_tokens
-            )
-        else:
-            return self.token_to_kv_pool_allocator.available_size() >= num_tokens
-
-    def _available_and_evictable_str(self) -> str:
-        if self.is_hybrid:
-            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-            full_evictable_size = self.tree_cache.full_evictable_size()
-            swa_evictable_size = self.tree_cache.swa_evictable_size()
-            return (
-                f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
-                f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
-                f"Full LRU list evictable size: {self.tree_cache.full_lru_list_evictable_size()}\n"
-                f"SWA LRU list evictable size: {self.tree_cache.swa_lru_list_evictable_size()}\n"
-            )
-        else:
-            available_size = self.token_to_kv_pool_allocator.available_size()
-            evictable_size = self.tree_cache.evictable_size()
-            return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
 
     def __repr__(self):
         return (
@@ -1451,7 +1410,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return (
                 num_reqs * global_config.retract_decode_steps + headroom_for_spec_decode
             )
-        
+
         def _get_available_size():
             if self.is_hybrid:
                 return min(
@@ -1833,6 +1792,50 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
         )
+
+    def _evict_tree_cache_if_needed(
+        self,
+        num_tokens: int,
+    ) -> None:
+        if self.is_hybrid:
+            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+
+            if full_available_size < num_tokens or swa_available_size < num_tokens:
+                if self.tree_cache is not None:
+                    full_num_tokens = max(0, num_tokens - full_available_size)
+                    swa_num_tokens = max(0, num_tokens - swa_available_size)
+                    self.tree_cache.evict(full_num_tokens, swa_num_tokens)
+        else:
+            if self.token_to_kv_pool_allocator.available_size() < num_tokens:
+                if self.tree_cache is not None:
+                    self.tree_cache.evict(num_tokens)
+
+    def _is_available_size_sufficient(self, num_tokens: int) -> bool:
+        if self.is_hybrid:
+            return (
+                self.token_to_kv_pool_allocator.full_available_size() >= num_tokens
+                and self.token_to_kv_pool_allocator.swa_available_size() >= num_tokens
+            )
+        else:
+            return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+
+    def _available_and_evictable_str(self) -> str:
+        if self.is_hybrid:
+            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+            full_evictable_size = self.tree_cache.full_evictable_size()
+            swa_evictable_size = self.tree_cache.swa_evictable_size()
+            return (
+                f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
+                f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
+                f"Full LRU list evictable size: {self.tree_cache.full_lru_list_evictable_size()}\n"
+                f"SWA LRU list evictable size: {self.tree_cache.swa_lru_list_evictable_size()}\n"
+            )
+        else:
+            available_size = self.token_to_kv_pool_allocator.available_size()
+            evictable_size = self.tree_cache.evictable_size()
+            return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
 
     def __str__(self):
         return (
