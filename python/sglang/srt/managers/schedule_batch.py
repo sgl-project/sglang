@@ -247,6 +247,7 @@ class MultimodalDataItem:
         """
         Set the pad value after first hashing the data
         """
+        print(f"{self.modality=}")
         from sglang.srt.managers.mm_utils import hash_feature
 
         if self.hash is None:
@@ -259,8 +260,8 @@ class MultimodalDataItem:
                     self.hash = hash_feature(self.input_features)
             elif self.is_video():
                 self.hash = hash_feature(self.pixel_values_videos)
-        else:
-            self.hash = hash_feature(self.pixel_values)
+            else:
+                self.hash = hash_feature(self.pixel_values)
 
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
