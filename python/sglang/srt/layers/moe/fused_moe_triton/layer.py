@@ -319,7 +319,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 layer.w2_weight,
                 topk_weights.to(
                     torch.float
-                ),  # TODO: the topk_weights of llama4 is computed via Llama4MoE:custom_routing_function and is bfloat16 while the kernel requires it to be float32
+                ),  # TODO: [Note] topk_weights should be float32 for now. The topk_weights of llama4 is computed via Llama4MoE:custom_routing_function and is bfloat16 while the kernel requires it to be float32
                 topk_ids,
                 False,  # inplace # See [Note] inplace should be False in fused_experts.
                 False,  # use_int8_w8a8

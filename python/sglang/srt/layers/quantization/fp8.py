@@ -1002,7 +1002,9 @@ class Fp8MoEMethod:
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
-                topk_weights,
+                topk_weights.to(
+                    torch.float
+                ),  # See [Note] topk_weights should be float32 for now.
                 topk_ids,
                 False,  # inplace See [Note] inplace should be False in fused_experts.
                 False,  # use_int8_w8a8
