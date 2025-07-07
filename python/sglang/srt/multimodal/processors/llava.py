@@ -110,9 +110,6 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         *args,
         **kwargs,
     ):
-        if not image_data:
-            return None
-
         modalities = request_obj.modalities or ["image"]
         aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
         grid_pinpoints = (
@@ -121,9 +118,6 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
             and "anyres" in aspect_ratio
             else None
         )
-
-        if isinstance(image_data, str):
-            image_data = [image_data]
 
         if isinstance(image_data, list) and len(image_data) > 0:
             if "multi-images" in modalities or "video" in modalities:

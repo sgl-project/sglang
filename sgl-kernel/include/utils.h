@@ -373,3 +373,9 @@ __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   val = fmaxf(val, __shfl_xor_sync(mask, val, 1));
   return val;
 }
+
+// Get the next power of 2 of a number
+inline uint32_t next_pow2(uint32_t x) noexcept {
+  if (x <= 1) return 1;
+  return 1u << (32 - __builtin_clz(x - 1));
+}

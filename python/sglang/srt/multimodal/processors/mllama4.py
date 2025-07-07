@@ -37,9 +37,6 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         *args,
         **kwargs,
     ):
-        if not image_data:
-            return None
-
         if isinstance(input_text, list):
             assert len(input_text) and isinstance(input_text[0], int)
             input_text = self._processor.tokenizer.decode(input_text)
