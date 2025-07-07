@@ -5,6 +5,7 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -64,6 +65,7 @@ class MultimodalSpecialTokens:
     video_token_regex: Optional[re.Pattern] = None
     audio_token_regex: Optional[re.Pattern] = None
 
+    @lru_cache(maxsize=16)
     def get_modality_of_token(self, token) -> Optional[Modality]:
         """
         :return: the modality associated with the given token, if the token is a special_token or matches with the multimodal token regex
@@ -94,6 +96,7 @@ class MultimodalSpecialTokens:
         if self.audio_token_regex is None and self.audio_token is not None:
             self.audio_token_regex = re.compile(re.escape(self.audio_token))
 
+    @lru_cache()
     def combine_regex(self) -> re.Pattern:
         tokens = [
             self.image_token_regex,
