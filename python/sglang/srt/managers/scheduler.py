@@ -591,6 +591,12 @@ class Scheduler(
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
+                    hicache_io_backend=(
+                        "direct"
+                        if server_args.attention_backend
+                        == "fa3"  # hot fix for incompatibility
+                        else server_args.hicache_io_backend
+                    ),
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
