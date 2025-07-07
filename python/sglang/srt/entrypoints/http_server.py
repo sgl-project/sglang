@@ -662,7 +662,9 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
 async def abort_request(obj: AbortReq, request: Request):
     """Abort a request."""
     try:
-        _global_state.tokenizer_manager.abort_request(rid=obj.rid)
+        _global_state.tokenizer_manager.abort_request(
+            rid=obj.rid, abort_all=obj.abort_all
+        )
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
@@ -708,6 +710,26 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     }
 
     return ORJSONResponse(content=response_data, status_code=200)
+
+
+@app.post("/pause_generation")
+async def pause_generation(request: Request):
+    """Pause generation."""
+    await _global_state.tokenizer_manager.pause_generation()
+    return ORJSONResponse(
+        content={"message": "Generation paused successfully.", "status": "ok"},
+        status_code=200,
+    )
+
+
+@app.post("/continue_generation")
+async def continue_generation(request: Request):
+    """Continue generation."""
+    await _global_state.tokenizer_manager.continue_generation()
+    return ORJSONResponse(
+        content={"message": "Generation continued successfully.", "status": "ok"},
+        status_code=200,
+    )
 
 
 ##### OpenAI-compatible API endpoints #####
@@ -932,11 +954,9 @@ def launch_server(
         warmup_thread.join()
 
 
-def _wait_and_warmup(
+def _execute_server_warmup(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
-    image_token_text: str,
-    launch_callback: Optional[Callable[[], None]] = None,
 ):
     headers = {}
     url = server_args.url()
@@ -961,7 +981,7 @@ def _wait_and_warmup(
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_process_tree(os.getpid())
-        return
+        return success
 
     model_info = res.json()
 
@@ -1035,10 +1055,25 @@ def _wait_and_warmup(
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_process_tree(os.getpid())
-        return
+        return False
 
     # Debug print
     # logger.info(f"warmup request returns: {res.json()=}")
+    return success
+
+
+def _wait_and_warmup(
+    server_args: ServerArgs,
+    pipe_finish_writer: Optional[multiprocessing.connection.Connection],
+    image_token_text: str,
+    launch_callback: Optional[Callable[[], None]] = None,
+):
+    if not server_args.skip_server_warmup:
+        if not _execute_server_warmup(
+            server_args,
+            pipe_finish_writer,
+        ):
+            return
 
     logger.info("The server is fired up and ready to roll!")
 

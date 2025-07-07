@@ -38,6 +38,8 @@ PROMPTS = [
     "What are the main components of a computer?",
 ]
 
+MEM_FRACTION_STATIC = 0.8
+
 
 class OperationType(Enum):
     LOAD = "load"
@@ -339,6 +341,7 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
             lora_paths=self.lora_paths,
             lora_backend=self.lora_backend,
             torch_dtype=torch.float16,
+            mem_fraction_static=MEM_FRACTION_STATIC,
             max_loras_per_batch=self.max_loras_per_batch,
             disable_cuda_graph=self.disable_cuda_graph,
             cuda_graph_max_bs=self.cuda_graph_max_bs,
@@ -440,6 +443,8 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
             "42",
             "--max-running-request",
             "1",
+            "--mem-fraction-static",
+            str(MEM_FRACTION_STATIC),
         ]
         if self.disable_cuda_graph:
             other_args.append("--disable-cuda-graph")
