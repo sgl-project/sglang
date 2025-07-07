@@ -79,7 +79,7 @@ class MultimodalSpecialTokens:
         for regex, modality in [
             (self.image_token_regex, Modality.IMAGE),
             (self.video_token_regex, Modality.VIDEO),
-            (self.audio_token_regex, Modality.AUDIO)
+            (self.audio_token_regex, Modality.AUDIO),
         ]:
             if regex and regex.match(token):
                 return modality
@@ -108,13 +108,6 @@ class MultimodalSpecialTokens:
                 flags |= t.flags
         combined = "(" + "|".join(f"(?:{p})" for p in patterns) + ")"
         return re.compile(combined, flags)
-
-    def get_token_strings(self) -> list[str]:
-        return [
-            token
-            for token in [self.image_token, self.video_token, self.audio_token]
-            if token
-        ]
 
 
 class BaseMultimodalProcessor(ABC):
@@ -380,7 +373,6 @@ class BaseMultimodalProcessor(ABC):
         # Process results
         images, videos, audios = [], [], []
         new_text_parts = []
-        multimodal_token_list = multimodal_tokens.get_token_strings()
         for text_part in text_parts:
             try:
                 if multimodal_tokens_pattern.match(text_part):
