@@ -208,7 +208,7 @@ class TestOpenAIVisionServer(CustomTestCase):
         # from transformers import AutoTokenizer
         from decord import VideoReader, cpu
 
-        max_frames_num = 20
+        max_frames_num = 10
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frame_num = len(vr)
         uniform_sampled_frames = np.linspace(
@@ -274,6 +274,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                 f.write(response.content)
         return file_path
 
+    # this test samples frames of video as input, but not video directly
     def test_video_images_chat_completion(self):
         url = VIDEO_JOBS_URL
         file_path = self.get_or_download_file(url)
