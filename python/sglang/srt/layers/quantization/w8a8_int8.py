@@ -38,10 +38,10 @@ class W8A8Int8Config(QuantizationConfig):
     def __init__(
         self,
         ignore: List[str],
-        packed_modules_mapping: Dict[str, List[str]] = {},
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ):
         self.ignore = ignore
-        self.packed_modules_mapping = packed_modules_mapping
+        self.packed_modules_mapping = packed_modules_mapping if packed_modules_mapping is not None else {}
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -74,7 +74,7 @@ class W8A8Int8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if should_ignore_layer(
-            prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+            prefix, ignore=self.ignore if self.ignore else [], fused_mapping=self.packed_modules_mapping if self.packed_modules_mapping else {}
         ):
             return UnquantizedLinearMethod()
         if isinstance(layer, LinearBase):
