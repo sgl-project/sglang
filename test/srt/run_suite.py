@@ -54,7 +54,7 @@ suites = {
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_eagle_infer_a.py", 370),
-        TestFile("test_eagle_infer_b.py", 270),
+        TestFile("test_eagle_infer_b.py", 700),
         TestFile("test_ebnf_constrained.py", 108),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 376),
@@ -70,7 +70,7 @@ suites = {
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
         TestFile("test_mla.py", 167),
-        TestFile("test_mla_deepseek_v3.py", 342),
+        TestFile("test_mla_deepseek_v3.py", 700),
         TestFile("test_mla_int8_deepseek_v3.py", 429),
         TestFile("test_mla_flashinfer.py", 302),
         TestFile("test_mla_fp8.py", 93),
@@ -125,6 +125,7 @@ suites = {
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_function_call_parser.py", 10),
+        TestFile("test_fused_moe.py", 30),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_metrics.py", 32),
         TestFile("test_no_chunked_prefill.py", 108),
@@ -142,6 +143,7 @@ suites = {
         TestFile("test_vertex_endpoint.py", 31),
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         TestFile("test_reasoning_parser.py", 5),
+        TestFile("test_rope_rocm.py", 3),
         TestFile("test_awq_dequant.py", 2),
     ],
     "per-commit-npu": [
