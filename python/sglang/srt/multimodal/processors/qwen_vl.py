@@ -257,7 +257,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
         mm_items, input_ids, ret = self.process_and_combine_mm_data(base_output)
 
-
         input_ids = input_ids.flatten()
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
