@@ -231,8 +231,6 @@ def rocm_aiter_fused_experts(
         )
     else:
         # TODO (Hubert): This should not be called for now...
-        assert False
-
         quant_method = QuantMethod.NO.value
 
         # w8a8 block-scaled

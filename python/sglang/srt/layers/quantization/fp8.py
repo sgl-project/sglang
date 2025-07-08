@@ -98,7 +98,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _is_hip and (_use_aiter or _use_hip_int4):
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
-
     from sglang.srt.layers.moe.rocm_aiter_fused_moe import (
         rocm_aiter_fused_experts,
         shuffle_weights,
@@ -782,14 +781,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_input_scale = None
 
             if _use_aiter:
-                # Pre-shuffle weights for aiter fused_moe
-                shuffled_w13, shuffled_w2 = shuffle_weights(
-                    layer.w13_weight.contiguous().data,
-                    layer.w2_weight.contiguous().data,
-                )
-                layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
-                layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
-                torch.cuda.empty_cache()
+                with torch.no_grad():
+                    # Pre-shuffle weights for aiter fused_moe
+                    shuffled_w13, shuffled_w2 = shuffle_weights(
+                        layer.w13_weight.contiguous().data,
+                        layer.w2_weight.contiguous().data,
+                    )
+                    layer.w13_weight = torch.nn.Parameter(
+                        shuffled_w13, requires_grad=False
+                    )
+                    layer.w2_weight = torch.nn.Parameter(
+                        shuffled_w2, requires_grad=False
+                    )
+                    torch.cuda.empty_cache()
 
             if _is_cpu:
                 assert (
@@ -916,12 +920,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # TODO: _use_aiter: add after triton kernel added
         # INT4-FP8 (INT4 MoE Weight, FP8 Compute)
         # Pre-shuffle weights for aiter fused_moe
-        shuffled_w13, shuffled_w2 = shuffle_weights(
-            layer.w13_weight.data, layer.w2_weight.data
-        )
-        layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
-        torch.cuda.empty_cache()
+        with torch.no_grad():
+            shuffled_w13, shuffled_w2 = shuffle_weights(
+                layer.w13_weight.data, layer.w2_weight.data
+            )
+            layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
+            torch.cuda.empty_cache()
 
         # INT4-FP8 : offset INT4 w13_weight_scale1 to single w13_weight_scale
         # Fp8 moe kernel needs single fp8 w13_weight_scale for w13 per expert.
@@ -957,13 +962,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
 
         if _use_aiter:
-            # Pre-shuffle weights for aiter fused_moe
-            shuffled_w13, shuffled_w2 = shuffle_weights(
-                layer.w13_weight.data, layer.w2_weight.data
-            )
-            layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
-            layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
-            torch.cuda.empty_cache()
+            with torch.no_grad():
+                # Pre-shuffle weights for aiter fused_moe
+                shuffled_w13, shuffled_w2 = shuffle_weights(
+                    layer.w13_weight.data, layer.w2_weight.data
+                )
+                layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
+                layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
+                torch.cuda.empty_cache()
 
             # ROCm (_use_aiter): using column-wise scaling
             layer.w13_weight_scale1 *= layer.w13_weight_scale.unsqueeze(-1)

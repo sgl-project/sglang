@@ -266,12 +266,13 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             )
 
         if _use_aiter:
-            shuffled_w13, shuffled_w2 = shuffle_weights(
-                layer.w13_weight.data, layer.w2_weight.data
-            )
-            layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
-            layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
-            torch.cuda.empty_cache()
+            with torch.no_grad():
+                shuffled_w13, shuffled_w2 = shuffle_weights(
+                    layer.w13_weight.data, layer.w2_weight.data
+                )
+                layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
+                layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
+                torch.cuda.empty_cache()
 
     def apply(
         self,
