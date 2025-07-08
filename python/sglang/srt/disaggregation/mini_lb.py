@@ -15,9 +15,9 @@ import orjson
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
-from sglang.srt.utils import is_valid_ipv6_address
 
 from sglang.srt.disaggregation.utils import PDRegistryRequest
+from sglang.srt.utils import is_valid_ipv6_address
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64

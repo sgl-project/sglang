@@ -35,7 +35,13 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_free_port, get_int_env_var, get_ip, get_local_ip_auto, is_valid_ipv6_address
+from sglang.srt.utils import (
+    get_free_port,
+    get_int_env_var,
+    get_ip,
+    get_local_ip_auto,
+    is_valid_ipv6_address,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -483,7 +489,9 @@ class MooncakeKVManager(BaseKVManager):
         if is_valid_ipv6_address(remote):
             remote = "[" + remote + "]"
             is_ipv6 = True
-        self._connect("tcp://" + remote + ":" + str(dst_port), is_ipv6=is_ipv6).send_multipart(
+        self._connect(
+            "tcp://" + remote + ":" + str(dst_port), is_ipv6=is_ipv6
+        ).send_multipart(
             [
                 str(room).encode("ascii"),
                 str(status).encode("ascii"),
@@ -837,8 +845,8 @@ class MooncakeKVManager(BaseKVManager):
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
-            if self.dist_init_addr[0] == '[':  # [ipv6]:port
-                ip_address, _ = self.dist_init_addr.rsplit(':', 1)
+            if self.dist_init_addr[0] == "[":  # [ipv6]:port
+                ip_address, _ = self.dist_init_addr.rsplit(":", 1)
             else:
                 ip_address = socket.gethostbyname(self.dist_init_addr.split(":")[0])
         else:
@@ -1196,7 +1204,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
             dst_tp_size = str(tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
 
-            self.prefill_server_url, sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            self.prefill_server_url, sock, lock = self._connect_to_bootstrap_server(
+                bootstrap_info
+            )
             with lock:
                 sock.send_multipart(
                     [
@@ -1226,7 +1236,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
 
     @classmethod
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
-        is_ipv6_address = is_valid_ipv6_address(bootstrap_info['rank_ip'])
+        is_ipv6_address = is_valid_ipv6_address(bootstrap_info["rank_ip"])
         if is_ipv6_address:
             prefill_server_url = (
                 f"[{bootstrap_info['rank_ip']}]:{bootstrap_info['rank_port']}"
@@ -1235,14 +1245,18 @@ class MooncakeKVReceiver(BaseKVReceiver):
             prefill_server_url = (
                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
             )
-        sock, lock = cls._connect("tcp://" + prefill_server_url, is_ipv6=is_ipv6_address)
+        sock, lock = cls._connect(
+            "tcp://" + prefill_server_url, is_ipv6=is_ipv6_address
+        )
         if is_ipv6_address:
             assert sock.getsockopt(zmq.IPV6) == 1
         return prefill_server_url, sock, lock
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
         for bootstrap_info in self.bootstrap_infos:
-            self.prefill_server_url, sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            self.prefill_server_url, sock, lock = self._connect_to_bootstrap_server(
+                bootstrap_info
+            )
             is_dummy = bootstrap_info["is_dummy"]
 
             with lock:
