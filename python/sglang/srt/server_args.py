@@ -20,7 +20,7 @@ import logging
 import os
 import random
 import tempfile
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Union
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -46,6 +46,7 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
+    skip_server_warmup: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
@@ -67,6 +68,7 @@ class ServerArgs:
     # Port for the HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
+    nccl_port: Optional[int] = None
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -131,7 +133,7 @@ class ServerArgs:
     preferred_sampling_params: Optional[str] = None
 
     # LoRA
-    lora_paths: Optional[List[str]] = None
+    lora_paths: Optional[Union[dict[str, str], List[str]]] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
 
@@ -156,6 +158,7 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     enable_flashinfer_moe: bool = False
+    enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -214,11 +217,13 @@ class ServerArgs:
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
+    hicache_io_backend: str = ""
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
+    enable_triton_kernel_moe: bool = False
     warmups: Optional[str] = None
 
     # Debug tensor dumps
@@ -317,6 +322,14 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
+            # Lazy init to avoid circular import
+            from sglang.srt.configs.model_config import ModelConfig
+
+            # Multimodal models need more memory for the image processor
+            model_config = ModelConfig.from_server_args(self)
+            if model_config.is_multimodal:
+                self.mem_fraction_static *= 0.90
+
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
             if gpu_mem is not None:
@@ -378,6 +391,12 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
 
+        if self.attention_backend == "ascend":
+            logger.warning(
+                "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
+            )
+            self.page_size = 128
+
         # Choose grammar backend
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
@@ -401,10 +420,6 @@ class ServerArgs:
 
         # DeepEP MoE
         if self.enable_deepep_moe:
-            if self.deepep_mode == "auto":
-                assert (
-                    not self.enable_dp_attention
-                ), "DeepEP MoE `auto` mode is not supported with DP Attention."
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
@@ -584,6 +599,12 @@ class ServerArgs:
             help="The port of the HTTP server.",
         )
         parser.add_argument(
+            "--nccl-port",
+            type=int,
+            default=ServerArgs.nccl_port,
+            help="The port for NCCL distributed environment setup. Defaults to a random port.",
+        )
+        parser.add_argument(
             "--tokenizer-mode",
             type=str,
             default=ServerArgs.tokenizer_mode,
@@ -596,6 +617,11 @@ class ServerArgs:
             "--skip-tokenizer-init",
             action="store_true",
             help="If set, skip init tokenizer and pass input_ids in generate request.",
+        )
+        parser.add_argument(
+            "--skip-server-warmup",
+            action="store_true",
+            help="If set, skip warmup.",
         )
         parser.add_argument(
             "--load-format",
@@ -682,6 +708,7 @@ class ServerArgs:
                 "w8a8_fp8",
                 "moe_wna16",
                 "qoq",
+                "w4afp8",
             ],
             help="The quantization method.",
         )
@@ -1106,6 +1133,7 @@ class ServerArgs:
                 "flashmla",
                 "intel_amx",
                 "torch_native",
+                "ascend",
                 "triton",
             ],
             default=ServerArgs.attention_backend,
@@ -1199,6 +1227,11 @@ class ServerArgs:
             "--enable-flashinfer-moe",
             action="store_true",
             help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP with --enable-ep-moe",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-allreduce-fusion",
+            action="store_true",
+            help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
         )
         parser.add_argument(
             "--enable-deepep-moe",
@@ -1500,6 +1533,13 @@ class ServerArgs:
             help="The write policy of hierarchical cache.",
         )
         parser.add_argument(
+            "--hicache-io-backend",
+            type=str,
+            choices=["direct", "kernel"],
+            default=ServerArgs.hicache_io_backend,
+            help="The IO backend for KV cache transfer between CPU and GPU",
+        )
+        parser.add_argument(
             "--flashinfer-mla-disable-ragged",
             action="store_true",
             help="Not using ragged prefill wrapper when running flashinfer mla",
@@ -1523,6 +1563,11 @@ class ServerArgs:
             "--enable-return-hidden-states",
             action="store_true",
             help="Enable returning hidden states with responses.",
+        )
+        parser.add_argument(
+            "--enable-triton-kernel-moe",
+            action="store_true",
+            help="Use triton moe grouped gemm kernel.",
         )
         parser.add_argument(
             "--warmups",
@@ -1720,14 +1765,17 @@ class PortArgs:
 
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
-        port = server_args.port + random.randint(100, 1000)
-        while True:
-            if is_port_available(port):
-                break
-            if port < 60000:
-                port += 42
-            else:
-                port -= 43
+        if server_args.nccl_port is None:
+            port = server_args.port + random.randint(100, 1000)
+            while True:
+                if is_port_available(port):
+                    break
+                if port < 60000:
+                    port += 42
+                else:
+                    port -= 43
+        else:
+            port = server_args.nccl_port
 
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
