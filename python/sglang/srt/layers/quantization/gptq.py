@@ -11,38 +11,21 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import is_cuda
+from sgl_kernel import (
+    gptq_marlin_moe_repack,
+    scalar_types,
+)
 
-_is_cuda = is_cuda()
+from sglang.srt.layers.moe.fused_moe_triton import (
+    FusedMoEMethodBase,
+    FusedMoeWeightScaleSupported,
+)
 
-try:
-    from vllm import _custom_ops as ops
-    from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
-    from vllm.model_executor.layers.quantization.gptq_marlin import (
-        FusedMoE,
-        FusedMoEMethodBase,
-        FusedMoeWeightScaleSupported,
-        GPTQMarlinLinearMethod,
-        marlin_moe_permute_scales,
-    )
-    from vllm.model_executor.layers.quantization.marlin import MarlinLinearMethod
-    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-        check_marlin_supported,
-    )
-    from vllm.scalar_type import scalar_types
-
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
-
-    GPTQLinearMethod = MarlinLinearMethod = Any
-
-    FusedMoEMethodBase = QuantizeMethodBase
-
-    class scalar_types:
-        uint4b8 = "uint4b8"
-        uint8b128 = "uint8b128"
-
-
+from sglang.srt.layers.quantization.utils import (
+    marlin_moe_permute_scales,
+    check_marlin_supported
+)
+    
 logger = logging.getLogger(__name__)
 
 
@@ -331,7 +314,7 @@ class GPTQMarlinConfig(QuantizationConfig):
         sym = quant_config.get("sym")
         desc_act = quant_config.get("desc_act")
 
-        if not _is_cuda:
+        if not is_cuda():
             return False
 
         if quant_method != "gptq":
@@ -644,7 +627,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
         # Repack weights
-        marlin_w13_qweight = ops.gptq_marlin_moe_repack(
+        marlin_w13_qweight = gptq_marlin_moe_repack(
             layer.w13_qweight,
             layer.w13_g_idx_sort_indices,
             layer.w13_qweight.shape[1] * self.quant_config.pack_factor,
@@ -652,7 +635,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             self.quant_config.quant_type.size_bits,
         )
         replace_parameter(layer, "w13_qweight", marlin_w13_qweight)
-        marlin_w2_qweight = ops.gptq_marlin_moe_repack(
+        marlin_w2_qweight = gptq_marlin_moe_repack(
             layer.w2_qweight,
             layer.w2_g_idx_sort_indices,
             layer.w2_qweight.shape[1] * self.quant_config.pack_factor,
@@ -698,6 +681,9 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         e_score_correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
     ) -> torch.Tensor:
+        # Delay the import to avoid circular dependency
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
         assert activation == "silu", "Only SiLU activation is supported."
 
         # The input must currently be float16
@@ -733,3 +719,310 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             quant_type_id=self.quant_config.quant_type.id,
             is_k_full=self.is_k_full,
         ).to(orig_dtype)
+
+class GPTQLinearMethod(LinearMethodBase):
+    """Linear method for GPTQ.
+
+    Args:
+        quant_config: The GPTQ quantization config.
+    """
+
+    def __init__(self, quant_config: GPTQConfig):
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        del output_size  # Unused.
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        if input_size_per_partition % self.quant_config.group_size != 0:
+            raise ValueError(
+                "The input size is not aligned with the quantized "
+                "weight shape. This can be caused by too large "
+                "tensor parallel size.")
+        output_size_per_partition = sum(output_partition_sizes)
+        if (output_size_per_partition % self.quant_config.pack_factor.numerator
+                != 0):
+            raise ValueError(
+                "The output size is not aligned with the quantized "
+                "weight shape. This can be caused by too large "
+                "tensor parallel size.")
+
+        if self.quant_config.group_size != -1:
+            group_size = self.quant_config.group_size
+        else:
+            group_size = input_size
+        exllama_state = ExllamaState.UNINITIALIZED
+        scale_and_zero_size = input_size // group_size
+        scale_and_zero_input_dim = None
+        if (input_size != input_size_per_partition
+                and self.quant_config.group_size != -1):
+            # For act-order models, we cannot use Exllama for row parallel layer
+            if self.quant_config.desc_act:
+                exllama_state = ExllamaState.UNUSED
+            else:
+                # we need to partition qzeros and scales for exllama kernel
+                scale_and_zero_size = input_size_per_partition // group_size
+                scale_and_zero_input_dim = 0
+
+        qweight = PackedvLLMParameter(
+            data=torch.empty(
+                input_size_per_partition // self.quant_config.pack_factor,
+                output_size_per_partition,
+                dtype=torch.int32,
+            ),
+            input_dim=0,
+            output_dim=1,
+            packed_dim=0,
+            packed_factor=self.quant_config.pack_factor,
+            weight_loader=weight_loader)
+
+        g_idx = RowvLLMParameter(data=torch.tensor(
+            [
+                i // self.quant_config.group_size
+                for i in range(input_size_per_partition)
+            ],
+            dtype=torch.int32,
+        ),
+                                 input_dim=0,
+                                 weight_loader=weight_loader)
+        qzeros_args = {
+            "data":
+            torch.empty(
+                scale_and_zero_size,
+                output_size_per_partition // self.quant_config.pack_factor,
+                dtype=torch.int32,
+            ),
+            "weight_loader":
+            weight_loader
+        }
+        weight_scale_args = {
+            "data":
+            torch.empty(
+                scale_and_zero_size,
+                output_size_per_partition,
+                dtype=params_dtype,
+            ),
+            "weight_loader":
+            weight_loader
+        }
+        if scale_and_zero_input_dim is None:
+            scales = ChannelQuantScaleParameter(output_dim=1,
+                                                **weight_scale_args)
+            qzeros = PackedColumnParameter(
+                output_dim=1,
+                packed_dim=1,
+                packed_factor=self.quant_config.pack_factor,
+                **qzeros_args)
+
+        else:
+            scales = GroupQuantScaleParameter(output_dim=1,
+                                              input_dim=0,
+                                              **weight_scale_args)
+            qzeros = PackedvLLMParameter(
+                input_dim=0,
+                output_dim=1,
+                packed_dim=1,
+                packed_factor=self.quant_config.pack_factor,
+                **qzeros_args)
+
+        layer.register_parameter("qweight", qweight)
+        layer.register_parameter("g_idx", g_idx)
+        layer.register_parameter("qzeros", qzeros)
+        layer.register_parameter("scales", scales)
+
+        layer.exllama_state = exllama_state
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # for torch.compile
+        layer.qzeros = Parameter(layer.qzeros.data, requires_grad=False)
+        layer.qweight = Parameter(layer.qweight.data, requires_grad=False)
+        layer.g_idx = Parameter(layer.g_idx.data, requires_grad=False)
+        layer.scales = Parameter(layer.scales.data, requires_grad=False)
+
+        # exllama needs to shuffle the weight after the weight is loaded
+        # here we do the shuffle on first forward pass
+        if layer.exllama_state == ExllamaState.UNINITIALIZED:
+            if self.quant_config.desc_act:
+                layer.g_idx.data = torch.argsort(layer.g_idx).to(torch.int)
+            else:
+                layer.g_idx.data = torch.empty((0, ),
+                                               dtype=torch.int,
+                                               device=layer.g_idx.device)
+            layer.exllama_state = ExllamaState.READY
+            ops.gptq_shuffle(layer.qweight, layer.g_idx,
+                             self.quant_config.weight_bits)
+
+    def apply(self,
+              layer: torch.nn.Module,
+              x: torch.Tensor,
+              bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        out_shape = x.shape[:-1] + (layer.qweight.shape[-1], )
+        reshaped_x = x.reshape(-1, x.shape[-1])
+
+        output = ops.gptq_gemm(reshaped_x, layer.qweight, layer.qzeros,
+                               layer.scales, layer.g_idx,
+                               layer.exllama_state == ExllamaState.READY,
+                               self.quant_config.weight_bits)
+        if bias is not None:
+            output.add_(bias)
+        return output.reshape(out_shape)
+
+class GPTQMarlinLinearMethod(LinearMethodBase):
+    """Linear method for GPTQ Marlin.
+
+    Args:
+        quant_config: The GPTQ Marlin quantization config.
+    """
+
+    _kernel_backends_being_used: set[str] = set()
+
+    def __init__(self, quant_config: GPTQMarlinConfig) -> None:
+        self.quant_config = quant_config
+
+        # Verify supported on platform.
+        verify_marlin_supported(quant_type=self.quant_config.quant_type,
+                                group_size=self.quant_config.group_size)
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        output_size_per_partition = sum(output_partition_sizes)
+        is_row_parallel = input_size != input_size_per_partition
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        mp_linear_kernel_config = MPLinearLayerConfig(
+            full_weight_shape=(input_size, output_size),
+            partition_weight_shape=\
+                (input_size_per_partition, output_size_per_partition),
+            weight_type=self.quant_config.quant_type,
+            act_type=params_dtype,
+            group_size=self.quant_config.group_size,
+            zero_points=False,
+            has_g_idx=self.quant_config.desc_act
+        )
+
+        kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
+
+        if kernel_type.__name__ not in self._kernel_backends_being_used:
+            logger.info("Using %s for GPTQMarlinLinearMethod",
+                        kernel_type.__name__)
+            self._kernel_backends_being_used.add(kernel_type.__name__)
+
+        # Normalize group_size
+        if self.quant_config.group_size != -1:
+            group_size = self.quant_config.group_size
+        else:
+            group_size = input_size
+
+        # Determine sharding
+        if marlin_repeat_scales_on_all_ranks(self.quant_config.desc_act,
+                                             self.quant_config.group_size,
+                                             is_row_parallel):
+            # By setting scale_dim == None, weight_loader will
+            # repeat the scales on each GPU in TP>1 case.
+            scales_and_zp_input_dim = None
+            scales_and_zp_size = input_size // group_size
+        else:
+            # By setting scale_dim == 0, weight_loader will
+            # shard the scales in TP>1 case.
+            scales_and_zp_input_dim = 0
+            scales_and_zp_size = input_size_per_partition // group_size
+
+        # Quantized weights
+        qweight = PackedvLLMParameter(
+            data=torch.empty(
+                input_size_per_partition // self.quant_config.pack_factor,
+                output_size_per_partition,
+                dtype=torch.int32,
+            ),
+            input_dim=0,
+            output_dim=1,
+            packed_dim=0,
+            packed_factor=self.quant_config.pack_factor,
+            weight_loader=weight_loader)
+
+        # Activation order
+        g_idx = RowvLLMParameter(data=torch.empty(
+            input_size_per_partition,
+            dtype=torch.int32,
+        ),
+                                 input_dim=0,
+                                 weight_loader=weight_loader)
+
+        qzeros_args = {
+            "data":
+            torch.empty(
+                scales_and_zp_size,
+                output_size_per_partition // self.quant_config.pack_factor,
+                dtype=torch.int32,
+            ),
+            "weight_loader":
+            weight_loader
+        }
+        weight_scale_args = {
+            "data":
+            torch.empty(
+                scales_and_zp_size,
+                output_size_per_partition,
+                dtype=params_dtype,
+            ),
+            "weight_loader":
+            weight_loader
+        }
+
+        if scales_and_zp_input_dim is None:
+            scales = ChannelQuantScaleParameter(output_dim=1,
+                                                **weight_scale_args)
+            qzeros = PackedColumnParameter(
+                output_dim=1,
+                packed_dim=1,
+                packed_factor=self.quant_config.pack_factor,
+                **qzeros_args)
+
+        else:
+            scales = GroupQuantScaleParameter(output_dim=1,
+                                              input_dim=0,
+                                              **weight_scale_args)
+            qzeros = PackedvLLMParameter(
+                input_dim=0,
+                output_dim=1,
+                packed_dim=1,
+                packed_factor=self.quant_config.pack_factor,
+                **qzeros_args)
+
+        layer.register_parameter("qweight", qweight)
+        layer.register_parameter("g_idx", g_idx)
+        layer.register_parameter("scales", scales)
+        layer.register_parameter("qzeros", qzeros)
+
+        self.kernel = kernel_type(mp_linear_kernel_config,
+                                  w_q_param_name="qweight",
+                                  w_s_param_name="scales",
+                                  w_zp_param_name="qzeros",
+                                  w_gidx_param_name="g_idx")
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.kernel.process_weights_after_loading(layer)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.kernel.apply_weights(layer, x, bias)

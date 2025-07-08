@@ -7,6 +7,10 @@ import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_npu
+from sgl_kernel import (
+    ScalarType,
+    scalar_types,
+)
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -143,3 +147,54 @@ def replace_parameter(
         if not isinstance(new, torch.nn.Parameter):
             new = torch.nn.Parameter(new, requires_grad=False)
         mod.register_parameter(name, torch.nn.Parameter(new, requires_grad=False))
+
+
+# Marlin utils
+MARLIN_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
+
+def check_marlin_supported(quant_type: ScalarType,
+                           group_size: int,
+                           has_zp: bool = False,
+                           device_capability: Optional[int] = None) -> bool:
+    cond, _ = _check_marlin_supported(quant_type, group_size, has_zp,
+                                      device_capability)
+    return cond
+
+def _check_marlin_supported(
+        quant_type: ScalarType,
+        group_size: Optional[int],
+        has_zp: bool,
+        device_capability: Optional[int] = None) -> tuple[bool, Optional[str]]:
+
+    if device_capability is None:
+        capability_tuple = current_platform.get_device_capability()
+        device_capability = (-1 if capability_tuple is None else
+                             capability_tuple.to_int())
+
+    supported_types = query_marlin_supported_quant_types(
+        has_zp, True, device_capability)
+
+    if quant_type not in supported_types:
+        return (False, f"Marlin does not support weight_bits = {quant_type}. "
+                f"Only types = {supported_types} "
+                f"are supported (for group_size = {group_size}, "
+                f"device_capability = {device_capability}, zp = {has_zp}).")
+    if (group_size is None or group_size not in MARLIN_SUPPORTED_GROUP_SIZES):
+        return (False, f"Marlin does not support group_size = {group_size}. "
+                f"Only group_sizes = {MARLIN_SUPPORTED_GROUP_SIZES} "
+                "are supported.")
+
+    return True, None
+
+def marlin_moe_permute_scales(
+    s: torch.Tensor, size_k: int, size_n: int, group_size: int, num_bits: int
+):
+    num_experts = s.shape[0]
+    output = torch.empty(
+        (num_experts, s.shape[1], s.shape[2]), device=s.device, dtype=s.dtype
+    )
+    for e in range(num_experts):
+        output[e] = marlin_permute_scales(
+            s[e], size_k, size_n, group_size, num_bits
+        )
+    return output
