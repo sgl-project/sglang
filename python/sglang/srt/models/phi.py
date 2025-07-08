@@ -1,12 +1,11 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/phi.py
-import math
-from typing import Iterable, Optional, Tuple, Union
+from typing import Iterable, Optional, Union
 
 import torch
 from torch import nn
 from transformers import PhiConfig
 
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -199,7 +198,7 @@ class PhiModel(nn.Module):
             hidden_states = self.get_input_embeddings(input_ids)
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            # hidden_states = layer(positions, hidden_states, forward_batch=forward_batch)
+
             hidden_states = layer(
                 position_ids=positions,
                 forward_batch=forward_batch,
@@ -209,7 +208,6 @@ class PhiModel(nn.Module):
         return hidden_states
 
 
-# Pending
 class PhiForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -252,7 +250,7 @@ class PhiForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
-        # hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)   changed it to below
+
         hidden_states = self.model(
             input_ids=input_ids,
             forward_batch=forward_batch,
