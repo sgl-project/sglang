@@ -411,7 +411,6 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 and global_server_args_dict["enable_flashinfer_allreduce_fusion"]
                 and hidden_states.shape[0] <= 128
             ):
-                import sys; sys.exit()
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
                 )
