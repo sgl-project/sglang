@@ -40,6 +40,7 @@ from sglang.srt.utils import (
     configure_logger,
     get_zmq_socket,
     kill_itself_when_parent_died,
+    get_workerids_from_rids,
 )
 from sglang.utils import (
     TypeBasedDispatcher,
@@ -135,7 +136,7 @@ class DetokenizerManager:
                 else:
                     # Extract worker_id from rid
                     if isinstance(recv_obj.rids, list):
-                        worker_ids = [int(rid.split("_")[0]) for rid in recv_obj.rids]
+                        worker_ids = get_workerids_from_rids(recv_obj.rids)
                     else:
                         raise RuntimeError(f"tokenizer_worker_num > 1, recv_obj.rids must be list")
 
