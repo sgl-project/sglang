@@ -29,6 +29,7 @@ import torch.distributed as dist
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import (
     get_tp_group,
@@ -72,12 +73,15 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.mem_cache.allocator import (
+    AscendPagedTokenToKVPoolAllocator,
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    AscendMLAPagedTokenToKVPool,
+    AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -102,6 +106,7 @@ from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
+    get_cpu_ids_by_node,
     init_custom_process_group,
     is_cuda,
     is_fa3_default_architecture,
@@ -109,6 +114,7 @@ from sglang.srt.utils import (
     is_hip,
     is_hopper_with_cuda_12_3,
     is_no_spec_infer_or_topk_one,
+    is_npu,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
@@ -116,6 +122,7 @@ from sglang.srt.utils import (
 )
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
 # Use a small KV cache pool size for tests in CI
@@ -159,7 +166,6 @@ class ModelRunner:
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
         # Parse args
-        self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
         self.gpu_id = gpu_id
@@ -172,6 +178,7 @@ class ModelRunner:
         self.dp_size = server_args.dp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
@@ -211,6 +218,10 @@ class ModelRunner:
         # CPU offload
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
+        # Init OpenMP threads binding for CPU
+        if self.device == "cpu":
+            self.init_threads_binding()
+
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
@@ -225,6 +236,7 @@ class ModelRunner:
         self.support_pp = (
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
         )
+        self._model_update_group = {}
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -302,6 +314,7 @@ class ModelRunner:
             self.init_cuda_graphs()
         else:
             self.cuda_graph_runner = None
+            self.cuda_graph_mem_usage = 0
             self.init_attention_backend()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
@@ -363,6 +376,8 @@ class ModelRunner:
                     server_args.attention_backend = "fa3"
                 elif _is_hip:
                     server_args.attention_backend = "aiter"
+                elif _is_npu:
+                    server_args.attention_backend = "ascend"
                 else:
                     server_args.attention_backend = (
                         "flashinfer" if is_flashinfer_available() else "triton"
@@ -382,6 +397,8 @@ class ModelRunner:
                         server_args.attention_backend = "aiter"
                     else:
                         server_args.attention_backend = "triton"
+                elif _is_npu:
+                    server_args.attention_backend = "ascend"
                 else:
                     server_args.attention_backend = "triton"
             logger.info(
@@ -396,6 +413,7 @@ class ModelRunner:
                     "triton",
                     "flashmla",
                     "cutlass_mla",
+                    "ascend",
                 ]:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
@@ -433,11 +451,6 @@ class ModelRunner:
             self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
         if self.is_multimodal:
-            self.mem_fraction_static *= 0.90
-            logger.info(
-                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} "
-                f"because this is a multimodal model."
-            )
             if not self.is_multimodal_chunked_prefill_supported:
                 server_args.chunked_prefill_size = -1
                 logger.info(
@@ -496,6 +509,19 @@ class ModelRunner:
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
 
         if not self.is_draft_worker:
+            if self.device == "cpu":
+                if _is_cpu_amx_available:
+                    # Bind OpenMP threads to CPU cores
+                    torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
+
+                    # Set local size to hint SGLang to use shared memory based AllReduce
+                    os.environ["LOCAL_SIZE"] = str(self.tp_size)
+                    torch.ops.sgl_kernel.initialize(self.tp_size, self.tp_rank)
+                else:
+                    logger.warning(
+                        "init_cpu_threads_env and shared memory based AllReduce is disabled since intel amx backend is not available"
+                    )
+
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
                 backend=backend,
@@ -574,6 +600,10 @@ class ModelRunner:
             download_dir=self.server_args.download_dir,
             model_loader_extra_config=self.server_args.model_loader_extra_config,
         )
+        if self.device == "cpu":
+            self.model_config = adjust_config_with_unaligned_cpu_tp(
+                self.model_config, self.load_config, self.tp_size
+            )
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
 
@@ -744,7 +774,7 @@ class ModelRunner:
         )
 
         try:
-            self._model_update_group = init_custom_process_group(
+            self._model_update_group[group_name] = init_custom_process_group(
                 backend=backend,
                 init_method=f"tcp://{master_address}:{master_port}",
                 world_size=world_size,
@@ -757,7 +787,7 @@ class ModelRunner:
             logger.error(message)
             return False, message
 
-    def update_weights_from_distributed(self, name, dtype, shape):
+    def update_weights_from_distributed(self, names, dtypes, shapes, group_name):
         """
         Update specific parameter in the model weights online
         through `_model_update_group` process group.
@@ -767,19 +797,34 @@ class ModelRunner:
             dtype: the data type of the parameter to be updated.
             shape: the shape of the parameter to be updated.
         """
-        target_dtype = (
-            dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
         )
 
-        assert (
-            self._model_update_group is not None
-        ), "model update group must be initialized"
-
         try:
-            weights = torch.empty(shape, dtype=target_dtype, device=self.device)
-            torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
-            self.model.load_weights([(name, weights)])
-            return True, f"Succeeded to update parameter {name} online."
+            weights = []
+            handles = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+                handles.append(
+                    torch.distributed.broadcast(
+                        weight,
+                        src=0,
+                        group=self._model_update_group[group_name],
+                        async_op=True,
+                    )
+                )
+                weights.append((name, weight))
+            for handle in handles:
+                handle.wait()
+
+            self.model.load_weights(weights)
+            return True, f"Succeeded to update parameter online."
 
         except Exception as e:
             error_msg = (
@@ -1062,7 +1107,35 @@ class ModelRunner:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
 
-        if self.use_mla_backend:
+        if self.server_args.attention_backend == "ascend" and not self.use_mla_backend:
+            self.token_to_kv_pool = AscendTokenToKVPool(
+                self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+            )
+        elif self.server_args.attention_backend == "ascend" and self.use_mla_backend:
+            self.token_to_kv_pool = AscendMLAPagedTokenToKVPool(
+                self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                layer_num=(
+                    self.model_config.num_hidden_layers
+                    if not self.is_draft_worker
+                    else self.model_config.hf_config.num_nextn_predict_layers
+                ),  # PP is not compatible with mla backend
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+            )
+        elif self.use_mla_backend:
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -1142,13 +1215,22 @@ class ModelRunner:
                         kvcache=self.token_to_kv_pool,
                     )
             else:
-                self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
-                    device=self.device,
-                    kvcache=self.token_to_kv_pool,
-                )
+                if _is_npu:
+                    self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                    )
+                else:
+                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                    )
         else:
             assert self.is_draft_worker
 
@@ -1195,6 +1277,10 @@ class ModelRunner:
             from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
             return AiterAttnBackend(self)
+        elif self.server_args.attention_backend == "ascend":
+            from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
+
+            return AscendAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
             assert not self.model_config.is_encoder_decoder, (
                 "Cross attention is not supported in the triton attention backend. "
@@ -1291,6 +1377,30 @@ class ModelRunner:
             f"Capture cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.cuda_graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
+
+    def init_threads_binding(self):
+        omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
+        if omp_cpuids == "all":
+            cpu_ids_by_node = get_cpu_ids_by_node()
+            n_numa_node = len(cpu_ids_by_node)
+
+            assert self.tp_size <= n_numa_node, (
+                f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
+                f"tp_size {self.tp_size} should be smaller than or equal to number of numa node on the machine {n_numa_node}. "
+                f"If you need tp_size to be larger than number of numa node, please set the CPU cores for each tp rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
+                f"For example, on a machine with 2 numa nodes, where core 0-31 are on numa node 0 and core 32-63 are on numa node 1, "
+                f"it is suggested to use -tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
+                f"This is the default behavior if SGLANG_CPU_OMP_THREADS_BIND is not set and it is the same as setting SGLANG_CPU_OMP_THREADS_BIND=0-31|32-63. "
+                f"If you do need tp_size to be larger than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with -tp 4. "
+                f"If you don't want each tp rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with -tp 2."
+            )
+            if self.tp_size < n_numa_node:
+                logger.warning(
+                    f"Detected the current machine has {n_numa_node} numa nodes available, but tp_size is set to {self.tp_size}, so only {self.tp_size} numa nodes are used."
+                )
+            self.local_omp_cpuid = cpu_ids_by_node[self.tp_rank]
+        else:
+            self.local_omp_cpuid = omp_cpuids.split("|")[self.tp_rank]
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
