@@ -186,8 +186,11 @@ class MooncakeKVManager(BaseKVManager):
                     target=self.transfer_worker, args=(queue, executor), daemon=True
                 ).start()
 
-            self.bootstrap_time_out = get_int_env_var(
-                "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 120
+            # If a bootstrap timeout happens, it means prefill instances fail
+            # to receive the KV indices from the decode instance of this request.
+            # These timeout requests should be aborted to release prefill tree cache.
+            self.bootstrap_timeout = get_int_env_var(
+                "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 300
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.heartbeat_failures = {}
@@ -938,7 +941,12 @@ class MooncakeKVSender(BaseKVSender):
                 if self.init_time is not None:
                     now = time.time()
                     elapsed = now - self.init_time
-                    if elapsed >= self.kv_mgr.bootstrap_time_out:
+                    if elapsed >= self.kv_mgr.bootstrap_timeout:
+                        logger.warning_once(
+                            "Some requests timed out when bootstrapping, "
+                            "which means prefill instances fail to receive the KV indices from the decode instance of this request. "
+                            "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
+                        )
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,
                             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.Bootstrapping",
