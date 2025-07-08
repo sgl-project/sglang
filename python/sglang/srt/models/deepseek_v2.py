@@ -1757,10 +1757,14 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             acc_chunk_len += chunk_len
 
-            latent_cache = latent_cache_buf[
-                block_table[ibatch : ibatch + 1, :prefix_len]
-            ]
-
+            if latent_cache_buf.dtype in (torch.float8_e5m2, ):
+                latent_cache = latent_cache_buf.view(torch.uint8)[
+                    block_table[ibatch : ibatch + 1, :prefix_len]
+                ].view(latent_cache_buf.dtype).to(q_chunk.dtype)
+            else:
+                latent_cache = latent_cache_buf[
+                    block_table[ibatch : ibatch + 1, :prefix_len]
+                ]
             kv_a_normed, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
@@ -1875,9 +1879,14 @@ class DeepseekV2AttentionMLA(nn.Module):
             latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
                 self.attn_mha.layer_id
             )
-            latent_cache = latent_cache_buf[
-                forward_batch.prefix_chunk_kv_indices[i]
-            ].contiguous()
+            if latent_cache_buf.dtype in (torch.float8_e5m2,):
+                latent_cache = latent_cache_buf.view(torch.uint8)[
+                    forward_batch.prefix_chunk_kv_indices[i]
+                ].view(latent_cache_buf.dtype).to(q.dtype).contiguous()
+            else:
+                latent_cache = latent_cache_buf[
+                    forward_batch.prefix_chunk_kv_indices[i]
+                ].contiguous()
 
             kv_a_normed, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
