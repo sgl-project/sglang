@@ -70,6 +70,7 @@ class TeleChat2ForCausalLM(LlamaForCausalLM):
     }
 
     # Apply mappings
+    @staticmethod
     def remap_telechat2_name(name):
         for old_prefix, new_prefix in TeleChat2ForCausalLM.prefix_map.items():
             if name.startswith(old_prefix):
@@ -81,7 +82,7 @@ class TeleChat2ForCausalLM(LlamaForCausalLM):
 
         return name
 
-
+    @staticmethod
     def patch_config(config):
         if not hasattr(config, "intermediate_size") and hasattr(config, "ffn_hidden_size"):
             config.intermediate_size = config.ffn_hidden_size
@@ -134,7 +135,6 @@ class TeleChat2ForCausalLM(LlamaForCausalLM):
             ('gate_up_proj', 'up_proj', 1),
         ]
         params_dict = dict(self.named_parameters())
-        # loaded_params: set[str] = set()
         total_num_heads = self.config.n_head
         head_dim = self.config.hidden_size // total_num_heads
         for name, loaded_weight in weights:
@@ -160,16 +160,12 @@ class TeleChat2ForCausalLM(LlamaForCausalLM):
                 k_weight = torch.cat(k_weight, dim=0)
                 v_weight = torch.cat(v_weight, dim=0)
                 name = name.replace("key_value", "qkv_proj")
-                # if is_pp_missing_parameter(name, self):
-                #     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, k_weight, "k")
                 weight_loader(param, v_weight, "v")
             elif "query" in name:
                 name = name.replace("query", "qkv_proj")
-                # if is_pp_missing_parameter(name, self):
-                #     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, "q")
@@ -178,20 +174,12 @@ class TeleChat2ForCausalLM(LlamaForCausalLM):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    # if is_pp_missing_parameter(name, self):
-                    #     continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
                     break
                 else:
-                    # if is_pp_missing_parameter(name, self):
-                    #     continue
-                    # param = params_dict[name]
-                    # weight_loader = getattr(param, "weight_loader",
-                    #                         default_weight_loader)
-                    # weight_loader(param, loaded_weight)
-                    if name in params_dict.keys():
+                    if name in params_dict:
                         param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
@@ -199,8 +187,5 @@ class TeleChat2ForCausalLM(LlamaForCausalLM):
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-        #     loaded_params.add(name)
-        # return loaded_params
-
 
 EntryClass = [TeleChat2ForCausalLM]
