@@ -214,7 +214,7 @@ class MooncakeKVManager(BaseKVManager):
             # If a timeout happens on the decode side, it means decode instances
             # fail to receive the KV Cache transfer done signal after bootstrapping.
             # These timeout requests should be aborted to release the tree cache.
-            self.bootstrap_timeout = get_int_env_var(
+            self.waiting_timeout = get_int_env_var(
                 "SGLANG_DISAGGREGATION_WAITING_TIMEOUT", 300
             )
         else:
@@ -1247,7 +1247,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 if self.init_time is not None:
                     now = time.time()
                     elapsed = now - self.init_time
-                    if elapsed >= self.kv_mgr.bootstrap_timeout:
+                    if elapsed >= self.kv_mgr.waiting_timeout:
                         logger.warning_once(
                             "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
                             "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
