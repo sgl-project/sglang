@@ -714,6 +714,10 @@ class TokenizerManager:
                         and finish_reason.get("status_code")
                         == HTTPStatus.TOO_MANY_REQUESTS
                     ):
+                        # This is an abort request initiated by scheduler.
+                        # Delete the key to prevent resending abort request to the scheduler and
+                        # to remove aborted request state from the state dictionary.
+                        del self.rid_to_state[state.obj.rid]
                         raise fastapi.HTTPException(
                             status_code=finish_reason["status_code"],
                             detail=finish_reason["message"],
@@ -1598,19 +1602,30 @@ class TokenizerManager:
             self.crash_dump_request_list.popleft()
 
     def _handle_abort_req(self, recv_obj):
+        state = self.rid_to_state[recv_obj.rid]
+        state.finished = True
         if recv_obj.finished_reason:
-            state = self.rid_to_state[recv_obj.rid]
-            state.finished = True
-            state.out_list.append(
-                {
-                    "meta_info": {
-                        "id": recv_obj.rid,
-                        "finish_reason": recv_obj.finished_reason,
+            out = {
+                "meta_info": {
+                    "id": recv_obj.rid,
+                    "finish_reason": recv_obj.finished_reason,
+                },
+            }
+        else:
+            out = {
+                "text": "",
+                "meta_info": {
+                    "id": recv_obj.rid,
+                    "finish_reason": {
+                        "type": "abort",
+                        "message": "Abort before prefill",
                     },
-                }
-            )
-            state.event.set()
-        self.rid_to_state.pop(recv_obj.rid, None)
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                },
+            }
+        state.out_list.append(out)
+        state.event.set()
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(
