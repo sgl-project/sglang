@@ -144,18 +144,17 @@ class KimiVLForConditionalGeneration(nn.Module):
             .type(self.vision_tower.dtype)
             .to(self.vision_tower.device)
         )
-        image_grid_thws = torch.concat(
-            [item.image_grid_thws for item in items], dim=0
-        ).to(self.vision_tower.device)
-        image_features = self.vision_tower(pixel_values, image_grid_thws)
+        image_grid_hws = torch.cat([item.image_grid_hws for item in items], dim=0).to(
+            self.vision_tower.device
+        )
+        image_features = self.vision_tower(pixel_values, image_grid_hws)
         assert isinstance(image_features, list)
         # lengths = [x.shape[0] for x in image_features]
         res = self.multi_modal_projector(torch.cat(image_features))  # .split(lengths)
         return res
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        # Get all special token IDs
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens(mm_inputs.im_token_id)
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def forward(

@@ -21,6 +21,7 @@ def fused_moe_forward_native(
     renormalize: bool,
     topk_group: Optional[int] = None,
     num_expert_group: Optional[int] = None,
+    num_fused_shared_experts: int = 0,
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
     activation: str = "silu",
@@ -41,6 +42,7 @@ def fused_moe_forward_native(
         renormalize=renormalize,
         topk_group=topk_group,
         num_expert_group=num_expert_group,
+        num_fused_shared_experts=num_fused_shared_experts,
         custom_routing_function=custom_routing_function,
         correction_bias=correction_bias,
         routed_scaling_factor=routed_scaling_factor,
@@ -71,11 +73,19 @@ def moe_forward_native(
     renormalize: bool,
     topk_group: Optional[int] = None,
     num_expert_group: Optional[int] = None,
+    num_fused_shared_experts: int = 0,
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
     activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
+    inplace: bool = True,
+    no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
+
+    if apply_router_weight_on_input:
+        raise NotImplementedError()
+
     topk_weights, topk_ids = select_experts(
         hidden_states=x,
         router_logits=router_logits,
@@ -84,6 +94,7 @@ def moe_forward_native(
         renormalize=renormalize,
         topk_group=topk_group,
         num_expert_group=num_expert_group,
+        num_fused_shared_experts=num_fused_shared_experts,
         custom_routing_function=custom_routing_function,
         correction_bias=correction_bias,
         torch_native=True,
