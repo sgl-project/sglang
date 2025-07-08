@@ -74,11 +74,9 @@ class LoRAMemoryPool:
             weights_a, weights_b = get_normalized_lora_weight_names(
                 config.target_modules
             )
-            if not weights_a.issubset(
-                self.lora_weight_names[0]
-            ) or not weights_b.issubset(self.lora_weight_names[1]):
-                return False
-            return True
+            return weights_a.issubset(self.lora_weight_names[0]) and weights_b.issubset(
+                self.lora_weight_names[1]
+            )
 
         if isinstance(config, LoRAConfig):
             return _can_support(config)

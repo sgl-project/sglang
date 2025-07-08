@@ -226,7 +226,7 @@ class ForwardBatch:
     encoder_out_cache_loc: Optional[torch.Tensor] = None
 
     # For LoRA
-    lora_paths: Optional[Dict[str, str]] = None
+    lora_paths: Optional[List[str]] = None
 
     # For input embeddings
     input_embeds: Optional[torch.tensor] = None

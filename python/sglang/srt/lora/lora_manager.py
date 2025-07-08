@@ -409,7 +409,8 @@ class LoRAManager:
 
             if self.max_lora_rank is None:
                 self.max_lora_rank = max(
-                    [x.hf_config["r"] for x in self.configs.values()]
+                    [x.hf_config["r"] for x in self.configs.values()],
+                    default=0,
                 )
 
             self.update_lora_weight_names()
