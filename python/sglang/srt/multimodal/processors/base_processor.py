@@ -65,7 +65,6 @@ class MultimodalSpecialTokens:
         self.video_token = self.convert_to_str(self.video_token, processor)
         self.audio_token = self.convert_to_str(self.audio_token, processor)
 
-    @lru_cache(maxsize=16)
     def get_modality_of_token(self, token) -> Optional[Modality]:
         """
         :return: the modality associated with the given token, if the token is a special_token or matches with the multimodal token regex
@@ -96,7 +95,6 @@ class MultimodalSpecialTokens:
         if self.audio_token_regex is None and self.audio_token is not None:
             self.audio_token_regex = re.compile(re.escape(self.audio_token))
 
-    @lru_cache()
     def combine_regex(self) -> re.Pattern:
         tokens = [
             self.image_token_regex,
