@@ -13,7 +13,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -154,6 +154,7 @@ class PhiLayer(nn.Module):
         attn_outputs = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
+            forward_batch=forward_batch,
         )
         feed_forward_hidden_states = self.mlp(hidden_states)
         hidden_states = attn_outputs + feed_forward_hidden_states + residual
@@ -162,7 +163,12 @@ class PhiLayer(nn.Module):
 
 class PhiModel(nn.Module):
 
-    def __init__(self, config: PhiConfig, prefix: str = ""):
+    def __init__(
+        self,
+        config: PhiConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.config = config
         self.embed_tokens = VocabParallelEmbedding(
@@ -230,9 +236,6 @@ class PhiForCausalLM(nn.Module):
             quant_config=quant_config,
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors
-        )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -243,10 +246,12 @@ class PhiForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor]:
-        hidden_states = self.model(input_ids, positions, inputs_embeds)
+    ) -> LogitsProcessorOutput:
+        hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
 
-        return hidden_states
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
 
     def compute_logits(
         self,
