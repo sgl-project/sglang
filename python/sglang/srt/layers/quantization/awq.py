@@ -18,7 +18,9 @@ _is_hip = is_hip()
 if _is_cuda:
     from sgl_kernel import awq_dequantize
 elif _is_hip:
-    from sglang.srt.layers.quantization.awq_triton import awq_dequantize_triton
+    from sglang.srt.layers.quantization.awq_triton import (
+        awq_dequantize_triton as awq_dequantize,
+    )
 else:
     raise RuntimeError("Only CUDA and HIP support AWQ currently.")
 
@@ -200,12 +202,7 @@ class AWQLinearMethod(LinearMethodBase):
         pack_factor = self.quant_config.pack_factor
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
-        if _is_cuda:
-            out = awq_dequantize(qweight, scales, qzeros)
-        elif _is_hip:
-            out = awq_dequantize_triton(qweight, scales, qzeros)
-        else:
-            raise RuntimeError("Only CUDA and HIP support AWQ currently.")
+        out = awq_dequantize(qweight, scales, qzeros)
         out = torch.matmul(reshaped_x, out)
 
         if bias is not None:
