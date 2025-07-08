@@ -24,6 +24,7 @@ from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 
 from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
@@ -33,7 +34,6 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_janus_pro import DropPath
-from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.utils import logger
@@ -41,10 +41,7 @@ from sglang.utils import logger
 
 class InternAttention(nn.Module):
     def __init__(
-        self,
-        config,
-        quant_config: QuantizationConfig = None,
-        hf_version: bool = False
+        self, config, quant_config: QuantizationConfig = None, hf_version: bool = False
     ):
         super().__init__()
         self.config = config
@@ -83,7 +80,7 @@ class InternVLVisionPatchEmbeddings(nn.Module):
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=kernel_size,
-            stride=stride
+            stride=stride,
         )
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
@@ -183,7 +180,7 @@ class InternVisionEmbeddings(nn.Module):
         )
         embeddings = embeddings + position_embedding.to(target_dtype)
         return embeddings
-    
+
 
 class InternMLP(nn.Module):
     def __init__(self, config: PretrainedConfig):
@@ -213,7 +210,7 @@ class InternVisionEncoderLayer(nn.Module):
         config: PretrainedConfig,
         drop_path_rate: float,
         quant_config: QuantizationConfig = None,
-        hf_version: bool = False
+        hf_version: bool = False,
     ):
         super().__init__()
         self.embed_dim = config.hidden_size
@@ -231,16 +228,32 @@ class InternVisionEncoderLayer(nn.Module):
         self.hf_version = hf_version
         if hf_version:
             self.attention = InternAttention(config, hf_version=hf_version)
-            self.layernorm_before = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
-            self.layernorm_after = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
-            self.lambda_1 = nn.Parameter(config.initializer_factor * torch.ones(self.embed_dim))
-            self.lambda_2 = nn.Parameter(config.initializer_factor * torch.ones(self.embed_dim))
+            self.layernorm_before = NORM2FN[self.norm_type](
+                self.embed_dim, eps=config.layer_norm_eps
+            )
+            self.layernorm_after = NORM2FN[self.norm_type](
+                self.embed_dim, eps=config.layer_norm_eps
+            )
+            self.lambda_1 = nn.Parameter(
+                config.initializer_factor * torch.ones(self.embed_dim)
+            )
+            self.lambda_2 = nn.Parameter(
+                config.initializer_factor * torch.ones(self.embed_dim)
+            )
         else:
             self.attn = InternAttention(config, hf_version=hf_version)
-            self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
-            self.norm2 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
-            self.ls1 = nn.Parameter(config.initializer_factor * torch.ones(self.embed_dim))
-            self.ls2 = nn.Parameter(config.initializer_factor * torch.ones(self.embed_dim))
+            self.norm1 = NORM2FN[self.norm_type](
+                self.embed_dim, eps=config.layer_norm_eps
+            )
+            self.norm2 = NORM2FN[self.norm_type](
+                self.embed_dim, eps=config.layer_norm_eps
+            )
+            self.ls1 = nn.Parameter(
+                config.initializer_factor * torch.ones(self.embed_dim)
+            )
+            self.ls2 = nn.Parameter(
+                config.initializer_factor * torch.ones(self.embed_dim)
+            )
 
     def forward(
         self,
@@ -260,7 +273,7 @@ class InternVisionEncoderLayer(nn.Module):
             norm1 = self.layernorm_before
             ls1 = self.lambda_1
             norm2 = self.layernorm_after
-            ls2 = self.lambda_2  
+            ls2 = self.lambda_2
         else:
             attn = self.attn
             norm1 = self.norm1
@@ -269,7 +282,8 @@ class InternVisionEncoderLayer(nn.Module):
             ls2 = self.ls2
 
         hidden_states = hidden_states + self.drop_path1(
-            attn(norm1(hidden_states).to(hidden_states.dtype), cu_seqlens=cu_seqlens) * ls1
+            attn(norm1(hidden_states).to(hidden_states.dtype), cu_seqlens=cu_seqlens)
+            * ls1
         )
 
         hidden_states = hidden_states + self.drop_path2(
@@ -293,11 +307,11 @@ class InternVisionEncoder(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        hf_version=False
+        hf_version=False,
     ):
         super().__init__()
         self.config = config
-        if not hasattr(config, 'drop_path_rate'):
+        if not hasattr(config, "drop_path_rate"):
             config.drop_path_rate = 0
         # stochastic depth decay rule
         dpr = [
@@ -306,11 +320,13 @@ class InternVisionEncoder(nn.Module):
         ]
         layers = nn.ModuleList(
             [
-                InternVisionEncoderLayer(config, dpr[idx], quant_config, hf_version=hf_version)
+                InternVisionEncoderLayer(
+                    config, dpr[idx], quant_config, hf_version=hf_version
+                )
                 for idx in range(config.num_hidden_layers)
             ]
         )
-        
+
         self.hf_version = hf_version
         if hf_version:
             self.layer = layers
@@ -378,14 +394,12 @@ class InternVisionModel(PreTrainedModel):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        hf_version: bool = False
+        hf_version: bool = False,
     ):
         super().__init__(config)
         self.config = config
 
-        self.embeddings = InternVisionEmbeddings(
-            config, hf_version=hf_version
-        )
+        self.embeddings = InternVisionEmbeddings(config, hf_version=hf_version)
         self.encoder = InternVisionEncoder(config, quant_config, hf_version=hf_version)
 
     def resize_pos_embeddings(self, old_size, new_size, patch_size):
@@ -469,12 +483,17 @@ class InternVisionModel(PreTrainedModel):
 class InternVLMultiModalProjector(nn.Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
-        self.layer_norm = nn.LayerNorm(config.vision_config.hidden_size * int(1 / config.downsample_ratio) ** 2)
+        self.layer_norm = nn.LayerNorm(
+            config.vision_config.hidden_size * int(1 / config.downsample_ratio) ** 2
+        )
         self.linear_1 = nn.Linear(
-            config.vision_config.hidden_size * int(1 / config.downsample_ratio) ** 2, config.text_config.hidden_size
+            config.vision_config.hidden_size * int(1 / config.downsample_ratio) ** 2,
+            config.text_config.hidden_size,
         )
         self.act = ACT2FN[config.projector_hidden_act]
-        self.linear_2 = nn.Linear(config.text_config.hidden_size, config.text_config.hidden_size)
+        self.linear_2 = nn.Linear(
+            config.text_config.hidden_size, config.text_config.hidden_size
+        )
 
     def forward(self, image_features):
         hidden_states = self.layer_norm(image_features)
@@ -482,7 +501,7 @@ class InternVLMultiModalProjector(nn.Module):
         hidden_states = self.act(hidden_states)
         hidden_states = self.linear_2(hidden_states)
         return hidden_states
-    
+
 
 class InternVLChatModel(nn.Module):
     def __init__(
@@ -490,7 +509,7 @@ class InternVLChatModel(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         use_flash_attn=True,
-        hf_version=False
+        hf_version=False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -538,16 +557,21 @@ class InternVLChatModel(nn.Module):
 
         vit_hidden_size = config.vision_config.hidden_size
         llm_hidden_size = config.llm_config.hidden_size
-        
+
         if hf_version:
             self.multi_modal_projector = InternVLMultiModalProjector(config)
-            self.vision_tower = InternVisionModel(config.vision_config, hf_version=hf_version)
+            self.vision_tower = InternVisionModel(
+                config.vision_config, hf_version=hf_version
+            )
         else:
-            self.vision_model = InternVisionModel(config.vision_config, hf_version=hf_version)
+            self.vision_model = InternVisionModel(
+                config.vision_config, hf_version=hf_version
+            )
             self.mlp1 = nn.Sequential(
                 nn.LayerNorm(vit_hidden_size * int(1 / self.downsample_ratio) ** 2),
                 nn.Linear(
-                    vit_hidden_size * int(1 / self.downsample_ratio) ** 2, llm_hidden_size
+                    vit_hidden_size * int(1 / self.downsample_ratio) ** 2,
+                    llm_hidden_size,
                 ),
                 nn.GELU(),
                 nn.Linear(llm_hidden_size, llm_hidden_size),
@@ -582,7 +606,7 @@ class InternVLChatModel(nn.Module):
         else:
             vision_model = self.vision_model
             mlp1 = self.mlp1
-            
+
         if self.select_layer == -1:
             vit_embeds = vision_model(
                 pixel_values=pixel_values, output_hidden_states=False, return_dict=True
@@ -727,7 +751,4 @@ class InternVLForConditionalGeneration(InternVLChatModel):
         super().__init__(config, quant_config, use_flash_attn, hf_version=True)
 
 
-EntryClass = [
-    InternVLChatModel, 
-    InternVLForConditionalGeneration
-]
+EntryClass = [InternVLChatModel, InternVLForConditionalGeneration]

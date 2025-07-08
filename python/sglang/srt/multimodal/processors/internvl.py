@@ -6,7 +6,10 @@ from decord import VideoReader, cpu
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.models.internvl import InternVLChatModel, InternVLForConditionalGeneration
+from sglang.srt.models.internvl import (
+    InternVLChatModel,
+    InternVLForConditionalGeneration,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -24,7 +27,9 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             patch_size = hf_config.vision_config.patch_size[0]
             tokenizer = self._processor.tokenizer
         else:
-            image_size = hf_config.force_image_size or hf_config.vision_config.image_size
+            image_size = (
+                hf_config.force_image_size or hf_config.vision_config.image_size
+            )
             patch_size = hf_config.vision_config.patch_size
             tokenizer = self._processor
 
