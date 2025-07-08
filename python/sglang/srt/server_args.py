@@ -133,6 +133,8 @@ class ServerArgs:
     preferred_sampling_params: Optional[str] = None
 
     # LoRA
+    max_lora_rank: Optional[int] = None
+    lora_target_modules: Optional[List[str]] = None
     lora_paths: Optional[Union[dict[str, str], List[str]]] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
@@ -1097,6 +1099,28 @@ class ServerArgs:
         )
 
         # LoRA
+        parser.add_argument(
+            "--max-lora-rank",
+            default=ServerArgs.max_lora_rank,
+            type=int,
+            help="The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+        )
+        parser.add_argument(
+            "--lora-target-modules",
+            type=str,
+            choices=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+            nargs="*",
+            default=None,
+            help="The list of target modules to apply LoRA to when the corresponding weights are available in the adapter. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+        )
         parser.add_argument(
             "--lora-paths",
             type=str,
