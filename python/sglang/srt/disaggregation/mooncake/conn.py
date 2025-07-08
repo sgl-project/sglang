@@ -41,6 +41,7 @@ from sglang.srt.utils import (
     get_ip,
     get_local_ip_auto,
     is_valid_ipv6_address,
+    maybe_wrap_ipv6_address,
 )
 
 logger = logging.getLogger(__name__)
@@ -482,15 +483,14 @@ class MooncakeKVManager(BaseKVManager):
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
-        is_ipv6 = False
-        colon_count = remote.count(":")
-        if colon_count == 1 or colon_count == 8:
-            remote = remote.rsplit(":", 1)[0]
-        if is_valid_ipv6_address(remote):
-            remote = "[" + remote + "]"
-            is_ipv6 = True
+        remote = maybe_wrap_ipv6_address(remote)
+
+        if ":" in remote:
+            if not remote.endswith("]"):
+                remote = remote.rsplit(":", 1)[0]
+
         self._connect(
-            "tcp://" + remote + ":" + str(dst_port), is_ipv6=is_ipv6
+            f"tcp://{remote}:{dst_port}", is_ipv6=remote.startswith("[")
         ).send_multipart(
             [
                 str(room).encode("ascii"),
@@ -845,14 +845,18 @@ class MooncakeKVManager(BaseKVManager):
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
-            if self.dist_init_addr[0] == "[":  # [ipv6]:port
-                ip_address, _ = self.dist_init_addr.rsplit(":", 1)
+            if self.dist_init_addr[0] == "[":  # [ipv6]:port or [ipv6]
+                if not self.dist_init_addr.endswith("]"):
+                    host, _ = self.dist_init_addr.rsplit(":", 1)
+                else:
+                    host = self.dist_init_addr
             else:
-                ip_address = socket.gethostbyname(self.dist_init_addr.split(":")[0])
+                host = socket.gethostbyname(self.dist_init_addr.rsplit(":", 1)[0])
         else:
-            ip_address = get_ip()
+            host = get_ip()
+            host = maybe_wrap_ipv6_address(host)
 
-        bootstrap_server_url = f"{ip_address}:{self.bootstrap_port}"
+        bootstrap_server_url = f"{host}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
         payload = {
             "role": "Prefill",

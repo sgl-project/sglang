@@ -16,7 +16,12 @@ from torch.distributed import ProcessGroup
 from zmq import IPV6  # type: ignore
 from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
 
-from sglang.srt.utils import get_ip, get_open_port, is_valid_ipv6_address
+from sglang.srt.utils import (
+    get_ip,
+    get_open_port,
+    is_valid_ipv6_address,
+    maybe_wrap_ipv6_address,
+)
 
 # SGLANG_RINGBUFFER_WARNING_INTERVAL can be set to 60
 SGLANG_RINGBUFFER_WARNING_INTERVAL = int(
@@ -225,9 +230,7 @@ class MessageQueue:
             remote_subscribe_port = get_open_port()
             if is_valid_ipv6_address(connect_ip):
                 self.remote_socket.setsockopt(IPV6, 1)
-                remote_subscribe_host = f"[{connect_ip}]"
-            else:
-                remote_subscribe_host = connect_ip
+            remote_subscribe_host = maybe_wrap_ipv6_address(connect_ip)
             socket_addr = f"tcp://{remote_subscribe_host}:{remote_subscribe_port}"
             self.remote_socket.bind(socket_addr)
 
