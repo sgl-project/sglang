@@ -1,7 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/quant_utils.py
 
 from types import MappingProxyType
-from typing import List, Mapping, Tuple, Union
+from typing import List, Mapping, Tuple, Union, Optional, NamedTuple
 
 import torch
 
@@ -20,6 +20,65 @@ _is_cpu = is_cpu()
 if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
     from vllm._custom_ops import scaled_fp8_quant
 
+class DeviceCapability(NamedTuple):
+    major: int
+    minor: int
+
+    def as_version_str(self) -> str:
+        return f"{self.major}.{self.minor}"
+
+    def to_int(self) -> int:
+        """
+        Express device capability as an integer ``<major><minor>``.
+
+        It is assumed that the minor version is always a single digit.
+        """
+        assert 0 <= self.minor < 10
+        return self.major * 10 + self.minor
+
+def verify_marlin_supported(quant_type: ScalarType,
+                            group_size: int,
+                            has_zp: bool = False) -> None:
+    cond, err_msg = _check_marlin_supported(quant_type, group_size, has_zp)
+    if not cond:
+        assert err_msg is not None
+        raise ValueError(err_msg)
+
+# For binary size and compile time, we don't support the same types for with and
+#  without runtime zero-point. We support common cases, i.e. AWQ and GPTQ.
+#  TODO: we may want to move this into the C++ so its closer to the actual impl
+def query_marlin_supported_quant_types(
+    has_zp: Optional[bool] = None,
+    include_fp_type: bool = True,
+    device_capability: Optional[int] = None,
+):
+    if device_capability is None:
+        capability_tuple = current_platform.get_device_capability()
+        device_capability = (-1 if capability_tuple is None else
+                             capability_tuple.to_int())
+
+    if device_capability < 80:
+        return []
+
+    # - has_zp is True: return quant_types that has zero points
+    # - has_zp is False: return quant_types that has not zero points
+    # - has_zp is None: both
+    if has_zp is None:
+        types0 = query_marlin_supported_quant_types(False, include_fp_type,
+                                                    device_capability)
+        types1 = query_marlin_supported_quant_types(True, include_fp_type,
+                                                    device_capability)
+        return types0 + types1
+
+    if has_zp:
+        # AWQ style, unsigned + runtime zero-point
+        return [scalar_types.uint4]
+    else:
+        # GPTQ style, unsigned + symmetric bias
+        res = [scalar_types.uint4b8, scalar_types.uint8b128]
+        if include_fp_type:
+            res += [scalar_types.float8_e4m3fn, scalar_types.float4_e2m1f]
+        return res
 
 def is_layer_skipped(
     prefix: str,
@@ -167,7 +226,7 @@ def _check_marlin_supported(
         device_capability: Optional[int] = None) -> tuple[bool, Optional[str]]:
 
     if device_capability is None:
-        capability_tuple = current_platform.get_device_capability()
+        capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
         device_capability = (-1 if capability_tuple is None else
                              capability_tuple.to_int())
 
