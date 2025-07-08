@@ -170,8 +170,7 @@ suites = {
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
     ],
     "per-commit-4-deepep": [
-        TestFile("test_deepep_intranode.py", 50),
-        TestFile("test_deepep_low_latency.py", 50),
+        TestFile("test_hybrid_dp_ep.py", 50),
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
