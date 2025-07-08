@@ -196,7 +196,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 param_data,
                 loaded_weight,
                 0,  # param_data_start
-                tp_rank * shard_size,
+                shard_id * shard_size,
                 self.output_dim,
                 shard_size,
                 not use_presharded_weights,
@@ -204,7 +204,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         else:
             if not use_presharded_weights:
                 loaded_weight = loaded_weight.narrow(
-                    self.output_dim, tp_rank * shard_size, shard_size
+                    self.output_dim, shard_id * shard_size, shard_size
                 )
 
         assert (
