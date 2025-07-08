@@ -4,7 +4,7 @@ set -euxo pipefail
 
 bash scripts/ci_install_dependency.sh
 
-if python -c "import deep_ep" >/dev/null 2>&1; then
+if python3 -c "import deep_ep" >/dev/null 2>&1; then
     echo "deep_ep is already installed or importable. Skipping installation."
     exit 0
 fi
