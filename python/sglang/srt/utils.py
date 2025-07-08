@@ -2761,7 +2761,8 @@ def lru_cache_frozenset(maxsize=128):
 
 def apply_module_patch(target_module, target_function, wrappers):
     original_module, original_function = parse_module_path(
-        target_module, target_function, False)
+        target_module, target_function, False
+    )
 
     original_function_id = id(original_function)
 
@@ -2772,10 +2773,11 @@ def apply_module_patch(target_module, target_function, wrappers):
         setattr(original_module, target_function, candidate)
 
     for key, value in sys.modules.copy().items():
-        if (target_function is not None
+        if (
+            target_function is not None
             and hasattr(value, target_function)
-            and id(getattr(value,
-                           target_function)) == original_function_id):
+            and id(getattr(value, target_function)) == original_function_id
+        ):
             setattr(value, target_function, candidate)
 
 
@@ -2796,8 +2798,7 @@ def parse_module_path(module_path, function_name, create_dummy):
         """Create dummy function that raises when called"""
 
         def placeholder(*args, **kwargs):
-            raise NotImplementedError(
-                f"Function {func_name} is a placeholder")
+            raise NotImplementedError(f"Function {func_name} is a placeholder")
 
         placeholder.__name__ = func_name
         return placeholder
@@ -2807,23 +2808,20 @@ def parse_module_path(module_path, function_name, create_dummy):
     processed_path = []
 
     for idx, part in enumerate(modules):
-        current_path = ".".join(modules[:idx + 1])
+        current_path = ".".join(modules[: idx + 1])
         parent_path = ".".join(modules[:idx]) if idx > 0 else None
 
         try:
             current_module = importlib.import_module(current_path)
         except ModuleNotFoundError:
             # Handle missing module
-            parent = importlib.import_module(
-                parent_path) if parent_path else None
+            parent = importlib.import_module(parent_path) if parent_path else None
             if parent and hasattr(parent, part):
                 # Use existing attribute from parent
                 current_module = getattr(parent, part)
                 # Check for early function resolution
-                if function_name and hasattr(current_module,
-                                             function_name):
-                    return current_module, getattr(current_module,
-                                                   function_name)
+                if function_name and hasattr(current_module, function_name):
+                    return current_module, getattr(current_module, function_name)
                 if function_name and create_dummy:
                     ph_func = create_placeholder_function(function_name)
                     setattr(current_module, function_name, ph_func)
@@ -2838,8 +2836,10 @@ def parse_module_path(module_path, function_name, create_dummy):
                 # Create and register dummy module
                 current_module = create_dummy_module(
                     current_path,
-                    parent=importlib.import_module(parent_path)
-                    if parent_path else None)
+                    parent=(
+                        importlib.import_module(parent_path) if parent_path else None
+                    ),
+                )
 
         processed_path.append(part)
 

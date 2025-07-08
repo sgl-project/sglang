@@ -162,7 +162,10 @@ def _initialize_model(
     model_class, _ = get_model_architecture(model_config)
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
     if is_npu():
-        packed_modules_mapping["fused_qkv_a_proj_with_mqa"] = ["q_a_proj", "kv_a_proj_with_mqa"]
+        packed_modules_mapping["fused_qkv_a_proj_with_mqa"] = [
+            "q_a_proj",
+            "kv_a_proj_with_mqa",
+        ]
         packed_modules_mapping["qkv_proj"] = ["q_proj", "k_proj", "v_proj"]
         packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
     quant_config = _get_quantization_config(

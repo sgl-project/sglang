@@ -37,7 +37,7 @@ import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, next_power_of_2
 
 logger = logging.getLogger(__name__)
 
