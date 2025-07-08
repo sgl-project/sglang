@@ -60,9 +60,9 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         )
 
         # Handle image resolutions and aspect ratios
-        if "pixel_values" not in processor_output: # no image processed
+        if "pixel_values" not in processor_output:  # no image processed
             return None
-    
+
         image_processor = processor.image_processor
         tokenizer = self._processor.tokenizer
 
