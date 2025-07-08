@@ -862,6 +862,7 @@ class SlowDownReqOutput:
     pass
 
 
+@dataclass
 class AbortReq:
     # The request id
     rid: str = ""
