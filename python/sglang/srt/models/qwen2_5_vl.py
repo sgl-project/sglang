@@ -496,7 +496,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        print(f"{items=}")
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
             self.visual.dtype

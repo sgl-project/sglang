@@ -6,7 +6,6 @@ from typing import List, Union
 
 import torch
 import torchvision
-from decord import VideoReader
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 
@@ -258,11 +257,8 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
         mm_items, input_ids, ret = self.process_and_combine_mm_data(base_output)
 
-        if not mm_items:
-            # Note(Xinyuan): This is the case where image loading fails.
-            return None
 
-        input_ids = ret["input_ids"].flatten()
+        input_ids = input_ids.flatten()
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.IM_TOKEN_ID,

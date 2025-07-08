@@ -6,8 +6,6 @@ python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_multi_
 
 import unittest
 
-from test_vision_openai_server_common import *
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -15,6 +13,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+from test_vision_openai_server_common import *
 
 
 class TestQwen2VLServer(TestOpenAIVisionServer):
@@ -34,6 +33,9 @@ class TestQwen2VLServer(TestOpenAIVisionServer):
             ],
         )
         cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        self._test_video_chat_completion()
 
 
 class TestQwen2_5_VLServer(TestOpenAIVisionServer):
