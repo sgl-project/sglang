@@ -105,3 +105,12 @@ $ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 ---di
 # decode 1
 $ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 ---disaggregation-transfer-backend nixl --disaggregation-mode decode --host ${local_ip} --port 30001 --trust-remote-code --dist-init-addr ${decode_master_ip}:5000 --nnodes 2 --node-rank 1 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode low_latency --mem-fraction-static 0.8 --max-running-requests 128
 ```
+
+## How to Tune the Ratio Between Prefill and Decode Nodes
+The process can be broken down into the following steps:
+1. First, measure the offline throughput of the prefill and decode nodes individually. For detailed instructions on how to conduct the tests, refer to this [guide](https://github.com/sgl-project/sglang/issues/6017#issue-3038593336)
+2. In many online serving scenarios, there are latency constraints in terms of **Time to First Token**(TTFT) and **Time Per Output Token** (TPOT). It is necessary to adjust the server arguments (server_args) for both prefill and decode nodes.
+    + **Prefill**: It is recommended to increase ratio between `--tp-size` and `--dp-size` or decrease `--chunked-prefill-size` until the TTFT meets the requirement.
+    + **Decode**: It is recommended to increase ratio between `--tp-size` and `--dp-size` or decrease `--max-running-requests` until the TPOT meets the requirement.
+3. Calculate the request processing rate of prefill and decode separately. The prefill request processing rate can be approximated as `prefill_throughput/input_length` and the decode request processing rate as `decode_throughput/output_length`
+4. The ratio between the number of prefill and decode nodes should be set based on the ratio of decode request processing rate to prefill request processing rate.
