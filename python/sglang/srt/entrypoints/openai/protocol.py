@@ -308,9 +308,9 @@ class ToolCall(BaseModel):
     def _serialize(self, handler):
         data = handler(self)
         # Remove all None fields
-        for field in ["id", "index"]:
-            if getattr(self, field) is None:
-                data.pop(field, None)
+        for field_name in self.__class__.model_fields:
+            if getattr(self, field_name) is None:
+                data.pop(field_name, None)
         return data
 
 
@@ -473,9 +473,9 @@ class ChatMessage(BaseModel):
     def _serialize(self, handler):
         data = handler(self)
         # Remove all None fields
-        for field in ["tool_calls", "reasoning_content"]:
-            if getattr(self, field) is None:
-                data.pop(field, None)
+        for field_name in self.__class__.model_fields:
+            if getattr(self, field_name) is None:
+                data.pop(field_name, None)
         return data
 
 
@@ -519,9 +519,9 @@ class DeltaMessage(BaseModel):
     def _serialize(self, handler):
         data = handler(self)
         # Remove all None fields
-        for field in ["tool_calls", "reasoning_content", "hidden_states"]:
-            if getattr(self, field) is None:
-                data.pop(field, None)
+        for field_name in self.__class__.model_fields:
+            if getattr(self, field_name) is None:
+                data.pop(field_name, None)
         return data
 
 
