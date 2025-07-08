@@ -160,6 +160,7 @@ class ServerArgs:
     enable_flashinfer_moe: bool = False
     enable_flashinfer_allreduce_fusion: bool = False
     enable_flashinfer_fp4_allgather: bool = False
+    enable_flashinfer_alltoall: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -268,6 +269,12 @@ class ServerArgs:
             assert (
                 self.enable_flashinfer_moe and self.enable_ep_moe and self.dp_size > 1
             ), "FP4 all-gather requires --enable-flashinfer-moe, --enable-ep-moe, and dp_size > 1"
+            assert not self.enable_flashinfer_alltoall, "Not compatible"
+        if self.enable_flashinfer_alltoall:
+            assert (
+                self.enable_flashinfer_moe and self.enable_ep_moe and self.dp_size > 1
+            ), "Flashinfer all-to-all requires --enable-flashinfer-moe, --enable-ep-moe, and dp_size > 1"
+            assert not self.enable_flashinfer_fp4_allgather, "Not compatible"
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -1241,6 +1248,11 @@ class ServerArgs:
             "--enable-flashinfer-fp4-allgather",
             action="store_true",
             help="Quantize before all-gather when using DP with flashinfer MOE EP",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-alltoall",
+            action="store_true",
+            help="Use flashinfer MNNVL AllToAll when using DP with flashinfer MOE EP",
         )
         parser.add_argument(
             "--enable-deepep-moe",

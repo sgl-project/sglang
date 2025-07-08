@@ -346,6 +346,7 @@ class DeepseekV2MoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if global_server_args_dict["enable_deepep_moe"]
                     or global_server_args_dict["enable_flashinfer_fp4_allgather"]
+                    or global_server_args_dict["enable_flashinfer_alltoall"]
                     else {}
                 ),
             )
@@ -449,9 +450,10 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states = final_hidden_states + shared_output
-        if (
-            self.tp_size > 1
-            and not global_server_args_dict["enable_flashinfer_fp4_allgather"]
+        if self.tp_size > 1 and not (
+            global_server_args_dict["enable_flashinfer_fp4_allgather"]
+            # TODO: do we need allreduce
+            or global_server_args_dict["enable_flashinfer_alltoall"]
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -482,9 +484,10 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-        if (
-            self.tp_size > 1
-            and not global_server_args_dict["enable_flashinfer_fp4_allgather"]
+        if self.tp_size > 1 and not (
+            global_server_args_dict["enable_flashinfer_fp4_allgather"]
+            # TODO: do we need allreduce
+            or global_server_args_dict["enable_flashinfer_alltoall"]
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states

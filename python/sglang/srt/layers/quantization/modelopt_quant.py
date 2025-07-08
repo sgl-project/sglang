@@ -780,7 +780,9 @@ class ModelOptNvFp4FusedMoEMethod:
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         enable_flashinfer_fp4_allgather: Optional[bool] = None,
+        enable_flashinfer_alltoall: Optional[bool] = None,
         global_num_tokens_cpu: Optional[List[int]] = None,
+        num_experts: Optional[int] = None,
     ) -> torch.Tensor:
 
         assert activation == "silu", "Only SiLU activation is supported."
@@ -812,6 +814,26 @@ class ModelOptNvFp4FusedMoEMethod:
             # and fp4 quantized weights loaded from the checkpoint
             output_dtype = x.dtype
             x_sf = None
+            alltoall_info = None
+            token_count = None
+
+            if enable_flashinfer_alltoall:
+                from sglang.srt.layers.flashinfer_comm_fusion import (
+                    flashinfer_alltoall_dispatch,
+                )
+
+                token_count = x.shape[0]
+                x, topk_ids, topk_weights, alltoall_info = flashinfer_alltoall_dispatch(
+                    global_num_tokens_cpu,
+                    x,
+                    topk_ids,
+                    topk_weights,
+                    top_k,
+                    num_experts,
+                    ep_rank,
+                    ep_size,
+                )
+
             if enable_flashinfer_fp4_allgather:
                 # Quantize before comm, swizzle after.
                 x_col = x.shape[1]
@@ -859,8 +881,22 @@ class ModelOptNvFp4FusedMoEMethod:
             )
             output = output[0]
 
+            if enable_flashinfer_alltoall:
+                from sglang.srt.layers.flashinfer_comm_fusion import (
+                    flashinfer_alltoall_combine,
+                )
+
+                return flashinfer_alltoall_combine(
+                    output,
+                    alltoall_info,
+                    ep_rank=ep_rank,
+                    ep_size=ep_size,
+                    top_k=top_k,
+                    token_count=token_count,
+                )
+
             if enable_flashinfer_fp4_allgather:
-                output = parallel_state.get_tp_group().reduce_scatterv(
+                return parallel_state.get_tp_group().reduce_scatterv(
                     output, sizes=global_num_tokens_cpu
                 )
 

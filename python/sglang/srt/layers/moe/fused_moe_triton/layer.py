@@ -915,7 +915,11 @@ class FusedMoE(torch.nn.Module):
                     ep_rank=self.ep_rank,
                     ep_size=self.ep_size,
                     enable_flashinfer_fp4_allgather=self.enable_flashinfer_fp4_allgather,
+                    enable_flashinfer_alltoall=global_server_args_dict[
+                        "enable_flashinfer_alltoall"
+                    ],
                     global_num_tokens_cpu=forward_batch.global_num_tokens_cpu,
+                    num_experts=self.num_experts,
                 )
                 if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod"
                 else {}
