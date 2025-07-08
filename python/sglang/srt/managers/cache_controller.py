@@ -24,9 +24,8 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
-    from sglang.srt.mem_cache.hicache_storage import HiCacheFile
 
-from sglang.srt.mem_cache.hicache_storage import get_hash_str
+from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
 
 logger = logging.getLogger(__name__)
 
@@ -216,7 +215,7 @@ class HiCacheController:
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
-        prefetch_threshold: int = 1000,
+        prefetch_threshold: int = 256,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -234,17 +233,20 @@ class HiCacheController:
         else:
             self.io_backend = io_backend
 
+        self.enable_storage = False
         # todo: move backend initialization to storage backend module
-        if storage_backend == "file":
-            self.storage_backend = HiCacheFile()
-            # tracking prefetch operation progress
-            self.ongoing_prefetch: dict[int, PrefetchOperation] = {}
-            # todo: threshold policy for prefetching
-            self.prefetch_threshold = prefetch_threshold
-        else:
-            raise NotImplementedError(
-                f"Unsupported storage backend: {self.storage_backend}"
-            )
+        if storage_backend is not None:
+            if storage_backend == "file":
+                self.storage_backend = HiCacheFile()
+                self.enable_storage = True
+                # tracking prefetch operation progress
+                self.ongoing_prefetch: dict[int, PrefetchOperation] = {}
+                # todo: threshold policy for prefetching
+                self.prefetch_threshold = prefetch_threshold
+            else:
+                raise NotImplementedError(
+                    f"Unsupported storage backend: {storage_backend}"
+                )
 
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
@@ -282,7 +284,7 @@ class HiCacheController:
         self.write_thread.start()
         self.load_thread.start()
 
-        if self.storage_backend is not None:
+        if self.enable_storage:
             self.prefetch_thread = threading.Thread(
                 target=self.prefetch_thread_func, daemon=True
             )
@@ -309,7 +311,7 @@ class HiCacheController:
         self.load_buffer.clear()
         self.ack_write_queue.queue.clear()
         self.ack_load_queue.queue.clear()
-        if self.storage_backend is not None:
+        if self.enable_storage:
             self.prefetch_thread.join()
             self.backup_thread.join()
             self.prefetch_queue.queue.clear()
@@ -327,7 +329,7 @@ class HiCacheController:
         self.write_thread.start()
         self.load_thread.start()
 
-        if self.storage_backend is not None:
+        if self.enable_storage:
             self.prefetch_thread = threading.Thread(
                 target=self.prefetch_thread_func, daemon=True
             )
@@ -511,8 +513,15 @@ class HiCacheController:
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 for h in operation.hash_value:
+                    page_data = self.storage_backend.get(h)
+                    if page_data is None:
+                        logger.warning(
+                            f"Prefetch operation {operation.request_id} failed to retrieve page {h}."
+                        )
+                        break
                     self.mem_pool_host.set_from_flat_data_page(
-                        self.storage_backend.get(h)
+                        operation.host_indices[operation.completed_tokens],
+                        page_data,
                     )
                     if operation.is_done():
                         # operation terminated by controller, release pre-allocated memory
@@ -550,17 +559,21 @@ class HiCacheController:
                         ],
                         last_hash,
                     )
-                    if not self.storage_backend.exists(last_hash):
-                        if storage_hit_count < self.prefetch_threshold:
-                            # not to prefetch if not enough benefits
-                            self.prefetch_revoke_queue.put(operation.request_id)
-                            break
-                    else:
+                    if self.storage_backend.exists(last_hash):
                         storage_hit_count += self.page_size
-                    hash_value.append(last_hash)
-                    remaining_tokens -= self.page_size
+                        hash_value.append(last_hash)
+                        remaining_tokens -= self.page_size
+                    else:
+                        break
+
+                if storage_hit_count < self.prefetch_threshold:
+                    # not to prefetch if not enough benefits
+                    self.prefetch_revoke_queue.put(operation.request_id)
                 else:
                     operation.hash_value = hash_value
+                    logger.debug(
+                        f"Prefetching {len(hash_value)} pages for request {operation.request_id}."
+                    )
                     self.prefetch_buffer.put(operation)
 
             except Empty:
@@ -600,7 +613,7 @@ class HiCacheController:
                     self.storage_backend.set(
                         last_hash,
                         self.mem_pool_host.get_flat_data_page(
-                            operation.operation.host_indices[i]
+                            operation.host_indices[i]
                         ),
                     )
                     operation.completed_tokens += self.page_size

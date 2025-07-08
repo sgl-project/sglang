@@ -1221,7 +1221,7 @@ class Scheduler(
         else:
             if self.enable_hicache_storage:
                 req.init_next_round_input(self.tree_cache)
-                last_hash = req.last_host_node.last_hash_value()
+                last_hash = req.last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 if (matched_len > 0 and last_hash is not None) or matched_len == 0:
                     new_input_tokens = req.fill_ids[matched_len:]

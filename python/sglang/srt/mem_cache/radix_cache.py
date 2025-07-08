@@ -89,7 +89,7 @@ class TreeNode:
         else:
             raise RuntimeError("Host reference counter is already zero.")
 
-    def last_hash_value(self) -> Optional[int]:
+    def get_last_hash_value(self) -> Optional[int]:
         """Returns the hash value of the last page in this node."""
         if self.hash_value is None or len(self.hash_value) == 0:
             return None

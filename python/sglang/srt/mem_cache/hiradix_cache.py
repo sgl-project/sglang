@@ -52,7 +52,7 @@ class HiRadixCache(RadixCache):
         self.tp_group = tp_cache_group
         self.enable_storage = hicache_storage_backend is not None
         # todo: customizable storage prefetch threshold
-        self.prefetch_threshold = 1000
+        self.prefetch_threshold = 256
 
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
@@ -120,7 +120,7 @@ class HiRadixCache(RadixCache):
 
     def write_backup_storage(self, node: TreeNode):
         operation_id = self.cache_controller.write_storage(
-            node.host_value, node.key, node.parent.last_hash_value
+            node.host_value, node.key, node.parent.get_last_hash_value()
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
@@ -136,8 +136,10 @@ class HiRadixCache(RadixCache):
                 self.write_backup(node)
         else:
             if (
-                not node.backuped_storage
-            ) and node.hit_count >= self.write_through_threshold_storage:
+                self.enable_storage
+                and (not node.backuped_storage)
+                and node.hit_count >= self.write_through_threshold_storage
+            ):
                 # if the node is backuped on host memory but not on storage
                 self.write_backup_storage(node)
 
@@ -360,10 +362,11 @@ class HiRadixCache(RadixCache):
             )
         for _ in range(queue_size.item()):
             req_id = self.cache_controller.prefetch_revoke_queue.get()
-            last_host_node, _, host_indices = self.outstanding_prefetch[req_id]
-            last_host_node.release_host()
-            self.cache_controller.mem_pool_host.free(host_indices)
-            del self.outstanding_prefetch[req_id]
+            if req_id in self.outstanding_prefetch:
+                last_host_node, _, host_indices = self.outstanding_prefetch[req_id]
+                last_host_node.release_host()
+                self.cache_controller.mem_pool_host.free(host_indices)
+                del self.outstanding_prefetch[req_id]
 
     def check_backup_progress(self):
         queue_size = torch.tensor(
@@ -378,7 +381,7 @@ class HiRadixCache(RadixCache):
             )
         for _ in range(queue_size.item()):
             ack_id, hash_value = self.cache_controller.ack_backup_queue.get()
-            self.ongoing_backup[ack_id].host_value = hash_value
+            self.ongoing_backup[ack_id].hash_value = hash_value
             self.ongoing_backup[ack_id].release_host()
             del self.ongoing_backup[ack_id]
 
@@ -388,6 +391,7 @@ class HiRadixCache(RadixCache):
 
         # todo: more policies for prefetch progress such as timeout
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(req_id)
+        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
         min_completed_tokens = torch.tensor(completed_tokens, dtype=torch.int)
         if torch.distributed.get_world_size(group=self.tp_group) > 1:
             # synchrnoize TP workers to make the same update to hiradix cache
