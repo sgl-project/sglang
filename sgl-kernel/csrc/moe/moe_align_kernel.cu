@@ -42,6 +42,16 @@ __global__ void count_and_sort_expert_tokens_kernel(
   }
 }
 
+__device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffffffffu) {
+  int original = v;
+#pragma unroll
+  for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+    int n = __shfl_up_sync(mask, v, offset);
+    if ((threadIdx.x & WARP_SIZE) >= offset) v += n;
+  }
+  return v - original;
+}
+
 template <typename scalar_t>
 __global__ void moe_align_block_size_kernel(
     const scalar_t* __restrict__ topk_ids,
@@ -58,6 +68,7 @@ __global__ void moe_align_block_size_kernel(
   int32_t* shared_counts = smem;                  // [num_experts]
   int32_t* prefix = shared_counts + num_experts;  // [num_experts + 1]
   int32_t* scan_buf = prefix + num_experts + 1;   // [scan_size]
+  int32_t* warp_sums = scan_buf + scan_size;
   __shared__ int32_t s_total_tokens_post_pad;
 
   const size_t tid = threadIdx.x;
@@ -89,40 +100,36 @@ __global__ void moe_align_block_size_kernel(
 
   __syncthreads();
 
-  // Blelloch scan
-  int offset = 1;
-#pragma unroll
-  for (int d = scan_size >> 1; d > 0; d >>= 1) {
-    if (tid < d) {
-      int ai = offset * (2 * tid + 1) - 1;
-      int bi = offset * (2 * tid + 2) - 1;
-      scan_buf[bi] += scan_buf[ai];
-    }
-    offset <<= 1;
-    __syncthreads();
-  }
+  int val = (tid < scan_size) ? scan_buf[tid] : 0;
 
-  // down-sweep
-  if (tid == 0) {
-    prefix[num_experts] = scan_buf[scan_size - 1];
-    scan_buf[scan_size - 1] = 0;
-  }
+  int warp_prefix = warp_exclusive_scan(val);
+
+  const int warp_id = tid >> 5;
+  const int lane_id = tid & 31;
+  const int num_warps = (scan_size + WARP_SIZE - 1) / WARP_SIZE;
+
+  if (lane_id == WARP_SIZE - 1) warp_sums[warp_id] = warp_prefix + val;
   __syncthreads();
 
-#pragma unroll
-  for (int d = 1; d < scan_size; d <<= 1) {
-    offset >>= 1;
-    if (tid < d) {
-      int ai = offset * (2 * tid + 1) - 1;
-      int bi = offset * (2 * tid + 2) - 1;
-      if (bi < scan_size) {
-        int temp = scan_buf[ai];
-        scan_buf[ai] = scan_buf[bi];
-        scan_buf[bi] += temp;
-      }
-    }
-    __syncthreads();
+  int warp_offset = 0;
+  if (warp_id == 0) {
+    int wv = (lane_id < num_warps) ? warp_sums[lane_id] : 0;
+    int wprefix = warp_exclusive_scan(wv);
+    if (lane_id < num_warps) warp_sums[lane_id] = wprefix;
   }
+  __syncthreads();
+  warp_offset = warp_sums[warp_id];
+
+  if (tid < scan_size) scan_buf[tid] = warp_prefix + warp_offset;
+  __syncthreads();
+
+  if (tid < num_experts) prefix[tid] = scan_buf[tid];
+  if (tid == 0) {
+    prefix[num_experts] = scan_buf[scan_size - 1];
+    s_total_tokens_post_pad = prefix[num_experts];
+    *total_tokens_post_pad = s_total_tokens_post_pad;
+  }
+  __syncthreads();
 
   if (tid < num_experts) {
     prefix[tid] = scan_buf[tid];
