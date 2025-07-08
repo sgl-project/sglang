@@ -1719,7 +1719,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch.token_to_kv_pool.set_kv_buffer(
             self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
         )
-        
+
         k_current = k
         v_current = v
 
@@ -1745,7 +1745,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             acc_chunk_len += chunk_len
 
             latent_cache = latent_cache_buf[
-                block_table[ibatch : ibatch + 1, : prefix_len]
+                block_table[ibatch : ibatch + 1, :prefix_len]
             ]
 
             kv_a_normed, k_pe = latent_cache.split(
@@ -1770,34 +1770,38 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             k[..., : self.qk_nope_head_dim] = k_nope
             k[..., self.qk_nope_head_dim :] = k_pe
-            
+
             # k = k[:-k_chunk.shape[1]]
             # v = v[:-k_chunk.shape[1]]
-            
+
             k = torch.cat([k, k_chunk[0]], dim=0)
             v = torch.cat([v, v_chunk[0]], dim=0)
-            
+
             current_forward_batch = copy.copy(forward_batch)
             current_forward_batch.batch_size = 1
-            current_forward_batch.req_pool_indices = forward_batch.req_pool_indices[ibatch:ibatch+1]
-            current_forward_batch.extend_seq_lens = forward_batch.extend_seq_lens[ibatch: ibatch+1]
-            current_forward_batch.extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu[ibatch: ibatch+1]
-            current_forward_batch.positions = forward_batch.positions[acc_chunk_len:acc_chunk_len + chunk_len]
+            current_forward_batch.req_pool_indices = forward_batch.req_pool_indices[
+                ibatch : ibatch + 1
+            ]
+            current_forward_batch.extend_seq_lens = forward_batch.extend_seq_lens[
+                ibatch : ibatch + 1
+            ]
+            current_forward_batch.extend_seq_lens_cpu = (
+                forward_batch.extend_seq_lens_cpu[ibatch : ibatch + 1]
+            )
+            current_forward_batch.positions = forward_batch.positions[
+                acc_chunk_len : acc_chunk_len + chunk_len
+            ]
             # cache_loc = (
             #     forward_batch.out_cache_loc
             #     if not layer.is_cross_attention
             #     else forward_batch.encoder_out_cache_loc
             # )
             assert not self.attn_mha.is_cross_attention
-            current_forward_batch.out_cache_loc = forward_batch.out_cache_loc[acc_chunk_len:acc_chunk_len + chunk_len]
+            current_forward_batch.out_cache_loc = forward_batch.out_cache_loc[
+                acc_chunk_len : acc_chunk_len + chunk_len
+            ]
 
-            output = self.attn_mha(
-                q_chunk, 
-                k, 
-                v, 
-                forward_batch, 
-                save_kv_cache=False
-            )
+            output = self.attn_mha(q_chunk, k, v, forward_batch, save_kv_cache=False)
 
             outputs.append(output)
         attn_output = torch.cat(outputs, dim=0)
