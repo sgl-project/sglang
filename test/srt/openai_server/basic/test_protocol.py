@@ -197,28 +197,32 @@ class TestChatCompletionRequest(unittest.TestCase):
         # Test assistant message with tool calls but no content
         tool_call_message = {
             "role": "assistant",
-            "tool_calls": [{
-                "function": {
-                    "arguments": '{"url":"https://example.com"}',
-                    "name": "tool-0_browser_navigate"
-                },
-                "id": "call_123",
-                "type": "function"
-            }]
+            "tool_calls": [
+                {
+                    "function": {
+                        "arguments": '{"url":"https://example.com"}',
+                        "name": "tool-0_browser_navigate",
+                    },
+                    "id": "call_123",
+                    "type": "function",
+                }
+            ],
         }
 
         # Test assistant message with both tool calls and content
         tool_call_with_content_message = {
             "role": "assistant",
             "content": "Let me help you with that.",
-            "tool_calls": [{
-                "function": {
-                    "arguments": '{"url":"https://example.com"}',
-                    "name": "tool-0_browser_navigate"
-                },
-                "id": "call_123",
-                "type": "function"
-            }]
+            "tool_calls": [
+                {
+                    "function": {
+                        "arguments": '{"url":"https://example.com"}',
+                        "name": "tool-0_browser_navigate",
+                    },
+                    "id": "call_123",
+                    "type": "function",
+                }
+            ],
         }
 
         # Create request with both types of messages
@@ -227,9 +231,13 @@ class TestChatCompletionRequest(unittest.TestCase):
             messages=[
                 {"role": "user", "content": "Navigate to example.com"},
                 tool_call_message,
-                {"role": "tool", "content": "Successfully navigated", "name": "tool-0_browser_navigate"},
-                tool_call_with_content_message
-            ]
+                {
+                    "role": "tool",
+                    "content": "Successfully navigated",
+                    "name": "tool-0_browser_navigate",
+                },
+                tool_call_with_content_message,
+            ],
         )
 
         # Verify the messages were properly parsed
@@ -240,14 +248,18 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(tool_msg.role, "assistant")
         self.assertIsNone(tool_msg.content)  # Content should be None
         self.assertEqual(len(tool_msg.tool_calls), 1)
-        self.assertEqual(tool_msg.tool_calls[0].function.name, "tool-0_browser_navigate")
+        self.assertEqual(
+            tool_msg.tool_calls[0].function.name, "tool-0_browser_navigate"
+        )
 
         # Check tool call message with content
         tool_content_msg = request.messages[3]
         self.assertEqual(tool_content_msg.role, "assistant")
         self.assertEqual(tool_content_msg.content, "Let me help you with that.")
         self.assertEqual(len(tool_content_msg.tool_calls), 1)
-        self.assertEqual(tool_content_msg.tool_calls[0].function.name, "tool-0_browser_navigate")
+        self.assertEqual(
+            tool_content_msg.tool_calls[0].function.name, "tool-0_browser_navigate"
+        )
 
 
 class TestModelSerialization(unittest.TestCase):
@@ -299,18 +311,12 @@ class TestModelSerialization(unittest.TestCase):
         # Test ChatMessage
         message = ChatMessage(role="assistant", content="Hello")
         json_str = message.model_dump_json()
-        self.assertEqual(
-            json_str,
-            '{"role":"assistant","content":"Hello"}'
-        )
+        self.assertEqual(json_str, '{"role":"assistant","content":"Hello"}')
 
         # Test DeltaMessage
         delta = DeltaMessage(role="assistant", content="Hello")
         json_str = delta.model_dump_json()
-        self.assertEqual(
-            json_str,
-            '{"role":"assistant","content":"Hello"}'
-        )
+        self.assertEqual(json_str, '{"role":"assistant","content":"Hello"}')
 
     def test_tool_calls_included_when_not_none(self):
         """Test that non-None tool_calls are included in serialization"""
@@ -319,34 +325,25 @@ class TestModelSerialization(unittest.TestCase):
                 id="call_123",
                 type="function",
                 function=FunctionResponse(
-                    name="test_function",
-                    arguments='{"test": "value"}'
-                )
+                    name="test_function", arguments='{"test": "value"}'
+                ),
             )
         ]
 
         # Test ChatMessage
-        message = ChatMessage(
-            role="assistant",
-            content="Hello",
-            tool_calls=tool_calls
-        )
+        message = ChatMessage(role="assistant", content="Hello", tool_calls=tool_calls)
         json_str = message.model_dump_json()
         self.assertEqual(
             json_str,
-            '{"role":"assistant","content":"Hello","tool_calls":[{"id":"call_123","type":"function","function":{"name":"test_function","arguments":"{\\\"test\\\": \\\"value\\\"}"}}]}'
+            '{"role":"assistant","content":"Hello","tool_calls":[{"id":"call_123","type":"function","function":{"name":"test_function","arguments":"{\\"test\\": \\"value\\"}"}}]}',
         )
 
         # Test DeltaMessage
-        delta = DeltaMessage(
-            role="assistant",
-            content="Hello",
-            tool_calls=tool_calls
-        )
+        delta = DeltaMessage(role="assistant", content="Hello", tool_calls=tool_calls)
         json_str = delta.model_dump_json()
         self.assertEqual(
             json_str,
-            '{"role":"assistant","content":"Hello","tool_calls":[{"id":"call_123","type":"function","function":{"name":"test_function","arguments":"{\\\"test\\\": \\\"value\\\"}"}}]}'
+            '{"role":"assistant","content":"Hello","tool_calls":[{"id":"call_123","type":"function","function":{"name":"test_function","arguments":"{\\"test\\": \\"value\\"}"}}]}',
         )
 
 
