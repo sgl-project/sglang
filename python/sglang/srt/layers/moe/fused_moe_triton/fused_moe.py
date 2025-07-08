@@ -436,7 +436,10 @@ def fused_moe_kernel(
         # block-wise
         if group_k > 0 and group_n > 0:
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
-            offs_bsn = offs_bn // group_n
+            if BLOCK_SIZE_N > group_n:
+                offs_bsn = offs_bn // group_n
+            else:
+                offs_bsn = pid_n * BLOCK_SIZE_N // group_n
             b_scale_ptrs = (
                 b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
             )
