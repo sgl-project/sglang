@@ -248,7 +248,9 @@ def _get_chunked_prefill_embedding(
 ) -> Optional[torch.Tensor]:
     # Calculate embedding for each request, try to get it from cache to avoid repeated calculation
     embedding_list = []
-    for i in range(len(items_size) - 1):
+    # FIXME(Xinyuan): temporary workaround for eagle3, which may have len(items_size) > len(prefix_length)
+    max_iterations = min(len(items_size) - 1, len(prefix_length))
+    for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
             continue
         embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
@@ -269,7 +271,7 @@ def _get_chunked_prefill_embedding(
         embedding_per_req_chunk, _, end_index = get_embedding_chunk(
             embedding=embedding_per_req,
             extend_prefix_len=prefix_length[i],
-            extend_seq_len=extend_length[i],
+            extend_seq_len=extend_length[i] if i < len(extend_length) else 0,
             items_offset=items_offset,
         )
         # remove this item from cache if chunk reaches to the end
