@@ -649,6 +649,27 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.tensor,
         tp_rank: int,
     ):
+        """Load w2 weights for down projection.
+
+        Args:
+            expert_data: The expert data tensor to load into
+            shard_dim: The dimension to shard along
+            shard_id: The shard ID (must be "w2")
+            loaded_weight: The weight tensor to load from
+            tp_rank: The tensor parallel rank
+        """
+        if not isinstance(expert_data, torch.Tensor) or not isinstance(
+            loaded_weight, torch.Tensor
+        ):
+            raise ValueError("expert_data and loaded_weight must be torch.Tensor")
+
+        if expert_data.dim() != 2 or loaded_weight.dim() != 2:
+            raise ValueError(
+                f"Expected 2D tensors, got expert_data shape {expert_data.shape} and loaded_weight shape {loaded_weight.shape}"
+            )
+
+        if shard_id != "w2":
+            raise ValueError(f"shard_id must be 'w2', got {shard_id}")
 
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
@@ -669,6 +690,10 @@ class FusedMoE(torch.nn.Module):
             if not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
+                if shard_size * tp_rank + shard_size > loaded_weight.shape[shard_dim]:
+                    raise ValueError(
+                        f"Shard size {shard_size} at rank {tp_rank} exceeds loaded_weight dimension {loaded_weight.shape[shard_dim]}"
+                    )
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )
@@ -795,8 +820,21 @@ class FusedMoE(torch.nn.Module):
                 tp_rank=tp_rank,
             )
             return
+
         if "ModelOpt" in self.quant_method.__class__.__name__:
-            if "weight_scale_2" in weight_name or "input_scale" in weight_name:
+            # Determine per-tensor weight scale patterns based on variant
+            is_fp4_variant = (
+                "ModelOptNvFp4FusedMoEMethod" in self.quant_method.__class__.__name__
+            )
+
+            # FP4 uses "weight_scale_2" for per-tensor, FP8 uses "weight_scale" for per-tensor
+            per_tensor_conditions = (
+                "weight_scale_2" in weight_name
+                if is_fp4_variant
+                else "weight_scale" in weight_name
+            ) or "input_scale" in weight_name
+
+            if per_tensor_conditions:
                 self._load_per_tensor_weight_scale(
                     shard_id=shard_id,
                     param=param,
