@@ -48,6 +48,7 @@ runtime_common = [
     "uvicorn",
     "uvloop",
     "xgrammar==0.1.19",
+    "py-spy",
 ]
 
 srt = [
