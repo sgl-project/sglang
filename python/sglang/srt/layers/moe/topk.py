@@ -494,14 +494,12 @@ def select_experts(
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
     else:
-        ep_config = (
-            dict(
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
-            )
-            if num_token_non_padded is not None
-            else dict()
-        )
+        ep_config = dict()
+        if num_token_non_padded is not None:
+            ep_config["num_token_non_padded"] = num_token_non_padded
+        if expert_location_dispatch_info is not None:
+            ep_config["expert_location_dispatch_info"] = expert_location_dispatch_info
+
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,

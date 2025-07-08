@@ -75,10 +75,10 @@ def deepep_post_reorder_triton_kernel(
         for idx in range(topk):
             dst_idx = tl.load(src2dst_ptr + idx)
             if dst_idx >= 0:
-                weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
+                weight_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
                 load_ptr = down_output_ptr + dst_idx * hidden_size
                 in_data = tl.load(load_ptr + offset, mask=mask)
-                sum_vec += in_data * weigh_scale
+                sum_vec += in_data * weight_scale
         tl.store(store_ptr + offset, sum_vec, mask=mask)
 
 
@@ -200,9 +200,9 @@ def pre_reorder_triton_kernel(
                 scale = 1.0
 
             if apply_router_weight_on_input:
-                scale_with_topk_weight = scale * tl.load(topk_weights_ptr + idx)
+                scale_with_maybe_topk_weight = scale * tl.load(topk_weights_ptr + idx)
             else:
-                scale_with_topk_weight = scale
+                scale_with_maybe_topk_weight = scale
 
             dst_idx = tl.load(src2dst_ptr + idx)
             dst_ptr = gateup_input_ptr + dst_idx * hidden_size
@@ -210,7 +210,7 @@ def pre_reorder_triton_kernel(
                 offset = start_offset + vec
                 mask = offset < hidden_size
                 in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
-                out_data = (in_data * scale_with_topk_weight).to(OutDtype)
+                out_data = (in_data * scale_with_maybe_topk_weight).to(OutDtype)
                 tl.store(dst_ptr + offset, out_data, mask=mask)
 
 
@@ -519,8 +519,8 @@ def post_reorder_triton_kernel(
                 if apply_router_weight_on_input:
                     sum_vec += in_data
                 else:
-                    weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
-                    sum_vec += in_data * weigh_scale
+                    weight_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
+                    sum_vec += in_data * weight_scale
         tl.store(store_ptr + offset, sum_vec, mask=mask)
 
     if computed == False:
