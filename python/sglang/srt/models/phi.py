@@ -1,0 +1,276 @@
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/phi.py
+import math
+from typing import Iterable, Optional, Tuple, Union
+
+import torch
+from torch import nn
+from transformers import PhiConfig
+
+from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.layers.activation import get_act_fn
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import add_prefix, make_layers
+
+
+class PhiAttention(nn.Module):
+
+    def __init__(
+        self,
+        config: PhiConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.total_num_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_size = self.hidden_size // self.total_num_heads
+
+        tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
+        assert self.total_num_heads % tensor_model_parallel_world_size == 0
+        self.num_heads = self.total_num_heads // tensor_model_parallel_world_size
+
+        # pylint: disable=C0103
+        self.qkv_proj = QKVParallelLinear(
+            self.hidden_size,
+            self.head_size,
+            self.total_num_heads,
+            bias=True,
+            quant_config=quant_config,
+        )
+        self.dense = RowParallelLinear(
+            self.hidden_size,
+            self.hidden_size,
+            quant_config=quant_config,
+        )
+
+        scaling = self.head_size**-0.5
+        rotary_dim = int(
+            config.partial_rotary_factor
+            * (config.hidden_size // config.num_attention_heads)
+        )
+        assert rotary_dim % 2 == 0
+
+        # pylint: disable=C0301
+        # Refer to:
+        # https://huggingface.co/microsoft/phi-1_5/blob/d212a789620c380ff32ca1d1ee9943a777360987/modeling_phi.py#L518
+        rope_theta = getattr(config, "rope_theta", 10000.0)
+        max_position_embeddings = getattr(config, "max_position_embeddings", 2048)
+        self.rotary_emb = get_rope(
+            self.head_size,
+            rotary_dim=rotary_dim,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+        )
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.head_size,
+            scaling,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
+        )
+
+    def forward(
+        self,
+        position_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.chunk(chunks=3, dim=-1)
+        q, k = self.rotary_emb(position_ids, q, k)
+        attn_output = self.attn(q, k, v, forward_batch=forward_batch)
+        output, _ = self.dense(attn_output)
+        return output
+
+
+class PhiMLP(nn.Module):
+
+    def __init__(
+        self, config: PhiConfig, quant_config: Optional[QuantizationConfig] = None
+    ):
+        super().__init__()
+
+        n_inner = getattr(config, "n_inner", None)
+        n_inner = n_inner if n_inner is not None else 4 * config.hidden_size
+
+        self.fc1 = ColumnParallelLinear(
+            config.hidden_size,
+            n_inner,
+            quant_config=quant_config,
+        )
+        self.fc2 = RowParallelLinear(
+            n_inner,
+            config.hidden_size,
+            quant_config=quant_config,
+        )
+        self.act = get_act_fn(config.hidden_act)
+
+    def forward(self, hidden_states):
+        hidden_states, _ = self.fc1(hidden_states)
+        hidden_states = self.act(hidden_states)
+        hidden_states, _ = self.fc2(hidden_states)
+        return hidden_states
+
+
+class PhiLayer(nn.Module):
+
+    def __init__(
+        self,
+        config: PhiConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.input_layernorm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
+        self.self_attn = PhiAttention(
+            config, quant_config, prefix=add_prefix("self_attn", prefix)
+        )
+        self.mlp = PhiMLP(config, quant_config)
+
+    def forward(
+        self,
+        position_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        attn_outputs = self.self_attn(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+        )
+        feed_forward_hidden_states = self.mlp(hidden_states)
+        hidden_states = attn_outputs + feed_forward_hidden_states + residual
+        return hidden_states
+
+
+class PhiModel(nn.Module):
+
+    def __init__(self, config: PhiConfig, prefix: str = ""):
+        super().__init__()
+        self.config = config
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size, config.hidden_size
+        )
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda prefix: PhiLayer(config, prefix=prefix),
+            prefix=add_prefix("layers", prefix),
+        )
+        self.final_layernorm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+        positions: torch.Tensor,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor]:
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.get_input_embeddings(input_ids)
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            hidden_states = layer(positions, hidden_states, forward_batch=forward_batch)
+        hidden_states = self.final_layernorm(hidden_states)
+        return hidden_states
+
+
+# Pending
+class PhiForCausalLM(nn.Module):
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ]
+    }
+
+    def __init__(
+        self,
+        config: PhiConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.config = config
+        self.quant_config = quant_config
+        self.model = PhiModel(
+            config=config,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
+        )
+
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            bias=True,
+            quant_config=quant_config,
+        )
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.get_input_embeddings(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor]:
+        hidden_states = self.model(input_ids, positions, inputs_embeds)
+
+        return hidden_states
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata,
+    ) -> Optional[torch.Tensor]:
+        logits = self.logits_processor(
+            self.lm_head, hidden_states, sampling_metadata, self.lm_head.bias
+        )
+        return logits
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                continue
+
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+
+
+EntryClass = PhiForCausalLM
