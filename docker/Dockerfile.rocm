@@ -6,24 +6,21 @@
 >>>>>>> aa0c914e7 (Add ROCm7.0 to support gfx950)
 
 # default base image
-#ARG BASE_IMAGE="rocm/sgl-dev:rocm7.0_preview_ubuntu_22.04"
-#ARG BASE_IMAGE="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_sglang_0.4.6.post4_mi35X_prealpha"
-ARG ARG_ARCH_CHOSEN
-ARG BASE_IMAGE_950="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.8.5_mi35X_prealpha"
+ARG ARG_PYTORCH_ROCM_ARCH
+ARG BASE_IMAGE_950="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_sglang_0.4.6.post4_mi35X_prealpha"
 ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
 
-FROM $BASE_IMAGE_950 AS base_950
-FROM $BASE_IMAGE_942 AS base_942
-FROM $ARG_ARCH_CHOSEN AS TARGET_ARCH
+FROM $BASE_IMAGE_950 AS gfx950
+FROM $BASE_IMAGE_942 AS gfx942
+FROM ${ARG_PYTORCH_ROCM_ARCH}
 
 USER root
 
-ARG ARG_PYTORCH_ROCM_ARCH
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 
-ARG BUILD_VLLM="1"
-ARG BUILD_TRITON="1"
-ARG BUILD_AITER_ALL="0"
+ARG BUILD_VLLM="0"
+ARG BUILD_TRITON="0"
+ARG BUILD_AITER_ALL="1"
 
 # Install some basic utilities
 RUN rm -rf /etc/apt/sources.list.d/*
@@ -33,6 +30,7 @@ RUN rm -rf /etc/apt/sources.list.d/*
 RUN python3 -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python3 -m pip uninstall -y sccache; rm -f "$(which sccache)"
 
+# For git checkout
 RUN git config --global user.email "62472426+mqhc2020@users.noreply.github.com" \
  && git config --global user.name "AMD User"
 
@@ -67,12 +65,11 @@ ARG TRITON_REPO="https://github.com/ROCm/triton.git"
 ARG TRITON_COMMIT="9dd57360b74ae60a05d81250113f4513010389aa"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
-ARG AITER_COMMIT="v0.1.3"
-
-ARG CK_COMMIT="bb571a033019fd5a8ba6de31119395c3621a4235"
-ARG CK_REVERT="a4e1248dbaeb868bf5d95f90f844e3a9a58e85d5"
+ARG AITER_COMMIT="8832dfdf35911935adf319ec98519f8cb6da2ae9"
+#ARG AITER_COMMIT="v0.1.3"
 
 WORKDIR /sgl-workspace/
+RUN pip uninstall -y sgl_kernel sglang
 RUN git clone ${SGL_REPO} \
     && cd sglang \
     && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
@@ -101,7 +98,6 @@ RUN pip install IPython \
     && pip install torchao \
     && pip install pybind11
 
-WORKDIR /sgl-workspace/
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
         pip3 uninstall -y triton \
      && git clone ${TRITON_REPO} \
@@ -110,21 +106,17 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
      && python3 setup.py install; \
     fi
 
-WORKDIR /sgl-workspace/
 RUN pip uninstall -y aiter
-RUN git clone ${AITER_REPO}
-WORKDIR /sgl-workspace/aiter
-RUN git checkout ${AITER_COMMIT} \
+RUN git clone ${AITER_REPO} \
+ && cd aiter \
+ && git checkout ${AITER_COMMIT} \
  && git submodule update --init --recursive \
- && cd 3rdparty/composable_kernel \
- && git checkout ${CK_COMMIT} \
- && git revert --no-edit ${CK_REVERT} \
- && cd ../../ \
  && GPU_ARCHS=$PYTORCH_ROCM_ARCH python3 setup.py develop
 
 RUN if [ "$BUILD_AITER_ALL" = "1" ]; then \
-    PREBUILD_KERNELS=1 GPU_ARCHS=$PYTORCH_ROCM_ARCH python3 setup.py develop; \
-fi
+        cd aiter \
+     && PREBUILD_KERNELS=1 GPU_ARCHS=$PYTORCH_ROCM_ARCH python3 setup.py develop; \
+    fi
 
 WORKDIR /sgl-workspace/
 
