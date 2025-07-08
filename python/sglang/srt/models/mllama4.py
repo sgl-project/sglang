@@ -16,7 +16,9 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_cpu
+
+_is_cpu = is_cpu()
 
 
 class Llama4ForConditionalGeneration(nn.Module):
@@ -50,10 +52,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(config.text_config)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        # Get all special token IDs
-        im_token_id: int = mm_inputs.im_token_id
-
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens([im_token_id])
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(
@@ -110,13 +109,17 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         # rotary embeds should be sliced
         if ("wk" in modules or "k_proj" in modules) and modules[-1] == "weight":
-            loaded_weight = permute(
-                loaded_weight, self.language_model.config.num_key_value_heads
-            )
+            if _is_cpu:
+                dim = self.language_model.config.original_total_num_kv_heads
+            else:
+                dim = self.language_model.config.num_key_value_heads
+            loaded_weight = permute(loaded_weight, dim)
         elif ("wq" in modules or "q_proj" in modules) and modules[-1] == "weight":
-            loaded_weight = permute(
-                loaded_weight, self.language_model.config.num_attention_heads
-            )
+            if _is_cpu:
+                dim = self.language_model.config.original_num_attention_heads
+            else:
+                dim = self.language_model.config.num_attention_heads
+            loaded_weight = permute(loaded_weight, dim)
 
         return name, loaded_weight
 
@@ -222,6 +225,35 @@ class Llama4ForConditionalGeneration(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if hasattr(self.language_model, "set_eagle3_layers_to_capture"):
+            self.language_model.set_eagle3_layers_to_capture(layer_ids)
+
+    def get_embed_and_head(self):
+        # For EAGLE3, we delegate to the language model which should have this method
+        # If the language model doesn't have lm_head (like EAGLE3), we return None for head
+        embed = self.language_model.get_embed()
+        if hasattr(self.language_model, "get_embed_and_head"):
+            return self.language_model.get_embed_and_head()
+        elif hasattr(self.language_model, "lm_head"):
+            return embed, self.language_model.lm_head.weight
+        else:
+            # For EAGLE3, head might not be needed
+            return embed, None
+
+    def set_embed_and_head(self, embed, head):
+        if hasattr(self.language_model, "set_embed_and_head"):
+            return self.language_model.set_embed_and_head(embed, head)
+        else:
+            # For EAGLE3, only set embed
+            return self.language_model.set_embed(embed)
+
+    def get_embed(self):
+        return self.language_model.get_embed()
+
+    def set_embed(self, embed):
+        return self.language_model.set_embed(embed)
 
 
 EntryClass = Llama4ForConditionalGeneration
