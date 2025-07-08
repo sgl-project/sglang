@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import base64
 import builtins
 import ctypes
 import dataclasses
@@ -68,6 +67,7 @@ from typing import (
 
 import numpy as np
 import psutil
+import pybase64
 import requests
 import torch
 import torch.distributed
@@ -616,7 +616,7 @@ def decode_video_base64(video_base64):
     from PIL import Image
 
     # Decode the base64 string
-    video_bytes = base64.b64decode(video_base64)
+    video_bytes = pybase64.b64decode(video_base64, validate=True)
 
     # Placeholder for the start indices of each PNG image
     img_starts = []
@@ -702,7 +702,9 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
         audio, original_sr = sf.read(BytesIO(audio_file))
     elif audio_file.startswith("data:"):
         audio_file = audio_file.split(",")[1]
-        audio, original_sr = sf.read(BytesIO(base64.b64decode(audio_file)))
+        audio, original_sr = sf.read(
+            BytesIO(pybase64.b64decode(audio_file, validate=True))
+        )
     elif audio_file.startswith("http://") or audio_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
         response = requests.get(audio_file, stream=True, timeout=timeout)
@@ -771,12 +773,12 @@ def load_image(
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
         image_file = image_file.split(",")[1]
-        image = Image.open(BytesIO(base64.b64decode(image_file)))
+        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     elif image_file.startswith("video:"):
         image_file = image_file.replace("video:", "")
         image, image_size = decode_video_base64(image_file)
     elif isinstance(image_file, str):
-        image = Image.open(BytesIO(base64.b64decode(image_file)))
+        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     else:
         raise ValueError(f"Invalid image: {image}")
 
@@ -1866,7 +1868,7 @@ class MultiprocessingSerializer:
 
         if output_str:
             # Convert bytes to base64-encoded string
-            output = base64.b64encode(output).decode("utf-8")
+            output = pybase64.b64encode(output).decode("utf-8")
 
         return output
 
@@ -1883,7 +1885,7 @@ class MultiprocessingSerializer:
         """
         if isinstance(data, str):
             # Decode base64 string to bytes
-            data = base64.b64decode(data)
+            data = pybase64.b64decode(data, validate=True)
 
         return ForkingPickler.loads(data)
 
