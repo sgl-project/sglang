@@ -199,7 +199,12 @@ class PhiModel(nn.Module):
             hidden_states = self.get_input_embeddings(input_ids)
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states = layer(positions, hidden_states, forward_batch=forward_batch)
+            # hidden_states = layer(positions, hidden_states, forward_batch=forward_batch)
+            hidden_states = layer(
+                position_ids=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+            )
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states
 
@@ -247,7 +252,13 @@ class PhiForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
-        hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
+        # hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)   changed it to below
+        hidden_states = self.model(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            positions=positions,
+            inputs_embeds=inputs_embeds,
+        )
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
