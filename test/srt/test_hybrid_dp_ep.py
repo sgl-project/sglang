@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
@@ -57,6 +57,7 @@ class TestPureDP(CustomTestCase):
         print(metrics)
 
         self.assertGreater(metrics["accuracy"], 0.62)
+
 
 class TestHybridDPTP(CustomTestCase):
     @classmethod
@@ -246,7 +247,6 @@ class TestMTP(CustomTestCase):
             f"{avg_spec_accept_length=:.3f}\n"
         )
         self.assertGreater(avg_spec_accept_length, 2.3)
-
 
 
 class TestMTPWithTBO(CustomTestCase):
