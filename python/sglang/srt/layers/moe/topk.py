@@ -22,12 +22,12 @@ from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
-    count_logical_expert_tokens,
 )
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
+from sglang.srt.eplb.lp_token_dispatch import get_log2phy_prob
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -197,12 +197,9 @@ def grouped_topk_gpu(
         topk_weights = topk_weights / topk_weights_sum
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
-
-    # Count logical expert tokens before logical-to-physical mapping if requested
-    logical_counts = None
     if lp_dispatch:
         num_logical_experts = gating_output.shape[1]  # Number of experts in gating output
-        logical_counts = count_logical_expert_tokens(topk_ids, num_logical_experts)
+        log2phy_prob = get_log2phy_prob(topk_ids, num_logical_experts)
 
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
@@ -296,11 +293,9 @@ def biased_grouped_topk_impl(
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
-    # Count logical expert tokens before logical-to-physical mapping if requested
-    logical_counts = None
     if lp_dispatch:
         num_logical_experts = gating_output.shape[1]  # Number of experts in gating output
-        logical_counts = count_logical_expert_tokens(topk_ids, num_logical_experts)
+        log2phy_prob = get_log2phy_prob(topk_ids, num_logical_experts)
 
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
@@ -364,11 +359,9 @@ def biased_grouped_topk_gpu(
             num_fused_shared_experts,
             routed_scaling_factor,
         )
-        # Count logical expert tokens before logical-to-physical mapping if requested
-        logical_counts = None
         if lp_dispatch:
             num_logical_experts = gating_output.shape[1]  # Number of experts in gating output
-            logical_counts = count_logical_expert_tokens(topk_ids, num_logical_experts)
+            logical_counts = get_log2phy_prob(topk_ids, num_logical_experts)
 
         # TODO merge into kernel
         if (expert_location_dispatch_info is not None) or (

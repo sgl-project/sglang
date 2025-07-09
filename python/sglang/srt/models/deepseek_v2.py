@@ -31,6 +31,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     parallel_state,
     tensor_model_parallel_all_reduce,
+    get_world_group,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -510,6 +511,8 @@ class DeepseekV2MoE(nn.Module):
                 lp_dispatch=self._lp_dispatch,
             )
         else:
+            if self._lp_dispatch:
+                torch.distributed.all_reduce(torch.zeros(256), group=get_world_group().cpu_group, op=torch.distributed.ReduceOp.SUM)
             topk_idx = torch.full(
                 (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
             )
