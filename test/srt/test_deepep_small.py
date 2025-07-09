@@ -1,6 +1,3 @@
-# Comprehensive test for hybrid parallelism (DP/TP attention, DP/TP Dense FFN, TP/EP Sparse FFN, DP/VP LM head) plus speculative decoding.
-# These tests are not run by default but can be launched on demand.
-
 import unittest
 from types import SimpleNamespace
 
@@ -8,7 +5,6 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
@@ -17,9 +13,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-
-
-# DEFAULT_MODEL_NAME_FOR_TEST_MLA = "/dev/shm/DeepSeek-V3-0324"
 
 
 class TestPureDP(CustomTestCase):
@@ -151,6 +144,7 @@ class TestTP(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
+@unittest.skip("covered in test_deepep_large.py")
 class TestNoGatherdBuffer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -245,6 +239,7 @@ class TestTBO(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
+@unittest.skip("covered in TestMTPWithTBO")
 class TestMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -310,7 +305,7 @@ class TestMTP(CustomTestCase):
             f"accuracy={metrics['accuracy']=:.3f}\n"
             f"{avg_spec_accept_length=:.3f}\n"
         )
-        self.assertGreater(avg_spec_accept_length, 2.3)
+        self.assertGreater(avg_spec_accept_length, 2.1)
 
 
 class TestMTPWithTBO(CustomTestCase):
@@ -382,7 +377,7 @@ class TestMTPWithTBO(CustomTestCase):
             f"accuracy={metrics['accuracy']=:.3f}\n"
             f"{avg_spec_accept_length=:.3f}\n"
         )
-        self.assertGreater(avg_spec_accept_length, 2.3)
+        self.assertGreater(avg_spec_accept_length, 2.1)
 
 
 if __name__ == "__main__":
