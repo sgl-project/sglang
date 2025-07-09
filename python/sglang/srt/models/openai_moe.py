@@ -612,6 +612,7 @@ class OpenAIMoeAttention(nn.Module):
                 if use_sliding_window
                 else None
             ),
+            enable_attention_sink=True,
             prefix=add_prefix("attn", prefix),
         )
 
