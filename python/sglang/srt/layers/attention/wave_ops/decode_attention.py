@@ -20,29 +20,25 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage1.py
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
+import functools
+import logging
 import math
+
 import iree.turbine.kernel as tk
 from iree.turbine.kernel.lang.global_symbols import *
-from iree.turbine.kernel.wave.utils.general_utils import (
-    get_default_scheduling_params,
-)
-from iree.turbine.kernel.wave.utils.run_utils import (
-    set_default_run_config,
-)
-from iree.turbine.kernel.wave.constraints import MMAType, GenericDot, MMAOperand
+from iree.turbine.kernel.wave.compile import WaveCompileOptions, wave_compile
+from iree.turbine.kernel.wave.constraints import GenericDot, MMAOperand, MMAType
 from iree.turbine.kernel.wave.templates.paged_decode_attention import (
     get_paged_decode_attention_kernels,
     get_paged_decode_intermediate_arrays_shapes,
     paged_decode_attention_shape,
 )
-from iree.turbine.kernel.wave.compile import WaveCompileOptions, wave_compile
-
-import logging
-
-import functools
+from iree.turbine.kernel.wave.utils.general_utils import get_default_scheduling_params
+from iree.turbine.kernel.wave.utils.run_utils import set_default_run_config
 
 logger = logging.getLogger(__name__)
 import os
+
 dump_generated_mlir = int(os.environ.get("WAVE_DUMP_MLIR", 0))
 
 
@@ -113,7 +109,9 @@ def get_wave_kernel(
     return phase_0, phase_1
 
 
-def decode_attention_intermediate_arrays_shapes(num_seqs, head_size_kv, num_query_heads, max_kv_splits):
+def decode_attention_intermediate_arrays_shapes(
+    num_seqs, head_size_kv, num_query_heads, max_kv_splits
+):
     # Not all fields are used, but we need to pass them to the function
     shape = paged_decode_attention_shape(
         num_query_heads=num_query_heads,

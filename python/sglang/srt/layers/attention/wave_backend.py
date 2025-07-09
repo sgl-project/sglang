@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import triton
 import triton.language as tl
-import logging
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
 logger = logging.getLogger(__name__)
+
 
 @triton.jit
 def get_num_kv_splits_triton(
@@ -105,6 +106,7 @@ class WaveAttnBackend(AttentionBackend):
 
         # Set unique cache dir for each process to avoid cache write races
         import iree.turbine.kernel.wave.cache as wave_cache
+
         base_cache_dir = wave_cache.CACHE_BASE_DIR
         new_dir = base_cache_dir / f"worker_{model_runner.tp_rank}"
         logger.info(f"Setting Wave cache dir: {new_dir}")
@@ -217,8 +219,15 @@ class WaveAttnBackend(AttentionBackend):
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
 
-            from sglang.srt.layers.attention.wave_ops.decode_attention import decode_attention_intermediate_arrays_shapes
-            attn_logits_shape, attn_logits_max_shape = decode_attention_intermediate_arrays_shapes(bs, self.v_head_dim, self.num_head, self.max_kv_splits)
+            from sglang.srt.layers.attention.wave_ops.decode_attention import (
+                decode_attention_intermediate_arrays_shapes,
+            )
+
+            attn_logits_shape, attn_logits_max_shape = (
+                decode_attention_intermediate_arrays_shapes(
+                    bs, self.v_head_dim, self.num_head, self.max_kv_splits
+                )
+            )
             attn_logits = torch.empty(
                 attn_logits_shape,
                 dtype=torch.float32,
@@ -336,10 +345,17 @@ class WaveAttnBackend(AttentionBackend):
         self,
         max_bs: int,
         max_num_tokens: int,
-        kv_indices_buf: Optional[torch.Tensor] = None
+        kv_indices_buf: Optional[torch.Tensor] = None,
     ):
-        from sglang.srt.layers.attention.wave_ops.decode_attention import decode_attention_intermediate_arrays_shapes
-        attn_logits_shape, attn_logits_max_shape = decode_attention_intermediate_arrays_shapes(max_bs, self.v_head_dim, self.num_head, self.max_kv_splits)
+        from sglang.srt.layers.attention.wave_ops.decode_attention import (
+            decode_attention_intermediate_arrays_shapes,
+        )
+
+        attn_logits_shape, attn_logits_max_shape = (
+            decode_attention_intermediate_arrays_shapes(
+                max_bs, self.v_head_dim, self.num_head, self.max_kv_splits
+            )
+        )
         self.cuda_graph_attn_logits = torch.zeros(
             attn_logits_shape,
             dtype=torch.float32,

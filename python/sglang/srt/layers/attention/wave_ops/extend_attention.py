@@ -19,28 +19,22 @@ It supporst page size = 1.
 # Adapted from
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py#L1
 
-import torch
+import functools
 import math
+import os
 
 import iree.turbine.kernel as tk
+import torch
 from iree.turbine.kernel.lang.global_symbols import *
-from iree.turbine.kernel.wave.utils.general_utils import (
-    get_default_scheduling_params,
-)
-from iree.turbine.kernel.wave.utils.run_utils import (
-    set_default_run_config,
-)
+from iree.turbine.kernel.wave.compile import WaveCompileOptions, wave_compile
 from iree.turbine.kernel.wave.constraints import MMAType
 from iree.turbine.kernel.wave.scheduling.schedule import SchedulingType
-
 from iree.turbine.kernel.wave.templates.attention_common import AttentionShape
 from iree.turbine.kernel.wave.templates.extend_attention import (
     get_extend_attention_kernel,
 )
-from iree.turbine.kernel.wave.compile import WaveCompileOptions, wave_compile
-
-import os
-import functools
+from iree.turbine.kernel.wave.utils.general_utils import get_default_scheduling_params
+from iree.turbine.kernel.wave.utils.run_utils import set_default_run_config
 
 dump_generated_mlir = int(os.environ.get("WAVE_DUMP_MLIR", 0))
 
