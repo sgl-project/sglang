@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import base64
 import builtins
 import ctypes
 import dataclasses
@@ -68,6 +67,7 @@ from typing import (
 
 import numpy as np
 import psutil
+import pybase64
 import requests
 import torch
 import torch.distributed
@@ -83,12 +83,7 @@ from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
-from triton.runtime.cache import (
-    FileCacheManager,
-    default_cache_dir,
-    default_dump_dir,
-    default_override_dir,
-)
+from triton.runtime.cache import FileCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -621,7 +616,7 @@ def decode_video_base64(video_base64):
     from PIL import Image
 
     # Decode the base64 string
-    video_bytes = base64.b64decode(video_base64)
+    video_bytes = pybase64.b64decode(video_base64, validate=True)
 
     # Placeholder for the start indices of each PNG image
     img_starts = []
@@ -707,7 +702,9 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
         audio, original_sr = sf.read(BytesIO(audio_file))
     elif audio_file.startswith("data:"):
         audio_file = audio_file.split(",")[1]
-        audio, original_sr = sf.read(BytesIO(base64.b64decode(audio_file)))
+        audio, original_sr = sf.read(
+            BytesIO(pybase64.b64decode(audio_file, validate=True))
+        )
     elif audio_file.startswith("http://") or audio_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
         response = requests.get(audio_file, stream=True, timeout=timeout)
@@ -776,12 +773,12 @@ def load_image(
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
         image_file = image_file.split(",")[1]
-        image = Image.open(BytesIO(base64.b64decode(image_file)))
+        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     elif image_file.startswith("video:"):
         image_file = image_file.replace("video:", "")
         image, image_size = decode_video_base64(image_file)
     elif isinstance(image_file, str):
-        image = Image.open(BytesIO(base64.b64decode(image_file)))
+        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     else:
         raise ValueError(f"Invalid image: {image}")
 
@@ -923,18 +920,41 @@ class CustomCacheManager(FileCacheManager):
 
         self.key = key
         self.lock_path = None
+
+        try:
+            module_path = "triton.runtime.cache"
+            cache_module = importlib.import_module(module_path)
+
+            default_cache_dir = getattr(cache_module, "default_cache_dir", None)
+            default_dump_dir = getattr(cache_module, "default_dump_dir", None)
+            default_override_dir = getattr(cache_module, "default_override_dir", None)
+        except (ModuleNotFoundError, AttributeError) as e:
+            default_cache_dir = None
+            default_dump_dir = None
+            default_override_dir = None
+
         if dump:
-            self.cache_dir = default_dump_dir()
+            self.cache_dir = (
+                default_dump_dir()
+                if default_dump_dir is not None
+                else os.path.join(Path.home(), ".triton", "dump")
+            )
             self.cache_dir = os.path.join(self.cache_dir, self.key)
             self.lock_path = os.path.join(self.cache_dir, "lock")
             os.makedirs(self.cache_dir, exist_ok=True)
         elif override:
-            self.cache_dir = default_override_dir()
+            self.cache_dir = (
+                default_override_dir()
+                if default_override_dir is not None
+                else os.path.join(Path.home(), ".triton", "override")
+            )
             self.cache_dir = os.path.join(self.cache_dir, self.key)
         else:
             # create cache directory if it doesn't exist
-            self.cache_dir = (
-                os.getenv("TRITON_CACHE_DIR", "").strip() or default_cache_dir()
+            self.cache_dir = os.getenv("TRITON_CACHE_DIR", "").strip() or (
+                default_cache_dir()
+                if default_cache_dir is not None
+                else os.path.join(Path.home(), ".triton", "cache")
             )
             if self.cache_dir:
                 try:
@@ -1848,7 +1868,7 @@ class MultiprocessingSerializer:
 
         if output_str:
             # Convert bytes to base64-encoded string
-            output = base64.b64encode(output).decode("utf-8")
+            output = pybase64.b64encode(output).decode("utf-8")
 
         return output
 
@@ -1865,7 +1885,7 @@ class MultiprocessingSerializer:
         """
         if isinstance(data, str):
             # Decode base64 string to bytes
-            data = base64.b64decode(data)
+            data = pybase64.b64decode(data, validate=True)
 
         return ForkingPickler.loads(data)
 
