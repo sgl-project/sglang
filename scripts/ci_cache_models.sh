@@ -8,7 +8,6 @@ if [ -z "$models" ]; then
     exit 1
 fi
 
-# 获取 DEFAULT_MODEL_CACHE_DIR 环境变量的值
 cache_dir="${DEFAULT_MODEL_CACHE_DIR:-}"
 
 if [ -z "$cache_dir" ]; then
@@ -17,10 +16,8 @@ if [ -z "$cache_dir" ]; then
 fi
 
 for model in $models; do
-    # 构建每个模型的本地下载路径
     local_model_dir="$cache_dir/$model"
     echo "Caching model: $model to $local_model_dir"
-    # 使用 local_model_dir 作为下载路径
     mkdir -p "$local_model_dir"
     huggingface-cli download "$model" --local-dir "$local_model_dir" --local-dir-use-symlinks False
     if [ $? -ne 0 ]; then
