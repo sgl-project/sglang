@@ -25,7 +25,7 @@
 #include "utils.h"
 
 #else
-#include "act_and_mul_internal.cuh"
+#include "hip_act_and_mul.cuh"
 #endif
 
 // Adapted from flashinfer activation
