@@ -11,7 +11,7 @@ ARG ARG_PYTORCH_ROCM_ARCH
 FROM $BASE_IMAGE_942 AS gfx942
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
-ENV BUILD_AITER_ALL="0"
+ENV BUILD_AITER_ALL="1"
 ENV AITER_REPO="https://github.com/ROCm/aiter.git"
 ENV AITER_COMMIT="v0.1.3"
 ENV SGL_REPO="https://github.com/sgl-project/sglang.git"
@@ -24,9 +24,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_AITER_ALL="1"
 ENV AITER_REPO="https://github.com/ROCm/aiter.git"
 ENV AITER_COMMIT="4738360c65a3c0e10fe6fbe86d54de825a161e87"
-# NEED TO FIX
-#ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
-ENV SGL_REPO="https://github.com/mqhc2020/sglang.git"
+ENV SGL_REPO="https://github.com/sgl-project/sglang.git"
 ENV SGL_DEFAULT="upstream-dockerfile"
 
 FROM ${ARG_PYTORCH_ROCM_ARCH}
