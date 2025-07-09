@@ -20,7 +20,7 @@ for model in "${models[@]}"; do
     local_model_dir="$cache_dir/$model"
     echo "Caching model: $model to $local_model_dir"
     mkdir -p "$local_model_dir"
-    
+
     if ! huggingface-cli download "$model" \
         --local-dir "$local_model_dir" \
         --local-dir-use-symlinks False 2>/dev/null; then
