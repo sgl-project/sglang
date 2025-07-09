@@ -22,7 +22,7 @@ apt install -y curl wget git sudo libibverbs-dev rdma-core infiniband-diags open
 mkdir -p /opt/gdrcopy
 mkdir -p /opt/nvshmem
 cd /opt/gdrcopy
-git clone https://github.com/NVIDIA/gdrcopy.git .
+rm -rf gdrcopy && git clone https://github.com/NVIDIA/gdrcopy.git .
 git checkout v2.4.4
 apt update
 apt install -y nvidia-dkms-535
