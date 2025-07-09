@@ -174,14 +174,14 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             )
 
             t = time.perf_counter()
-            gpu_memory_usage_before_release_kv_cache = get_gpu_memory_gb()
+            gpu_memory_usage_before_release = get_gpu_memory_gb()
             engine.release_memory_occupation(tags=[GPU_MEMORY_TYPE_KV_CACHE])
 
             gpu_memory_usage_after_release_kv_cache = get_gpu_memory_gb()
 
             self.assertLess(
                 gpu_memory_usage_after_release_kv_cache,
-                gpu_memory_usage_before_release_kv_cache,
+                gpu_memory_usage_before_release,
             )
 
             engine.release_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
@@ -202,7 +202,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
 
             print(f"Release took {time.perf_counter() - t:.2f}s")
             print(
-                f"Memory: {gpu_memory_usage_before_release_kv_cache:.1f} → {gpu_memory_usage_after_release_kv_cache:.1f} → {gpu_memory_usage_after_release_weights:.1f} -> {gpu_memory_usage_after_release_cuda_graph:.1f} GB"
+                f"Memory: {gpu_memory_usage_before_release:.1f} → {gpu_memory_usage_after_release_kv_cache:.1f} → {gpu_memory_usage_after_release_weights:.1f} -> {gpu_memory_usage_after_release_cuda_graph:.1f} GB"
             )
 
             if _DEBUG_EXTRA:
