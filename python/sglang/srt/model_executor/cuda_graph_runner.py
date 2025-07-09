@@ -47,12 +47,13 @@ from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    get_bool_env_var,
     get_device_memory_capacity,
     rank0_log,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
-    require_mlp_tp_gather, get_bool_env_var,
+    require_mlp_tp_gather,
 )
 
 logger = logging.getLogger(__name__)
@@ -594,7 +595,8 @@ class CudaGraphRunner:
         )
         graph_fn = (
             partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
-            if memory_saver_adapter.enabled and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+            if memory_saver_adapter.enabled
+            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
             else torch.cuda.graph
         )
 
