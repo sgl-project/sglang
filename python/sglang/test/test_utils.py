@@ -446,7 +446,6 @@ def try_cached_model(model_repo):
 
     return model_repo
 
-
 def popen_launch_server(
     model: str,
     base_url: str,
@@ -1266,7 +1265,6 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                                 rank += 1
                             else:
                                 raise
-
 
 
 class CustomTestCase(unittest.TestCase):
