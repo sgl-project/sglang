@@ -29,6 +29,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     verify_marlin_supported,
+    marlin_repeat_scales_on_all_ranks,
 )
 from sglang.srt.utils import is_cuda
 from sgl_kernel import (

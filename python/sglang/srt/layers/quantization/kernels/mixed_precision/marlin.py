@@ -5,14 +5,19 @@ from typing import Optional
 
 import torch
 
-
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+from sglang.srt.layers.quantization.utils import (
     apply_gptq_marlin_linear,
-    check_marlin_supports_shape, marlin_is_k_full, marlin_make_empty_g_idx,
-    marlin_make_workspace_new, marlin_permute_scales, marlin_sort_g_idx,
-    marlin_zero_points, query_marlin_supported_quant_types, unpack_cols)
-
-
+    check_marlin_supports_shape, 
+    marlin_is_k_full,
+    marlin_make_empty_g_idx,
+    marlin_make_workspace_new,
+    marlin_permute_scales,
+    marlin_sort_g_idx,
+    marlin_zero_points,
+    query_marlin_supported_quant_types,
+    unpack_cols,
+    MARLIN_SUPPORTED_GROUP_SIZES,
+)
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     permute_param_layout_,

@@ -1,5 +1,10 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/v0.8.2/vllm/model_executor/layers/quantization/kernels/mixed_precision/__init__.py
 
+from typing import List, Mapping, Tuple, Union, Optional, NamedTuple
+
+import torch
+
+from sglang.srt.layers.quantization.kernels.mixed_precision.marlin import MarlinLinearKernel
 from sglang.srt.layers.quantization.kernels.mixed_precision.MPLinearKernel import (
     MPLinearKernel, MPLinearLayerConfig
 )
@@ -29,12 +34,8 @@ def choose_mp_linear_kernel(
     Returns:
         type[MPLinearKernel]: Chosen kernel.
     """
-    if compute_capability is None:
-        if current_platform is None:
-            raise ValueError("Cannot determine compute capability")
-        _cc = current_platform.get_device_capability()
-        compute_capability = _cc[0] * 10 + _cc[1]
-
+    compute_capability = torch.cuda.get_device_capability()
+    compute_capability = compute_capability[0] * 10 + compute_capability[1]
     failure_reasons = []
     for kernel in _POSSIBLE_KERNELS:
         if kernel.get_min_capability() > compute_capability:
