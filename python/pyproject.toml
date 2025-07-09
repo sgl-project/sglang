@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.9"
+version = "0.4.9.post1"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -38,6 +38,7 @@ runtime_common = [
     "psutil",
     "pydantic",
     "pynvml",
+    "pybase64",
     "python-multipart",
     "pyzmq>=25.1.2",
     "soundfile==0.13.1",
@@ -47,7 +48,7 @@ runtime_common = [
     "timm==1.0.16",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.19",
+    "xgrammar==0.1.20",
 ]
 
 srt = [
