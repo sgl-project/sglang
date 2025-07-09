@@ -47,7 +47,7 @@ rm -rf /root/.cache/deepep && git clone https://github.com/deepseek-ai/DeepEP.gi
 cd /opt/nvshmem
 wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz
 tar -xf nvshmem_src_3.2.5-1.txz
-mv nvshmem_src nvshmem
+rm nvshmem && mv nvshmem_src nvshmem
 cd nvshmem
 git apply /root/.cache/deepep/third-party/nvshmem.patch
 NVSHMEM_SHMEM_SUPPORT=0 \
