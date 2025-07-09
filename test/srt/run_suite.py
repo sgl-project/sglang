@@ -177,7 +177,6 @@ suites = {
         TestFile("test_pp_single_node.py", 150),
     ],
     "per-commit-8-gpu": [
-        # Disabled deepep tests temporarily because it takes too much time.
         # Disabled because it hangs on the CI.
         # TestFile("test_moe_ep.py", 181),
         TestFile("test_disaggregation.py", 270),
