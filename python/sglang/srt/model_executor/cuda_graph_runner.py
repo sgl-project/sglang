@@ -49,7 +49,7 @@ from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
-    require_mlp_tp_gather,
+    require_mlp_tp_gather, get_bool_env_var,
 )
 
 logger = logging.getLogger(__name__)
@@ -586,8 +586,14 @@ class CudaGraphRunner:
 
             run_once()
 
+        graph_fn = (
+            TODO
+            if self.model_runner.server_args.enable_memory_saver and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+            else torch.cuda.graph
+        )
+
         global global_graph_memory_pool
-        with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=stream):
+        with graph_fn(graph, pool=global_graph_memory_pool, stream=stream):
             out = run_once()
 
         global_graph_memory_pool = graph.pool()

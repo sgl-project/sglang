@@ -52,6 +52,8 @@ def get_gpu_memory_gb():
 class TestReleaseMemoryOccupation(CustomTestCase):
     def _setup_engine(self, model_name, mem_fraction_static=0.8, tp_size=1):
         """Common setup for engine and HF model."""
+
+        os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "1"
         engine = sgl.Engine(
             model_path=model_name,
             random_seed=42,
