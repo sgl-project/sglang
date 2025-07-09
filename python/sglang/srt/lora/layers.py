@@ -80,10 +80,10 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         Apply LoRA to base embedding output.
         Formula: output = base_output + lora_a_embedding(input_) @ lora_b_weights
         """
-        batch_info = self.lora_backend.batch_info
-        token_weight_indices = self._get_token_weight_indices(input_, batch_info)
+        weight_indices = self.lora_backend.batch_info.weight_indices
+        # token_weight_indices = self._get_token_weight_indices(input_, batch_info)
         
-        lora_a_output = self._run_lora_a_embedding(input_, token_weight_indices)
+        lora_a_output = self._run_lora_a_embedding(input_, weight_indices)
         
         lora_b_output = self.lora_backend.run_lora_b_sgemm(
             lora_a_output,
@@ -112,39 +112,26 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         return token_weight_indices
 
     def _run_lora_a_embedding(self, input_: torch.Tensor, weight_indices: torch.Tensor) -> torch.Tensor:
-        batch_info = self.lora_backend.batch_info
-        device = input_.device
-        
         lora_a_output = torch.zeros(
             (input_.shape[0], self.embedding_A_buffer.shape[1]), 
             dtype=self.embedding_A_buffer.dtype, 
-            device=device
+            device=input_.device
         )
         
-        unique_indices = torch.unique(weight_indices)
-        
         for lora_idx in unique_indices:
-            mask = weight_indices == lora_idx
-            if not mask.any():
-                continue
-                
-            actual_rank = batch_info.lora_ranks[lora_idx]
-            if actual_rank == 0:
-                continue
-                
-            lora_tokens = input_[mask]
-            lora_a_weights = self.embedding_A_buffer[lora_idx, :actual_rank, :]
-            lora_a_result = F.embedding(lora_tokens, lora_a_weights.t())
-            lora_a_output[mask, :actual_rank] = lora_a_result
+            lora_a_weights = self.embedding_A_buffer[lora_idx, :, :]
+            lora_a_output = F.embedding(input_, lora_a_weights.t())
             
         return lora_a_output
 
     def forward(self, input_: torch.Tensor):
-        if self.new_embeddings_buffer is not None:
-            base_output = self._forward(input_)
+        added_tokens_mask = torch.where(input_ > self.vocab_size - 1, 1, 0)
+        if added_tokens_mask.sum() > 0:
+            batch_info = self.lora_backend.batch_info
+            base_output = self._forward(input_, added_tokens_mask, batch_info)
         else:
             base_output = self.base_layer.forward(input_)
-
+        
         if self.set_lora:
             output = self.apply_lora(base_output, input_)
         else:
@@ -152,27 +139,14 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
         return output
 
-    def _forward(self, input_: torch.Tensor) -> torch.Tensor:
-        base_token_mask = input_ < self.vocab_size
-        added_token_mask = ~base_token_mask
+    def _forward(self, input_: torch.Tensor, added_tokens_mask: torch.Tensor, batch_info: LoRABatchInfo) -> torch.Tensor:        
+        token_weight_indices = self._get_token_weight_indices(input_, batch_info)
+        added_weight_indices = token_weight_indices[added_tokens_mask]
+        unique_indices = torch.unique(added_weight_indices)
         
-        base_input = input_.clone()
-        base_input[added_token_mask] = 0
-        base_output = self.base_layer.forward(base_input)
-        
-        if added_token_mask.any():
-            added_tokens = input_[added_token_mask] - self.vocab_size
-            batch_info = self.lora_backend.batch_info
-            
-            token_weight_indices = self._get_token_weight_indices(input_, batch_info)
-            added_weight_indices = token_weight_indices[added_token_mask]
-            unique_indices = torch.unique(added_weight_indices)
-            
-            for lora_idx in unique_indices:
-                lora_mask = added_weight_indices == lora_idx
-                if not lora_mask.any():
-                    continue
-                    
+        for lora_idx in unique_indices:
+            lora_mask = added_weight_indices == lora_idx
+            if lora_mask.sum() > 0:
                 lora_added_tokens = added_tokens[lora_mask]
                 new_embeddings = F.embedding(
                     lora_added_tokens, 

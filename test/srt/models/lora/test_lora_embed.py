@@ -24,7 +24,7 @@ LORA_SETS = [
     #     "base": "meta-llama/Llama-2-7b-hf",
     #     "loras": ["RuterNorway/Llama-2-7b-chat-norwegian-LoRa"],
     # },
-    {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
+    # {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
     # {"base": "Qwen/Qwen2.5-14B-Instruct", "loras": ["mssongit/Qwen2.5-14B-SFT-LoRA"]},
     # {"base": "mistralai/Mistral-7B-Instruct-v0.3", "loras": ["/home/ying/test_lora"]},
     # {
@@ -37,12 +37,13 @@ LORA_SETS = [
     #         "/home/ying/test_lora_4",
     #     ],
     # },
-    # {"base": "meta-llama/Llama-2-7b-hf", "loras": ["yard1/llama-2-7b-sql-lora-test"]},
+    {"base": "meta-llama/Llama-2-7b-hf", "loras": ["yard1/llama-2-7b-sql-lora-test"]},
 ]
 TORCH_DTYPES = [torch.float16]
 
 PROMPTS = [
     """
+[/assistant]    
 ### Instruction:
 Write a poem about the transformers Python library.
 Mention the word "large language models" in that poem.
@@ -51,6 +52,7 @@ The Transformers are large language models,
 They're used to make predictions on text.
 """,
     """
+[/assistant]
 ### Instruction:
 Tell me about llamas and alpacas
 ### Response:
@@ -77,6 +79,7 @@ class TestLoRA(unittest.TestCase):
         base_path = lora_set["base"]
         all_lora_paths = lora_set["loras"]
         batch_lora_paths = [None]
+        # batch_lora_paths = ["yard1/llama-2-7b-sql-lora-test"]
         i = 0
         for _ in range(len(prompts) - 1):
             batch_lora_paths.append(all_lora_paths[i])
@@ -89,7 +92,7 @@ class TestLoRA(unittest.TestCase):
             tp_size=tp_size,
             lora_paths=all_lora_paths,
             max_loras_per_batch=3,
-            disable_cuda_graph=False,
+            disable_cuda_graph=True,
             disable_radix_cache=True,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(

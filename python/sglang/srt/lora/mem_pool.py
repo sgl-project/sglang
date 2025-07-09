@@ -189,6 +189,7 @@ class LoRAMemoryPool:
         cur_uids: Set[Optional[str]],
         lora_adapters: Dict[str, LoRAAdapter],
         lora_modules: Dict[int, Dict[str, BaseLayerWithLoRA]],
+        lora_embeddings_modules: Dict[str, BaseLayerWithLoRA],
     ):
         def get_available_buffer_slot():
             for buffer_id in range(self.max_loras_per_batch):
@@ -211,7 +212,7 @@ class LoRAMemoryPool:
                 buffer_id = get_available_buffer_slot()
                 lora_adapter = lora_adapters.get(uid, None)
                 self.load_lora_weight_to_buffer(
-                    uid, buffer_id, lora_adapter, lora_modules
+                    uid, buffer_id, lora_adapter, lora_modules, lora_embeddings_modules
                 )
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
@@ -222,6 +223,7 @@ class LoRAMemoryPool:
         buffer_id: int,
         lora_adapter: LoRAAdapter,
         lora_modules: Dict[int, Dict[str, BaseLayerWithLoRA]],
+        lora_embeddings_modules: Dict[str, BaseLayerWithLoRA],
     ):
         def check_lora_weight_shape(buffer_view: torch.Tensor, weight: torch.Tensor):
             assert (
@@ -232,6 +234,8 @@ class LoRAMemoryPool:
             for i in range(self.num_layer):
                 for k in self.A_buffer.keys():
                     self.A_buffer[k][i][buffer_id] = 0
+            for k in self.embedding_A_buffer.keys():
+                self.embedding_A_buffer[k][buffer_id] = 0
             return
 
         assert lora_adapter is not None
@@ -324,7 +328,7 @@ class LoRAMemoryPool:
                     )
                     lora_b_weights = weights
                     if self.tp_size > 1:
-                        cur_module = self.lora_embeddings_modules[lora_weight_name]
+                        cur_module = lora_embeddings_modules[lora_weight_name]
                         for module_name, module in cur_module:
                             weight_name = get_weight_name(
                                 module_name, self.lora_embeddings_weight_names, LoRAType.LORA_B

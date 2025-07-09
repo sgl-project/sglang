@@ -140,7 +140,11 @@ class LoRAManager:
         # load active loras into lora memory pool
         cur_uids = set(forward_batch.lora_paths)
         assert len(cur_uids) <= self.max_loras_per_batch
-        self.memory_pool.prepare_lora_batch(cur_uids, self.loras, self.lora_modules)
+        self.memory_pool.prepare_lora_batch(cur_uids, self.loras, self.lora_modules, self.lora_embeddings_modules)
+
+        # skip setting up batch info (FIXME)
+        if cur_uids == set([None]):
+            return
 
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
