@@ -17,7 +17,6 @@ import torch.distributed as dist
 
 from sglang.srt.utils import get_ip, is_npu
 
-_is_npu = is_npu()
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
@@ -96,8 +95,8 @@ class MetadataBuffers:
     ):
         self.custom_mem_pool = custom_mem_pool
         device = "cpu"
-        if _is_npu:
-            # We need set output tokens to ascend device in order to transfer by D2D channel.
+        if is_npu():
+            # For ascend backend, output tokens are placed in the NPU and will be transferred by D2D channel.
             device = "npu"
         elif self.custom_mem_pool:
             device = "cuda"

@@ -290,9 +290,9 @@ class TokenizerManager:
                 and self.server_args.disaggregation_transfer_backend == "ascend"
             )
             if is_create_store:
-                from mf_adapter import create_config_store
-
                 try:
+                    from mf_adapter import create_config_store
+
                     ascend_url = os.getenv("ASCEND_MF_STORE_URL")
                     create_config_store(ascend_url)
                 except Exception as e:
