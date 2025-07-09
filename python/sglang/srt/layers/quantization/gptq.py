@@ -9,7 +9,6 @@ from sglang.srt.layers.moe.fused_moe_triton import (
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
 )
-from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     ChannelQuantScaleParameter,
@@ -1115,6 +1114,8 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         e_score_correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
     ) -> torch.Tensor:
+        from sglang.srt.layers.moe.topk import select_experts
+
         assert activation == "silu", "Only SiLU activation is supported."
 
         # The input must currently be float16
