@@ -207,7 +207,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
 
             print(f"Release took {time.perf_counter() - t:.2f}s")
             print(
-                f"Memory: {gpu_memory_usage_before_release:.1f} → {gpu_memory_usage_after_release_kv_cache:.1f} → {gpu_memory_usage_after_release_weights:.1f} -> {gpu_memory_usage_after_release_cuda_graph:.1f} GB"
+                f"Memory: {gpu_memory_usage_before_release:.1f} → {gpu_memory_usage_after_release_kv_cache:.1f} → {gpu_memory_usage_after_release_weights:.1f} → {gpu_memory_usage_after_release_cuda_graph:.1f} GB"
             )
 
             if _DEBUG_EXTRA:
