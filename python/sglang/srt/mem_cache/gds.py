@@ -56,7 +56,7 @@ class Gds:
         else:
             raise ValueError("file register nixl failed")
 
-    def d2s(self, device_indices: torch.Tensor, mode: str, file_path: str, index: int, buff_size: int):
+    def d2s(self, mode: str, file_path: str, device_indices: torch.Tensor, index: int, buff_size: int):
         valid_options = {"READ", "WRITE"}
         if mode not in valid_options:
             raise ValueError("mode has to be write/read")
