@@ -19,10 +19,10 @@ export CUDA_HOME=/usr/local/cuda
 apt install -y curl wget git sudo libibverbs-dev rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 build-essential cmake
 
 # Install GDRCopy
-mkdir -p /opt/gdrcopy
+rm -rf gdrcopy && mkdir -p /opt/gdrcopy
 mkdir -p /opt/nvshmem
 cd /opt/gdrcopy
-rm -rf gdrcopy && git clone https://github.com/NVIDIA/gdrcopy.git .
+git clone https://github.com/NVIDIA/gdrcopy.git .
 git checkout v2.4.4
 apt update
 apt install -y nvidia-dkms-535
