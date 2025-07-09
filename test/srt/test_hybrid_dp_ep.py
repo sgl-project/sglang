@@ -19,6 +19,9 @@ from sglang.test.test_utils import (
 )
 
 
+DEFAULT_MODEL_NAME_FOR_TEST_MLA = "/dev/shm/DeepSeek-V3-0324"
+
+
 class TestPureDP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -36,6 +39,10 @@ class TestPureDP(CustomTestCase):
                 "--dp",
                 "8",
                 "--enable-deepep-moe",
+                "--cuda-graph-max-bs",
+                "128",
+                "--max-running-requests",
+                "128",
             ],
         )
 
@@ -76,6 +83,11 @@ class TestHybridDPTP(CustomTestCase):
                 "--dp",
                 "2",
                 "--enable-deepep-moe",
+                "--cuda-graph-max-bs",
+                "128",
+                "--max-running-requests",
+                "128",
+                
             ],
         )
 
@@ -113,6 +125,10 @@ class TestTP(CustomTestCase):
                 "--tp",
                 "8",
                 "--enable-deepep-moe",
+                "--cuda-graph-max-bs",
+                "128",
+                "--max-running-requests",
+                "128",
             ],
         )
 
@@ -203,6 +219,10 @@ class TestTBO(CustomTestCase):
                 "1",
                 "--enable-deepep-moe",
                 "--enable-two-batch-overlap",
+                "--cuda-graph-max-bs",
+                "128",
+                "--max-running-requests",
+                "128",
             ],
         )
 
@@ -254,6 +274,10 @@ class TestMTP(CustomTestCase):
                 "3",
                 "--speculative-num-draft-tokens",
                 "5",
+                "--cuda-graph-max-bs",
+                "128",
+                "--max-running-requests",
+                "128",
             ],
         )
 
@@ -322,6 +346,10 @@ class TestMTPWithTBO(CustomTestCase):
                 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
                 "--chunked-prefill-size",
                 "256",
+                "--cuda-graph-max-bs",
+                "128",
+                "--max-running-requests",
+                "128",
             ],
         )
 
