@@ -480,26 +480,30 @@ class CustomAllreduce:
             return None
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(enable=get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH"))
-        with (memory_saver_adapter.disable() if memory_saver_adapter.enabled else nullcontext()):
-            if self._IS_CAPTURING:
-                if torch.cuda.is_current_stream_capturing():
-                    if _is_hip:
-                        return self.all_reduce_reg(input)
-                    else:
-                        return self.all_reduce(input, registered=True)
-                else:
-                    # If warm up, mimic the allocation pattern since custom
-                    # allreduce is out-of-place.
-                    return torch.empty_like(input)
-            else:
+        if memory_saver_adapter.enabled:
+            with memory_saver_adapter.disable():
+                # TODO improve
+                input = input.clone()
+
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
                 if _is_hip:
-                    # note: outside of cuda graph context,
-                    # custom allreduce incurs a cost of cudaMemcpy, which should
-                    # be small(<=1% of overall latency) compared to the performance
-                    # gains of using custom kernels
-                    return self.all_reduce_unreg(input)
+                    return self.all_reduce_reg(input)
                 else:
-                    return self.all_reduce(input, registered=False)
+                    return self.all_reduce(input, registered=True)
+            else:
+                # If warm up, mimic the allocation pattern since custom
+                # allreduce is out-of-place.
+                return torch.empty_like(input)
+        else:
+            if _is_hip:
+                # note: outside of cuda graph context,
+                # custom allreduce incurs a cost of cudaMemcpy, which should
+                # be small(<=1% of overall latency) compared to the performance
+                # gains of using custom kernels
+                return self.all_reduce_unreg(input)
+            else:
+                return self.all_reduce(input, registered=False)
 
     def close(self):
         if not self.disabled and self._ptr:
