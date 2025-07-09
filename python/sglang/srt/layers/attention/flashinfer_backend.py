@@ -42,6 +42,40 @@ if is_flashinfer_available():
     )
     from flashinfer.cascade import merge_state
     from flashinfer.decode import _get_range_buf, get_seq_lens
+    from flashinfer.jit.utils import filename_safe_dtype_map
+
+
+# Attention sink declaration (from test_attention_sink.py)
+attention_sink_decl = r"""
+struct AttentionSink : AttentionVariantBase {
+  static constexpr bool use_softmax = true;
+
+  uint32_t window_left, qo_len, kv_len;
+  float sm_scale_log2;
+
+  // Create closure
+  template <typename Params>
+  __device__ __host__ AttentionSink(const Params& params, uint32_t batch_idx,
+                                   uint8_t* smem_ptr) {
+    qo_len = params.get_qo_len(batch_idx);
+    kv_len = params.get_kv_len(batch_idx);
+    window_left = (params.window_left >= 0) ? params.window_left : kv_len;
+    sm_scale_log2 = params.sm_scale * math::log2e;
+  }
+
+  REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+    bool mask = true;
+    // Apply sliding window mask using the same formula as FlashInfer's DefaultAttention
+    mask &= (kv_idx + qo_len + window_left >= kv_len + qo_idx);
+    return mask;
+  })
+
+  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, {
+    float d_rcp = (m != -math::inf) ? math::ptx_rcp(d + params.sink[qo_head_idx]) : 0.f;
+    return output * d_rcp;
+  });
+};
+"""
 
 
 class WrapperDispatch(Enum):
@@ -64,7 +98,7 @@ class PrefillMetadata:
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
 
-
+# todo: now it only supports attention sink or not, support hybrid attention later
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -74,10 +108,13 @@ class FlashInferAttnBackend(AttentionBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
+        # todo: set it as false and pass it as a parameter
+        enable_attention_sink: bool = True,
     ):
         super().__init__()
 
         # Parse constants
+        # decode_use_tensor_cores should be true for attention sink since decode interface has accuracy problem
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
@@ -89,6 +126,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
+        self.enable_attention_sink = enable_attention_sink
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -153,9 +191,35 @@ class FlashInferAttnBackend(AttentionBackend):
         fmha_backend = "auto"
         if is_sm100_supported():
             fmha_backend = "cutlass"
-        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend
-        )
+        
+        # Prepare JIT args for attention sink if enabled
+        if self.enable_attention_sink and not skip_prefill:
+            # Common JIT args for attention sink
+            q_dtype = model_runner.dtype
+            kv_dtype = model_runner.kv_cache_dtype
+            self.attention_sink_jit_args = [
+                f"batch_prefill_attention_sink_{filename_safe_dtype_map[q_dtype]}",  # uri
+                q_dtype,  # dtype_q
+                kv_dtype,  # dtype_kv
+                q_dtype,  # dtype_o
+                torch.int32,  # idtype
+                model_runner.model_config.head_dim,  # hidden_dim_qk
+                model_runner.model_config.head_dim,  # hidden_dim_vo
+                ["sink"],  # additional_tensor_names
+                ["float"],  # additional_tensor_dtypes
+                ["sm_scale"],  # additional_scalar_names
+                ["double"],  # additional_scalar_dtypes
+                "AttentionSink",
+                attention_sink_decl,
+            ]
+            
+            self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer, "NHD", backend="fa2", jit_args=self.attention_sink_jit_args
+            )
+        else:
+            self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer, "NHD", backend=fmha_backend
+            )
 
         # Two wrappers: one for sliding window attention and one for full attention.
         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
@@ -164,26 +228,73 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_wrappers = []
         for _ in range(self.num_wrappers):
             if not skip_prefill:
-                self.prefill_wrappers_paged.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
+                if self.enable_attention_sink:
+                    self.prefill_wrappers_paged.append(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            backend="fa2",
+                            jit_args=self.attention_sink_jit_args,
+                        )
+                    )
+                    self.prefill_wrappers_verify.append(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            #backend should not be auto when jit_args is provided
+                            backend="fa2",
+                            jit_args=self.attention_sink_jit_args,
+                        )
+                    )
+                else:
+                    self.prefill_wrappers_paged.append(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            backend="fa2",
+                        )
+                    )
+                    self.prefill_wrappers_verify.append(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                        )
+                    )
+            
+            # Decode wrappers with attention sink support
+            if self.enable_attention_sink:
+                # Create JIT args for decode with attention sink
+                decode_jit_args = [
+                    f"batch_decode_attention_sink_{filename_safe_dtype_map[model_runner.dtype]}",  # uri
+                    model_runner.dtype,  # dtype_q
+                    model_runner.kv_cache_dtype,  # dtype_kv
+                    model_runner.dtype,  # dtype_o
+                    torch.int32,  # idtype
+                    model_runner.model_config.head_dim,  # hidden_dim_qk
+                    model_runner.model_config.head_dim,  # hidden_dim_vo
+                    ["sink"],  # additional_tensor_names
+                    ["float"],  # additional_tensor_dtypes
+                    ["sm_scale"],  # additional_scalar_names
+                    ["double"],  # additional_scalar_dtypes
+                    "AttentionSink",
+                    attention_sink_decl,
+                ]
+                self.decode_wrappers.append(
+                    BatchDecodeWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        backend="fa2",
+                        use_tensor_cores=self.decode_use_tensor_cores,
+                        jit_args=decode_jit_args,
                     )
                 )
-                self.prefill_wrappers_verify.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
+            else:
+                self.decode_wrappers.append(
+                    BatchDecodeWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
+                        use_tensor_cores=self.decode_use_tensor_cores,
                     )
                 )
-            self.decode_wrappers.append(
-                BatchDecodeWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
-                    "NHD",
-                    use_tensor_cores=self.decode_use_tensor_cores,
-                )
-            )
 
         # Create indices updater
         if not skip_prefill:
@@ -453,10 +564,12 @@ class FlashInferAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sink: Optional[torch.Tensor] = None,
     ):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
+        
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -464,6 +577,8 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
         logits_soft_cap = layer.logit_cap
+        window_left = layer.sliding_window_size if layer.sliding_window_size is not None and layer.sliding_window_size >= 0 else -1
+        print(f"### forward_extend: window_left={window_left}")
 
         q = q.contiguous()
         if not self.forward_metadata.use_ragged:
@@ -474,43 +589,108 @@ class FlashInferAttnBackend(AttentionBackend):
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
 
-            o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=not layer.is_cross_attention,
-                sm_scale=layer.scaling,
-                window_left=layer.sliding_window_size,
-                logits_soft_cap=logits_soft_cap,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
-            )
-        else:
-            if self.forward_metadata.extend_no_prefix:
-                o = self.prefill_wrapper_ragged.forward(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    causal=True,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=logits_soft_cap,
-                )
+            # NOTE(ganler): a workaround to use .run() instead of .forward() for sink attention
+            # because .forward() is deprecated and does not support extra arguments.
+            # We manually set the config attributes on the wrapper object before calling .run().
+            prefill_wrapper_paged._causal = not layer.is_cross_attention
+            prefill_wrapper_paged._logits_soft_cap = logits_soft_cap
+            prefill_wrapper_paged._window_left = window_left
 
-            else:
-                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    causal=True,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=logits_soft_cap,
-                )
-                o2, s2 = prefill_wrapper_paged.forward_return_lse(
+            if hasattr(layer, 'enable_attention_sink') and layer.enable_attention_sink and sink is not None:
+                # For JIT kernels, sm_scale is passed as a kernel argument, so the one on the object is ignored.
+                prefill_wrapper_paged._sm_scale = None
+                o = prefill_wrapper_paged.run(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                    causal=False,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=logits_soft_cap,
+                    sink,
+                    layer.scaling,
+                    k_scale=layer.k_scale,
+                    v_scale=layer.v_scale,
                 )
+            else:
+
+                o = prefill_wrapper_paged.forward(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    causal=not layer.is_cross_attention,
+                    sm_scale=layer.scaling,
+                    window_left=window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    k_scale=layer.k_scale,
+                    v_scale=layer.v_scale,
+                )
+        else:
+            # use_ragged branch
+            self.prefill_wrapper_ragged._logits_soft_cap = logits_soft_cap
+            self.prefill_wrapper_ragged._window_left = window_left
+
+            if self.forward_metadata.extend_no_prefix:
+                self.prefill_wrapper_ragged._causal = True
+
+                if hasattr(layer, 'enable_attention_sink') and layer.enable_attention_sink and sink is not None:
+                    # For JIT kernels, sm_scale is passed as a kernel argument.
+                    self.prefill_wrapper_ragged._sm_scale = None
+                    o = self.prefill_wrapper_ragged.run(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                        v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                        sink,
+                        layer.scaling,
+                    )
+                else:
+                    o = self.prefill_wrapper_ragged.forward(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                        v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                        causal=True,
+                        sm_scale=layer.scaling,
+                        logits_soft_cap=logits_soft_cap,
+                    )
+
+            else:
+                # extend with prefix
+                self.prefill_wrapper_ragged._causal = True
+                self.prefill_wrapper_ragged._window_left = window_left
+                prefill_wrapper_paged._causal = False
+                prefill_wrapper_paged._logits_soft_cap = logits_soft_cap
+                prefill_wrapper_paged._window_left = window_left
+                prefill_wrapper_paged._k_scale = layer.k_scale
+                prefill_wrapper_paged._v_scale = layer.v_scale
+
+                if hasattr(layer, 'enable_attention_sink') and layer.enable_attention_sink and sink is not None:
+                    self.prefill_wrapper_ragged._sm_scale = None
+                    prefill_wrapper_paged._sm_scale = None
+
+                    o1, s1 = self.prefill_wrapper_ragged.run_return_lse(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                        v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                        sink,
+                        layer.scaling,
+                    )
+
+                    o2, s2 = prefill_wrapper_paged.run_return_lse(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                        sink,
+                        layer.scaling,
+                    )
+                else:
+                    o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                        v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                        causal=True,
+                        sm_scale=layer.scaling,
+                        logits_soft_cap=logits_soft_cap,
+                    )
+                    o2, s2 = prefill_wrapper_paged.forward_return_lse(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                        causal=False,
+                        sm_scale=layer.scaling,
+                        logits_soft_cap=logits_soft_cap,
+                    )
 
                 o, _ = merge_state(o1, s1, o2, s2)
 
@@ -529,10 +709,14 @@ class FlashInferAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sink: Optional[torch.Tensor] = None,
     ):
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
+        
+        window_left = layer.sliding_window_size if layer.sliding_window_size is not None and layer.sliding_window_size >= 0 else -1
+
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -545,16 +729,33 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
+        # NOTE(ganler): a workaround to use .run() instead of .forward() for sink attention
+        # because .forward() is deprecated and does not support extra arguments.
+        # We manually set the config attributes on the wrapper object before calling .run().
+        decode_wrapper._logits_soft_cap = layer.logit_cap
+        decode_wrapper._window_left = window_left
 
         # Call the wrapped function
-        o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
-            k_scale=layer.k_scale,
-            v_scale=layer.v_scale,
-        )
+        if hasattr(layer, 'enable_attention_sink') and layer.enable_attention_sink and sink is not None:
+            # For JIT kernels, sm_scale is passed as a kernel argument, so the one on the object is ignored.
+            decode_wrapper._sm_scale = None
+            o = decode_wrapper.run(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                sink,
+                layer.scaling,
+                k_scale=layer.k_scale,
+                v_scale=layer.v_scale,
+            )
+        else:
+            o = decode_wrapper.forward(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale,
+                v_scale=layer.v_scale,
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
