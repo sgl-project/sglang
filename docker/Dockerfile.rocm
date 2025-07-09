@@ -1,14 +1,19 @@
 # Usage (to build SGLang ROCm docker image):
 <<<<<<< HEAD
+<<<<<<< HEAD
 #   docker build --build-arg SGL_BRANCH=v0.4.9.post1 -t v0.4.9.post1-rocm630 -f Dockerfile.rocm .
 =======
 #   docker build --build-arg SGL_BRANCH=v0.4.7.post1 --build-arg ARG_PYTORCH_ROCM_ARCH=gfx950 -t v0.4.7.post1-rocm700 -f Dockerfile.rocm .
 >>>>>>> aa0c914e7 (Add ROCm7.0 to support gfx950)
+=======
+#   docker build --build-arg SGL_BRANCH=v0.4.8.post1 --build-arg ARG_PYTORCH_ROCM_ARCH=[gfx950|gfx942] -t v0.4.8.post1-rocm700 -f Dockerfile.rocm .
+>>>>>>> 7a74f6f44 (cleanup a little bit)
 
 # default base image
-ARG ARG_PYTORCH_ROCM_ARCH
 ARG BASE_IMAGE_950="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_sglang_0.4.6.post4_mi35X_prealpha"
 ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
+
+ARG ARG_PYTORCH_ROCM_ARCH
 
 FROM $BASE_IMAGE_950 AS gfx950
 FROM $BASE_IMAGE_942 AS gfx942
@@ -25,9 +30,9 @@ ARG BUILD_AITER_ALL="1"
 
 # Install some basic utilities
 RUN rm -rf /etc/apt/sources.list.d/*
-#RUN apt-get update -q -y && apt-get install -q -y \
-#    sqlite3 libsqlite3-dev libfmt-dev libmsgpack-dev libsuitesparse-dev \
-#    apt-transport-https ca-certificates wget curl
+RUN apt-get update -q -y && apt-get install -q -y \
+    sqlite3 libsqlite3-dev libfmt-dev libmsgpack-dev libsuitesparse-dev \
+    apt-transport-https ca-certificates wget curl
 RUN python3 -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python3 -m pip uninstall -y sccache; rm -f "$(which sccache)"
 
@@ -36,6 +41,35 @@ RUN git config --global user.email "62472426+mqhc2020@users.noreply.github.com" 
  && git config --global user.name "AMD User"
 
 WORKDIR /sgl-workspace
+
+# -----------------------
+# AITER
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_COMMIT="4738360c65a3c0e10fe6fbe86d54de825a161e87"
+#ARG AITER_COMMIT="v0.1.3"
+RUN pip uninstall -y aiter
+RUN git clone ${AITER_REPO} \
+ && cd aiter \
+ && git checkout ${AITER_COMMIT} \
+ && git submodule update --init --recursive
+RUN cd aiter \
+     && if [ "$BUILD_AITER_ALL" = "1" ]; then \
+          PREBUILD_KERNELS=1 GPU_ARCHS=$PYTORCH_ROCM_ARCH python3 setup.py develop; \
+        else \
+          GPU_ARCHS=$PYTORCH_ROCM_ARCH python3 setup.py develop; \
+        fi
+
+# -----------------------
+# Triton
+ARG TRITON_REPO="https://github.com/ROCm/triton.git"
+ARG TRITON_COMMIT="9dd57360b74ae60a05d81250113f4513010389aa"
+RUN if [ "$BUILD_TRITON" = "1" ]; then \
+        pip3 uninstall -y triton \
+     && git clone ${TRITON_REPO} \
+     && cd triton \
+     && git checkout ${TRITON_COMMIT} \
+     && python3 setup.py install; \
+    fi
 
 # -----------------------
 # Build vLLM
@@ -62,14 +96,11 @@ ARG SGL_REPO="https://github.com/mqhc2020/sglang.git"
 ENV SGL_DEFAULT="upstream-dockerfile"
 ARG SGL_BRANCH=${SGL_DEFAULT}
 
-ARG TRITON_REPO="https://github.com/ROCm/triton.git"
-ARG TRITON_COMMIT="9dd57360b74ae60a05d81250113f4513010389aa"
-
-ARG AITER_REPO="https://github.com/ROCm/aiter.git"
-ARG AITER_COMMIT="4738360c65a3c0e10fe6fbe86d54de825a161e87"
-#ARG AITER_COMMIT="v0.1.3"
-
-WORKDIR /sgl-workspace/
+RUN pip install IPython \
+    && pip install orjson \
+    && pip install python-multipart \
+    && pip install torchao \
+    && pip install pybind11
 RUN pip uninstall -y sgl_kernel sglang
 RUN git clone ${SGL_REPO} \
     && cd sglang \
@@ -92,35 +123,6 @@ RUN git clone ${SGL_REPO} \
        fi
 
 RUN python -m pip cache purge
-
-RUN pip install IPython \
-    && pip install orjson \
-    && pip install python-multipart \
-    && pip install torchao \
-    && pip install pybind11
-
-RUN if [ "$BUILD_TRITON" = "1" ]; then \
-        pip3 uninstall -y triton \
-     && git clone ${TRITON_REPO} \
-     && cd triton \
-     && git checkout ${TRITON_COMMIT} \
-     && python3 setup.py install; \
-    fi
-
-RUN pip uninstall -y aiter
-RUN git clone ${AITER_REPO} \
- && cd aiter \
- && git checkout ${AITER_COMMIT} \
- && git submodule update --init --recursive
-
-RUN cd aiter \
-     && if [ "$BUILD_AITER_ALL" = "1" ]; then \
-          PREBUILD_KERNELS=1 GPU_ARCHS=$PYTORCH_ROCM_ARCH python3 setup.py develop; \
-        else \
-          GPU_ARCHS=$PYTORCH_ROCM_ARCH python3 setup.py develop; \
-        fi
-
-WORKDIR /sgl-workspace/
 
 # Copy config files to support MI300X in virtualized environments (MI300X_VF).  Symlinks will not be created in image build.
 RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
