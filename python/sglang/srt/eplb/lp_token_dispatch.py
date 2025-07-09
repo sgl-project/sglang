@@ -62,9 +62,6 @@ def get_global_logical_counts_cpu_allreduce(local_counts: torch.Tensor) -> torch
     # Move local counts to CPU for CPU-based communication
     local_counts_cpu = local_counts.cpu()
     
-    # Ensure the tensor is contiguous before communication
-    # local_counts_cpu = local_counts_cpu.contiguous()
-    
     # Use the CPU communication group for all-reduce
     torch.distributed.all_reduce(local_counts_cpu, group=group.cpu_group, op=torch.distributed.ReduceOp.SUM)
     # Move result back to GPU
