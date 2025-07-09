@@ -67,7 +67,7 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         return _memory_saver.region(tag=tag)
 
     def cuda_graph(self, **kwargs):
-        raise _memory_saver.cuda_graph(**kwargs)
+        return _memory_saver.cuda_graph(**kwargs)
 
     def pause(self, tag: str):
         return _memory_saver.pause(tag=tag)
