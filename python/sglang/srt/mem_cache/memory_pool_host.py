@@ -281,13 +281,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             for j in range(self.layer_num):
                 if global_config.enable_gds:
                     file_path = global_config.gds_path + "k_buffer_layer" + str(j)
-                    self.gds.d2s("write",
+                    self.gds.d2s("WRITE",
                         file_path,
                         device_pool.k_buffer[j][d_index : d_index + self.page_size],
                         h_index * self.size_per_page,
                         self.page_size * self.size_per_page)
                     file_path = global_config.gds_path + "v_buffer_layer" + str(j)
-                    self.gds.d2s("write",
+                    self.gds.d2s("WRITE",
                         file_path,
                         device_pool.v_buffer[j][d_index : d_index + self.page_size],
                         h_index * self.size_per_page,
@@ -303,27 +303,40 @@ class MHATokenToKVPoolHost(HostKVCache):
                     )
 
     def load_page_per_layer(self, host_indices, device_indices, device_pool, layer_id):
-        logger.info("###binwa cuda H2D###")
         device_indices_cpu = device_indices[:: self.page_size].cpu()
         for i in range(len(device_indices_cpu)):
             h_index = host_indices[i * self.page_size]
             d_index = device_indices_cpu[i]
-            device_pool.k_buffer[layer_id - self.start_layer][
-                d_index : d_index + self.page_size
-            ].copy_(
-                self.kv_buffer[
-                    0, layer_id - self.start_layer, h_index : h_index + self.page_size
-                ],
-                non_blocking=True,
-            )
-            device_pool.v_buffer[layer_id - self.start_layer][
-                d_index : d_index + self.page_size
-            ].copy_(
-                self.kv_buffer[
-                    1, layer_id - self.start_layer, h_index : h_index + self.page_size
-                ],
-                non_blocking=True,
-            )
+            if global_config.enable_gds:
+                    file_path = global_config.gds_path + "k_buffer_layer" + str(layer_id - self.start_layer)
+                    self.gds.d2s("READ",
+                        file_path,
+                        device_pool.k_buffer[layer_id - self.start_layer][d_index : d_index + self.page_size],
+                        h_index * self.size_per_page,
+                        self.page_size * self.size_per_page)
+                    file_path = global_config.gds_path + "v_buffer_layer" + str(layer_id - self.start_layer)
+                    self.gds.d2s("READ",
+                        file_path,
+                        device_pool.v_buffer[layer_id - self.start_layer][d_index : d_index + self.page_size],
+                        h_index * self.size_per_page,
+                        self.page_size * self.size_per_page)
+            else:
+                device_pool.k_buffer[layer_id - self.start_layer][
+                    d_index : d_index + self.page_size
+                ].copy_(
+                    self.kv_buffer[
+                        0, layer_id - self.start_layer, h_index : h_index + self.page_size
+                    ],
+                    non_blocking=True,
+                )
+                device_pool.v_buffer[layer_id - self.start_layer][
+                    d_index : d_index + self.page_size
+                ].copy_(
+                    self.kv_buffer[
+                        1, layer_id - self.start_layer, h_index : h_index + self.page_size
+                    ],
+                    non_blocking=True,
+                )
 
 
 class MLATokenToKVPoolHost(HostKVCache):
