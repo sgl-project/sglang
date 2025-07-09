@@ -524,6 +524,8 @@ class EmbeddingReqInput:
     image_data: Optional[
         Union[List[List[Union[Image, str]]], List[Union[Image, str]], Union[Image, str]]
     ] = None
+    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
+    video_data: Optional[Union[List[str], str]] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[Union[List[str], str]] = None
     # The token ids for text; one can either specify text or input_ids.
@@ -597,8 +599,8 @@ class EmbeddingReqInput:
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
-            or has_valid_data(self.audio_data)
             or has_valid_data(self.video_data)
+            or has_valid_data(self.audio_data)
         )
 
     def __getitem__(self, i):
