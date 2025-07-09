@@ -218,7 +218,7 @@ class LoRAManager:
             seg_lens = (
                 forward_batch.extend_seq_lens
                 if forward_batch.forward_mode.is_extend()
-                else torch.ones(bs, device=self.device)
+                else torch.ones(bs, device=self.device, dtype=torch.int32)
             )
 
             max_len = (
