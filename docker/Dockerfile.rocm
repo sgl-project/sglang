@@ -1,13 +1,5 @@
 # Usage (to build SGLang ROCm docker image):
-<<<<<<< HEAD
-<<<<<<< HEAD
-#   docker build --build-arg SGL_BRANCH=v0.4.9.post1 -t v0.4.9.post1-rocm630 -f Dockerfile.rocm .
-=======
-#   docker build --build-arg SGL_BRANCH=v0.4.7.post1 --build-arg ARG_PYTORCH_ROCM_ARCH=gfx950 -t v0.4.7.post1-rocm700 -f Dockerfile.rocm .
->>>>>>> aa0c914e7 (Add ROCm7.0 to support gfx950)
-=======
-#   docker build --build-arg SGL_BRANCH=v0.4.8.post1 --build-arg ARG_PYTORCH_ROCM_ARCH=[gfx950|gfx942] -t v0.4.8.post1-rocm700 -f Dockerfile.rocm .
->>>>>>> 7a74f6f44 (cleanup a little bit)
+#   docker build --build-arg SGL_BRANCH=v0.4.9 --build-arg ARG_PYTORCH_ROCM_ARCH=[gfx950|gfx942] -t v0.4.9-rocm700 -f Dockerfile.rocm .
 
 # default base image
 ARG BASE_IMAGE_950="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_sglang_0.4.6.post4_mi35X_prealpha"
