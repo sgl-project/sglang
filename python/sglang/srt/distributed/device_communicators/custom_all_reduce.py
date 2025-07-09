@@ -483,7 +483,9 @@ class CustomAllreduce:
         if memory_saver_adapter.enabled:
             with memory_saver_adapter.disable():
                 # TODO improve
-                input = input.clone()
+                cloned_input = torch.empty_like(input)
+                cloned_input.copy_(input)
+                input = cloned_input
 
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
