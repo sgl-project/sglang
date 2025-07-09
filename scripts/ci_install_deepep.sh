@@ -40,6 +40,9 @@ if [ ! -e "/usr/lib/x86_64-linux-gnu/libmlx5.so" ]; then
 fi
 apt-get update && apt-get install -y libfabric-dev
 
+# Clone DeepEP
+rm -rf /root/.cache/deepep && git clone https://github.com/deepseek-ai/DeepEP.git /root/.cache/deepep && cd /root/.cache/deepep && git checkout eef7ab50fa5cf0ab1dd3fce4c6493c90bdf290ac
+
 # Install NVSHMEM
 cd /opt/nvshmem
 wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz
@@ -60,7 +63,6 @@ cd build
 make -j$(nproc) install
 
 # Install DeepEP
-rm -rf /root/.cache/deepep && git clone https://github.com/deepseek-ai/DeepEP.git /root/.cache/deepep
 cd /root/.cache/deepep && git checkout eef7ab50fa5cf0ab1dd3fce4c6493c90bdf290ac && python3 setup.py install
 
 # Verify configuration
