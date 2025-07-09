@@ -17,7 +17,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
             from mf_adapter import TransferEngine
         except ImportError as e:
             raise ImportError(
-                "Please install AscendTransferEngine, run SGLang with AscendTransferEngine"
+                "Please install mf_adapter, for details, see docs/backend/pd_disaggregation.md"
             ) from e
 
         self.engine = TransferEngine()
