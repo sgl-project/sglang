@@ -478,15 +478,6 @@ class CustomAllreduce:
         # When custom allreduce is disabled, this will be None.
         if self.disabled or not self.should_custom_ar(input):
             return None
-
-        memory_saver_adapter = TorchMemorySaverAdapter.create(enable=get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH"))
-        if memory_saver_adapter.enabled:
-            with memory_saver_adapter.disable():
-                # TODO improve
-                cloned_input = torch.empty_like(input)
-                cloned_input.copy_(input)
-                input = cloned_input
-
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 if _is_hip:
