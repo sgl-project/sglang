@@ -15,15 +15,25 @@ if [ -z "$cache_dir" ]; then
     exit 1
 fi
 
+failed_models=()
 for model in $models; do
     local_model_dir="$cache_dir/$model"
     echo "Caching model: $model to $local_model_dir"
     mkdir -p "$local_model_dir"
-    huggingface-cli download "$model" --local-dir "$local_model_dir" --local-dir-use-symlinks False
-    if [ $? -ne 0 ]; then
-        echo "Failed to cache model: $model"
-        continue 
-    else
-        echo "Successfully cached model: $model"
+    
+    if ! huggingface-cli download "$model" \
+        --local-dir "$local_model_dir" \
+        --local-dir-use-symlinks False 2>/dev/null; then
+        echo "WARNING: Failed to cache model: $model"
+        failed_models+=("$model")
+        continue
     fi
+    echo "Successfully cached model: $model"
 done
+
+if [ ${#failed_models[@]} -gt 0 ]; then
+    echo -e "\n[Summary] Failed to cache following models:"
+    printf ' - %s\n' "${failed_models[@]}"
+else
+    echo -e "\n[Summary] All models cached successfully"
+fi
