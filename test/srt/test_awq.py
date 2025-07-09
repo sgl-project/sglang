@@ -301,9 +301,7 @@ class TestAWQMethods(unittest.TestCase):
 
         self.assertEqual(output.shape, expected_output.shape)
         self.assertEqual(output.shape, (self.batch_size, self.output_size))
-        self.assertTrue(
-            torch.allclose(output, expected_output, atol=1e-1, rtol=1e-1)
-        )
+        self.assertTrue(torch.allclose(output, expected_output, atol=1e-1, rtol=1e-1))
 
 
 if __name__ == "__main__":
