@@ -601,7 +601,7 @@ class CudaGraphRunner:
         )
 
         global global_graph_memory_pool
-        with graph_fn(graph, pool=global_graph_memory_pool, stream=stream):
+        with graph_fn(cuda_graph=graph, pool=global_graph_memory_pool, stream=stream):
             out = run_once()
 
         global_graph_memory_pool = graph.pool()
