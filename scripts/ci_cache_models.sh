@@ -16,7 +16,7 @@ if [ -z "$cache_dir" ]; then
 fi
 
 failed_models=()
-for model in $models; do
+for model in "${models[@]}"; do
     local_model_dir="$cache_dir/$model"
     echo "Caching model: $model to $local_model_dir"
     mkdir -p "$local_model_dir"
