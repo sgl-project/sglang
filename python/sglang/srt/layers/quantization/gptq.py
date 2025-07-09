@@ -5,10 +5,11 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import torch
 
 from sglang.srt.layers.linear import LinearBase, LinearMethodBase, set_weight_attrs
-from sglang.srt.layers.moe.fused_moe_triton import (
-    FusedMoEMethodBase,
-    FusedMoeWeightScaleSupported,
-)
+
+# from sglang.srt.layers.moe.fused_moe_triton import (
+#     FusedMoEMethodBase,
+#     FusedMoeWeightScaleSupported,
+# )
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     ChannelQuantScaleParameter,
@@ -868,6 +869,9 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         )
 
 
+FusedMoEMethodBase = QuantizeMethodBase
+
+
 class GPTQMarlinMoEMethod(FusedMoEMethodBase):
     """MoE Marlin method with quantization."""
 
@@ -883,6 +887,8 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
         intermediate_size = extra_weight_attrs.pop("intermediate_size")
 
         self.is_k_full = (not self.quant_config.desc_act) or (
