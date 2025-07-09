@@ -20,6 +20,7 @@ import inspect
 import logging
 import os
 from contextlib import contextmanager
+from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
@@ -40,6 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
     empty_context,
@@ -586,8 +588,11 @@ class CudaGraphRunner:
 
             run_once()
 
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.enable_memory_saver
+        )
         graph_fn = (
-            TODO
+            partial(memory_saver_adapter.cuda_graph, tag="cuda_graph")
             if self.model_runner.server_args.enable_memory_saver and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
             else torch.cuda.graph
         )

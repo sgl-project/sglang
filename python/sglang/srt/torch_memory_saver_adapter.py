@@ -43,6 +43,9 @@ class TorchMemorySaverAdapter(ABC):
     def region(self, tag: str):
         raise NotImplementedError
 
+    def cuda_graph(self, **kwargs):
+        raise NotImplementedError
+
     def pause(self, tag: str):
         raise NotImplementedError
 
@@ -63,6 +66,9 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     def region(self, tag: str):
         return _memory_saver.region(tag=tag)
 
+    def cuda_graph(self, **kwargs):
+        raise _memory_saver.cuda_graph(**kwargs)
+
     def pause(self, tag: str):
         return _memory_saver.pause(tag=tag)
 
@@ -81,6 +87,10 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
 
     @contextmanager
     def region(self, tag: str):
+        yield
+
+    @contextmanager
+    def cuda_graph(self, **kwargs):
         yield
 
     def pause(self, tag: str):
