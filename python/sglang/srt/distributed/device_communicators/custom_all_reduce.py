@@ -483,7 +483,8 @@ class CustomAllreduce:
                 if _is_hip:
                     return self.all_reduce_reg(input)
                 else:
-                    return self.all_reduce(input, registered=True)
+                    registered = not get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+                    return self.all_reduce(input, registered=registered)
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
