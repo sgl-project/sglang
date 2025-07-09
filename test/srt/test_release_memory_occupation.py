@@ -220,12 +220,20 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             )
             print(f"Resume weights took {time.perf_counter() - t:.2f}s")
 
+            engine.resume_memory_occupation(tags=[GPU_MEMORY_TYPE_CUDA_GRAPH])
+            gpu_memory_usage_after_resume_cuda_graph = get_gpu_memory_gb()
+
+            self.assertGreater(
+                gpu_memory_usage_after_resume_cuda_graph,
+                gpu_memory_usage_before_resume,
+            )
+
             engine.resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
             gpu_memory_usage_after_resume_weights = get_gpu_memory_gb()
 
             self.assertGreater(
                 gpu_memory_usage_after_resume_weights,
-                gpu_memory_usage_before_resume,
+                gpu_memory_usage_after_resume_cuda_graph,
             )
 
             # Update weights from a trained model to serving engine, and then destroy the trained model
@@ -250,7 +258,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
 
             print(f"Resume + update took {time.perf_counter() - t:.2f}s")
             print(
-                f"Memory: {gpu_memory_usage_before_resume:.1f} → {gpu_memory_usage_after_resume_weights:.1f} → {gpu_memory_usage_after_loaded_hf_model:.1f} → {gpu_memory_usage_after_resume_kv_cache:.1f} GB"
+                f"Memory: {gpu_memory_usage_before_resume:.1f} → {gpu_memory_usage_after_resume_cuda_graph:.1f} → {gpu_memory_usage_after_resume_weights:.1f} → {gpu_memory_usage_after_loaded_hf_model:.1f} → {gpu_memory_usage_after_resume_kv_cache:.1f} GB"
             )
 
             print("generate (#2)")
