@@ -42,6 +42,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci_install_dependency.sh
+
       - name: Run test
         timeout-minutes: 10
         run: |
@@ -63,6 +64,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci_install_dependency.sh
+
       - name: Run test
         timeout-minutes: 30
         run: |
@@ -80,6 +82,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci_install_dependency.sh
+
       - name: Run test
         timeout-minutes: 30
         run: |
@@ -98,6 +101,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci_install_dependency.sh
+
       - name: Run test
         timeout-minutes: 30
         run: |
@@ -120,6 +124,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci_install_dependency.sh
+
       - name: Run test
         timeout-minutes: 20
         run: |
@@ -137,27 +142,32 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci_install_dependency.sh
+
       - name: Benchmark single latency
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_small
           python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default
+
       - name: Benchmark online latency
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
+
       - name: Benchmark offline throughput
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
+
       - name: Benchmark offline throughput (Non-streaming, small batch size)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
+
       - name: Benchmark online latency (EAGLE)
         timeout-minutes: 10
         run: |
@@ -175,26 +185,31 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci_install_dependency.sh
+
       - name: Benchmark offline throughput (w/o RadixAttention)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
+
       - name: Benchmark offline throughput (w/ Triton)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
+
       - name: Benchmark offline throughput (w/ FP8)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
+
       - name: Benchmark VLM offline throughput
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_offline_throughput
+
       - name: Benchmark VLM online latency
         timeout-minutes: 10
         run: |
@@ -212,37 +227,43 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci_install_dependency.sh
+
       - name: Benchmark single latency (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
+
       - name: Benchmark single latency + torch.compile (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_torch_compile_tp2_bs1
+
       - name: Benchmark offline throughput (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
+
       - name: Benchmark offline throughput (w/o RadixAttention) (TP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
+
       - name: Benchmark offline decode throughput (PP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_pp_offline_throughput_default_decode
+
       - name: Benchmark offline prefill throughput (PP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
-  
+
   accuracy-test-1-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
@@ -257,6 +278,7 @@ jobs:
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
+
       - name: Evaluate accuracy
         timeout-minutes: 20
         run: |
@@ -277,6 +299,7 @@ jobs:
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
+
       - name: Evaluate accuracy (TP=2)
         timeout-minutes: 20
         run: |
