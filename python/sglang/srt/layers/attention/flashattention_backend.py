@@ -666,13 +666,7 @@ class FlashAttentionBackend(AttentionBackend):
                 v.view(
                     forward_batch.batch_size, -1, layer.tp_v_head_num, layer.head_dim
                 ),
-                gamma=0.9,
-                tau=0.1,
-                min_budget=1024,
-                max_budget=None,
-                gqa_interleave=False,
-                block_size=128,
-                return_computational_ratio=False,
+                softmax_scale=layer.scaling,
             )
 
             return out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
