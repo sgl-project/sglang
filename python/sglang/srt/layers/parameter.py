@@ -187,11 +187,12 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         param_data = self.data
         shard_id = tp_rank if shard_id == "q" else tp_rank // num_heads
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
-        from sglang.srt.model_loader.weight_utils import (
-            narrow_padded_param_and_loaded_weight,
-        )
 
         if _is_cpu:
+            from sglang.srt.model_loader.weight_utils import (
+                narrow_padded_param_and_loaded_weight,
+            )
+
             param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 param_data,
                 loaded_weight,
