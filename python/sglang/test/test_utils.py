@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import json
 import logging
 import os
 import random
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple
+import inspect
 
 import numpy as np
 import requests
@@ -100,6 +102,26 @@ def is_in_ci():
 def is_in_amd_ci():
     """Return whether it is in an AMD CI runner."""
     return get_bool_env_var("SGLANG_AMD_CI")
+
+def is_cache_default_models():
+    return os.getenv("DEFAULT_MODEL_CACHE_DIR") is not None
+
+def _model_repo2name(model_repo):
+    if model_repo and "/" in model_repo:
+        return model_repo.split("/")[-1]
+    return model_repo
+
+def try_cached_model(model_repo):
+    if is_cache_default_models():
+        model_dir = os.getenv('DEFAULT_MODEL_CACHE_DIR')
+    else :
+        return model_repo
+
+    model_path = os.path.join(model_dir, _model_repo2name(model_repo))
+    if os.path.isdir(model_path):
+        return os.path.abspath(model_path)
+
+    return model_repo
 
 
 if is_in_ci():
@@ -417,6 +439,18 @@ def get_call_select(args: argparse.Namespace):
             raise
 
     return func
+
+def _get_default_models():
+    current_module = inspect.getmodule(_get_default_models)
+    default_models = set()
+    for name, value in current_module.__dict__.items():
+        if isinstance(name, str) and "DEFAULT_" in name and "MODEL_" in name and isinstance(value, str):
+            if ',' in value:
+                parts = [part.strip() for part in value.split(',')]
+                default_models.update(parts)
+            else:
+                default_models.add(value.strip())
+    return json.dumps(list(default_models))
 
 
 def popen_launch_server(
@@ -1238,6 +1272,7 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                                 rank += 1
                             else:
                                 raise
+
 
 
 class CustomTestCase(unittest.TestCase):
