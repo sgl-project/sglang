@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from transformers import PhiConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -32,6 +32,7 @@ class PhiAttention(nn.Module):
         config: PhiConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        layer_id: int = 0,
     ):
         super().__init__()
         self.total_num_heads = config.num_attention_heads
@@ -78,6 +79,8 @@ class PhiAttention(nn.Module):
             self.num_heads,
             self.head_size,
             scaling,
+            num_kv_heads=self.num_heads,
+            layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -132,13 +135,17 @@ class PhiLayer(nn.Module):
         config: PhiConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        idx: int = 0,
     ):
         super().__init__()
         self.input_layernorm = nn.LayerNorm(
             config.hidden_size, eps=config.layer_norm_eps
         )
         self.self_attn = PhiAttention(
-            config, quant_config, prefix=add_prefix("self_attn", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("self_attn", prefix),
+            layer_id=idx,
         )
         self.mlp = PhiMLP(config, quant_config)
 
@@ -173,11 +180,22 @@ class PhiModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size
         )
-        self.start_layer, self.end_layer, self.layers = make_layers(
+
+        pp_group = get_pp_group()
+        pp_size = pp_group.world_size
+        pp_rank = pp_group.rank
+
+        self.start_layer = pp_rank * config.num_hidden_layers // pp_size
+        self.end_layer = (pp_rank + 1) * config.num_hidden_layers // pp_size
+
+        self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: PhiLayer(config, prefix=prefix),
+            lambda idx, prefix: PhiLayer(
+                config, quant_config=quant_config, prefix=prefix, idx=idx
+            ),
             prefix=add_prefix("layers", prefix),
         )
+
         self.final_layernorm = nn.LayerNorm(
             config.hidden_size, eps=config.layer_norm_eps
         )
@@ -238,7 +256,7 @@ class PhiForCausalLM(nn.Module):
             bias=True,
             quant_config=quant_config,
         )
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.logits_processor = LogitsProcessor(config)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -263,18 +281,54 @@ class PhiForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if name.endswith(".bias") and name not in params_dict:
-                continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+        weights = dict(weights)
+        loaded_keys = set()
+
+        for name, param in params_dict.items():
+            if name in loaded_keys:
                 continue
 
-            param = params_dict[name]
+            # Handle packed weights
+            is_packed = False
+            for packed_name, src_names in self.packed_modules_mapping.items():
+                if packed_name not in name:
+                    continue
+
+                # Load and concat packed weights
+                loaded_weights = []
+                for src_name in src_names:
+                    full_src_name = name.replace(packed_name, src_name)
+                    if full_src_name not in weights:
+                        # Sometimes the biases are not included in the checkpoint
+                        continue
+                    loaded_weights.append(weights[full_src_name])
+                    loaded_keys.add(full_src_name)
+
+                if not loaded_weights:
+                    continue
+
+                # Concatenate along the first dimension
+                loaded_weight = torch.cat(loaded_weights, dim=0)
+
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_keys.add(name)
+                is_packed = True
+                break
+            if is_packed:
+                continue
+
+            # Handle non-packed weights
+            if name not in weights:
+                # Redundant with the check in the loop, but good for safety
+                continue
+
+            loaded_weight = weights[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
+            loaded_keys.add(name)
 
 
 EntryClass = PhiForCausalLM
