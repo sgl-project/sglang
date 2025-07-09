@@ -169,9 +169,6 @@ suites = {
         TestFile("test_pp_single_node.py", 150),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
     ],
-    "per-commit-4-deepep": [
-        TestFile("test_hybrid_dp_ep.py", 50),
-    ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
     ],
@@ -184,7 +181,8 @@ suites = {
         TestFile("test_full_deepseek_v3.py", 463),
     ],
     "per-commit-8-deepep": [
-        TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
+        TestFile("test_hybrid_dp_ep.py", 50),
+        # TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),

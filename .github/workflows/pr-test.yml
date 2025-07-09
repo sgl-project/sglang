@@ -32,28 +32,9 @@ concurrency:
 
 jobs:
 
-  unittest-test-deepep-4-gpu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
-    runs-on: 8-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci_install_deepep.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-4-deepep
-
   unittest-test-deepep-8-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
-    needs: [unittest-test-deepep-4-gpu]
     runs-on: 8-gpu-runner
     steps:
       - name: Checkout code
@@ -72,7 +53,7 @@ jobs:
   finish:
     if: always()
     needs: [
-      unittest-test-deepep-4-gpu, unittest-test-deepep-8-gpu,
+      unittest-test-deepep-8-gpu,
     ]
     runs-on: ubuntu-latest
     steps:

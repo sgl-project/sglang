@@ -99,6 +99,43 @@ class TestHybridDPTP(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
+class TestTP(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--enable-deepep-moe",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(metrics)
+
+        self.assertGreater(metrics["accuracy"], 0.62)
+
+
 class TestNoGatherdBuffer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -119,6 +156,10 @@ class TestNoGatherdBuffer(CustomTestCase):
                 "1",
                 "--enable-dp-lm-head",
                 "--enable-deepep-moe",
+                "--cuda-graph-max-bs",
+                "32",
+                "--max-running-requests",
+                "128",
             ],
         )
 
@@ -210,9 +251,9 @@ class TestMTP(CustomTestCase):
                 "--speculative-num-steps",
                 "2",
                 "--speculative-eagle-topk",
-                "4",
+                "3",
                 "--speculative-num-draft-tokens",
-                "4",
+                "5",
             ],
         )
 
@@ -256,39 +297,32 @@ class TestMTPWithTBO(CustomTestCase):
 
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = [
-            "--trust-remote-code",
-            "--speculative-algorithm",
-            "EAGLE",
-            "--speculative-num-steps",
-            "2",
-            "--speculative-eagle-topk",
-            "4",
-            "--speculative-num-draft-tokens",
-            "4",
-            "--speculative-draft",
-            DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
-            "--tp-size",
-            "4",
-            "--enable-dp-attention",
-            "--dp-size",
-            "4",
-            "--enable-two-batch-overlap",
-            "--enable-deepep-moe",
-            "--deepep-mode",
-            "low_latency",
-            "--chunked-prefill-size",
-            "256",
-            "--cuda-graph-max-bs",
-            "32",
-            "--max-running-requests",
-            "32",
-        ]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
+            other_args=[
+                "--tp-size",
+                "4",
+                "--enable-dp-attention",
+                "--dp-size",
+                "4",
+                "--enable-two-batch-overlap",
+                "--enable-deepep-moe",
+                "--trust-remote-code",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "2",
+                "--speculative-eagle-topk",
+                "3",
+                "--speculative-num-draft-tokens",
+                "5",
+                "--speculative-draft",
+                DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
+                "--chunked-prefill-size",
+                "256",
+            ],
         )
 
     @classmethod
