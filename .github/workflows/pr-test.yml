@@ -32,7 +32,7 @@ concurrency:
 
 jobs:
 
-  unittest-test-deepep-8-gpu:
+  unittest-test-deepep-4-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
     runs-on: 4-gpu-runner
