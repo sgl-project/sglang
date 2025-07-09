@@ -157,7 +157,9 @@ class ElasticTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def __init__(self, size: int, dtype: torch.dtype, device: str, kvcache: KVCache):
         super().__init__(size, 1, dtype, device, kvcache)
         self.clear()
-        assert hasattr(kvcache, "kv_allocator"), "ElasticTokenToKVPoolAllocator requires kvcache as ElasticMHATokenToKVPool"
+        assert hasattr(
+            kvcache, "kv_allocator"
+        ), "ElasticTokenToKVPoolAllocator requires kvcache as ElasticMHATokenToKVPool"
         self.kv_allocator = kvcache.kv_allocator
 
     def available_size(self):
