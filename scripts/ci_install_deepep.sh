@@ -41,7 +41,7 @@ fi
 apt-get update && apt-get install -y libfabric-dev
 
 # Clone DeepEP
-git clone https://github.com/deepseek-ai/DeepEP.git /root/.cache/deepep
+git clone --branch eef7ab50fa5cf0ab1dd3fce4c6493c90bdf290ac --depth 1 https://github.com/deepseek-ai/DeepEP.git /root/.cache/deepep
 
 # Install NVSHMEM
 cd /opt/nvshmem
