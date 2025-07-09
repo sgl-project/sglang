@@ -27,6 +27,7 @@ import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
@@ -589,11 +590,11 @@ class CudaGraphRunner:
             run_once()
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
+            enable=self.model_runner.server_args.enable_memory_saver
         )
         graph_fn = (
-            partial(memory_saver_adapter.cuda_graph, tag="cuda_graph")
-            if self.model_runner.server_args.enable_memory_saver and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+            partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
+            if memory_saver_adapter.enabled and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
             else torch.cuda.graph
         )
 
