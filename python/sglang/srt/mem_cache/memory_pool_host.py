@@ -235,8 +235,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         if global_config.enable_gds:
             self.size_per_page = self.head_dim * self.head_num * self.dtype.itemsize
             self.gds = Gds(
-                gds_file_path="/tmp/gds/try.txt",
-                buf_size=self.get_size_per_token(),
+                gds_file_path = global_config.gds_path + "test.txt",
+                buf_size = self.get_size_per_token(),
             )
 
     def get_size_per_token(self):
@@ -280,13 +280,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             d_index = device_indices_cpu[i]
             for j in range(self.layer_num):
                 if global_config.enable_gds:
-                    file_path = "/tmp/gds/k_buffer_layer" + str(j)
+                    file_path = global_config.gds_path + "k_buffer_layer" + str(j)
                     self.gds.d2s("write",
                         file_path,
                         device_pool.k_buffer[j][d_index : d_index + self.page_size],
                         h_index * self.size_per_page,
                         self.page_size * self.size_per_page)
-                    file_path = "/tmp/gds/v_buffer_layer" + str(j)
+                    file_path = global_config.gds_path + "v_buffer_layer" + str(j)
                     self.gds.d2s("write",
                         file_path,
                         device_pool.v_buffer[j][d_index : d_index + self.page_size],
