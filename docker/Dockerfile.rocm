@@ -1,8 +1,8 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.4.9 --build-arg ARG_PYTORCH_ROCM_ARCH=[gfx950|gfx942] -t v0.4.9-rocm700 -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg ARG_PYTORCH_ROCM_ARCH=[gfx950|gfx942] -t v0.4.9.post1-rocm700 -f Dockerfile.rocm .
 
 # default base image
-ARG BASE_IMAGE_950="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_sglang_0.4.6.post4_mi35X_prealpha"
+ARG BASE_IMAGE_950="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.8.5_mi35X_prealpha"
 ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
 
 ARG ARG_PYTORCH_ROCM_ARCH
@@ -25,7 +25,7 @@ ENV BUILD_AITER_ALL="1"
 ENV AITER_REPO="https://github.com/ROCm/aiter.git"
 ENV AITER_COMMIT="4738360c65a3c0e10fe6fbe86d54de825a161e87"
 ENV SGL_REPO="https://github.com/sgl-project/sglang.git"
-ENV SGL_DEFAULT="upstream-dockerfile"
+ENV SGL_DEFAULT="main"
 
 FROM ${ARG_PYTORCH_ROCM_ARCH}
 
@@ -36,15 +36,11 @@ ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 
 # Install some basic utilities
 RUN rm -rf /etc/apt/sources.list.d/*
-RUN apt-get update -q -y && apt-get install -q -y \
-    sqlite3 libsqlite3-dev libfmt-dev libmsgpack-dev libsuitesparse-dev \
-    apt-transport-https ca-certificates wget curl
+#RUN apt-get update -q -y && apt-get install -q -y \
+#    sqlite3 libsqlite3-dev libfmt-dev libmsgpack-dev libsuitesparse-dev \
+#    apt-transport-https ca-certificates wget curl
 RUN python3 -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python3 -m pip uninstall -y sccache; rm -f "$(which sccache)"
-
-# For git checkout
-RUN git config --global user.email "62472426+mqhc2020@users.noreply.github.com" \
- && git config --global user.name "AMD User"
 
 WORKDIR /sgl-workspace
 
