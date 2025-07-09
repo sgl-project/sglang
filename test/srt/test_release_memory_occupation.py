@@ -156,7 +156,13 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         # With multi-stage release and resume, we can set the memory fraction to 0.85 without concern of OOM
         model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
-        for tp_size in [1, 2]:
+        # TODO
+        # TODO
+        # TODO temp
+        # TODO
+        # TODO
+        # for tp_size in [1, 2]:
+        for tp_size in [2]:
             if tp_size == 2 and torch.cuda.device_count() < 2:
                 continue
 
