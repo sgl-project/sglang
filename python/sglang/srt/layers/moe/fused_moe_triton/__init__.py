@@ -14,7 +14,6 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import (
 
 _config: Optional[Dict[str, Any]] = None
 
-
 @contextmanager
 def override_config(config):
     global _config
@@ -30,7 +29,7 @@ def get_config() -> Optional[Dict[str, Any]]:
 
 __all__ = [
     "FusedMoE",
-    "FusedMoEMethodBase",
+    "FusedMoEMethodBase", 
     "FusedMoeWeightScaleSupported",
     "override_config",
     "get_config",

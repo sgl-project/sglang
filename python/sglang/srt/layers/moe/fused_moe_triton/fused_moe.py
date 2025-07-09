@@ -1182,6 +1182,8 @@ def inplace_fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     routed_scaling_factor: Optional[float] = None,
+    w1_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -1206,6 +1208,8 @@ def inplace_fused_experts(
         block_shape,
         False,
         routed_scaling_factor,
+        w1_bias,
+        w2_bias,
     )
 
 
@@ -1230,6 +1234,8 @@ def inplace_fused_experts_fake(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     routed_scaling_factor: Optional[float] = None,
+    w1_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
 ) -> None:
     pass
 
@@ -1264,6 +1270,8 @@ def outplace_fused_experts(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    w1_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -1288,6 +1296,8 @@ def outplace_fused_experts(
         block_shape,
         no_combine=no_combine,
         routed_scaling_factor=routed_scaling_factor,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
     )
 
 
@@ -1313,6 +1323,8 @@ def outplace_fused_experts_fake(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    w1_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -1348,6 +1360,8 @@ def fused_experts(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    w1_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
 ):
 
     if inplace:
@@ -1373,6 +1387,8 @@ def fused_experts(
             a2_scale,
             block_shape,
             routed_scaling_factor,
+            w1_bias,
+            w2_bias,
         )
         return hidden_states
     else:
@@ -1398,6 +1414,8 @@ def fused_experts(
             block_shape,
             no_combine=no_combine,
             routed_scaling_factor=routed_scaling_factor,
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
         )
 
 
@@ -1516,6 +1534,8 @@ def fused_experts_impl(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    w1_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
 ):
     padded_size = padding_size
     if (
@@ -1647,6 +1667,17 @@ def fused_experts_impl(
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
         )
+        
+        # Add bias for w1 if provided
+        if w1_bias is not None:
+            # w1_bias shape: (num_experts, 2 * intermediate_size)
+            # We need to add bias for each expert based on topk_ids
+            w1_bias_selected = w1_bias[curr_topk_ids]  # Shape: (tokens_in_chunk, topk, N)
+            # N is already 2 * intermediate_size, so we don't need to multiply by 2
+            intermediate_cache1 = intermediate_cache1.view(tokens_in_chunk, topk_ids.shape[1], N)
+            intermediate_cache1 = intermediate_cache1 + w1_bias_selected
+            intermediate_cache1 = intermediate_cache1.view(-1, N)
+
         if activation == "silu":
             if _is_cuda:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
@@ -1661,6 +1692,25 @@ def fused_experts_impl(
                 vllm_ops.gelu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
                 )
+        elif activation == "swiglu":
+            # SwiGLU: out_glu * (x_linear + 1)
+            # intermediate_cache1 contains [gate_output, up_output]
+            # We need to apply sigmoid to gate_output and multiply with (up_output + 1)
+            if _is_cuda:
+                # For CUDA, we may need to implement a custom kernel for SwiGLU
+                # For now, fallback to native implementation
+                # N is already 2 * intermediate_size, so we split it into two halves
+                gate_output, up_output = torch.chunk(intermediate_cache1.view(-1, N), 2, dim=-1)
+                gate_activated = torch.sigmoid(1.702 * gate_output)  # alpha = 1.702
+                up_with_bias = up_output + 1  # Add bias of 1
+                intermediate_cache2.copy_(gate_activated * up_with_bias)
+            else:
+                # For CPU, use native implementation
+                # N is already 2 * intermediate_size, so we split it into two halves
+                gate_output, up_output = torch.chunk(intermediate_cache1.view(-1, N), 2, dim=-1)
+                gate_activated = torch.sigmoid(1.702 * gate_output)  # alpha = 1.702
+                up_with_bias = up_output + 1  # Add bias of 1
+                intermediate_cache2.copy_(gate_activated * up_with_bias)
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
 
@@ -1692,6 +1742,17 @@ def fused_experts_impl(
             block_shape=block_shape,
         )
 
+        # Add bias for w2 if provided
+        if w2_bias is not None:
+            # w2_bias shape: (num_experts, hidden_size)
+            # We need to add bias for each expert based on topk_ids
+            w2_bias_selected = w2_bias[curr_topk_ids]  # Shape: (tokens_in_chunk, topk, hidden_size)
+            if not no_combine and topk_ids.shape[1] != 1:
+                # intermediate_cache3 should maintain its 3D shape for proper bias addition
+                intermediate_cache3 = intermediate_cache3 + w2_bias_selected
+            else:
+                out_hidden_states[begin_chunk_idx:end_chunk_idx] = out_hidden_states[begin_chunk_idx:end_chunk_idx] + w2_bias_selected.squeeze(1)
+
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
 
@@ -1710,13 +1771,13 @@ def fused_experts_impl(
                 # According to micro benchmark results, torch.compile can get better performance for small token.
                 if tokens_in_chunk <= 32:
                     moe_sum_reduce_torch_compile(
-                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        intermediate_cache3,
                         out_hidden_states[begin_chunk_idx:end_chunk_idx],
                         routed_scaling_factor,
                     )
                 else:
                     moe_sum_reduce_triton(
-                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        intermediate_cache3,
                         out_hidden_states[begin_chunk_idx:end_chunk_idx],
                         routed_scaling_factor,
                     )
