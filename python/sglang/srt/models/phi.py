@@ -262,16 +262,6 @@ class PhiForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata,
-    ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(
-            self.lm_head, hidden_states, sampling_metadata, self.lm_head.bias
-        )
-        return logits
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
