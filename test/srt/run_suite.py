@@ -54,7 +54,7 @@ suites = {
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_eagle_infer_a.py", 370),
-        TestFile("test_eagle_infer_b.py", 270),
+        TestFile("test_eagle_infer_b.py", 700),
         TestFile("test_ebnf_constrained.py", 108),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 376),
@@ -67,10 +67,11 @@ suites = {
         TestFile("test_hidden_states.py", 55),
         TestFile("test_int8_kernel.py", 8),
         TestFile("test_input_embeddings.py", 38),
+        TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
         TestFile("test_mla.py", 167),
-        TestFile("test_mla_deepseek_v3.py", 342),
+        TestFile("test_mla_deepseek_v3.py", 700),
         TestFile("test_mla_int8_deepseek_v3.py", 429),
         TestFile("test_mla_flashinfer.py", 302),
         TestFile("test_mla_fp8.py", 93),
@@ -169,20 +170,21 @@ suites = {
         TestFile("test_pp_single_node.py", 150),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
     ],
+    "per-commit-4-gpu-deepep": [
+        TestFile("test_deepep_small.py", 531),
+    ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
     ],
     "per-commit-8-gpu": [
-        # Disabled deepep tests temporarily because it takes too much time.
-        # TODO: re-enable them after reducing the test time with compilation cache and smaller models.
-        # TestFile("test_deepep_intranode.py", 50),
-        # TestFile("test_deepep_low_latency.py", 50),
-        # TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
         # Disabled because it hangs on the CI.
         # TestFile("test_moe_ep.py", 181),
         TestFile("test_disaggregation.py", 270),
         TestFile("test_disaggregation_different_tp.py", 155),
         TestFile("test_full_deepseek_v3.py", 463),
+    ],
+    "per-commit-8-gpu-deepep": [
+        TestFile("test_deepep_large.py", 485),
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
