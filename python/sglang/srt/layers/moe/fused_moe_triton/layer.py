@@ -21,7 +21,10 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe_oai import fused_experts_oai
 
-# fused_experts will be imported at runtime to avoid circular imports
+if torch.cuda.is_available():
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+else:
+    fused_experts = None  # type: ignore
 
 import logging
 
@@ -242,9 +245,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 ),
             )
         else:
-            # Import at runtime to avoid circular dependency
-            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-
             return fused_experts(
                 hidden_states=x,
                 w1=layer.w13_weight,

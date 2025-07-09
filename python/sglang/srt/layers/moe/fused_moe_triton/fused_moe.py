@@ -1115,13 +1115,9 @@ def try_get_optimal_moe_config(
     is_marlin: bool = False,
     block_shape: Optional[List[int]] = None,
 ):
-    # Use runtime import to avoid circular dependency
-    try:
-        import sglang.srt.layers.moe.fused_moe_triton as triton_module
-        override_config = triton_module.get_config()
-    except (ImportError, AttributeError):
-        # Fallback if there's circular import or missing function
-        override_config = None
+    from sglang.srt.layers.moe.fused_moe_triton import get_config
+
+    override_config = get_config()
     if override_config:
         config = override_config
     else:
