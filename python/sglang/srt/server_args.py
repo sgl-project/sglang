@@ -217,11 +217,13 @@ class ServerArgs:
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
+    hicache_io_backend: str = ""
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
+    enable_triton_kernel_moe: bool = False
     warmups: Optional[str] = None
 
     # Debug tensor dumps
@@ -414,7 +416,7 @@ class ServerArgs:
         if self.enable_dp_lm_head:
             assert (
                 self.enable_dp_attention
-            ), "Please enable dp attention when setting enable_dp_attention. "
+            ), "Please enable dp attention when setting enable_dp_lm_head. "
 
         # DeepEP MoE
         if self.enable_deepep_moe:
@@ -706,6 +708,7 @@ class ServerArgs:
                 "w8a8_fp8",
                 "moe_wna16",
                 "qoq",
+                "w4afp8",
             ],
             help="The quantization method.",
         )
@@ -1530,6 +1533,13 @@ class ServerArgs:
             help="The write policy of hierarchical cache.",
         )
         parser.add_argument(
+            "--hicache-io-backend",
+            type=str,
+            choices=["direct", "kernel"],
+            default=ServerArgs.hicache_io_backend,
+            help="The IO backend for KV cache transfer between CPU and GPU",
+        )
+        parser.add_argument(
             "--flashinfer-mla-disable-ragged",
             action="store_true",
             help="Not using ragged prefill wrapper when running flashinfer mla",
@@ -1553,6 +1563,11 @@ class ServerArgs:
             "--enable-return-hidden-states",
             action="store_true",
             help="Enable returning hidden states with responses.",
+        )
+        parser.add_argument(
+            "--enable-triton-kernel-moe",
+            action="store_true",
+            help="Use triton moe grouped gemm kernel.",
         )
         parser.add_argument(
             "--warmups",
