@@ -659,8 +659,8 @@ class OpenAIMoeAttention(nn.Module):
         if inner_state is None:
             return hidden_states
         # Todo: use hyperparam self.sinks
-        sink = torch.exp(self.sinks.to(torch.float32))
-        sink = sink.to(torch.float32)
+        sinks = torch.exp(self.sinks.to(torch.float32))
+        sinks = sinks.to(torch.float32)
         attn_output = self.attn(*inner_state, sink=sinks)
         output, _ = self.o_proj(attn_output)
         return output
