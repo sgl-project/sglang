@@ -416,7 +416,7 @@ class ServerArgs:
         if self.enable_dp_lm_head:
             assert (
                 self.enable_dp_attention
-            ), "Please enable dp attention when setting enable_dp_attention. "
+            ), "Please enable dp attention when setting enable_dp_lm_head. "
 
         # DeepEP MoE
         if self.enable_deepep_moe:
