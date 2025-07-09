@@ -75,6 +75,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.allocator import (
     AscendPagedTokenToKVPoolAllocator,
     BaseTokenToKVPoolAllocator,
+    ElasticTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -83,6 +84,7 @@ from sglang.srt.mem_cache.memory_pool import (
     AscendMLAPagedTokenToKVPool,
     AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
+    ElasticMHATokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
@@ -194,6 +196,7 @@ class ModelRunner:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid = model_config.is_hybrid
+        self.is_elastic = get_bool_env_var("ENABLE_KVCACHED", "false")
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
 
@@ -1182,20 +1185,36 @@ class ModelRunner:
                     device=self.device,
                 )
             else:
-                self.token_to_kv_pool = MHATokenToKVPool(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    layer_num=self.num_effective_layers,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
-                )
+                if self.is_elastic:
+                    self.token_to_kv_pool = ElasticMHATokenToKVPool(
+                        size=self.full_max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                    )
+                else:
+                    self.token_to_kv_pool = MHATokenToKVPool(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                    )
 
         if self.token_to_kv_pool_allocator is None:
             if self.page_size == 1:
@@ -1203,6 +1222,13 @@ class ModelRunner:
                     self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                         self.full_max_total_num_tokens,
                         self.swa_max_total_num_tokens,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                    )
+                elif self.is_elastic:
+                    self.token_to_kv_pool_allocator = ElasticTokenToKVPoolAllocator(
+                        self.max_total_num_tokens,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
