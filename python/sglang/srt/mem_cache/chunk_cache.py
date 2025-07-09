@@ -78,6 +78,7 @@ class SWAChunkCache(ChunkCache):
         page_size: int,
     ):
         super().__init__(req_to_token_pool, token_to_kv_pool_allocator, page_size)
+        self.page_size = page_size
         assert isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
 
     def evict(
@@ -86,6 +87,7 @@ class SWAChunkCache(ChunkCache):
         prelen: int,
         attention_chunk_size: int,
     ):
+        assert attention_chunk_size % self.page_size == 0
         if prelen >= req.evicted_seqlen_local + attention_chunk_size:
             new_evicted_seqlen_local = attention_chunk_size * (
                 prelen // attention_chunk_size
