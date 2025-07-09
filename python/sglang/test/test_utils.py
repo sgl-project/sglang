@@ -106,24 +106,6 @@ def is_in_amd_ci():
 def is_cache_default_models():
     return os.getenv("DEFAULT_MODEL_CACHE_DIR") is not None
 
-def _model_repo2name(model_repo):
-    if model_repo and "/" in model_repo:
-        return model_repo.split("/")[-1]
-    return model_repo
-
-def try_cached_model(model_repo):
-    if is_cache_default_models():
-        model_dir = os.getenv('DEFAULT_MODEL_CACHE_DIR')
-    else :
-        return model_repo
-
-    model_path = os.path.join(model_dir, _model_repo2name(model_repo))
-    if os.path.isdir(model_path):
-        return os.path.abspath(model_path)
-
-    return model_repo
-
-
 if is_in_ci():
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
         5000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
@@ -451,6 +433,18 @@ def _get_default_models():
             else:
                 default_models.add(value.strip())
     return json.dumps(list(default_models))
+
+def try_cached_model(model_repo):
+    if is_cache_default_models():
+        model_dir = os.getenv('DEFAULT_MODEL_CACHE_DIR')
+    else :
+        return model_repo
+
+    model_path = os.path.join(model_dir, model_repo)
+    if os.path.isdir(model_path):
+        return os.path.abspath(model_path)
+
+    return model_repo
 
 
 def popen_launch_server(
