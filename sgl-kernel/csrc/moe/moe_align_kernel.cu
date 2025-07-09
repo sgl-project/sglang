@@ -47,7 +47,7 @@ __device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffff
 #pragma unroll
   for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
     int n = __shfl_up_sync(mask, v, offset);
-    if ((threadIdx.x & WARP_SIZE) >= offset) v += n;
+    if ((threadIdx.x & (WARP_SIZE - 1)) >= offset) v += n;
   }
   return v - original;
 }
@@ -68,7 +68,7 @@ __global__ void moe_align_block_size_kernel(
   int32_t* shared_counts = smem;                  // [num_experts]
   int32_t* prefix = shared_counts + num_experts;  // [num_experts + 1]
   int32_t* scan_buf = prefix + num_experts + 1;   // [scan_size]
-  int32_t* warp_sums = scan_buf + scan_size;
+  int32_t* warp_sums = scan_buf + scan_size;      // [<= 32]
   __shared__ int32_t s_total_tokens_post_pad;
 
   const size_t tid = threadIdx.x;
@@ -87,61 +87,63 @@ __global__ void moe_align_block_size_kernel(
 
   __syncthreads();
 
-  int32_t padded_count = 0;
+  // Calculate padded_cnt, write scan_buf, directly prefix sum
+  int32_t local_total = 0;
   if (tid < num_experts) {
     int32_t count = shared_counts[tid];
-    padded_count = (count + block_size - 1) / block_size * block_size;
+    int32_t padded_count = (count + block_size - 1) / block_size * block_size;
     scan_buf[tid] = padded_count;
+    local_total = padded_count;
   }
 
-  if (tid >= num_experts && tid < scan_size) {
-    scan_buf[tid] = 0;
-  }
-
-  __syncthreads();
-
-  int val = (tid < scan_size) ? scan_buf[tid] : 0;
-
-  int warp_prefix = warp_exclusive_scan(val);
-
+  // Intra warp prefix sum
   const int warp_id = tid >> 5;
-  const int lane_id = tid & 31;
-  const int num_warps = (scan_size + WARP_SIZE - 1) / WARP_SIZE;
-
-  if (lane_id == WARP_SIZE - 1) warp_sums[warp_id] = warp_prefix + val;
+  const int lane_id = tid & (WARP_SIZE - 1);
+  const int nw = (scan_size + WARP_SIZE - 1) >> 5;
+  const int warp_sum = warp_exclusive_scan(local_total) + local_total;
+  if (lane_id == WARP_SIZE - 1) warp_sums[warp_id] = warp_sum;
   __syncthreads();
 
-  int warp_offset = 0;
+  // warp0 accumulate all the block's prefix sum
+  if (tid < WARP_SIZE) {
+    int val = (tid < (scan_size + WARP_SIZE - 1) / WARP_SIZE) ? warp_sums[tid] : 0;
+    int incl = warp_exclusive_scan(val) + val;
+    warp_sums[tid] = incl;
+  }
+  __syncthreads();
+
+  // Every thread obtains the whole block's sum
+  int total_tokens = warp_sums[((scan_size + WARP_SIZE - 1) >> 5) - 1];
+
+  if (tid == 0) {
+    prefix[num_experts] = total_tokens;
+    s_total_tokens_post_pad = total_tokens;
+    *total_tokens_post_pad = total_tokens;
+  }
+  __syncthreads();
+
+  // Fill 0 to scan_buf extended area (tid >= num_expert)
+  if (tid >= num_experts && tid < scan_size) scan_buf[tid] = 0;
+  __syncthreads();
+
+  // Perform 2 level exclusive-prefix-sum to scan_buf
+  int v = (tid < scan_size) ? scan_buf[tid] : 0;
+  int pre = warp_exclusive_scan(v);
+  if (lane_id == WARP_SIZE - 1) warp_sums[warp_id] = pre + v;
+  __syncthreads();
+
   if (warp_id == 0) {
-    int wv = (lane_id < num_warps) ? warp_sums[lane_id] : 0;
-    int wprefix = warp_exclusive_scan(wv);
-    if (lane_id < num_warps) warp_sums[lane_id] = wprefix;
+    int val = (lane_id < nw) ? warp_sums[lane_id] : 0;
+    warp_sums[lane_id] = warp_exclusive_scan(val);
   }
   __syncthreads();
-  warp_offset = warp_sums[warp_id];
 
-  if (tid < scan_size) scan_buf[tid] = warp_prefix + warp_offset;
+  int offset = warp_sums[warp_id];
+  if (tid < scan_size) scan_buf[tid] = pre + offset;
   __syncthreads();
 
+  // Write prefix[0..num_experts - 1] and cumsum
   if (tid < num_experts) prefix[tid] = scan_buf[tid];
-  if (tid == 0) {
-    prefix[num_experts] = scan_buf[scan_size - 1];
-    s_total_tokens_post_pad = prefix[num_experts];
-    *total_tokens_post_pad = s_total_tokens_post_pad;
-  }
-  __syncthreads();
-
-  if (tid < num_experts) {
-    prefix[tid] = scan_buf[tid];
-  }
-
-  if (tid == 0) {
-    s_total_tokens_post_pad = prefix[num_experts];
-    *total_tokens_post_pad = s_total_tokens_post_pad;
-  }
-
-  __syncthreads();
-
   if (tid <= num_experts) {
     cumsum[tid] = prefix[tid];
   }
@@ -257,9 +259,6 @@ void moe_align_block_size(
     bool pad_sorted_token_ids) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  int64_t padded_num_experts = ((num_experts + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
-
-  int experts_per_warp = WARP_SIZE;
   int threads = 1024;
 
   threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
@@ -285,7 +284,7 @@ void moe_align_block_size(
       auto align_kernel = moe_align_block_size_kernel<scalar_t>;
 
       const size_t scan_size = next_pow2(num_experts);
-      const size_t shared_mem_size = (num_experts + (num_experts + 1) + scan_size) * sizeof(int32_t);
+      const size_t shared_mem_size = (num_experts + (num_experts + 1) + scan_size + WARP_SIZE) * sizeof(int32_t);
 
       align_kernel<<<1, threads, shared_mem_size, stream>>>(
           topk_ids.data_ptr<scalar_t>(),
