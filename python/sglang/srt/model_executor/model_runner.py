@@ -1187,7 +1187,7 @@ class ModelRunner:
             else:
                 if self.is_elastic:
                     self.token_to_kv_pool = ElasticMHATokenToKVPool(
-                        size=self.full_max_total_num_tokens,
+                        size=self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
                         head_num=self.model_config.get_num_kv_heads(

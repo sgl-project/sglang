@@ -175,7 +175,8 @@ class ElasticTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_group.append(free_index)
 
     def clear(self):
-        self.kv_allocator.clear()
+        if hasattr(self, "kv_allocator"):
+            self.kv_allocator.clear()
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
