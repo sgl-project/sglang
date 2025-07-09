@@ -3,7 +3,7 @@
 import ctypes
 import logging
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 from typing import Any, Callable, List, Optional, TypeVar, Union
 
@@ -18,7 +18,8 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     gpu_p2p_access_check,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils import is_cuda, is_hip, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -477,25 +478,28 @@ class CustomAllreduce:
         # When custom allreduce is disabled, this will be None.
         if self.disabled or not self.should_custom_ar(input):
             return None
-        if self._IS_CAPTURING:
-            if torch.cuda.is_current_stream_capturing():
-                if _is_hip:
-                    return self.all_reduce_reg(input)
+
+        memory_saver_adapter = TorchMemorySaverAdapter.create(enable=get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH"))
+        with (memory_saver_adapter.disable() if memory_saver_adapter.enabled else nullcontext()):
+            if self._IS_CAPTURING:
+                if torch.cuda.is_current_stream_capturing():
+                    if _is_hip:
+                        return self.all_reduce_reg(input)
+                    else:
+                        return self.all_reduce(input, registered=True)
                 else:
-                    return self.all_reduce(input, registered=True)
+                    # If warm up, mimic the allocation pattern since custom
+                    # allreduce is out-of-place.
+                    return torch.empty_like(input)
             else:
-                # If warm up, mimic the allocation pattern since custom
-                # allreduce is out-of-place.
-                return torch.empty_like(input)
-        else:
-            if _is_hip:
-                # note: outside of cuda graph context,
-                # custom allreduce incurs a cost of cudaMemcpy, which should
-                # be small(<=1% of overall latency) compared to the performance
-                # gains of using custom kernels
-                return self.all_reduce_unreg(input)
-            else:
-                return self.all_reduce(input, registered=False)
+                if _is_hip:
+                    # note: outside of cuda graph context,
+                    # custom allreduce incurs a cost of cudaMemcpy, which should
+                    # be small(<=1% of overall latency) compared to the performance
+                    # gains of using custom kernels
+                    return self.all_reduce_unreg(input)
+                else:
+                    return self.all_reduce(input, registered=False)
 
     def close(self):
         if not self.disabled and self._ptr:
