@@ -298,6 +298,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         assert activation == "silu", f"activation = {activation} is not supported."
 
         if use_intel_amx_backend(layer):
+            from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+
             topk_weights, topk_ids = select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
@@ -311,20 +313,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 correction_bias=correction_bias,
                 routed_scaling_factor=routed_scaling_factor,
             )
-
-            if apply_router_weight_on_input:
-                assert (
-                    topk_weights.dim() == 2
-                ), "`topk_weights` should be in shape (num_tokens, topk)"
-                _, topk = topk_weights.shape
-                assert (
-                    topk == 1
-                ), "Only support topk=1 when `apply_router_weight_on_input` is True"
-                x = x * topk_weights.to(x.dtype)
-                topk_weights = torch.ones_like(
-                    topk_weights, dtype=torch.float32
-                )  # topk_weights must be FP32 (float32)
-                # TODO: fuse above processing in fused_experts_cpu kernel
+            x, topk_weights = apply_topk_weights_cpu(
+                apply_router_weight_on_input, topk_weights, x
+            )
 
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
