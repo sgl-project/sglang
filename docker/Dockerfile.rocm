@@ -15,18 +15,34 @@ ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
 
 ARG ARG_PYTORCH_ROCM_ARCH
 
-FROM $BASE_IMAGE_950 AS gfx950
+# base image 942 and it's args
 FROM $BASE_IMAGE_942 AS gfx942
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="0"
+ENV BUILD_AITER_ALL="0"
+ENV AITER_REPO="https://github.com/ROCm/aiter.git"
+ENV AITER_COMMIT="v0.1.3"
+ENV SGL_REPO="https://github.com/sgl-project/sglang.git"
+ENV SGL_DEFAULT="main"
+
+# base image 950 and it's args
+FROM $BASE_IMAGE_950 AS gfx950
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="0"
+ENV BUILD_AITER_ALL="1"
+ENV AITER_REPO="https://github.com/ROCm/aiter.git"
+ENV AITER_COMMIT="4738360c65a3c0e10fe6fbe86d54de825a161e87"
+# NEED TO FIX
+#ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
+ENV SGL_REPO="https://github.com/mqhc2020/sglang.git"
+ENV SGL_DEFAULT="upstream-dockerfile"
+
 FROM ${ARG_PYTORCH_ROCM_ARCH}
 
 USER root
 
 ARG ARG_PYTORCH_ROCM_ARCH
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
-
-ARG BUILD_VLLM="0"
-ARG BUILD_TRITON="0"
-ARG BUILD_AITER_ALL="1"
 
 # Install some basic utilities
 RUN rm -rf /etc/apt/sources.list.d/*
@@ -44,9 +60,6 @@ WORKDIR /sgl-workspace
 
 # -----------------------
 # AITER
-ARG AITER_REPO="https://github.com/ROCm/aiter.git"
-ARG AITER_COMMIT="4738360c65a3c0e10fe6fbe86d54de825a161e87"
-#ARG AITER_COMMIT="v0.1.3"
 RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
@@ -87,13 +100,7 @@ RUN if [ "$BUILD_VLLM" = "1" ]; then \
 # -----------------------
 # Build SGLang
 ARG BUILD_TYPE=all
-#ARG SGL_REPO="https://github.com/sgl-project/sglang"
-#ENV SGL_DEFAULT="main"
-# NEED TO FIX
-ARG SGL_REPO="https://github.com/mqhc2020/sglang.git"
-#ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
 
-ENV SGL_DEFAULT="upstream-dockerfile"
 ARG SGL_BRANCH=${SGL_DEFAULT}
 
 RUN pip install IPython \
