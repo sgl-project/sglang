@@ -66,7 +66,7 @@ ARG TRITON_REPO="https://github.com/ROCm/triton.git"
 ARG TRITON_COMMIT="9dd57360b74ae60a05d81250113f4513010389aa"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
-ARG AITER_COMMIT="8832dfdf35911935adf319ec98519f8cb6da2ae9"
+ARG AITER_COMMIT="4738360c65a3c0e10fe6fbe86d54de825a161e87"
 #ARG AITER_COMMIT="v0.1.3"
 
 WORKDIR /sgl-workspace/
@@ -83,7 +83,7 @@ RUN git clone ${SGL_REPO} \
     && cd sgl-kernel \
     && rm -f pyproject.toml \
     && mv pyproject_rocm.toml pyproject.toml \
-    && python setup_rocm.py install \
+    && AMDGPU_TARGET=$PYTORCH_ROCM_ARCH python setup_rocm.py install \
     && cd .. \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
          python -m pip --no-cache-dir install -e "python[srt_hip]"; \
@@ -111,13 +111,14 @@ RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout ${AITER_COMMIT} \
- && git submodule update --init --recursive \
- && GPU_ARCHS=$PYTORCH_ROCM_ARCH python3 setup.py develop
+ && git submodule update --init --recursive
 
-RUN if [ "$BUILD_AITER_ALL" = "1" ]; then \
-        cd aiter \
-     && PREBUILD_KERNELS=1 GPU_ARCHS=$PYTORCH_ROCM_ARCH python3 setup.py develop; \
-    fi
+RUN cd aiter \
+     && if [ "$BUILD_AITER_ALL" = "1" ]; then \
+          PREBUILD_KERNELS=1 GPU_ARCHS=$PYTORCH_ROCM_ARCH python3 setup.py develop; \
+        else \
+          GPU_ARCHS=$PYTORCH_ROCM_ARCH python3 setup.py develop; \
+        fi
 
 WORKDIR /sgl-workspace/
 
