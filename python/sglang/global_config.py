@@ -45,7 +45,7 @@ class GlobalConfig:
         self.enable_precache_with_tracing = True
         self.enable_parallel_encoding = True
 
-        self.enable_gds = os.environ.get("enable_gds", False)
+        self.enable_gds = os.environ.get("enable_gds", "false").lower() in ("true", "1")
         self.gds_path = os.environ.get("gds_path", "/tmp/gds/")
 
 
