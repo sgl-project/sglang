@@ -69,29 +69,31 @@ class Gds:
                 logger.info("##create##" + file_path)
                 pass
         fd = os.open(file_path, os.O_RDWR | os.O_CREAT)
-        file_descs = self.file_nixl_obj(index, buff_size, fd)
-        agent_xfer_files = file_descs.trim()
-        # initialize transfer mode
-        xfer_hdl = self.x_agent.initialize_xfer(
-            mode, agent_xfer_tensor, agent_xfer_files, "GDSTester"
-        )
-        if not xfer_hdl:
-            raise ValueError("Creating transfer failed.")
-        state = self.x_agent.transfer(xfer_hdl)
-        if state == "ERR":
-            raise ValueError("Transfer got to Error state.")
-        done = False
-        while not done:
-            state = self.x_agent.check_xfer_state(xfer_hdl)
+        try:
+            file_descs = self.file_nixl_obj(index, buff_size, fd)
+            agent_xfer_files = file_descs.trim()
+            # initialize transfer mode
+            xfer_hdl = self.x_agent.initialize_xfer(
+                mode, agent_xfer_tensor, agent_xfer_files, "GDSTester"
+            )
+            if not xfer_hdl:
+                raise ValueError("Creating transfer failed.")
+            state = self.x_agent.transfer(xfer_hdl)
             if state == "ERR":
                 raise ValueError("Transfer got to Error state.")
-            elif state == "DONE":
-                done = True
-                logger.info("d2s Initiator done")
-        self.x_agent.release_xfer_handle(xfer_hdl)
-        self.x_agent.deregister_memory(gpu_reg_descs)
-        self.x_agent.deregister_memory(file_descs)
-        os.close(fd)
+            done = False
+            while not done:
+                state = self.x_agent.check_xfer_state(xfer_hdl)
+                if state == "ERR":
+                    raise ValueError("Transfer got to Error state.")
+                elif state == "DONE":
+                    done = True
+                    logger.info("d2s Initiator done")
+            self.x_agent.release_xfer_handle(xfer_hdl)
+            self.x_agent.deregister_memory(gpu_reg_descs)
+            self.x_agent.deregister_memory(file_descs)
+        finally:
+            os.close(fd)
 
 def main():
     logging.basicConfig(
@@ -115,7 +117,7 @@ def main():
     logger.info("Write tensor to k buffer 0 and gds to local file")
     logger.info(k_buffer)
     gds_backend = Gds(gds_file_path="/tmp/gds/try.txt",buf_size=128)
-    gds_backend.d2s(test_device_indices, "WRITE", "/tmp/gds/k_buffer_layer1", 0, occupy_size)
+    gds_backend.d2s("WRITE", "/tmp/gds/k_buffer_layer1", test_device_indices, 0, occupy_size)
     test2_device_indices = k_buffer[1][0:3]
     gds_backend.d2s(test2_device_indices, "READ", "/tmp/gds/k_buffer_layer1", 0, occupy_size)
     logger.info("GDS Read tensor back from local file to k buffer 1")
