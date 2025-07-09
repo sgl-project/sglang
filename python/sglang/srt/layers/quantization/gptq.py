@@ -1060,7 +1060,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
         # Repack weights
-        marlin_w13_qweight = torch.ops.sgl_kernel.gptq_marlin_moe_repack(
+        marlin_w13_qweight = ops.gptq_marlin_moe_repack(
             layer.w13_qweight,
             layer.w13_g_idx_sort_indices,
             layer.w13_qweight.shape[1] * self.quant_config.pack_factor,
@@ -1068,7 +1068,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             self.quant_config.quant_type.size_bits,
         )
         replace_parameter(layer, "w13_qweight", marlin_w13_qweight)
-        marlin_w2_qweight = torch.ops.sgl_kernel.gptq_marlin_moe_repack(
+        marlin_w2_qweight = ops.gptq_marlin_moe_repack(
             layer.w2_qweight,
             layer.w2_g_idx_sort_indices,
             layer.w2_qweight.shape[1] * self.quant_config.pack_factor,
