@@ -19,9 +19,6 @@ from sglang.test.test_utils import (
 )
 
 
-DEFAULT_MODEL_NAME_FOR_TEST_MLA = "/dev/shm/DeepSeek-V3-0324"
-
-
 class TestPureDP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -87,7 +84,6 @@ class TestHybridDPTP(CustomTestCase):
                 "128",
                 "--max-running-requests",
                 "128",
-                
             ],
         )
 
