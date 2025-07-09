@@ -160,30 +160,56 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self,
         size: int,
         size_swa: int,
+        page_size: int,
         dtype: torch.dtype,
         device: str,
         kvcache: SWAKVPool,
     ):
-        super().__init__(size, 1, dtype, device, kvcache)
+        super().__init__(size, page_size, dtype, device, kvcache)
         assert isinstance(kvcache, SWAKVPool)
         self._size_full = size
         self._size_swa = size_swa
-        self.full_attn_allocator = TokenToKVPoolAllocator(
-            size,
-            dtype,
-            device,
-            kvcache.full_kv_pool,
-        )
-        self.swa_attn_allocator = TokenToKVPoolAllocator(
-            size_swa,
-            dtype,
-            device,
-            kvcache.swa_kv_pool,
-        )
-        self.full_to_swa_index_mapping = torch.empty(
-            size + size_swa + 1,
-            dtype=torch.int64,
-            device=device,
+        self.page_size = page_size
+        if page_size == 1:
+            self.full_attn_allocator = TokenToKVPoolAllocator(
+                size,
+                dtype,
+                device,
+                kvcache.full_kv_pool,
+            )
+            self.swa_attn_allocator = TokenToKVPoolAllocator(
+                size_swa,
+                dtype,
+                device,
+                kvcache.swa_kv_pool,
+            )
+        else:
+            self.full_attn_allocator = PagedTokenToKVPoolAllocator(
+                size,
+                page_size,
+                dtype,
+                device,
+                kvcache.full_kv_pool,
+            )
+            self.swa_attn_allocator = PagedTokenToKVPoolAllocator(
+                size_swa,
+                page_size,
+                dtype,
+                device,
+                kvcache.swa_kv_pool,
+            )
+        # Note: append one more item of value -1 in the end so -1 maps to -1.
+        # It is needed for the last_loc in alloc_extend, where the first full_last_loc
+        # is -1, and we need to map it to swa_last_loc -1 as well.
+        self.full_to_swa_index_mapping = torch.cat(
+            [
+                torch.empty(
+                    size + 1,
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                torch.tensor([-1], dtype=torch.int64, device=device),
+            ]
         )
         self.clear()
 
@@ -232,6 +258,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
 
     def alloc(self, need_size: int):
+        assert self.page_size == 1
         if need_size > self.full_attn_allocator.available_size():
             return None
         if need_size > self.swa_attn_allocator.available_size():
@@ -239,7 +266,65 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         alloc_full_indices = self.full_attn_allocator.alloc(need_size)
         alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
+        assert alloc_full_indices is not None
+        assert alloc_swa_indices is not None
+
         self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        return alloc_full_indices
+
+    def alloc_extend(
+        self,
+        prefix_lens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        full_last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ):
+        assert self.page_size > 1
+        num_tokens = extend_num_tokens + len(seq_lens) * self.page_size
+        if num_tokens > self.full_attn_allocator.available_size():
+            return None
+        if num_tokens > self.swa_attn_allocator.available_size():
+            return None
+
+        swa_last_loc = self.translate_loc_from_full_to_swa(full_last_loc)
+
+        alloc_full_indices = self.full_attn_allocator.alloc_extend(
+            prefix_lens, seq_lens, full_last_loc, extend_num_tokens
+        )
+        alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
+            prefix_lens, seq_lens, swa_last_loc, extend_num_tokens
+        )
+        assert alloc_full_indices is not None
+        assert alloc_swa_indices is not None
+
+        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+
+        return alloc_full_indices
+
+    def alloc_decode(
+        self,
+        seq_lens: torch.Tensor,
+        full_last_loc: torch.Tensor,
+    ):
+        assert self.page_size > 1
+        num_tokens = len(seq_lens) * self.page_size
+        if num_tokens > self.full_attn_allocator.available_size():
+            return None
+        if num_tokens > self.swa_attn_allocator.available_size():
+            return None
+
+        swa_last_loc = self.translate_loc_from_full_to_swa(full_last_loc)
+
+        alloc_full_indices = self.full_attn_allocator.alloc_decode(
+            seq_lens, full_last_loc
+        )
+        alloc_swa_indices = self.swa_attn_allocator.alloc_decode(seq_lens, swa_last_loc)
+
+        assert alloc_full_indices is not None
+        assert alloc_swa_indices is not None
+
+        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+
         return alloc_full_indices
 
     def free(self, free_index: torch.Tensor):
@@ -270,7 +355,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         self.swa_attn_allocator.clear()
         self.full_attn_allocator.clear()
-        self.full_to_swa_index_mapping.fill_(0)
+        # Note: the last item is -1, we don't clear it, see the comment in __init__
+        self.full_to_swa_index_mapping[:-1].fill_(0)
         self.is_in_free_group = False
         self.free_group = []
 
