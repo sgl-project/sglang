@@ -161,6 +161,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
                 continue
 
             print(f"Testing tp_size={tp_size} for test_multi_stage_release_and_resume")
+            os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "1"
             engine = sgl.Engine(
                 model_path=model_name,
                 random_seed=42,
