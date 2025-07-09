@@ -33,7 +33,6 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 
 import copy
 import dataclasses
-import hashlib
 import logging
 import threading
 from enum import Enum, auto
@@ -53,10 +52,9 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
-from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.metrics.collector import TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -87,6 +85,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "deepep_mode",
     "enable_ep_moe",
     "enable_flashinfer_moe",
+    "enable_flashinfer_allreduce_fusion",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
     "deepep_config",
@@ -96,12 +95,13 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "max_micro_batch_size",
     "disable_shared_experts_fusion",
     "sampling_backend",
-    "speculative_accept_threshold_acc",
     "speculative_accept_threshold_single",
+    "speculative_accept_threshold_acc",
     "torchao_config",
     "triton_attention_reduce_in_fp32",
     "num_reserved_decode_tokens",
     "weight_loader_disable_mmap",
+    "enable_triton_kernel_moe",
 ]
 
 # Put some global args for easy access
@@ -176,45 +176,62 @@ class Modality(Enum):
     VIDEO = auto()
     AUDIO = auto()
 
+    @staticmethod
+    def from_str(modality_str: str):
+        try:
+            return Modality[modality_str.upper()]
+        except KeyError:
+            raise ValueError(
+                f"Invalid modality string: {modality_str}. Valid modalities are: {[m.name for m in Modality]}"
+            )
+
 
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
-    A single multimodal data, from a single image/video/audio or others
+    One MultimodalDataItem contains all inputs for one modality.
+    For example, if there are 3 images and 1 audio inputs, there will be 2 MultimodalDataItem.
+    One for images and one for audio.
+
+    We put the common fields first and the model-specific fields last.
     """
 
     modality: Modality
-
     hash: int = None
     pad_value: int = None
-
-    aspect_ratio_id: Optional[List[torch.Tensor]] = None
-    aspect_ratio_mask: Optional[List[torch.Tensor]] = None
-
     image_sizes: Tuple[int, int] = None
     image_offsets: Optional[list] = None
 
     # the real data, pixel_values or audio_features
     # data: Union[List[torch.Tensor], List[np.ndarray]]
-    pixel_values: Union[torch.Tensor, np.ndarray] = None
-    image_grid_thw: Union[torch.Tensor, np.ndarray] = None
-    video_grid_thws: Union[torch.Tensor, np.ndarray] = None
-
-    image_emb_mask: Optional[torch.Tensor] = None
-    image_spatial_crop: Optional[torch.Tensor] = None
-    second_per_grid_ts: Optional[List[torch.Tensor]] = None
-
-    # [num_images, (n, w, h)]
-    tgt_size: Tuple[int, int] = None
-
-    # kimi-vl related
-    image_grid_hws: Optional[List[torch.Tensor]] = None
-
+    pixel_values: Union[torch.Tensor, np.ndarray, "PIL.Image"] = None
     audio_features: Union[torch.Tensor, np.ndarray] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
     audio_offsets: Optional[List[Tuple[int, int]]] = None
-
     precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
+
+    # For qwen-vl
+    image_grid_thw: Union[torch.Tensor, np.ndarray] = None
+    second_per_grid_ts: Optional[List[torch.Tensor]] = None
+
+    # For deepseek-vl
+    image_emb_mask: Optional[torch.Tensor] = None
+    image_spatial_crop: Optional[torch.Tensor] = None
+
+    # For minicpmv
+    # [num_images, (n, w, h)]
+    tgt_size: Tuple[int, int] = None
+
+    # For mllama
+    aspect_ratio_id: Optional[List[torch.Tensor]] = None
+    aspect_ratio_mask: Optional[List[torch.Tensor]] = None
+
+    # For kimi-vl
+    image_grid_hws: Optional[List[torch.Tensor]] = None
+
+    # For gemma3n
+    input_features: Optional[torch.Tensor] = None
+    input_features_mask: Optional[torch.Tensor] = None
 
     @staticmethod
     def is_empty_list(l):
@@ -226,60 +243,18 @@ class MultimodalDataItem:
         """
         Set the pad value after first hashing the data
         """
+        from sglang.srt.managers.mm_utils import hash_feature
 
-        def data_hash(data) -> int:
-            hash_bytes = hashlib.sha256(data).digest()[:8]
-            return int.from_bytes(hash_bytes, byteorder="big", signed=False)
-
-        def tensor_hash(tensor_list) -> int:
-            """
-            hash a tensor or a tensor list
-            """
-            tensor = tensor_list
-            if isinstance(tensor_list, list):
-                tensor_list = flatten_nested_list(tensor_list)
-                tensor_list = [
-                    x.flatten() if isinstance(x, torch.Tensor) else x
-                    for x in tensor_list
-                ]
-                tensor = torch.concat(tensor_list)
-            if tensor.is_cuda:
-                return gpu_tensor_hash(tensor)
-            tensor = tensor.detach().contiguous()
-
-            if tensor.dtype == torch.bfloat16:
-                # memoryview() doesn't support PyTorch's BFloat16 dtype
-                tensor = tensor.float()
-
-            assert isinstance(tensor, torch.Tensor)
-            if tensor.is_cuda:
-                # TODO: improve this
-                tensor_cpu = tensor.cpu()
+        if self.hash is None:
+            if self.precomputed_features is not None:
+                self.hash = hash_feature(self.precomputed_features)
+            elif self.is_audio():
+                if self.audio_features is not None:
+                    self.hash = hash_feature(self.audio_features)
+                elif self.input_features is not None:
+                    self.hash = hash_feature(self.input_features)
             else:
-                tensor_cpu = tensor
-
-            mv = memoryview(tensor_cpu.numpy())
-            return data_hash(mv.tobytes())
-
-        def hash_feature(f):
-            if isinstance(f, list):
-                if isinstance(f[0], torch.Tensor):
-                    return tensor_hash(f)
-                return data_hash(tuple(flatten_nested_list(f)))
-            elif isinstance(f, np.ndarray):
-                arr = np.ascontiguousarray(f)
-                arr_bytes = arr.tobytes()
-                return data_hash(arr_bytes)
-            elif isinstance(f, torch.Tensor):
-                return tensor_hash([f])
-            return data_hash(f)
-
-        if self.precomputed_features is not None:
-            self.hash = hash_feature(self.precomputed_features)
-        elif self.is_audio():
-            self.hash = hash_feature(self.audio_features)
-        else:
-            self.hash = hash_feature(self.pixel_values)
+                self.hash = hash_feature(self.pixel_values)
 
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
@@ -288,6 +263,7 @@ class MultimodalDataItem:
         return (self.modality == Modality.AUDIO) and (
             self.precomputed_features is not None
             or not MultimodalDataItem.is_empty_list(self.audio_features)
+            or not MultimodalDataItem.is_empty_list(self.input_features)
         )
 
     def is_image(self):
@@ -321,6 +297,13 @@ class MultimodalDataItem:
         ret.validate()
         return ret
 
+    def merge(self, other):
+        self.pixel_values += other.pixel_values
+        self.image_sizes += other.image_sizes
+        self.image_offsets += other.image_offsets
+        self.hash = hash((self.hash, other.hash))
+        self.set_pad_value()
+
 
 @dataclasses.dataclass
 class MultimodalInputs:
@@ -330,10 +313,6 @@ class MultimodalInputs:
     mm_items: List[MultimodalDataItem]
     image_pad_len: Optional[list] = None
     num_image_tokens: Optional[int] = None
-
-    # QWen2-VL related
-    mrope_positions: Optional[torch.Tensor] = None
-    mrope_position_delta: Optional[torch.Tensor] = None
 
     # image
     im_token_id: Optional[int] = None
@@ -349,6 +328,10 @@ class MultimodalInputs:
     audio_token_id: Optional[int] = None
     audio_start_id: Optional[int] = None
     audio_end_id: Optional[int] = None
+
+    # QWen2-VL related
+    mrope_positions: Optional[torch.Tensor] = None
+    mrope_position_delta: Optional[torch.Tensor] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -476,6 +459,9 @@ class Req:
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
+
+        # The length of KV that have been removed in local attention chunked prefill
+        self.evicted_seqlen_local = 0
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -855,8 +841,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
-    can_run_dp_cuda_graph: bool = False
     is_extend_in_batch: bool = False
+    can_run_dp_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
 
@@ -1183,6 +1169,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_to_token_pool.write(
                     (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
                 )
+                if isinstance(self.tree_cache, SWAChunkCache):
+                    self.tree_cache.evict(
+                        req, pre_len, self.model_config.attention_chunk_size
+                    )
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -1375,7 +1365,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             * buf_multiplier
             * self.token_to_kv_pool_allocator.page_size
         )
-
         if self.token_to_kv_pool_allocator.available_size() >= tokens_required:
             return True
 
@@ -1556,6 +1545,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens.add_(1)
         self.seq_lens_sum += bs
 
+        # free memory
+        if isinstance(self.tree_cache, SWAChunkCache):
+            for req in self.reqs:
+                self.tree_cache.evict(
+                    req, req.seqlen - 1, self.model_config.attention_chunk_size
+                )
+
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
             self.out_cache_loc = self.alloc_token_slots(bs)
@@ -1686,6 +1682,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             or global_server_args_dict["attention_backend"] == "flashmla"
             or global_server_args_dict["attention_backend"] == "cutlass_mla"
+            or global_server_args_dict["attention_backend"] == "ascend"
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
             seq_lens_cpu = (
@@ -1718,6 +1715,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_ids_logprobs=self.token_ids_logprobs,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            is_extend_in_batch=self.is_extend_in_batch,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             tbo_split_seq_index=self.tbo_split_seq_index,
             global_forward_mode=self.global_forward_mode,
@@ -1790,7 +1788,6 @@ class ModelWorkerBatch:
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool_allocator
     out_cache_loc: torch.Tensor
-
     # The sequence length tensor on CPU
     seq_lens_cpu: Optional[torch.Tensor]
     seq_lens_sum: int
@@ -1803,6 +1800,7 @@ class ModelWorkerBatch:
     # For DP attention
     global_num_tokens: Optional[List[int]]
     global_num_tokens_for_logprob: Optional[List[int]]
+    is_extend_in_batch: bool
     can_run_dp_cuda_graph: bool
     tbo_split_seq_index: Optional[int]
     global_forward_mode: Optional[ForwardMode]
@@ -1889,7 +1887,10 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    if global_server_args_dict["attention_backend"] != "torch_native":
+    if (
+        global_server_args_dict["attention_backend"] != "ascend"
+        and global_server_args_dict["attention_backend"] != "torch_native"
+    ):
         impl = get_last_loc_triton
     else:
         impl = get_last_loc_torch

@@ -46,6 +46,9 @@ _is_cpu = is_cpu()
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
+if is_npu():
+    import torch_npu
+
 logger = logging.getLogger(__name__)
 
 if is_npu():

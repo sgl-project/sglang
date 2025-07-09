@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.8"
+version = "0.4.9.post1"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -18,6 +18,7 @@ dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle
 [project.optional-dependencies]
 runtime_common = [
     "blobfile==3.0.0",
+    "build",
     "compressed-tensors",
     "datasets",
     "fastapi",
@@ -37,26 +38,28 @@ runtime_common = [
     "psutil",
     "pydantic",
     "pynvml",
+    "pybase64",
     "python-multipart",
     "pyzmq>=25.1.2",
     "soundfile==0.13.1",
     "scipy",
     "torchao==0.9.0",
-    "transformers==4.52.3",
+    "transformers==4.53.0",
+    "timm==1.0.16",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.19",
+    "xgrammar==0.1.20",
 ]
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.1.9",
+    "sgl-kernel==0.2.4",
     "torch==2.7.1",
     "torchaudio==2.7.1",
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.6.post1",
+    "flashinfer_python==0.2.7.post1",
 ]
 
 blackwell = [
@@ -67,7 +70,7 @@ blackwell = [
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.6.post1",
+    "flashinfer_python==0.2.7.post1",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
@@ -86,9 +89,7 @@ srt_xpu = ["sglang[runtime_common]"]
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
 srt_hpu = ["sglang[runtime_common]"]
 
-# CPU: currently, there are no pre-built vllm wheels for CPU.
-# To install vllm for CPU, please follow the instruction here:
-# https://docs.vllm.ai/en/latest/getting_started/installation/cpu/index.html
+# CPU: torch wheel for CPU needs to be installed from https://download.pytorch.org/whl/cpu
 srt_cpu = ["sglang[runtime_common]", "einops"]
 # https://vllm-ascend.readthedocs.io/en/latest/installation.html
 srt_npu = ["sglang[runtime_common]"]
@@ -104,7 +105,6 @@ test = [
     "matplotlib",
     "pandas",
     "peft",
-    "timm",
     "sentence_transformers",
 ]
 all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[torch_memory_saver]", "sglang[decord]"]

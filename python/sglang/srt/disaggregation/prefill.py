@@ -122,6 +122,9 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        if not self.is_mla_backend:
+            kv_args.kv_head_num = self.token_to_kv_pool.head_num
+        kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -273,7 +276,7 @@ class SchedulerDisaggregationPrefillMixin:
             batch = self.get_new_batch_prefill()
 
             if require_mlp_sync(self.server_args):
-                batch, _ = self.prepare_mlp_sync_batch(batch)
+                batch = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
 
             if batch:
@@ -307,7 +310,7 @@ class SchedulerDisaggregationPrefillMixin:
             batch = self.get_new_batch_prefill()
 
             if require_mlp_sync(self.server_args):
-                batch, _ = self.prepare_mlp_sync_batch(batch)
+                batch = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
             if batch:
                 result = self.run_batch(batch)

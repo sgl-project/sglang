@@ -59,6 +59,7 @@ class SeparatorStyle(IntEnum):
     METAMATH = auto()
     DeepSeekVL2 = auto()
     QWEN2_VL_EMBED = auto()
+    QWEN2_AUDIO = auto()
     GEMMA3 = auto()
     MPT = auto()
 
@@ -349,6 +350,23 @@ class Conversation:
                     ret += role + message + self.sep
                 else:
                     ret += role
+            return ret
+        elif self.sep_style == SeparatorStyle.QWEN2_AUDIO:
+            ret = "" if system_prompt == "" else system_prompt + self.sep
+
+            counter = 1
+            for role, message in self.messages:
+                if message:
+                    while self.audio_token in message:
+                        message = message.replace(
+                            self.audio_token, self.audio_token.format(idx=counter), 1
+                        )
+                        counter += 1
+
+                    ret += role + "\n" + message + self.sep
+                else:
+                    ret += role + "\n"
+
             return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
@@ -823,6 +841,7 @@ register_conv_template(
         sep_style=SeparatorStyle.GEMMA3,
         stop_str=["<end_of_turn>"],
         image_token="<start_of_image>",
+        audio_token="<start_of_audio>",
     )
 )
 
@@ -902,6 +921,46 @@ register_conv_template(
     )
 )
 
+register_conv_template(
+    Conversation(
+        name="mimo-vl",
+        system_message="You are MiMo, an AI assistant developed by Xiaomi.",
+        system_template="<|im_start|>system\n{system_message}",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<|im_end|>"],
+        image_token="<|vision_start|><|image_pad|><|vision_end|>",
+    )
+)
+
+
+register_conv_template(
+    Conversation(
+        name="qwen2-audio",
+        system_template="<|im_start|>system\n{system_message}",
+        system_message="You are a helpful assistant.",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.QWEN2_AUDIO,
+        stop_str=["<|im_end|>"],
+        audio_token="Audio {idx}: <|audio_bos|><|AUDIO|><|audio_eos|>\n",
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="llama_4_vision",
+        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
+        system_template="<|header_start|>system<|header_end|>\n\n{system_message}<|eot|>",
+        roles=("user", "assistant"),
+        sep_style=SeparatorStyle.LLAMA4,
+        sep="",
+        stop_str="<|eot|>",
+        image_token="<|image|>",
+    )
+)
+
 
 @register_conv_template_matching_function
 def match_internvl(model_path: str):
@@ -910,9 +969,11 @@ def match_internvl(model_path: str):
 
 
 @register_conv_template_matching_function
-def match_llama_3_vision(model_path: str):
+def match_llama_vision(model_path: str):
     if re.search(r"llama.*3\.2.*vision", model_path, re.IGNORECASE):
         return "llama_3_vision"
+    if re.search(r"llama.*4.*", model_path, re.IGNORECASE):
+        return "llama_4_vision"
 
 
 @register_conv_template_matching_function
@@ -955,6 +1016,8 @@ def match_qwen_chat_ml(model_path: str):
         return "gme-qwen2-vl"
     if re.search(r"qwen.*vl", model_path, re.IGNORECASE):
         return "qwen2-vl"
+    if re.search(r"qwen.*audio", model_path, re.IGNORECASE):
+        return "qwen2-audio"
     if re.search(
         r"llava-v1\.6-34b|llava-v1\.6-yi-34b|llava-next-video-34b|llava-onevision-qwen2",
         model_path,
@@ -999,3 +1062,9 @@ def match_phi_4_mm(model_path: str):
 def match_vila(model_path: str):
     if re.search(r"vila", model_path, re.IGNORECASE):
         return "chatml"
+
+
+@register_conv_template_matching_function
+def match_mimo_vl(model_path: str):
+    if re.search(r"mimo.*vl", model_path, re.IGNORECASE):
+        return "mimo-vl"

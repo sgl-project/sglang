@@ -241,6 +241,23 @@ inline int getSMVersion() {
   return sm_major * 10 + sm_minor;
 }
 
+inline bool getBoolEnv(char const* name) {
+  char const* env = std::getenv(name);
+  return env && env[0] == '1' && env[1] == '\0';
+}
+
+inline bool getEnvEnablePDL() {
+  static std::once_flag flag;
+  static bool enablePDL = false;
+  std::call_once(flag, [&]() {
+    if (getSMVersion() >= 90) {
+      // PDL will be enabled by setting the env variables `TRTLLM_ENABLE_PDL` to `1`
+      enablePDL = getBoolEnv("TRTLLM_ENABLE_PDL");
+    }
+  });
+  return enablePDL;
+}
+
 // SGLANG_SHFL_XOR_* adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/csrc/cuda_compat.h#L19-L28
 #ifndef USE_ROCM
 #define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor_sync((mask), (var), (lane_mask))
@@ -345,4 +362,10 @@ inline torch::Tensor pad_tensor(const torch::Tensor& tensor, int64_t alignment =
     return tensor_padded.t().contiguous().t();
   }
   return tensor_padded;
+}
+
+// Get the next power of 2 of a number
+inline uint32_t next_pow2(uint32_t x) noexcept {
+  if (x <= 1) return 1;
+  return 1u << (32 - __builtin_clz(x - 1));
 }

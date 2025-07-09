@@ -12,7 +12,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.math_utils import ceil_div
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -25,6 +24,7 @@ from sglang.srt.layers.quantization.int8_kernel import (
     sglang_per_token_group_quant_int8,
 )
 from sglang.srt.utils import (
+    ceil_div,
     cpu_has_amx_support,
     direct_register_custom_op,
     get_bool_env_var,
@@ -32,7 +32,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
-    log_info_on_rank0,
     next_power_of_2,
 )
 
@@ -1738,6 +1737,7 @@ def fused_moe(
     renormalize: bool,
     inplace: bool = False,
     activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
     use_grouped_topk: bool = False,
     num_expert_group: Optional[int] = None,
     num_fused_shared_experts: int = 0,
@@ -1823,6 +1823,7 @@ def fused_moe(
         topk_ids,
         inplace=inplace,
         activation=activation,
+        apply_router_weight_on_input=apply_router_weight_on_input,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
