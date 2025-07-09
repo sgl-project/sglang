@@ -47,7 +47,7 @@ rm -rf /root/.cache/deepep && git clone https://github.com/deepseek-ai/DeepEP.gi
 cd /opt/nvshmem
 wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz
 tar -xf nvshmem_src_3.2.5-1.txz
-rm nvshmem && mv nvshmem_src nvshmem
+rm -rf nvshmem && mv nvshmem_src nvshmem
 cd nvshmem
 git apply /root/.cache/deepep/third-party/nvshmem.patch
 NVSHMEM_SHMEM_SUPPORT=0 \
@@ -63,7 +63,7 @@ cd build
 make -j$(nproc) install
 
 # Install DeepEP
-cd /root/.cache/deepep && git checkout eef7ab50fa5cf0ab1dd3fce4c6493c90bdf290ac && python3 setup.py install
+cd /root/.cache/deepep && python3 setup.py install
 
 # Verify configuration
 echo "=== NCCL Configuration ==="
