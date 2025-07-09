@@ -1,5 +1,4 @@
 import base64
-import copy
 import io
 import json
 import os

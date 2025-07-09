@@ -60,70 +60,72 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         )
 
         # Handle image resolutions and aspect ratios
-        if "pixel_values" in processor_output:
-            image_processor = processor.image_processor
-            tokenizer = self._processor.tokenizer
+        if "pixel_values" not in processor_output:  # no image processed
+            return None
 
-            # Calculate tile size and find supported resolutions
-            tile_size = self.vision_config.image_size
-            max_num_tiles = getattr(self.vision_config, "max_patches", 1)
+        image_processor = processor.image_processor
+        tokenizer = self._processor.tokenizer
 
-            possible_resolutions = find_supported_resolutions(
-                max_num_chunks=max_num_tiles,
-                patch_size=SizeDict(height=tile_size, width=tile_size),
+        # Calculate tile size and find supported resolutions
+        tile_size = self.vision_config.image_size
+        max_num_tiles = getattr(self.vision_config, "max_patches", 1)
+
+        possible_resolutions = find_supported_resolutions(
+            max_num_chunks=max_num_tiles,
+            patch_size=SizeDict(height=tile_size, width=tile_size),
+        )
+
+        # Find best fit for each image
+        best_fit_sizes = [
+            get_best_fit(
+                (image.size[1], image.size[0]),  # (height, width)
+                torch.tensor(possible_resolutions),
+                resize_to_max_canvas=image_processor.resize_to_max_canvas,
             )
+            for image in processed_data.images
+        ]
 
-            # Find best fit for each image
-            best_fit_sizes = [
-                get_best_fit(
-                    (image.size[1], image.size[0]),  # (height, width)
-                    torch.tensor(possible_resolutions),
-                    resize_to_max_canvas=image_processor.resize_to_max_canvas,
-                )
-                for image in processed_data.images
-            ]
+        # Calculate aspect ratios and patches per image
+        aspect_ratios = [
+            (image_size[0] // tile_size, image_size[1] // tile_size)
+            for image_size in best_fit_sizes
+        ]
 
-            # Calculate aspect ratios and patches per image
-            aspect_ratios = [
-                (image_size[0] // tile_size, image_size[1] // tile_size)
-                for image_size in best_fit_sizes
-            ]
+        patches_per_image = [
+            1 if r_h * r_w == 1 else 1 + r_h * r_w for (r_h, r_w) in aspect_ratios
+        ]
 
-            patches_per_image = [
-                1 if r_h * r_w == 1 else 1 + r_h * r_w for (r_h, r_w) in aspect_ratios
-            ]
+        # Add to image_inputs
+        processor_output["aspect_ratios"] = aspect_ratios
+        processor_output["patches_per_image"] = torch.tensor(patches_per_image)
 
-            # Add to image_inputs
-            processor_output["aspect_ratios"] = aspect_ratios
-            processor_output["patches_per_image"] = torch.tensor(patches_per_image)
+        # Process embed_is_patch
+        vocab = tokenizer.get_vocab()
+        patch_id = vocab.get(processor.img_patch_token, -1)
+        image_end_id = vocab.get(processor.end_of_img_token, -1)
 
-            # Process embed_is_patch
-            vocab = tokenizer.get_vocab()
-            patch_id = vocab.get(processor.img_patch_token, -1)
-            image_end_id = vocab.get(processor.end_of_img_token, -1)
+        if patch_id != -1 and image_end_id != -1:
+            input_ids = processor_output["input_ids"].view(-1)
 
-            if patch_id != -1 and image_end_id != -1:
-                input_ids = processor_output["input_ids"].view(-1)
+            # Remove BOS token if present
+            if input_ids.size(0) > 0 and input_ids[0] == tokenizer.bos_token_id:
+                input_ids = input_ids[1:]
 
-                # Remove BOS token if present
-                if input_ids.size(0) > 0 and input_ids[0] == tokenizer.bos_token_id:
-                    input_ids = input_ids[1:]
+            # Find image end indices and split input_ids
+            image_end_indices = (input_ids == image_end_id).nonzero().view(-1)
 
-                # Find image end indices and split input_ids
-                image_end_indices = (input_ids == image_end_id).nonzero().view(-1)
+            if image_end_indices.size(0) > 0:
+                # Split at image boundaries
+                split_indices = (image_end_indices + 1)[:-1]
+                split_input_ids = torch.tensor_split(input_ids, split_indices)
+                split_input_ids = [x for x in split_input_ids if x.numel() > 0]
 
-                if image_end_indices.size(0) > 0:
-                    # Split at image boundaries
-                    split_indices = (image_end_indices + 1)[:-1]
-                    split_input_ids = torch.tensor_split(input_ids, split_indices)
-                    split_input_ids = [x for x in split_input_ids if x.numel() > 0]
+                # Create embed_is_patch for each image
+                embed_is_patch = []
+                for per_image_input_ids in split_input_ids:
+                    embed_is_patch.append(per_image_input_ids == patch_id)
 
-                    # Create embed_is_patch for each image
-                    embed_is_patch = []
-                    for per_image_input_ids in split_input_ids:
-                        embed_is_patch.append(per_image_input_ids == patch_id)
-
-                    processor_output["embed_is_patch"] = embed_is_patch
+                processor_output["embed_is_patch"] = embed_is_patch
 
         # Convert to the format expected by SGLang
         processor_output["input_ids"] = processor_output["input_ids"].tolist()[0]
