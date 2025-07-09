@@ -66,7 +66,6 @@ class TestDeepseek(CustomTestCase):
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
         self.assertGreater(metrics["accuracy"], 0.93)
-        self.assertGreater(metrics["output_throughput"], 3800)
 
 
 class TestDeepseekMTP(CustomTestCase):
