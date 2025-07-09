@@ -271,7 +271,7 @@ def unpack_cols(
 
     return q_res
 
-def get_scale_perms(num_bits: int):
+def get_scale_perms():
     scale_perm: List[int] = []
     for i in range(8):
         scale_perm.extend([i + 8 * j for j in range(8)])
@@ -311,16 +311,20 @@ def _check_marlin_supported(
     return True, None
 
 def marlin_moe_permute_scales(
-    s: torch.Tensor, size_k: int, size_n: int, group_size: int, num_bits: int
+    s: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    group_size: int,
 ):
     num_experts = s.shape[0]
     output = torch.empty(
-        (num_experts, s.shape[1], s.shape[2]), device=s.device, dtype=s.dtype
+        (num_experts, s.shape[1], s.shape[2]),
+        device=s.device,
+        dtype=s.dtype,
     )
+
     for e in range(num_experts):
-        output[e] = marlin_permute_scales(
-            s[e], size_k, size_n, group_size, num_bits
-        )
+        output[e] = marlin_permute_scales(s[e], size_k, size_n, group_size)
     return output
 
 def should_use_atomic_add_reduce(m: int, n: int, k: int, device: torch.device,

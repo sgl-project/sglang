@@ -560,6 +560,17 @@ torch::Tensor moe_wna16_marlin_gemm(
     bool use_fp32_reduce,
     bool is_zp_float);
 
+torch::Tensor gptq_marlin_gemm(
+    torch::Tensor& a, std::optional<torch::Tensor> c_or_none,
+    torch::Tensor& b_q_weight, torch::Tensor& b_scales,
+    std::optional<torch::Tensor> const& global_scale_or_none,
+    std::optional<torch::Tensor> const& b_zeros_or_none,
+    std::optional<torch::Tensor> const& g_idx_or_none,
+    std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
+    sglang::ScalarTypeId const& b_q_type_id, int64_t size_m, int64_t size_n,
+    int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
+    bool is_zp_float);
+
 namespace flash {
 /*
  * From fa2 sparse
