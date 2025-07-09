@@ -1,6 +1,7 @@
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from sgl_kernel import sgl_per_tensor_quant_fp8
 
 IS_TRITON_KERNELS_AVAILABLE = False
@@ -124,6 +125,35 @@ def swizzle_weight_and_scale(weight_tensor: torch.Tensor,
                                                 swizzle_axis)
     return quant_tensor, scale, actual_scale_shape
 
+def pad_weight_and_scale_on_hopper(weight: torch.Tensor, 
+                                   scale: Optional[torch.Tensor], 
+                                   swizzle_scale: SwizzlingType) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if swizzle_scale == SwizzlingType.HOPPER:
+        assert weight.dim() in [2,
+                                3], "Weight should be 2D or 3D tensor"
+        out_dim = weight.shape[-1]
+        assert scale is None or scale.shape[
+            -1] == out_dim, "Out dim of weight and scale should match"
+        pad_size = (256 - out_dim % 256) % 256
+        weight = F.pad(
+            weight,
+            (0, pad_size
+             )).contiguous()  # Pad the last dimension on right side
+        if scale is not None:
+            scale = F.pad(scale, (0, pad_size)).contiguous()
+    return (weight, scale) if scale is not None else weight
+
+def maybe_remove_padding(gemm_output: torch.Tensor, 
+                         expected_size: int,
+                         swizzle_scale: SwizzlingType):
+    assert gemm_output.dim() == 2
+    if gemm_output.shape[-1] != expected_size:
+        assert swizzle_scale == SwizzlingType.HOPPER, "Only Hopper style swizzle can have padding"
+        assert gemm_output.shape[
+            -1] % 256 == 0, "The padding is not done correctly"
+        gemm_output = gemm_output[:, :expected_size]
+    return gemm_output
+
 def fused_experts_oai(
     hidden_states: torch.Tensor,  # (num_tokens, hidden_dim)
     w13: torch.Tensor,  # (num_experts, hidden_dim, intermediate_dim * 2)
@@ -170,7 +200,6 @@ def fused_experts_oai(
         precision_config=pcs,
         routing_data=rdata)
 
-
     pc2 = PrecisionConfig(flex_ctx=FlexCtx(),
                             allow_tf32=False,
                             out_dtype=dtype)
@@ -210,6 +239,8 @@ def fused_experts_mxfp4_oai(
     swizzle_scale: Optional[SwizzlingType] = None,
     actual_w13_scale_shape: Optional[torch.Size] = None,
     actual_w2_scale_shape: Optional[torch.Size] = None,
+    intermediate_size: int = 0,
+    hidden_size: int = 0,
 ) -> torch.Tensor:
     if activation_dtype == torch.float8_e4m3fn:
         hidden_states, hidden_states_scale = quantize_fp8_per_tensor(hidden_states, fc31_input_dequant)
@@ -242,16 +273,19 @@ def fused_experts_mxfp4_oai(
                           allow_tf32=False,
                           out_dtype=dtype)
 
-    # Call the Triton kernel, which also does permutation
     gemm1_output = matmul_ogs(
             hidden_states,
             gemm1_weights,
-            w1_bias,  # Bias
+            w1_bias,
             rdata,
             gather_indx=gather_indx,
             precision_config=pc1)
+
+    gemm1_output = maybe_remove_padding(gemm1_output,
+                                        intermediate_size * 2,
+                                        swizzle_scale).contiguous()
+
     pcs = triton_kernels.swiglu.PrecisionConfig(limit=None)
-    # Call the Triton activation kernel
     act_out = triton_kernels.swiglu.swiglu(
         gemm1_output,
         alpha=swiglu_alpha,
@@ -259,7 +293,6 @@ def fused_experts_mxfp4_oai(
         precision_config=pcs,
         routing_data=rdata)
     if activation_dtype == torch.float8_e4m3fn:
-        # Quantize the activation output manually since the Triton activation kernel doesn't support bf16 in fp8 out
         act_out, act_scale = quantize_fp8_per_tensor(act_out, fc2_input_dequant)
     mx_ctx_2 = MicroscalingCtx(
             weight_scale=gemm2_scales,
@@ -284,4 +317,7 @@ def fused_experts_mxfp4_oai(
         scatter_indx=scatter_indx,
         precision_config=pc2,
         gammas=rdata.gate_scal if rdata else None)
+    gemm2_output = maybe_remove_padding(gemm2_output, 
+                                        hidden_size,
+                                        swizzle_scale)
     return gemm2_output

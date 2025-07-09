@@ -26,6 +26,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe_oai import (
     quantize_to_mxfp4,
     get_swizzle_type,
     swizzle_weight_and_scale,
+    pad_weight_and_scale_on_hopper,
 )
 if torch.cuda.is_available():
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
@@ -573,6 +574,11 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
         tmp_w2_weight = torch.transpose(w2_weight_fp4, 1, 2).contiguous()
         tmp_w2_scale = torch.transpose(w2_weight_scale, 1, 2).contiguous()
 
+        tmp_w13_weight, tmp_w13_scale = pad_weight_and_scale_on_hopper(
+            tmp_w13_weight, tmp_w13_scale, self.swizzle_scale)
+        tmp_w2_weight, tmp_w2_scale = pad_weight_and_scale_on_hopper(
+            tmp_w2_weight, tmp_w2_scale, self.swizzle_scale)
+
         tmp_w13_weight, tmp_w13_scale, tmp_w13_scale_shape = swizzle_weight_and_scale(
             tmp_w13_weight, tmp_w13_scale, self.swizzle_value, self.swizzle_scale)
         tmp_w2_weight, tmp_w2_scale, tmp_w2_scale_shape = swizzle_weight_and_scale(
@@ -678,6 +684,8 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
             swizzle_scale=self.swizzle_scale,
             actual_w13_scale_shape=self.actual_w13_weight_shape,
             actual_w2_scale_shape=self.actual_w2_weight_shape,
+            intermediate_size=self.intermediate_size,
+            hidden_size=self.hidden_size,
         )
 
     def forward_cpu(self, *args, **kwargs) -> torch.Tensor:
