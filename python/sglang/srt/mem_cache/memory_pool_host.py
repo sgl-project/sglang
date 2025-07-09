@@ -7,6 +7,7 @@ from functools import wraps
 import psutil
 import torch
 
+from sglang.global_config import global_config
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.gds import Gds
 from sglang.srt.utils import debug_timing
@@ -231,10 +232,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         super().__init__(
             device_pool, host_to_device_ratio, host_size, pin_memory, device, page_size
         )
-        kv = self.init_kv_buffer()
-        print("#####show per token size######")
-        print(self.get_size_per_token())
-        self.gds_backend = Gds(
+        if global_config.enable_gds:
+            self.size_per_page = self.head_dim * self.head_num * self.dtype.itemsize
+            self.gds = Gds(
                 gds_file_path="/tmp/gds/try.txt",
                 buf_size=self.get_size_per_token(),
             )
@@ -274,22 +274,33 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.kv_buffer[:, :, indices] = flat_data
 
     def write_page_all_layers(self, host_indices, device_indices, device_pool):
-        logger.info("###binwa cuda D2H###")
-        self.gds_backend.transfer()
         device_indices_cpu = device_indices[:: self.page_size].cpu()
-        logger.info(f"###devcie_indices_cpu:{device_indices_cpu}###")
         for i in range(len(device_indices_cpu)):
             h_index = host_indices[i * self.page_size]
             d_index = device_indices_cpu[i]
             for j in range(self.layer_num):
-                self.kv_buffer[0, j, h_index : h_index + self.page_size].copy_(
-                    device_pool.k_buffer[j][d_index : d_index + self.page_size],
-                    non_blocking=True,
-                )
-                self.kv_buffer[1, j, h_index : h_index + self.page_size].copy_(
-                    device_pool.v_buffer[j][d_index : d_index + self.page_size],
-                    non_blocking=True,
-                )
+                if global_config.enable_gds:
+                    file_path = "/tmp/gds/k_buffer_layer" + str(j)
+                    self.gds.d2s("write",
+                        file_path,
+                        device_pool.k_buffer[j][d_index : d_index + self.page_size],
+                        h_index * self.size_per_page,
+                        self.page_size * self.size_per_page)
+                    file_path = "/tmp/gds/v_buffer_layer" + str(j)
+                    self.gds.d2s("write",
+                        file_path,
+                        device_pool.v_buffer[j][d_index : d_index + self.page_size],
+                        h_index * self.size_per_page,
+                        self.page_size * self.size_per_page)
+                else:
+                    self.kv_buffer[0, j, h_index : h_index + self.page_size].copy_(
+                        device_pool.k_buffer[j][d_index : d_index + self.page_size],
+                        non_blocking=True,
+                    )
+                    self.kv_buffer[1, j, h_index : h_index + self.page_size].copy_(
+                        device_pool.v_buffer[j][d_index : d_index + self.page_size],
+                        non_blocking=True,
+                    )
 
     def load_page_per_layer(self, host_indices, device_indices, device_pool, layer_id):
         logger.info("###binwa cuda H2D###")
