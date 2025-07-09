@@ -31,10 +31,10 @@ class TestPureDP(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "4",
+                "8",
                 "--enable-dp-attention",
                 "--dp",
-                "4",
+                "8",
                 "--enable-deepep-moe",
             ],
         )
@@ -71,7 +71,7 @@ class TestHybridDPTP(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "4",
+                "8",
                 "--enable-dp-attention",
                 "--dp",
                 "2",
@@ -111,7 +111,7 @@ class TestTP(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "4",
+                "8",
                 "--enable-deepep-moe",
             ],
         )
@@ -148,10 +148,10 @@ class TestNoGatherdBuffer(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "4",
+                "8",
                 "--enable-dp-attention",
                 "--dp",
-                "4",
+                "8",
                 "--moe-dense-tp-size",
                 "1",
                 "--enable-dp-lm-head",
@@ -195,10 +195,10 @@ class TestTBO(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "4",
+                "8",
                 "--enable-dp-attention",
                 "--dp",
-                "4",
+                "8",
                 "--moe-dense-tp-size",
                 "1",
                 "--enable-deepep-moe",
@@ -238,7 +238,7 @@ class TestMTP(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "4",
+                "8",
                 "--enable-dp-attention",
                 "--dp",
                 "2",
@@ -303,10 +303,10 @@ class TestMTPWithTBO(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--tp-size",
-                "4",
+                "8",
                 "--enable-dp-attention",
                 "--dp-size",
-                "4",
+                "8",
                 "--enable-two-batch-overlap",
                 "--enable-deepep-moe",
                 "--trust-remote-code",
