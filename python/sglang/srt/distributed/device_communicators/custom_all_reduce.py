@@ -3,7 +3,7 @@
 import ctypes
 import logging
 import os
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from functools import wraps
 from typing import Any, Callable, List, Optional, TypeVar, Union
 
@@ -18,7 +18,6 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     gpu_p2p_access_check,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import is_cuda, is_hip, get_bool_env_var
 
 logger = logging.getLogger(__name__)
