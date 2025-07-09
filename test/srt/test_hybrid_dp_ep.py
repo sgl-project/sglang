@@ -19,6 +19,9 @@ from sglang.test.test_utils import (
 )
 
 
+# DEFAULT_MODEL_NAME_FOR_TEST_MLA = "/dev/shm/DeepSeek-V3-0324"
+
+
 class TestPureDP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -31,10 +34,10 @@ class TestPureDP(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "8",
+                "4",
                 "--enable-dp-attention",
                 "--dp",
-                "8",
+                "4",
                 "--enable-deepep-moe",
                 "--cuda-graph-max-bs",
                 "128",
@@ -75,7 +78,7 @@ class TestHybridDPTP(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "8",
+                "4",
                 "--enable-dp-attention",
                 "--dp",
                 "2",
@@ -119,7 +122,7 @@ class TestTP(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "8",
+                "4",
                 "--enable-deepep-moe",
                 "--cuda-graph-max-bs",
                 "128",
@@ -160,10 +163,10 @@ class TestNoGatherdBuffer(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "8",
+                "4",
                 "--enable-dp-attention",
                 "--dp",
-                "8",
+                "4",
                 "--moe-dense-tp-size",
                 "1",
                 "--enable-dp-lm-head",
@@ -207,10 +210,10 @@ class TestTBO(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "8",
+                "4",
                 "--enable-dp-attention",
                 "--dp",
-                "8",
+                "4",
                 "--moe-dense-tp-size",
                 "1",
                 "--enable-deepep-moe",
@@ -254,7 +257,7 @@ class TestMTP(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "8",
+                "4",
                 "--enable-dp-attention",
                 "--dp",
                 "2",
@@ -269,11 +272,11 @@ class TestMTP(CustomTestCase):
                 "--speculative-eagle-topk",
                 "3",
                 "--speculative-num-draft-tokens",
-                "5",
+                "3",
                 "--cuda-graph-max-bs",
-                "128",
+                "32",
                 "--max-running-requests",
-                "128",
+                "32",
             ],
         )
 
@@ -323,29 +326,29 @@ class TestMTPWithTBO(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--tp-size",
-                "8",
+                "4",
                 "--enable-dp-attention",
                 "--dp-size",
-                "8",
+                "4",
                 "--enable-two-batch-overlap",
                 "--enable-deepep-moe",
                 "--trust-remote-code",
                 "--speculative-algorithm",
-                "EAGLE",
+                "NEXTN",
                 "--speculative-num-steps",
                 "2",
                 "--speculative-eagle-topk",
                 "3",
                 "--speculative-num-draft-tokens",
-                "5",
+                "3",
                 "--speculative-draft",
                 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
                 "--chunked-prefill-size",
                 "256",
                 "--cuda-graph-max-bs",
-                "128",
+                "32",
                 "--max-running-requests",
-                "128",
+                "32",
             ],
         )
 
