@@ -1,42 +1,39 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg ARG_PYTORCH_ROCM_ARCH=[gfx950|gfx942] -t v0.4.9.post1-rocm700 -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx942 -t v0.4.9.post1-rocm630 -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx950 -t v0.4.9.post1-rocm700 -f Dockerfile.rocm .
 
 # default base image
 ARG BASE_IMAGE_950="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.8.5_mi35X_prealpha"
 ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
 
-ARG ARG_PYTORCH_ROCM_ARCH
+ARG GPU_ARCH
+
+ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
+ENV SGL_DEFAULT="main"
+ARG SGL_BRANCH=${SGL_DEFAULT}
+
+ARG TRITON_REPO="https://github.com/ROCm/triton.git"
+ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
+
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 
 # base image 942 and it's args
 FROM $BASE_IMAGE_942 AS gfx942
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
 ENV BUILD_AITER_ALL="1"
-ENV AITER_REPO="https://github.com/ROCm/aiter.git"
 ENV AITER_COMMIT="v0.1.3"
-ENV TRITON_REPO="https://github.com/ROCm/triton.git"
-ENV TRITON_COMMIT="improve_fa_decode_3.0.0"
-ENV SGL_REPO="https://github.com/sgl-project/sglang.git"
-ENV SGL_DEFAULT="main"
 
 # base image 950 and it's args
 FROM $BASE_IMAGE_950 AS gfx950
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_AITER_ALL="1"
-ENV AITER_REPO="https://github.com/ROCm/aiter.git"
 ENV AITER_COMMIT="4738360c65a3c0e10fe6fbe86d54de825a161e87"
-ENV TRITON_REPO="https://github.com/ROCm/triton.git"
-ENV TRITON_COMMIT="improve_fa_decode_3.0.0"
-ENV SGL_REPO="https://github.com/sgl-project/sglang.git"
-ENV SGL_DEFAULT="main"
-
-FROM ${ARG_PYTORCH_ROCM_ARCH}
 
 USER root
 
-ARG ARG_PYTORCH_ROCM_ARCH
-ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
+ENV GPU_ARCH_LIST=${GPU_ARCH:-${PYTORCH_ROCM_ARCH}}
 
 # Install some basic utilities
 RUN python3 -m pip install --upgrade pip && pip install setuptools_scm
@@ -53,15 +50,15 @@ RUN git clone ${AITER_REPO} \
  && git submodule update --init --recursive
 RUN cd aiter \
      && if [ "$BUILD_AITER_ALL" = "1" ]; then \
-          PREBUILD_KERNELS=1 GPU_ARCHS=$PYTORCH_ROCM_ARCH python3 setup.py develop; \
+          PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop; \
         else \
-          GPU_ARCHS=$PYTORCH_ROCM_ARCH python3 setup.py develop; \
+          GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop; \
         fi
 
 # -----------------------
 # Triton
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
-        pip3 uninstall -y triton \
+        pip uninstall -y triton \
      && git clone ${TRITON_REPO} \
      && cd triton \
      && git checkout ${TRITON_COMMIT} \
@@ -85,13 +82,12 @@ RUN if [ "$BUILD_VLLM" = "1" ]; then \
 # Build SGLang
 ARG BUILD_TYPE=all
 
-ARG SGL_BRANCH=${SGL_DEFAULT}
-
 RUN pip install IPython \
     && pip install orjson \
     && pip install python-multipart \
     && pip install torchao \
     && pip install pybind11
+
 RUN pip uninstall -y sgl_kernel sglang
 RUN git clone ${SGL_REPO} \
     && cd sglang \
@@ -105,7 +101,7 @@ RUN git clone ${SGL_REPO} \
     && cd sgl-kernel \
     && rm -f pyproject.toml \
     && mv pyproject_rocm.toml pyproject.toml \
-    && AMDGPU_TARGET=$PYTORCH_ROCM_ARCH python setup_rocm.py install \
+    && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install \
     && cd .. \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
          python -m pip --no-cache-dir install -e "python[srt_hip]"; \
@@ -127,6 +123,7 @@ ENV SGLANG_SET_CPU_AFFINITY=1
 ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 ENV NCCL_MIN_NCHANNELS=112
 
+ENV SGLANG_USE_AITER=1
 ENV SGLANG_MOE_PADDING=1
 ENV VLLM_FP8_PADDING=1
 ENV VLLM_FP8_ACT_PADDING=1
