@@ -323,6 +323,7 @@ class HiPAttentionBackend(AttentionBackend):
                     max_context_len=self.max_context_len,
                     extend_seq_lens=forward_batch.extend_seq_lens,
                     extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                    extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
                     hip_config=self.hip_config,
                     is_kv_cache_offload_enabled=self.is_kv_cache_offload_enabled,
                     online_update_cache=(
@@ -379,6 +380,7 @@ class HiPAttentionBackend(AttentionBackend):
                         max_context_len=self.max_context_len,
                         extend_seq_lens=forward_batch.extend_seq_lens,
                         extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                        extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
                         hip_config=self.hip_config,
                         is_kv_cache_offload_enabled=self.is_kv_cache_offload_enabled,
                         cached_metadata=None,

@@ -156,7 +156,6 @@ class ServerArgs:
     # HiP Attention
     enable_hip_attention: bool = False
     hip_attention_config: Optional[HiPAttentionConfig] = None
-    hip_attention_config_path: Optional[str] = None
 
     # HiP Attention Offload
     enable_hip_kv_cache_offload: bool = False
@@ -1331,10 +1330,17 @@ class ServerArgs:
             help="Enable HiP attention. This flag is not compatible with other sparse attention flags (e.g., double sparsity).",
         )
         parser.add_argument(
+            "--hip-attention-config",
             "--hip-attention-config-path",
             type=str,
-            default=ServerArgs.hip_attention_config_path,
+            default=ServerArgs.hip_attention_config,
             help="Path to the HiP attention config file, or the json in string format.",
+        )
+        parser.add_argument(
+            "--hip-attention-config-override-json",
+            type=str,
+            default=None,
+            help="JSON string to override imported HiP Attention configs.",
         )
 
         # HiP Attention Offload
@@ -2109,16 +2115,16 @@ class ServerArgs:
         if args.enable_hip_attention:
             from hip_attn.v1_2 import HiPAttentionConfig
 
-            if args.hip_attention_config_path is not None:
-                json_or_path = args.hip_attention_config_path
-            else:
-                assert hasattr(args, "hip_attention_config")
-                json_or_path = args.hip_attention_config
+            json_or_path = args.hip_attention_config
 
-            args.hip_attention_config = HiPAttentionConfig(json_or_path=json_or_path)
-            logger.info(
-                f"attention_backend changed {args.attention_backend} -> hip_attention"
+            args.hip_attention_config = HiPAttentionConfig(
+                json_or_path=json_or_path, 
+                json_override=args.hip_attention_config_override_json,
             )
+            if args.attention_backend != 'hip_attention':
+                logger.info(
+                    f"attention_backend changed {args.attention_backend} -> hip_attention"
+                )
             args.attention_backend = "hip_attention"
         else:
             args.hip_attention_config = None
