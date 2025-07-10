@@ -10,6 +10,7 @@ class LBArgs:
     policy: str = "random"
     prefill_infos: list = dataclasses.field(default_factory=list)
     decode_infos: list = dataclasses.field(default_factory=list)
+    vision_infos: list = dataclasses.field(default_factory=list)
     log_interval: int = 5
     timeout: int = 600
 
@@ -40,6 +41,25 @@ class LBArgs:
             help=f"Policy to use for load balancing (default: {LBArgs.policy})",
         )
         parser.add_argument(
+            "--enable-multimodal-disagg",
+            action="store_true",
+            help="Enable multimodal disaggregation",
+        )
+        parser.add_argument(
+            "--vision",
+            type=str,
+            default=[],
+            nargs="+",
+            help="URLs for vision servers",
+        )
+        parser.add_argument(
+            "--vision-bootstrap-ports",
+            type=int,
+            default=[8998],
+            nargs="+",
+            help="Bootstrap ports for vision servers",
+        )
+        parser.add_argument(
             "--prefill",
             type=str,
             default=[],
@@ -56,6 +76,7 @@ class LBArgs:
         parser.add_argument(
             "--prefill-bootstrap-ports",
             type=int,
+            default=[8998],
             nargs="+",
             help="Bootstrap ports for prefill servers",
         )
@@ -74,6 +95,20 @@ class LBArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "LBArgs":
+        vision_bootstrap_ports = args.vision_bootstrap_ports
+        if vision_bootstrap_ports is None:
+            vision_bootstrap_ports = [None] * len(args.vision)
+        elif len(vision_bootstrap_ports) == 1:
+            vision_bootstrap_ports = vision_bootstrap_ports * len(args.vision)
+        else:
+            if len(vision_bootstrap_ports) != len(args.vision):
+                raise ValueError(
+                    "Number of vision URLs must match number of bootstrap ports"
+                )
+        vision_infos = [
+            (url, port) for url, port in zip(args.vision, vision_bootstrap_ports)
+        ]
+
         bootstrap_ports = args.prefill_bootstrap_ports
         if bootstrap_ports is None:
             bootstrap_ports = [None] * len(args.prefill)
@@ -94,6 +129,7 @@ class LBArgs:
             host=args.host,
             port=args.port,
             policy=args.policy,
+            vision_infos=vision_infos,
             prefill_infos=prefill_infos,
             decode_infos=args.decode,
             log_interval=args.log_interval,
@@ -128,12 +164,19 @@ def main():
             timeout=lb_args.timeout,
         ).start()
     else:
-        from sglang.srt.disaggregation.mini_lb import PrefillConfig, run
+        from sglang.srt.disaggregation.mini_lb import PrefillConfig, VisionConfig, run
 
+        vision_configs = [VisionConfig(url, port) for url, port in lb_args.vision_infos]
         prefill_configs = [
             PrefillConfig(url, port) for url, port in lb_args.prefill_infos
         ]
-        run(prefill_configs, lb_args.decode_infos, lb_args.host, lb_args.port)
+        run(
+            vision_configs,
+            prefill_configs,
+            lb_args.decode_infos,
+            lb_args.host,
+            lb_args.port,
+        )
 
 
 if __name__ == "__main__":
