@@ -417,7 +417,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 max_token_per_sequence = int(qo_lengths.max().item())
                 max_sequence_kv = int(kv_lengths.max().item())
 
-                o, lse = cudnn_batch_prefill_with_kv_cache(
+                o, _ = cudnn_batch_prefill_with_kv_cache(
                     q=qall,
                     k_cache=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v_cache=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
