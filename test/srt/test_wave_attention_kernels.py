@@ -261,18 +261,14 @@ class TestWaveAttention(unittest.TestCase):
         self.assertTrue(torch.allclose(o, o_triton, atol=3e-2))
 
     def test_grouped_decode_attention(self):
-        # seq_lens = [5, 100, 128, 500]
-        seq_lens = [
-            100,
-        ]
+        seq_lens = [5, 100, 128, 500]
         configs = [
-            # (2, 16, 16, 64, 64),
-            # (2, 16, 1, 64, 64), uncomment this
-            # (2, 64, 1, 13, 13),
-            # (2, 128, 1, 80, 80),
+            (2, 16, 16, 64, 64),
+            (2, 16, 1, 64, 64),
+            (2, 128, 1, 80, 80),
             (32, 128, 2, 512, 512),
-            # (2, 128, 2, 512, 512),
-            # (2, 128, 1, 576, 512),
+            (2, 128, 2, 512, 512),
+            (2, 128, 1, 576, 512),
         ]
 
         for S in seq_lens:
@@ -315,10 +311,7 @@ class TestWaveAttention(unittest.TestCase):
         self.assertTrue(cos_sim.item() > 1 - (1e-5))
 
     def test_context_attention(self):
-        # head_dim = [128, 96, 80, 13]
-        # for is_causal in [False, True]:
-
-        head_dim = [128]
+        head_dim = [128, 96]
 
         for dim in head_dim:
             for is_causal in [False]:

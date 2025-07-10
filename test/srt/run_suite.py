@@ -153,6 +153,8 @@ suites = {
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_rope_rocm.py", 3),
         TestFile("test_awq_dequant.py", 2),
+        TestFile("test_wave_attention_kernels.py", 2),
+        TestFile("test_wave_attention_backend.py", 150),
     ],
     "per-commit-npu": [
         TestFile("test_ascend_attention_backend.py", 400),

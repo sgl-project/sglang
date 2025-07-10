@@ -1,40 +1,21 @@
-# Copyright 2023-2024 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
 """
 Memory-efficient attention for decoding.
 It supports page size = 1.
 """
 
-# Adapted from
-# https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage1.py
-# https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
-
 import functools
 import logging
-import math
 
-import iree.turbine.kernel as tk
-from iree.turbine.kernel.lang.global_symbols import *
-from iree.turbine.kernel.wave.compile import WaveCompileOptions, wave_compile
-from iree.turbine.kernel.wave.constraints import GenericDot, MMAOperand, MMAType
-from iree.turbine.kernel.wave.templates.paged_decode_attention import (
+from wave_lang.kernel.lang.global_symbols import *
+from wave_lang.kernel.wave.compile import WaveCompileOptions, wave_compile
+from wave_lang.kernel.wave.constraints import GenericDot, MMAOperand, MMAType
+from wave_lang.kernel.wave.templates.paged_decode_attention import (
     get_paged_decode_attention_kernels,
     get_paged_decode_intermediate_arrays_shapes,
     paged_decode_attention_shape,
 )
-from iree.turbine.kernel.wave.utils.general_utils import get_default_scheduling_params
-from iree.turbine.kernel.wave.utils.run_utils import set_default_run_config
+from wave_lang.kernel.wave.utils.general_utils import get_default_scheduling_params
+from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
 
 logger = logging.getLogger(__name__)
 import os
@@ -189,7 +170,6 @@ def decode_attention_fwd(
     sm_scale,
     logit_cap=0.0,
 ):
-    # assert max_kv_splits == attn_logits.shape[2]
     decode_attention_wave(
         q,
         k_buffer,
