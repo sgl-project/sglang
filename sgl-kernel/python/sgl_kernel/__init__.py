@@ -99,6 +99,11 @@ from sgl_kernel.speculative import (
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
 )
+from sgl_kernel.mamba import (
+    causal_conv1d_fwd,
+    causal_conv1d_update,
+    selective_scan_fwd,
+)
 from sgl_kernel.top_k import fast_topk
 from sgl_kernel.version import __version__
 
