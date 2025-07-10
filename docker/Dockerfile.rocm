@@ -1,6 +1,6 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx942 -t v0.4.9.post1-rocm630 -f Dockerfile.rocm .
-#   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx950 -t v0.4.9.post1-rocm700 -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx942 -t v0.4.9.post1-rocm630-mi30x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx950 -t v0.4.9.post1-rocm700-mi35x -f Dockerfile.rocm .
 
 # Default base images
 ARG BASE_IMAGE_950="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.8.5_mi35X_prealpha"
@@ -45,8 +45,8 @@ ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 USER root
 
 # Install some basic utilities
-RUN python3 -m pip install --upgrade pip && pip install setuptools_scm
-RUN apt-get purge -y sccache; python3 -m pip uninstall -y sccache; rm -f "$(which sccache)"
+RUN python -m pip install --upgrade pip && pip install setuptools_scm
+RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which sccache)"
 
 WORKDIR /sgl-workspace
 
@@ -59,9 +59,9 @@ RUN git clone ${AITER_REPO} \
  && git submodule update --init --recursive
 RUN cd aiter \
      && if [ "$BUILD_AITER_ALL" = "1" ]; then \
-          PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop; \
+          PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
         else \
-          GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop; \
+          GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
         fi
 
 # -----------------------
@@ -72,7 +72,7 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
      && cd triton \
      && git checkout ${TRITON_COMMIT} \
      && cd python \
-     && python3 setup.py install; \
+     && python setup.py install; \
     fi
 
 # -----------------------
@@ -83,9 +83,9 @@ RUN if [ "$BUILD_VLLM" = "1" ]; then \
         git clone ${VLLM_REPO} \
      && cd vllm \
      && git checkout ${VLLM_BRANCH} \
-     && python3 -m pip install -r requirements/rocm.txt \
-     && python3 setup.py clean --all \
-     && python3 setup.py develop; \
+     && python -m pip install -r requirements/rocm.txt \
+     && python setup.py clean --all \
+     && python setup.py develop; \
     fi
 
 # -----------------------
