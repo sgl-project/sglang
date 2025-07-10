@@ -646,7 +646,7 @@ class BaseMultimodalProcessor(ABC):
                     Modality.MULTI_IMAGES: mm_tokens.image_token_id,
                     Modality.VIDEO: mm_tokens.video_token_id,
                     Modality.AUDIO: mm_tokens.audio_token_id,
-                }.get(mm_item.modality),
+                }.get(mm_item.modality, None),
             )
 
         return all_collected_items, input_ids, ret
