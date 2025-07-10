@@ -829,12 +829,20 @@ class Scheduler(
         pp_outputs: Optional[PPProxyTensors] = None
         while True:
             server_is_idle = True
+            parallel_requests: List[Req] = []
+
             for mb_id in range(self.pp_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = last_mbs[mb_id]
 
-                recv_reqs = self.recv_requests()
-                self.process_input_requests(recv_reqs)
+                recv_requests = self.recv_requests()
+                cur_parallel_request, serial_requests = filter_parallel_requests(
+                    recv_requests
+                )
+                if cur_parallel_request:
+                    parallel_requests.extend(cur_parallel_request)
+                self.process_input_requests(serial_requests)
+
                 mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -929,7 +937,7 @@ class Scheduler(
                     dp_offset = self.attn_dp_rank * self.attn_tp_size
                     if self.attn_tp_rank == 0:
                         point_to_point_pyobj(
-                            recv_reqs,
+                            recv_requests,
                             self.pp_rank * self.tp_size + dp_offset,
                             self.world_group.device_group,
                             self.pp_rank * self.tp_size + dp_offset,
@@ -944,6 +952,9 @@ class Scheduler(
                         )
 
                 pp_outputs = next_pp_outputs
+
+            if parallel_requests:
+                self.process_input_requests(parallel_requests)
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
@@ -2692,11 +2703,43 @@ class Scheduler(
 def is_health_check_generate_req(recv_req):
     return getattr(recv_req, "rid", "").startswith("HEALTH_CHECK")
 
+
 def is_multi_result_requested(req):
     """
     Check if the request require multiple results
     """
     return isinstance(req, UpdateWeightFromDiskReqInput)
+
+
+def filter_parallel_requests(
+    requests: List[Req],
+) -> Tuple[List[Req], List[Req]]:
+    """
+    Filter parallel requests from the list of requests.
+    """
+    parallel_reqs = []
+    serial_reqs = []
+    for req in requests:
+        if is_parallel_request(req):
+            parallel_reqs.append(req)
+        else:
+            serial_reqs.append(req)
+    return parallel_reqs, serial_reqs
+
+
+def is_parallel_request(req: Req) -> bool:
+    """
+    Check if the request is a parallel request.
+    """
+    return isinstance(
+        req,
+        (
+            UpdateWeightFromDiskReqInput,
+            UpdateWeightsFromDistributedReqInput,
+            UpdateWeightsFromTensorReqInput,
+            InitWeightsUpdateGroupReqInput,
+        ),
+    )
 
 
 def _export_static_state(model):

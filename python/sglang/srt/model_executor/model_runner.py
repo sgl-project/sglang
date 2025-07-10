@@ -772,7 +772,12 @@ class ModelRunner:
         if self.server_args.enable_dp_attention:
             rank = rank_offset + self.tp_rank * self.pp_size + self.pp_rank
         else:
-            rank = rank_offset + self.dp_rank * self.tp_size * self.pp_size + self.tp_rank * self.pp_size + self.pp_rank
+            rank = (
+                rank_offset
+                + self.dp_rank * self.tp_size * self.pp_size
+                + self.tp_rank * self.pp_size
+                + self.pp_rank
+            )
 
         logger.info(
             f"init custom process group: master_address={master_address}, master_port={master_port}, "
