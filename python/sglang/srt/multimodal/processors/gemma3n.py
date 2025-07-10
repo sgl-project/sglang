@@ -30,19 +30,19 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
 
-        self.IM_TOKEN_ID = hf_config.image_token_id
         self.IM_START_TOKEN_ID = hf_config.boi_token_id
         self.IM_END_TOKEN_ID = hf_config.eoi_token_id
 
-        self.AUDIO_TOKEN_ID = hf_config.audio_token_id
         self.AUDIO_START_TOKEN_ID = hf_config.boa_token_id
         self.AUDIO_END_TOKEN_ID = hf_config.eoa_token_id
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<image_soft_token>",
+            image_token_id=hf_config.image_token_id,
             image_token_regex=re.compile(
                 r"<start_of_image>(?:(?:<image_soft_token>)*<end_of_image>)?"
             ),
             audio_token="<audio_soft_token>",
+            audio_token_id=hf_config.audio_token_id,
             audio_token_regex=re.compile(
                 r"<start_of_audio>(?:(?:<audio_soft_token>)*<end_of_audio>)?"
             ),
@@ -67,11 +67,14 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(base_output)
+        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+            base_output, self.mm_tokens
+        )
 
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
-            "im_token_id": self.IM_TOKEN_ID,
-            "audio_token_id": self.AUDIO_TOKEN_ID,
+            # TODO(mick): could we return MultimodalSpecialTokens directly?
+            "im_token_id": self.mm_tokens.image_token_id,
+            "audio_token_id": self.mm_tokens.audio_token_id,
         }

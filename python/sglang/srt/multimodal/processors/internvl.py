@@ -31,12 +31,10 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         tokenizer = self._processor
         self.img_start_token_id = tokenizer.convert_tokens_to_ids(self.IMG_START_TOKEN)
         self.img_end_token_id = tokenizer.convert_tokens_to_ids(self.IMG_END_TOKEN)
-        self.img_context_token_id = tokenizer.convert_tokens_to_ids(
-            self.IMG_CONTEXT_TOKEN
-        )
-        self.mm_tokens = MultimodalSpecialTokens(image_token="<image>").build(
-            _image_processor
-        )
+        self.mm_tokens = MultimodalSpecialTokens(
+            image_token="<image>",
+            image_token_id=tokenizer.convert_tokens_to_ids(self.IMG_CONTEXT_TOKEN),
+        ).build(_image_processor)
 
     @staticmethod
     def build_transform(input_size):
@@ -221,7 +219,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         input_ids = tokenizer(input_text, return_tensors="pt")["input_ids"].flatten()
         image_offsets = self.get_mm_items_offset(
             input_ids=input_ids,
-            mm_token_id=self.img_context_token_id,
+            mm_token_id=self.mm_tokens.image_token_id,
         )
         items = [
             MultimodalDataItem(
@@ -236,5 +234,5 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             "mm_items": items,
             "im_start_id": self.img_start_token_id,
             "im_end_id": self.img_end_token_id,
-            "im_token_id": self.img_context_token_id,
+            "im_token_id": self.mm_tokens.image_token_id,
         }

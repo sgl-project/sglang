@@ -16,11 +16,12 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
         super().__init__(hf_config, server_args, _processor)
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|media_pad|>",
+            # TODO: could we convert in MultimodalSpecialTokens?
+            image_token_id=_processor.tokenizer.convert_tokens_to_ids(
+                "<|media_pad|>",
+            ),
             image_token_regex=re.compile(r"(?:<\|media_pad\|>)+"),
         ).build(_processor)
-        self.IM_TOKEN_ID = _processor.tokenizer.convert_tokens_to_ids(
-            self.mm_tokens.image_token
-        )
 
     async def process_mm_data_async(
         self,
@@ -38,10 +39,12 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
             max_req_input_len=max_req_input_len,
         )
 
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(base_output)
+        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+            base_output, self.mm_tokens
+        )
 
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
-            "im_token_id": self.IM_TOKEN_ID,
+            "im_token_id": self.mm_tokens.image_token_id,
         }

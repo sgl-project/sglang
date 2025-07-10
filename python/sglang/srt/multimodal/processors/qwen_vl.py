@@ -206,8 +206,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         # The regex that matches expanded image tokens.
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
-        self.IM_TOKEN_ID = hf_config.image_token_id
-        self.VIDEO_TOKEN_ID = hf_config.video_token_id
         self.vision_start_token_id = hf_config.vision_start_token_id
         self.vision_end_token_id = hf_config.vision_end_token_id
         self.NUM_TOKEN_PER_FRAME = 770
@@ -217,10 +215,11 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         self.MAX_RATIO = 200
         self.mm_special_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
+            image_token_id=hf_config.image_token_id,
             image_token_regex=re.compile(
                 r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
             ),
-            video_token=self.VIDEO_TOKEN_ID,
+            video_token_id=hf_config.video_token_id,
         ).build(_processor)
 
     async def process_mm_data_async(
@@ -251,13 +250,15 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
                 await preprocess_video(video) for video in base_output.videos
             ]
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(base_output)
+        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+            base_output, self.mm_special_tokens
+        )
 
         input_ids = input_ids.flatten()
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
-            image_token_id=self.IM_TOKEN_ID,
-            video_token_id=self.mm_special_tokens.video_token,
+            image_token_id=self.mm_special_tokens.image_token_id,
+            video_token_id=self.mm_special_tokens.video_token_id,
             vision_start_token_id=self.vision_start_token_id,
             model_type=self.hf_config.model_type,
             tokens_per_second=getattr(
@@ -275,8 +276,8 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             "mm_items": mm_items,
             "im_start_id": self.IM_START_TOKEN_ID,
             "im_end_id": self.IM_END_TOKEN_ID,
-            "im_token_id": self.IM_TOKEN_ID,
-            "video_token_id": self.VIDEO_TOKEN_ID,
+            "im_token_id": self.mm_special_tokens.image_token_id,
+            "video_token_id": self.mm_special_tokens.video_token_id,
             "mrope_positions": mrope_positions,
             "mrope_position_delta": mrope_position_delta,
         }
