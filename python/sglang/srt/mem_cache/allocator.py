@@ -159,7 +159,7 @@ class ElasticTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
         assert hasattr(
             kvcache, "kv_allocator"
-        ), "ElasticTokenToKVPoolAllocator requires kvcache as ElasticMHATokenToKVPool"
+        ), "ElasticTokenToKVPoolAllocator requires kvcache to be an ElasticMHATokenToKVPool"
         self.kv_allocator = kvcache.kv_allocator
 
     def available_size(self):

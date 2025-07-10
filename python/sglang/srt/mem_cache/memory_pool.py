@@ -534,7 +534,6 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool):
         self.v_buffer = None
 
     def _create_buffers(self):
-        assert self.page_size == 1, "kvcached only supports page_size = 1 for SGL"
         assert "cuda" in self.device, "kvcached only supports cuda device"
         k_buffer, v_buffer = self.kvcached_ops.sgl_alloc_kv_cache(
             self.size,
