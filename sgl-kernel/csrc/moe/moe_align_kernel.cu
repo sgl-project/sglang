@@ -88,37 +88,34 @@ __global__ void moe_align_block_size_kernel(
   __syncthreads();
 
   // Calculate padded_cnt, write scan_buf, directly prefix sum
-  int32_t local_total = 0;
+  int32_t padded_count = 0;
   if (tid < num_experts) {
     int32_t count = shared_counts[tid];
-    int32_t padded_count = (count + block_size - 1) / block_size * block_size;
+    padded_count = (count + block_size - 1) / block_size * block_size;
     scan_buf[tid] = padded_count;
-    local_total = padded_count;
   }
 
   // Intra warp prefix sum
-  const int warp_id = tid >> 5;
+  const int warp_id = tid / WARP_SIZE;
   const int lane_id = tid & (WARP_SIZE - 1);
-  const int nw = (scan_size + WARP_SIZE - 1) >> 5;
-  const int warp_sum = warp_exclusive_scan(local_total) + local_total;
+  const int num_warps_for_scan = (scan_size + WARP_SIZE - 1) / WARP_SIZE;
+  const int warp_sum = warp_exclusive_scan(padded_count) + padded_count;
   if (lane_id == WARP_SIZE - 1) warp_sums[warp_id] = warp_sum;
   __syncthreads();
 
   // warp0 accumulate all the block's prefix sum
   if (tid < WARP_SIZE) {
-    int val = (tid < (scan_size + WARP_SIZE - 1) / WARP_SIZE) ? warp_sums[tid] : 0;
+    int val = (tid < num_warps_for_scan) ? warp_sums[tid] : 0;
     int incl = warp_exclusive_scan(val) + val;
     warp_sums[tid] = incl;
   }
   __syncthreads();
 
   // Every thread obtains the whole block's sum
-  int total_tokens = warp_sums[((scan_size + WARP_SIZE - 1) >> 5) - 1];
-
   if (tid == 0) {
-    prefix[num_experts] = total_tokens;
-    s_total_tokens_post_pad = total_tokens;
-    *total_tokens_post_pad = total_tokens;
+    prefix[num_experts] = warp_sums[num_warps_for_scan - 1];
+    s_total_tokens_post_pad = prefix[num_experts];
+    *total_tokens_post_pad = s_total_tokens_post_pad;
   }
   __syncthreads();
 
@@ -133,7 +130,7 @@ __global__ void moe_align_block_size_kernel(
   __syncthreads();
 
   if (warp_id == 0) {
-    int val = (lane_id < nw) ? warp_sums[lane_id] : 0;
+    int val = (lane_id < num_warps_for_scan) ? warp_sums[lane_id] : 0;
     warp_sums[lane_id] = warp_exclusive_scan(val);
   }
   __syncthreads();
