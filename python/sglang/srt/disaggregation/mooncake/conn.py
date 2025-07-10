@@ -12,7 +12,7 @@ import threading
 import time
 from collections import defaultdict
 from functools import cache
-from typing import Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -36,6 +36,10 @@ from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferE
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_free_port, get_int_env_var, get_ip, get_local_ip_auto
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
+
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +133,7 @@ class MooncakeKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        is_remote_prefill: Optional[bool] = False,
     ):
         self.kv_args = args
         self.local_ip = get_local_ip_auto()
@@ -138,6 +143,9 @@ class MooncakeKVManager(BaseKVManager):
             ib_device=self.kv_args.ib_device,
         )
         self.is_mla_backend = is_mla_backend
+        self.is_remote_prefill = (
+            False  # TODO: remote prefill doesn't support mooncake for now
+        )
         self.disaggregation_mode = disaggregation_mode
         # for p/d multi node infer
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -1216,7 +1224,12 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
-    def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
+    def init(
+        self,
+        req: Req,
+        kv_indices: npt.NDArray[np.int64],
+        aux_index: Optional[int] = None,
+    ):
         for bootstrap_info in self.bootstrap_infos:
             self.prefill_server_url = (
                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"

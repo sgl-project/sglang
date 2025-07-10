@@ -35,9 +35,11 @@ class CommonKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        is_remote_prefill: Optional[bool] = False,
     ):
         self.kv_args = args
         self.is_mla_backend = is_mla_backend
+        self.is_remote_prefill = is_remote_prefill
         self.disaggregation_mode = disaggregation_mode
         # for p/d multi node infer
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -51,6 +53,12 @@ class CommonKVManager(BaseKVManager):
             )
 
         self.rank_port = get_free_port()
+        self.rank_ip = get_local_ip_by_remote()
+        self.engine_rank = args.engine_rank
+
+        if self.is_remote_prefill:
+            return
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._register_to_bootstrap()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:

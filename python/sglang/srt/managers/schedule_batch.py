@@ -47,7 +47,6 @@ import triton.language as tl
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
@@ -451,6 +450,7 @@ class Req:
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
+        is_remote_prefill: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -611,7 +611,7 @@ class Req:
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
-        self.disagg_kv_sender: Optional[BaseKVSender] = None
+        self.is_remote_prefill = is_remote_prefill
 
         # For data parallel rank routing
         self.data_parallel_rank: Optional[int] = data_parallel_rank

@@ -8,13 +8,15 @@ import warnings
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
+import numpy.typing as npt
 import requests
 import torch
 import torch.distributed as dist
 
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import get_ip
 
 if TYPE_CHECKING:
@@ -24,6 +26,21 @@ if TYPE_CHECKING:
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+
+
+@dataclasses.dataclass
+class RemotePrefillReq:
+    rid: str
+    origin_input_text: str
+    origin_input_ids: Tuple[int]
+    sampling_params: SamplingParams
+    kv_indices: bytes
+    rank_ip: str
+    rank_port: int
+    engine_rank: int
+    aux_index: int
+    bootstrap_room: int
+    engine_id: str
 
 
 class DisaggregationMode(Enum):

@@ -11,6 +11,8 @@ from sglang.srt.server_args import ServerArgs
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.utils import DisaggregationMode
 
+from sglang.srt.managers.schedule_batch import Req
+
 
 class KVArgs:
     engine_rank: int
@@ -49,6 +51,7 @@ class BaseKVManager(ABC):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        is_remote_prefill: Optional[bool] = False,
     ): ...
 
 
@@ -104,7 +107,12 @@ class BaseKVReceiver(ABC):
     ): ...
 
     @abstractmethod
-    def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
+    def init(
+        self,
+        req: Req,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int] = None,
+    ):
         """
         Notify the prefill server about the kv indices and aux index
         """

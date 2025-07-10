@@ -242,6 +242,7 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
+    enable_remote_prefill: bool = False
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
@@ -1661,6 +1662,13 @@ class ServerArgs:
             default=None,
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
+
+        parser.add_argument(
+            "--enable-remote-prefill",
+            action="store_true",
+            help="Enable remote prefill",
+        )
+
         parser.add_argument(
             "--custom-weight-loader",
             type=str,
