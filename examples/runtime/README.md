@@ -33,9 +33,10 @@ The `hidden_states` folder contains examples on how to extract hidden states usi
 * `hidden_states_engine.py`: An example how to extract hidden states using the Engine API.
 * `hidden_states_server.py`: An example how to extract hidden states using the Server API.
 
-## LLaVA-NeXT
+## Multimodal
 
-SGLang support LLaVA-OneVision with single-image, multi-image and video are supported. The folder `llava_onevision` shows how to do this.
+SGLang supports multimodal inputs for various model architectures. The `multimodal` folder contains examples showing how to use urls, files or encoded data to make requests to multimodal models. Examples include querying the [Llava-OneVision](multimodal/llava_onevision_server.py) model (image, multi-image, video), Llava-backed [Qwen-Llava](multimodal/qwen_llava_server.py) and [Llama3-Llava](multimodal/llama3_llava_server.py) models (image, multi-image), and Mistral AI's [Pixtral](multimodal/pixtral_server.py) (image, multi-image).
+
 
 ## Token In, Token Out
 

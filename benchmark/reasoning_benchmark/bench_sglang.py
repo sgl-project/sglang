@@ -51,7 +51,7 @@ def main(args):
     )
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     states = reasoning_gen.run_batch(
         questions,
         num_threads=args.parallel,
@@ -60,7 +60,7 @@ def main(args):
         max_new_tokens=32768,
         top_p=0.95,
     )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Extract results and record outcomes in a list.
     outcomes = []

@@ -290,6 +290,9 @@ class InternLM2ForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.tok_embeddings
+
     @torch.no_grad()
     def forward(
         self,

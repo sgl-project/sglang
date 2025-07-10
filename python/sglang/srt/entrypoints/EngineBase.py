@@ -23,8 +23,19 @@ class EngineBase(ABC):
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        return_hidden_states: Optional[bool] = None,
+        stream: Optional[bool] = None,
+        bootstrap_host: Optional[Union[List[str], str]] = None,
+        bootstrap_port: Optional[Union[List[int], int]] = None,
+        bootstrap_room: Optional[Union[List[int], int]] = None,
+        data_parallel_rank: Optional[int] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """Generate outputs based on given inputs."""
+        pass
+
+    @abstractmethod
+    def flush_cache(self):
+        """Flush the cache of the engine."""
         pass
 
     @abstractmethod
@@ -35,6 +46,14 @@ class EngineBase(ABC):
         flush_cache: bool = True,
     ):
         """Update model weights with in-memory tensor data."""
+        pass
+
+    def load_lora_adapter(self, lora_name: str, lora_path: str):
+        """Load a new LoRA adapter without re-launching the engine."""
+        pass
+
+    def unload_lora_adapter(self, lora_name: str):
+        """Unload a LoRA adapter without re-launching the engine."""
         pass
 
     @abstractmethod

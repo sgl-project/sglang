@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang-router"
-version = "0.1.4"
+version = "0.1.5"
 description = "SGLang router is a standalone module implemented in Rust to achieve data parallelism across SGLang instances."
 authors = [{name = "Byron Hsu", email = "byronhsu1230@gmail.com"}]
 requires-python = ">=3.8"
@@ -14,6 +14,11 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "requests>=2.25.0",
 ]
 
 # https://github.com/PyO3/setuptools-rust?tab=readme-ov-file

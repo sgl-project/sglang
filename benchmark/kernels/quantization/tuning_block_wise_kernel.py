@@ -359,7 +359,7 @@ def tune_on_gpu(args_dict):
         config for config in search_space if block_k % config["BLOCK_SIZE_K"] == 0
     ]
 
-    start = time.time()
+    start = time.perf_counter()
     results = {}
     for shape in tqdm(weight_shapes, desc=f"GPU {gpu_id} - Shapes"):
         N, K = shape[0], shape[1]
@@ -379,7 +379,7 @@ def tune_on_gpu(args_dict):
         best_configs = {M: config for M, config in zip(batch_sizes, benchmark_results)}
         save_configs(N, K, block_n, block_k, best_configs, save_path, input_type)
 
-    end = time.time()
+    end = time.perf_counter()
     print(f"Tuning on GPU {gpu_id} took {end - start:.2f} seconds")
 
 

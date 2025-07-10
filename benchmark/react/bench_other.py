@@ -146,7 +146,7 @@ def main(args):
 
             states.append(answer)
 
-    tic = time.time()
+    tic = time.perf_counter()
 
     if args.backend != "lmql":
         if args.parallel == 1:
@@ -173,7 +173,7 @@ def main(args):
             tasks = [run_single_agent_async(arg) for arg in bt]
             loop.run_until_complete(asyncio.gather(*tasks))
 
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     print(f"Latency: {latency:.3f}")
 

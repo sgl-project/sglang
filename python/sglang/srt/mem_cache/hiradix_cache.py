@@ -7,13 +7,16 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
-    MHATokenToKVPoolHost,
     MLATokenToKVPool,
-    MLATokenToKVPoolHost,
     ReqToTokenPool,
-    TokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.memory_pool_host import (
+    MHATokenToKVPoolHost,
+    MLATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
@@ -25,12 +28,13 @@ class HiRadixCache(RadixCache):
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_cache_group: torch.distributed.ProcessGroup,
         page_size: int,
         hicache_ratio: float,
         hicache_size: int,
         hicache_write_policy: str,
+        hicache_io_backend: str,
     ):
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
@@ -53,6 +57,7 @@ class HiRadixCache(RadixCache):
             page_size,
             load_cache_event=self.load_cache_event,
             write_policy=hicache_write_policy,
+            io_backend=hicache_io_backend,
         )
 
         # record the nodes with ongoing write through
@@ -281,39 +286,44 @@ class HiRadixCache(RadixCache):
     def init_load_back(
         self,
         last_node: TreeNode,
-        prefix_indices: torch.Tensor,
+        host_hit_length: int,
         mem_quota: Optional[int] = None,
     ):
-        assert (
-            len(prefix_indices) == 0 or prefix_indices.is_cuda
-        ), "indices of device kV caches should be on GPU"
+        _ = host_hit_length  # unused, but kept for compatibility
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
-                prefix_indices = (
-                    loading_values
-                    if len(prefix_indices) == 0
-                    else torch.cat([prefix_indices, loading_values])
-                )
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
+                return loading_values, last_node
 
             while last_node.evicted:
                 last_node = last_node.parent
 
-        return last_node, prefix_indices
+        return (
+            torch.empty((0,), dtype=torch.int64, device=self.device),
+            last_node,
+        )
 
-    def ready_to_load_cache(self):
+    def ready_to_load_host_cache(self):
+        producer_index = self.cache_controller.layer_done_counter.next_producer()
         self.load_cache_event.set()
+        return producer_index
 
-    def match_prefix(self, key: List[int], include_evicted=False, **kwargs):
+    def check_hicache_events(self):
+        self.writing_check()
+        self.loading_check()
+
+    def match_prefix(self, key: List[int], **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         if self.disable or len(key) == 0:
-            if include_evicted:
-                return empty_value, self.root_node, self.root_node
-            else:
-                return empty_value, self.root_node
+            return MatchResult(
+                device_indices=empty_value,
+                last_device_node=self.root_node,
+                last_host_node=self.root_node,
+                host_hit_length=0,
+            )
 
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
@@ -325,23 +335,27 @@ class HiRadixCache(RadixCache):
         else:
             value = empty_value
 
-        last_node_global = last_node
+        host_hit_length = 0
+        last_host_node = last_node
         while last_node.evicted:
+            host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
 
-        if include_evicted:
-            return value, last_node, last_node_global
-        else:
-            return value, last_node
+        return MatchResult(
+            device_indices=value,
+            last_device_node=last_node,
+            last_host_node=last_host_node,
+            host_hit_length=host_hit_length,
+        )
 
     def _match_prefix_helper(self, node: TreeNode, key: List):
-        node.last_access_time = time.time()
+        node.last_access_time = time.monotonic()
         child_key = self.get_child_key_fn(key)
         value = []
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            child.last_access_time = time.time()
+            child.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -370,6 +384,7 @@ class HiRadixCache(RadixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.loading = child.loading
+        new_node.hit_count = child.hit_count
 
         # split value and host value if exists
         if child.evicted:
@@ -386,7 +401,7 @@ class HiRadixCache(RadixCache):
         return new_node
 
     def _insert_helper(self, node: TreeNode, key: List, value):
-        node.last_access_time = time.time()
+        node.last_access_time = time.monotonic()
         if len(key) == 0:
             return 0
 
@@ -395,7 +410,7 @@ class HiRadixCache(RadixCache):
 
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
-            node.last_access_time = time.time()
+            node.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(node.key, key)
 
             if prefix_len == len(node.key):

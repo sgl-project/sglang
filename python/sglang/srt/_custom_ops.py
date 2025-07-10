@@ -4,7 +4,7 @@ from typing import List, Tuple
 
 import torch
 
-from sglang.srt.utils import get_bool_env_var, is_hip, is_hpu
+from sglang.srt.utils import get_bool_env_var, is_hip, is_hpu, is_npu
 
 logger = logging.getLogger(__name__)
 use_vllm_custom_allreduce = get_bool_env_var(
@@ -25,7 +25,7 @@ if not is_hpu():
             logger.warning("Failed to import from custom_ar with %r", e)
 
 
-if not is_hip():
+if not is_hip() and not is_npu():
     if use_vllm_custom_allreduce:
         custom_op = torch.ops._C_custom_ar
     else:
@@ -113,3 +113,37 @@ else:
 
     def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
         return sgl_kernel.allreduce.get_meta_buffer_ipc_handle(inp)
+
+
+def mscclpp_generate_unique_id() -> bytes:
+    return sgl_kernel.allreduce.mscclpp_generate_unique_id()
+
+
+def mscclpp_init_context(
+    unique_id: bytes,
+    rank: int,
+    world_size: int,
+    scratch: torch.Tensor,
+    put_buffer: torch.Tensor,
+    nranks_per_node: int,
+    rank_to_node: List[int],
+    rank_to_ib: List[int],
+    context_selection: int,
+) -> int:
+    return sgl_kernel.allreduce.mscclpp_init_context(
+        unique_id,
+        rank,
+        world_size,
+        scratch,
+        put_buffer,
+        nranks_per_node,
+        rank_to_node,
+        rank_to_ib,
+        context_selection,
+    )
+
+
+def mscclpp_allreduce(
+    context: int, inp: torch.Tensor, out: torch.Tensor, nthreads: int, nblocks: int
+) -> None:
+    return sgl_kernel.allreduce.mscclpp_allreduce(context, inp, out, nthreads, nblocks)
