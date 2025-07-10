@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     run_bench_offline_throughput,
 )
 
-DEFAULT_MODEL_NAME_FOR_TEST="AI-ModelScope/Llama-3.1-8B-Instruct"
+DEFAULT_MODEL_NAME_FOR_TEST = "AI-ModelScope/Llama-3.1-8B-Instruct"
 
 
 class TestAscendAttnBackend(CustomTestCase):
