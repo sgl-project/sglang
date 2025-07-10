@@ -1,3 +1,8 @@
+"""
+FROM RULER TASKS
+https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/ruler/README.md
+"""
+
 import os
 import unittest
 from types import SimpleNamespace
@@ -12,11 +17,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-
-"""
-FROM RULER TASKS
-https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/ruler/README.md
-"""
 
 import random
 import re
@@ -105,20 +105,8 @@ class TestFlexPrefill(CustomTestCase):
 
         for each in results['results']:
             print("{} -> {}".format(each, results['results'][each]))
-        # self.assertGreaterEqual(metrics["score"], 0.65)
 
 
 if __name__ == "__main__":
     unittest.main()
 
-"""
-FLEXPREFILL
-niah_multikey_1 -> {'alias': 'niah_multikey_1', '4096,none': -1, '4096_stderr,none': 'N/A', '16384,none': 0.3, '16384_stderr,none': 'N/A'}
-niah_multikey_2 -> {'alias': 'niah_multikey_2', '4096,none': -1, '4096_stderr,none': 'N/A', '16384,none': 0.35, '16384_stderr,none': 'N/A'}
-niah_multikey_3 -> {'alias': 'niah_multikey_3', '4096,none': -1, '4096_stderr,none': 'N/A', '16384,none': 0.1, '16384_stderr,none': 'N/A'}
-niah_single_1 -> {'alias': 'niah_single_1', '4096,none': -1, '4096_stderr,none': 'N/A', '16384,none': 0.8, '16384_stderr,none': 'N/A'}
-niah_single_2 -> {'alias': 'niah_single_2', '4096,none': -1, '4096_stderr,none': 'N/A', '16384,none': 0.4, '16384_stderr,none': 'N/A'}
-niah_single_3 -> {'alias': 'niah_single_3', '4096,none': -1, '4096_stderr,none': 'N/A', '16384,none': 0.7, '16384_stderr,none': 'N/A'}
-
-
-"""
