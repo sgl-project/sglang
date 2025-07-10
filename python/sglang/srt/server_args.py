@@ -80,6 +80,7 @@ class ServerArgs:
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
     page_size: int = 1
+    use_multilevel_backend: bool = False
 
     # Other runtime options
     tp_size: int = 1
@@ -851,6 +852,12 @@ class ServerArgs:
                 "(0.0 = pure uniform: swa_size / full_size = 1)"
                 "(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length)"
             ),
+        )
+        parser.add_argument(
+            "--use-multilevel-backend",
+            type=bool,
+            default=ServerArgs.use_multilevel_backend,
+            help="If using multi-level backend as kv cache.",
         )
 
         # Other runtime options

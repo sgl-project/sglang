@@ -12,8 +12,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.mem_cache.external_cache import DiskKVCache
 
 """
 Memory pool.
@@ -464,6 +466,250 @@ class MHATokenToKVPool(KVCache):
             len(tgt_loc),
             next_power_of_2(len(tgt_loc)),
         )
+
+
+class MultiLevelKVCache(KVCache):
+    """
+    Multi-level KV Cache system (Disk ↔ GPU)
+    Leverages MHATokenToKVPool's built-in CPU cache management
+    Implements disk offloading and prefetching
+    """
+
+    def __init__(self,
+                 size: int,
+                 page_size: int,
+                 dtype: torch.dtype,
+                 head_num: int,
+                 head_dim: int,
+                 layer_num: int,
+                 device: str,
+                 enable_memory_saver: bool,
+                 cache_dir: str = "./kv_cache",
+                 prefetch_workers: int = 4,
+                 start_layer: Optional[int] = None,
+                 end_layer: Optional[int] = None):
+        """
+        Initialize the multi-level cache
+
+        Args:
+            size: Total cache capacity in tokens
+            page_size: Size of each memory page
+            dtype: Data type for storage
+            head_num: Number of attention heads
+            head_dim: Dimension of each attention head
+            layer_num: Number of transformer layers
+            device: Target device (e.g., "cuda")
+            enable_memory_saver: Whether to enable memory optimization
+            cache_dir: Directory for disk cache files
+            prefetch_workers: Number of parallel prefetch threads
+            start_layer: First layer index to cache
+            end_layer: Last layer index to cache
+        """
+        super().__init__(
+            size, page_size, dtype, layer_num, device,
+            enable_memory_saver, start_layer, end_layer
+        )
+
+        # Initialize disk cache (persistent storage)
+        self.disk_cache = DiskKVCache(
+            size, page_size, dtype, head_num, head_dim, layer_num, cache_dir
+        )
+
+        # Initialize GPU cache (with built-in CPU cache)
+        self.gpu_cache = MHATokenToKVPool(
+            size, page_size, dtype, head_num, head_dim, layer_num,
+            device, enable_memory_saver, start_layer, end_layer
+        )
+
+        # Prefetch management
+        self.prefetch_executor = ThreadPoolExecutor(max_workers=prefetch_workers)
+        self.prefetch_queue = []
+        self.prefetch_lock = Lock()
+
+        # Performance statistics
+        self.stats = {
+            'disk_hits': 0,
+            'gpu_hits': 0,
+            'prefetches': 0
+        }
+
+    def backup_to_host_all_layer(self):
+        """Backup all layers from GPU to disk (via MHATokenToKVPool's CPU cache)"""
+        for layer_id in range(self.layer_num):
+            try:
+                # Get current KV cache from GPU
+                k_gpu, v_gpu = self.gpu_cache.get_kv_buffer(layer_id)
+
+                # Convert to CPU (handled internally by MHATokenToKVPool)
+                k_cpu = k_gpu.cpu()
+                v_cpu = v_gpu.cpu()
+
+                # Write to disk
+                k_disk, v_disk = self.disk_cache.get_kv_buffer(layer_id)
+                k_disk.copy_(k_cpu)
+                v_disk.copy_(v_cpu)
+
+            except Exception as e:
+                print(f"Failed to backup layer {layer_id}: {e}")
+
+    def load_from_host_per_layer(self, layer_id: int) -> bool:
+        """
+        Load specific layer from disk to GPU (via MHATokenToKVPool's CPU cache)
+
+        Args:
+            layer_id: Layer index to load
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Load from disk
+            k_disk, v_disk = self.disk_cache.get_kv_buffer(layer_id)
+
+            # Upload to GPU (MHATokenToKVPool will handle CPU caching)
+            self._async_upload_to_gpu(layer_id, k_disk, v_disk)
+            return True
+
+        except Exception as e:
+            print(f"Failed to load layer {layer_id}: {e}")
+            return False
+
+    def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        """Get key buffer with automatic multi-level fetching"""
+        try:
+            # Try GPU cache first
+            k = self.gpu_cache.get_key_buffer(layer_id)
+            self.stats['gpu_hits'] += 1
+            self._async_prefetch(layer_id + 1)  # Prefetch next layer
+            return k
+        except:
+            pass
+
+        # Fall back to disk
+        k_disk, _ = self.disk_cache.get_kv_buffer(layer_id)
+        self.stats['disk_hits'] += 1
+
+        # Upload to GPU asynchronously
+        self._async_upload_to_gpu(layer_id, k_disk, k_disk)
+        return k_disk
+
+    def get_value_buffer(self, layer_id: int) -> torch.Tensor:
+        """Get value buffer (wrapper around get_kv_buffer)"""
+        _, v = self.get_kv_buffer(layer_id)
+        return v
+
+    def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get both key and value buffers"""
+        try:
+            # Try GPU cache first
+            k, v = self.gpu_cache.get_kv_buffer(layer_id)
+            self.stats['gpu_hits'] += 1
+            self._async_prefetch(layer_id + 1)
+            return k, v
+        except:
+            pass
+
+        # Fall back to disk
+        k_disk, v_disk = self.disk_cache.get_kv_buffer(layer_id)
+        self.stats['disk_hits'] += 1
+
+        # Upload to GPU asynchronously
+        self._async_upload_to_gpu(layer_id, k_disk, v_disk)
+        return k_disk, v_disk
+
+    def _async_upload_to_gpu(self, layer_id: int, k: torch.Tensor, v: torch.Tensor):
+        """Asynchronously upload KV cache to GPU"""
+
+        def upload_task():
+            try:
+                # Non-blocking transfer to GPU
+                k_gpu = k.to(self.device, non_blocking=True)
+                v_gpu = v.to(self.device, non_blocking=True)
+
+                # Update GPU cache
+                loc = torch.arange(k.shape[0], device=self.device)
+                self.gpu_cache.set_kv_buffer(
+                    layer=None,
+                    loc=loc,
+                    cache_k=k_gpu,
+                    cache_v=v_gpu,
+                    layer_id_override=layer_id
+                )
+            except Exception as e:
+                print(f"GPU upload failed for layer {layer_id}: {e}")
+
+        self.prefetch_executor.submit(upload_task)
+
+    def _async_prefetch(self, layer_id: int):
+        """Prefetch next layer's data from disk"""
+        if layer_id < 0 or layer_id >= self.layer_num:
+            return
+
+        with self.prefetch_lock:
+            if layer_id in self.prefetch_queue:
+                return
+            self.prefetch_queue.append(layer_id)
+            self.stats['prefetches'] += 1
+
+        def prefetch_task():
+            try:
+                # Load from disk
+                k_disk, v_disk = self.disk_cache.get_kv_buffer(layer_id)
+
+                # Upload to GPU
+                self._async_upload_to_gpu(layer_id, k_disk, v_disk)
+            finally:
+                with self.prefetch_lock:
+                    if layer_id in self.prefetch_queue:
+                        self.prefetch_queue.remove(layer_id)
+
+        self.prefetch_executor.submit(prefetch_task)
+
+    def set_kv_buffer(self,
+                      layer,
+                      loc,
+                      cache_k: torch.Tensor,
+                      cache_v: torch.Tensor,
+                      k_scale: Optional[float] = None,
+                      v_scale: Optional[float] = None,
+                      layer_id_override: Optional[int] = None):
+        """
+        Update KV cache across all levels
+
+        Args:
+            layer: Attention layer reference
+            loc: Location indices to update
+            cache_k: New key values
+            cache_v: New value values
+            k_scale: Quantization scale for keys
+            v_scale: Quantization scale for values
+            layer_id_override: Optional layer ID override
+        """
+        # Update GPU cache (handles CPU caching internally)
+        self.gpu_cache.set_kv_buffer(
+            layer, loc, cache_k, cache_v,
+            k_scale, v_scale, layer_id_override
+        )
+
+        # Determine layer ID
+        layer_id = layer_id_override if layer_id_override is not None else layer.layer_id
+
+        # Asynchronously update disk cache
+        def update_disk_cache():
+            try:
+                k_disk, v_disk = self.disk_cache.get_kv_buffer(layer_id)
+                k_disk[loc] = cache_k.cpu()
+                v_disk[loc] = cache_v.cpu()
+            except Exception as e:
+                print(f"Disk update failed for layer {layer_id}: {e}")
+
+        self.prefetch_executor.submit(update_disk_cache)
+
+    def cleanup(self):
+        """Clean up resources"""
+        self.prefetch_executor.shutdown(wait=True)
+        self.disk_cache.cleanup()
+        print("Cache statistics:", self.stats)
 
 
 class SWAKVPool(KVCache):

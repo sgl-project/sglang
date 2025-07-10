@@ -121,6 +121,8 @@ from sglang.srt.utils import (
     set_cuda_arch,
 )
 
+from sglang.srt.mem_cache.memory_pool import MultiLevelKVCache
+
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -1162,6 +1164,21 @@ class ModelRunner:
                 layer_num=self.num_effective_layers,
                 device=self.device,
                 heavy_channel_num=self.server_args.ds_heavy_channel_num,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+            )
+        elif self.server_args.use_multilevel_backend:
+            self.token_to_kv_pool = MultiLevelKVCache(
+                self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(
+                    get_attention_tp_size()
+                ),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
