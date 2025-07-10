@@ -1,4 +1,4 @@
-# adapted from https://github.com/ByteDance-Seed/FlexPrefill/blob/main/flex_prefill/ops/flex_prefill_attention.py
+# adapted from https://arxiv.org/abs/2502.20766
 import math
 import warnings
 from typing import List, Optional, Tuple, Union
@@ -7,7 +7,23 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
+import math
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import get_bool_env_var
 
+FLEXPREFILL_DEFAULT_BLOCK_SIZE = 128
+FLEXPREFILL_DEFAULT_MIN_BUDGET = 1024
+FLEXPREFILL_THRESHOLD = max(
+    2 * FLEXPREFILL_DEFAULT_BLOCK_SIZE,
+    math.ceil(FLEXPREFILL_DEFAULT_MIN_BUDGET / FLEXPREFILL_DEFAULT_BLOCK_SIZE) * FLEXPREFILL_DEFAULT_BLOCK_SIZE
+)
+
+def check_if_use_flexprefill(forward_batch: ForwardBatch) -> bool:
+    return (
+        forward_batch.batch_size == 1
+        and forward_batch.seq_lens_sum > FLEXPREFILL_THRESHOLD
+        and get_bool_env_var("SGL_USE_FLEXPREFILL")
+    )
 
 def gpu_info():
     if torch.cuda.is_available():
@@ -1524,7 +1540,7 @@ def flex_prefill_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    gamma: float = 0.9,
+    gamma: float = 0.8,
     tau: float = 0.1,
     min_budget: int = 1024,
     max_budget: int = 2147483647,

@@ -9,7 +9,7 @@ import torch
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_ops.flex_prefill_attention import (
-    flex_prefill_attention,
+    flex_prefill_attention, check_if_use_flexprefill, FLEXPREFILL_THRESHOLD
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
-from sglang.srt.utils import get_bool_env_var
+
 
 
 @dataclass
@@ -654,8 +654,8 @@ class FlashAttentionBackend(AttentionBackend):
                         k,
                         k_rope,
                     )
-        if forward_batch.batch_size == 1 and get_bool_env_var("SGL_USE_FLEXPREFILL"):
 
+        if check_if_use_flexprefill(forward_batch):
             out = flex_prefill_attention(
                 q.view(
                     forward_batch.batch_size, -1, layer.tp_q_head_num, layer.head_dim
