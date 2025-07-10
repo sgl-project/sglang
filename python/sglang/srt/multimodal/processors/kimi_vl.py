@@ -1,9 +1,6 @@
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Dict, List, Union
 
-import torch
-
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.kimi_vl import KimiVLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -17,9 +14,13 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        self.IMAGE_TOKEN = "<|media_pad|>"
-        self.IMAGE_TOKEN_REGEX = re.compile(r"(?:<\|media_pad\|>)+")
-        self.IM_TOKEN_ID = _processor.tokenizer.convert_tokens_to_ids(self.IMAGE_TOKEN)
+        self.mm_tokens = MultimodalSpecialTokens(
+            image_token="<|media_pad|>",
+            image_token_regex=re.compile(r"(?:<\|media_pad\|>)+"),
+        )
+        self.IM_TOKEN_ID = _processor.tokenizer.convert_tokens_to_ids(
+            self.mm_tokens.image_token
+        )
 
     async def process_mm_data_async(
         self,
@@ -33,9 +34,7 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(
-                image_token=self.IMAGE_TOKEN, image_token_regex=self.IMAGE_TOKEN_REGEX
-            ),
+            multimodal_tokens=self.mm_tokens,
             max_req_input_len=max_req_input_len,
         )
 

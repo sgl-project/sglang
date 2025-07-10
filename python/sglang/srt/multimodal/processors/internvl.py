@@ -24,7 +24,6 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         self.IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
         self.IMG_START_TOKEN = "<img>"
         self.IMG_END_TOKEN = "</img>"
-        self.IMG_TOKEN = "<image>"
         self.num_image_token = int(
             (image_size // patch_size) ** 2 * (hf_config.downsample_ratio**2)
         )
@@ -35,6 +34,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         self.img_context_token_id = tokenizer.convert_tokens_to_ids(
             self.IMG_CONTEXT_TOKEN
         )
+        self.mm_tokens = MultimodalSpecialTokens(image_token="<image>")
 
     @staticmethod
     def build_transform(input_size):
@@ -175,7 +175,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(image_token=self.IMG_TOKEN),
+            multimodal_tokens=self.mm_tokens,
             max_req_input_len=max_req_input_len,
             discard_alpha_channel=True,
         )

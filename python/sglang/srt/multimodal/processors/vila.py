@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Type, cast
+from typing import Any, Dict, List, Optional, Type
 
 import torch.nn as nn
 from transformers.configuration_utils import PretrainedConfig
@@ -10,7 +10,6 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     ImageDataInputItem,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.vila import VILAForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -39,6 +38,9 @@ class VILAMultimodalProcessor(BaseMultimodalProcessor):
         super().__init__(hf_config, server_args, _processor)
         self.IM_TOKEN_ID = hf_config.image_token_id
         self.VIDEO_TOKEN_ID = hf_config.video_token_id
+        self.mm_tokens = MultimodalSpecialTokens(
+            image_token=self._processor.tokenizer.image_token
+        )
 
     async def process_mm_data_async(
         self,
@@ -50,9 +52,7 @@ class VILAMultimodalProcessor(BaseMultimodalProcessor):
     ) -> Optional[Dict[str, Any]]:
         base_output = self.load_mm_data(
             prompt=input_text,
-            multimodal_tokens=MultimodalSpecialTokens(
-                image_token=self._processor.tokenizer.image_token
-            ),
+            multimodal_tokens=self.mm_tokens,
             max_req_input_len=max_req_input_len,
             image_data=image_data,
         )
