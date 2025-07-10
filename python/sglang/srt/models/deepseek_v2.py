@@ -1836,7 +1836,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         if not _is_sm100_supported or not _is_flashinfer_available:
             return False
 
-        if hasattr(forward_batch, 'input_ids') and (forward_batch.input_ids.shape[0] == 0 or forward_batch.input_ids.shape[0] > 1024):
+        if hasattr(forward_batch, 'input_ids') and (forward_batch.input_ids.shape[0] == 0 or forward_batch.input_ids.shape[0] > 128):
             return False
 
         return True
