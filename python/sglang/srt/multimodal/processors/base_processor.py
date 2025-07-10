@@ -465,7 +465,6 @@ class BaseMultimodalProcessor(ABC):
             return result = [(2,4),(6,7)]
         """
         mask = input_ids == mm_token_id
-
         start_positions = (mask & ~torch.roll(mask, 1)).nonzero(as_tuple=True)[0]
         end_positions = (mask & ~torch.roll(mask, -1)).nonzero(as_tuple=True)[0]
 

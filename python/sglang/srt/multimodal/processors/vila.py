@@ -36,10 +36,10 @@ class VILAMultimodalProcessor(BaseMultimodalProcessor):
         _processor: VILAProcessor,
     ) -> None:
         super().__init__(hf_config, server_args, _processor)
-        self.IM_TOKEN_ID = hf_config.image_token_id
-        self.VIDEO_TOKEN_ID = hf_config.video_token_id
         self.mm_tokens = MultimodalSpecialTokens(
-            image_token=self._processor.tokenizer.image_token
+            image_token=self._processor.tokenizer.image_token,
+            image_token_id=hf_config.image_token_id,
+            video_token_id=hf_config.video_token_id,
         ).build(_processor)
 
     async def process_mm_data_async(
@@ -64,6 +64,6 @@ class VILAMultimodalProcessor(BaseMultimodalProcessor):
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
-            "im_token_id": self.IM_TOKEN_ID,
-            "video_token_id": self.VIDEO_TOKEN_ID,
+            "im_token_id": self.mm_tokens.image_token_id,
+            "video_token_id": self.mm_tokens.video_token_id,
         }
