@@ -2,14 +2,39 @@
 #   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx942 -t v0.4.9.post1-rocm630 -f Dockerfile.rocm .
 #   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx950 -t v0.4.9.post1-rocm700 -f Dockerfile.rocm .
 
-# default base image
+# Default base images
 ARG BASE_IMAGE_950="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.8.5_mi35X_prealpha"
 ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
 
+# This is necessary for scope purpose
+ARG GPU_ARCH=gfx950
+
+# ===============================
+# Base image 942 and args
+FROM $BASE_IMAGE_942 AS gfx942
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_AITER_ALL="1"
+ENV AITER_COMMIT="v0.1.3"
+
+# ===============================
+# Base image 950 and args
+FROM $BASE_IMAGE_950 AS gfx950
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="0"
+ENV BUILD_AITER_ALL="1"
+ENV AITER_COMMIT="4738360c65a3c0e10fe6fbe86d54de825a161e87"
+
+# ===============================
+# Chosen arch and args
+FROM ${GPU_ARCH}
+
+# This is necessary for scope purpose, again
 ARG GPU_ARCH
+ENV GPU_ARCH_LIST=${GPU_ARCH:-${PYTORCH_ROCM_ARCH}}
 
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
-ENV SGL_DEFAULT="main"
+ARG SGL_DEFAULT="main"
 ARG SGL_BRANCH=${SGL_DEFAULT}
 
 ARG TRITON_REPO="https://github.com/ROCm/triton.git"
@@ -17,23 +42,7 @@ ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 
-# base image 942 and it's args
-FROM $BASE_IMAGE_942 AS gfx942
-ENV BUILD_VLLM="0"
-ENV BUILD_TRITON="1"
-ENV BUILD_AITER_ALL="1"
-ENV AITER_COMMIT="v0.1.3"
-
-# base image 950 and it's args
-FROM $BASE_IMAGE_950 AS gfx950
-ENV BUILD_VLLM="0"
-ENV BUILD_TRITON="0"
-ENV BUILD_AITER_ALL="1"
-ENV AITER_COMMIT="4738360c65a3c0e10fe6fbe86d54de825a161e87"
-
 USER root
-
-ENV GPU_ARCH_LIST=${GPU_ARCH:-${PYTORCH_ROCM_ARCH}}
 
 # Install some basic utilities
 RUN python3 -m pip install --upgrade pip && pip install setuptools_scm
@@ -62,6 +71,7 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
      && git clone ${TRITON_REPO} \
      && cd triton \
      && git checkout ${TRITON_COMMIT} \
+     && cd python \
      && python3 setup.py install; \
     fi
 
