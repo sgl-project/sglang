@@ -74,7 +74,6 @@ def get_wave_kernel(
         max_kv_splits,
         input_dtype=input_dtype,
         output_dtype=output_dtype,
-        mha=mha,
         logit_cap=logit_cap,
     )
     hyperparams_0.update(get_default_scheduling_params())
