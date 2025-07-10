@@ -863,6 +863,7 @@ class TokenizerManager:
     async def start_profile(
         self,
         output_dir: Optional[str] = None,
+        start_step: Optional[int] = None,
         num_steps: Optional[int] = None,
         activities: Optional[List[str]] = None,
         with_stack: Optional[bool] = None,
@@ -875,6 +876,7 @@ class TokenizerManager:
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
+            start_step=start_step,
             num_steps=num_steps,
             activities=activities,
             with_stack=with_stack,
