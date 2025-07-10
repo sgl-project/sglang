@@ -1777,7 +1777,7 @@ class PortArgs:
         else:
             port = server_args.nccl_port
 
-        if not server_args.enable_dp_attention:
+        if not server_args.enable_dp_attention and server_args.pp_size == 1:
             # Normal case, use IPC within a single node
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",

@@ -274,38 +274,31 @@ class Scheduler(
         context = zmq.Context(2)
         self.idle_sleeper = None
 
-        if self.pp_rank == 0 and self.attn_tp_rank == 0:
-            self.recv_from_tokenizer = get_zmq_socket(
-                context, zmq.PULL, port_args.scheduler_input_ipc_name, False
-            )
+        if self.attn_tp_rank == 0:
             self.send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
-            self.send_metrics_from_scheduler = get_zmq_socket(
-                context, zmq.PUSH, port_args.metrics_ipc_name, False
-            )
-
-            if server_args.skip_tokenizer_init:
-                # Directly send to the TokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+            if self.pp_rank == 0:
+                self.recv_from_tokenizer = get_zmq_socket(
+                    context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+                )
+                if server_args.skip_tokenizer_init:
+                    # Directly send to the TokenizerManager
+                    self.send_to_detokenizer = get_zmq_socket(
+                        context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+                    )
+                else:
+                    # Send to the DetokenizerManager
+                    self.send_to_detokenizer = get_zmq_socket(
+                        context, zmq.PUSH, port_args.detokenizer_ipc_name, False
+                    )
+                self.recv_from_rpc = get_zmq_socket(
+                    context, zmq.DEALER, port_args.rpc_ipc_name, False
                 )
             else:
-                # Send to the DetokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.detokenizer_ipc_name, False
-                )
-
-            self.recv_from_rpc = get_zmq_socket(
-                context, zmq.DEALER, port_args.rpc_ipc_name, False
-            )
-            if self.server_args.sleep_on_idle:
-                self.idle_sleeper = IdleSleeper(
-                    [
-                        self.recv_from_tokenizer,
-                        self.recv_from_rpc,
-                    ]
-                )
+                self.recv_from_tokenizer = None
+                self.recv_from_rpc = None
+                self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
@@ -1051,7 +1044,11 @@ class Scheduler(
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)
                 else:
-                    self.send_to_tokenizer.send_pyobj(output)
+                    if is_multi_result_requested(recv_req):
+                        self.send_to_tokenizer.send_pyobj(output)
+                    else:
+                        if self.pp_rank == 0:
+                            self.send_to_tokenizer.send_pyobj(output)
 
     def handle_generate_request(
         self,
@@ -1819,7 +1816,8 @@ class Scheduler(
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
             self.return_health_check_ct -= 1
-            self.send_to_tokenizer.send_pyobj(HealthCheckOutput())
+            if self.pp_rank == 0:
+                self.send_to_tokenizer.send_pyobj(HealthCheckOutput())
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return self.prepare_mlp_sync_batch_raw(
@@ -2235,8 +2233,9 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
-            logger.debug(f"Abort queued request. {req.rid=}")
+            if self.pp_rank == 0:
+                self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
+                logger.info(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
         for req in self.grammar_queue:
@@ -2692,6 +2691,12 @@ class Scheduler(
 
 def is_health_check_generate_req(recv_req):
     return getattr(recv_req, "rid", "").startswith("HEALTH_CHECK")
+
+def is_multi_result_requested(req):
+    """
+    Check if the request require multiple results
+    """
+    return isinstance(req, UpdateWeightFromDiskReqInput)
 
 
 def _export_static_state(model):
