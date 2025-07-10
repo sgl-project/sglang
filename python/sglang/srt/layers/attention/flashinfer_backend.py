@@ -71,7 +71,7 @@ struct AttentionSink : AttentionVariantBase {
   })
 
   REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, {
-    float d_rcp = (m != -math::inf) ? math::ptx_rcp(d + params.sink[qo_head_idx]) : 0.f;
+    float d_rcp = (m != -math::inf) ? math::ptx_rcp(d + params.sink[qo_head_idx] * math::ptx_exp2(-m)) : 0.f;
     return output * d_rcp;
   });
 };
