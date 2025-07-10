@@ -357,12 +357,12 @@ class MooncakeKVManager(BaseKVManager):
             )
 
             # Sanity check: The data sub-slice to be sent should fit into the dst buffer.
-            # This means heads_bytes_per_token_to_send <= dst_kv_item_len
-            if heads_bytes_per_token_to_send > dst_kv_item_len:
+            # This means heads_bytes_per_token_to_send <= (dst_kv_item_len // page_size)
+            if heads_bytes_per_token_to_send > (dst_kv_item_len // page_size):
                 logger.error(
                     f"[{mooncake_session_id}] Layer {layer_id}: "
                     f"slice size ({heads_bytes_per_token_to_send}) exceeds "
-                    f"target page size ({dst_kv_item_len})"
+                    f"target token slot size ({dst_kv_item_len // page_size})"
                 )
                 return -1
             layers_params.append(
