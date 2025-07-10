@@ -418,6 +418,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
 
     await _global_state.tokenizer_manager.start_profile(
         output_dir=obj.output_dir,
+        start_step=obj.start_step,
         num_steps=obj.num_steps,
         activities=obj.activities,
         with_stack=obj.with_stack,
@@ -710,6 +711,26 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     }
 
     return ORJSONResponse(content=response_data, status_code=200)
+
+
+@app.post("/pause_generation")
+async def pause_generation(request: Request):
+    """Pause generation."""
+    await _global_state.tokenizer_manager.pause_generation()
+    return ORJSONResponse(
+        content={"message": "Generation paused successfully.", "status": "ok"},
+        status_code=200,
+    )
+
+
+@app.post("/continue_generation")
+async def continue_generation(request: Request):
+    """Continue generation."""
+    await _global_state.tokenizer_manager.continue_generation()
+    return ORJSONResponse(
+        content={"message": "Generation continued successfully.", "status": "ok"},
+        status_code=200,
+    )
 
 
 ##### OpenAI-compatible API endpoints #####

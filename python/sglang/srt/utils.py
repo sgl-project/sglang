@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import base64
 import builtins
 import ctypes
 import dataclasses
@@ -42,7 +41,7 @@ import threading
 import time
 import traceback
 import warnings
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from enum import Enum
 from functools import lru_cache
@@ -68,6 +67,7 @@ from typing import (
 
 import numpy as np
 import psutil
+import pybase64
 import requests
 import torch
 import torch.distributed
@@ -83,12 +83,7 @@ from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
-from triton.runtime.cache import (
-    FileCacheManager,
-    default_cache_dir,
-    default_dump_dir,
-    default_override_dir,
-)
+from triton.runtime.cache import FileCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -96,35 +91,6 @@ show_time_cost = False
 time_infos = {}
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
-
-_warned_bool_env_var_keys = set()
-
-
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    value = value.lower()
-
-    truthy_values = ("true", "1")
-    falsy_values = ("false", "0")
-
-    if (value not in truthy_values) and (value not in falsy_values):
-        if value not in _warned_bool_env_var_keys:
-            logger.warning(
-                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
-            )
-        _warned_bool_env_var_keys.add(value)
-
-    return value in truthy_values
-
-
-def get_int_env_var(name: str, default: int = 0) -> int:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -174,6 +140,82 @@ def is_host_cpu_x86() -> bool:
 
 def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
+
+
+def get_cuda_version():
+    if torch.version.cuda:
+        return tuple(map(int, torch.version.cuda.split(".")))
+    return (0, 0)
+
+
+def _check(cc_major):
+    if not is_cuda():
+        return False
+    return torch.cuda.get_device_capability()[0] == cc_major and tuple(
+        map(int, torch.version.cuda.split(".")[:2])
+    ) >= (12, 3)
+
+
+is_ampere_with_cuda_12_3 = lambda: _check(8)
+is_hopper_with_cuda_12_3 = lambda: _check(9)
+
+
+def is_blackwell():
+    if not is_cuda():
+        return False
+    return torch.cuda.get_device_capability()[0] == 10
+
+
+_warned_bool_env_var_keys = set()
+
+
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
+    value = value.lower()
+
+    truthy_values = ("true", "1")
+    falsy_values = ("false", "0")
+
+    if (value not in truthy_values) and (value not in falsy_values):
+        if value not in _warned_bool_env_var_keys:
+            logger.warning(
+                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+            )
+        _warned_bool_env_var_keys.add(value)
+
+    return value in truthy_values
+
+
+def get_int_env_var(name: str, default: int = 0) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def support_triton(backend: str) -> bool:
+    return backend not in ["torch_native", "intel_amx"]
+
+
+try:
+    import sgl_kernel
+
+    is_intel_amx_backend_available = hasattr(
+        torch.ops.sgl_kernel, "convert_weight_packed"
+    )
+except:
+    is_intel_amx_backend_available = False
+
+
+def cpu_has_amx_support():
+    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
+
+
+def use_intel_amx_backend(layer):
+    return getattr(layer, "use_intel_amx_backend", False)
 
 
 def is_flashinfer_available():
@@ -503,6 +545,46 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def find_process_using_port(port: int) -> Optional[psutil.Process]:
+    for conn in psutil.net_connections(kind="inet"):
+        if conn.laddr.port == port:
+            try:
+                return psutil.Process(conn.pid)
+            except psutil.NoSuchProcess:
+                # It could happen by race condition (the proc dies when psutil.Process is called).
+                pass
+
+    return None
+
+
+def wait_port_available(
+    port: int, port_name: str, timeout_s: int = 30, raise_exception: bool = True
+) -> bool:
+    for i in range(timeout_s):
+        if is_port_available(port):
+            return True
+
+        if i > 10 and i % 5 == 0:
+            process = find_process_using_port(port)
+            if process is None:
+                logger.warning(
+                    f"The port {port} is in use, but we could not find the process that uses it."
+                )
+
+            pid = process.pid
+            error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
+            logger.info(
+                f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
+            )
+        time.sleep(0.1)
+
+    if raise_exception:
+        raise ValueError(
+            f"{port_name} at {port} is not available in {timeout_s} seconds. {error_message}"
+        )
+    return False
+
+
 def is_port_available(port):
     """Return whether a port is available."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -517,11 +599,24 @@ def is_port_available(port):
             return False
 
 
+def get_free_port():
+    # try ipv4
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+    except OSError:
+        # try ipv6
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+
 def decode_video_base64(video_base64):
     from PIL import Image
 
     # Decode the base64 string
-    video_bytes = base64.b64decode(video_base64)
+    video_bytes = pybase64.b64decode(video_base64, validate=True)
 
     # Placeholder for the start indices of each PNG image
     img_starts = []
@@ -607,7 +702,9 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
         audio, original_sr = sf.read(BytesIO(audio_file))
     elif audio_file.startswith("data:"):
         audio_file = audio_file.split(",")[1]
-        audio, original_sr = sf.read(BytesIO(base64.b64decode(audio_file)))
+        audio, original_sr = sf.read(
+            BytesIO(pybase64.b64decode(audio_file, validate=True))
+        )
     elif audio_file.startswith("http://") or audio_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
         response = requests.get(audio_file, stream=True, timeout=timeout)
@@ -631,33 +728,6 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
     return audio
 
 
-def encode_video(video_path, frame_count_limit=None):
-    # Lazy import because decord is not available on some arm platforms.
-    from decord import VideoReader, cpu
-
-    if not os.path.exists(video_path):
-        logger.error(f"Video {video_path} does not exist")
-        return []
-
-    if frame_count_limit == 0:
-        return []
-
-    def uniform_sample(l, n):
-        gap = len(l) / n
-        idxs = [int(i * gap + gap / 2) for i in range(n)]
-        return [l[i] for i in idxs]
-
-    vr = VideoReader(video_path, ctx=cpu(0))
-    sample_fps = round(vr.get_avg_fps() / 1)  # FPS
-    frame_indices = [i for i in range(0, len(vr), sample_fps)]
-    if frame_count_limit is not None and len(frame_indices) > frame_count_limit:
-        frame_indices = uniform_sample(frame_indices, frame_count_limit)
-
-    frames = vr.get_batch(frame_indices).asnumpy()
-    frames = [Image.fromarray(v.astype("uint8")) for v in frames]
-    return frames
-
-
 def load_image(
     image_file: Union[Image.Image, str, bytes],
 ) -> tuple[Image.Image, tuple[int, int]]:
@@ -676,16 +746,68 @@ def load_image(
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
         image_file = image_file.split(",")[1]
-        image = Image.open(BytesIO(base64.b64decode(image_file)))
-    elif image_file.startswith("video:"):
-        image_file = image_file.replace("video:", "")
-        image, image_size = decode_video_base64(image_file)
+        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     elif isinstance(image_file, str):
-        image = Image.open(BytesIO(base64.b64decode(image_file)))
+        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     else:
         raise ValueError(f"Invalid image: {image}")
 
     return image, image_size
+
+
+def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
+    # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
+    from decord import VideoReader, cpu, gpu
+
+    try:
+        from decord.bridge import decord_bridge
+
+        ctx = gpu(0)
+        _ = decord_bridge.get_ctx_device(ctx)
+    except Exception:
+        ctx = cpu(0)
+
+    tmp_file = None
+    vr = None
+    try:
+        if isinstance(video_file, bytes):
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            tmp_file.write(video_file)
+            tmp_file.close()
+            vr = VideoReader(tmp_file.name, ctx=ctx)
+        elif isinstance(video_file, str):
+            if video_file.startswith(("http://", "https://")):
+                timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+                response = requests.get(video_file, stream=True, timeout=timeout)
+                response.raise_for_status()
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                for chunk in response.iter_content(chunk_size=8192):
+                    tmp_file.write(chunk)
+                tmp_file.close()
+                vr = VideoReader(tmp_file.name, ctx=ctx)
+            elif video_file.startswith("data:"):
+                _, encoded = video_file.split(",", 1)
+                video_bytes = base64.b64decode(encoded)
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                tmp_file.write(video_bytes)
+                tmp_file.close()
+                vr = VideoReader(tmp_file.name, ctx=ctx)
+            elif os.path.isfile(video_file):
+                vr = VideoReader(video_file, ctx=ctx)
+            else:
+                video_bytes = base64.b64decode(video_file)
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                tmp_file.write(video_bytes)
+                tmp_file.close()
+                vr = VideoReader(tmp_file.name, ctx=ctx)
+        else:
+            raise ValueError(f"Unsupported video input type: {type(video_file)}")
+
+        return vr
+
+    finally:
+        if tmp_file and os.path.exists(tmp_file.name):
+            os.unlink(tmp_file.name)
 
 
 def suppress_other_loggers():
@@ -819,24 +941,51 @@ def maybe_set_triton_cache_manager() -> None:
 class CustomCacheManager(FileCacheManager):
     # Adapted from: https://github.com/tdoublep/vllm/blob/3307522289fdfefe323b6c00d0db696651989a2f/vllm/triton_utils/custom_cache_manager.py
     def __init__(self, key, override=False, dump=False):
+        from sglang.srt.distributed.parallel_state import get_tp_group
 
         self.key = key
         self.lock_path = None
+
+        try:
+            module_path = "triton.runtime.cache"
+            cache_module = importlib.import_module(module_path)
+
+            default_cache_dir = getattr(cache_module, "default_cache_dir", None)
+            default_dump_dir = getattr(cache_module, "default_dump_dir", None)
+            default_override_dir = getattr(cache_module, "default_override_dir", None)
+        except (ModuleNotFoundError, AttributeError) as e:
+            default_cache_dir = None
+            default_dump_dir = None
+            default_override_dir = None
+
         if dump:
-            self.cache_dir = default_dump_dir()
+            self.cache_dir = (
+                default_dump_dir()
+                if default_dump_dir is not None
+                else os.path.join(Path.home(), ".triton", "dump")
+            )
             self.cache_dir = os.path.join(self.cache_dir, self.key)
             self.lock_path = os.path.join(self.cache_dir, "lock")
             os.makedirs(self.cache_dir, exist_ok=True)
         elif override:
-            self.cache_dir = default_override_dir()
+            self.cache_dir = (
+                default_override_dir()
+                if default_override_dir is not None
+                else os.path.join(Path.home(), ".triton", "override")
+            )
             self.cache_dir = os.path.join(self.cache_dir, self.key)
         else:
             # create cache directory if it doesn't exist
-            self.cache_dir = (
-                os.getenv("TRITON_CACHE_DIR", "").strip() or default_cache_dir()
+            self.cache_dir = os.getenv("TRITON_CACHE_DIR", "").strip() or (
+                default_cache_dir()
+                if default_cache_dir is not None
+                else os.path.join(Path.home(), ".triton", "cache")
             )
             if self.cache_dir:
-                self.cache_dir = f"{self.cache_dir}_{os.getpid()}"
+                try:
+                    self.cache_dir = f"{self.cache_dir}_{get_tp_group().local_rank}"
+                except:
+                    self.cache_dir = f"{self.cache_dir}_{os.getpid()}"
                 self.cache_dir = os.path.join(self.cache_dir, self.key)
                 self.lock_path = os.path.join(self.cache_dir, "lock")
                 os.makedirs(self.cache_dir, exist_ok=True)
@@ -1744,7 +1893,7 @@ class MultiprocessingSerializer:
 
         if output_str:
             # Convert bytes to base64-encoded string
-            output = base64.b64encode(output).decode("utf-8")
+            output = pybase64.b64encode(output).decode("utf-8")
 
         return output
 
@@ -1761,7 +1910,7 @@ class MultiprocessingSerializer:
         """
         if isinstance(data, str):
             # Decode base64 string to bytes
-            data = base64.b64decode(data)
+            data = pybase64.b64decode(data, validate=True)
 
         return ForkingPickler.loads(data)
 
@@ -1939,12 +2088,6 @@ def rank0_log(msg: str):
         logger.info(msg)
 
 
-def get_cuda_version():
-    if torch.version.cuda:
-        return tuple(map(int, torch.version.cuda.split(".")))
-    return (0, 0)
-
-
 def launch_dummy_health_check_server(host, port):
     import asyncio
 
@@ -2104,14 +2247,14 @@ class DeepEPMode(Enum):
     def enable_low_latency(self):
         return self in [DeepEPMode.low_latency, DeepEPMode.auto]
 
-    def resolve(self, forward_mode):
+    def resolve(self, is_extend_in_batch: bool):
         if self != DeepEPMode.auto:
             return self
 
-        if forward_mode.is_decode():
-            return DeepEPMode.low_latency
-        else:
+        if is_extend_in_batch:
             return DeepEPMode.normal
+        else:
+            return DeepEPMode.low_latency
 
 
 def is_non_idle_and_non_empty(forward_mode, hidden_states):
@@ -2131,35 +2274,12 @@ def fast_topk(values, topk, dim):
         return torch.topk(values, topk, dim=dim)
 
 
-def _check(cc_major):
-    if not is_cuda():
-        return False
-    return torch.cuda.get_device_capability()[0] == cc_major and tuple(
-        map(int, torch.version.cuda.split(".")[:2])
-    ) >= (12, 3)
-
-
-is_ampere_with_cuda_12_3 = lambda: _check(8)
-is_hopper_with_cuda_12_3 = lambda: _check(9)
-
-
-def is_blackwell():
-    if not is_cuda():
-        return False
-    return torch.cuda.get_device_capability()[0] == 10
-
-
-def get_free_port():
-    # try ipv4
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-    except OSError:
-        # try ipv6
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
+def bind_or_assign(target, source):
+    if target is not None:
+        target.copy_(source)
+        return target
+    else:
+        return source
 
 
 def get_local_ip_auto() -> str:
@@ -2412,26 +2532,75 @@ def bind_or_assign(target, source):
         return source
 
 
-def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx", "ascend"]
+def prepack_weight_if_needed(weight):
+    if weight.device != torch.device("cpu"):
+        return weight
+    if not cpu_has_amx_support():
+        return weight
+
+    return torch.ops.sgl_kernel.convert_weight_packed(weight)
 
 
-try:
-    import sgl_kernel
+# TODO: currently gemm kernel has the below requirements:
+# OC % TILE_N == 0, where TILE_N = 16
+# IC % TILE_K == 0, where TILE_K = 32
+def dim_is_supported(weight):
+    return weight.size(0) % 16 == 0 and weight.size(1) % 32 == 0
 
-    is_intel_amx_backend_available = hasattr(
-        torch.ops.sgl_kernel, "convert_weight_packed"
+
+def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
+    # Pack weight for get better performance on CPU
+    devices = {getattr(module, weight_name).device for weight_name in weight_names}
+    assert len(devices) == 1, f"Expects all weights to be on the same device"
+    device = devices.pop()
+
+    if transpose_dims:
+        assert len(weight_names) == len(
+            transpose_dims
+        ), "len(weight_names) should be equal to len(transpose_dims)"
+
+    for i, weight_name in enumerate(weight_names):
+        weight_tensor = getattr(module, weight_name)
+
+        # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
+        if not dim_is_supported(weight_tensor):
+            logger.warning(
+                f"Expects weight.size(0) % 16 == 0 and weight.size(1) % 32 == 0 "
+                f"but {weight_tensor.size(0)=} and {weight_tensor.size(1)=} in {module}. "
+                f"{module} won't use intel amx backend."
+            )
+            module.use_intel_amx_backend = False
+            return
+
+        if transpose_dims and transpose_dims[i]:
+            weight_tensor = weight_tensor.transpose(*transpose_dims[i])
+
+        packed_weight = torch.nn.Parameter(
+            prepack_weight_if_needed(weight_tensor),
+            requires_grad=False,
+        )
+        packed_weight.__dict__ = weight_tensor.__dict__
+        setattr(module, weight_name, packed_weight)
+
+    module.use_intel_amx_backend = (
+        device == torch.device("cpu") and cpu_has_amx_support()
     )
-except:
-    is_intel_amx_backend_available = False
+
+    if (
+        module.use_intel_amx_backend
+        and hasattr(module, "bias")
+        and module.bias is not None
+    ):
+        module.bias = torch.nn.Parameter(module.bias.data.float(), requires_grad=False)
 
 
-def cpu_has_amx_support():
-    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
+class PackWeightMethod:
+    def __init__(self, weight_names, transpose_dims=None):
+        self.weight_names = weight_names
+        self.transpose_dims = transpose_dims
 
-
-def use_intel_amx_backend(layer):
-    return getattr(layer, "use_intel_amx_backend", False)
+    def process_weights_after_loading(self, module) -> None:
+        _process_weight_after_loading(module, self.weight_names, self.transpose_dims)
 
 
 class LazyValue:
@@ -2568,3 +2737,48 @@ def is_shm_available(dtype, world_size, local_size):
         and world_size >= 1
         and world_size == local_size
     )
+
+
+def lru_cache_frozenset(maxsize=128):
+    def _to_hashable(o):
+        try:
+            hash(o)
+            return o
+        except TypeError:
+            # Not hashable; convert based on type
+            if isinstance(o, (dict)):
+                return frozenset(
+                    (_to_hashable(k), _to_hashable(v)) for k, v in o.items()
+                )
+            elif isinstance(o, set):
+                return frozenset(_to_hashable(v) for v in o)
+            elif isinstance(o, (list, tuple)) or (
+                isinstance(o, Sequence) and not isinstance(o, (str, bytes))
+            ):
+                return tuple(_to_hashable(v) for v in o)
+            else:
+                raise TypeError(f"Cannot make hashable: {type(o)}")
+
+    def decorator(func):
+        cache = OrderedDict()
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            h_args = tuple(_to_hashable(a) for a in args)
+            h_kwargs = frozenset(
+                (_to_hashable(k), _to_hashable(v)) for k, v in kwargs.items()
+            )
+            key = (h_args, h_kwargs)
+            if key in cache:
+                cache.move_to_end(key)
+                return cache[key]
+            result = func(*args, **kwargs)
+            cache[key] = result
+            if maxsize is not None and len(cache) > maxsize:
+                cache.popitem(last=False)
+            return result
+
+        wrapper.cache_clear = cache.clear  # For manual cache clearing
+        return wrapper
+
+    return decorator
