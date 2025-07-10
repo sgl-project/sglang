@@ -3,7 +3,7 @@ from __future__ import annotations
 """
 Support attention backend for flashinfer MLA.
 The flashinfer_mla_disable_ragged flag controls whether to use ragged prefill wrapper and defaults to be false.
-The flashinfer_mla_use_cudnn flag controls whether to use cudnn_batch_prefill_with_kv_cache and defaults to be false.
+The flashinfer_use_cudnn flag controls whether to use cudnn_batch_prefill_with_kv_cache and defaults to be false.
 When it's set to false, all wrappers are BatchMLAPaged wrapper.
 When it's set to true, the backend uses BatchRagged and BatchMLAPaged wrapper for prefilling,
 and uses BatchMLAPaged wrapper for decoding.
@@ -411,7 +411,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             if k_rope is not None:
                 k = torch.cat([k, k_rope], dim=-1)
 
-            if global_server_args_dict["flashinfer_mla_use_cudnn"]:
+            if global_server_args_dict["flashinfer_use_cudnn"]:
                 qo_lengths = forward_batch.seq_lens - forward_batch.extend_prefix_lens
                 kv_lengths = forward_batch.extend_prefix_lens
                 max_token_per_sequence = int(qo_lengths.max().item())

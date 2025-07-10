@@ -511,7 +511,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 return o, lse
 
             if self.forward_metadata.extend_no_prefix:
-                if global_server_args_dict["flashinfer_mla_use_cudnn"]:
+                if global_server_args_dict["flashinfer_use_cudnn"]:
                     o, _ = _cudnn_prefill()
                 else:
                     o = self.prefill_wrapper_ragged.forward(
@@ -523,7 +523,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         logits_soft_cap=logits_soft_cap,
                     )
             else:
-                if global_server_args_dict["flashinfer_mla_use_cudnn"]:
+                if global_server_args_dict["flashinfer_use_cudnn"]:
                     o1, s1 = _cudnn_prefill()
                 else:
                     o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
