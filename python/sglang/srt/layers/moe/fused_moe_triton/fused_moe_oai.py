@@ -160,11 +160,7 @@ def fused_experts_oai(
     w2: torch.Tensor,  # (num_experts, intermediate_dim, hidden_dim)
     expert_logits: torch.Tensor,  # (num_tokens, num_experts)
     top_k: int,
-    inplace: bool,
     activation: str,  # "swiglu"
-    apply_router_weight_on_input: bool,
-    no_combine: bool,
-    routed_scaling_factor: Optional[float],
     w1_bias: Optional[torch.Tensor],
     w2_bias: Optional[torch.Tensor],
     swiglu_alpha: torch.Tensor,
@@ -215,20 +211,16 @@ def fused_experts_oai(
     return gemm2_output
 
 def fused_experts_mxfp4_oai(
-    hidden_states: torch.Tensor,  # (num_tokens, hidden_dim)
-    w13: torch.Tensor,  # (num_experts, hidden_dim, intermediate_dim * 2)
-    w2: torch.Tensor,  # (num_experts, intermediate_dim, hidden_dim)
-    expert_logits: torch.Tensor,  # (num_tokens, num_experts)
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    expert_logits: torch.Tensor,
     top_k: int,
     fc31_input_dequant: torch.Tensor,
     fc2_input_dequant: torch.Tensor,
     w13_scale: torch.Tensor,
     w2_scale: torch.Tensor,
-    inplace: bool,
     activation: str,  # "swiglu"
-    apply_router_weight_on_input: bool,
-    no_combine: bool,
-    routed_scaling_factor: Optional[float],
     w1_bias: Optional[torch.Tensor],
     w2_bias: Optional[torch.Tensor],
     swiglu_alpha: torch.Tensor,

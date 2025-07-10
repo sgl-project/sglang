@@ -449,11 +449,7 @@ class UnquantizedFusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
                 w2=layer.w2_weight,
                 expert_logits=router_logits,
                 top_k=top_k,
-                inplace=inplace and not no_combine,
                 activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                no_combine=no_combine,
-                routed_scaling_factor=routed_scaling_factor,
                 w1_bias=getattr(layer, 'w13_bias', None),
                 w2_bias=getattr(layer, 'w2_bias', None),
                 swiglu_alpha=self.swiglu_alpha,
@@ -538,27 +534,6 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
             layer.register_parameter("w2_bias", None)
     
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        mlp1_weight_fp4_shape = (
-            self.num_experts,
-            self.hidden_size // 2,
-            self.intermediate_size * 2,
-        )
-        mlp1_scale_shape = (
-            mlp1_weight_fp4_shape[0],
-            mlp1_weight_fp4_shape[1] // 16,  # block size of 32 for mxfp4
-            mlp1_weight_fp4_shape[2]
-        )
-        mlp2_weight_fp4_shape = (
-            self.num_experts,
-            self.intermediate_size // 2,
-            self.hidden_size,
-        )
-        mlp2_scale_shape = (
-            mlp2_weight_fp4_shape[0],
-            mlp2_weight_fp4_shape[1] // 16,
-            mlp2_weight_fp4_shape[2]
-        )
-
         w1_weight_fp4, w1_weight_scale = quantize_to_mxfp4(layer.w13_weight.data[:, :self.intermediate_size, :])
         w3_weight_fp4, w3_weight_scale = quantize_to_mxfp4(layer.w13_weight.data[:, self.intermediate_size:, :])
         w2_weight_fp4, w2_weight_scale = quantize_to_mxfp4(layer.w2_weight.data)
@@ -669,11 +644,7 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
             fc2_input_dequant=getattr(layer, 'fc2_input_dequant', None),
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            inplace=inplace and not no_combine,
             activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
             w1_bias=getattr(layer, 'w13_bias', None),
             w2_bias=getattr(layer, 'w2_bias', None),
             swiglu_alpha=self.swiglu_alpha,
@@ -745,6 +716,8 @@ class FusedMoE(torch.nn.Module):
         routed_scaling_factor: Optional[float] = None,
         enable_flashinfer_moe: Optional[bool] = False,
         enable_ep_moe: Optional[bool] = False,
+        enable_mxfp4_moe: Optional[bool] = False,
+        enable_fp8_activation: Optional[bool] = False,
         bias: bool = False,
         is_openai_moe: Optional[bool] = False,
         swiglu_alpha: Optional[float] = None,
@@ -812,9 +785,6 @@ class FusedMoE(torch.nn.Module):
         self.no_combine = no_combine
         self.bias = bias
 
-        import os
-        ENABLE_MXFPE_MOE = os.getenv("ENABLE_MXFP4_MOE", "0") == "1"
-
         if is_openai_moe:
             if self.ep_size > 1:
                 raise ValueError("OpenAI FusedMoE only supports ep_size=1")
@@ -825,21 +795,26 @@ class FusedMoE(torch.nn.Module):
                     UnquantizedFusedMoEMethod()
                 )
             else:
-                if not ENABLE_MXFPE_MOE:
+                if self.activation != "swiglu":
+                    raise ValueError("OpenAI FusedMoE only supports swiglu activation")
+                if not enable_mxfp4_moe and not enable_fp8_activation:
                     logger.info("use unquantized fused moe method")
                     self.quant_method = UnquantizedFusedMoEMethodOpenAI(
                         swiglu_alpha=swiglu_alpha or 1.0,
                         swiglu_beta=swiglu_beta or 0.0,
                         bias=bias,
                     )
-                else:
-                    logger.info("use mxfp4 fused moe method")
+                elif enable_mxfp4_moe:
+                    activation_dtype = torch.bfloat16 if not enable_fp8_activation else torch.float8_e4m3fn
+                    logger.info("use mxfp4 fused moe method, activation_dtype: %s", activation_dtype)
                     self.quant_method = MXFP4FusedMoEMethodOpenAI(
                         swiglu_alpha=swiglu_alpha or 1.0,
                         swiglu_beta=swiglu_beta or 0.0,
                         bias=bias,
-                        activation_dtype=torch.float8_e4m3fn,
+                        activation_dtype=activation_dtype,
                     )
+                else:
+                    raise ValueError("Invalid quantization method")
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod":
