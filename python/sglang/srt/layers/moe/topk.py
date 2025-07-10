@@ -92,7 +92,6 @@ def fused_topk_cpu(
     )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
 def apply_topk_weights_cpu(need_apply, topk_weights, inputs):
     if not need_apply:
         return inputs, topk_weights
