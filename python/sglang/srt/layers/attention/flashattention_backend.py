@@ -703,6 +703,13 @@ class FlashAttentionBackend(AttentionBackend):
             max_seqlen_k = metadata.max_seq_len_k
             cu_seqlens_k = metadata.cu_seqlens_k
 
+        if isinstance(forward_batch.token_to_kv_pool, SWAKVPool):
+            _bs, _seq_len = page_table.shape
+            page_table = forward_batch.token_to_kv_pool.translate_loc_from_full_to_swa(
+                page_table.flatten(), layer.layer_id
+            )
+            page_table = page_table.view(_bs, _seq_len)
+
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
@@ -740,12 +747,22 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
             if use_cascade_attn:
+                cascade_table = self.forward_metadata_spec_decode_expand.page_table
+                if isinstance(forward_batch.token_to_kv_pool, SWAKVPool):
+                    _bs, _seq_len = cascade_table.shape
+                    cascade_table = (
+                        forward_batch.token_to_kv_pool.translate_loc_from_full_to_swa(
+                            cascade_table.flatten(), layer.layer_id
+                        )
+                    )
+                    cascade_table = cascade_table.view(_bs, _seq_len)
+
                 o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
-                    page_table=self.forward_metadata_spec_decode_expand.page_table,
+                    page_table=cascade_table,
                     cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
                     cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
                     cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
@@ -855,6 +872,14 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=use_cascade_attn,
                 )
                 if use_cascade_attn:
+                    cascade_table = self.forward_metadata_spec_decode_expand.page_table
+                    if isinstance(forward_batch.token_to_kv_pool, SWAKVPool):
+                        _bs, _seq_len = cascade_table.shape
+                        cascade_table = forward_batch.token_to_kv_pool.translate_loc_from_full_to_swa(
+                            cascade_table.flatten(), layer.layer_id
+                        )
+                        cascade_table = cascade_table.view(_bs, _seq_len)
+
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
@@ -862,7 +887,7 @@ class FlashAttentionBackend(AttentionBackend):
                             k_cache=k_rope_cache,
                             v_cache=c_kv_cache,
                             qv=q_nope,
-                            page_table=self.forward_metadata_spec_decode_expand.page_table,
+                            page_table=cascade_table,
                             cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
                             cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
                             cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
@@ -943,6 +968,14 @@ class FlashAttentionBackend(AttentionBackend):
         )
         causal = not layer.is_cross_attention
 
+        page_table = metadata.page_table
+        if isinstance(forward_batch.token_to_kv_pool, SWAKVPool):
+            _bs, _seq_len = page_table.shape
+            page_table = forward_batch.token_to_kv_pool.translate_loc_from_full_to_swa(
+                page_table.flatten(), layer.layer_id
+            )
+            page_table = page_table.view(_bs, _seq_len)
+
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -1005,7 +1038,6 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                 )
             else:
-                page_table = metadata.page_table
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
@@ -1032,13 +1064,21 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=use_cascade_attn,
                 )
                 if use_cascade_attn:
+                    cascade_table = self.forward_metadata_spec_decode_expand.page_table
+                    if isinstance(forward_batch.token_to_kv_pool, SWAKVPool):
+                        _bs, _seq_len = cascade_table.shape
+                        cascade_table = forward_batch.token_to_kv_pool.translate_loc_from_full_to_swa(
+                            cascade_table.flatten(), layer.layer_id
+                        )
+                        cascade_table = cascade_table.view(_bs, _seq_len)
+
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
                             q=q_reshaped,
                             k_cache=key_cache,
                             v_cache=value_cache,
-                            page_table=self.forward_metadata_spec_decode_expand.page_table,
+                            page_table=cascade_table,
                             cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
                             cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
                             cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
@@ -1093,7 +1133,7 @@ class FlashAttentionBackend(AttentionBackend):
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
                 qv=q_nope,
-                page_table=metadata.page_table,
+                page_table=page_table,
                 cache_seqlens=metadata.cache_seqlens_int32,
                 cu_seqlens_q=metadata.cu_seqlens_q,
                 cu_seqlens_k_new=metadata.cu_seqlens_k,
@@ -1106,13 +1146,23 @@ class FlashAttentionBackend(AttentionBackend):
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
             )
             if use_cascade_attn:
+                cascade_table = self.forward_metadata_spec_decode_expand.page_table
+                if isinstance(forward_batch.token_to_kv_pool, SWAKVPool):
+                    _bs, _seq_len = cascade_table.shape
+                    cascade_table = (
+                        forward_batch.token_to_kv_pool.translate_loc_from_full_to_swa(
+                            cascade_table.flatten(), layer.layer_id
+                        )
+                    )
+                    cascade_table = cascade_table.view(_bs, _seq_len)
+
                 o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q_rope,
                     k_cache=k_rope_cache,
                     v_cache=c_kv_cache,
                     qv=q_nope,
-                    page_table=self.forward_metadata_spec_decode_expand.page_table,
+                    page_table=cascade_table,
                     cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
                     cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
                     cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
