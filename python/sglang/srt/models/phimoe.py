@@ -34,7 +34,6 @@ from sglang.srt.utils import add_prefix, make_layers
 class PhiMoEConfig(PretrainedConfig):
 
     model_type = "phimoe"
-    keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
         self,
@@ -105,7 +104,7 @@ class PhiMoEConfig(PretrainedConfig):
 
 
 def sparsemixer(scores, jitter_eps=0.01):
-    ################ first expert ################
+    ################ Select first expert (topk=2) ################
 
     with torch.no_grad():
         # compute mask for sparsity
@@ -132,6 +131,8 @@ def sparsemixer(scores, jitter_eps=0.01):
         selected_experts,
         float("-inf"),
     )
+
+    ################ Select second expert (topk=2) ################
     with torch.no_grad():
         # compute mask for sparsity
         mask_logits_threshold, max_ind = masked_scores.max(dim=-1, keepdim=True)
@@ -331,7 +332,6 @@ class PhiMoEDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        # Requires transformers > 4.32.0
         rope_theta = getattr(config, "rope_theta", 10000)
         self.self_attn = PhiMoEAttention(
             hidden_size=self.hidden_size,
@@ -373,7 +373,6 @@ class PhiMoEDecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
 
-        # Self Attention
         hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self.self_attn(
@@ -383,7 +382,6 @@ class PhiMoEDecoderLayer(nn.Module):
         )
         hidden_states = hidden_states + residual
 
-        # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.block_sparse_moe(
@@ -424,9 +422,6 @@ class PhiMoEModel(nn.Module):
         self.norm = nn.LayerNorm(
             config.hidden_size, eps=config.rms_norm_eps, elementwise_affine=True
         )
-
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
 
     def forward(
         self,
@@ -479,9 +474,6 @@ class PhiMoEForCausalLM(nn.Module):
             self.lm_head.weight = self.model.embed_tokens.weight
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
 
     @torch.no_grad()
     def forward(
