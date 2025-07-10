@@ -25,6 +25,7 @@ from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_int_env_var,
     is_cpu,
     is_hip,
     set_weight_attrs,
@@ -55,6 +56,8 @@ if _use_aiter:
     from aiter.fused_moe import fused_moe
     from aiter.fused_moe_bf16_asm import ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
+
+TRTLMM_GEN_MOE_EP_SIZE = get_int_env_var("SGLANG_TRTLMM_GEN_MOE_EP_SIZE", "0")
 
 logger = logging.getLogger(__name__)
 
@@ -466,10 +469,13 @@ class FusedMoE(torch.nn.Module):
             assert (
                 self.enable_flashinfer_moe
             ), "FusedMoE only supports EP with --enable-flashinfer-moe"
-            self.ep_size = self.tp_size
-            self.ep_rank = self.tp_rank
-            self.tp_size = 1
-            self.tp_rank = 0
+            etp_ep_size = self.tp_size
+            if TRTLMM_GEN_MOE_EP_SIZE > 0:
+                etp_ep_size = TRTLMM_GEN_MOE_EP_SIZE
+            self.ep_size = etp_ep_size
+            self.ep_rank = self.tp_rank % etp_ep_size
+            self.tp_size = self.tp_size // etp_ep_size
+            self.tp_rank = self.tp_rank // etp_ep_size
             # Create a tensor of size num_experts filled with -1
             self.expert_map = torch.full((self.num_experts,), -1, dtype=torch.int32)
             # Create a expert map for the local experts
@@ -745,8 +751,7 @@ class FusedMoE(torch.nn.Module):
         if expert_id == -1:
             return
 
-        # TP rank is set to 0 if EP is enabled
-        tp_rank = 0 if self.ep_size > 1 else get_tensor_model_parallel_rank()
+        tp_rank = self.tp_rank
 
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
