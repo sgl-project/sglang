@@ -540,6 +540,10 @@ class EmbeddingReqInput:
     log_metrics: bool = True
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
+    # For disaggregation
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[int], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
 
@@ -620,6 +624,15 @@ class EmbeddingReqInput:
             image_data=self.image_data[i] if self.image_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
+            bootstrap_host=(
+                self.bootstrap_host[i] if self.bootstrap_host is not None else None
+            ),
+            bootstrap_port=(
+                self.bootstrap_port[i] if self.bootstrap_port is not None else None
+            ),
+            bootstrap_room=(
+                self.bootstrap_room[i] if self.bootstrap_room is not None else None
+            ),
         )
 
 
@@ -637,6 +650,10 @@ class TokenizedEmbeddingReqInput:
     token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
+    # For disaggregation
+    bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
+    bootstrap_room: Optional[int] = None
 
 
 @dataclass

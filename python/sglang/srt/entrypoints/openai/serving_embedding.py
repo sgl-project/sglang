@@ -84,7 +84,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 # Handle multimodal embedding inputs
                 texts = []
                 images = []
-                for item in prompt:
+                for idx, item in enumerate(prompt):
                     # Use padding for text if None - this could be improved
                     texts.append(item.text if item.text is not None else "padding")
                     images.append(item.image if item.image is not None else None)
@@ -120,6 +120,9 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         adapted_request = EmbeddingReqInput(
             **prompt_kwargs,
             rid=request.rid,
+            bootstrap_host=request.bootstrap_host,
+            bootstrap_port=request.bootstrap_port,
+            bootstrap_room=request.bootstrap_room,
         )
 
         return adapted_request, request
@@ -149,6 +152,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         embedding_objects = []
         prompt_tokens = 0
 
+        print(f"ret: {ret}", flush=True)
         for idx, ret_item in enumerate(ret):
             embedding_objects.append(
                 EmbeddingObject(

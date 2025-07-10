@@ -1043,6 +1043,20 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
     return model_path, tokenizer_path
 
 
+class NewLineFormatter(logging.Formatter):
+    """Adds logging prefix to newlines to align multi-line messages."""
+
+    def __init__(self, fmt, datefmt=None, style="%"):
+        logging.Formatter.__init__(self, fmt, datefmt, style)
+
+    def format(self, record):
+        msg = logging.Formatter.format(self, record)
+        if record.message != "":
+            parts = msg.split(record.message)
+            msg = msg.replace("\n", "\r\n" + parts[0])
+        return msg
+
+
 def configure_logger(server_args, prefix: str = ""):
     if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
         if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
@@ -1156,7 +1170,7 @@ def point_to_point_pyobj(
             tensor_size = torch.tensor(
                 [0], dtype=torch.long, device=torch.cuda.current_device()
             )
-            dist.send(tensor_size, dst=dst, group=group)
+            dist.isend(tensor_size, dst=dst, group=group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
@@ -2782,3 +2796,40 @@ def lru_cache_frozenset(maxsize=128):
         return wrapper
 
     return decorator
+
+
+def extract_numa_id(device_id):
+    return device_id.split(":")[0]
+
+
+def check_device_cross_numa_node(visible_device_idx=None) -> bool:
+    """Check if the GPU devices are on different NUMA nodes.
+    Assuming the device id format is like 00000001:8A:00.0
+    For example, for "00000001:8A:00.0", the NUMA node ID might be "01".
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=pci.bus_id", "--format=csv,noheader"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            text=True,
+        )
+        device_ids = result.stdout.strip().split("\n")
+        if visible_device_idx is not None:
+            valid_indices = [i for i in visible_device_idx if 0 <= i < len(device_ids)]
+            device_ids = [device_ids[i] for i in valid_indices]
+
+        if len(device_ids) <= 1:
+            return False
+
+        numa_ids = [extract_numa_id(device_id) for device_id in device_ids]
+        same_numa = all(numa == numa_ids[0] for numa in numa_ids)
+
+        return not same_numa
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to execute nvidia-smi: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {e}")
+        return False

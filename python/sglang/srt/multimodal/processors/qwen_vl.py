@@ -11,6 +11,7 @@ from torchvision.transforms import InterpolationMode
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+from sglang.srt.models.qwen2_5_vl_embedding import Qwen2_5_VLForConditionalEmbedding
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -199,7 +200,11 @@ async def preprocess_video(
 
 # Compatible with Qwen2VL and Qwen2_5VL
 class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
-    models = [Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration]
+    models = [
+        Qwen2VLForConditionalGeneration,
+        Qwen2_5_VLForConditionalGeneration,
+        Qwen2_5_VLForConditionalEmbedding,
+    ]
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)

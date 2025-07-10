@@ -47,6 +47,15 @@ from sglang.srt.disaggregation.decode import (
     SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
+from sglang.srt.disaggregation.multimodal_embedding import (
+    MultimodalEmbeddingBootstrapQueue,
+    SchedulerDisaggregationMultimodalEmbeddingMixin,
+)
+from sglang.srt.disaggregation.multimodal_language import (
+    MultimodalLanguagePreallocQueue,
+    MultimodalLanguageTransferQueue,
+    SchedulerDisaggregationMultiModalLanguageMixin,
+)
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -54,6 +63,7 @@ from sglang.srt.disaggregation.prefill import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     MetadataBuffers,
+    MetaMultiModaldataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     prepare_abort,
@@ -226,6 +236,8 @@ class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
+    SchedulerDisaggregationMultimodalEmbeddingMixin,
+    SchedulerDisaggregationMultiModalLanguageMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -538,6 +550,7 @@ class Scheduler(
 
         self.model_config = ModelConfig.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
+        self.is_multimodal_embedding = self.model_config.is_multimodal_embedding
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -757,6 +770,59 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+        elif self.disaggregation_mode == DisaggregationMode.EMBEDDING:
+            buffer_size = int(os.environ.get("SGLANG_EMBEDDING_BUFFER_SIZE", "16"))
+            req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+                buffer_size
+            )
+            logger.debug(
+                f"init MetaMultiModaldataBuffers: {buffer_size=};{self.max_req_input_len=};{self.model_config.hidden_size=}"
+            )
+            self.disagg_metadata_buffers = MetaMultiModaldataBuffers(
+                buffer_size, self.max_req_input_len, self.model_config.hidden_size
+            )
+            self.disagg_embedding_bootstrap_queue = MultimodalEmbeddingBootstrapQueue(
+                req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
+                metadata_buffers=self.disagg_metadata_buffers,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                gloo_group=self.attn_tp_cpu_group,
+                transfer_backend=self.transfer_backend,
+                scheduler=self,
+            )
+            self.disagg_embedding_inflight_queue: List[Req] = []
+        elif self.disaggregation_mode == DisaggregationMode.LANGUAGE:
+            buffer_size = int(os.environ.get("SGLANG_LANGUAGE_BUFFER_SIZE", "16"))
+            req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+                buffer_size
+            )
+            logger.debug(
+                f"init MetaMultiModaldataBuffers: {buffer_size=};{self.max_req_input_len=};{self.model_config.hidden_size=}"
+            )
+            self.disagg_metadata_buffers = MetaMultiModaldataBuffers(
+                buffer_size, self.max_req_input_len, self.model_config.hidden_size
+            )
+            self.disagg_language_transfer_queue = MultimodalLanguageTransferQueue(
+                gloo_group=self.attn_tp_cpu_group,
+                req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
+                metadata_buffers=self.disagg_metadata_buffers,
+                scheduler=self,
+                tree_cache=self.tree_cache,
+            )
+            self.disagg_language_prealloc_queue = MultimodalLanguagePreallocQueue(
+                req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
+                metadata_buffers=self.disagg_metadata_buffers,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                scheduler=self,
+                gloo_group=self.attn_tp_cpu_group,
+                transfer_backend=self.transfer_backend,
+                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+            )
+
+            # Metric for pre-allocation
+            self.num_tokens_pre_allocated = 0
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1219,6 +1285,10 @@ class Scheduler(
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
+        elif self.disaggregation_mode == DisaggregationMode.EMBEDDING:
+            self.disagg_embedding_bootstrap_queue.add(req)
+        elif self.disaggregation_mode == DisaggregationMode.LANGUAGE:
+            self.disagg_language_prealloc_queue.add(req)
         else:
             self.waiting_queue.append(req)
 
@@ -1230,6 +1300,10 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # If this is a decode server, we put the request to the decode pending prealloc queue
             self.disagg_decode_prealloc_queue.extend(reqs, is_retracted)
+        elif self.disaggregation_mode == DisaggregationMode.EMBEDDING:
+            self.disagg_embedding_bootstrap_queue.extend(reqs)
+        elif self.disaggregation_mode == DisaggregationMode.LANGUAGE:
+            self.disagg_language_prealloc_queue.extend(reqs)
         else:
             self.waiting_queue.extend(reqs)
 
@@ -1243,6 +1317,9 @@ class Scheduler(
             recv_req.input_ids,
             recv_req.sampling_params,
             token_type_ids=recv_req.token_type_ids,
+            bootstrap_host=recv_req.bootstrap_host,
+            bootstrap_port=recv_req.bootstrap_port,
+            bootstrap_room=recv_req.bootstrap_room,
         )
         req.tokenizer = self.tokenizer
 
@@ -1324,6 +1401,11 @@ class Scheduler(
             f += f"#queue-req: {len(self.waiting_queue)}, "
             f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)}, "
             f += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
+        elif self.disaggregation_mode == DisaggregationMode.EMBEDDING:
+            f += f"#unbootstrapped-req: {len(self.disagg_embedding_bootstrap_queue.queue)}, "
+            f += f"#queue-req: {len(self.waiting_queue)}, "
+            f += f"#transferring-req: {len(self.disagg_embedding_inflight_queue)}, "
+            f += f"time: {gap_latency:.2f} "
         else:
             f += f"#running-req: {running_bs}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
@@ -1593,7 +1675,10 @@ class Scheduler(
                 self.running_batch.batch_is_full = True
                 break
 
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self.disaggregation_mode in [
+                DisaggregationMode.PREFILL,
+                DisaggregationMode.EMBEDDING,
+            ]:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
@@ -2111,6 +2196,16 @@ class Scheduler(
             load += sum(
                 len(req.origin_input_ids)
                 for req in self.disagg_prefill_bootstrap_queue.queue
+            )
+        elif self.disaggregation_mode == DisaggregationMode.EMBEDDING:
+            load += sum(
+                len(req.origin_input_ids)
+                for req in self.disagg_embedding_bootstrap_queue.queue
+            )
+        elif self.disaggregation_mode == DisaggregationMode.LANGUAGE:
+            load += sum(
+                len(req.req.origin_input_ids)
+                for req in self.disagg_language_prealloc_queue.queue
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             load += sum(
@@ -2778,6 +2873,16 @@ def run_scheduler_process(
                 scheduler.event_loop_overlap_disagg_decode()
             else:
                 scheduler.event_loop_normal_disagg_decode()
+        elif disaggregation_mode == DisaggregationMode.EMBEDDING:
+            if scheduler.enable_overlap:
+                scheduler.event_loop_overlap_disagg_multimodal_embedding()
+            else:
+                scheduler.event_loop_normal_disagg_multimodal_embedding()
+        elif disaggregation_mode == DisaggregationMode.LANGUAGE:
+            if scheduler.enable_overlap:
+                scheduler.event_loop_overlap_disagg_multimodal_language()
+            else:
+                scheduler.event_loop_normal_disagg_multimodal_language()
 
     except Exception:
         traceback = get_exception_traceback()
