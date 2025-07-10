@@ -215,6 +215,26 @@ class TestKimiVLImageUnderstandsImage(
             image_grid_hws=processor_output["image_grid_hws"],
         )
 
+class TestMiniCPMUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
+    #python test_vlm_input_format.py TestMiniCPMUnderstandsImage
+    model_path = "openbmb/MiniCPM-v-2_6"
+    chat_template = "minicpmv"
+
+    @classmethod
+    def _init_visual(cls):
+        pass
+
+    @unittest.skip("skip")
+    async def test_understands_precomputed_features(self):
+        pass
+
+    def _pixel_values_image_data(self, processor_output):
+        return dict(
+            modality="IMAGE",
+            pixel_values=processor_output["pixel_values"],
+            tgt_size=processor_output["tgt_sizes"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
