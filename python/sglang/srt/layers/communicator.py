@@ -36,7 +36,6 @@ from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda, is_flashinfer_available
-from sglang.srt.layers.flashinfer_comm_fusion import flashinfer_allreduce_add_rmsnorm
 
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
@@ -192,7 +191,6 @@ class LayerCommunicator:
                 hidden_states, residual = self.input_layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
                 )
-                delattr(hidden_states, '_sglang_needs_allreduce_fusion')
             else:
                 if residual is None:
                     residual = hidden_states
