@@ -159,6 +159,10 @@ suites = {
         TestFile("test_patch_torch.py", 19),
         TestFile("test_update_weights_from_distributed.py", 103),
     ],
+    "per-commit-npu": [
+        TestFile("test_local_attn.py", 250),
+        TestFile("test_npu_function.py", 250),
+    ],
     "per-commit-4-gpu": [
         TestFile("test_local_attn.py", 250),
         TestFile("test_pp_single_node.py", 150),
