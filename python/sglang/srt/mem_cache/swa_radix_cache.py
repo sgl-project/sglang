@@ -27,9 +27,9 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -608,10 +608,10 @@ class SWARadixCache(BasePrefixCache):
                     self._iteratively_delete_tombstone_leaf(x)
 
                 x = x_next
-    
+
     def inc_lock_ref(self, node: TreeNode) -> Optional[int]:
         """
-        Increment the lock reference count for the node. Returns the swa_uuid_for_lock, which needs 
+        Increment the lock reference count for the node. Returns the swa_uuid_for_lock, which needs
         to be passed to dec_lock_ref.
         It locks the full_lock_ref for nodes between the [last node, root), exclusive.
         It locks the swa_lock_ref for nodes between the [last node, swa_uuid_for_lock], inclusive.
@@ -654,7 +654,7 @@ class SWARadixCache(BasePrefixCache):
         """
         Decrement the lock reference count for the node.
         It unlocks the full_lock_ref for nodes between the [last node, root), exclusive.
-        It unlocks the swa_lock_ref for nodes between the [last node, swa_uuid_for_lock], inclusive. 
+        It unlocks the swa_lock_ref for nodes between the [last node, swa_uuid_for_lock], inclusive.
         If swa_uuid_for_lock is None, it unlocks to the root, exclusive.
         """
         if self.disable:

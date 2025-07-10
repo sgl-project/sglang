@@ -25,9 +25,10 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 import torch
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
-from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
@@ -310,7 +311,7 @@ class PrefillAdder:
                     for r in running_batch.reqs
                 ]
             )
-        
+
         self.is_hybrid = isinstance(
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         )
