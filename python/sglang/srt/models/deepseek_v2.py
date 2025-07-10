@@ -1805,9 +1805,13 @@ class DeepseekV2AttentionMLA(nn.Module):
             current_forward_batch.extend_seq_lens_cpu = (
                 forward_batch.extend_seq_lens_cpu[ibatch : ibatch + 1]
             )
+            current_forward_batch.extend_prefix_lens_cpu = (
+                forward_batch.extend_prefix_lens_cpu[ibatch : ibatch + 1]
+            )
             current_forward_batch.positions = forward_batch.positions[
                 acc_chunk_len : acc_chunk_len + chunk_len
             ]
+            assert current_forward_batch.extend_prefix_lens_cpu is not None
             # cache_loc = (
             #     forward_batch.out_cache_loc
             #     if not layer.is_cross_attention
