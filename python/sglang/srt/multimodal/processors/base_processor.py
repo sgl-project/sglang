@@ -21,7 +21,7 @@ class BaseMultiModalProcessorOutput:
     # input_text, with each frame of video/image represented with a image_token
     input_text: str
 
-    # frames loaded from image and video, in given order
+    # frames loaded from image, in given order
     images: Optional[list[Union[Image.Image, dict]]] = None
 
     # videos
@@ -51,6 +51,12 @@ class MultimodalSpecialTokens:
     image_token_regex: Optional[re.Pattern] = None
     video_token_regex: Optional[re.Pattern] = None
     audio_token_regex: Optional[re.Pattern] = None
+
+    def build(self, processor):
+        self.convert_to_strs(processor)
+        self.parse_regex()
+        self.combine_regex()
+        return self
 
     def convert_to_str(self, token: Union[str, int], processor) -> str:
         if token is None:
@@ -341,9 +347,7 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel: if True, discards the alpha channel in the returned images
 
         """
-        multimodal_tokens.convert_to_strs(self._processor)
-        multimodal_tokens.parse_regex()
-        multimodal_tokens_pattern = multimodal_tokens.combine_regex()
+
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
             prompt = self._processor.tokenizer.decode(prompt)

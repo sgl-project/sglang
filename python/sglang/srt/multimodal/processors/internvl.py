@@ -34,7 +34,9 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         self.img_context_token_id = tokenizer.convert_tokens_to_ids(
             self.IMG_CONTEXT_TOKEN
         )
-        self.mm_tokens = MultimodalSpecialTokens(image_token="<image>")
+        self.mm_tokens = MultimodalSpecialTokens(image_token="<image>").build(
+            _image_processor
+        )
 
     @staticmethod
     def build_transform(input_size):

@@ -26,7 +26,7 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
             image_token_regex=re.compile(
                 r"<start_of_image>(?:(?:<image_soft_token>)*<end_of_image>)?"
             ),
-        )
+        ).build(_processor)
 
     async def process_mm_data_async(
         self,

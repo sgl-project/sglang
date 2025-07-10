@@ -40,7 +40,7 @@ class VILAMultimodalProcessor(BaseMultimodalProcessor):
         self.VIDEO_TOKEN_ID = hf_config.video_token_id
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self._processor.tokenizer.image_token
-        )
+        ).build(_processor)
 
     async def process_mm_data_async(
         self,

@@ -21,7 +21,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             image_token="(<image>./</image>)",
             audio_token="(<audio>./</audio>)",
             video_token="(<video>./</video>)",
-        )
+        ).build(_processor)
 
     async def process_mm_data_async(
         self,

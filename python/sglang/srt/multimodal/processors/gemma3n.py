@@ -46,7 +46,7 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
             audio_token_regex=re.compile(
                 r"<start_of_audio>(?:(?:<audio_soft_token>)*<end_of_audio>)?"
             ),
-        )
+        ).build(_processor)
 
     async def process_mm_data_async(
         self,

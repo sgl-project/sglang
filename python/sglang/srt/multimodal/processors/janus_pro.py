@@ -14,7 +14,9 @@ class JanusProImageProcessor(BaseMultimodalProcessor):
     def __init__(self, hf_config, server_args, processor):
         super().__init__(hf_config, server_args, processor)
 
-        self.mm_tokens = MultimodalSpecialTokens(image_token=processor.image_token)
+        self.mm_tokens = MultimodalSpecialTokens(
+            image_token=processor.image_token
+        ).build(processor)
 
     async def process_mm_data_async(
         self,

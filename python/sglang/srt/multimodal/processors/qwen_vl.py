@@ -221,7 +221,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
                 r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
             ),
             video_token=self.VIDEO_TOKEN_ID,
-        )
+        ).build(_processor)
 
     async def process_mm_data_async(
         self,
