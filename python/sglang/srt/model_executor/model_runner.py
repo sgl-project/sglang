@@ -183,6 +183,7 @@ class ModelRunner:
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
+        self.is_multimodal_embedding = model_config.is_multimodal_embedding
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
             model_config.is_multimodal_chunked_prefill_supported
@@ -1358,7 +1359,7 @@ class ModelRunner:
         self.cuda_graph_runner = None
         self.cuda_graph_mem_usage = 0
 
-        if not self.is_generation:
+        if not self.is_generation and not self.is_multimodal_embedding:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
 
