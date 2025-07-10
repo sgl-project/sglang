@@ -83,13 +83,18 @@ def fused_topk_cpu(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
-    return torch.ops.sgl_kernel.topk_softmax_cpu(
+    topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
         hidden_states=hidden_states,
         gating_output=gating_output,
         topk=topk,
         renormalize=renormalize,
     )
+    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    return topk_weights, topk_ids
 
 
 def fused_topk(
@@ -411,6 +416,7 @@ if _is_cpu and _is_cpu_amx_available:
     biased_grouped_topk = biased_grouped_topk_cpu
     grouped_topk = grouped_topk_cpu
     fused_topk_native = fused_topk_cpu
+    fused_topk = fused_topk_cpu
 else:
     biased_grouped_topk = biased_grouped_topk_gpu
     grouped_topk = grouped_topk_gpu
