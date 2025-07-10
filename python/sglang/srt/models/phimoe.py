@@ -106,13 +106,12 @@ class PhiMoEConfig(PretrainedConfig):
 def sparsemixer(scores, jitter_eps=0.01):
     ################ Select first expert (topk=2) ################
 
-    with torch.no_grad():
-        # compute mask for sparsity
-        mask_logits_threshold, max_ind = scores.max(dim=-1, keepdim=True)
-        factor = scores.abs().clamp(min=mask_logits_threshold)
-        mask_logits_threshold = ((mask_logits_threshold - scores) / factor) > (
-            2 * jitter_eps
-        )
+    # compute mask for sparsity
+    mask_logits_threshold, max_ind = scores.max(dim=-1, keepdim=True)
+    factor = scores.abs().clamp(min=mask_logits_threshold)
+    mask_logits_threshold = ((mask_logits_threshold - scores) / factor) > (
+        2 * jitter_eps
+    )
 
     # apply mask
     masked_gates = scores.masked_fill(mask_logits_threshold, float("-inf"))
@@ -133,13 +132,12 @@ def sparsemixer(scores, jitter_eps=0.01):
     )
 
     ################ Select second expert (topk=2) ################
-    with torch.no_grad():
-        # compute mask for sparsity
-        mask_logits_threshold, max_ind = masked_scores.max(dim=-1, keepdim=True)
-        factor = scores.abs().clamp(min=mask_logits_threshold)
-        mask_logits_threshold = ((mask_logits_threshold - scores) / factor) > (
-            2 * jitter_eps
-        )
+    # compute mask for sparsity
+    mask_logits_threshold, max_ind = masked_scores.max(dim=-1, keepdim=True)
+    factor = scores.abs().clamp(min=mask_logits_threshold)
+    mask_logits_threshold = ((mask_logits_threshold - scores) / factor) > (
+        2 * jitter_eps
+    )
 
     # apply mask
     masked_gates_top2 = masked_scores.masked_fill(mask_logits_threshold, float("-inf"))
@@ -515,7 +513,6 @@ class PhiMoEForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -539,7 +536,6 @@ class PhiMoEForCausalLM(nn.Module):
                     )
                     break
                 else:
-                    # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     # Remapping the name of FP8 kv-scale.
