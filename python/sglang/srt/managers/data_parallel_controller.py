@@ -338,7 +338,7 @@ def run_data_parallel_controller_process(
     setproctitle.setproctitle("sglang::data_parallel_controller")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
-    balance_meta = DPBalanceMeta(server_args.dp_size, do_init=True)
+    balance_meta = DPBalanceMeta(server_args.dp_size)
 
     try:
         controller = DataParallelController(

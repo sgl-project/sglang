@@ -3,6 +3,7 @@ import multiprocessing as mp
 import pickle
 import struct
 from multiprocessing import shared_memory
+from multiprocessing.managers import BaseManager
 from typing import Dict, List
 
 logger = logging.getLogger(__name__)
@@ -15,82 +16,49 @@ it will cause circular references, so it is placed in a separate file.
 
 
 class DPBalanceMeta:
-    def __init__(self, num_workers: int, do_init: bool = False):
-        self.mutex = mp.Lock()
-        self.shm_name_onfly_info = "sglang_dp_balance_onfly_info"
-        self.shm_name_local_tokens = "sglang_dp_balance_local_tokens"
-        self.onfly_info_size = (
-            512 * num_workers * 8
-        )  # max_onfly_req_per_worker * num_workers * dByte
-        self.local_tokens_size = num_workers * 8 + 512
+    def __init__(self, num_workers: int):
         self.num_workers = num_workers
+        self._manager = mp.Manager()
+        self.mutex = self._manager.Lock()
 
-        if do_init:
-            self.shm1 = shared_memory.SharedMemory(
-                name=self.shm_name_onfly_info, create=True, size=self.onfly_info_size
-            )
-            self.shm2 = shared_memory.SharedMemory(
-                name=self.shm_name_local_tokens,
-                create=True,
-                size=self.local_tokens_size,
-            )
-            init_local_tokens = [0 for _ in range(num_workers)]
-            init_onfly_req = [{} for _ in range(num_workers)]
-            self.set_shared_local_tokens(init_local_tokens)
-            self.set_shared_onfly_info(init_onfly_req)
-            self.shm1.name
+        init_local_tokens = [0] * self.num_workers
+        init_onfly_info = [self._manager.dict() for _ in range(self.num_workers)]
+
+        self.shared_state = self._manager.Namespace()
+        self.shared_state.local_tokens = self._manager.list(init_local_tokens)
+        self.shared_state.onfly_info = self._manager.list(init_onfly_info)
 
     def destructor(self):
-        # we must destructor this class manually, otherwise will cause shm leak
-        self.shm1.close()
-        self.shm1.unlink()
-        self.shm2.close()
-        self.shm2.unlink()
+        # we must destructor this class manually
+        self._manager.shutdown()
 
     def get_shared_onfly(self) -> List[Dict[int, int]]:
-        """Retrieve data from shared memory and deserialize it into List[Dict[int, int]]"""
-        shm = shared_memory.SharedMemory(name=self.shm_name_onfly_info)
-
-        header_size = struct.calcsize("Q")
-        data_size = struct.unpack("Q", shm.buf[:header_size])[0]
-        assert 0 <= data_size <= self.onfly_info_size, "no valid data in shared memory"
-
-        serialized_data = bytes(shm.buf[header_size : header_size + data_size])
-        onfly_info = pickle.loads(serialized_data)
-
-        shm.close()
-        return onfly_info
+        return [dict(d) for d in self.shared_state.onfly_info]
 
     def set_shared_onfly_info(self, data: List[Dict[int, int]]):
-        """Serialize the data and write it to shared memory."""
-        serialized_data = pickle.dumps(data)
-        data_size = len(serialized_data)
-
-        assert data_size < self.onfly_info_size, (
-            f"The size of the serialized data {data_size} "
-            f"exceeds the shared memory capacity {self.onfly_info_size} bytes. "
-            "Please increase onfly_info_size."
-        )
-
-        shm = shared_memory.SharedMemory(name=self.shm_name_onfly_info)
-        shm.buf[: struct.calcsize("Q")] = struct.pack("Q", data_size)
-        shm.buf[struct.calcsize("Q") : struct.calcsize("Q") + data_size] = (
-            serialized_data
-        )
-        shm.close()
+        self.shared_state.onfly_info = data
 
     def get_shared_local_tokens(self) -> List[int]:
-        shm = shared_memory.SharedMemory(name=self.shm_name_local_tokens)
-        serialized_data = bytes(shm.buf)
-        worker_onfly_data = pickle.loads(serialized_data)
-        shm.close()
-        return worker_onfly_data
+        return list(self.shared_state.local_tokens)
 
     def set_shared_local_tokens(self, data: List[int]):
-        serialized_data = pickle.dumps(data)
-        data_size = len(serialized_data)
+        self.shared_state.local_tokens = data
 
-        shm = shared_memory.SharedMemory(name=self.shm_name_local_tokens)
-        shm.buf[:data_size] = serialized_data
+    def __getstate__(self):
+        """
+        自定义序列化方法。
+        在序列化时，排除掉无法被 pickle 的 _manager 属性。
+        """
+        state = self.__dict__.copy()
+        del state["_manager"]
+        return state
 
-        shm.close()
+    def __setstate__(self, state):
+        """
+        自定义反序列化方法。
+        在新进程中恢复对象状态。_manager 属性将不存在，这没关系，
+        因为子进程只需要代理对象（mutex, shared_state），而不需要 manager 本身。
+        """
+        self.__dict__.update(state)
+        # 在子进程中，self._manager 会是 None
+        self._manager = None
