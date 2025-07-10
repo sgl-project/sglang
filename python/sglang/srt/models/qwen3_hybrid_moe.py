@@ -1,5 +1,6 @@
+import enum
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple, Set
 
 import torch
 from torch import nn
@@ -20,7 +21,6 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
-    PPProxyTensors,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.linear import (
@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.mamba_cache import (
 )
 from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
+    default_weight_loader,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.configs.qwen3_hybrid_moe import Qwen3HybridMoeConfig
@@ -50,12 +51,13 @@ from sglang.srt.models.qwen2_moe import (
     Qwen2MoeSparseMoeBlock,
 )
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
+from sglang.srt.layers.attention.mamba.mamba_mixer2 import MambaMixer2, extra_groups_for_head_shards
 from einops import rearrange
 from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
-from causal_conv1d import (
-    causal_conv1d_fn, 
-    causal_conv1d_update
-)
+
+from sglang.srt.layers.attention.mamba.ops.causal_conv1d import (
+    causal_conv1d_fn, causal_conv1d_update)
+
 from fla.ops.gated_delta_rule import (
     chunk_gated_delta_rule, 
     fused_recurrent_gated_delta_rule,
@@ -214,6 +216,9 @@ class Qwen3GatedDeltaNet(nn.Module):
         cache_params: Optional[MambaCacheParams] = None,
         sequence_idx: Optional[torch.Tensor] = None,
     ):
+        has_initial_states = None
+        if forward_batch.extend_prefix_lens is not None:
+            has_initial_states = forward_batch.extend_prefix_lens > 0
 
         # Set up dimensions for reshapes later
         seq_len, _ = hidden_states.shape
@@ -252,7 +257,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                 conv_states=cache_params.conv_state,
                 has_initial_state=has_initial_states,
                 cache_indices=cache_params.state_indices_tensor,
-                query_start_loc=attn_metadata.query_start_loc).transpose(
+                query_start_loc=forward_batch.extend_start_loc).transpose(
                     0, 1)[:seq_len]
 
             # TODO: Why is this needed?
@@ -295,7 +300,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                 beta=beta,
                 initial_state=None, # NOTE: In my view, the initial state is not used in training and prefill stage.
                 output_final_state=recurrent_state is not None,
-                cu_seqlens=attn_metadata.query_start_loc,
+                cu_seqlens=forward_batch.extend_start_loc,
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
@@ -308,7 +313,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=recurrent_state is not None,
-                cu_seqlens=attn_metadata.query_start_loc,
+                cu_seqlens=forward_batch.extend_start_loc,
                 head_first=False,
                 use_qk_l2norm_in_kernel=True
             )
@@ -410,7 +415,7 @@ class Qwen3HybridMixerDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.mamba2 = MambaMixer2(
-            layer_id=layer_id,
+            layer_idx=layer_id,
             hidden_size= config.hidden_size,
             ssm_state_size = config.mamba2_state_dim,
             conv_kernel_size = config.mamba2_conv_dim,
@@ -459,13 +464,14 @@ class Qwen3HybridMixerDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         mamba_cache_params: MambaCacheParams,
         sequence_idx: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
         **kwargs,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self.mamba2(hidden_states, mamba_cache_params,
-                                   sequence_idx)
+                                   sequence_idx, forward_batch=forward_batch)
         
         # Fully Connected
         hidden_states = residual + hidden_states
@@ -713,17 +719,17 @@ class Qwen3HybridMoeModel(nn.Module):
         # chunked prefill
 
         # TODO(cao1zhg)
-        # seq_idx = None
-        # attn_metadata = get_forward_context().attn_metadata
-        # if attn_metadata.num_prefills > 0:
-        #     seq_idx = torch.zeros_like(input_ids, dtype=torch.int32)
-        #     for i, (srt, end) in enumerate(
-        #             zip(
-        #                 attn_metadata.query_start_loc,
-        #                 attn_metadata.query_start_loc[1:],
-        #             )):
-        #         seq_idx[srt:end] = i
-        #     seq_idx.unsqueeze_(0)
+        seq_idx = None
+        if forward_batch.forward_mode.is_prefill() > 0:
+            seq_idx = torch.zeros_like(input_ids, dtype=torch.int32)
+            if forward_batch.extend_start_loc is not None:
+                for i, (srt, end) in enumerate(
+                        zip(
+                            forward_batch.extend_start_loc.tolist(),
+                            forward_batch.extend_start_loc[1:].tolist(),
+                        )):
+                    seq_idx[srt:end] = i
+            seq_idx.unsqueeze_(0)
 
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
@@ -749,6 +755,7 @@ class Qwen3HybridMoeModel(nn.Module):
                 residual=residual,
                 mamba_cache_params=layer_mamba_cache_params,
                 sequence_idx=seq_idx,
+                forward_batch=forward_batch,
             )
             
         hidden_states = self.norm(hidden_states)
@@ -756,6 +763,12 @@ class Qwen3HybridMoeModel(nn.Module):
         if hidden_states.shape[0] <= 3:
             self.infer_count += 1
         return hidden_states
+
+class HybridLayerType(enum.Enum):
+    full_attention = "attention"
+    swa_attention = "swa_attention"
+    linear_attention = "linear_attention"
+    mamba2 = "mamba"
 
 class Qwen3HybridMoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
@@ -786,6 +799,54 @@ class Qwen3HybridMoeForCausalLM(nn.Module):
         # Used to track and store by the Mamba cache between steps.
         self.mamba_cache: Optional[MambaCacheManager] = None
 
+    def _get_linear_cache_shape(self) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+        config = self.config
+        world_size = get_tensor_model_parallel_world_size()
+        conv_dim = (config.linear_key_head_dim * config.linear_num_key_heads * 2 + config.linear_value_head_dim * config.linear_num_value_heads)
+        conv_state_shape = (
+            divide(conv_dim, world_size),
+            config.linear_conv_kernel_dim - 1,
+        )
+        
+        temporal_state_shape = (
+            divide(config.linear_num_value_heads, world_size),
+            config.linear_key_head_dim, 
+            config.linear_value_head_dim
+        )
+        return conv_state_shape, temporal_state_shape
+
+    def _get_mamba_cache_shape(
+            self) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+        world_size = get_tensor_model_parallel_world_size()
+        hidden_size = self.config.hidden_size
+
+        conv_state_shape, temporal_state_shape = None, None
+
+        intermediate_size = self.config.mamba2_expand * hidden_size
+
+        # if n_groups is not divisible by world_size, need to extend the shards
+        # to ensure all groups needed by a head is sharded along with it
+        n_groups = (self.config.mamba2_ngroups + extra_groups_for_head_shards(
+            self.config.mamba2_ngroups, world_size))
+
+        # - heads and n_groups are TP-ed
+        conv_dim = (intermediate_size +
+                    2 * n_groups * self.config.mamba2_state_dim)
+        conv_state_shape = (
+            divide(conv_dim, world_size),
+            self.config.mamba2_conv_dim - 1,
+        )
+
+        # These are not TP-ed as they depend on A, dt_bias, D
+        # - they are typically small
+        #   e.g., (h_heads, d_head, d_state) = (128, 64, 128)
+        temporal_state_shape = (
+            divide(self.config.mamba2_nheads, world_size),
+            self.config.mamba2_head_dim,
+            self.config.mamba2_state_dim,
+        )
+        return conv_state_shape, temporal_state_shape
+    
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -795,15 +856,21 @@ class Qwen3HybridMoeForCausalLM(nn.Module):
         **kwargs,
     ):
         if self.mamba_cache is None:
-            pass
-        self.mamba_cache = MambaCacheManager(
-            self.config, 
-            self.lm_head.weight.dtype, 
-            num_mamba_layers,
-            *self.config.cache_shape)
+            layers_block_type_value = self.config.layers_block_type
+            if self.config.hybrid_linear_attention:
+                num_mamba_layers = sum(type_value == HybridLayerType.linear_attention for type_value in layers_block_type_value)
+                conv_state_shape, temporal_state_shape = self._get_linear_cache_shape()
+            else:
+                num_mamba_layers = sum(type_value == HybridLayerType.mamba2 for type_value in layers_block_type_value)
+                conv_state_shape, temporal_state_shape = self._get_mamba_cache_shape()
+            self.mamba_cache = MambaCacheManager(
+                self.lm_head.weight.dtype, num_mamba_layers,
+                conv_state_shape, temporal_state_shape)
+
         mamba_cache_params = self.mamba_cache.current_run_tensors(**kwargs)
 
-        pass
+        hidden_states = self.model(input_ids, positions, forward_batch, mamba_cache_params, inputs_embeds)
+        return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
@@ -845,12 +912,12 @@ class Qwen3HybridMoeForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 # Skip layers on other devices.
-                if is_pp_missing_parameter(name, self):
-                    continue
+                # if is_pp_missing_parameter(name, self):
+                #     continue
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
-                weight_loader = param.weight_loader
+                weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -860,14 +927,14 @@ class Qwen3HybridMoeForCausalLM(nn.Module):
                         continue
                     name = name.replace(weight_name, param_name)
                     # Skip layers on other devices.
-                    if is_pp_missing_parameter(name, self):
-                        continue
+                    # if is_pp_missing_parameter(name, self):
+                    #     continue
                     # Skip loading extra bias for GPTQ models.
                     if ((name.endswith(".bias") or name.endswith("_bias"))
                             and name not in params_dict):
                         continue
                     param = params_dict[name]
-                    weight_loader = param.weight_loader
+                    weight_loader = getattr(param, "weight_loader")
                     weight_loader(param,
                                   loaded_weight,
                                   name,
@@ -878,8 +945,8 @@ class Qwen3HybridMoeForCausalLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-                    if is_pp_missing_parameter(name, self):
-                        continue
+                    # if is_pp_missing_parameter(name, self):
+                    #     continue
 
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader",
