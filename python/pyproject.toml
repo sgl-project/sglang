@@ -58,7 +58,7 @@ srt = [
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.7.post1",
+    "flashinfer_python @ git+https://github.com/yyihuang/flashinfer.git@e9cc63479e1447cd50409ac8d63b7f4fc2a05082",
 ]
 
 blackwell = [
@@ -69,8 +69,9 @@ blackwell = [
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.7.post1",
+    "flashinfer_python @ git+https://github.com/yyihuang/flashinfer.git@e9cc63479e1447cd50409ac8d63b7f4fc2a05082",
 ]
+
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20250114, not from public vllm whl
