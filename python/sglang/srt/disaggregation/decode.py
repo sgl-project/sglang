@@ -416,6 +416,12 @@ class DecodePreallocQueue:
 
         return preallocated_reqs
 
+    @property
+    def num_tokens_pre_allocated(self):
+        return sum(
+            len(decode_req.req.fill_ids) for decode_req in self.transfer_queue.queue
+        )
+
     def _allocatable_tokens(
         self, retractable_tokens: Optional[int] = None, count_retracted: bool = True
     ) -> int:
@@ -785,7 +791,7 @@ class SchedulerDisaggregationDecodeMixin:
         self.flush_disaggregation_resources()
         del self.stop_decode_event
     def _prepare_idle_batch_and_run(self: Scheduler, batch, delay_process=False):
-        batch, _ = self.prepare_mlp_sync_batch(batch)
+        batch = self.prepare_mlp_sync_batch(batch)
         result = None
         if batch:
             result = self.run_batch(batch)
