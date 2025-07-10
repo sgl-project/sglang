@@ -396,7 +396,18 @@ class ModelRunner:
                 ):
                     server_args.attention_backend = "fa3"
                 elif is_sm100_supported():
-                    server_args.attention_backend = "flashinfer"
+                    # On Blackwell, prefer TRTLLM MLA if available, otherwise flashinfer
+                    if is_flashinfer_available():
+                        try:
+                            import flashinfer
+                            if hasattr(flashinfer.decode, 'trtllm_batch_decode_with_kv_cache_mla'):
+                                server_args.attention_backend = "trtllm_mla"
+                            else:
+                                server_args.attention_backend = "flashinfer"
+                        except:
+                            server_args.attention_backend = "flashinfer"
+                    else:
+                        server_args.attention_backend = "flashinfer"
                 elif _is_hip:
                     head_num = self.model_config.get_num_kv_heads(self.tp_size)
                     # TODO current aiter only support head number 16 or 128 head number
@@ -422,6 +433,7 @@ class ModelRunner:
                     "triton",
                     "flashmla",
                     "cutlass_mla",
+                    "trtllm_mla",
                     "ascend",
                 ]:
                     logger.info(
@@ -1430,6 +1442,12 @@ class ModelRunner:
             )
 
             return CutlassMLABackend(self)
+        elif self.server_args.attention_backend == "trtllm_mla":
+            from sglang.srt.layers.attention.trtllm_mla_backend import (
+                TRTLLMMLABackend,
+            )
+
+            return TRTLLMMLABackend(self)
         elif self.server_args.attention_backend == "intel_amx":
             from sglang.srt.layers.attention.intel_amx_backend import (
                 IntelAMXAttnBackend,
