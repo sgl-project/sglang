@@ -544,7 +544,6 @@ class OpenAIMoeAttention(nn.Module):
 
         # default sink dtype is bfloat16
         self.sinks = nn.Parameter(torch.empty(self.num_heads, dtype=torch.bfloat16))
-        self.layer_id = layer_id
 
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -605,7 +604,7 @@ class OpenAIMoeAttention(nn.Module):
         print(f"cos allclose: {torch.allclose(self.rotary_emb._compute_cos_sin_cache()[:,:self.head_dim//2], self.rope._compute_cos_sin(max_position_embeddings)[0], atol=1e-5, rtol=1e-5)}")
         print(f"sin allclose: {torch.allclose(self.rotary_emb._compute_cos_sin_cache()[:,self.head_dim//2:], self.rope._compute_cos_sin(max_position_embeddings)[1], atol=1e-5, rtol=1e-5)}")
         '''
-
+        use_sliding_window = True if config.layer_types[layer_id] == "sliding_attention" else False
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -613,8 +612,8 @@ class OpenAIMoeAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=(
-                127
-                if layer_id % 2 == 0
+                get_attention_sliding_window_size(config)
+                if use_sliding_window
                 else None
             ),
             enable_attention_sink=True,
@@ -986,7 +985,7 @@ class OpenAIMoeForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
     def get_attention_sliding_window_size(self):
-        return 127
+        return get_attention_sliding_window_size(self.config)
     @torch.no_grad()
     def forward(
         self,
