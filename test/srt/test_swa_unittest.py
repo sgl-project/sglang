@@ -2,9 +2,9 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.allocator import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import SWARadixCache
-from sglang.srt.mem_cache.allocator import SWAKVPool, SWATokenToKVPoolAllocator
 
 
 class TestSWA(unittest.TestCase):
