@@ -871,15 +871,6 @@ class MooncakeEmbeddingReceiver(BaseKVReceiver):
                 logger.debug(
                     f"Register embedding args with {self.embedding_mgr.rank_port=};{self.session_id=};{self.embedding_mgr.data_args.aux_data_ptrs=} success"
                 )
-                # 用 uint16 读取内存（bfloat16 在内存中的存储格式和 uint16 相同）
-                buffer = (ctypes.c_uint16 * 100).from_address(
-                    self.embedding_mgr.data_args.aux_data_ptrs[0]
-                )
-                arr = np.ctypeslib.as_array(buffer)
-                new_tensor = torch.frombuffer(
-                    arr.tobytes(), dtype=torch.bfloat16, count=100
-                ).flatten()
-                logger.debug(f"Register embedding args with {new_tensor=}")
 
     @classmethod
     def _connect(cls, endpoint: str):

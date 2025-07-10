@@ -1359,7 +1359,7 @@ class ModelRunner:
         self.cuda_graph_runner = None
         self.cuda_graph_mem_usage = 0
 
-        if not self.is_generation and not self.is_multimodal_embedding:
+        if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
 

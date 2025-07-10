@@ -776,10 +776,10 @@ class Scheduler(
                 buffer_size
             )
             logger.debug(
-                f"init MetaMultiModaldataBuffers: {buffer_size=};{self.max_req_input_len=};{self.model_config.hidden_size=}"
+                f"init MetaMultiModaldataBuffers: {buffer_size=};{self.max_prefill_tokens=};{self.model_config.hidden_size=}"
             )
             self.disagg_metadata_buffers = MetaMultiModaldataBuffers(
-                buffer_size, self.max_req_input_len, self.model_config.hidden_size
+                buffer_size, self.max_prefill_tokens, self.model_config.hidden_size
             )
             self.disagg_embedding_bootstrap_queue = MultimodalEmbeddingBootstrapQueue(
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
@@ -798,10 +798,10 @@ class Scheduler(
                 buffer_size
             )
             logger.debug(
-                f"init MetaMultiModaldataBuffers: {buffer_size=};{self.max_req_input_len=};{self.model_config.hidden_size=}"
+                f"init MetaMultiModaldataBuffers: {buffer_size=};{self.max_prefill_tokens=};{self.model_config.hidden_size=}"
             )
             self.disagg_metadata_buffers = MetaMultiModaldataBuffers(
-                buffer_size, self.max_req_input_len, self.model_config.hidden_size
+                buffer_size, self.max_prefill_tokens, self.model_config.hidden_size
             )
             self.disagg_language_transfer_queue = MultimodalLanguageTransferQueue(
                 gloo_group=self.attn_tp_cpu_group,

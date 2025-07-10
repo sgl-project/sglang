@@ -68,6 +68,10 @@ class MiniLoadBalancer:
         self.decode_servers = decode_servers
         self.enable_multimodal_disagg = vision_configs is not None
 
+        # round robin selection of vision server and prefill server
+        self.vision_server_index = 0
+        self.prefill_server_index = 0
+
     def add_vision_server(self, new_vision_config: VisionConfig):
         self.vision_configs.append(new_vision_config)
         self.vision_servers.append(new_vision_config.url)
@@ -89,8 +93,15 @@ class MiniLoadBalancer:
             assert len(self.decode_servers) > 0, "No decode servers available"
 
         if self.enable_multimodal_disagg:
-            vision_config = random.choice(self.vision_configs)
-            prefill_server = random.choice(self.prefill_servers)
+            # support random selection of vision server and prefill server
+            vision_config = self.vision_configs[self.vision_server_index]
+            prefill_server = self.prefill_servers[self.prefill_server_index]
+            self.vision_server_index = (self.vision_server_index + 1) % len(
+                self.vision_configs
+            )
+            self.prefill_server_index = (self.prefill_server_index + 1) % len(
+                self.prefill_servers
+            )
             return vision_config.url, vision_config.bootstrap_port, prefill_server
         else:
             prefill_config = random.choice(self.prefill_configs)

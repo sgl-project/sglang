@@ -378,12 +378,16 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
 
 class MetaMultiModaldataBuffers:
     def __init__(
-        self, size: int, max_model_len: int, embedding_dim: int = 8192
+        self, size: int, max_prefill_tokens: int, embedding_dim: int = 8192
     ) -> None:
         self.input_embeddings = torch.zeros(
-            (size, max_model_len, embedding_dim), dtype=torch.bfloat16, device="cpu"
+            (size, max_prefill_tokens * embedding_dim), dtype=torch.bfloat16, device="cpu"
         )
-        self.embedding_lengths = torch.zeros((size,), dtype=torch.int32, device="cpu")
+         # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
+        self.embedding_lengths = torch.zeros((size, 16), dtype=torch.int32, device="cpu")
+        self.max_prefill_tokens = max_prefill_tokens
+        self.embedding_dim = embedding_dim
+
 
     def get_buf_infos(self):
         ptrs = [self.input_embeddings.data_ptr(), self.embedding_lengths.data_ptr()]
@@ -392,8 +396,10 @@ class MetaMultiModaldataBuffers:
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
-        input_embeddings = self.input_embeddings[idx]
-        embedding_lengths = self.embedding_lengths[idx]
+        input_embeddings = self.input_embeddings[idx].reshape(
+            self.max_prefill_tokens, self.embedding_dim
+        )
+        embedding_lengths = self.embedding_lengths[idx][0]
         logger.debug(
             f"Get embedding buffer: {idx=} {input_embeddings.shape=} {input_embeddings.data_ptr()=} {embedding_lengths=} {self.input_embeddings.data_ptr()=}"
         )
@@ -404,10 +410,10 @@ class MetaMultiModaldataBuffers:
         logger.debug(
             f"Set embedding buffer: {req.metadata_buffer_index=} {embed_length=} {req.embedding.shape=}"
         )
-        self.input_embeddings[req.metadata_buffer_index, :embed_length, :] = (
-            req.embedding
+        self.input_embeddings[req.metadata_buffer_index, :embed_length * self.embedding_dim] = (
+            req.embedding.flatten()
         )
-        self.embedding_lengths[req.metadata_buffer_index] = embed_length
+        self.embedding_lengths[req.metadata_buffer_index][0] = embed_length
 
 
 class MetadataBuffers:
