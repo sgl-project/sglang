@@ -417,6 +417,11 @@ class ModelConfig:
                 "quant_method", "" if not self.quantization else self.quantization
             ).lower()
 
+            # For NVIDIA GPUs, use ModelOpt as default
+            if self.quantization is None and not is_hip():
+                if "fp8" in quant_method:
+                    self.quantization = "modelopt"
+
             # Detect which checkpoint is it
             for _, method in QUANTIZATION_METHODS.items():
                 quantization_override = method.override_quantization_method(
