@@ -4,17 +4,15 @@ from fractions import Fraction
 from typing import Any, Optional, Union
 
 import torch
+import logging
+logger = logging.getLogger(__name__)
 
 try:
-    from vllm.logger import init_logger
     from vllm.model_executor.layers.quantization.utils.marlin_utils import (
         check_marlin_supported,
         check_moe_marlin_supports_layer,
     )
-    from vllm.platforms import current_platform
     from vllm.scalar_type import scalar_types
-
-    logger = init_logger(__name__)
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
@@ -25,10 +23,7 @@ except ImportError:
         uint4b8 = "uint4b8"
         uint8b128 = "uint8b128"
 
-    current_platform = None
-    import logging
 
-    logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.linear import (
     LinearBase,
