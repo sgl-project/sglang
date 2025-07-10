@@ -928,9 +928,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            assert isinstance(
-                tree_cache, SWARadixCache
-            ), "SWARadixCache is required for SWATokenToKVPoolAllocator"
+            assert isinstance(tree_cache, SWARadixCache) or isinstance(
+                tree_cache, SWAChunkCache
+            ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid = True
 
         return cls(

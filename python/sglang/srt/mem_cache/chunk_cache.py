@@ -61,7 +61,7 @@ class ChunkCache(BasePrefixCache):
     def inc_lock_ref(self, node: Any):
         return 0
 
-    def dec_lock_ref(self, node: Any):
+    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
         return 0
 
     def pretty_print(self):
