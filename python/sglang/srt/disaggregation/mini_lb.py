@@ -49,10 +49,18 @@ class PrefillConfig:
 
 
 class MiniLoadBalancer:
-    def __init__(self, prefill_configs: List[PrefillConfig], decode_servers: List[str]):
+    def __init__(
+        self,
+        prefill_configs: List[PrefillConfig],
+        decode_servers: List[str],
+        policy: str,
+    ):
         self.prefill_configs = prefill_configs
         self.prefill_servers = [p.url for p in prefill_configs]
         self.decode_servers = decode_servers
+        self.policy = policy
+        self.prefill_index = 0
+        self.decode_index = 0
 
     def add_prefill_server(self, new_prefill_config: PrefillConfig):
         self.prefill_configs.append(new_prefill_config)
@@ -66,8 +74,14 @@ class MiniLoadBalancer:
         assert len(self.prefill_configs) > 0, "No prefill servers available"
         assert len(self.decode_servers) > 0, "No decode servers available"
 
-        prefill_config = random.choice(self.prefill_configs)
-        decode_server = random.choice(self.decode_servers)
+        if self.policy == "rr":
+            self.prefill_index = (self.prefill_index + 1) % len(self.prefill_configs)
+            self.decode_index = (self.decode_index + 1) % len(self.decode_servers)
+            prefill_config = self.prefill_configs[self.prefill_index]
+            decode_server = self.decode_servers[self.decode_index]
+        else:
+            prefill_config = random.choice(self.prefill_configs)
+            decode_server = random.choice(self.decode_servers)
         return prefill_config.url, prefill_config.bootstrap_port, decode_server
 
     async def generate(
@@ -400,9 +414,9 @@ async def register(obj: PDRegistryRequest):
     return Response(status_code=200)
 
 
-def run(prefill_configs, decode_addrs, host, port):
+def run(prefill_configs, decode_addrs, host, port, policy):
     global load_balancer
-    load_balancer = MiniLoadBalancer(prefill_configs, decode_addrs)
+    load_balancer = MiniLoadBalancer(prefill_configs, decode_addrs, policy)
     uvicorn.run(app, host=host, port=port)
 
 
