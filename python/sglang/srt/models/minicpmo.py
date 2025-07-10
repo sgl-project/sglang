@@ -32,7 +32,7 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from transformers.models.whisper.modeling_whisper import (
-    WHISPER_ATTENTION_CLASSES,
+    WhisperAttention,
     WhisperConfig,
     WhisperEncoder,
 )
@@ -51,11 +51,8 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.minicpmv import (
-    Idefics2VisionTransformer,
-    MiniCPMBaseModel,
-    Resampler2_5,
-)
+from sglang.srt.models.idefics2 import Idefics2VisionTransformer
+from sglang.srt.models.minicpmv import MiniCPMBaseModel, Resampler2_5
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.utils import logger
 
@@ -1093,7 +1090,7 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
     def __init__(self, config: WhisperConfig, layer_idx: int = None):
         super().__init__()
         self.embed_dim = config.d_model
-        self.self_attn = WHISPER_ATTENTION_CLASSES[config._attn_implementation](
+        self.self_attn = WhisperAttention(
             embed_dim=self.embed_dim,
             num_heads=config.encoder_attention_heads,
             dropout=config.attention_dropout,

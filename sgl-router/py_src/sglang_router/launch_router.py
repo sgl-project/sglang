@@ -31,6 +31,13 @@ class RouterArgs:
     host: str = "127.0.0.1"
     port: int = 30000
 
+    # PD-specific configuration
+    pd_disaggregation: bool = False  # Enable PD disaggregated mode
+    prefill_urls: List[tuple] = dataclasses.field(
+        default_factory=list
+    )  # List of (url, bootstrap_port)
+    decode_urls: List[str] = dataclasses.field(default_factory=list)
+
     # Routing policy
     policy: str = "cache_aware"
     worker_startup_timeout_secs: int = 300
@@ -40,14 +47,21 @@ class RouterArgs:
     balance_rel_threshold: float = 1.0001
     eviction_interval: int = 60
     max_tree_size: int = 2**24
-    max_payload_size: int = 4 * 1024 * 1024  # 4MB
-    verbose: bool = False
+    max_payload_size: int = 256 * 1024 * 1024  # 256MB default for large batches
     log_dir: Optional[str] = None
+    log_level: Optional[str] = None
     # Service discovery configuration
     service_discovery: bool = False
     selector: Dict[str, str] = dataclasses.field(default_factory=dict)
     service_discovery_port: int = 80
     service_discovery_namespace: Optional[str] = None
+    # PD service discovery configuration
+    prefill_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
+    decode_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
+    bootstrap_port_annotation: str = "sglang.ai/bootstrap-port"
+    # Prometheus configuration
+    prometheus_port: Optional[int] = None
+    prometheus_host: Optional[str] = None
 
     @staticmethod
     def add_cli_args(
@@ -92,8 +106,29 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware"],
-            help="Load balancing policy to use",
+            choices=["random", "round_robin", "cache_aware", "power_of_two"],
+            help="Load balancing policy to use. Note: power_of_two is only available in PD disaggregated mode",
+        )
+
+        # PD-specific arguments
+        parser.add_argument(
+            f"--{prefix}pd-disaggregation",
+            action="store_true",
+            help="Enable PD (Prefill-Decode) disaggregated mode",
+        )
+        parser.add_argument(
+            f"--{prefix}prefill",
+            nargs=2,
+            action="append",
+            metavar=("URL", "BOOTSTRAP_PORT"),
+            help="Prefill server URL and bootstrap port. Can be specified multiple times. BOOTSTRAP_PORT can be 'none' for no bootstrap port.",
+        )
+        parser.add_argument(
+            f"--{prefix}decode",
+            nargs=1,
+            action="append",
+            metavar=("URL",),
+            help="Decode server URL. Can be specified multiple times.",
         )
         parser.add_argument(
             f"--{prefix}worker-startup-timeout-secs",
@@ -144,15 +179,17 @@ class RouterArgs:
             help="Maximum payload size in bytes",
         )
         parser.add_argument(
-            f"--{prefix}verbose",
-            action="store_true",
-            help="Enable verbose logging",
-        )
-        parser.add_argument(
             f"--{prefix}log-dir",
             type=str,
             default=None,
             help="Directory to store log files. If not specified, logs are only output to console.",
+        )
+        parser.add_argument(
+            f"--{prefix}log-level",
+            type=str,
+            default="info",
+            choices=["debug", "info", "warning", "error", "critical"],
+            help="Set the logging level. If not specified, defaults to INFO.",
         )
         parser.add_argument(
             f"--{prefix}service-discovery",
@@ -176,6 +213,31 @@ class RouterArgs:
             type=str,
             help="Kubernetes namespace to watch for pods. If not provided, watches all namespaces (requires cluster-wide permissions)",
         )
+        parser.add_argument(
+            f"--{prefix}prefill-selector",
+            type=str,
+            nargs="+",
+            help="Label selector for prefill server pods in PD mode (format: key1=value1 key2=value2)",
+        )
+        parser.add_argument(
+            f"--{prefix}decode-selector",
+            type=str,
+            nargs="+",
+            help="Label selector for decode server pods in PD mode (format: key1=value1 key2=value2)",
+        )
+        # Prometheus configuration
+        parser.add_argument(
+            f"--{prefix}prometheus-port",
+            type=int,
+            default=29000,
+            help="Port to expose Prometheus metrics. If not specified, Prometheus metrics are disabled",
+        )
+        parser.add_argument(
+            f"--{prefix}prometheus-host",
+            type=str,
+            default="127.0.0.1",
+            help="Host address to bind the Prometheus metrics server",
+        )
 
     @classmethod
     def from_cli_args(
@@ -189,11 +251,19 @@ class RouterArgs:
             use_router_prefix: If True, look for arguments with 'router-' prefix
         """
         prefix = "router_" if use_router_prefix else ""
-        worker_urls = args.worker_urls if args.worker_urls is not None else []
+        worker_urls = getattr(args, "worker_urls", [])
+
+        # Parse PD URLs
+        prefill_urls = cls._parse_prefill_urls(getattr(args, f"{prefix}prefill", None))
+        decode_urls = cls._parse_decode_urls(getattr(args, f"{prefix}decode", None))
+
         return cls(
             worker_urls=worker_urls,
             host=args.host,
             port=args.port,
+            pd_disaggregation=getattr(args, f"{prefix}pd_disaggregation", False),
+            prefill_urls=prefill_urls,
+            decode_urls=decode_urls,
             policy=getattr(args, f"{prefix}policy"),
             worker_startup_timeout_secs=getattr(
                 args, f"{prefix}worker_startup_timeout_secs"
@@ -207,14 +277,23 @@ class RouterArgs:
             eviction_interval=getattr(args, f"{prefix}eviction_interval"),
             max_tree_size=getattr(args, f"{prefix}max_tree_size"),
             max_payload_size=getattr(args, f"{prefix}max_payload_size"),
-            verbose=getattr(args, f"{prefix}verbose", False),
             log_dir=getattr(args, f"{prefix}log_dir", None),
+            log_level=getattr(args, f"{prefix}log_level", None),
             service_discovery=getattr(args, f"{prefix}service_discovery", False),
             selector=cls._parse_selector(getattr(args, f"{prefix}selector", None)),
             service_discovery_port=getattr(args, f"{prefix}service_discovery_port"),
             service_discovery_namespace=getattr(
                 args, f"{prefix}service_discovery_namespace", None
             ),
+            prefill_selector=cls._parse_selector(
+                getattr(args, f"{prefix}prefill_selector", None)
+            ),
+            decode_selector=cls._parse_selector(
+                getattr(args, f"{prefix}decode_selector", None)
+            ),
+            bootstrap_port_annotation="sglang.ai/bootstrap-port",  # Mooncake-specific annotation
+            prometheus_port=getattr(args, f"{prefix}prometheus_port", None),
+            prometheus_host=getattr(args, f"{prefix}prometheus_host", None),
         )
 
     @staticmethod
@@ -229,6 +308,46 @@ class RouterArgs:
                 selector[key] = value
         return selector
 
+    @staticmethod
+    def _parse_prefill_urls(prefill_list):
+        """Parse prefill URLs from --prefill arguments.
+
+        Format: --prefill URL BOOTSTRAP_PORT
+        Example: --prefill http://prefill1:8080 9000 --prefill http://prefill2:8080 none
+        """
+        if not prefill_list:
+            return []
+
+        prefill_urls = []
+        for url, bootstrap_port_str in prefill_list:
+            # Handle 'none' as None
+            if bootstrap_port_str.lower() == "none":
+                bootstrap_port = None
+            else:
+                try:
+                    bootstrap_port = int(bootstrap_port_str)
+                except ValueError:
+                    raise ValueError(
+                        f"Invalid bootstrap port: {bootstrap_port_str}. Must be a number or 'none'"
+                    )
+
+            prefill_urls.append((url, bootstrap_port))
+
+        return prefill_urls
+
+    @staticmethod
+    def _parse_decode_urls(decode_list):
+        """Parse decode URLs from --decode arguments.
+
+        Format: --decode URL
+        Example: --decode http://decode1:8081 --decode http://decode2:8081
+        """
+        if not decode_list:
+            return []
+
+        # decode_list is a list of single-element lists due to nargs=1
+        return [url[0] for url in decode_list]
+
 
 def policy_from_str(policy_str: str) -> PolicyType:
     """Convert policy string to PolicyType enum."""
@@ -236,6 +355,7 @@ def policy_from_str(policy_str: str) -> PolicyType:
         "random": PolicyType.Random,
         "round_robin": PolicyType.RoundRobin,
         "cache_aware": PolicyType.CacheAware,
+        "power_of_two": PolicyType.PowerOfTwo,
     }
     return policy_map[policy_str]
 
@@ -259,8 +379,22 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
         else:
             router_args = args
 
+        # Validate configuration based on mode
+        if router_args.pd_disaggregation:
+            # Validate PD configuration - skip URL requirements if using service discovery
+            if not router_args.service_discovery:
+                if not router_args.prefill_urls:
+                    raise ValueError("PD disaggregation mode requires --prefill")
+                if not router_args.decode_urls:
+                    raise ValueError("PD disaggregation mode requires --decode")
+
+        # Create router with unified constructor
         router = Router(
-            worker_urls=router_args.worker_urls,
+            worker_urls=(
+                []
+                if router_args.service_discovery or router_args.pd_disaggregation
+                else router_args.worker_urls
+            ),
             host=router_args.host,
             port=router_args.port,
             policy=policy_from_str(router_args.policy),
@@ -272,12 +406,23 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             eviction_interval_secs=router_args.eviction_interval,
             max_tree_size=router_args.max_tree_size,
             max_payload_size=router_args.max_payload_size,
-            verbose=router_args.verbose,
             log_dir=router_args.log_dir,
+            log_level=router_args.log_level,
             service_discovery=router_args.service_discovery,
             selector=router_args.selector,
             service_discovery_port=router_args.service_discovery_port,
             service_discovery_namespace=router_args.service_discovery_namespace,
+            prefill_selector=router_args.prefill_selector,
+            decode_selector=router_args.decode_selector,
+            prometheus_port=router_args.prometheus_port,
+            prometheus_host=router_args.prometheus_host,
+            pd_disaggregation=router_args.pd_disaggregation,
+            prefill_urls=(
+                router_args.prefill_urls if router_args.pd_disaggregation else None
+            ),
+            decode_urls=(
+                router_args.decode_urls if router_args.pd_disaggregation else None
+            ),
         )
 
         router.start()
@@ -306,8 +451,14 @@ This launcher enables starting a router with individual worker instances. It is 
 multi-node setups or when you want to start workers and router separately.
 
 Examples:
+  # Regular mode
   python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000
-  python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000 --cache-threshold 0.7 --balance-abs-threshold 64 --balance-rel-threshold 1.2
+
+  # PD disaggregated mode
+  python -m sglang_router.launch_router --pd-disaggregation \\
+    --prefill http://prefill1:8000 9000 --prefill http://prefill2:8000 none \\
+    --decode http://decode1:8001 --decode http://decode2:8001 \\
+    --policy cache_aware
 
     """,
         formatter_class=CustomHelpFormatter,

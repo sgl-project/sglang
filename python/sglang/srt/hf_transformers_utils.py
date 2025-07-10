@@ -42,7 +42,7 @@ from sglang.srt.configs import (
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
-from sglang.srt.utils import is_remote_url
+from sglang.srt.utils import is_remote_url, lru_cache_frozenset
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ChatGLMConfig.model_type: ChatGLMConfig,
@@ -103,6 +103,7 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
+@lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
     trust_remote_code: bool,
@@ -202,6 +203,10 @@ def get_tokenizer(
         if kwargs.get("use_fast", False):
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
+
+    # TODO(Xinyuan): Remove this once we have a proper tokenizer for Devstral
+    if tokenizer_name == "mistralai/Devstral-Small-2505":
+        tokenizer_name = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
 
     is_gguf = check_gguf_file(tokenizer_name)
     if is_gguf:

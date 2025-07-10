@@ -39,7 +39,6 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 ASSISTANT_SUFFIX = "Assistant:"
 
 global args
@@ -49,6 +48,19 @@ global args
 def _get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
     return value.lower() in ("true", "1")
+
+
+def _create_bench_client_session():
+    # When the pressure is big, the read buffer could be full before aio thread read
+    # the content. We increase the read_bufsize from 64K to 10M.
+    # Define constants for timeout and buffer size for clarity and maintainability
+    BENCH_AIOHTTP_TIMEOUT_SECONDS = 6 * 60 * 60  # 6 hours
+    BENCH_AIOHTTP_READ_BUFSIZE_BYTES = 10 * 1024**2  # 10 MB
+
+    aiohttp_timeout = aiohttp.ClientTimeout(total=BENCH_AIOHTTP_TIMEOUT_SECONDS)
+    return aiohttp.ClientSession(
+        timeout=aiohttp_timeout, read_bufsize=BENCH_AIOHTTP_READ_BUFSIZE_BYTES
+    )
 
 
 @dataclass
@@ -106,7 +118,7 @@ async def async_request_trt_llm(
     api_url = request_func_input.api_url
     assert api_url.endswith("generate_stream")
 
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with _create_bench_client_session() as session:
         payload = {
             "accumulate_tokens": True,
             "text_input": request_func_input.prompt,
@@ -179,7 +191,7 @@ async def async_request_openai_completions(
 
     prompt = request_func_input.prompt
 
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with _create_bench_client_session() as session:
         payload = {
             "model": request_func_input.model,
             "prompt": prompt,
@@ -253,6 +265,138 @@ async def async_request_openai_completions(
     return output
 
 
+async def async_request_openai_chat_completions(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    """Makes a request to the OpenAI Chat Completions API.
+
+    Handles both streaming and non-streaming responses, including support
+    for image data in messages. Calculates and returns various performance
+    metrics.
+
+    Args:
+        request_func_input: Input parameters for the request.
+        pbar: Optional tqdm progress bar to update.
+
+    Returns:
+        RequestFuncOutput: Output of the request, including generated text,
+                           latency, TTFT, ITL, and success status.
+    """
+    api_url = request_func_input.api_url
+    assert api_url.endswith(
+        "chat/completions"
+    ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
+
+    if request_func_input.image_data:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": request_func_input.image_data},
+                    },
+                    {"type": "text", "text": request_func_input.prompt},
+                ],
+            },
+        ]
+    else:
+        messages = [{"role": "user", "content": request_func_input.prompt}]
+
+    async with _create_bench_client_session() as session:
+        payload = {
+            "model": request_func_input.model,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": request_func_input.output_len,
+            "stream": not args.disable_stream,
+            **request_func_input.extra_request_body,
+        }
+        headers = get_auth_headers()
+
+        output = RequestFuncOutput.init_new(request_func_input)
+
+        generated_text = ""
+        output_len = request_func_input.output_len
+        ttft = 0.0
+        st = time.perf_counter()
+        most_recent_timestamp = st
+        try:
+            async with session.post(
+                url=api_url, json=payload, headers=headers
+            ) as response:
+                if response.status == 200:
+                    if args.disable_stream:
+                        # Non-streaming response
+                        response_json = await response.json()
+                        output.generated_text = response_json["choices"][0]["message"][
+                            "content"
+                        ]
+                        output.success = True
+                        output.latency = time.perf_counter() - st
+                        output.ttft = (
+                            output.latency
+                        )  # For non-streaming, TTFT = total latency
+                        output.output_len = response_json.get("usage", {}).get(
+                            "completion_tokens", output_len
+                        )
+                    else:
+                        # Streaming response
+                        async for chunk_bytes in response.content:
+                            chunk_bytes = chunk_bytes.strip()
+                            if not chunk_bytes:
+                                continue
+
+                            chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                            latency = time.perf_counter() - st
+                            if chunk == "[DONE]":
+                                pass
+                            else:
+                                data = json.loads(chunk)
+
+                                # Check if this chunk contains content
+                                delta = data.get("choices", [{}])[0].get("delta", {})
+                                content = delta.get("content", "")
+
+                                if content:
+                                    timestamp = time.perf_counter()
+                                    # First token
+                                    if ttft == 0.0:
+                                        ttft = timestamp - st
+                                        output.ttft = ttft
+
+                                    # Decoding phase
+                                    else:
+                                        output.itl.append(
+                                            timestamp - most_recent_timestamp
+                                        )
+
+                                    most_recent_timestamp = timestamp
+                                    generated_text += content
+
+                                # Check for usage info in final chunk
+                                output_len = (data.get("usage") or {}).get(
+                                    "completion_tokens", output_len
+                                )
+
+                        output.generated_text = generated_text
+                        output.success = True
+                        output.latency = latency
+                        output.output_len = output_len
+                else:
+                    output.error = response.reason or ""
+                    output.success = False
+        except Exception:
+            output.success = False
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 async def async_request_truss(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
@@ -261,7 +405,7 @@ async def async_request_truss(
 
     prompt = request_func_input.prompt
 
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with _create_bench_client_session() as session:
         payload = {
             "model": request_func_input.model,
             "prompt": prompt,
@@ -338,9 +482,9 @@ async def async_request_sglang_generate(
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
 
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with _create_bench_client_session() as session:
         payload = {
-            "text": prompt,
+            ("text" if isinstance(prompt, str) else "input_ids"): prompt,
             "sampling_params": {
                 "temperature": 0.0,
                 "max_new_tokens": request_func_input.output_len,
@@ -376,7 +520,6 @@ async def async_request_sglang_generate(
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
                             continue
-                        # print(chunk_bytes)
 
                         chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
                         latency = time.perf_counter() - st
@@ -388,7 +531,7 @@ async def async_request_sglang_generate(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["text"]:
+                            if "text" in data and data["text"]:
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
                                 output_len = data["meta_info"]["completion_tokens"]
@@ -437,7 +580,7 @@ async def async_request_gserver(
 
 
 async def async_request_profile(api_url: str) -> RequestFuncOutput:
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with _create_bench_client_session() as session:
         output = RequestFuncOutput()
         try:
             async with session.post(url=api_url) as response:
@@ -493,7 +636,9 @@ def get_tokenizer(
 
 
 def get_dataset(args, tokenizer):
+    tokenize_prompt = getattr(args, "tokenize_prompt", False)
     if args.dataset_name == "sharegpt":
+        assert not tokenize_prompt
         input_requests = sample_sharegpt_requests(
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
@@ -512,8 +657,10 @@ def get_dataset(args, tokenizer):
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
             random_sample=args.dataset_name == "random",
+            return_text=not tokenize_prompt,
         )
     elif args.dataset_name == "generated-shared-prefix":
+        assert not tokenize_prompt
         input_requests = sample_generated_shared_prefix_requests(
             num_groups=args.gsp_num_groups,
             prompts_per_group=args.gsp_prompts_per_group,
@@ -524,10 +671,12 @@ def get_dataset(args, tokenizer):
             args=args,
         )
     elif args.dataset_name == "mmmu":
+        assert not tokenize_prompt
         input_requests = sample_mmmu_requests(
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
             fixed_output_len=args.random_output_len,
+            apply_chat_template=args.apply_chat_template,
             random_sample=True,
         )
     else:
@@ -539,8 +688,11 @@ ASYNC_REQUEST_FUNCS = {
     "sglang": async_request_sglang_generate,
     "sglang-native": async_request_sglang_generate,
     "sglang-oai": async_request_openai_completions,
+    "sglang-oai-chat": async_request_openai_chat_completions,
     "vllm": async_request_openai_completions,
+    "vllm-chat": async_request_openai_chat_completions,
     "lmdeploy": async_request_openai_completions,
+    "lmdeploy-chat": async_request_openai_chat_completions,
     "trt": async_request_trt_llm,
     "gserver": async_request_gserver,
     "truss": async_request_truss,
@@ -638,12 +790,14 @@ class DatasetRow:
     prompt: str
     prompt_len: int
     output_len: int
+    image_data: Optional[str] = None
 
 
 def sample_mmmu_requests(
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int] = None,
+    apply_chat_template: bool = True,
     random_sample: bool = True,
 ) -> List[DatasetRow]:
     """
@@ -653,15 +807,16 @@ def sample_mmmu_requests(
         num_requests: Number of requests to sample.
         tokenizer: Tokenizer to use for token counting.
         fixed_output_len: If provided, use this fixed output length for all requests.
+        apply_chat_template: Whether to apply the chat template to the prompt.
         random_sample: Whether to randomly sample or take the first N.
 
     Returns:
         List of tuples (prompt, prompt_token_len, output_token_len).
     """
     try:
-        import base64
         import io
 
+        import pybase64
         from datasets import load_dataset
     except ImportError:
         raise ImportError("Please install datasets: pip install datasets")
@@ -712,43 +867,53 @@ def sample_mmmu_requests(
                     # Encode image to base64
                     buffered = io.BytesIO()
                     image.save(buffered, format="JPEG")
-                    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-                    image_path = f"data:image/jpeg;base64,{img_str}"
+                    img_str = pybase64.b64encode(buffered.getvalue()).decode("utf-8")
+                    image_data = f"data:image/jpeg;base64,{img_str}"
                 else:
                     continue
 
                 # Extract the question
                 question = example.get("question")
 
-                # Create the prompt with image, question
+                # Construct the prompt
                 prompt = f"Question: {question}\n\nAnswer: "
-                prompt = tokenizer.apply_chat_template(
-                    [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image_url", "image_url": {"url": image_path}},
-                                {"type": "text", "text": prompt},
+                if apply_chat_template:
+                    try:
+                        prompt = tokenizer.apply_chat_template(
+                            [
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {"url": image_data},
+                                        },
+                                        {"type": "text", "text": prompt},
+                                    ],
+                                }
                             ],
-                        }
-                    ],
-                    add_generation_prompt=True,
-                    tokenize=False,
-                )
-                prompt = f"<image>{image_path}</image>{prompt}"
+                            add_generation_prompt=True,
+                            tokenize=False,
+                        )
+                    except Exception as e:
+                        # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
+                        print(
+                            f"Error applying chat template: {e}, fallback to <image> tag"
+                        )
+                        prompt = f"<image>{prompt}"
 
-                # Calculate token lengths
-                # Note: This is approximate since we're not rendering the actual image tokens
+                # Calculate token lengths for text only (without image data)
                 prompt_token_ids = tokenizer.encode(prompt)
-                prompt_len = (
-                    len(prompt_token_ids) + 512
-                )  # Add estimate for image tokens
+                prompt_len = len(prompt_token_ids)
 
                 output_len = fixed_output_len if fixed_output_len is not None else 256
 
                 filtered_dataset.append(
                     DatasetRow(
-                        prompt=prompt, prompt_len=prompt_len, output_len=output_len
+                        prompt=prompt,
+                        prompt_len=prompt_len,
+                        output_len=output_len,
+                        image_data=image_data,
                     )
                 )
 
@@ -1182,34 +1347,21 @@ async def benchmark(
 
     # Use the first request for all warmup iterations
     test_request = input_requests[0]
-    test_prompt, test_prompt_len, test_output_len = (
-        test_request.prompt,
-        test_request.prompt_len,
-        test_request.output_len,
-    )
+
     if lora_names is not None and len(lora_names) != 0:
         lora_name = lora_names[0]
     else:
         lora_name = None
 
-    if "<image>" in test_prompt:
-        import re
-
-        image_match = re.search(r"<image>(.*?)</image>(.*)", test_prompt)
-        image_data = image_match.group(1) if image_match else None
-        test_prompt = image_match.group(2) if image_match else test_prompt
-    else:
-        image_data = None
-
     # Create the test input once
     test_input = RequestFuncInput(
         model=model_id,
-        prompt=test_prompt,
+        prompt=test_request.prompt,
         api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=min(test_output_len, 32),
+        prompt_len=test_request.prompt_len,
+        output_len=min(test_request.output_len, 32),
         lora_name=lora_name,
-        image_data=image_data,
+        image_data=test_request.image_data,
         extra_request_body=extra_request_body,
     )
 
@@ -1254,36 +1406,23 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate):
-        prompt, prompt_len, output_len = (
-            request.prompt,
-            request.prompt_len,
-            request.output_len,
-        )
         if lora_names is not None and len(lora_names) != 0:
             idx = random.randint(0, len(lora_names) - 1)
             lora_name = lora_names[idx]
         else:
             lora_name = None
 
-        if "<image>" in prompt:
-            import re
-
-            image_match = re.search(r"<image>(.*?)</image>(.*)", prompt)
-            image_data = image_match.group(1) if image_match else None
-            prompt = image_match.group(2) if image_match else prompt
-        else:
-            image_data = None
-
         request_func_input = RequestFuncInput(
             model=model_id,
-            prompt=prompt,
+            prompt=request.prompt,
             api_url=api_url,
-            prompt_len=prompt_len,
-            output_len=output_len,
+            prompt_len=request.prompt_len,
+            output_len=request.output_len,
             lora_name=lora_name,
-            image_data=image_data,
+            image_data=request.image_data,
             extra_request_body=extra_request_body,
         )
+
         tasks.append(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input, pbar=pbar)
@@ -1304,14 +1443,12 @@ async def benchmark(
     if "sglang" in backend:
         server_info = requests.get(base_url + "/get_server_info")
         if server_info.status_code == 200:
-            if pd_separated:
-                accept_length = server_info.json()["decode"][0]["internal_states"][
-                    0
-                ].get("avg_spec_accept_length", None)
-            else:
-                accept_length = server_info.json()["internal_states"][0].get(
-                    "avg_spec_accept_length", None
-                )
+            server_info_json = server_info.json()
+            if "decode" in server_info_json:
+                server_info_json = server_info_json["decode"][0]
+            accept_length = server_info_json["internal_states"][0].get(
+                "avg_spec_accept_length", None
+            )
         else:
             accept_length = None
     else:
@@ -1497,6 +1634,9 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "output_details"):
         args.output_details = False
 
+    if not hasattr(args, "tokenize_prompt"):
+        args.tokenize_prompt = False
+
     print(f"benchmark_args={args}")
 
     # Set global environments
@@ -1507,6 +1647,11 @@ def run_benchmark(args_: argparse.Namespace):
     extra_request_body = {}
     if args.extra_request_body:
         extra_request_body = json.loads(args.extra_request_body)
+
+    if args.tokenize_prompt:
+        assert (
+            args.backend == "sglang"
+        ), "`--tokenize-prompt` only compatible with `--backend sglang` currently"
 
     # Set url
     if args.port is None:
@@ -1538,6 +1683,12 @@ def run_benchmark(args_: argparse.Namespace):
             f"{args.base_url}/v1/completions"
             if args.base_url
             else f"http://{args.host}:{args.port}/v1/completions"
+        )
+    elif args.backend in ["sglang-oai-chat", "vllm-chat", "lmdeploy-chat"]:
+        api_url = (
+            f"{args.base_url}/v1/chat/completions"
+            if args.base_url
+            else f"http://{args.host}:{args.port}/v1/chat/completions"
         )
     elif args.backend == "trt":
         api_url = (
@@ -1618,6 +1769,7 @@ def run_benchmark(args_: argparse.Namespace):
             profile=args.profile,
             pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
+            warmup_requests=args.warmup_requests,
         )
     )
 
@@ -1812,6 +1964,11 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of warmup requests to run before the benchmark",
+    )
+    parser.add_argument(
+        "--tokenize-prompt",
+        action="store_true",
+        help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
     )
 
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")

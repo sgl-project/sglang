@@ -15,11 +15,13 @@ python3 -m sglang.launch_server \
 
 Below the supported models are summarized in a table.
 
-If unsure if a specific architecture is implemented you may look it up via github search for example to search for `Qwen3ForCausalLm` use the expression
+If you are unsure if a specific architecture is implemented, you can search for it via GitHub. For example, to search for `Qwen3ForCausalLM`, use the expression:
+
 ```
-repo:sgl-project/sglang path:/^python\/sglang\/srt\/models\// Qwen3ForCausalLm
+repo:sgl-project/sglang path:/^python\/sglang\/srt\/models\// Qwen3ForCausalLM
 ```
-in Github search.
+
+in the GitHub search bar.
 
 | Model Family (Variants)             | Example HuggingFace Identifier                     | Description                                                                            |
 |-------------------------------------|--------------------------------------------------|----------------------------------------------------------------------------------------|

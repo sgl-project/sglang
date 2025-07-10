@@ -23,8 +23,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
+from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.utils import (
+    align,
     direct_register_custom_op,
     get_device_core_count,
     get_device_name,
@@ -42,10 +43,6 @@ if _is_cuda:
         sgl_per_tensor_quant_fp8,
         sgl_per_token_group_quant_fp8,
         sgl_per_token_quant_fp8,
-    )
-
-    from sglang.srt.layers.quantization.deep_gemm import (
-        gemm_nt_f8f8bf16 as deep_gemm_gemm_nt_f8f8bf16,
     )
 
 logger = logging.getLogger(__name__)
@@ -67,7 +64,6 @@ else:
     fp8_max = torch.finfo(fp8_dtype).max
 fp8_min = -fp8_max
 
-
 if supports_custom_op():
 
     def deep_gemm_fp8_fp8_bf16_nt(
@@ -77,7 +73,7 @@ if supports_custom_op():
         Bs: torch.Tensor,
         C: torch.Tensor,
     ) -> None:
-        deep_gemm_gemm_nt_f8f8bf16((A, As), (B, Bs), C)
+        deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
     def deep_gemm_fp8_fp8_bf16_nt_fake(
         A: torch.Tensor,
@@ -280,6 +276,7 @@ def sglang_per_token_group_quant_fp8(
     eps: float = 1e-10,
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
+    scale_ue8m0: bool = False,
 ):
     assert (
         x.shape[-1] % group_size == 0
@@ -287,8 +284,21 @@ def sglang_per_token_group_quant_fp8(
     assert x.is_contiguous(), "`x` is not contiguous"
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
-    if column_major_scales:
+    if scale_ue8m0:
+        assert column_major_scales and scale_tma_aligned
+        x_q_mn, x_q_k = x.shape
+        x_s_mn, x_s_k = x_q_mn, x_q_k // 128
+        aligned_mn = align(x_s_mn, 4)
+        aligned_k = align(x_s_k, 4)
+        # TODO(FIXME): Fix cuda kernel and recover here to empty.
+        x_s = torch.zeros(
+            (aligned_k // 4, aligned_mn),
+            device=x.device,
+            dtype=torch.int,
+        ).transpose(0, 1)[:x_s_mn, :]
+    elif column_major_scales:
         if scale_tma_aligned:
+            # TODO extract "align" function
             # aligned to 4 * sizeof(float)
             aligned_size = (x.shape[-2] + 3) // 4 * 4
             x_s = torch.empty(
@@ -309,7 +319,9 @@ def sglang_per_token_group_quant_fp8(
             dtype=torch.float32,
         )
     if x.shape[0] > 0:
-        sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
+        sgl_per_token_group_quant_fp8(
+            x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+        )
 
     return x_q, x_s
 
@@ -740,7 +752,76 @@ if _is_hip:
             return _w8a8_block_fp8_matmul
 
 
-def w8a8_block_fp8_matmul(
+def prepare_block_fp8_matmul_inputs(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: List[int],
+    output_dtype: torch.dtype = torch.float16,
+) -> Tuple[int, int, int]:
+    assert len(block_size) == 2
+    block_n, block_k = block_size[0], block_size[1]
+
+    assert A.shape[-1] == B.shape[-1]
+    assert A.shape[:-1] == As.shape[:-1]
+    assert A.is_contiguous()
+
+    if As.dtype == torch.float:
+        assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+    elif As.dtype == torch.int:
+        assert (
+            triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1]
+        ), f"{A.shape=} {As.shape=} {block_size=}"
+    else:
+        raise NotImplementedError
+
+    M = A.numel() // A.shape[-1]
+
+    assert B.ndim == 2
+    assert B.is_contiguous()
+    assert Bs.ndim == 2
+    N, K = B.shape
+
+    if Bs.dtype == torch.float:
+        assert triton.cdiv(N, block_n) == Bs.shape[0]
+        assert triton.cdiv(K, block_k) == Bs.shape[1]
+    elif Bs.dtype == torch.int:
+        assert N == Bs.shape[0], f"{B.shape=} {Bs.shape=} {block_size=}"
+        assert (
+            triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1]
+        ), f"{B.shape=} {Bs.shape=} {block_size=}"
+    else:
+        raise NotImplementedError
+
+    C_shape = A.shape[:-1] + (N,)
+    C = A.new_empty(C_shape, dtype=output_dtype)
+
+    return M, N, K, C
+
+
+def w8a8_block_fp8_matmul_deepgemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: List[int],
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
+
+    # Deepgemm only supports output tensor type as bfloat16
+    assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+
+    if supports_custom_op():
+        torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
+    else:
+        deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
+
+    return C
+
+
+def w8a8_block_fp8_matmul_triton(
     A: torch.Tensor,
     B: torch.Tensor,
     As: torch.Tensor,
@@ -764,79 +845,79 @@ def w8a8_block_fp8_matmul(
     Returns:
         torch.Tensor: The result of matmul.
     """
-    assert len(block_size) == 2
-    block_n, block_k = block_size[0], block_size[1]
 
-    assert A.shape[-1] == B.shape[-1]
-    assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
-    assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
-    M = A.numel() // A.shape[-1]
+    M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
 
-    assert B.ndim == 2 and B.is_contiguous() and Bs.ndim == 2
-    N, K = B.shape
-    assert triton.cdiv(N, block_n) == Bs.shape[0]
-    assert triton.cdiv(K, block_k) == Bs.shape[1]
+    block_n, block_k = block_size
 
-    C_shape = A.shape[:-1] + (N,)
-    C = A.new_empty(C_shape, dtype=output_dtype)
-
-    # deepgemm only support bf16
-    if C.dtype == torch.bfloat16 and _ENABLE_JIT_DEEPGEMM:
-        if supports_custom_op():
-            torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
-        else:
-            deep_gemm_gemm_nt_f8f8bf16((A, As), (B, Bs), C)
+    configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
+    if configs:
+        # If an optimal configuration map has been found, look up the
+        # optimal config
+        config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
     else:
-        configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
-        if configs:
-            # If an optimal configuration map has been found, look up the
-            # optimal config
-            config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
-        else:
-            # Default config
-            # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
-            config = {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": block_size[0],
-                "BLOCK_SIZE_K": block_size[1],
-                "GROUP_SIZE_M": 32,
-                "num_warps": 4,
-                "num_stages": 3,
-            }
+        # Default config
+        # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
+        config = {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": block_size[0],
+            "BLOCK_SIZE_K": block_size[1],
+            "GROUP_SIZE_M": 32,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
 
-        def grid(META):
-            return (
-                triton.cdiv(M, META["BLOCK_SIZE_M"])
-                * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-            )
-
-        kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
-
-        kernel[grid](
-            A,
-            B,
-            C,
-            As,
-            Bs,
-            M,
-            N,
-            K,
-            block_n,
-            block_k,
-            A.stride(-2),
-            A.stride(-1),
-            B.stride(1),
-            B.stride(0),
-            C.stride(-2),
-            C.stride(-1),
-            As.stride(-2),
-            As.stride(-1),
-            Bs.stride(1),
-            Bs.stride(0),
-            **config,
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
 
+    kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
+
+    kernel[grid](
+        A,
+        B,
+        C,
+        As,
+        Bs,
+        M,
+        N,
+        K,
+        block_n,
+        block_k,
+        A.stride(-2),
+        A.stride(-1),
+        B.stride(1),
+        B.stride(0),
+        C.stride(-2),
+        C.stride(-1),
+        As.stride(-2),
+        As.stride(-1),
+        Bs.stride(1),
+        Bs.stride(0),
+        **config,
+    )
+
     return C
+
+
+# universal entry point, for testing purposes
+def w8a8_block_fp8_matmul(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: List[int],
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    if output_dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        return w8a8_block_fp8_matmul_deepgemm(
+            A, B, As, Bs, block_size, output_dtype=output_dtype
+        )
+
+    return w8a8_block_fp8_matmul_triton(
+        A, B, As, Bs, block_size, output_dtype=output_dtype
+    )
 
 
 @triton.jit

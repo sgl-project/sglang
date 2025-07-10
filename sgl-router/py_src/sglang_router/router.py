@@ -15,6 +15,7 @@ class Router:
             - PolicyType.Random: Randomly select workers
             - PolicyType.RoundRobin: Distribute requests in round-robin fashion
             - PolicyType.CacheAware: Distribute requests based on cache state and load balance
+            - PolicyType.PowerOfTwo: Select best of two random workers based on load (PD mode only)
         host: Host address to bind the router server. Default: '127.0.0.1'
         port: Port number to bind the router server. Default: 3001
         worker_startup_timeout_secs: Timeout in seconds for worker startup. Default: 300
@@ -28,10 +29,10 @@ class Router:
             AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 1.0001
         eviction_interval_secs: Interval in seconds between cache eviction operations in cache-aware
             routing. Default: 60
-        max_payload_size: Maximum payload size in bytes. Default: 4MB
+        max_payload_size: Maximum payload size in bytes. Default: 256MB
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
-        verbose: Enable verbose logging. Default: False
         log_dir: Directory to store log files. If None, logs are only output to console. Default: None
+        log_level: Logging level. Options: 'debug', 'info', 'warning', 'error', 'critical'.
         service_discovery: Enable Kubernetes service discovery. When enabled, the router will
             automatically discover worker pods based on the selector. Default: False
         selector: Dictionary mapping of label keys to values for Kubernetes pod selection.
@@ -40,6 +41,15 @@ class Router:
             worker URLs using this port. Default: 80
         service_discovery_namespace: Kubernetes namespace to watch for pods. If not provided,
             watches pods across all namespaces (requires cluster-wide permissions). Default: None
+        prefill_selector: Dictionary mapping of label keys to values for Kubernetes pod selection
+            for prefill servers (PD mode only). Default: {}
+        decode_selector: Dictionary mapping of label keys to values for Kubernetes pod selection
+            for decode servers (PD mode only). Default: {}
+        prometheus_port: Port to expose Prometheus metrics. Default: None
+        prometheus_host: Host address to bind the Prometheus metrics server. Default: None
+        pd_disaggregation: Enable PD (Prefill-Decode) disaggregated mode. Default: False
+        prefill_urls: List of (url, bootstrap_port) tuples for prefill servers (PD mode only)
+        decode_urls: List of URLs for decode servers (PD mode only)
     """
 
     def __init__(
@@ -55,16 +65,27 @@ class Router:
         balance_rel_threshold: float = 1.0001,
         eviction_interval_secs: int = 60,
         max_tree_size: int = 2**24,
-        max_payload_size: int = 4 * 1024 * 1024,  # 4MB
-        verbose: bool = False,
+        max_payload_size: int = 256 * 1024 * 1024,  # 256MB
         log_dir: Optional[str] = None,
+        log_level: Optional[str] = None,
         service_discovery: bool = False,
         selector: Dict[str, str] = None,
         service_discovery_port: int = 80,
         service_discovery_namespace: Optional[str] = None,
+        prefill_selector: Dict[str, str] = None,
+        decode_selector: Dict[str, str] = None,
+        prometheus_port: Optional[int] = None,
+        prometheus_host: Optional[str] = None,
+        pd_disaggregation: bool = False,
+        prefill_urls: Optional[List[tuple]] = None,
+        decode_urls: Optional[List[str]] = None,
     ):
         if selector is None:
             selector = {}
+        if prefill_selector is None:
+            prefill_selector = {}
+        if decode_selector is None:
+            decode_selector = {}
 
         self._router = _Router(
             worker_urls=worker_urls,
@@ -79,12 +100,19 @@ class Router:
             eviction_interval_secs=eviction_interval_secs,
             max_tree_size=max_tree_size,
             max_payload_size=max_payload_size,
-            verbose=verbose,
             log_dir=log_dir,
+            log_level=log_level,
             service_discovery=service_discovery,
             selector=selector,
             service_discovery_port=service_discovery_port,
             service_discovery_namespace=service_discovery_namespace,
+            prefill_selector=prefill_selector,
+            decode_selector=decode_selector,
+            prometheus_port=prometheus_port,
+            prometheus_host=prometheus_host,
+            pd_disaggregation=pd_disaggregation,
+            prefill_urls=prefill_urls,
+            decode_urls=decode_urls,
         )
 
     def start(self) -> None:

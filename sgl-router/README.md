@@ -1,17 +1,16 @@
 # SGLang Router
 
-SGLang router is a standalone module implemented in Rust to achieve data parallelism across SGLang instances.
+SGLang router is a standalone Rust module that enables data parallelism across SGLang instances, providing high-performance request routing and advanced load balancing. The router supports multiple load balancing algorithms including cache-aware, power of two, random, and round robin, and acts as a specialized load balancer for prefill-decode disaggregated serving architectures.
 
-## User docs
+## Documentation
 
-Please check https://docs.sglang.ai/router/router.html
+- **User Guide**: [docs.sglang.ai/router/router.html](https://docs.sglang.ai/router/router.html)
 
-## Developer docs
+## Quick Start
 
 ### Prerequisites
 
-- Rust and Cargo installed
-
+**Rust and Cargo:**
 ```bash
 # Install rustup (Rust installer and version manager)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -24,123 +23,259 @@ rustc --version
 cargo --version
 ```
 
-- Python with pip installed
+**Python with pip installed**
 
+### Installation
 
-### Build Process
-
-#### 1. Build Rust Project
-
+#### Option A: Build and Install Wheel (Recommended)
 ```bash
-$ cargo build
+# Install build dependencies
+pip install setuptools-rust wheel build
+
+# Build the wheel package
+python -m build
+
+# Install the generated wheel
+pip install dist/*.whl
+
+# One-liner for development (rebuild + install)
+python -m build && pip install --force-reinstall dist/*.whl
 ```
 
-#### 2. Build Python Binding
-
-##### Option A: Build and Install Wheel
-1. Build the wheel package:
+#### Option B: Development Mode
 ```bash
-$ pip install setuptools-rust wheel build
-$ python -m build
+pip install -e .
 ```
 
-2. Install the generated wheel:
-```bash
-$ pip install <path-to-wheel>
-```
+⚠️ **Warning**: Editable installs may suffer performance degradation. Use wheel builds for performance testing.
 
-If you want one handy command to do build + install for every change you make:
+### Basic Usage
 
 ```bash
-$ python -m build && pip install --force-reinstall dist/*.whl
+# Build Rust components
+cargo build
+
+# Launch router with worker URLs
+python -m sglang_router.launch_router \
+    --worker-urls http://worker1:8000 http://worker2:8000
 ```
 
-##### Option B: Development Mode
-
-For development purposes, you can install the package in editable mode:
-
-Warning: Using editable python binding can suffer from performance degradation!! Please build a fresh wheel for every update if you want to test performance.
-
-```bash
-$ pip install -e .
-```
-
-**Note:** When modifying Rust code, you must rebuild the wheel for changes to take effect.
+## Configuration
 
 ### Logging
 
-The SGL Router includes structured logging with console output by default. To enable log files:
+Enable structured logging with optional file output:
 
 ```python
-# Enable file logging when creating a router
+from sglang_router import Router
+
+# Console logging (default)
+router = Router(worker_urls=["http://worker1:8000", "http://worker2:8000"])
+
+# File logging enabled
 router = Router(
     worker_urls=["http://worker1:8000", "http://worker2:8000"],
-    log_dir="./logs"  # Daily log files will be created here
+    log_dir="./logs"  # Daily log files created here
 )
 ```
 
-Use the `--verbose` flag with the CLI for more detailed logs.
+Set log level with `--log-level` flag ([documentation](https://docs.sglang.ai/backend/server_arguments.html#logging)).
+
+### Metrics
+
+Prometheus metrics endpoint available at `127.0.0.1:29000` by default.
+
+```bash
+# Custom metrics configuration
+python -m sglang_router.launch_router \
+    --worker-urls http://localhost:8080 http://localhost:8081 \
+    --prometheus-host 0.0.0.0 \
+    --prometheus-port 9000
+```
+
+## Advanced Features
 
 ### Kubernetes Service Discovery
 
-SGL Router supports automatic service discovery for worker nodes in Kubernetes environments. When enabled, the router will automatically:
+Automatic worker discovery and management in Kubernetes environments.
 
-- Discover and add worker pods with matching labels
-- Remove unhealthy or deleted worker pods
-- Dynamically adjust the worker pool based on pod health and availability
-
-#### Command Line Usage
+#### Basic Service Discovery
 
 ```bash
 python -m sglang_router.launch_router \
     --service-discovery \
     --selector app=sglang-worker role=inference \
-    --service-discovery-port 8000 \
     --service-discovery-namespace default
 ```
 
-#### Service Discovery Arguments
+#### PD (Prefill-Decode) Mode
 
-- `--service-discovery`: Enable Kubernetes service discovery feature
-- `--selector`: One or more label key-value pairs for pod selection (format: key1=value1 key2=value2)
-- `--service-discovery-port`: Port to use when generating worker URLs (default: 80)
-- `--service-discovery-namespace`: Optional. Kubernetes namespace to watch for pods. If not provided, watches all namespaces (requires cluster-wide permissions)
+For disaggregated prefill/decode routing:
 
-#### RBAC Requirements
+```bash
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --service-discovery \
+    --prefill-selector app=sglang component=prefill \
+    --decode-selector app=sglang component=decode \
+    --service-discovery-namespace sglang-system
+```
 
-When using service discovery, you must configure proper Kubernetes RBAC permissions:
+#### Kubernetes Pod Configuration
 
-- **If using namespace-scoped discovery** (with `--service-discovery-namespace`):
-  Set up a ServiceAccount, Role, and RoleBinding
+**Prefill Server Pod:**
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sglang-prefill-1
+  labels:
+    app: sglang
+    component: prefill
+  annotations:
+    sglang.ai/bootstrap-port: "9001"  # Optional: Bootstrap port
+spec:
+  containers:
+  - name: sglang
+    image: lmsys/sglang:latest
+    ports:
+    - containerPort: 8000  # Main API port
+    - containerPort: 9001  # Optional: Bootstrap port
+```
 
-- **If watching all namespaces** (without specifying namespace):
-  Set up a ServiceAccount, ClusterRole, and ClusterRoleBinding with permissions to list/watch pods at the cluster level
+**Decode Server Pod:**
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sglang-decode-1
+  labels:
+    app: sglang
+    component: decode
+spec:
+  containers:
+  - name: sglang
+    image: lmsys/sglang:latest
+    ports:
+    - containerPort: 8000
+```
+
+#### RBAC Configuration
+
+**Namespace-scoped (recommended):**
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sglang-router
+  namespace: sglang-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: sglang-system
+  name: sglang-router
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sglang-router
+  namespace: sglang-system
+subjects:
+- kind: ServiceAccount
+  name: sglang-router
+  namespace: sglang-system
+roleRef:
+  kind: Role
+  name: sglang-router
+  apiGroup: rbac.authorization.k8s.io
+```
+
+#### Complete PD Example
+
+```bash
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --service-discovery \
+    --prefill-selector app=sglang component=prefill environment=production \
+    --decode-selector app=sglang component=decode environment=production \
+    --service-discovery-namespace production \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --prometheus-host 0.0.0.0 \
+    --prometheus-port 9090
+```
+
+### Command Line Arguments Reference
+
+#### Service Discovery
+- `--service-discovery`: Enable Kubernetes service discovery
+- `--service-discovery-port`: Port for worker URLs (default: 8000)
+- `--service-discovery-namespace`: Kubernetes namespace to watch
+- `--selector`: Label selectors for regular mode (format: `key1=value1 key2=value2`)
+
+#### PD Mode
+- `--pd-disaggregation`: Enable Prefill-Decode disaggregated mode
+- `--prefill`: Initial prefill server (format: `URL BOOTSTRAP_PORT`)
+- `--decode`: Initial decode server URL
+- `--prefill-selector`: Label selector for prefill pods
+- `--decode-selector`: Label selector for decode pods
+- `--policy`: Routing policy (`cache_aware`, `random`, `power_of_two`)
+
+## Development
+
+### Build Process
+
+```bash
+# Build Rust project
+cargo build
+
+# Build Python binding (see Installation section above)
+```
+
+**Note**: When modifying Rust code, you must rebuild the wheel for changes to take effect.
 
 ### Troubleshooting
 
-1. If rust analyzer is not working in VSCode, set `rust-analyzer.linkedProjects` to the absolute path of `Cargo.toml` in your repo. For example:
+**VSCode Rust Analyzer Issues:**
+Set `rust-analyzer.linkedProjects` to the absolute path of `Cargo.toml`:
 
 ```json
 {
-  "rust-analyzer.linkedProjects":  ["/workspaces/sglang/sgl-router/Cargo.toml"]
+  "rust-analyzer.linkedProjects": ["/workspaces/sglang/sgl-router/Cargo.toml"]
 }
 ```
 
-### CI/CD Setup
+### CI/CD Pipeline
 
-The continuous integration pipeline consists of three main steps:
+The continuous integration pipeline includes comprehensive testing, benchmarking, and publishing:
 
-#### 1. Build Wheels
-- Uses `cibuildwheel` to create manylinux x86_64 packages
-- Compatible with major Linux distributions (Ubuntu, CentOS, etc.)
-- Additional configurations can be added to support other OS/architectures
-- Reference: [cibuildwheel documentation](https://cibuildwheel.pypa.io/en/stable/)
+#### Build & Test
+1. **Build Wheels**: Uses `cibuildwheel` for manylinux x86_64 packages
+2. **Build Source Distribution**: Creates source distribution for pip fallback
+3. **Rust HTTP Server Benchmarking**: Performance testing of router overhead
+4. **Basic Inference Testing**: End-to-end validation through the router
+5. **PD Disaggregation Testing**: Benchmark and sanity checks for prefill-decode load balancing
 
-#### 2. Build Source Distribution
-- Creates a source distribution containing the raw, unbuilt code
-- Enables `pip` to build the package from source when prebuilt wheels are unavailable
+#### Publishing
+- **PyPI Publishing**: Wheels and source distributions are published only when the version changes in `pyproject.toml`
+- **Container Images**: Docker images published using `/docker/Dockerfile.router`
 
-#### 3. Publish to PyPI
-- Uploads both wheels and source distribution to PyPI
+## Features
 
-The CI configuration is based on the [tiktoken workflow](https://github.com/openai/tiktoken/blob/63527649963def8c759b0f91f2eb69a40934e468/.github/workflows/build_wheels.yml#L1).
+- **High Performance**: Rust-based routing with connection pooling and optimized request handling
+- **Advanced Load Balancing**: Multiple algorithms including:
+  - **Cache-Aware**: Intelligent routing based on cache locality for optimal performance
+  - **Power of Two**: Chooses the less loaded of two randomly selected workers
+  - **Random**: Distributes requests randomly across available workers
+  - **Round Robin**: Sequential distribution across workers in rotation
+- **Prefill-Decode Disaggregation**: Specialized load balancing for separated prefill and decode servers
+- **Service Discovery**: Automatic Kubernetes worker discovery and health management
+- **Monitoring**: Comprehensive Prometheus metrics and structured logging
+- **Scalability**: Handles thousands of concurrent connections with efficient resource utilization
