@@ -148,6 +148,8 @@ def load_model(server_args, port_args, tp_rank):
         tp_size=server_args.tp_size,
         pp_rank=0,
         pp_size=1,
+        dp_rank=0,
+        dp_size=1,
         nccl_port=port_args.nccl_port,
         server_args=server_args,
     )
