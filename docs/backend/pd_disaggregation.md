@@ -108,7 +108,27 @@ $ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 ---di
 
 ## How to Tune the Ratio Between Prefill and Decode Nodes
 The process can be broken down into the following steps:
-1. First, measure the offline throughput of the prefill and decode nodes individually. For detailed instructions on how to conduct the tests, refer to this [guide](https://github.com/sgl-project/sglang/issues/6017#issue-3038593336)
+1. First, measure the offline throughput of the prefill and decode nodes individually.
+
+    Benchmark for prefill nodes
+    ``` python
+    # benchmark
+    python3 -m sglang.bench_one_batch_server --model-path ${model_path} --base-url ${lb_url} --batch-size 8192 --input-len 4096 --output-len 5 --skip-warmup
+    ```
+
+    Benchmark for decode nodes
+    + The example below demonstrates how to use the slow_down debug feature to stress test decode nodes when there are not enough prefill nodes. If your test workload has enough prefill nodes, slow_down steps can be omitted.
+    ``` python
+    # slow down D nodes
+    curl -H "Content-Type: application/json" -d '{"forward_sleep_time": 90.0}' -X POST "http://YOUR_FIRST_DECODE_NODE_IP:30000/slow_down"
+
+    # start benchmark; do not wait for this to finish before running the next line
+    python3 -m sglang.bench_one_batch_server --model-path ${model_path} --base-url ${lb_url} --batch-size 40000 --input-len 2000 --output-len 100 --skip-warmup
+
+    # after some time (e.g. 10 minute), the D nodes are saturated, then this command should be executed
+    # finish slowing down D nodes
+    curl -H "Content-Type: application/json" -d '{"forward_sleep_time": null}' -X POST "http://YOUR_FIRST_DECODE_NODE_IP:30000/slow_down"
+    ```
 2. In many online serving scenarios, there are latency constraints in terms of **Time to First Token**(TTFT) and **Time Per Output Token** (TPOT). It is necessary to adjust the server arguments (server_args) for both prefill and decode nodes.
     + **Prefill**: It is recommended to increase ratio between `--tp-size` and `--dp-size` or decrease `--chunked-prefill-size` until the TTFT meets the requirement.
     + **Decode**: It is recommended to increase ratio between `--tp-size` and `--dp-size` or decrease `--max-running-requests` until the TPOT meets the requirement.
