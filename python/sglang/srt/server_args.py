@@ -154,6 +154,8 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     enable_flashinfer_moe: bool = False
+    enable_w4_mxfp4_moe: bool = False
+    enable_w4a8_mxfp4_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -1190,6 +1192,16 @@ class ServerArgs:
             "--enable-deepep-moe",
             action="store_true",
             help="Enabling DeepEP MoE implementation for EP MoE.",
+        )
+        parser.add_argument(
+            "--enable-w4-mxfp4-moe",
+            action="store_true",
+            help="Enable w4_mxfp4 MoE implementation.",
+        )
+        parser.add_argument(
+            "--enable-w4a8-mxfp4-moe",
+            action="store_true",
+            help="Enable w4a8_mxfp4 MoE implementation.",
         )
         parser.add_argument(
             "--deepep-mode",
