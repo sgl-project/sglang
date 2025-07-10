@@ -547,11 +547,11 @@ async def update_weights_from_distributed(
 @app.post("/convert_pd_role")
 async def convert_pd_role():
     """Update model parameter from distributed online."""
-    success, message = (
+    success, message, bootstrap_port = (
         await _global_state.tokenizer_manager.convert_pd_role()
     )
     logger.info(f"{message}")
-    content = {"success": success, "message": message}
+    content = {"success": success, "message": message, "bootstrap_port": bootstrap_port}
     if success:
         return ORJSONResponse(content, status_code=200)
     else:

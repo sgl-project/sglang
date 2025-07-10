@@ -257,12 +257,7 @@ class PrefillBootstrapQueue:
             return bootstrapped_reqs, failed_reqs
 
     def __del__(self):
-        if len(self.queue) > 0:
-            raise RuntimeError("This could not happen")
-        else:
-            del self.kv_manager
-            del self.req_to_metadata_buffer_idx_allocator
-            del self.metadata_buffers
+        del self.kv_manager
 
 class SchedulerDisaggregationPrefillMixin:
     """
@@ -276,8 +271,6 @@ class SchedulerDisaggregationPrefillMixin:
         while not self.stop_prefill_event.is_set():
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            if self.stop_prefill_event.is_set():
-                break
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -304,6 +297,8 @@ class SchedulerDisaggregationPrefillMixin:
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
             # Otherwise, it hangs under high concurrency
             self.running_batch.batch_is_full = False
+        self.flush_disaggregation_resources()
+        del self.stop_prefill_event
 
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
@@ -312,8 +307,6 @@ class SchedulerDisaggregationPrefillMixin:
         while not self.stop_prefill_event.is_set():
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            if self.stop_prefill_event.is_set():
-                break
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -356,6 +349,8 @@ class SchedulerDisaggregationPrefillMixin:
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
             # Otherwise, it hangs under high concurrency
             self.running_batch.batch_is_full = False
+        self.flush_disaggregation_resources()
+        del self.stop_prefill_event
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,

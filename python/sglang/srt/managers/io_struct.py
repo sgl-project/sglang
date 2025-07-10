@@ -764,7 +764,7 @@ class UpdateWeightsFromDistributedReqOutput:
 
 @dataclass
 class ConvertDisaggregationRoleReqInput:
-    pass
+    bootstrap_port:Optional[int] = None
 
 @dataclass
 class ConvertDisaggregationRoleReqOutput:

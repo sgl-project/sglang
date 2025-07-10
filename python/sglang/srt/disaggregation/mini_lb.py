@@ -66,8 +66,8 @@ class MiniLoadBalancer:
         del self.prefill_configs[index_to_remove]
         del self.prefill_servers[index_to_remove]
 
-    def remove_decode_server(self, decode_server: str):
-        self.decode_servers.remove(decode_server)
+    def remove_decode_server(self, decode_url: str):
+        self.decode_servers.remove(decode_url)
 
     def select_pair(self):
         # TODO: return some message instead of panic
@@ -412,7 +412,6 @@ async def convert_pd_role(obj: PDConvertRequest):
     """ Convert identity of a PD server """
     server_url = obj.server_url
     if server_url in load_balancer.prefill_servers:
-        logger.info(f"Converting prefill to decode : {server_url}")
         if len(load_balancer.prefill_servers) <= 1:
             raise HTTPException(
                 status_code=400,
@@ -422,7 +421,6 @@ async def convert_pd_role(obj: PDConvertRequest):
         load_balancer.remove_prefill_server(server_url)
         logger.info(f"Stop sending req to {server_url}.Waiting for prefill to finish all reqs.")
     elif server_url in load_balancer.decode_servers:
-        logger.info(f"Converting decode to prefill : {server_url}")
         if len(load_balancer.decode_servers) <= 1:
             raise HTTPException(
                 status_code=500,
@@ -436,10 +434,41 @@ async def convert_pd_role(obj: PDConvertRequest):
             status_code=500,
             detail=f"Invalid URL:{server_url}. The server may be not registered.",
         )
+    # flush the cache first, when flush cache is success, then we can try to convert pd role
+    # wait 10s for server to finish all requests
+    max_tries = 10
     async with aiohttp.ClientSession() as session:
-        response = await session.post(f"{server_url}/convert_pd_role")
+        try:
+            while max_tries > 0:
+                response = await session.post(f"{server_url}/flush_cache")
+                if response.status == 200:
+                    break
+                else:
+                    logger.warning(
+                        f"There are some request to server {server_url} haven't been done. Waiting..."
+                    )
+                max_tries -= 1
+                await asyncio.sleep(1)
+        except:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Wait 10s for server: {server_url} to finish all reqs. "
+                f"May be caused by: 1. Server is not stuck, 2. 10s is not enough for server to finish all reqs.",
+            )
+    logger.info(f"All requests to {server_url} have been done, now converting role...")
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            response = await session.post(f"{server_url}/convert_pd_role")
+            content = await response.json()
+            if content["message"] != "bootstrap":
+                break
+            else:
+                logger.info("Have some requests bootstrapping, waiting...")
+                await asyncio.sleep(1)
+    # wait scheduler ready
+    await asyncio.sleep(5)
     
-    content = await response.json()
     if content["success"]:
         if current_role == "prefill":
             load_balancer.add_decode_server(server_url)
@@ -447,6 +476,7 @@ async def convert_pd_role(obj: PDConvertRequest):
         else:
             load_balancer.add_prefill_server(PrefillConfig(url=server_url, bootstrap_port=content["bootstrap_port"]))
             logger.info(f"Converted decode server to prefill: {server_url}")
+            logger.info(f"prefill server bootstrap port: {content['bootstrap_port']}")
         return Response(status_code=200)
     else:
         raise HTTPException(

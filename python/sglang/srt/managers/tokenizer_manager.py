@@ -116,7 +116,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, is_port_available
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
     get_bool_env_var,
@@ -1127,19 +1127,43 @@ class TokenizerManager:
         return [res.internal_state for res in responses]
 
     async def convert_pd_role(self) -> Tuple[bool, str]:
-        
-        req= ConvertDisaggregationRoleReqInput()
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            # start a bootstarp server first
+            kv_bootstrap_server_class = get_kv_class(
+                self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER
+            )
+            # find a free port
+            bootstrap_port = 8998
+            while True:
+                if is_port_available(bootstrap_port):
+                    break
+                else:
+                    bootstrap_port += 1
+            self.bootstrap_server = kv_bootstrap_server_class(
+                bootstrap_port,
+            )
+            self.server_args.disaggregation_bootstrap_port = bootstrap_port
+            req = ConvertDisaggregationRoleReqInput(bootstrap_port=bootstrap_port)
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            req = ConvertDisaggregationRoleReqInput()
+        else:
+            return False, "Not support converting disaggregation of 'null'", None
+
         responses: List[ConvertDisaggregationRoleReqOutput] = (
             await self.convert_pd_role_communicator(req)
         )
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # stop the bootstrap server then
-            self.bootstrap_server.close()
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            pass
+            if responses[0].success:
+                # stop the bootstrap server then
+                await asyncio.sleep(2)
+                self.bootstrap_server.close()
+                del self.bootstrap_server
+                self.disaggregation_mode = DisaggregationMode.DECODE
+            return responses[0].success, responses[0].message, None
         else:
-            return False, "The role of this server is null, can not convert it."
-        return responses[0].success, responses[0].message
+            self.disaggregation_mode = DisaggregationMode.PREFILL
+            return responses[0].success, responses[0].message, bootstrap_port
 
     def get_log_request_metadata(self):
         max_length = None

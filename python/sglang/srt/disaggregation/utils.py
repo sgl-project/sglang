@@ -309,6 +309,9 @@ class PDRegistryRequest:
 class PDConvertRequest:
     """A request to convert identity of a PD server"""
     server_url: str
+    # if convert decode to prefill,these two parameters are required
+    prefill_tp_size:Optional[int] = None
+    prefill_dp_size:Optional[int] = None
     def __post_init__(self):
         if not self.server_url:
             raise ValueError("URL must be provided for PDConvertRequest.")

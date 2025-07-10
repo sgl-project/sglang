@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
+    DecodeReqToTokenPool,
 )
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.prefill import (
@@ -134,6 +135,7 @@ from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -161,7 +163,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+import gc
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
@@ -342,6 +344,7 @@ class Scheduler(
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
         )
+        self.port_args = port_args
 
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
@@ -655,13 +658,13 @@ class Scheduler(
                 kv_events_config, self.attn_dp_rank
             )
 
-    def init_disaggregation(self,convert=None):
+    def init_disaggregation(self):
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
 
         if (
-            self.disaggregation_mode == DisaggregationMode.DECODE or convert == DisaggregationMode.DECODE
+            self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
             self.stop_decode_event = threading.Event()
             buffer_size = (self.req_to_token_pool.size) * 2
@@ -714,7 +717,7 @@ class Scheduler(
             # Metric for pre-allocation
             self.num_tokens_pre_allocated = 0
 
-        elif self.disaggregation_mode == DisaggregationMode.PREFILL or convert == DisaggregationMode.PREFILL:
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             self.stop_prefill_event = threading.Event()
 
@@ -2643,66 +2646,179 @@ class Scheduler(
 
     def convert_disaggregation_role(self, recv_req: ConvertDisaggregationRoleReqInput):
         """Convert the disaggregation role of the scheduler."""
+        self.flush_cache()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            logger.info("Converting the role of this server to DECODE.")
-            logger.info("Waiting for all requests to finish before converting the role...")
-            
-            while not (len(self.waiting_queue) == 0 and self.running_batch.is_empty() and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))):
-                continue
-
-            logger.info("All requests finished, reset related resources.")
             # stop prefill event loop
+            # if len(self.disagg_prefill_bootstrap_queue.queue) > 0:
+            #     return ConvertDisaggregationRoleReqOutput(
+            #         success=False,
+            #         message="bootstrap",
+            #     )
             self.stop_prefill_event.set()
-            # flush the memory resources
-            self.flush_cache()
-            self.flush_disaggregation_resources()
-            # reinitialize the disaggregation resources for decode
-            self.disaggregation_mode = DisaggregationMode.DECODE
-            self.init_disaggregation()
-            # send back the response
-            # then run_scheduler_process can restart the new event loop
-
             return ConvertDisaggregationRoleReqOutput(
                 success=True,
                 message="The role of this server is now DECODE.",
             )
+            
         else:
-            logger.info("Converting the role of this server to PREFILL.")
+            self.server_args.disaggregation_bootstrap_port = recv_req.bootstrap_port
+            # stop decode event loop
+            self.stop_decode_event.set()
             return ConvertDisaggregationRoleReqOutput(
-                success=False,
-                message="The role of this server is decode, currently can not convert it.",
+                success=True,
+                message="The role of this server is now PREFILL.",
             )
 
     def flush_disaggregation_resources(self):
         logger.info("Flushing disaggregation resources...")
+        print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+        print(f"Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+        
+        del self.req_to_metadata_buffer_idx_allocator
+        del self.disagg_metadata_buffers
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # release queues and kv_manager
+            # print(sys.getrefcount(self.disagg_prefill_bootstrap_queue))
+            
             del self.disagg_prefill_bootstrap_queue
             del self.disagg_prefill_inflight_queue
-            # resize buffers
-            torch.cuda.empty_cache()
-
+            
             # update the req-to-token-pool to DecodeReqToTokenPool
             pool_size=self.req_to_token_pool.size
             pool_max_context_len=self.req_to_token_pool.max_context_len
             pool_device=self.req_to_token_pool.device
             pre_alloc_size = pool_size * 2 if pool_size <= 32 else 0
-            del self.req_to_token_pool
-            self.req_to_token_pool = DecodeReqToTokenPool(
-                size=pool_size,
-                max_context_len=pool_max_context_len,
-                device=pool_device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                pre_alloc_size=pre_alloc_size,
-            )
+            if isinstance(self.tp_worker, TpModelWorkerClient):
+                # three place ref reqtotokenpool, all set None to release Cuda memory
+                # import objgraph
+                # objgraph.show_backrefs([self.tp_worker.worker.model_runner.req_to_token_pool], filename='backrefs.png',max_depth=10)
+                self.req_to_token_pool = None
+                self.tree_cache.req_to_token_pool = None
+                self.tp_worker.worker.model_runner.attn_backend = None
+                gc.collect()
+                torch.cuda.empty_cache()
+                # import objgraph
+                # objgraph.show_backrefs([self.tp_worker.worker.model_runner.req_to_token_pool], filename='backrefs2.png',max_depth=10)
+                del self.tp_worker.worker.model_runner.req_to_token_pool
+                gc.collect()
+                torch.cuda.empty_cache()
+                print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+                print(f"Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+                self.tp_worker.worker.model_runner.req_to_token_pool = DecodeReqToTokenPool(
+                    size=pool_size,
+                    max_context_len=pool_max_context_len,
+                    device=pool_device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    pre_alloc_size=pre_alloc_size,
+                )
+                self.tp_worker.worker.model_runner.init_attention_backend()
+                self.req_to_token_pool = self.tp_worker.worker.model_runner.req_to_token_pool
+                gc.collect()
+                torch.cuda.empty_cache()  
+            else:
+                # import objgraph
+                # objgraph.show_backrefs([self.tp_worker.model_runner.req_to_token_pool], filename='backrefs1.png',max_depth=8)
+                self.req_to_token_pool = None
+                self.tree_cache.req_to_token_pool = None
+                self.tp_worker.model_runner.attn_backend = None
+                gc.collect()
+                torch.cuda.empty_cache()
+                # import objgraph
+                # objgraph.show_backrefs([self.tp_worker.model_runner.req_to_token_pool], filename='backrefs3.png',max_depth=8)
+                del self.tp_worker.model_runner.req_to_token_pool
+                
+                print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+                print(f"Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+                self.tp_worker.model_runner.req_to_token_pool = DecodeReqToTokenPool(
+                    size=pool_size,
+                    max_context_len=pool_max_context_len,
+                    device=pool_device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    pre_alloc_size=pre_alloc_size,
+                )
+                self.tp_worker.model_runner.init_attention_backend()
+                self.req_to_token_pool = self.tp_worker.model_runner.req_to_token_pool
+                gc.collect()
+                torch.cuda.empty_cache()
+            
             self.tree_cache.req_to_token_pool = self.req_to_token_pool
+            # reinitialize the disaggregation resources for decode
+            self.disaggregation_mode = DisaggregationMode.DECODE
+            self.init_disaggregation()
+            gc.collect()
+            torch.cuda.empty_cache()
         else:
             del self.disagg_decode_transfer_queue
             del self.disagg_decode_prealloc_queue
             del self.num_tokens_pre_allocated
-            torch.cuda.empty_cache()
-            pass
+
+            # update the DecodeReqToTokenPool to req-to-token-pool
+            pool_size=self.req_to_token_pool.size
+            pool_max_context_len=self.req_to_token_pool.max_context_len
+            pool_device=self.req_to_token_pool.device
+            if isinstance(self.tp_worker, TpModelWorkerClient):
+                # three place ref reqtotokenpool, all set None to release Cuda memory
+                # import objgraph
+                # objgraph.show_backrefs([self.tp_worker.worker.model_runner.req_to_token_pool], filename='backrefs.png',max_depth=10)
+                self.req_to_token_pool = None
+                self.tree_cache.req_to_token_pool = None
+                self.tp_worker.worker.model_runner.attn_backend = None
+                self.running_batch.req_to_token_pool = None
+                gc.collect()
+                torch.cuda.empty_cache()
+                # import objgraph
+                # objgraph.show_backrefs([self.tp_worker.worker.model_runner.req_to_token_pool], filename='backrefs2.png',max_depth=10)
+                print(sys.getrefcount(self.tp_worker.worker.model_runner.req_to_token_pool))
+                del self.tp_worker.worker.model_runner.req_to_token_pool
+                gc.collect()
+                torch.cuda.empty_cache()
+                print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+                print(f"Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+                self.tp_worker.worker.model_runner.req_to_token_pool = ReqToTokenPool(
+                    size=pool_size,
+                    max_context_len=pool_max_context_len,
+                    device=pool_device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                )
+                self.tp_worker.worker.model_runner.init_attention_backend()
+                self.req_to_token_pool = self.tp_worker.worker.model_runner.req_to_token_pool
+                gc.collect()
+                torch.cuda.empty_cache()  
+            else:
+                # import objgraph
+                # objgraph.show_backrefs([self.tp_worker.model_runner.req_to_token_pool], filename='backrefs1.png',max_depth=8)
+                self.req_to_token_pool = None
+                self.tree_cache.req_to_token_pool = None
+                self.tp_worker.model_runner.attn_backend = None
+                self.running_batch.req_to_token_pool = None
+                gc.collect()
+                torch.cuda.empty_cache()
+                # import objgraph
+                # objgraph.show_backrefs([self.tp_worker.model_runner.req_to_token_pool], filename='backrefs3.png',max_depth=8)
+                del self.tp_worker.model_runner.req_to_token_pool
                 
+                print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+                print(f"Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+                self.tp_worker.model_runner.req_to_token_pool = ReqToTokenPool(
+                    size=pool_size,
+                    max_context_len=pool_max_context_len,
+                    device=pool_device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                )
+                self.tp_worker.model_runner.init_attention_backend()
+                self.req_to_token_pool = self.tp_worker.model_runner.req_to_token_pool
+                gc.collect()
+                torch.cuda.empty_cache()
+            self.tree_cache.req_to_token_pool = self.req_to_token_pool
+            self.running_batch.req_to_token_pool = self.req_to_token_pool
+            self.server_args.disaggregation_decode_dp = self.dp_size
+            self.server_args.disaggregation_decode_tp = self.tp_size
+            # reinitialize the disaggregation resources for prefill
+            self.disaggregation_mode = DisaggregationMode.PREFILL
+            self.init_disaggregation()
+
+
     def get_print_prefix(self):
         prefix = ""
         if self.attn_dp_rank is not None:
