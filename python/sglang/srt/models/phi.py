@@ -281,7 +281,6 @@ class PhiForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-
         params_dict = dict(self.named_parameters())
         weights = dict(weights)
         loaded_keys = set()
@@ -296,24 +295,16 @@ class PhiForCausalLM(nn.Module):
                 if packed_name not in name:
                     continue
 
-                # Load and concat packed weights
-                loaded_weights = []
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 for src_name in src_names:
                     full_src_name = name.replace(packed_name, src_name)
-                    if full_src_name not in weights:
-                        # Sometimes the biases are not included in the checkpoint
-                        continue
-                    loaded_weights.append(weights[full_src_name])
-                    loaded_keys.add(full_src_name)
+                    if full_src_name in weights:
+                        loaded_weight = weights[full_src_name]
+                        # The shard_id for QKVParallelLinear is 'q', 'k', 'v'.
+                        shard_id = src_name.split("_")[0]
+                        weight_loader(param, loaded_weight, shard_id)
+                        loaded_keys.add(full_src_name)
 
-                if not loaded_weights:
-                    continue
-
-                # Concatenate along the first dimension
-                loaded_weight = torch.cat(loaded_weights, dim=0)
-
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
                 loaded_keys.add(name)
                 is_packed = True
                 break
