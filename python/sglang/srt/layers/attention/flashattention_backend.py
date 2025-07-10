@@ -24,8 +24,6 @@ from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
-
-
 @dataclass
 class FlashAttentionMetadata:
     """Metadata to be init once in the model forward pass,
