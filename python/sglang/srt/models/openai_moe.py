@@ -13,7 +13,6 @@
 # ==============================================================================
 
 """Inference-only OpenAIMoE model."""
-import einops
 import logging
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
@@ -75,7 +74,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher, model_forward_maybe_tbo
 from sglang.srt.utils import DeepEPMode, add_prefix, is_non_idle_and_non_empty, make_layers
-import sys
 
 OpenAIMoeConfig = None
 
@@ -667,7 +665,6 @@ class OpenAIMoeAttention(nn.Module):
         sinks = sinks.to(torch.float32)
         attn_output = self.attn(*inner_state, sink=sinks)       
         output, _ = self.o_proj(attn_output)
-
         return output
 
     def forward(
