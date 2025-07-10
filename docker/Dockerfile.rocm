@@ -30,7 +30,7 @@ ENV AITER_COMMIT="4738360c65a3c0e10fe6fbe86d54de825a161e87"
 FROM ${GPU_ARCH}
 
 # This is necessary for scope purpose, again
-ARG GPU_ARCH
+ARG GPU_ARCH=gfx950
 ENV GPU_ARCH_LIST=${GPU_ARCH:-${PYTORCH_ROCM_ARCH}}
 
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
@@ -143,4 +143,3 @@ ENV TORCHINDUCTOR_MAX_AUTOTUNE=1
 ENV TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1
 
 CMD ["/bin/bash"]
-
