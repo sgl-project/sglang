@@ -41,4 +41,3 @@ pip install -e "python[srt_npu]"
 ### Modify PyTorch TODO: to be removed later
 TORCH_LOCATION=$(pip show torch | grep Location | awk -F' ' '{print $2}')
 sed -i 's/from triton.runtime.autotuner import OutOfResources/from triton.runtime.errors import OutOfResources/' "${TORCH_LOCATION}/torch/_inductor/runtime/triton_heuristics.py"
-
