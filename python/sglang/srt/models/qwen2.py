@@ -531,6 +531,9 @@ class Qwen2ForCausalLM(nn.Module):
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
 
+            if name.startswith("visual") and name not in params_dict:
+                continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
