@@ -219,6 +219,7 @@ class ServerArgs:
     hicache_write_policy: str = "write_through_selective"
     hicache_io_backend: str = ""
     flashinfer_mla_disable_ragged: bool = False
+    flashinfer_mla_use_cudnn: bool = False
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
@@ -1543,6 +1544,11 @@ class ServerArgs:
             "--flashinfer-mla-disable-ragged",
             action="store_true",
             help="Not using ragged prefill wrapper when running flashinfer mla",
+        )
+        parser.add_argument(
+            "--flashinfer-mla-use-cudnn",
+            action="store_true",
+            help="Not using cudnn for prefill when running flashinfer mla",
         )
         parser.add_argument(
             "--disable-shared-experts-fusion",
