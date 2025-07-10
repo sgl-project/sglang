@@ -839,6 +839,8 @@ class InitWeightsUpdateGroupReqInput:
     group_name: str = "weight_update_group"
     # The backend
     backend: str = "nccl"
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
 
 
 @dataclass
