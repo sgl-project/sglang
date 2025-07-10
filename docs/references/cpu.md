@@ -11,7 +11,7 @@ including the most notable open-source models like Llama series, Qwen series,
 and the phenomenal high-quality reasoning model DeepSeek-R1.
 
 | Model Name | BF16 | w8a8_int8 | w4a16 | FP8 |
-|:---:|:---:|:---:|:---:|
+|:---:|:---:|:---:|:---:|:---:|
 | DeepSeek-R1 |   | meituan/DeepSeek-R1-Channel-INT8 |   | deepseek-ai/DeepSeek-R1 |
 | Llama-3.2-3B | meta-llama/Llama-3.2-3B-Instruct | RedHatAI/Llama-3.2-3B-quantized.w8a8 | AMead10/Llama-3.2-3B-Instruct-AWQ |   |
 
