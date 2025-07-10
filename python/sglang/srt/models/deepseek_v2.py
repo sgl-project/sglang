@@ -1870,6 +1870,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         can_fuse_mlp_allreduce = (
             self._should_fuse_mlp_allreduce_with_next_layer(forward_batch) and
             not (self.enable_dp_attention and self.speculative_algorithm.is_eagle())
+            and not self.is_nextn
         )
         
         hidden_states = self.mlp(hidden_states, forward_batch, can_fuse_mlp_allreduce)
