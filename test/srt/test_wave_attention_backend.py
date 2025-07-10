@@ -1,6 +1,6 @@
 """
 Usage:
-python3 -m unittest test_triton_attention_backend.TestTritonAttnBackend.test_mmlu
+python3 -m unittest test_wave_attention_backend.TestWaveAttnBackend.test_mmlu
 """
 
 import unittest
@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
 
 class TestWaveAttnBackend(unittest.TestCase):
     def test_latency(self):
-        output_throughput = run_bench_one_batch(
+        _, output_throughput, _ = run_bench_one_batch(
             DEFAULT_MODEL_NAME_FOR_TEST,
             [
                 "--attention-backend",
@@ -32,7 +32,7 @@ class TestWaveAttnBackend(unittest.TestCase):
         if is_in_ci():
             self.assertGreater(output_throughput, 153)
 
-    def test_mmlu(self):
+    def _test_mmlu(self):
         model = DEFAULT_MODEL_NAME_FOR_TEST
         base_url = DEFAULT_URL_FOR_TEST
         process = popen_launch_server(

@@ -1,38 +1,20 @@
-# Copyright 2023-2024 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
 """
 Memory-efficient attention for prefill.
-It supporst page size = 1.
+It support page size = 1.
 """
-
-# Adapted from
-# https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py#L1
 
 import math
 import os
 
-import iree.turbine.kernel as tk
-import torch
-from iree.turbine.kernel.lang.global_symbols import *
-from iree.turbine.kernel.wave.compile import WaveCompileOptions, wave_compile
-from iree.turbine.kernel.wave.constraints import MMAType
-from iree.turbine.kernel.wave.templates.attention_common import AttentionShape
-from iree.turbine.kernel.wave.templates.prefill_attention import (
+from wave_lang.kernel.lang.global_symbols import *
+from wave_lang.kernel.wave.compile import WaveCompileOptions, wave_compile
+from wave_lang.kernel.wave.constraints import MMAType
+from wave_lang.kernel.wave.templates.attention_common import AttentionShape
+from wave_lang.kernel.wave.templates.prefill_attention import (
     get_prefill_attention_kernel,
 )
-from iree.turbine.kernel.wave.utils.general_utils import get_default_scheduling_params
-from iree.turbine.kernel.wave.utils.run_utils import set_default_run_config
+from wave_lang.kernel.wave.utils.general_utils import get_default_scheduling_params
+from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
 
 dump_generated_mlir = int(os.environ.get("WAVE_DUMP_MLIR", 0))
 
@@ -41,8 +23,6 @@ def prefill_attention_wave(
     q, k, v, o, b_start_loc, b_seq_len, max_seq_len, is_causal=True
 ):
 
-    # if not is_causal:
-    #     raise NotImplementedError("non causal mask not supported yet on prefill_attention wave backend.")
     shape = AttentionShape(
         num_query_heads=q.shape[1],
         num_kv_heads=k.shape[1],
@@ -84,8 +64,6 @@ def prefill_attention_wave(
     options = set_default_run_config(options)
     prefill = wave_compile(options, prefill)
 
-    # TODO: Add scaling of QK as part of kernel.
-    # TODO: Add variant of non-transposed V attention kernel.
     mb = prefill(
         q * dk_sqrt * log2e,
         k,
