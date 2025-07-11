@@ -237,11 +237,18 @@ class DecodePreallocQueue:
                     self.transfer_backend, KVClassType.RECEIVER
                 )
 
+            if req.prefix_indices.numel() == 0:
+                prefix_ids = req.adjust_max_prefix_ids()
+                req.prefix_indices, _, _, _ = self.tree_cache.match_prefix(
+                    rid=req.rid, key=prefix_ids
+                )
+
             kv_receiver = kv_receiver_class(
                 mgr=self.kv_manager,
                 bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
                 bootstrap_room=req.bootstrap_room,
                 data_parallel_rank=req.data_parallel_rank,
+                prefix_cache_len=len(req.prefix_indices),
             )
 
             self.queue.append(
