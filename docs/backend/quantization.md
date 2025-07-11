@@ -84,9 +84,20 @@ autoround.quantize_and_save(quant_path, format=format) # quantize and save
 
 ```
 
+- Command Line Usage (Gaudi/CPU/Intel GPU/CUDA)
+
+```bash
+auto-round \
+    --model meta-llama/Llama-3.2-1B-Instruct \
+    --bits 4 \
+    --group_size 128 \
+    --format "auto_gptq,auto_awq,auto_round" \
+    --output_dir ./tmp_autoround
+```
+
 - known issues
 
-Several limitations currently affect offline quantized model loading in sglang:
+Several limitations currently affect offline quantized model loading in sglang, These issues might be resolved in future updates of sglang. If you experience any problems, consider using Hugging Face Transformers as an alternative.
 
 1. Mixed-bit Quantization Limitations
 
@@ -94,13 +105,17 @@ Several limitations currently affect offline quantized model loading in sglang:
 
 
 2. Limited Support for Quantized MoE Models
-    
+
+    Most quantized MoE models may encounter inference issues due to kernel-related limitation. Detailed failure cases are listed below.
+    <details>
+        <summary>MoE failure cases</summary>
     Qwen3-30B-A3B:
     
     GPTQ format:  Accuracy is nearly zero due to the error:  
         ```
         Capture CUDA graph failed: Apply router weight on input is not supported for fused Marlin MoE method
         ```
+
     AWQ format:  Symmetric quantization Fails with:
         ```
         KeyError: 'model.layers.13.mlp.experts.w2_qzeros'
@@ -113,18 +128,23 @@ Several limitations currently affect offline quantized model loading in sglang:
         ```
         ValueError: The input size is not aligned with the quantized weight shape. This can be caused by too large tensor parallel size.
         ``` The same issue occurs with both AWQ and GPTQ formats.
-
+    </details>
 
 3. Limited Support for Quantized VLMs
+    <details>
+        <summary>VLM failure cases</summary>
 
     Qwen2.5-VL-7B
 
     auto_round:auto_gptq format:  Accuracy is close to zero.
+
     GPTQ format:  Fails with:
     ```
     The output size is not aligned with the quantized weight shape
     ```
+
     auto_round:auto_awq and AWQ format:  These work as expected.
+    </details>
 
 
 
