@@ -115,5 +115,7 @@ def adjust_config_with_unaligned_cpu_tp(
     model_config = update_intermediate_size(
         model_config, "intermediate_size", intermediate_padding_size
     )
-
+    model_config = update_intermediate_size(
+        model_config, "intermediate_size_mlp", intermediate_padding_size
+    )
     return model_config
