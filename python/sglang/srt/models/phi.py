@@ -64,9 +64,6 @@ class PhiAttention(nn.Module):
         )
         assert rotary_dim % 2 == 0
 
-        # pylint: disable=C0301
-        # Refer to:
-        # https://huggingface.co/microsoft/phi-1_5/blob/d212a789620c380ff32ca1d1ee9943a777360987/modeling_phi.py#L518
         rope_theta = getattr(config, "rope_theta", 10000.0)
         max_position_embeddings = getattr(config, "max_position_embeddings", 2048)
         self.rotary_emb = get_rope(
@@ -209,7 +206,7 @@ class PhiModel(nn.Module):
         forward_batch: ForwardBatch,
         positions: torch.Tensor,
         inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor]:
+    ) -> torch.Tensor:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
