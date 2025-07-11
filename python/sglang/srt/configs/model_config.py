@@ -475,6 +475,8 @@ class ModelConfig:
         if eos_ids:
             # it can be either int or list of int
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
+        if eos_ids is None:
+            eos_ids = set()
         if self.hf_generation_config:
             generation_eos_ids = getattr(
                 self.hf_generation_config, "eos_token_id", None
