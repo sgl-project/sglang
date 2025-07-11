@@ -45,10 +45,7 @@ python3 -m sglang.launch_server \
 
 ```bash
 # Install
-# CPU/Intel GPU/CUDA
 pip install auto-round
-# HPU
-pip install auto-round-lib
 ```
 
 - LLM quantization
@@ -61,10 +58,9 @@ model_id = "meta-llama/Llama-3.2-1B-Instruct"
 quant_path = "Llama-3.2-1B-Instruct-autoround-4bit"
 model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(model_id)
-
 bits, group_size, sym = 4, 128, True # set quantize args
 autoround = AutoRound(model, tokenizer, bits=bits, group_size=group_size, sym=sym)
-format='auto_round' # set format='auto_round:auto_awq' or 'auto_round:auto_gptq' to use other formats
+format='auto_round'
 autoround.quantize_and_save(quant_path, format=format) # quantize and save
 
 ```
@@ -74,23 +70,63 @@ autoround.quantize_and_save(quant_path, format=format) # quantize and save
 # for VLMs
 from auto_round import AutoRoundMLLM
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, AutoTokenizer
-
 model_name = "Qwen/Qwen2-VL-2B-Instruct" 
 quant_path = "Qwen2-VL-2B-Instruct-autoround-4bit"
 model = Qwen2VLForConditionalGeneration.from_pretrained(
     model_name, trust_remote_code=True, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-
-## quantize the model
 bits, group_size, sym = 4, 128, True
 autoround = AutoRoundMLLM(model, tokenizer, processor,
                           bits=bits, group_size=group_size, sym=sym)
-autoround.quantize()
-# save the quantized model, set format='auto_gptq' or 'auto_awq' to use other formats
-autoround.save_quantized(quant_path, format='auto_round', inplace=True)
+format='auto_round'
+autoround.quantize_and_save(quant_path, format=format) # quantize and save
 
 ```
+
+- known issues
+
+Several limitations currently affect offline quantized model loading in sglang:
+
+1. Mixed-bit Quantization Limitations
+
+    Mixed-bit quantization is not fully supported. Due to vLLM's layer fusion (e.g., QKV fusion), applying different bit-widths to components within the same fused layer can lead to compatibility issues.
+
+
+2. Limited Support for Quantized MoE Models
+    
+    Qwen3-30B-A3B:
+    
+    GPTQ format:  Accuracy is nearly zero due to the error:  
+        ```
+        Capture CUDA graph failed: Apply router weight on input is not supported for fused Marlin MoE method
+        ```
+    AWQ format:  Symmetric quantization Fails with:
+        ```
+        KeyError: 'model.layers.13.mlp.experts.w2_qzeros'
+        ```
+        Asymmetric quantization Also results in near-zero accuracy.
+
+    DeepSeek-MoE-16B-Base
+
+    Fails with:
+        ```
+        ValueError: The input size is not aligned with the quantized weight shape. This can be caused by too large tensor parallel size.
+        ``` The same issue occurs with both AWQ and GPTQ formats.
+
+
+3. Limited Support for Quantized VLMs
+
+    Qwen2.5-VL-7B
+
+    auto_round:auto_gptq format:  Accuracy is close to zero.
+    GPTQ format:  Fails with:
+    ```
+    The output size is not aligned with the quantized weight shape
+    ```
+    auto_round:auto_awq and AWQ format:  These work as expected.
+
+
 
 #### Using [GPTQModel](https://github.com/ModelCloud/GPTQModel)
 
