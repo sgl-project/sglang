@@ -95,7 +95,7 @@ class KimiK2Detector(BaseFormatDetector):
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """
-        Streaming incremental parsing tool calls for DeepSeekV3 format.
+        Streaming incremental parsing tool calls for KimiK2 format.
         """
         self._buffer += new_text
         current_text = self._buffer
