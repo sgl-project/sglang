@@ -43,7 +43,6 @@ class PhiAttention(nn.Module):
         assert self.total_num_heads % tensor_model_parallel_world_size == 0
         self.num_heads = self.total_num_heads // tensor_model_parallel_world_size
 
-        # pylint: disable=C0103
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
             self.head_size,
