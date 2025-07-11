@@ -317,9 +317,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
-                topk_weights.to(
-                    torch.float
-                ),  # TODO: the topk_weights of llama4 is computed via Llama4MoE:custom_routing_function and is bfloat16 while the kernel requires it to be float32
+                topk_weights,
                 topk_ids,
                 False,  # inplace # See [Note] inplace should be False in fused_experts.
                 False,  # use_int8_w8a8
@@ -852,7 +850,7 @@ class FusedMoE(torch.nn.Module):
             return
 
         # Case weight scales and zero_points
-        if "scale" in weight_name or "zero" in weight_name:
+        if "scale" in weight_name or "zero" in weight_name or "offset" in weight_name:
             # load the weight scales and zp based on the quantization scheme
             # supported weight scales/zp can be found in
             # FusedMoeWeightScaleSupported
