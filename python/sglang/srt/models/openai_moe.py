@@ -15,6 +15,8 @@
 """Inference-only OpenAIMoE model."""
 import logging
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
+import einops
+
 
 import torch
 from torch import nn
@@ -84,6 +86,89 @@ logger = logging.getLogger(__name__)
 # Oai RoPE Reference
 # ================================================================================================================
 import math
+def sink_softmax(logits, sink):
+    sink = einops.repeat(sink, "h -> b h m 1", b=logits.shape[0], m=logits.shape[2])
+    # (b, h, m, (n + 1))
+    logits = torch.cat([logits, torch.log(sink)], dim=-1)
+    # (s_1, s_2, ..., s_n)
+    # (s_1, s_2, ..., s_n, log(sink))
+    # (exp(s_1), exp(s_2), ..., exp(s_n), sink)
+    # (exp(s_1) / (exp(s_1) + exp(s_2) + ... + exp(s_n) + sink),
+    #  exp(s_2) / (exp(s_1) + exp(s_2) + ... + exp(s_n) + sink),
+    #  ...,
+    #  exp(s_n) / (exp(s_1) + exp(s_2) + ... + exp(s_n) + sink))
+    #  sink / (exp(s_1) + exp(s_2) + ... + exp(s_n) + sink)
+    score = torch.softmax(logits, dim=-1)[..., :-1].contiguous()
+    return score
+
+
+def sink_attention_ref(
+    batch_size,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sink: torch.Tensor,
+    causal: bool,
+    sm_scale: float,
+    window_left: int = -1,
+) -> torch.Tensor:
+    qo_len = q.shape[0] // batch_size
+    kv_len = k.shape[0] // batch_size
+    num_qo_heads = q.shape[1]
+    head_dim_qk = q.shape[2]
+    head_dim_vo = v.shape[2]
+    logits = (
+        torch.einsum(
+            "bmhd,bnhd->bhmn",
+            q.view(batch_size, qo_len, num_qo_heads, head_dim_qk).float(),
+            k.view(batch_size, kv_len, num_qo_heads, head_dim_qk).float(),
+        )
+        * sm_scale
+    )
+
+    # For decode case (qo_len=1), the query is at position kv_len-1
+    # For prefill case (qo_len=kv_len), queries start from position 0
+    if qo_len == 1:
+        # Decode: single query at the end
+        q_indices = torch.tensor([kv_len - 1], device=q.device)
+    else:
+        # Prefill: queries from kv_len-qo_len to kv_len-1
+        q_indices = torch.arange(kv_len - qo_len, kv_len, device=q.device)
+    
+    k_indices = torch.arange(0, kv_len, device=q.device)
+    
+    if causal:
+        mask = q_indices.unsqueeze(1) >= k_indices.unsqueeze(0)
+    else:
+        mask = torch.ones(qo_len, kv_len, device=q.device, dtype=torch.bool)
+    
+    # Apply sliding window mask
+    if window_left >= 0:
+        # For sliding window, we can only attend to at most window_left + 1 tokens
+        # This matches the logic in the C++ kernel: kv_idx + qo_len + window_left >= kv_len + qo_idx
+        # Rearranging: kv_idx >= kv_len + qo_idx - qo_len - window_left
+        #             = kv_len - qo_len + qo_idx - window_left
+        #             = (kv_len - qo_len) + (qo_idx - window_left)
+        # For each query position q_indices[qo_idx], we can attend to k_indices[kv_idx] if:
+        # kv_idx >= q_indices[qo_idx] - window_left
+        sliding_window_mask = k_indices.unsqueeze(0) >= (q_indices.unsqueeze(1) - window_left)
+        mask = mask & sliding_window_mask
+
+    logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
+
+    p = sink_softmax(logits, sink)
+    o_ref = (
+        torch.einsum(
+            "bhmn,bnhd->bmhd",
+            p,
+            v.view(batch_size, kv_len, num_qo_heads, head_dim_vo).float(),
+        )
+        .contiguous()
+        .view(batch_size * qo_len, num_qo_heads, head_dim_vo)
+        .to(q)
+    )
+
+    return o_ref
 
 def _apply_rotary_emb(
     x: torch.Tensor,
@@ -617,6 +702,7 @@ class OpenAIMoeAttention(nn.Module):
             enable_attention_sink=True,
             prefix=add_prefix("attn", prefix),
         )
+        self.layer_id = layer_id
 
 
 
@@ -664,7 +750,44 @@ class OpenAIMoeAttention(nn.Module):
         # todo: check if sinks need exp before exp
         sinks = torch.exp(self.sinks)
         sinks = sinks.to(torch.float32)
-        attn_output = self.attn(*inner_state, sink=sinks)       
+        attn_output = self.attn(*inner_state, sink=sinks)    
+        q, k, v, forward_batch = inner_state
+        
+        # Reshape q, k, v to match what sink_attention_ref expects
+        # Current shapes: q=[seq_len, num_heads * head_dim], k/v=[seq_len, num_kv_heads * head_dim]
+        # Need: [batch_size * seq_len, num_heads, head_dim]
+        batch_size = forward_batch.batch_size
+        
+        if batch_size > 0 and q.shape[0] > 0:
+            seq_len = q.shape[0]
+            
+            # Reshape tensors to [seq_len, num_heads, head_dim]
+            q_reshaped = q.view(seq_len, self.num_heads, self.head_dim)
+            k_reshaped = k.view(seq_len, self.num_kv_heads, self.head_dim)
+            v_reshaped = v.view(seq_len, self.num_kv_heads, self.head_dim)
+            
+            # Expand k and v to match q's num_heads if using MQA/GQA
+            if self.num_kv_heads != self.num_heads:
+                k_reshaped = k_reshaped.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+                v_reshaped = v_reshaped.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+            
+            o_ref = sink_attention_ref(
+                batch_size=batch_size,
+                q=q_reshaped,
+                k=k_reshaped,
+                v=v_reshaped,
+                sink=sinks,
+                causal=True,
+                sm_scale=self.scaling,
+                window_left=127,
+            )
+            # Reshape o_ref back to match attn_output shape
+            o_ref = o_ref.view(seq_len, self.num_heads * self.head_dim)
+            if self.layer_id % 2 == 0:
+                print(f"### layer_id={self.layer_id}, attn_output.shape={attn_output.shape}, o_ref.shape={o_ref.shape}")
+                torch.testing.assert_close(attn_output, o_ref, rtol=5e-2, atol=5e-2)
+
+
         output, _ = self.o_proj(attn_output)
         return output
 

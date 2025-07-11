@@ -50,9 +50,6 @@ _tensor_log_file_path = os.environ.get("SGLANG_TENSOR_LOG_PATH")
 
 
 def log_tensor(name: str, tensor: Optional[torch.Tensor]):
-    # Debug print to check if the function is called and the path is correct
-    print(f"[Debug] log_tensor called for '{name}'. Log path: {_tensor_log_file_path}")
-
     if not _tensor_log_file_path:
         return
 
