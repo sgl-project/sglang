@@ -5,7 +5,8 @@ ARG BUILD_TYPE=all
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
-    NVSHMEM_DIR=/sgl-workspace/nvshmem/install
+    NVSHMEM_DIR=/sgl-workspace/nvshmem/install \
+    BUILD_TYPE=${BUILD_TYPE}
 
 # Set timezone and install all packages
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
@@ -43,12 +44,12 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
  && cd / && rm -rf /tmp/gdrcopy
 
 # Fix DeepEP IBGDA symlink
-RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
+RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
 
 # Clone and install SGLang
 WORKDIR /sgl-workspace
+COPY . /sgl-workspace/sglang
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
- && git clone --depth=1 https://github.com/sgl-project/sglang.git \
  && cd sglang \
  && case "$CUDA_VERSION" in \
       12.6.1) CUINDEX=126 ;; \
@@ -58,7 +59,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
       python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.5 --force-reinstall --no-deps ; \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.2.4/sgl_kernel-0.2.4+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.2.4/sgl_kernel-0.2.4+cu128-cp39-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
     fi
 
 # Build and install NVSHMEM + DeepEP
@@ -69,6 +70,7 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/sour
  && git apply /sgl-workspace/DeepEP/third-party/nvshmem.patch \
  && sed -i '1i#include <unistd.h>' examples/moe_shuffle.cu \
  && rm -f /sgl-workspace/nvshmem_src_3.2.5-1.txz \
+ && if [ "$BUILD_TYPE" = "blackwell" ]; then CUDA_ARCH=100; else CUDA_ARCH=90; fi \
  && NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
@@ -77,9 +79,10 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/sour
     NVSHMEM_PMIX_SUPPORT=0 \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
     NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=90 \
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
  && cmake --build build --target install -j \
  && cd /sgl-workspace/DeepEP \
+ && if [ "$BUILD_TYPE" = "blackwell" ]; then export TORCH_CUDA_ARCH_LIST="10.0"; fi \
  && NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
 
 # Python tools
@@ -124,8 +127,8 @@ RUN apt-get update && apt-get install -y \
 
 RUN apt update -y \
     && apt install -y --no-install-recommends gnupg \
-    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/amd64 /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
-    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub \
+    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
+    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
     && apt update -y \
     && apt install nsight-systems-cli -y
 
@@ -164,11 +167,14 @@ RUN curl -L https://github.com/clangd/clangd/releases/download/18.1.3/clangd-lin
     && rm -rf clangd_18.1.3 clangd.zip
 
 # Install CMake
-RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1-linux-x86_64.tar.gz \
-    && tar -xzf cmake-3.31.1-linux-x86_64.tar.gz \
-    && cp -r cmake-3.31.1-linux-x86_64/bin/* /usr/local/bin/ \
-    && cp -r cmake-3.31.1-linux-x86_64/share/* /usr/local/share/ \
-    && rm -rf cmake-3.31.1-linux-x86_64 cmake-3.31.1-linux-x86_64.tar.gz
+RUN CMAKE_VERSION=3.31.1 \
+    && ARCH=$(uname -m) \
+    && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
+    && wget "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
+    && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
+    && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
+    && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
+    && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
 # Add yank script
 COPY --chown=root:root <<-"EOF" /usr/local/bin/yank
