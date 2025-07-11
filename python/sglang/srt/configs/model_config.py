@@ -17,7 +17,7 @@ import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
-from typing import List, Optional, Set, Union
+from typing import Dict, List, Optional, Set, Union
 
 import torch
 from transformers import PretrainedConfig
@@ -58,6 +58,7 @@ class ModelConfig:
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
+        modelopt_quant: Optional[Union[str, Dict]] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
@@ -67,6 +68,8 @@ class ModelConfig:
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
+        self.impl = impl
+        self.modelopt_quant = modelopt_quant
         self.impl = impl
 
         # Parse args
@@ -287,6 +290,8 @@ class ModelConfig:
             quantization=server_args.quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             impl=server_args.impl,
+            modelopt_quant=server_args.modelopt_quant,
+            impl=server_args.impl,
             **kwargs,
         )
 
@@ -359,7 +364,7 @@ class ModelConfig:
             # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
             is_local = os.path.exists(self.model_path)
-            modelopt_quant_config = {"quant_method": "modelopt"}
+            modelopt_quant_config = {"quant_method": "modelopt_fp8"}
             if not is_local:
                 from huggingface_hub import HfApi
 
@@ -395,7 +400,7 @@ class ModelConfig:
         optimized_quantization_methods = [
             "fp8",
             "marlin",
-            "modelopt",
+            "modelopt_fp8",
             "gptq_marlin_24",
             "gptq_marlin",
             "awq_marlin",
