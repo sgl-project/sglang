@@ -1138,5 +1138,119 @@ class TestLlama32Detector(unittest.TestCase):
         self.assertTrue(result.normal_text.strip().startswith("Some intro."))
 
 
+class TestQwen25Detector(unittest.TestCase):
+    def setUp(self):
+        """Set up test tools and detector for Qwen25 format testing."""
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_website_info",
+                    description="Get information about a website",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "The URL to get information about",
+                            }
+                        },
+                        "required": ["url"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = Qwen25Detector()
+
+    def test_parse_json_encoded_string_arguments(self):
+        """Test parsing when arguments are provided as JSON-encoded strings (the problematic case)."""
+        # This is the problematic case from Qwen2.5 where arguments are JSON-encoded strings
+        test_action = {
+            "name": "get_website_info",
+            "arguments": '{"url": "https://google.com"}',
+        }
+
+        result = self.detector.parse_base_json(test_action, self.tools)
+
+        self.assertEqual(len(result), 1)
+        call = result[0]
+        self.assertEqual(call.name, "get_website_info")
+
+        # The parameters should be properly formatted JSON
+        params = json.loads(call.parameters)
+        self.assertEqual(params["url"], "https://google.com")
+
+        # Verify that the parameters string is valid JSON
+        self.assertIsInstance(call.parameters, str)
+        json.loads(call.parameters)  # Should not raise an exception
+
+    def test_parse_dict_arguments(self):
+        """Test parsing when arguments are provided as dictionaries (the normal case)."""
+        test_action = {
+            "name": "get_website_info",
+            "arguments": {"url": "https://google.com"},
+        }
+
+        result = self.detector.parse_base_json(test_action, self.tools)
+
+        self.assertEqual(len(result), 1)
+        call = result[0]
+        self.assertEqual(call.name, "get_website_info")
+
+        # The parameters should be properly formatted JSON
+        params = json.loads(call.parameters)
+        self.assertEqual(params["url"], "https://google.com")
+
+    def test_parse_double_encoded_string_arguments(self):
+        """Test parsing when arguments are double JSON-encoded strings."""
+        # This tests the extreme case where the string is double-encoded
+        test_action = {
+            "name": "get_website_info",
+            "arguments": '"{\\"url\\":\\"https://google.com\\"}"',
+        }
+
+        result = self.detector.parse_base_json(test_action, self.tools)
+
+        self.assertEqual(len(result), 1)
+        call = result[0]
+        self.assertEqual(call.name, "get_website_info")
+
+        # The parameters should be properly formatted JSON
+        params = json.loads(call.parameters)
+        self.assertEqual(params["url"], "https://google.com")
+
+    def test_parse_malformed_string_arguments(self):
+        """Test parsing when arguments are malformed strings."""
+        test_action = {
+            "name": "get_website_info",
+            "arguments": "this is not valid json",
+        }
+
+        result = self.detector.parse_base_json(test_action, self.tools)
+
+        self.assertEqual(len(result), 1)
+        call = result[0]
+        self.assertEqual(call.name, "get_website_info")
+
+        # The parameters should be the original string since it couldn't be parsed
+        self.assertEqual(call.parameters, "this is not valid json")
+
+    def test_detect_and_parse_with_tool_call_format(self):
+        """Test full detect_and_parse with complete tool call format."""
+        test_text = '<tool_call>\n{"name": "get_website_info", "arguments": {"url": "https://google.com"}}\n</tool_call>'
+
+        result = self.detector.detect_and_parse(test_text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_website_info")
+
+        params = json.loads(call.parameters)
+        self.assertEqual(params["url"], "https://google.com")
+
+        # Normal text should be empty for pure tool call
+        self.assertEqual(result.normal_text, "")
+
+
 if __name__ == "__main__":
     unittest.main()

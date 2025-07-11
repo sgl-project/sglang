@@ -1,13 +1,14 @@
 import json
 import logging
 import re
-from typing import List
+from typing import Any, List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
+    ToolCallItem,
     _GetInfoFunc,
 )
 from sglang.srt.function_call.ebnf_composer import EBNFComposer
@@ -35,6 +36,57 @@ class Qwen25Detector(BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Qwen 2.5 format tool call."""
         return self.bot_token in text
+
+    def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
+        """Override base_json parsing to handle Qwen2.5's specific argument format."""
+        tool_indices = {
+            tool.function.name: i for i, tool in enumerate(tools) if tool.function.name
+        }
+        if not isinstance(action, list):
+            action = [action]
+
+        results = []
+        for act in action:
+            name = act.get("name")
+            if name and name in tool_indices:
+                # Get arguments, which may be a string or dict
+                arguments = act.get("parameters") or act.get("arguments", {})
+
+                # Handle the case where arguments is a JSON-encoded string (possibly multiple times)
+                if isinstance(arguments, str):
+                    try:
+                        # Try to parse the string as JSON first
+                        parsed_arguments = json.loads(arguments)
+
+                        # If the result is still a string, it might be double-encoded, so parse again
+                        while isinstance(parsed_arguments, str):
+                            try:
+                                parsed_arguments = json.loads(parsed_arguments)
+                            except (json.JSONDecodeError, TypeError):
+                                # If parsing fails, stop trying
+                                break
+
+                        # Re-encode the final result properly
+                        arguments = json.dumps(parsed_arguments, ensure_ascii=False)
+                    except (json.JSONDecodeError, TypeError):
+                        # If parsing fails, it might already be a proper JSON string
+                        # or it might be a malformed string, so use it as-is
+                        pass
+                else:
+                    # If arguments is not a string, convert it to JSON
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+
+                results.append(
+                    ToolCallItem(
+                        tool_index=-1,  # Caller should update this based on the actual tools array called
+                        name=name,
+                        parameters=arguments,
+                    )
+                )
+            else:
+                logger.warning(f"Model attempted to call undefined function: {name}")
+
+        return results
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
