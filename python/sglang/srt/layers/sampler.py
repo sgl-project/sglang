@@ -20,7 +20,6 @@ if is_cuda():
         top_p_renorm_prob,
     )
 
-
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
@@ -76,29 +75,35 @@ class Sampler(nn.Module):
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         else:
             # Post process logits
-            logits.div_(sampling_info.temperatures)
-            logits[:] = torch.softmax(logits, dim=-1)
-            probs = logits
-            del logits
-
             if True:  # Keep this redundant check to simplify some internal code sync
                 if global_server_args_dict["sampling_backend"] == "flashinfer":
                     if sampling_info.need_min_p_sampling:
+                        logits.div_(sampling_info.temperatures)
+                        logits[:] = torch.softmax(logits, dim=-1)
+                        probs = logits
+                        del logits
+
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                         probs = top_p_renorm_prob(probs, sampling_info.top_ps)
                         batch_next_token_ids = min_p_sampling_from_probs(
                             probs, sampling_info.min_ps
                         )
                     else:
-                        batch_next_token_ids = top_k_top_p_sampling_from_probs(
-                            probs.contiguous(),
-                            sampling_info.top_ks,
-                            sampling_info.top_ps,
-                            filter_apply_order="joint",
-                            check_nan=self.use_nan_detection,
-                        )
+                        logits.div_(sampling_info.temperatures)
+                        batch_next_token_ids = (
+                            top_k_top_p_sampling_from_logits_flashinfer(
+                                logits,
+                                sampling_info.top_ks,
+                                sampling_info.top_ps,
+                                sampling_info.temperatures,
+                            )
                 elif global_server_args_dict["sampling_backend"] == "pytorch":
                     # A slower fallback implementation with torch native operations.
+                    logits.div_(sampling_info.temperatures)
+                    logits[:] = torch.softmax(logits, dim=-1)
+                    probs = logits
+                    del logits
+
                     batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
                         probs,
                         sampling_info.top_ks,
@@ -112,8 +117,15 @@ class Sampler(nn.Module):
                     )
 
             if return_logprob:
-                # clamp to avoid -inf
-                logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
+                if (
+                    global_server_args_dict["sampling_backend"] == "flashinfer"
+                    and not sampling_info.need_min_p_sampling
+                ):
+                    probs = torch.softmax(logits, dim=-1)
+                    logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
+                else:
+                    # clamp to avoid -inf
+                    logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
@@ -265,3 +277,25 @@ def apply_custom_logit_processor(
         logger.debug(
             f"Custom logit processor {processor.__class__.__name__} is applied."
         )
+
+
+def top_k_top_p_sampling_from_logits_flashinfer(
+    logits: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    temperatures: torch.Tensor,
+) -> torch.Tensor:
+    """Use flashinfer's top_k_top_p_sampling_from_logits for faster sampling.
+
+    This function implements the optimized path:
+    logits -> top_k_mask_logits -> softmax -> top_p_sampling_from_probs
+    instead of:
+    logits -> softmax -> top_k_renorm_probs -> top_p_sampling_from_probs
+    """
+    import flashinfer.sampling
+
+    batch_next_token_ids = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+        logits, top_ks, top_ps, filter_apply_order="joint", deterministic=True
+    )
+
+    return batch_next_token_ids
