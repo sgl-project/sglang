@@ -177,9 +177,7 @@ class MooncakeKVManager(BaseKVManager):
             )
             self.thread_pool_size = transfer_thread_pool_size // transfer_queue_size
             self.executors = [
-                concurrent.futures.ThreadPoolExecutor(
-                    self.thread_pool_size
-                )
+                concurrent.futures.ThreadPoolExecutor(self.thread_pool_size)
                 for _ in range(transfer_queue_size)
             ]
             for queue, executor in zip(self.transfer_queues, self.executors):
@@ -263,12 +261,12 @@ class MooncakeKVManager(BaseKVManager):
         dst_addr_list_large_chunk, dst_addr_list_small_chunk = [], []
         length_list_large_chunk, length_list_small_chunk = [], []
 
-        for (src_ptr, dst_ptr, item_len) in layers_params:
+        for src_ptr, dst_ptr, item_len in layers_params:
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
-                if length > get_int_env_var('SGLANG_DISAGGREGATION_LARGE_CHUNK', 20480):
+                if length > get_int_env_var("SGLANG_DISAGGREGATION_LARGE_CHUNK", 20480):
                     src_addr_list_large_chunk.append(src_addr)
                     dst_addr_list_large_chunk.append(dst_addr)
                     length_list_large_chunk.append(length)
@@ -276,7 +274,7 @@ class MooncakeKVManager(BaseKVManager):
                     src_addr_list_small_chunk.append(src_addr)
                     dst_addr_list_small_chunk.append(dst_addr)
                     length_list_small_chunk.append(length)
-        
+
         large_chunks_transfer_futures = [
             executor.submit(
                 self.engine.batch_transfer_sync,
@@ -288,7 +286,9 @@ class MooncakeKVManager(BaseKVManager):
         ]
 
         num_small_chunks = len(length_list_small_chunk)
-        micro_batch_size = max(num_small_chunks // self.thread_pool_size, self.thread_pool_size)
+        micro_batch_size = max(
+            num_small_chunks // self.thread_pool_size, self.thread_pool_size
+        )
         small_chunks_transfer_futures = [
             executor.submit(
                 self.engine.batch_transfer_sync,
@@ -297,7 +297,7 @@ class MooncakeKVManager(BaseKVManager):
                 dst_addr_list_small_chunk[i : i + micro_batch_size],
                 length_list_small_chunk[i : i + micro_batch_size],
             )
-            for i in range (0, num_small_chunks, micro_batch_size)
+            for i in range(0, num_small_chunks, micro_batch_size)
         ]
 
         futures = large_chunks_transfer_futures + small_chunks_transfer_futures
@@ -392,8 +392,14 @@ class MooncakeKVManager(BaseKVManager):
                 prefill_page_idx = int(prefill_kv_indices[i])
                 decode_page_idx = int(dst_kv_indices[i])
 
-                src_page_start_addr = self.kv_args.kv_data_ptrs[layer_id] + prefill_page_idx * item_len_of_prefill_rank_page
-                dst_page_start_addr = dst_kv_ptrs[layer_id] + decode_page_idx * item_len_of_decode_rank_page
+                src_page_start_addr = (
+                    self.kv_args.kv_data_ptrs[layer_id]
+                    + prefill_page_idx * item_len_of_prefill_rank_page
+                )
+                dst_page_start_addr = (
+                    dst_kv_ptrs[layer_id]
+                    + decode_page_idx * item_len_of_decode_rank_page
+                )
 
                 for token_slot_in_page in range(page_size):
                     src_token_slot_start_addr = (
@@ -413,8 +419,9 @@ class MooncakeKVManager(BaseKVManager):
                     dst_addr_list.append(dst_slice_addr)
                     length_list.append(slice_lens_per_page)
 
-        
-        if slice_lens_per_page > get_int_env_var('SGLANG_DISAGGREGATION_LARGE_CHUNK', 20480):
+        if slice_lens_per_page > get_int_env_var(
+            "SGLANG_DISAGGREGATION_LARGE_CHUNK", 20480
+        ):
             futures = [
                 executor.submit(
                     self.engine.batch_transfer_sync,
@@ -425,7 +432,9 @@ class MooncakeKVManager(BaseKVManager):
                 )
             ]
         else:
-            micro_batch_size = max(len(length_list) // self.thread_pool_size, self.thread_pool_size)
+            micro_batch_size = max(
+                len(length_list) // self.thread_pool_size, self.thread_pool_size
+            )
             futures = [
                 executor.submit(
                     self.engine.batch_transfer_sync,
