@@ -33,18 +33,22 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_hip,
     is_npu,
     set_weight_attrs,
 )
 from sglang.utils import resolve_obj_by_qualname
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
-if _is_cuda:
+if _is_cuda or _is_hip:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+if _is_hip:
+    from sgl_kernel import gelu_quick
 
 if is_npu():
     import torch_npu
@@ -115,8 +119,12 @@ class QuickGELU(CustomOp):
         return x * torch.sigmoid(1.702 * x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO(zhyncs): Implement the CUDA kernel for QuickGELU in sgl-kernel
         return self.forward_native(x)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        gelu_quick(x, out)
+        return out
 
 
 class ScaledActivation(nn.Module):
@@ -209,8 +217,8 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
         return nn.Identity()
 
 
-if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
+if not (_is_cuda or _is_hip or _is_npu or (_is_cpu and _is_cpu_amx_available)):
     logger.info(
-        "sgl-kernel is not available on Non-NV platforms or Non-AMX CPUs. Fallback to other kernel libraries."
+        "sgl-kernel is not available on Non-NV, Non-AMD platforms or Non-AMX CPUs. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
