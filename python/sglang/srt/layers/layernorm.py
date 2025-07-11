@@ -52,7 +52,6 @@ elif _is_hip:
 
 logger = logging.getLogger(__name__)
 
-
 class RMSNorm(CustomOp):
     def __init__(
         self,

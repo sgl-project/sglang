@@ -210,70 +210,16 @@ class RotaryEmbedding(torch.nn.Module):
             torch.arange(0, self.head_dim, 2, dtype=torch.float, device=self.device)
             / self.head_dim
         )
-        if self.scaling_factor > 1.0:
-            concentration = (
-                0.1 * math.log(self.scaling_factor) + 1.0
-            )  # YaRN concentration
+    QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
+    QK *= sm_scale
+    QK += mask[None, None, :, :]
+    QK = torch.cat([QK, S], dim=-1)
+    W = torch.softmax(QK, dim=-1)
+    W = W[..., :-1]
+    attn = torch.einsum("hmqk,khmd->qhmd", W, V)
+    return attn.reshape(n_tokens, -1)
 
-            d_half = self.head_dim / 2
-            # NTK by parts
-            low = (
-                d_half
-                * math.log(self.initial_context_length / (self.ntk_beta * 2 * math.pi))
-                / math.log(self.base)
-            )
-            high = (
-                d_half
-                * math.log(self.initial_context_length / (self.ntk_alpha * 2 * math.pi))
-                / math.log(self.base)
-            )
-            assert 0 < low < high < d_half - 1
 
-            interpolation = 1.0 / (self.scaling_factor * freq)
-            extrapolation = 1.0 / freq
-
-            ramp = (
-                torch.arange(d_half, dtype=torch.float32, device=freq.device) - low
-            ) / (high - low)
-            mask = 1 - ramp.clamp(0, 1)
-
-            inv_freq = interpolation * (1 - mask) + extrapolation * mask
-        else:
-            concentration = 1.0
-            inv_freq = 1.0 / freq
-
-        return concentration, inv_freq
-
-    def _compute_cos_sin(self, num_tokens: int):
-        concentration, inv_freq = self._compute_concentration_and_inv_freq()
-        t = torch.arange(self.initial_context_length, dtype=torch.float32, device=self.device)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        cos = freqs.cos() * concentration
-        sin = freqs.sin() * concentration
-        return cos, sin
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_tokens = query.shape[0]
-        cos, sin = self._compute_cos_sin(num_tokens)
-        cos = cos.index_select(0, positions)
-        sin = sin.index_select(0, positions)
-
-        query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_dim)
-        query = _apply_rotary_emb(query, cos, sin)
-        query = query.reshape(query_shape)
-
-        key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_dim)
-        key = _apply_rotary_emb(key, cos, sin)
-        key = key.reshape(key_shape)
-        return query, key
-# ================================================================================================================
 # Todo: to make sure sliding window size for flashinfer is correct
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
@@ -397,7 +343,6 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
     ) -> torch.Tensor:
-
         if not global_server_args_dict["enable_deepep_moe"]:
             return self.forward_normal(hidden_states)
         else:
@@ -651,8 +596,7 @@ class OpenAIMoeAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
-            #Todo: to make sure if it is set to be true.
-            reduce_results=True, # False,
+            reduce_results=True,
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -667,27 +611,8 @@ class OpenAIMoeAttention(nn.Module):
         )
         # Todo: remove this, use CUDA impl. Currently sgl-kernel apply_rope_with_cos_sin_cache_inplace is not supported for Oai rope
         self.rotary_emb._forward_method = self.rotary_emb.forward_native
-        '''
-        # reference
-        self.rope = RotaryEmbedding(
-            self.head_dim,
-            rope_theta,
-            torch.float32,
-            initial_context_length=max_position_embeddings,
-            scaling_factor=rope_scaling["factor"],
-            ntk_alpha=rope_scaling["beta_slow"],
-            ntk_beta=rope_scaling["beta_fast"],
-            device=torch.device("cuda:0"),
-        )
-        print(f"self.rotary_emb.inv_freq: {self.rotary_emb._compute_inv_freq(32.0)}")
-        print(f"self.rope.inv_freq: {self.rope._compute_concentration_and_inv_freq()[1]}")
-        print(f"allclose: {torch.allclose(self.rotary_emb._compute_inv_freq(32.0), self.rope._compute_concentration_and_inv_freq()[1], atol=1e-5, rtol=1e-5)}")
-        print(f"self.rotary_emb.cos_sin_cache: {self.rotary_emb._compute_cos_sin_cache().shape}")
-        print(f"self.rope.cos_sin_cache: {self.rope._compute_cos_sin(max_position_embeddings)[0].shape}, {self.rope._compute_cos_sin(max_position_embeddings)[1].shape}")
-        print(f"cos allclose: {torch.allclose(self.rotary_emb._compute_cos_sin_cache()[:,:self.head_dim//2], self.rope._compute_cos_sin(max_position_embeddings)[0], atol=1e-5, rtol=1e-5)}")
-        print(f"sin allclose: {torch.allclose(self.rotary_emb._compute_cos_sin_cache()[:,self.head_dim//2:], self.rope._compute_cos_sin(max_position_embeddings)[1], atol=1e-5, rtol=1e-5)}")
-        '''
         use_sliding_window = True if config.layer_types[layer_id] == "sliding_attention" else False
+        self.sliding_window = get_attention_sliding_window_size(config) if use_sliding_window else None
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -703,8 +628,6 @@ class OpenAIMoeAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
         self.layer_id = layer_id
-
-
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -728,18 +651,7 @@ class OpenAIMoeAttention(nn.Module):
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # q_clone = q.clone()
-        # k_clone = k.clone()
         q, k = self.rotary_emb(positions, q, k)
-        '''
-        q_ref, k_ref = self.rope(positions, q_clone, k_clone)
-        print(f"q: {q}")
-        print(f"q_ref: {q_ref}")
-        print(f"k: {k}")
-        print(f"k_ref: {k_ref}")
-        assert torch.allclose(q, q_ref, atol=1e-5, rtol=1e-5)
-        assert torch.allclose(k, k_ref, atol=1e-5, rtol=1e-5)
-        '''
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -788,6 +700,17 @@ class OpenAIMoeAttention(nn.Module):
                 torch.testing.assert_close(attn_output, o_ref, rtol=1e-2, atol=1e-2)
 
 
+        '''
+        # Todo: use hyperparam self.sinks
+        sinks = torch.exp(self.sinks.to(torch.float32))
+        sinks = sinks.to(torch.float32)
+        attn_output = self.attn(*inner_state, sink=sinks)
+        '''
+        # # Todo: sdpa as a WA for attn_kernel
+        # q = inner_state[0].view(-1, self.num_kv_heads, self.num_heads // self.num_kv_heads, self.head_dim)
+        # k = inner_state[1].view(-1, self.num_kv_heads, self.head_dim)
+        # v = inner_state[2].view(-1, self.num_kv_heads, self.head_dim)
+        # attn_output = sdpa(q, k, v, self.sinks, self.scaling, self.sliding_window)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -891,7 +814,6 @@ class OpenAIMoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
