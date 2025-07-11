@@ -71,7 +71,6 @@ class KimiK2Detector(BaseFormatDetector):
             tool_calls = []
             for match in function_call_tuples:
                 function_id, function_args = match
-                # function_id: functions.get_weather:0
                 function_name = function_id.split(".")[1].split(":")[0]
                 function_idx = int(function_id.split(".")[1].split(":")[1])
 
