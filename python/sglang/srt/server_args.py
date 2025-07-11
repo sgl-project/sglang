@@ -356,6 +356,11 @@ class ServerArgs:
             1,
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
+        if self.moe_dense_tp_size == 1:
+            self.enable_dp_lm_head = True
+            logger.warning(
+                "enable_dp_lm_head is enabled, when moe_dense_tp_size set to 1."
+            )
 
         if self.attention_backend == "flashmla":
             logger.warning(
