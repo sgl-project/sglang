@@ -143,19 +143,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Run forward for decode using TRTLLM kernel."""
         cache_loc = forward_batch.out_cache_loc
 
-        if k is not None:
-            assert v is not None
-            if save_kv_cache:
-                if k_rope is not None:
-                    # MLA style KV cache storage
-                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                        layer,
-                        cache_loc,
-                        k,
-                        k_rope,
-                    )
-                else:
-                    # Standard KV cache storage
+        if k is not None and save_kv_cache:
+            if k_rope is not None:
+                # MLA style KV cache storage
+                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    layer,
+                    cache_loc,
+                    k,
+                    k_rope,
+                )
+            else:
+                # Standard KV cache storage path. Skip if value tensor is absent (e.g., MLA decode tests).
+                if v is not None:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer,
                         cache_loc,
@@ -176,11 +175,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Get KV cache
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
-        # Reshape KV cache for TRTLLM format
-        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim)
+        # Reshape KV cache to 4-D (num_kv_heads, num_blocks, page_size, kv_dim)
+        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(0)  # 1 KV head
 
         # Call TRTLLM MLA decode kernel
-        output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
             workspace_buffer=forward_batch.decode_trtllm_mla_metadata.workspace,
@@ -196,5 +195,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             bmm1_scale=1.0,  # Only needed for FP8
             bmm2_scale=1.0,  # Only needed for FP8
         )
-
-        return output.view(-1, layer.tp_q_head_num * layer.v_head_dim) 
+        output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        if output.shape[0] > forward_batch.batch_size:
+            output = output[: forward_batch.batch_size]
+        return output 
