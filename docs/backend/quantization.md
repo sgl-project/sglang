@@ -54,7 +54,7 @@ pip install auto-round
 # for LLM
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from auto_round import AutoRound
-model_id = "meta-llama/Llama-3.2-1B-Instruct" 
+model_id = "meta-llama/Llama-3.2-1B-Instruct"
 quant_path = "Llama-3.2-1B-Instruct-autoround-4bit"
 model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -70,7 +70,7 @@ autoround.quantize_and_save(quant_path, format=format) # quantize and save
 # for VLMs
 from auto_round import AutoRoundMLLM
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, AutoTokenizer
-model_name = "Qwen/Qwen2-VL-2B-Instruct" 
+model_name = "Qwen/Qwen2-VL-2B-Instruct"
 quant_path = "Qwen2-VL-2B-Instruct-autoround-4bit"
 model = Qwen2VLForConditionalGeneration.from_pretrained(
     model_name, trust_remote_code=True, torch_dtype="auto")
@@ -110,8 +110,8 @@ Several limitations currently affect offline quantized model loading in sglang, 
     <details>
         <summary>MoE failure cases</summary>
     Qwen3-30B-A3B:
-    
-    GPTQ format:  Accuracy is nearly zero due to the error:  
+
+    GPTQ format:  Accuracy is nearly zero due to the error:
         ```
         Capture CUDA graph failed: Apply router weight on input is not supported for fused Marlin MoE method
         ```

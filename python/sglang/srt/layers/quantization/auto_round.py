@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 from fractions import Fraction
 from typing import Any, Optional, Union
 
 import torch
-import logging
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -13,6 +14,7 @@ try:
         check_moe_marlin_supports_layer,
     )
     from vllm.scalar_type import scalar_types
+
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
@@ -22,7 +24,6 @@ except ImportError:
         uint8 = "uint8"
         uint4b8 = "uint4b8"
         uint8b128 = "uint8b128"
-
 
 
 from sglang.srt.layers.linear import (
