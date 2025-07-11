@@ -85,6 +85,7 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
+    cached_tokens: int = 0
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -199,6 +200,7 @@ async def async_request_openai_completions(
             "best_of": 1,
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
+            "stream_options": {"include_usage": True},
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
@@ -211,6 +213,7 @@ async def async_request_openai_completions(
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
+        cached_tokens = 0
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
@@ -231,7 +234,7 @@ async def async_request_openai_completions(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            if data["choices"] and data["choices"][0]["text"]:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -244,14 +247,19 @@ async def async_request_openai_completions(
 
                                 most_recent_timestamp = timestamp
                                 generated_text += data["choices"][0]["text"]
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
+                            output_len = (data.get("usage") or {}).get(
+                                "completion_tokens", output_len
+                            )
+                            cached_tokens = (
+                                (data.get("usage") or {}).get("prompt_tokens_details")
+                                or {}
+                            ).get("cached_tokens", cached_tokens)
 
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
                     output.output_len = output_len
+                    output.cached_tokens = cached_tokens
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -311,6 +319,7 @@ async def async_request_openai_chat_completions(
             "temperature": 0.0,
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
+            "stream_options": {"include_usage": True},
             **request_func_input.extra_request_body,
         }
         headers = get_auth_headers()
@@ -322,6 +331,7 @@ async def async_request_openai_chat_completions(
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
+        cached_tokens = 0
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
@@ -341,6 +351,12 @@ async def async_request_openai_chat_completions(
                         output.output_len = response_json.get("usage", {}).get(
                             "completion_tokens", output_len
                         )
+                        output.cached_tokens = (
+                            (response_json.get("usage") or {}).get(
+                                "prompt_tokens_details"
+                            )
+                            or {}
+                        ).get("cached_tokens", cached_tokens)
                     else:
                         # Streaming response
                         async for chunk_bytes in response.content:
@@ -356,7 +372,8 @@ async def async_request_openai_chat_completions(
                                 data = json.loads(chunk)
 
                                 # Check if this chunk contains content
-                                delta = data.get("choices", [{}])[0].get("delta", {})
+                                choices = data.get("choices", [{}])
+                                delta = choices[0].get("delta", {}) if choices else {}
                                 content = delta.get("content", "")
 
                                 if content:
@@ -379,11 +396,18 @@ async def async_request_openai_chat_completions(
                                 output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
+                                cached_tokens = (
+                                    (data.get("usage") or {}).get(
+                                        "prompt_tokens_details"
+                                    )
+                                    or {}
+                                ).get("cached_tokens", cached_tokens)
 
                         output.generated_text = generated_text
                         output.success = True
                         output.latency = latency
                         output.output_len = output_len
+                        output.cached_tokens = cached_tokens
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -511,6 +535,7 @@ async def async_request_sglang_generate(
         st = time.perf_counter()
         most_recent_timestamp = st
         last_output_len = 0
+        cached_tokens = 0
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
@@ -535,6 +560,7 @@ async def async_request_sglang_generate(
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
                                 output_len = data["meta_info"]["completion_tokens"]
+                                cached_tokens = data["meta_info"]["cached_tokens"]
 
                                 # First token
                                 if ttft == 0.0:
@@ -558,6 +584,7 @@ async def async_request_sglang_generate(
                     output.success = True
                     output.latency = latency
                     output.output_len = output_len
+                    output.cached_tokens = cached_tokens
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -703,6 +730,7 @@ ASYNC_REQUEST_FUNCS = {
 class BenchmarkMetrics:
     completed: int
     total_input: int
+    total_cached_tokens: Optional[int]
     total_output: int
     total_output_retokenized: int
     request_throughput: float
@@ -1241,6 +1269,7 @@ def calculate_metrics(
     output_lens: List[int] = []
     retokenized_output_lens: List[int] = []
     total_input = 0
+    total_cached_tokens = 0
     completed = 0
     itls: List[float] = []
     tpots: List[float] = []
@@ -1255,6 +1284,7 @@ def calculate_metrics(
             )
             retokenized_output_lens.append(retokenized_output_len)
             total_input += input_requests[i].prompt_len
+            total_cached_tokens += outputs[i].cached_tokens
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             itls += outputs[i].itl
@@ -1276,6 +1306,7 @@ def calculate_metrics(
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
+        total_cached_tokens=total_cached_tokens,
         total_output=sum(output_lens),
         total_output_retokenized=sum(retokenized_output_lens),
         request_throughput=completed / dur_s,
@@ -1476,6 +1507,7 @@ async def benchmark(
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
+    print("{:<40} {:<10}".format("Total cached tokens:", metrics.total_cached_tokens))
     print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
     print(
         "{:<40} {:<10}".format(
