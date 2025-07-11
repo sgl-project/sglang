@@ -7,7 +7,7 @@ from torch import nn
 import torch.nn.functional as F
 
 
-from python.sglang.srt.utils import (
+from sglang.srt.utils import (
     set_weight_attrs,
     make_layers,
     add_prefix,
@@ -372,7 +372,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
             )
         if getattr(config, "use_gemma_rms_norm", getattr(config, "apply_layernorm_1p", False)):
-            print("Using Gemma RMSNorm for input normalization and post attn normalization.")
+            logger.warning_once("Using Gemma RMSNorm for input normalization and post attn normalization.")
             self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -449,7 +449,7 @@ class Qwen3HybridMixerDecoderLayer(nn.Module):
                 quant_config=quant_config,
             )
         if getattr(config, "use_gemma_rms_norm", getattr(config, "apply_layernorm_1p", False)):
-            print("Using Gemma RMSNorm for input normalization and post attn normalization.")
+            logger.warning_once("Using Gemma RMSNorm for input normalization and post attn normalization.")
             self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -520,7 +520,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
 
         self.attn_output_gate = getattr(config, "attn_output_gate", False)
         if self.attn_output_gate:
-            logger.info('using attn output gate!')
+            logger.warning_once('using attn output gate!')
 
         if hasattr(config, "partial_rotary_factor"):
             rotary_dim = self.head_dim * config.partial_rotary_factor
@@ -581,7 +581,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 quant_config=quant_config,
             )
         if getattr(config, "use_gemma_rms_norm", getattr(config, "apply_layernorm_1p", False)):
-            print("Using Gemma RMSNorm for input normalization and post attn normalization.")
+            logger.warning_once("Using Gemma RMSNorm for input normalization and post attn normalization.")
             self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -590,7 +590,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         
         if self.config.use_qk_norm:
             if getattr(config, "use_gemma_rms_norm", getattr(config, "apply_layernorm_1p", False)):
-                print("Using Gemma RMSNorm for Q normalization and K normalization.")
+                logger.warning_once("Using Gemma RMSNorm for Q normalization and K normalization.")
                 self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
                 self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
             else:
@@ -682,24 +682,25 @@ class Qwen3HybridMoeModel(nn.Module):
             org_num_embeddings=config.vocab_size,
         )
 
-        def get_layer(layer_id, prefix: str):
+        def get_layer(idx: int, prefix: str):
             layer_class = ALL_DECODER_LAYER_TYPES[
-                config.layers_block_type[layer_id]]
+                config.layers_block_type[idx]]
             return layer_class(
                 config,
-                layer_id,
+                idx,
                 quant_config=quant_config,
                 prefix=prefix,
             )
 
-        self.start_layer, self.end_layer, self.layers = make_layers(
+        # self.start_layer, self.end_layer, self.layers = make_layers(
+        self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers")
         # self.make_empty_intermediate_tensors = (
         #     make_empty_intermediate_tensors_factory(
         #         ["hidden_states", "residual"], config.hidden_size))
         
         if getattr(config, "use_gemma_rms_norm", getattr(config, "apply_layernorm_1p", False)):
-            print("Using Gemma RMSNorm for final normalization.")
+            logger.warning_once("Using Gemma RMSNorm for final normalization.")
             self.norm = GemmaRMSNorm(config.hidden_size,  eps=config.rms_norm_eps)
         else:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -770,7 +771,7 @@ class HybridLayerType(enum.Enum):
     linear_attention = "linear_attention"
     mamba2 = "mamba"
 
-class Qwen3HybridMoeForCausalLM(nn.Module):
+class Qwen3HybridMoEForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -955,3 +956,4 @@ class Qwen3HybridMoeForCausalLM(nn.Module):
             loaded_params.add(name)
         return loaded_params
 
+EntryClass = Qwen3HybridMoEForCausalLM
