@@ -145,12 +145,13 @@ class SchedulerStats:
     num_prefill_infight_queue_reqs: int = 0
     num_decode_prealloc_queue_reqs: int = 0
     num_decode_transfer_queue_reqs: int = 0
-    kvcache_transfer_latency : float = 0.0
+    kvcache_transfer_latency: float = 0.0
 
 
 class SchedulerMetricsCollector:
 
-    def __init__(self,
+    def __init__(
+        self,
         labels: Dict[str, str],
         bucket_kvcache_transfer_latency: Optional[List[float]] = None,
     ) -> None:
@@ -293,7 +294,7 @@ class SchedulerMetricsCollector:
                 80,
                 100,
                 200,
-                400
+                400,
             ]
 
         self.histogram_kvcache_transfer_latency = Histogram(

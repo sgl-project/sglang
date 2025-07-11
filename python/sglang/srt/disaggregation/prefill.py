@@ -138,7 +138,11 @@ class PrefillBootstrapQueue:
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
             self.is_mla_backend,
-            self.scheduler.metrics_collector if self.scheduler.enable_metrics and self.scheduler.attn_dp_rank == 0 else None,
+            (
+                self.scheduler.metrics_collector
+                if self.scheduler.enable_metrics and self.scheduler.attn_dp_rank == 0
+                else None
+            ),
         )
         return kv_manager
 

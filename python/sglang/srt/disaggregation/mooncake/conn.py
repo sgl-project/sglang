@@ -34,9 +34,9 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.metrics.collector import SchedulerMetricsCollector
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_free_port, get_int_env_var, get_ip, get_local_ip_auto
-from sglang.srt.metrics.collector import SchedulerMetricsCollector
 
 logger = logging.getLogger(__name__)
 
@@ -556,10 +556,17 @@ class MooncakeKVManager(BaseKVManager):
                                     req.mooncake_session_id: -time.time()
                                 }
                             else:
-                                if req.mooncake_session_id not in self.kvcache_transfer_latency_table[req.room]:
-                                    self.kvcache_transfer_latency_table[req.room][req.mooncake_session_id] = -time.time()
+                                if (
+                                    req.mooncake_session_id
+                                    not in self.kvcache_transfer_latency_table[req.room]
+                                ):
+                                    self.kvcache_transfer_latency_table[req.room][
+                                        req.mooncake_session_id
+                                    ] = -time.time()
                                 else:
-                                    self.kvcache_transfer_latency_table[req.room][req.mooncake_session_id] -= time.time()
+                                    self.kvcache_transfer_latency_table[req.room][
+                                        req.mooncake_session_id
+                                    ] -= time.time()
 
                         if self.is_mla_backend or (
                             local_tp_size == target_rank_registration_info.dst_tp_size
@@ -585,11 +592,18 @@ class MooncakeKVManager(BaseKVManager):
 
                         if self.scheduler_metrics_collector is not None:
                             assert req.room in self.kvcache_transfer_latency_table
-                            assert req.mooncake_session_id in self.kvcache_transfer_latency_table[req.room]
+                            assert (
+                                req.mooncake_session_id
+                                in self.kvcache_transfer_latency_table[req.room]
+                            )
                             if ret != 0:
-                                self.kvcache_transfer_latency_table[req.room][req.mooncake_session_id] = 0
+                                self.kvcache_transfer_latency_table[req.room][
+                                    req.mooncake_session_id
+                                ] = 0
                             else:
-                                self.kvcache_transfer_latency_table[req.room][req.mooncake_session_id] += time.time()
+                                self.kvcache_transfer_latency_table[req.room][
+                                    req.mooncake_session_id
+                                ] += time.time()
 
                         if ret != 0:
                             with self.session_lock:
@@ -617,9 +631,13 @@ class MooncakeKVManager(BaseKVManager):
                         if kv_chunk.is_last:
                             if self.scheduler_metrics_collector is not None:
                                 self.scheduler_metrics_collector.observe_kvcache_transfer_latency(
-                                    self.kvcache_transfer_latency_table[req.room][req.mooncake_session_id]
+                                    self.kvcache_transfer_latency_table[req.room][
+                                        req.mooncake_session_id
+                                    ]
                                 )
-                                self.kvcache_transfer_latency_table[req.room].pop(req.mooncake_session_id)
+                                self.kvcache_transfer_latency_table[req.room].pop(
+                                    req.mooncake_session_id
+                                )
 
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
