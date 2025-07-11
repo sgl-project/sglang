@@ -116,7 +116,7 @@ class HiRadixCache(RadixCache):
             self.write_backup(node)
             node.hit_count = 0
 
-    def writing_check(self, write_back=False):
+    def writing_check_helper(self, write_back=False):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
@@ -138,7 +138,7 @@ class HiRadixCache(RadixCache):
             self.dec_lock_ref(self.ongoing_write_through[ack_id])
             del self.ongoing_write_through[ack_id]
 
-    def loading_check(self):
+    def loading_check_helper(self):
         while not self.cache_controller.ack_load_queue.empty():
             try:
                 ack_id = self.cache_controller.ack_load_queue.get_nowait()
@@ -152,6 +152,22 @@ class HiRadixCache(RadixCache):
                 del self.ongoing_load_back[ack_id]
             except Exception:
                 break
+
+    def writing_check(self, write_back=False, block=False):
+        if not block:
+            return self.writing_check_helper(write_back)
+
+        while len(self.ongoing_write_through) > 0:
+            self.writing_check_helper(write_back)
+            time.sleep(0.001)
+
+    def loading_check(self, block=False):
+        if not block:
+            return self.loading_check_helper()
+
+        while len(self.ongoing_load_back) > 0:
+            self.loading_check_helper()
+            time.sleep(0.001)
 
     def evictable_size(self):
         return self.evictable_size_
