@@ -785,7 +785,7 @@ class OpenAIMoeAttention(nn.Module):
             o_ref = o_ref.view(seq_len, self.num_heads * self.head_dim)
             if self.layer_id % 2 == 1:
                 print(f"### layer_id={self.layer_id}, attn_output.shape={attn_output.shape}, o_ref.shape={o_ref.shape}")
-                torch.testing.assert_close(attn_output, o_ref, rtol=5e-2, atol=5e-2)
+                torch.testing.assert_close(attn_output, o_ref, rtol=1e-2, atol=1e-2)
 
 
         output, _ = self.o_proj(attn_output)
