@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
+from queue import Queue
 
 import psutil
 import setproctitle
@@ -475,10 +476,10 @@ class Scheduler(
         self.enable_mooncake_store_l3_cache = server_args.enable_mooncake_store_l3_cache
         # Init loading l3 cache thread
         if self.enable_hierarchical_cache and self.enable_mooncake_store_l3_cache:
-            loading_l3_cache_thread = threading.Thread(
-                target=self.loading_l3_cache, daemon=True
+            prefetch_thread = threading.Thread(
+                target=self.prefetch_l3, daemon=True
             )
-            loading_l3_cache_thread.start()
+            prefetch_thread.start()
 
         # Init memory saver
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -539,6 +540,14 @@ class Scheduler(
 
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
+
+        self.setup_logging("/home/zzy/sglang/schedulerlog.log")
+
+    def setup_logging(self, log_file_path: str):
+        log_file = open(log_file_path, "w", buffering=1)  # line-buffered
+        sys.stdout = log_file
+        sys.stderr = log_file
+        print("log file initialized")
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
@@ -752,6 +761,7 @@ class Scheduler(
         """A normal scheduler loop."""
         while True:
             recv_reqs = self.recv_requests()
+            print("requests recved from normal event loop")
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
@@ -775,6 +785,7 @@ class Scheduler(
 
         while True:
             recv_reqs = self.recv_requests()
+            print("recv requests from overlap event loop")
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
@@ -2023,23 +2034,31 @@ class Scheduler(
                 self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
 
-    def loading_l3_cache(self):
-        torch.cuda.set_stream(self.current_stream)
-        while True:
-            if len(self.waiting_queue) > 0:
-                for req in self.waiting_queue:
-                    if req.waiting_status != WaitingStatus.UNREADY:
-                        continue
+    def prefetch_l3(self):
+        # torch.cuda.set_stream(self.current_stream)
+        # while True:
+        #     if len(self.waiting_queue) > 0:
+        #         for req in self.waiting_queue:
+        #             if req.waiting_status != WaitingStatus.UNREADY:
+        #                 continue
 
-                    req.init_next_round_input(
-                        self.tree_cache
-                    )
-                    if req.l3_hit_length == 0:
-                        req.waiting_status = WaitingStatus.READY
-                        continue
-                    req.waiting_status = WaitingStatus.LOADING
-                    self.tree_cache.mooncake_load_back(req, req.last_l3_node)
-            time.sleep(0.001)
+        #             req.init_next_round_input(
+        #                 self.tree_cache
+        #             )
+        #             if req.l3_hit_length == 0:
+        #                 req.waiting_status = WaitingStatus.READY
+        #                 continue
+        #             req.waiting_status = WaitingStatus.LOADING
+        #             self.tree_cache.mooncake_load_back(req, req.last_l3_node)
+        #     time.sleep(0.001)
+        while True:
+            req = self.prefetch_queue.get(block=True)
+            key = req.input_ids
+            print("prefetch begin")
+            _, _ = self.tree_cache.match_prefix(key, True)
+            print("prefetch end")
+            self.prefetch_ack_queue.put(req)
+            
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""

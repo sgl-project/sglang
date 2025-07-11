@@ -15,7 +15,7 @@ from typing import List, Optional
 
 import torch
 
-DEFAULT_GLOBAL_SEGMENT_SIZE = 0  # 3.125 GiB
+DEFAULT_GLOBAL_SEGMENT_SIZE = int(4 * 1024 * 1024 * 1024)  # 3.125 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 8 * 1024 * 1024 * 1024  # 8.0 GiB
 
 logger = logging.getLogger(__name__)
@@ -168,7 +168,7 @@ class MooncakeStore:
             # Since mooncake store is stored in layer by layer,
             # only the first layer is checked here.
             _keys.append(f"{key}_0_k")
-        return {k: v for k, v in zip(keys, self.store.is_batch_exist(_keys).values())}
+        return {k: v for k, v in zip(keys, self.store.batch_is_exist(_keys))}
 
     def _put_batch_zero_copy_impl(
         self,
