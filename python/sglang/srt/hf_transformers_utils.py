@@ -166,7 +166,7 @@ def get_generation_config(
         return GenerationConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-    except Exception as e:
+    except OSError as e:
         logging.info("model doesn't have generation_config.json")
         return None
 
