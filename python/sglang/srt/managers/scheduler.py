@@ -1538,7 +1538,7 @@ class Scheduler(
         if need_dp_attn_preparation:
             if (
                 self.server_args.load_balance_method == "minimum_tokens"
-                and self.forward_ct % 10 == 0
+                and self.forward_ct % 40 == 0
             ):
                 self.handle_dp_balance_data(ret)
             ret = self.prepare_mlp_sync_batch(ret)
