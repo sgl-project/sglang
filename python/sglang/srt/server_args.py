@@ -1621,7 +1621,7 @@ class ServerArgs:
             "--disaggregation-transfer-backend",
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
-            choices=["mooncake", "nixl"],
+            choices=["mooncake", "nixl", "ascend"],
             help="The backend for disaggregation transfer. Default is mooncake.",
         )
         parser.add_argument(
