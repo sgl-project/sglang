@@ -177,7 +177,7 @@ typename Gemm::Arguments prepare_sm89_fp8_args(
   using ElementComputeEpilogue = float;
 
   int32_t m = a.size(0);
-  int32_t n = b.size(1);
+  int32_t n = out.size(1);
   int32_t k = a.size(1);
 
   int64_t lda = a.stride(0);
@@ -612,7 +612,7 @@ typename Gemm::Arguments prepare_sm90_fp8_args(
   using StrideD = typename Gemm::GemmKernel::StrideD;
 
   int32_t m = a.size(0);
-  int32_t n = b.size(1);
+  int32_t n = out.size(1);
   int32_t k = a.size(1);
   ElementT const* ptr_a = reinterpret_cast<ElementT const*>(a.data_ptr());
   ElementT const* ptr_b = reinterpret_cast<ElementT const*>(b.data_ptr());
@@ -949,7 +949,7 @@ typename GemmType::Gemm::Arguments prepare_sm100_fp8_args(
   using StrideAux = StrideC;
 
   int32_t m = a.size(0);
-  int32_t n = b.size(1);
+  int32_t n = out.size(1);
   int32_t k = a.size(1);
 
   ElementT const* ptr_a = reinterpret_cast<ElementT const*>(a.data_ptr());
@@ -1083,10 +1083,6 @@ torch::Tensor fp8_scaled_mm(
   TORCH_CHECK(mat_b.stride(0) == 1, "mat_a must be a column major tensor");
   TORCH_CHECK(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
 
-  TORCH_CHECK(
-      (mat_a.size(1) * mat_a.element_size()) % 16 == 0, "mat_a must be multiple of 16 bytes for memory alignment");
-  TORCH_CHECK(
-      (mat_b.size(0) * mat_b.element_size()) % 16 == 0, "mat_b must be multiple of 16 bytes for memory alignment");
   TORCH_CHECK(mat_a.scalar_type() == torch::kFloat8_e4m3fn, "mat_a must be Float8_e4m3fn");
   TORCH_CHECK(mat_b.scalar_type() == torch::kFloat8_e4m3fn, "mat_b must be Float8_e4m3fn");
   TORCH_CHECK(out_dtype == torch::kHalf || out_dtype == torch::kBFloat16, "out_dtype must be Half or BFloat16");
@@ -1104,41 +1100,91 @@ torch::Tensor fp8_scaled_mm(
     TORCH_CHECK(bias->dtype() == out_dtype, "bias dtype must match output dtype");
   }
 
-  torch::Tensor out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
-  TORCH_CHECK((out.size(1) * out.element_size()) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
+  int32_t m = mat_a.size(0);
+  int32_t original_k = mat_a.size(1);
+  int32_t original_n = mat_b.size(1);
+
+  size_t alignment_bytes_input = 16;
+  int32_t k_padded = original_k;
+  if ((static_cast<size_t>(original_k) * mat_a.element_size()) % alignment_bytes_input != 0) {
+    size_t padded_k_bytes =
+        ((static_cast<size_t>(original_k) * mat_a.element_size() + alignment_bytes_input - 1) / alignment_bytes_input) *
+        alignment_bytes_input;
+    k_padded = padded_k_bytes / mat_a.element_size();
+  }
+
+  // Create padded tensors if needed
+  torch::Tensor effective_mat_a = mat_a;
+  torch::Tensor effective_mat_b = mat_b;
+  std::cout << k_padded << " " << original_k << std::endl;
+
+  if (k_padded > original_k) {
+    // Pad mat_a, row-major
+    effective_mat_a = torch::empty_strided({m, k_padded}, {k_padded, 1}, mat_a.options());
+    effective_mat_a.slice(1, 0, original_k).copy_(mat_a);
+    effective_mat_a.slice(1, original_k, k_padded).zero_();
+
+    // Pad mat_b, column-major
+    effective_mat_b = torch::empty_strided({k_padded, original_n}, {1, k_padded}, mat_b.options());
+    effective_mat_b.slice(0, 0, original_k).copy_(mat_b);
+    effective_mat_b.slice(0, original_k, k_padded).zero_();
+  }
+
+  size_t element_size_out = 0;
+  if (out_dtype == torch::kHalf) {
+    element_size_out = sizeof(cutlass::half_t);
+  } else if (out_dtype == torch::kBFloat16) {
+    element_size_out = sizeof(cutlass::bfloat16_t);
+  } else {
+    TORCH_CHECK(false, "Unsupported output dtype");
+  }
+
+  size_t alignment_bytes_output = 16;  // 128 bits = 16 bytes
+  int32_t n_padded = original_n;
+  if ((static_cast<size_t>(original_n) * element_size_out) % alignment_bytes_output != 0) {
+    size_t padded_row_bytes =
+        ((static_cast<size_t>(original_n) * element_size_out + alignment_bytes_output - 1) / alignment_bytes_output) *
+        alignment_bytes_output;
+    n_padded = padded_row_bytes / element_size_out;
+  }
+  // Pad out, row-major
+  torch::Tensor padded_out = torch::empty({m, n_padded}, mat_a.options().dtype(out_dtype));
 
   auto sm_version = getSMVersion();
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12080
   if (sm_version >= 100) {
     if (out_dtype == torch::kBFloat16) {
-      sm100_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
-    } else {
-      sm100_fp8_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      sm100_fp8_dispatch_shape<cutlass::bfloat16_t>(
+          padded_out, effective_mat_a, effective_mat_b, scales_a, scales_b, bias);
+    } else {  // torch::kHalf
+      sm100_fp8_dispatch_shape<cutlass::half_t>(padded_out, effective_mat_a, effective_mat_b, scales_a, scales_b, bias);
     }
-    return out;
+    return padded_out.narrow(1, 0, original_n);
   }
 #endif
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12000
   if (sm_version >= 90) {
     if (out_dtype == torch::kBFloat16) {
-      sm90_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
-    } else {
-      sm90_fp8_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      sm90_fp8_dispatch_shape<cutlass::bfloat16_t>(
+          padded_out, effective_mat_a, effective_mat_b, scales_a, scales_b, bias);
+    } else {  // torch::kHalf
+      sm90_fp8_dispatch_shape<cutlass::half_t>(padded_out, effective_mat_a, effective_mat_b, scales_a, scales_b, bias);
     }
-    return out;
+    return padded_out.narrow(1, 0, original_n);
   }
 #endif
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12040
   if (sm_version == 89) {
     if (out_dtype == torch::kBFloat16) {
-      sm89_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
-    } else {
-      sm89_fp8_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      sm89_fp8_dispatch_shape<cutlass::bfloat16_t>(
+          padded_out, effective_mat_a, effective_mat_b, scales_a, scales_b, bias);
+    } else {  // torch::kHalf
+      sm89_fp8_dispatch_shape<cutlass::half_t>(padded_out, effective_mat_a, effective_mat_b, scales_a, scales_b, bias);
     }
-    return out;
+    return padded_out.narrow(1, 0, original_n);
   }
 #endif
 
