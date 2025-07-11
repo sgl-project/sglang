@@ -102,16 +102,9 @@ struct AttentionSink : AttentionVariantBase {
                                    uint8_t* smem_ptr) {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
-    window_left = (params.window_left >= 0) ? params.window_left : kv_len;
+    window_left = kv_len;
     sm_scale_log2 = params.sm_scale * math::log2e;
   }
-
-  REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
-    bool mask = true;
-    // Apply sliding window mask using the same formula as FlashInfer's DefaultAttention
-    mask &= (kv_idx + qo_len + window_left >= kv_len + qo_idx);
-    return mask;
-  })
 
   REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, {
     float d_rcp = (m != -math::inf) ? math::ptx_rcp(d + params.sink[qo_head_idx] * math::ptx_exp2(-m)) : 0.f;
