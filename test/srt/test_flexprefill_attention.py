@@ -59,7 +59,7 @@ class TestFlexPrefill(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_mmlu(self):
+    def test_niah(self):
         metadata = {"pretrained": "Qwen/Qwen3-32B-FP8", "max_seq_lengths": [32768]}
 
         tasks_list = [
