@@ -18,9 +18,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import BumpAllocator, DeepEPMode, get_bool_env_var
+from sglang.srt.utils import BumpAllocator, DeepEPMode, get_bool_env_var, is_hip
 
 _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
+
+_is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -512,9 +514,8 @@ class TboForwardBatchPreparer:
         )
 
         # TODO improve, e.g. unify w/ `init_raw`
-        if (
-            global_server_args_dict["moe_dense_tp_size"] == 1
-            and batch.gathered_buffer is not None
+        if global_server_args_dict["moe_dense_tp_size"] == 1 and (
+            _is_hip or batch.gathered_buffer is not None
         ):
             sum_len = end_token_index - start_token_index
             gathered_buffer = torch.zeros(
