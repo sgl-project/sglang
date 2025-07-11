@@ -112,7 +112,7 @@ def parse_args():
     parser.add_argument(
         "--sub-question-input-length",
         type=int,
-        default=512,
+        default=128,
         help="Length of the question input for each request (default: 128)",
     )
     parser.add_argument(
