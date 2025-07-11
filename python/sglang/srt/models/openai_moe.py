@@ -661,6 +661,7 @@ class OpenAIMoeAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+        # todo: check if sinks need exp before exp
         sinks = torch.exp(self.sinks)
         sinks = sinks.to(torch.float32)
         attn_output = self.attn(*inner_state, sink=sinks)       
