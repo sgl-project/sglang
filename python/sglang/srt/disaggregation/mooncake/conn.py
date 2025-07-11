@@ -1232,8 +1232,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
         sock, lock = cls._connect(
             format_tcp_address(ip_address, port), is_ipv6=is_ipv6_address
         )
-        if is_ipv6_address:
-            assert sock.getsockopt(zmq.IPV6) == 1
         return sock, lock
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
