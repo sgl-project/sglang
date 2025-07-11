@@ -308,7 +308,7 @@ def biased_grouped_topk_gpu(
     renormalize: bool,
     num_expert_group: int = 0,
     topk_group: int = 0,
-    compiled: bool = True,
+    compiled: bool = not _is_npu,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
