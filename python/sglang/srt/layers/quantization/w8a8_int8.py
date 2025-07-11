@@ -182,7 +182,6 @@ class W8A8Int8Config(QuantizationConfig):
     def __init__(self, quant_config: Dict[str, Any]):
         super().__init__()
         self.quant_description = quant_config
-        self.ignore = cast(List[str], quant_config.get("ignore", []))
         self.is_dynamic = quant_config.get("is_dynamic", False)
         if _is_npu:
             if (
@@ -204,6 +203,9 @@ class W8A8Int8Config(QuantizationConfig):
                         "forward_npu",
                         [npu_wrapper_rmsnorm_forward],
                     )
+        else:
+            self.ignore = cast(List[str], quant_config.get("ignore", []))
+            self.packed_modules_mapping = quant_config.get("packed_modules_mapping", {})
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -265,7 +267,9 @@ class W8A8Int8Config(QuantizationConfig):
                 return NPU_W8A8MoEMethod(self)
             return None
         else:
-            if should_ignore_layer(prefix, ignore=self.ignore):
+            if should_ignore_layer(
+                prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+            ):
                 return UnquantizedLinearMethod()
             if isinstance(layer, LinearBase):
                 return W8A8Int8LinearMethod(self)
