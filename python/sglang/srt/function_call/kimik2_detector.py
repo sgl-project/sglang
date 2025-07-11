@@ -74,6 +74,8 @@ class KimiK2Detector(BaseFormatDetector):
                 function_name = function_id.split(".")[1].split(":")[0]
                 function_idx = int(function_id.split(".")[1].split(":")[1])
 
+                logger.info(f"function_name {function_name}")
+
                 tool_calls.append(
                     ToolCallItem(
                         tool_index=function_idx,  # Use the call index in the response, not tool position
@@ -160,23 +162,26 @@ class KimiK2Detector(BaseFormatDetector):
                         else function_args
                     )
 
-                    if argument_diff:
+                    parsed_args_diff = argument_diff.split("<|tool_call_end|>", 1)[0]
+
+                    if parsed_args_diff:
 
                         calls.append(
                             ToolCallItem(
                                 tool_index=self.current_tool_id,
                                 name=None,
-                                parameters=argument_diff,
+                                parameters=parsed_args_diff,
                             )
                         )
                         self._last_arguments += argument_diff
                         self.streamed_args_for_tool[
                             self.current_tool_id
-                        ] += argument_diff
+                        ] += parsed_args_diff
 
-                    if _is_complete_json(function_args):
+                    parsed_args = function_args.split("<|tool_call_end|>", 1)[0]
+                    if _is_complete_json(parsed_args):
                         try:
-                            parsed_args = json.loads(function_args)
+                            parsed_args = json.loads(parsed_args)
                             self.prev_tool_call_arr[self.current_tool_id][
                                 "arguments"
                             ] = parsed_args
