@@ -42,6 +42,7 @@ jobs:
         timeout-minutes: 30
         env:
           SGLANG_USE_MODELSCOPE: true
+          HF_ENDPOINT: https://hf-mirror.com
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-npu
