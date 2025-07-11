@@ -116,8 +116,7 @@ class MoeWNA16Config(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
-        can_convert = cls.is_moe_wna16_compatible(hf_quant_cfg)
-        if can_convert and user_quant == "moe_wna16":
+        if user_quant == "moe_wna16" and cls.is_moe_wna16_compatible(hf_quant_cfg):
             return cls.get_name()
         return None
 

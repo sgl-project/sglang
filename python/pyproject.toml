@@ -41,6 +41,7 @@ runtime_common = [
     "pybase64",
     "python-multipart",
     "pyzmq>=25.1.2",
+    "sentencepiece",
     "soundfile==0.13.1",
     "scipy",
     "torchao==0.9.0",
