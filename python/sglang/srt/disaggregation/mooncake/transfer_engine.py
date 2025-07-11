@@ -1,6 +1,4 @@
-import json
 import logging
-from dataclasses import dataclass
 from typing import List, Optional
 
 from sglang.srt.utils import get_bool_env_var, get_free_port
