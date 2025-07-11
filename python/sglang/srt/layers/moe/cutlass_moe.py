@@ -131,8 +131,11 @@ def cutlass_fused_experts_fp8(
     a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
     device = a_q.device
 
-    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    numel = topk_ids.numel()
+    maps = torch.empty(numel * 2, dtype=torch.int32, device=device)
+
+    a_map = maps[:numel]
+    c_map = maps[numel:]
 
     prepare_moe_input(
         topk_ids,
@@ -149,10 +152,11 @@ def cutlass_fused_experts_fp8(
     rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
     rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
 
-    c_buffer = torch.empty((m * topk, n * 2 + k), device=device, dtype=out_dtype)
-    c1 = c_buffer[:, : n * 2]
-    c2 = c_buffer[:, n * 2 :]
-    intermediate = c_buffer[:, :n]
+    rows = m * topk
+    c_buffer = torch.empty((rows * (n * 3 + k)), device=device, dtype=out_dtype)
+    c1 = c_buffer[: rows * n * 2].view(rows, -1)
+    c2 = c_buffer[rows * n * 2 : rows * (2 * n + k)].view(rows, -1)
+    intermediate = c_buffer[rows * (2 * n + k) :].view(rows, -1)
 
     fp8_blockwise_scaled_grouped_mm(
         c1,
@@ -177,7 +181,7 @@ def cutlass_fused_experts_fp8(
 
     silu_and_mul(c1, intermediate)
 
-    intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
+    intermediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
 
     fp8_blockwise_scaled_grouped_mm(
         c2,
@@ -186,7 +190,7 @@ def cutlass_fused_experts_fp8(
         out_ptrs,
         a_scales_ptrs,
         b_scales_ptrs,
-        intemediate_q,
+        intermediate_q,
         w2_q,
         a2_scale,
         w2_scale,
@@ -201,14 +205,8 @@ def cutlass_fused_experts_fp8(
     )
 
     result = torch.empty((m, k), device=device, dtype=out_dtype)
-    apply_shuffle_mul_sum(c2, result, c_map, topk_weights)
+    apply_shuffle_mul_sum(c2, result, c_map, topk_weights.to(out_dtype))
     return result
-
-    # c2 = shuffle_rows(c2, c_map, (m * topk, k))
-    # c2 = c2.view(m, topk, k)
-    # c2 = c2 * topk_weights.view(m, topk, 1).to(out_dtype)
-    # result = c2.sum(dim=1).to(out_dtype)
-    # return result
 
 
 FLOAT4_E2M1_MAX = 6.0
