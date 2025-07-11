@@ -5,11 +5,6 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import torch
 
 from sglang.srt.layers.linear import LinearBase, LinearMethodBase, set_weight_attrs
-
-# from sglang.srt.layers.moe.fused_moe_triton import (
-#     FusedMoEMethodBase,
-#     FusedMoeWeightScaleSupported,
-# )
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     ChannelQuantScaleParameter,
@@ -52,6 +47,8 @@ except ImportError:
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
+
+FusedMoEMethodBase = QuantizeMethodBase
 
 
 class scalar_types:
@@ -623,7 +620,8 @@ class GPTQLinearMethod(LinearMethodBase):
             layer.qzeros,
             layer.scales,
             layer.g_idx,
-            self.quant_config.weight_bits,
+            False,
+            4,
         )
         if bias is not None:
             output.add_(bias)
@@ -661,25 +659,6 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         output_size_per_partition = sum(output_partition_sizes)
         is_row_parallel = input_size != input_size_per_partition
         weight_loader = extra_weight_attrs.get("weight_loader")
-
-        # mp_linear_kernel_config = MPLinearLayerConfig(
-        #     full_weight_shape=(input_size, output_size),
-        #     partition_weight_shape=(
-        #         input_size_per_partition,
-        #         output_size_per_partition,
-        #     ),
-        #     weight_type=self.quant_config.quant_type,
-        #     act_type=params_dtype,
-        #     group_size=self.quant_config.group_size,
-        #     zero_points=False,
-        #     has_g_idx=self.quant_config.desc_act,
-        # )
-
-        # kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
-
-        # if kernel_type.__name__ not in self._kernel_backends_being_used:
-        #     logger.info("Using %s for GPTQMarlinLinearMethod", kernel_type.__name__)
-        #     self._kernel_backends_being_used.add(kernel_type.__name__)
 
         # Normalize group_size
         if self.quant_config.group_size != -1:
@@ -769,7 +748,7 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         layer.register_parameter("qzeros", qzeros)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        device = getattr(layer, self.w_q_name).device
+        device = getattr(layer, "qweight").device
         c = self.config
 
         row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
@@ -867,9 +846,6 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
             is_k_full=self.is_k_full,
             bias=bias,
         )
-
-
-FusedMoEMethodBase = QuantizeMethodBase
 
 
 class GPTQMarlinMoEMethod(FusedMoEMethodBase):
@@ -1066,20 +1042,20 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
         # Repack weights
-        marlin_w13_qweight = ops.gptq_marlin_moe_repack(
+        marlin_w13_qweight = gptq_marlin_moe_repack(
             layer.w13_qweight,
             layer.w13_g_idx_sort_indices,
             layer.w13_qweight.shape[1] * self.quant_config.pack_factor,
             layer.w13_qweight.shape[2],
-            self.quant_config.quant_type.size_bits,
+            4,
         )
         replace_parameter(layer, "w13_qweight", marlin_w13_qweight)
-        marlin_w2_qweight = ops.gptq_marlin_moe_repack(
+        marlin_w2_qweight = gptq_marlin_moe_repack(
             layer.w2_qweight,
             layer.w2_g_idx_sort_indices,
             layer.w2_qweight.shape[1] * self.quant_config.pack_factor,
             layer.w2_qweight.shape[2],
-            self.quant_config.quant_type.size_bits,
+            4,
         )
         replace_parameter(layer, "w2_qweight", marlin_w2_qweight)
         # Repack scales
@@ -1137,11 +1113,14 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias,
+            # scoring_func=scoring_func,
+            correction_bias=e_score_correction_bias,
         )
 
-        return torch.ops.sgl_kernel.fused_marlin_moe(
+        from sgl_kernel import fused_marlin_moe
+
+        # return torch.ops.vllm.fused_marlin_moe(
+        return fused_marlin_moe(
             x,
             layer.w13_qweight,
             layer.w2_qweight,
@@ -1154,6 +1133,6 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             g_idx2=layer.w2_g_idx,
             sort_indices1=layer.w13_g_idx_sort_indices,
             sort_indices2=layer.w2_g_idx_sort_indices,
-            quant_type_id=self.quant_config.quant_type.id,
+            num_bits=4,
             is_k_full=self.is_k_full,
         ).to(orig_dtype)

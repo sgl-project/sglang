@@ -388,6 +388,7 @@ class ModelConfig:
             "fp8",
             "marlin",
             "modelopt",
+            "gptq",
             "gptq_marlin_24",
             "gptq_marlin",
             "awq_marlin",
@@ -405,6 +406,7 @@ class ModelConfig:
             "modelopt_fp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
+            "gptq_marlin": ["gptq"],
         }
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
