@@ -453,6 +453,10 @@ def prefetch_weight_files(hf_weights_files: List[str]) -> None:
     if torch.distributed.is_initialized():
         world_size = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
+        device_nums = torch.cuda.device_count()
+        if device_nums < world_size:
+            rank = rank % device_nums
+            world_size = device_nums
     local_files = hf_weights_files[rank::world_size]
     mmap_files_concurrently(local_files)
 
