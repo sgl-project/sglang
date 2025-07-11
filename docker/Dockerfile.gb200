@@ -1,5 +1,4 @@
 FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
-
 ARG CUDA_VERSION=12.8.0
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -56,24 +55,24 @@ WORKDIR /sgl-workspace
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 RUN mkdir /opt/dynamo && \
     uv venv /sgl-workspace/venv --python 3.10
+
 # Activate virtual environment
 ENV VIRTUAL_ENV=/sgl-workspace/venv
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
 # --- Clone & install sglang ---
-RUN git clone --depth 1 https://github.com/sgl-project/sglang.git && \
+# We are using https://github.com/sgl-project/sglang/pull/7569
+RUN git clone https://github.com/sgl-project/sglang.git && \
     cd sglang && \
+    git checkout 3d7cdb2ebd89413ecfec4dad27456f994f1ee7ee && \
     uv pip install -e "python[blackwell]"
 
 # --- Install nightly PyTorch ---
 RUN uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128 --force-reinstall
-
 # --- Install sgl_kernel ---
 RUN uv pip install https://github.com/sgl-project/whl/releases/download/v0.2.0/sgl_kernel-0.2.0+cu128-cp39-abi3-manylinux2014_aarch64.whl
-
 # --- torch sanity check ---
 RUN uv pip show torch
-
 # --- Download & build NVSHMEM (before DeepEP to enable cache reuse) ---
 RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz \
  && git clone https://github.com/deepseek-ai/DeepEP.git \
@@ -92,7 +91,6 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/sour
     NVSHMEM_USE_GDRCOPY=1 \
     cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=100 \
  && cmake --build build --target install -j
-
 RUN uv pip show torch
 RUN cd /sgl-workspace/DeepEP && DEEPEP_NVCC_LINEINFO=1 CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=10.0 NVSHMEM_DIR=${NVSHMEM_DIR} python3 setup.py install
 
@@ -117,13 +115,11 @@ RUN apt-get update -y && \
     autoconf \
     libtool \
     build-essential
-
 # Install RDMA/UCX dependencies
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
     --reinstall libibverbs-dev rdma-core ibverbs-utils libibumad-dev \
     libnuma-dev librdmacm-dev ibverbs-providers
-
 # Build UCX from source
 ARG NIXL_UCX_REF=v1.19.x
 RUN rm -rf /opt/hpcx/ucx || true && \
@@ -149,15 +145,12 @@ RUN rm -rf /opt/hpcx/ucx || true && \
     make -j && \
     make -j install-strip && \
     ldconfig
-
 # Set UCX environment
 ENV LD_LIBRARY_PATH=/usr/lib:/usr/local/ucx/lib:$LD_LIBRARY_PATH
-
 # 0.3.1 release pinned commit
 RUN git clone https://github.com/ai-dynamo/nixl.git /opt/nixl && \
     cd /opt/nixl && \
     git checkout 16348080f5bdeb9fe6058a23be140cec020ef3f3
-
 RUN uv pip install meson
 RUN cd /opt/nixl && \
     mkdir build && \
@@ -171,12 +164,9 @@ RUN cd /opt/nixl && \
     uv build . --out-dir /tmp/nixl-wheels && \
     uv pip install /tmp/nixl-wheels/*.whl && \
     rm -rf /tmp/nixl-wheels
-
 # Set NIXL environment
 ENV LD_LIBRARY_PATH=/usr/local/nixl/lib/aarch64-linux-gnu:/usr/local/nixl/lib/aarch64-linux-gnu/plugins:$LD_LIBRARY_PATH
 ENV NIXL_PLUGIN_DIR=/usr/local/nixl/lib/aarch64-linux-gnu/plugins
-
-# TODO: mooncake
 
 # --- Entrypoint ---
 WORKDIR /sgl-workspace
