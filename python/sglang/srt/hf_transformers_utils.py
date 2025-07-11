@@ -116,6 +116,14 @@ def get_config(
         kwargs["gguf_file"] = model
         model = Path(model).parent
 
+    if is_remote_url(model):
+        # BaseConnector implements __del__() to clean up the local dir.
+        # Since config files need to exist all the time, so we DO NOT use
+        # with statement to avoid closing the client.
+        client = create_remote_connector(model)
+        client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
+        model = client.get_local_dir()
+
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
     )

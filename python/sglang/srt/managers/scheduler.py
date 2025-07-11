@@ -2210,8 +2210,13 @@ class Scheduler(
         url = params["url"]
 
         worker = self.tp_worker.worker
-
         worker.model_runner.save_remote_model(url)
+
+        if self.draft_worker is not None:
+            draft_worker = self.draft_worker.worker
+            draft_url = params["draft_url"]
+            assert draft_url is not None
+            draft_worker.model_runner.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):
         worker = self.tp_worker.worker

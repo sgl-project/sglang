@@ -131,6 +131,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        self.is_nextn = True
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
