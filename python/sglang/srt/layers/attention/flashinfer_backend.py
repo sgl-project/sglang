@@ -7,6 +7,7 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import datetime
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -43,6 +44,51 @@ if is_flashinfer_available():
     from flashinfer.cascade import merge_state
     from flashinfer.decode import _get_range_buf, get_seq_lens
     from flashinfer.jit.utils import filename_safe_dtype_map
+
+
+_tensor_log_file_path = os.environ.get("SGLANG_TENSOR_LOG_PATH")
+
+
+def log_tensor(name: str, tensor: Optional[torch.Tensor]):
+    # Debug print to check if the function is called and the path is correct
+    print(f"[Debug] log_tensor called for '{name}'. Log path: {_tensor_log_file_path}")
+
+    if not _tensor_log_file_path:
+        return
+
+    # Only log tensors on GPU 0
+    if tensor is not None and tensor.is_cuda and tensor.device.index != 0:
+        return
+
+    with open(_tensor_log_file_path, "a") as f:
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        f.write(f"[{timestamp}]-START-{name}\n")
+        if tensor is None:
+            f.write("None\n")
+        else:
+            f.write(f"shape: {tensor.shape}, dtype: {tensor.dtype}, device: {tensor.device}\n")
+            f.write(
+                f"mean: {tensor.float().mean()}, std: {tensor.float().std()}, min: {tensor.float().min()}, max: {tensor.float().max()}\n"
+            )
+            f.write("value:\n")
+            with torch.no_grad():
+                # Special handling for Q and output tensors to show first 256 values
+                if ("_q" in name.lower() or "_output" in name.lower()) and tensor.numel() >= 256:
+                    tensor_type = "Q" if "_q" in name.lower() else "output"
+                    f.write(f"First 256 values of {tensor_type} tensor:\n")
+                    flat_tensor = tensor.flatten()
+                    f.write(f"{flat_tensor[:256]}\n")
+                    if tensor.numel() > 256:
+                        f.write(f"... (total {tensor.numel()} elements)\n")
+                elif tensor.numel() > 2048:
+                    f.write(
+                        f"tensor too large to print completely. shape: {tensor.shape}. numel: {tensor.numel()}. printing sample.\n"
+                    )
+                    f.write(f"begin: {tensor.flatten()[:128]}\n")
+                    f.write(f"end: {tensor.flatten()[-128:]}\n")
+                else:
+                    f.write(f"{tensor}\n")
+        f.write(f"[{timestamp}]-END-{name}\n\n")
 
 
 # Attention sink declaration (from test_attention_sink.py)
@@ -566,6 +612,12 @@ class FlashInferAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sink: Optional[torch.Tensor] = None,
     ):
+        # Log input tensors
+        log_tensor(f"forward_extend_layer{layer.layer_id}_q", q)
+        log_tensor(f"forward_extend_layer{layer.layer_id}_k", k)
+        log_tensor(f"forward_extend_layer{layer.layer_id}_v", v)
+        log_tensor(f"forward_extend_layer{layer.layer_id}_sink", sink)
+        
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -699,7 +751,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        output = o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        
+        # Log output tensor
+        log_tensor(f"forward_extend_layer{layer.layer_id}_output", output)
+        
+        return output
 
     def forward_decode(
         self,
@@ -711,6 +768,12 @@ class FlashInferAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sink: Optional[torch.Tensor] = None,
     ):
+        # Log input tensors
+        log_tensor(f"forward_decode_layer{layer.layer_id}_q", q)
+        log_tensor(f"forward_decode_layer{layer.layer_id}_k", k)
+        log_tensor(f"forward_decode_layer{layer.layer_id}_v", v)
+        log_tensor(f"forward_decode_layer{layer.layer_id}_sink", sink)
+        
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -757,7 +820,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale,
             )
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        output = o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        
+        # Log output tensor
+        log_tensor(f"forward_decode_layer{layer.layer_id}_output", output)
+        
+        return output
 
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
