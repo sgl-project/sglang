@@ -117,7 +117,7 @@ class SchedulerOutputProcessorMixin:
                             logits_output.hidden_states[
                                 hidden_state_offset : (
                                     hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
+                                    + req.extend_input_len
                                 )
                             ]
                             .cpu()
