@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
-import math
+
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import get_bool_env_var
 
@@ -15,8 +15,10 @@ FLEXPREFILL_DEFAULT_BLOCK_SIZE = 128
 FLEXPREFILL_DEFAULT_MIN_BUDGET = 1024
 FLEXPREFILL_THRESHOLD = max(
     2 * FLEXPREFILL_DEFAULT_BLOCK_SIZE,
-    math.ceil(FLEXPREFILL_DEFAULT_MIN_BUDGET / FLEXPREFILL_DEFAULT_BLOCK_SIZE) * FLEXPREFILL_DEFAULT_BLOCK_SIZE
+    math.ceil(FLEXPREFILL_DEFAULT_MIN_BUDGET / FLEXPREFILL_DEFAULT_BLOCK_SIZE)
+    * FLEXPREFILL_DEFAULT_BLOCK_SIZE,
 )
+
 
 def check_if_use_flexprefill(forward_batch: ForwardBatch) -> bool:
     return (
@@ -24,6 +26,7 @@ def check_if_use_flexprefill(forward_batch: ForwardBatch) -> bool:
         and forward_batch.seq_lens_sum > FLEXPREFILL_THRESHOLD
         and get_bool_env_var("SGL_USE_FLEXPREFILL")
     )
+
 
 def gpu_info():
     if torch.cuda.is_available():
