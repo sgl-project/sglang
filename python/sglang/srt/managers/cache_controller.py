@@ -34,7 +34,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.mooncake_store import MooncakeStore
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
+from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str, get_hash_str_mooncake
 
 logger = logging.getLogger(__name__)
 
@@ -152,14 +152,12 @@ class CacheOperation:
         device_indices: torch.Tensor,
         node_id: int,
         priority: Optional[int] = None,
-        l3_keys: Optional[List[str]] = None,
         page_size: Optional[int] = None,
     ):
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
         self.data = None
-        self.l3_keys = l3_keys
         self.page_size = page_size
 
         self.id = CacheOperation.counter
@@ -173,8 +171,6 @@ class CacheOperation:
         self.device_indices = torch.cat([self.device_indices, other.device_indices])
         self.priority = min(self.priority, other.priority)
         self.node_ids.extend(other.node_ids)
-        if self.l3_keys and other.l3_keys:
-            self.l3_keys.extend(other.l3_keys)
 
     def split(self, factor) -> List["CacheOperation"]:
         # split an operation into smaller operations to reduce the size of intermediate buffers
@@ -189,13 +185,6 @@ class CacheOperation:
                     host_indices=self.host_indices[i : i + chunk_size],
                     device_indices=self.device_indices[i : i + chunk_size],
                     node_id=0,
-                    l3_keys=(
-                        self.l3_keys[
-                            i // self.page_size : (i + chunk_size) // self.page_size
-                        ]
-                        if self.l3_keys
-                        else None
-                    ),
                     page_size=self.page_size,
                 )
             )
@@ -302,7 +291,7 @@ class HiCacheController:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         mem_pool_host: HostKVCache,
         page_size: int,
-        enable_mooncake_store_l3_cache: bool,
+        # enable_mooncake_store_l3_cache: bool,
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through_selective",
         # mooncake_l3_kv_pool: MooncakeStore = None,
@@ -329,9 +318,18 @@ class HiCacheController:
                 self.ongoing_prefetch: dict[int, PrefetchOperation] = {}
                 # todo: threshold policy for prefetching
                 self.prefetch_threshold = prefetch_threshold
+                self.storage_zerocopy = False
+                self.storage_batchedio = False
             elif storage_backend == "mooncake":
-                # self.storage_backend = 
-                pass
+                self.storage_backend = MooncakeStore()
+                self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
+                self.enable_storage = True
+                # tracking prefetch operation progress
+                self.ongoing_prefetch: dict[int, PrefetchOperation] = {}
+                # todo: threshold policy for prefetching
+                self.prefetch_threshold = prefetch_threshold
+                self.storage_zerocopy = True
+                self.storage_batchedio = True
             else:
                 raise NotImplementedError(
                     f"Unsupported storage backend: {storage_backend}"
@@ -372,33 +370,48 @@ class HiCacheController:
         self.write_thread.start()
         self.load_thread.start()
 
-        self.enable_mooncake_store_l3_cache = enable_mooncake_store_l3_cache
-        if self.enable_mooncake_store_l3_cache:
+        # self.enable_mooncake_store_l3_cache = enable_mooncake_store_l3_cache
+        # if self.enable_mooncake_store_l3_cache:
 
-            self.mooncake_l3_kv_pool = mooncake_l3_kv_pool
+        #     self.mooncake_l3_kv_pool = mooncake_l3_kv_pool
 
-            self.mooncake_l3_write_queue = PriorityQueue()
-            self.mooncake_load_queue = PriorityQueue()
-            self.l3_load_queue = PriorityQueue()
+        #     self.mooncake_l3_write_queue = PriorityQueue()
+        #     self.mooncake_load_queue = PriorityQueue()
+        #     self.l3_load_queue = PriorityQueue()
 
-            self.mooncake_l3_stop_event = threading.Event()
+        #     self.mooncake_l3_stop_event = threading.Event()
 
-            self.mooncake_l3_load_cache_event = mooncake_l3_load_cache_event
+        #     self.mooncake_l3_load_cache_event = mooncake_l3_load_cache_event
 
-            self.mooncake_l3_ack_load_queue = Queue()
+        #     self.mooncake_l3_ack_load_queue = Queue()
 
-            # L2 -> L3
-            self.mooncake_l3_write_thread = threading.Thread(
-                target=self.mooncake_l3_write_thread_func_direct,
-                daemon=True,
+        #     # L2 -> L3
+        #     self.mooncake_l3_write_thread = threading.Thread(
+        #         target=self.mooncake_l3_write_thread_func_direct,
+        #         daemon=True,
+        #     )
+        #     # L3 -> L2
+        #     self.mooncake_load_thread = threading.Thread(
+        #         target=self.mooncake_load_thread_func, daemon=True
+        #     )
+
+        #     self.mooncake_l3_write_thread.start()
+        #     self.mooncake_load_thread.start()
+        if self.enable_storage:
+            self.prefetch_thread = threading.Thread(
+                target=self.prefetch_thread_func, daemon=True
             )
-            # L3 -> L2
-            self.mooncake_load_thread = threading.Thread(
-                target=self.mooncake_load_thread_func, daemon=True
+            self.backup_thread = threading.Thread(
+                target=self.backup_thread_func, daemon=True
             )
+            self.prefetch_queue = Queue()
+            self.backup_queue = Queue()
 
-            self.mooncake_l3_write_thread.start()
-            self.mooncake_load_thread.start()
+            self.prefetch_revoke_queue = Queue()
+            self.ack_backup_queue = Queue()
+
+            self.prefetch_thread.start()
+            self.backup_thread.start()
 
     def reset(self):
         self.stop_event.set()
@@ -411,6 +424,13 @@ class HiCacheController:
         self.load_buffer.clear()
         self.ack_write_queue.queue.clear()
         self.ack_load_queue.queue.clear()
+        if self.enable_storage:
+            self.prefetch_thread.join()
+            self.backup_thread.join()
+            self.prefetch_queue.queue.clear()
+            self.backup_queue.queue.clear()
+            self.prefetch_revoke_queue.queue.clear()
+            self.ack_backup_queue.queue.clear()
 
         self.write_thread = threading.Thread(
             target=self.write_thread_func_direct, daemon=True
@@ -422,35 +442,43 @@ class HiCacheController:
         self.write_thread.start()
         self.load_thread.start()
 
-        if self.enable_mooncake_store_l3_cache:
-            self.mooncake_l3_stop_event.set()
-            self.mooncake_l3_write_thread.join()
-            self.mooncake_load_thread.join()
+        # if self.enable_mooncake_store_l3_cache:
+        #     self.mooncake_l3_stop_event.set()
+        #     self.mooncake_l3_write_thread.join()
+        #     self.mooncake_load_thread.join()
 
-            self.mooncake_l3_write_queue.queue.clear()
-            self.mooncake_load_queue.queue.clear()
-            self.l3_load_queue.queue.clear()
+        #     self.mooncake_l3_write_queue.queue.clear()
+        #     self.mooncake_load_queue.queue.clear()
+        #     self.l3_load_queue.queue.clear()
 
-            self.mooncake_l3_ack_load_queue.queue.clear()
+        #     self.mooncake_l3_ack_load_queue.queue.clear()
 
-            self.mooncake_l3_write_thread = threading.Thread(
-                target=self.mooncake_l3_write_thread_func_direct,
-                daemon=True,
+        #     self.mooncake_l3_write_thread = threading.Thread(
+        #         target=self.mooncake_l3_write_thread_func_direct,
+        #         daemon=True,
+        #     )
+        #     self.mooncake_load_thread = threading.Thread(
+        #         target=self.mooncake_load_thread_func, daemon=True
+        #     )
+
+        #     self.mooncake_l3_stop_event.clear()
+
+        #     self.mooncake_l3_write_thread.start()
+        #     self.mooncake_load_thread.start()
+        if self.enable_storage:
+            self.prefetch_thread = threading.Thread(
+                target=self.prefetch_thread_func, daemon=True
             )
-            self.mooncake_load_thread = threading.Thread(
-                target=self.mooncake_load_thread_func, daemon=True
+            self.backup_thread = threading.Thread(
+                target=self.backup_thread_func, daemon=True
             )
-
-            self.mooncake_l3_stop_event.clear()
-
-            self.mooncake_l3_write_thread.start()
-            self.mooncake_load_thread.start()
+            self.prefetch_thread.start()
+            self.backup_thread.start()
 
     def write(
         self,
         device_indices: torch.Tensor,
         priority: Optional[int] = None,
-        l3_keys: Optional[List] = None,
         node_id: int = 0,
     ) -> Optional[torch.Tensor]:
         """
@@ -466,7 +494,6 @@ class HiCacheController:
                 device_indices,
                 node_id,
                 priority,
-                l3_keys=l3_keys,
                 page_size=self.page_size,
             )
         )
@@ -536,15 +563,15 @@ class HiCacheController:
                 self.mem_pool_host.complete_io(operation.host_indices)
 
                 # write L3 cache
-                if self.enable_mooncake_store_l3_cache:
-                    mooncake_operation = MooncakeStoreCacheOperation(
-                        operation.l3_keys,
-                        operation.host_indices,
-                        operation.node_ids,
-                        priority=operation.priority,
-                    )
+                # if self.enable_mooncake_store_l3_cache:
+                #     mooncake_operation = MooncakeStoreCacheOperation(
+                #         operation.l3_keys,
+                #         operation.host_indices,
+                #         operation.node_ids,
+                #         priority=operation.priority,
+                #     )
 
-                    self.mooncake_l3_write_queue.put(mooncake_operation)
+                #     self.mooncake_l3_write_queue.put(mooncake_operation)
 
                 for node_id in operation.node_ids:
                     if node_id != 0:
@@ -578,28 +605,28 @@ class HiCacheController:
                 logger.error(e)
 
 
-    def mooncake_load_thread_func(self):
-        while not self.mooncake_l3_stop_event.is_set():
-            try:
-                operation = self.mooncake_load_queue.get(block=True, timeout=0.001)
-                if isinstance(operation, MooncakeStoreCacheOperation):
-                    key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(operation.mooncake_keys,
-                                                                                     operation.host_indices)
-                    self.mooncake_l3_kv_pool.batch_get(key_strs, buffer_ptrs, buffer_sizes)
+    # def mooncake_load_thread_func(self):
+    #     while not self.mooncake_l3_stop_event.is_set():
+    #         try:
+    #             operation = self.mooncake_load_queue.get(block=True, timeout=0.001)
+    #             if isinstance(operation, MooncakeStoreCacheOperation):
+    #                 key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(operation.mooncake_keys,
+    #                                                                                  operation.host_indices)
+    #                 self.mooncake_l3_kv_pool.batch_get(key_strs, buffer_ptrs, buffer_sizes)
 
-                    for node_id in operation.node_ids:
-                        if node_id != 0:
-                            self.mooncake_l3_ack_load_queue.put(node_id)
-                elif isinstance(operation, MooncakeIsBatchExistOperation):
-                    self.mooncake_l3_kv_pool.is_batch_exist(operation.l3_keys)
-                    for node_id in operation.node_ids:
-                        if node_id != 0:
-                            self.mooncake_l3_ack_load_queue.put(node_id)
+    #                 for node_id in operation.node_ids:
+    #                     if node_id != 0:
+    #                         self.mooncake_l3_ack_load_queue.put(node_id)
+    #             elif isinstance(operation, MooncakeIsBatchExistOperation):
+    #                 self.mooncake_l3_kv_pool.is_batch_exist(operation.l3_keys)
+    #                 for node_id in operation.node_ids:
+    #                     if node_id != 0:
+    #                         self.mooncake_l3_ack_load_queue.put(node_id)
 
-            except Empty:
-                continue
-            except Exception as e:
-                logger.error(e)
+    #         except Empty:
+    #             continue
+    #         except Exception as e:
+    #             logger.error(e)
 
     def load_thread_func_layer_by_layer(self):
         """
@@ -668,3 +695,215 @@ class HiCacheController:
             raise ValueError(
                 f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
             )
+    def prefetch(
+        self,
+        request_id: str,
+        host_indices: torch.Tensor,
+        new_input_tokens: List[int],
+        last_hash: Optional[str] = None,
+    ) -> int:
+        """
+        Prefetch KV caches from storage backend to host memory.
+        """
+        operation = PrefetchOperation(
+            request_id, host_indices, new_input_tokens, last_hash
+        )
+        self.ongoing_prefetch[request_id] = operation
+        self.prefetch_queue.put(operation)
+
+    def terminate_prefetch(self, request_id: str):
+        operation = self.ongoing_prefetch.pop(request_id, None)
+        if operation is None:
+            raise ValueError(
+                f"Request ID {request_id} not found in ongoing prefetches."
+            )
+        operation.mark_done()
+        return operation.completed_tokens, operation.hash_value
+
+    def prefetch_io_aux_func(self):
+        """
+        Auxiliary function conducting IO operations for prefetching.
+        """
+        while not self.stop_event.is_set():
+            try:
+                operation = self.prefetch_buffer.get(block=True, timeout=1)
+                if self.storage_batchedio:
+                    if self.storage_zerocopy:
+                        key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(operation.hash_value,
+                                                                                     operation.host_indices)
+                        self.storage_backend.get(key_strs, buffer_ptrs, buffer_sizes)
+                    else:
+                        pass
+                    operation.completed_tokens += len(operation.hash_value) * self.page_size
+                else:
+                    for h in operation.hash_value:
+                        if self.storage_zerocopy:
+                            #unimplemented
+                            pass
+                        else:
+                            page_data = self.storage_backend.get(h)
+                            if page_data is None:
+                                logger.warning(
+                                    f"Prefetch operation {operation.request_id} failed to retrieve page {h}."
+                                )
+                                break
+                            self.mem_pool_host.set_from_flat_data_page(
+                                operation.host_indices[operation.completed_tokens],
+                                page_data,
+                            )
+                        if operation.is_done():
+                            # operation terminated by controller, release pre-allocated memory
+                            self.mem_pool_host.free(
+                                operation.host_indices[operation.completed_tokens :]
+                            )
+                            break
+                        operation.completed_tokens += self.page_size
+            except Empty:
+                continue
+
+    def prefetch_thread_func(self):
+        """
+        Manage prefetching operations from storage backend to host memory.
+        """
+        self.prefetch_buffer = Queue()
+        aux_thread = threading.Thread(target=self.prefetch_io_aux_func, daemon=True)
+        aux_thread.start()
+        while (not self.stop_event.is_set()) or not self.prefetch_queue.empty():
+            try:
+                operation = self.prefetch_queue.get(block=True, timeout=1)
+                if operation is None:
+                    continue
+
+                last_hash = operation.last_hash
+                tokens_to_fetch = operation.token_ids
+
+                storage_hit_count = 0
+                remaining_tokens = len(tokens_to_fetch)
+                hash_value = []
+                while remaining_tokens >= self.page_size:
+                    if isinstance(self.storage_backend, HiCacheFile):
+                        last_hash = get_hash_str(
+                            tokens_to_fetch[
+                                storage_hit_count : storage_hit_count + self.page_size
+                            ],
+                            last_hash,
+                        )
+                    elif isinstance(self.storage_backend, MooncakeStore):
+                        local_rank = torch.cuda.current_device()
+                        last_hash = get_hash_str_mooncake(
+                                last_hash, 
+                                tokens_to_fetch[
+                                    storage_hit_count : storage_hit_count + self.page_size
+                                ],
+                                local_rank
+                            )
+                    
+                    if self.storage_backend.exists(last_hash):
+                        storage_hit_count += self.page_size
+                        hash_value.append(last_hash)
+                        remaining_tokens -= self.page_size
+                    else:
+                        break
+
+                if storage_hit_count < self.prefetch_threshold:
+                    # not to prefetch if not enough benefits
+                    self.prefetch_revoke_queue.put(operation.request_id)
+                else:
+                    operation.hash_value = hash_value
+                    logger.debug(
+                        f"Prefetching {len(hash_value)} pages for request {operation.request_id}."
+                    )
+                    self.prefetch_buffer.put(operation)
+
+            except Empty:
+                continue
+
+    def write_storage(
+        self,
+        host_indices: torch.Tensor,
+        token_ids: List[int],
+        last_hash: Optional[str] = None,
+    ) -> int:
+        """
+        Write KV caches from host memory to storage backend.
+        """
+        operation = StorageOperation(host_indices, token_ids, last_hash)
+        self.backup_queue.put(operation)
+        return operation.id
+
+    def backup_thread_func(self):
+        """
+        Manage backup operations from host memory to storage backend.
+        """
+        while not self.stop_event.is_set():
+            try:
+                operation = self.backup_queue.get(block=True, timeout=1)
+                if operation is None:
+                    continue
+
+                last_hash = operation.last_hash
+                tokens_to_backup = operation.token_ids
+
+                backup_hit_count = 0
+                remaining_tokens = len(tokens_to_backup)
+                hash_value = []
+                while remaining_tokens >= self.page_size:
+                    if isinstance(self.storage_backend, HiCacheFile):
+                        last_hash = get_hash_str(
+                            tokens_to_backup[
+                                backup_hit_count : backup_hit_count + self.page_size
+                            ],
+                            last_hash,
+                        )
+                    elif isinstance(self.storage_backend, MooncakeStore):
+                        local_rank = torch.cuda.current_device()
+                        last_hash = get_hash_str_mooncake(
+                                last_hash, 
+                                tokens_to_backup[
+                                    backup_hit_count : backup_hit_count + self.page_size
+                                ],
+                                local_rank
+                            )
+                    backup_hit_count += self.page_size
+                    hash_value.append(last_hash)
+                    remaining_tokens -= self.page_size
+                    operation.hash_value = hash_value
+                    
+                if self.storage_batchedio:
+                    if self.storage_zerocopy:
+                        exist_hashvalues = self.storage_backend.exists(hash_value)
+                        indices = operation.host_indices.tolist()
+                        non_exist_keys = []
+                        non_exist_indices = []
+                        for i in range(len(hash_value)):
+                            if not exist_hashvalues[hash_value[i]]:
+                                non_exist_keys.append(hash_value[i])
+                                non_exist_indices.extend(indices[i * self.page_size: (i + 1) * self.page_size])
+                        if len(non_exist_keys) > 0:
+                            key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(non_exist_keys,
+                                                                                             non_exist_indices)
+                            self.storage_backend.set(key_strs, buffer_ptrs, buffer_sizes)
+
+                        operation.comleted_tokens += len(hash_value) * self.page_size
+                    else:
+                        #unimplemented
+                        pass
+                else:
+                    for i in range(0, len(tokens_to_backup), self.page_size):
+                        last_hash = hash_value[i]
+                        # todo, handle failures in storage backend
+                        if self.storage_zerocopy:
+                            pass
+                        else:
+                            self.storage_backend.set(
+                                last_hash,
+                                self.mem_pool_host.get_flat_data_page(
+                                    operation.host_indices[i]
+                                ),
+                            )
+                        operation.completed_tokens += self.page_size
+
+                self.ack_backup_queue.put((operation.id, operation.hash_value))
+
+            except Empty:
+                continue

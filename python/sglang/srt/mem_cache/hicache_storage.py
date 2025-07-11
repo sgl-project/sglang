@@ -8,6 +8,7 @@ import uuid
 import json
 
 import torch
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,17 @@ def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
 		hasher.update(t.to_bytes(4, byteorder="little", signed=False))
 
 	return hasher.hexdigest()
+
+def get_hash_str_mooncake(
+    prefix_block_key: str, current_page_ids: List, local_rank: int
+):
+    prefix_str = ""
+    if len(prefix_block_key):
+        prefix_str = hashlib.sha256(prefix_block_key.encode()).hexdigest()
+    current_token_ids_bytes = np.array(current_page_ids).tobytes()
+    current_hash_object = hashlib.sha256(current_token_ids_bytes)
+    current_hash_hex = current_hash_object.hexdigest()
+    return f"{prefix_str}_{int(current_hash_hex[:16], 16)}_{local_rank}"
 
 
 # todo: batch API for better performance
@@ -131,7 +143,7 @@ class HiCacheFile(HiCacheStorage):
 			logger.warning(f"Key {key} does not exist. Cannot delete.")
 			return
 
-	def exists(self, key: str) -> bool | Dict:
+	def exists(self, key) -> bool | Dict:
 		tensor_path = f"{self.file_path}/{key}.bin"
 		return os.path.exists(tensor_path)
 
@@ -279,7 +291,7 @@ class MooncakeStore(HiCacheStorage):
 
 		return self._get_batch_zero_copy_impl(key, target_location, target_sizes)
 	
-	def exists(self, key: str) -> bool | Dict:
+	def exists(self, key) -> bool | Dict:
 		_keys = []
 		for key in key:
 			if key is None:
