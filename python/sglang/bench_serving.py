@@ -251,9 +251,10 @@ async def async_request_openai_completions(
                                 "completion_tokens", output_len
                             )
                             cached_tokens = (
-                                (data.get("usage") or {}).get("prompt_tokens_details")
-                                or {}
-                            ).get("cached_tokens", cached_tokens)
+                                data.get("usage", {})
+                                .get("prompt_tokens_details", {})
+                                .get("cached_tokens", cached_tokens)
+                            )
 
                     output.generated_text = generated_text
                     output.success = True
@@ -351,12 +352,11 @@ async def async_request_openai_chat_completions(
                         output.output_len = response_json.get("usage", {}).get(
                             "completion_tokens", output_len
                         )
-                        output.cached_tokens = (
-                            (response_json.get("usage") or {}).get(
-                                "prompt_tokens_details"
-                            )
-                            or {}
-                        ).get("cached_tokens", cached_tokens)
+                        cached_tokens = (
+                            data.get("usage", {})
+                            .get("prompt_tokens_details", {})
+                            .get("cached_tokens", cached_tokens)
+                        )
                     else:
                         # Streaming response
                         async for chunk_bytes in response.content:
@@ -372,7 +372,7 @@ async def async_request_openai_chat_completions(
                                 data = json.loads(chunk)
 
                                 # Check if this chunk contains content
-                                choices = data.get("choices", [{}])
+                                choices = data.get("choices", [])
                                 delta = choices[0].get("delta", {}) if choices else {}
                                 content = delta.get("content", "")
 
@@ -397,11 +397,10 @@ async def async_request_openai_chat_completions(
                                     "completion_tokens", output_len
                                 )
                                 cached_tokens = (
-                                    (data.get("usage") or {}).get(
-                                        "prompt_tokens_details"
-                                    )
-                                    or {}
-                                ).get("cached_tokens", cached_tokens)
+                                    data.get("usage", {})
+                                    .get("prompt_tokens_details", {})
+                                    .get("cached_tokens", cached_tokens)
+                                )
 
                         output.generated_text = generated_text
                         output.success = True
@@ -560,7 +559,9 @@ async def async_request_sglang_generate(
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
                                 output_len = data["meta_info"]["completion_tokens"]
-                                cached_tokens = data["meta_info"]["cached_tokens"]
+                                cached_tokens = data["meta_info"].get(
+                                    "cached_tokens", 0
+                                )
 
                                 # First token
                                 if ttft == 0.0:
