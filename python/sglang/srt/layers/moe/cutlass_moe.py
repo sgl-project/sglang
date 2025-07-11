@@ -151,8 +151,8 @@ def cutlass_fused_experts_fp8(
 
     c_buffer = torch.empty((m * topk, n * 2 + k), device=device, dtype=out_dtype)
     c1 = c_buffer[:, : n * 2]
-    c2 = c_buffer[:, n * 2:]
-    intermediate = c_buffer[:, : n]
+    c2 = c_buffer[:, n * 2 :]
+    intermediate = c_buffer[:, :n]
 
     fp8_blockwise_scaled_grouped_mm(
         c1,
@@ -200,11 +200,15 @@ def cutlass_fused_experts_fp8(
         workspace,
     )
 
-    c2 = shuffle_rows(c2, c_map, (m * topk, k))
-    c2 = c2.view(m, topk, k)
-    c2 = c2 * topk_weights.view(m, topk, 1).to(out_dtype)
-    result = c2.sum(dim=1).to(out_dtype)
+    result = torch.empty((m, k), device=device, dtype=out_dtype)
+    apply_shuffle_mul_sum(c2, result, c_map, topk_weights)
     return result
+
+    # c2 = shuffle_rows(c2, c_map, (m * topk, k))
+    # c2 = c2.view(m, topk, k)
+    # c2 = c2 * topk_weights.view(m, topk, 1).to(out_dtype)
+    # result = c2.sum(dim=1).to(out_dtype)
+    # return result
 
 
 FLOAT4_E2M1_MAX = 6.0
