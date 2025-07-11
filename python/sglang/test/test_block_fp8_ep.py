@@ -40,7 +40,7 @@ def ep_moe(
     block_shape: Optional[List[int]] = None,
 ):
     use_blockwise_fp8 = block_shape is not None
-    topk_weights, topk_ids = select_experts(
+    topk_weights, topk_ids, _ = select_experts(
         hidden_states=hidden_states,
         router_logits=router_logits,
         top_k=top_k,

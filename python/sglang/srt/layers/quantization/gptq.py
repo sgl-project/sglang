@@ -1,6 +1,6 @@
 import logging
 from fractions import Fraction
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 import torch
 
@@ -11,6 +11,9 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import is_cuda
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import TopKOutput
 
 _is_cuda = is_cuda()
 
@@ -685,15 +688,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        global_num_experts: int = -1,
-        expert_map: Optional[torch.Tensor] = None,
-        custom_routing_function: Optional[Callable] = None,
+        topk_output: "TopKOutput",
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
@@ -704,18 +699,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         orig_dtype = x.dtype
         x = x.half()
 
-        topk_weights, topk_ids = FusedMoE.select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias,
-        )
+        topk_weights, topk_ids, router_logits = topk_output
 
         return torch.ops.vllm.fused_marlin_moe(
             x,

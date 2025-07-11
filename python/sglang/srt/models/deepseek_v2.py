@@ -57,7 +57,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -298,6 +298,17 @@ class DeepseekV2MoE(nn.Module):
             config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
         )
 
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=True,
+            num_expert_group=config.n_group,
+            num_fused_shared_experts=self.num_fused_shared_experts,
+            topk_group=config.topk_group,
+            correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
+
         self.experts = get_moe_impl_class()(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
@@ -306,13 +317,7 @@ class DeepseekV2MoE(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=self.layer_id,
-            renormalize=config.norm_topk_prob,
             quant_config=quant_config,
-            use_grouped_topk=True,
-            num_expert_group=config.n_group,
-            num_fused_shared_experts=self.num_fused_shared_experts,
-            topk_group=config.topk_group,
-            correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
             **(
@@ -443,10 +448,11 @@ class DeepseekV2MoE(nn.Module):
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
 
         with torch.cuda.stream(self.alt_stream):
             final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=router_logits
+                hidden_states=hidden_states, topk_output=topk_output
             )
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
@@ -467,8 +473,9 @@ class DeepseekV2MoE(nn.Module):
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=hidden_states, topk_output=topk_output
         )
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
@@ -482,8 +489,9 @@ class DeepseekV2MoE(nn.Module):
     def forward_cpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
         fused_experts_out = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=hidden_states, topk_output=topk_output
         )
 
         assert use_intel_amx_backend(
@@ -541,17 +549,9 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             shared_output = self._forward_shared_experts(hidden_states)
-            topk_weights, topk_idx = select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                top_k=self.top_k,
-                use_grouped_topk=True,
-                renormalize=self.renormalize,
-                topk_group=self.topk_group,
-                num_expert_group=self.num_expert_group,
-                num_fused_shared_experts=self.num_fused_shared_experts,
-                correction_bias=self.correction_bias,
-                routed_scaling_factor=self.routed_scaling_factor,
+            topk_weights, topk_idx, _ = self.topk(
+                hidden_states,
+                router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
@@ -641,17 +641,9 @@ class DeepseekV2MoE(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
-                state.topk_weights_local, state.topk_idx_local = select_experts(
+                state.topk_weights_local, state.topk_idx_local, _ = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    top_k=self.top_k,
-                    use_grouped_topk=True,
-                    renormalize=self.renormalize,
-                    topk_group=self.topk_group,
-                    num_expert_group=self.num_expert_group,
-                    num_fused_shared_experts=self.num_fused_shared_experts,
-                    correction_bias=self.correction_bias,
-                    routed_scaling_factor=self.routed_scaling_factor,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
