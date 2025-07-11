@@ -58,6 +58,15 @@ endif()
 
 file(GLOB SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
+if(NOT DEFINED ENV{SGLANG_CPU_FP8_CVT_FTZ})
+    set(ENV{SGLANG_CPU_FP8_CVT_FTZ} "1")
+endif()
+
+if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
+    message(STATUS "Enabling macro: SGLANG_CPU_FP8_CVT_FTZ")
+    add_compile_definitions(SGLANG_CPU_FP8_CVT_FTZ)
+endif()
+
 add_compile_options(
     -O3
     -Wno-unknown-pragmas

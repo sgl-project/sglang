@@ -93,7 +93,7 @@ class TestJanusProServer(TestOpenAIVisionServer):
         )
         cls.base_url += "/v1"
 
-    def test_video_chat_completion(self):
+    def test_video_images_chat_completion(self):
         pass
 
     def test_single_image_chat_completion(self):
@@ -170,7 +170,7 @@ class TestKimiVLServer(TestOpenAIVisionServer):
         )
         cls.base_url += "/v1"
 
-    def test_video_chat_completion(self):
+    def test_video_images_chat_completion(self):
         pass
 
 

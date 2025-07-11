@@ -35,12 +35,12 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int scale_num_rows = 0,
     const int scale_stride = 0) {
   const int threads_per_group = 16;
-  const int local_group_id = threadIdx.x / threads_per_group;
+  const int64_t local_group_id = threadIdx.x / threads_per_group;
   const int lane_id = threadIdx.x % threads_per_group;
 
-  const int block_group_id = blockIdx.x * groups_per_block;
-  const int global_group_id = block_group_id + local_group_id;
-  const int block_group_offset = global_group_id * group_size;
+  const int64_t block_group_id = blockIdx.x * groups_per_block;
+  const int64_t global_group_id = block_group_id + local_group_id;
+  const int64_t block_group_offset = global_group_id * group_size;
 
   float local_absmax = eps;
 

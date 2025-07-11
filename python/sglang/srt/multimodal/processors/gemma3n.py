@@ -72,7 +72,7 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
             ),
         )
 
-        mm_items, input_ids = self.process_and_combine_mm_data(base_output)
+        mm_items, input_ids, _ = self.process_and_combine_mm_data(base_output)
 
         return {
             "input_ids": input_ids.tolist(),

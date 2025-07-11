@@ -493,6 +493,17 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
 
+    def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        # in qwen-vl, last dim is the same
+        pixel_values = torch.cat(
+            [item.pixel_values_videos for item in items], dim=0
+        ).type(self.visual.dtype)
+        video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
+        assert pixel_values.dim() == 2, pixel_values.dim()
+        assert video_grid_thw.dim() == 2, video_grid_thw.dim()
+        video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
+        return video_embeds
+
     def _process_video_input(self, video_input: Qwen2VLVideoInputs) -> torch.Tensor:
         pixel_values_videos = video_input["pixel_values_videos"].type(self.visual.dtype)
         video_embeds = self.visual(
@@ -538,7 +549,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.model,
-            image_data_embedding_func=self.get_image_feature,
+            multimodal_model=self,
             positions=positions,
         )
 
