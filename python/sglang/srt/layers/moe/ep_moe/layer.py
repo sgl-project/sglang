@@ -12,7 +12,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
@@ -64,6 +63,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if not _is_npu:
     from sgl_kernel import silu_and_mul
+
+    from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 
 if _is_hip:
     from vllm._custom_ops import scaled_fp8_quant

@@ -144,7 +144,7 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
             MultimodalDataItem(
                 pixel_values=processor_output["pixel_values"],
                 modality=Modality.IMAGE,
-                image_offsets=image_offsets,
+                offsets=image_offsets,
             )
         ]
 

@@ -267,6 +267,10 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
 
 
+class ChatCompletionMessageContentVideoURL(BaseModel):
+    url: str
+
+
 class ChatCompletionMessageContentAudioURL(BaseModel):
     url: str
 
@@ -277,6 +281,11 @@ class ChatCompletionMessageContentImagePart(BaseModel):
     modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
 
 
+class ChatCompletionMessageContentVideoPart(BaseModel):
+    type: Literal["video_url"]
+    video_url: ChatCompletionMessageContentVideoURL
+
+
 class ChatCompletionMessageContentAudioPart(BaseModel):
     type: Literal["audio_url"]
     audio_url: ChatCompletionMessageContentAudioURL
@@ -285,6 +294,7 @@ class ChatCompletionMessageContentAudioPart(BaseModel):
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentImagePart,
+    ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
 ]
 
@@ -629,6 +639,7 @@ class MessageProcessingResult:
     prompt_ids: Union[str, List[int]]
     image_data: Optional[Any]
     audio_data: Optional[Any]
+    video_data: Optional[Any]
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[Any] = None
