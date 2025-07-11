@@ -10,13 +10,13 @@ A list of popular LLMs are optimized and run efficiently on CPU,
 including the most notable open-source models like Llama series, Qwen series,
 and the phenomenal high-quality reasoning model DeepSeek-R1.
 
-| Model Name | BF16 | w8a8_int8 | w4a16 | FP8 |
-|:---:|:---:|:---:|:---:|:---:|
-| DeepSeek-R1 |   | meituan/DeepSeek-R1-Channel-INT8 |   | deepseek-ai/DeepSeek-R1 |
-| Llama-3.2-3B | meta-llama/Llama-3.2-3B-Instruct | RedHatAI/Llama-3.2-3B-quantized.w8a8 | AMead10/Llama-3.2-3B-Instruct-AWQ |   |
+| Model Name | BF16 | w8a8_int8 | FP8 |
+|:---:|:---:|:---:|:---:|
+| DeepSeek-R1 |   | [meituan/DeepSeek-R1-Channel-INT8](https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8) | [deepseek-ai/DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1) |
+| Llama-3.2-3B | [meta-llama/Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct) | [RedHatAI/Llama-3.2-3B-quantized.w8a8](https://huggingface.co/RedHatAI/Llama-3.2-3B-Instruct-quantized.w8a8) |   |
 
-**Note:** In the above table, if the model ID is exhibited in the grid,
-it means the model is verified. 
+**Note:** In the above table, if the model identifier is listed in the grid,
+it means the model is verified.
 
 ## Installation
 
@@ -37,6 +37,7 @@ docker run \
     -it \
     --privileged \
     --ipc=host \
+    --network=host \
     -v /dev/shm:/dev/shm \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     -p 30000:30000 \
@@ -63,7 +64,7 @@ python -m sglang.launch_server   \
 
 Notes:
 
-1. For running INT8 quantized models, please add the flag `--quantization w8a8_int8`.
+1. For running W8A8 quantized models, please add the flag `--quantization w8a8_int8`.
 
 2. The flag `--tp 6` indicates that we will apply tensor parallel with 6 ranks (TP6).
 In general the TP rank number should be in line with the total number of sub-numa clusters (SNCs) on the server
@@ -107,3 +108,37 @@ python -m sglang.bench_serving -h
 Additionally, the requests can be formed with
 [OpenAI Completions API](https://docs.sglang.ai/backend/openai_api_completions.html)
 and sent via the command line (e.g. using `curl`) or via your own script.
+
+## Example: Running DeepSeek-R1
+
+The example W8A8 model service launching command in the container on a Xeon® 6980P server would be
+
+```bash
+python -m sglang.launch_server                 \
+    --model meituan/DeepSeek-R1-Channel-INT8   \
+    --trust-remote-code                        \
+    --disable-overlap-schedule                 \
+    --device cpu                               \
+    --quantization w8a8_int8                   \
+    --host 0.0.0.0                             \
+    --mem-fraction-static 0.8                  \
+    --max-total-token 65536                    \
+    --tp 6
+```
+
+Similarly, the example FP8 model service launching command would be
+
+```bash
+python -m sglang.launch_server                 \
+    --model deepseek-ai/DeepSeek-R1            \
+    --trust-remote-code                        \
+    --disable-overlap-schedule                 \
+    --device cpu                               \
+    --host 0.0.0.0                             \
+    --mem-fraction-static 0.8                  \
+    --max-total-token 65536                    \
+    --tp 6
+```
+
+Then we can test with `bench_serving` command or construct our own command or script
+following [the benchmarking example](#benchmarking-with-requests).
