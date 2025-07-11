@@ -193,15 +193,23 @@ class PrefetchOperation(StorageOperation):
     ):
         self.request_id = request_id
 
-        self._done_flag = threading.Event()
+        self._done_flag = False
+        self._lock = threading.Lock()
 
         super().__init__(host_indices, token_ids, last_hash)
 
+    def increment(self, num_tokens: int):
+        with self._lock:
+            if self._done_flag:
+                return
+            self.completed_tokens += num_tokens
+
     def mark_done(self):
-        self._done_flag.set()
+        with self._lock:
+            self._done_flag = True
 
     def is_done(self) -> bool:
-        return self._done_flag.is_set()
+        return self._done_flag
 
 
 class HiCacheController:
@@ -523,13 +531,13 @@ class HiCacheController:
                         operation.host_indices[operation.completed_tokens],
                         page_data,
                     )
+                    operation.increment(self.page_size)
                     if operation.is_done():
                         # operation terminated by controller, release pre-allocated memory
                         self.mem_pool_host.free(
                             operation.host_indices[operation.completed_tokens :]
                         )
                         break
-                    operation.completed_tokens += self.page_size
             except Empty:
                 continue
 

@@ -390,6 +390,7 @@ class HiRadixCache(RadixCache):
             return
 
         # todo: more policies for prefetch progress such as timeout
+        # the current policy is to prefetch with best effort and terminate when queuing is over
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(req_id)
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
         min_completed_tokens = torch.tensor(completed_tokens, dtype=torch.int)

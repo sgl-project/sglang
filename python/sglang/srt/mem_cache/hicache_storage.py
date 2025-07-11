@@ -41,10 +41,28 @@ class HiCacheStorage(ABC):
         pass
 
     @abstractmethod
+    def batch_get(
+        self, keys: List[str], target_locations: Optional[List[torch.Tensor]] = None
+    ) -> List[torch.Tensor | None]:
+        """
+        Retrieve values for multiple keys.
+        Returns a list of tensors or None for each key.
+        """
+        pass
+
+    @abstractmethod
     def set(self, key, value) -> bool:
         """
         Store the value associated with the given key.
         Returns True if the operation was successful, False otherwise.
+        """
+        pass
+
+    @abstractmethod
+    def batch_set(self, keys: List[str], values: List[torch.Tensor]) -> bool:
+        """
+        Store multiple key-value pairs.
+        Returns True if all operations were successful, False otherwise.
         """
         pass
 
@@ -94,10 +112,22 @@ class HiCacheFile(HiCacheStorage):
         except FileNotFoundError:
             return None
 
+    def batch_get(
+        self,
+        keys: List[str],
+        target_locations: Optional[List[torch.Tensor]] = None,
+    ) -> List[torch.Tensor | None]:
+        return [
+            self.get(key, target_location)
+            for key, target_location in zip(
+                keys, target_locations or [None] * len(keys)
+            )
+        ]
+
     def set(self, key: str, value: torch.Tensor) -> bool:
-        tensor_path = f"{self.file_path}/{key}.bin"
+        tensor_path = os.path.join(self.file_path, f"{key}.bin")
         if self.exists(key):
-            logger.warning(f"Key {key} already exists. Skipped.")
+            logger.debug(f"Key {key} already exists. Skipped.")
             return True
         try:
             torch.save(value, tensor_path)
@@ -106,8 +136,13 @@ class HiCacheFile(HiCacheStorage):
             logger.error(f"Failed to save tensor {key}: {e}")
             return False
 
+    def batch_set(self, keys: List[str], values: List[torch.Tensor]) -> bool:
+        for key, value in zip(keys, values):
+            if not self.set(key, value):
+                return False
+
     def delete(self, key: str) -> None:
-        tensor_path = f"{self.file_path}/{key}.bin"
+        tensor_path = os.path.join(self.file_path, f"{key}.bin")
         try:
             os.remove(tensor_path)
         except FileNotFoundError:
@@ -115,7 +150,7 @@ class HiCacheFile(HiCacheStorage):
             return
 
     def exists(self, key: str) -> bool:
-        tensor_path = f"{self.file_path}/{key}.bin"
+        tensor_path = os.path.join(self.file_path, f"{key}.bin")
         return os.path.exists(tensor_path)
 
     def clear(self) -> None:
