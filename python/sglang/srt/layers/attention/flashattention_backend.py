@@ -9,7 +9,7 @@ import torch
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_ops.flex_prefill_attention import (
-    flex_prefill_attention, check_if_use_flexprefill, FLEXPREFILL_THRESHOLD
+    flex_prefill_attention, check_if_use_flexprefill
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
