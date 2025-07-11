@@ -187,11 +187,24 @@ class LayerCommunicator:
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
-            if residual is None:
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
+            if (
+                residual is not None
+                and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
+                and hidden_states._sglang_needs_allreduce_fusion
+            ):
+                hidden_states, residual = (
+                    self.input_layernorm.forward_with_allreduce_fusion(
+                        hidden_states, residual
+                    )
+                )
             else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+                if residual is None:
+                    residual = hidden_states
+                    hidden_states = self.input_layernorm(hidden_states)
+                else:
+                    hidden_states, residual = self.input_layernorm(
+                        hidden_states, residual
+                    )
 
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,
@@ -402,12 +415,14 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if hidden_states.shape[0] != 0:
                 hidden_states = layernorm(hidden_states)
         else:
+            # According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
+            # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
             if (
                 _is_sm100_supported
                 and _is_flashinfer_available
                 and hasattr(layernorm, "forward_with_allreduce_fusion")
                 and global_server_args_dict["enable_flashinfer_allreduce_fusion"]
-                and hidden_states.shape[0] <= 1024
+                and hidden_states.shape[0] <= 128
             ):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
