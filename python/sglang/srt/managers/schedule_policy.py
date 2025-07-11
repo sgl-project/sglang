@@ -452,19 +452,17 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
-        if not self.is_hybrid:
-            # Skip this logic for swa. The SWA has different memory management, and
-            # this mechanism is underestimating the memory usage.
-            cur_rem_tokens = self.cur_rem_tokens - len(req.origin_input_ids)
-            tokens_freed = 0
-            for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
-                # tokens_left gives a reservative calculation as the last token is not stored
-                bs = len(self.req_states) - i
-                min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
-                # reserve tokens for corner cases
-                if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
-                    return AddReqResult.NO_TOKEN
-                tokens_freed += tokens_occupied
+        # TODO: better estimation for swa
+        cur_rem_tokens = self.cur_rem_tokens - len(req.origin_input_ids)
+        tokens_freed = 0
+        for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
+            # tokens_left gives a reservative calculation as the last token is not stored
+            bs = len(self.req_states) - i
+            min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
+            # reserve tokens for corner cases
+            if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
+                return AddReqResult.NO_TOKEN
+            tokens_freed += tokens_occupied
 
         if (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
