@@ -1284,7 +1284,7 @@ def calculate_metrics(
             )
             retokenized_output_lens.append(retokenized_output_len)
             total_input += input_requests[i].prompt_len
-            total_cached_tokens += outputs[i].cached_tokens
+            total_cached_tokens += outputs[i].cached_tokens or 0
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             itls += outputs[i].itl
