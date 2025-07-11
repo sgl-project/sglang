@@ -1,8 +1,9 @@
 import random
+from typing import Tuple
+
 import pytest
 import torch
 from sgl_kernel import fp8_blockwise_scaled_grouped_mm
-from typing import Tuple
 
 
 def cdiv(a: int, b: int) -> int:
@@ -18,6 +19,7 @@ def to_fp8(tensor: torch.Tensor) -> torch.Tensor:
     return torch.round(tensor.clamp(min=finfo.min, max=finfo.max)).to(
         dtype=torch.float8_e4m3fn
     )
+
 
 # Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
 def calc_diff(x, y):
@@ -125,16 +127,20 @@ def test_fp8_blockwise_scaled_grouped_mm(num_experts, out_dtype):
         expert_offsets[g + 1] = expert_offsets[g] + m_g
         problem_sizes[g][:] = torch.tensor([m_g, n_g, k_g], device=device)
 
-        a = torch.randn((m_g, k_g), device=device, dtype=out_dtype)      # (M, K):(K, 1)
+        a = torch.randn((m_g, k_g), device=device, dtype=out_dtype)  # (M, K):(K, 1)
         b = torch.randn((n_g, k_g), device=device, dtype=out_dtype).t()  # (K, N):(1, K)
 
-        a_g, a_scale = per_token_cast_to_fp8(a) # ag -- (M, K):(K, 1), a_scale() -- (M, k):(k, 1)
-        b_g, b_scale = per_block_cast_to_fp8(b) # bg -- (K, N):(N, 1), b_scale() -- (k, n):(n, 1)
+        a_g, a_scale = per_token_cast_to_fp8(
+            a
+        )  # ag -- (M, K):(K, 1), a_scale() -- (M, k):(k, 1)
+        b_g, b_scale = per_block_cast_to_fp8(
+            b
+        )  # bg -- (K, N):(N, 1), b_scale() -- (k, n):(n, 1)
         a_tensors.append(a_g)
         b_tensors.append(b_g)
         a_scales_tensors.append(a_scale)
         b_scales_tensors.append(b_scale)
-        
+
         baseline = torch.mm(a, b)
         baseline_tensors.append(baseline)
 
@@ -147,9 +153,11 @@ def test_fp8_blockwise_scaled_grouped_mm(num_experts, out_dtype):
 
     for g in range(num_experts):
         # Matrix A is Row-Major.
-        a_stack[expert_offsets[g] : expert_offsets[g + 1]] = a_tensors[g]   # a_stack[expert_offsets[g] : expert_offsets[g + 1]] -- (M, K):(K, 1)
-        b_stack[g] = b_tensors[g].t()   # b_stack[g] -- (N, K):(K, 1)
-    b_stack = b_stack.transpose(1, 2)   # Transpose Matrix B to Column-Major.
+        a_stack[expert_offsets[g] : expert_offsets[g + 1]] = a_tensors[
+            g
+        ]  # a_stack[expert_offsets[g] : expert_offsets[g + 1]] -- (M, K):(K, 1)
+        b_stack[g] = b_tensors[g].t()  # b_stack[g] -- (N, K):(K, 1)
+    b_stack = b_stack.transpose(1, 2)  # Transpose Matrix B to Column-Major.
 
     a_scale_stack = torch.empty(
         (expert_offsets[-1] * (k_g // 128)), device=device, dtype=torch.float32
@@ -163,15 +171,19 @@ def test_fp8_blockwise_scaled_grouped_mm(num_experts, out_dtype):
             # For SM90, we need MN-Major scale factor
             # a_scales_tensors[g] -- (M, k):(k, 1)
             # a_scales_tensors[g].t().contiguous() -- (k, M):(M, 1)
-            a_scale_stack[expert_offsets[g] * (k_g // 128) : expert_offsets[g + 1] * (k_g // 128)] = \
-                a_scales_tensors[g].t().contiguous().view(-1)
+            a_scale_stack[
+                expert_offsets[g] * (k_g // 128) : expert_offsets[g + 1] * (k_g // 128)
+            ] = (a_scales_tensors[g].t().contiguous().view(-1))
             b_scale_stack[g] = b_scales_tensors[g]  # b_scale_stack[g] -- (k, n):(n, 1)
         elif cc == 10:
             # For SM100, we need K-Major scale factor
             # a_scales_tensors[g] -- (M, k):(k, 1)
-            a_scale_stack[expert_offsets[g] * (k_g // 128) : expert_offsets[g + 1] * (k_g // 128)] = \
-                a_scales_tensors[g].view(-1)
-            b_scale_stack[g] = b_scales_tensors[g]  # b_scale_stack[g] -- (k, n):(n, 1), we need transpose & contiguous later
+            a_scale_stack[
+                expert_offsets[g] * (k_g // 128) : expert_offsets[g + 1] * (k_g // 128)
+            ] = a_scales_tensors[g].view(-1)
+            b_scale_stack[g] = b_scales_tensors[
+                g
+            ]  # b_scale_stack[g] -- (k, n):(n, 1), we need transpose & contiguous later
     a_scale_stack = a_scale_stack.view(expert_offsets[-1], k_g // 128)
     if cc == 10:
         b_scale_stack = b_scale_stack.transpose(1, 2).contiguous()
@@ -216,7 +228,10 @@ def test_fp8_blockwise_scaled_grouped_mm(num_experts, out_dtype):
         actual = c_out[expert_offsets[g] : expert_offsets[g + 1]]
         diff = calc_diff(actual, baseline)
         assert diff < 0.001
-        print(f"cc={cc}0 num_experts={num_experts}, out_dtype={out_dtype}, diff={diff:.5f}: OK")
+        print(
+            f"cc={cc}0 num_experts={num_experts}, out_dtype={out_dtype}, diff={diff:.5f}: OK"
+        )
+
 
 if __name__ == "__main__":
     pytest.main([__file__])
