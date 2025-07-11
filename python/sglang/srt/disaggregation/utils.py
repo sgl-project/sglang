@@ -15,11 +15,11 @@ import requests
 import torch
 import torch.distributed as dist
 
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.utils import get_ip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.scheduler import Scheduler
 
 #########################
 # Constants & Enums
