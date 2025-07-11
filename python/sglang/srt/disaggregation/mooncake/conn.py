@@ -196,7 +196,7 @@ class MooncakeKVManager(BaseKVManager):
             )
 
             if self.scheduler_metrics_collector is not None:
-                self.kvcache_transfer_latency_table: Dict[str, Dict[str, float]] = {}
+                self.kvcache_transfer_latency_table: Dict[int, Dict[str, float]] = {}
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.heartbeat_failures = {}
             self.session_pool = defaultdict(requests.Session)

@@ -15,6 +15,7 @@ import requests
 import torch
 import torch.distributed as dist
 
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.utils import get_ip
 
 if TYPE_CHECKING:
@@ -349,3 +350,9 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
         req.input_top_logprobs_idx = []
         req.input_token_ids_logprobs_val = []
         req.input_token_ids_logprobs_idx = []
+
+
+def get_metrics_collector(scheduler: Scheduler):
+    if scheduler.enable_metrics:
+        return scheduler.metrics_collector
+    return None
