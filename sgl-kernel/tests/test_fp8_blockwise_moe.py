@@ -216,7 +216,7 @@ def test_fp8_blockwise_scaled_grouped_mm(num_experts, out_dtype):
         actual = c_out[expert_offsets[g] : expert_offsets[g + 1]]
         diff = calc_diff(actual, baseline)
         assert diff < 0.001
-        print(f"num_experts={num_experts}, out_dtype={out_dtype}, diff={diff:.5f}: OK")
+        print(f"cc={cc}0 num_experts={num_experts}, out_dtype={out_dtype}, diff={diff:.5f}: OK")
 
 if __name__ == "__main__":
     pytest.main([__file__])
