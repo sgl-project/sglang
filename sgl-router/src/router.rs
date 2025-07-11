@@ -105,8 +105,8 @@ pub enum Router {
             during the next eviction cycle.
         */
         worker_urls: Arc<RwLock<Vec<String>>>,
-        tree: Arc<Mutex<Tree>>,
-        running_queue: Arc<Mutex<HashMap<String, usize>>>,
+        tree: Arc<RwLock<Tree>>,
+        running_queue: Arc<RwLock<HashMap<String, usize>>>,
         processed_queue: Arc<Mutex<HashMap<String, usize>>>,
         cache_threshold: f32,
         balance_abs_threshold: usize,
@@ -230,8 +230,8 @@ impl Router {
                     processed_queue.insert(url.clone(), 0);
                 }
 
-                let tree = Arc::new(Mutex::new(Tree::new()));
-                let running_queue = Arc::new(Mutex::new(running_queue));
+                let tree = Arc::new(RwLock::new(Tree::new()));
+                let running_queue = Arc::new(RwLock::new(running_queue));
                 let processed_queue = Arc::new(Mutex::new(processed_queue));
 
                 // Create background eviction thread
@@ -243,7 +243,7 @@ impl Router {
                         // Sleep for the specified interval
                         thread::sleep(Duration::from_secs(eviction_interval_secs));
 
-                        let locked_tree_clone = tree_clone.lock().unwrap();
+                        let locked_tree_clone = tree_clone.read().unwrap();
                         // Run eviction
                         locked_tree_clone.evict_tenant_by_size(max_tree_size);
 
@@ -252,13 +252,13 @@ impl Router {
                         info!("Processed Queue: {:?}", locked_processed_queue);
 
                         // Print the running queue
-                        let locked_running_queue = running_queue_clone.lock().unwrap();
+                        let locked_running_queue = running_queue_clone.read().unwrap();
                         info!("Running Queue: {:?}", locked_running_queue);
                     }
                 });
 
                 for url in &worker_urls {
-                    tree.lock().unwrap().insert("", url);
+                    tree.write().unwrap().insert("", url);
                 }
 
                 Router::CacheAware {
@@ -620,7 +620,14 @@ impl Router {
                     let is_stream = typed_req.is_stream();
 
                     // Select worker based on text
-                    let worker_url = self.select_generate_worker_from_text(&text);
+                    let worker_url = match self.select_generate_worker_from_text(&text) {
+                        Ok(url) => url,
+                        Err(e) => {
+                            // If there are no workers, we can't continue. Return 503 Service Unavailable.
+                            error!("Failed to select worker from `select_generate_worker_from_text` with error:{}", e);
+                            return HttpResponse::ServiceUnavailable().body(e);
+                        }
+                    };
                     let mut request_retries = 0;
 
                     // Try the same worker multiple times
@@ -684,44 +691,96 @@ impl Router {
         }
     }
 
-    // Helper method to select worker from text
-    fn select_generate_worker_from_text(&self, text: &str) -> String {
+    fn select_generate_worker_from_text(&self, text: &str) -> Result<String, String> {
         match self {
-            Router::RoundRobin {
-                worker_urls,
-                current_index,
-                ..
-            } => {
-                let idx = current_index
-                    .fetch_update(
-                        std::sync::atomic::Ordering::SeqCst,
-                        std::sync::atomic::Ordering::SeqCst,
-                        |x| Some((x + 1) % worker_urls.read().unwrap().len()),
-                    )
-                    .unwrap();
-                worker_urls.read().unwrap()[idx].clone()
+            Self::RoundRobin { .. } => self.select_worker_round_robin(),
+            Self::Random { .. } => self.select_worker_random(),
+            Self::CacheAware { .. } => self.select_worker_cache_aware(text),
+            Self::PrefillDecode { .. } => {
+                // For PD mode, we don't use this method
+                return Err("`PD_MODE_ERROR`: PD mode does not support this method".to_string());
             }
+        }
+    }
 
-            Router::Random { worker_urls, .. } => worker_urls.read().unwrap()
-                [rand::random::<usize>() % worker_urls.read().unwrap().len()]
-            .clone(),
+    fn select_worker_round_robin(&self) -> Result<String, String> {
+        if let Self::RoundRobin {
+            worker_urls,
+            current_index,
+            ..
+        } = self
+        {
+            let urls = worker_urls.read().unwrap();
+            if urls.is_empty() {
+                return Err("No workers available for RoundRobin routing".to_string());
+            }
+            let idx = current_index
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |x| Some((x + 1) % urls.len()),
+                )
+                .unwrap(); // Safe due to the empty check
+            Ok(urls[idx].clone())
+        } else {
+            unreachable!("Called `select_worker_round_robin` on a non-RoundRobin router");
+        }
+    }
 
-            Router::CacheAware {
-                worker_urls,
-                tree,
-                running_queue,
-                processed_queue,
-                cache_threshold,
-                balance_abs_threshold,
-                balance_rel_threshold,
-                ..
-            } => {
-                let tree = tree.lock().unwrap();
-                let mut running_queue = running_queue.lock().unwrap();
+    fn select_worker_random(&self) -> Result<String, String> {
+        if let Self::Random { worker_urls, .. } = self {
+            let urls = worker_urls.read().unwrap();
+            if urls.is_empty() {
+                return Err("No workers available for Random routing".to_string());
+            }
+            Ok(urls[rand::random::<usize>() % urls.len()].clone())
+        } else {
+            unreachable!("Called select_worker_random on a non-Random router");
+        }
+    }
 
-                // Get current load statistics
-                let max_load = *running_queue.values().max().unwrap_or(&0);
-                let min_load = *running_queue.values().min().unwrap_or(&0);
+    fn select_worker_cache_aware(&self, text: &str) -> Result<String, String> {
+        if let Self::CacheAware {
+            worker_urls,
+            tree,
+            running_queue,
+            processed_queue,
+            cache_threshold,
+            balance_abs_threshold,
+            balance_rel_threshold,
+            ..
+        } = self
+        {
+            // --- 1. Validate Worker URLs & Get Fallback ---
+            let first_worker_url = {
+                let worker_urls_guard = worker_urls
+                    .read()
+                    .expect("Failed to read worker urls: RwLock poisoned");
+                if worker_urls_guard.is_empty() {
+                    return Err("No workers available for CacheAware routing".to_string());
+                }
+                worker_urls_guard[0].clone()
+            };
+
+            let selected_url: String;
+
+            // --- 2. Determine Load Balancing or Cache-Aware Routing ---
+            {
+                let running_queue_read_guard = running_queue
+                    .read()
+                    .expect("Failed to read running queue: RwLock poisoned");
+
+                let (mut min_load, mut max_load) = running_queue_read_guard
+                    .values()
+                    .fold((usize::MAX, 0), |(min, max), &load| {
+                        (min.min(load), max.max(load))
+                    });
+
+                // Adjust for empty queue case (where min_load remains usize::MAX)
+                if running_queue_read_guard.is_empty() {
+                    min_load = 0;
+                    max_load = 0;
+                }
 
                 // Load is considered imbalanced if:
                 // 1. (max - min) > abs_threshold AND
@@ -729,61 +788,89 @@ impl Router {
                 let is_imbalanced = max_load.saturating_sub(min_load) > *balance_abs_threshold
                     && (max_load as f32) > (min_load as f32 * balance_rel_threshold);
 
-                let selected_url = if is_imbalanced {
-                    // Log load balancing trigger and current queue state
+                if is_imbalanced {
                     info!(
                         "Load balancing triggered due to workload imbalance:\n\
                         Max load: {}, Min load: {}\n\
                         Current running queue: {:?}",
-                        max_load, min_load, running_queue
+                        max_load, min_load, running_queue_read_guard
                     );
 
                     counter!("sgl_router_load_balancing_events_total").increment(1);
                     gauge!("sgl_router_max_load").set(max_load as f64);
                     gauge!("sgl_router_min_load").set(min_load as f64);
 
-                    // Use shortest queue routing when load is imbalanced
-                    running_queue
+                    // Find the worker with the shortest queue.
+                    selected_url = running_queue_read_guard
                         .iter()
                         .min_by_key(|(_url, &count)| count)
                         .map(|(url, _)| url.clone())
-                        .unwrap_or_else(|| worker_urls.read().unwrap()[0].clone())
+                        .unwrap_or_else(|| first_worker_url.clone());
                 } else {
-                    // Use cache-aware routing when load is balanced
-                    let (matched_text, matched_worker) = tree.prefix_match(&text);
+                    let tree_read_guard = tree
+                        .read()
+                        .expect("Failed to read lock tree: RwLock poisoned");
+
+                    let (matched_text, matched_worker) = tree_read_guard.prefix_match(text);
                     let matched_rate =
                         matched_text.chars().count() as f32 / text.chars().count() as f32;
 
                     if matched_rate > *cache_threshold {
                         counter!("sgl_router_cache_hits_total").increment(1);
-                        matched_worker.to_string()
+                        selected_url = matched_worker;
                     } else {
                         counter!("sgl_router_cache_misses_total").increment(1);
-                        tree.get_smallest_tenant()
+                        selected_url = tree_read_guard.get_smallest_tenant();
                     }
-                };
+                }
+            }
 
-                // Update queues and tree
-                *running_queue.get_mut(&selected_url).unwrap() += 1;
-
-                *processed_queue
-                    .lock()
-                    .unwrap()
-                    .get_mut(&selected_url)
-                    .unwrap() += 1;
-
+            // --- 3. Update Queues and Tree (Write Operations) ---
+            let mut running_queue_locked = running_queue
+                .write()
+                .expect("Failed to lock running queue: RwLock poisoned");
+            if let Some(count) = running_queue_locked.get_mut(&selected_url) {
+                *count += 1;
                 gauge!("sgl_router_running_requests", "worker" => selected_url.to_string())
-                    .set(*running_queue.get(&selected_url).unwrap() as f64);
-                counter!("sgl_router_processed_requests_total", "worker" => selected_url.to_string()).increment(1);
-
-                tree.insert(&text, &selected_url);
-
-                selected_url
+                    .set(*count as f64);
+            } else {
+                error!(
+                    "Selected worker URL '{}' not found in pre-initialized running queue. This indicates a logic error.",
+                    selected_url
+                );
+                return Err(format!(
+                    "Internal error: Selected worker URL '{}' not found in running queue.",
+                    selected_url
+                ));
             }
-            Router::PrefillDecode { .. } => {
-                // For PD mode, we don't use this method
-                return "PD_MODE_ERROR".to_string();
+            drop(running_queue_locked);
+
+            let mut processed_queue_locked = processed_queue
+                .lock()
+                .expect("Failed to lock processed queue: Mutex poisoned");
+            if let Some(count) = processed_queue_locked.get_mut(&selected_url) {
+                *count += 1;
+                counter!("sgl_router_processed_requests_total", "worker" => selected_url.to_string())
+                    .increment(1);
+            } else {
+                error!(
+                    "Selected worker URL '{}' not found in pre-initialized processed queue. This indicates a logic error.",
+                    selected_url
+                );
+                return Err(format!(
+                    "Internal error: Selected worker URL '{}' not found in processed queue.",
+                    selected_url
+                ));
             }
+            drop(processed_queue_locked);
+
+            tree.write()
+                .expect("Failed to write tree: RwLock poisoned")
+                .insert(&text, &selected_url);
+
+            Ok(selected_url)
+        } else {
+            unreachable!("Called `select_worker_cache_aware` on a non-CacheAware router");
         }
     }
 
@@ -839,7 +926,7 @@ impl Router {
 
             // Then decrement running queue counter if using CacheAware
             if let Router::CacheAware { running_queue, .. } = self {
-                if let Ok(mut queue) = running_queue.lock() {
+                if let Ok(mut queue) = running_queue.write() {
                     if let Some(count) = queue.get_mut(worker_url) {
                         *count = count.saturating_sub(1);
                         gauge!("sgl_router_running_requests", "worker" => worker_url.to_string())
@@ -873,7 +960,7 @@ impl Router {
                                 .windows(12)
                                 .any(|window| window == b"data: [DONE]")
                             {
-                                let mut locked_queue = running_queue.lock().unwrap();
+                                let mut locked_queue = running_queue.write().unwrap();
                                 let count = locked_queue.get_mut(&worker_url).unwrap();
                                 *count = count.saturating_sub(1);
                                 gauge!("sgl_router_running_requests", "worker" => worker_url.to_string()).set(*count as f64);
@@ -962,7 +1049,7 @@ impl Router {
                         {
                             // Add worker to running queue with initial count of 0
                             running_queue
-                                .lock()
+                                .write()
                                 .unwrap()
                                 .insert(worker_url.to_string(), 0);
 
@@ -973,7 +1060,7 @@ impl Router {
                                 .insert(worker_url.to_string(), 0);
 
                             // Add worker to tree
-                            tree.lock().unwrap().insert("", worker_url);
+                            tree.write().unwrap().insert("", worker_url);
                         }
 
                         return Ok(format!("Successfully added worker: {}", worker_url));
@@ -1040,9 +1127,9 @@ impl Router {
             ..
         } = self
         {
-            tree.lock().unwrap().remove_tenant(&worker_url);
+            tree.write().unwrap().remove_tenant(&worker_url);
             running_queue
-                .lock()
+                .write()
                 .unwrap()
                 .remove(&worker_url.to_string());
             processed_queue
