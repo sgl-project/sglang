@@ -263,7 +263,7 @@ class Engine(EngineBase):
                 raise ValueError("data_parallel_rank must be non-negative")
             elif data_parallel_rank >= self.server_args.dp_size:
                 raise ValueError(
-                    f"data_parallel_rank must be in range [0, {self.server_args.dp_size-1}]"
+                    f"data_parallel_rank must be in range [0, {self.server_args.dp_size - 1}]"
                 )
 
         logger.info(f"data_parallel_rank: {data_parallel_rank}")
@@ -722,11 +722,10 @@ def _launch_subprocesses(
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
                 reader, writer = mp.Pipe(duplex=False)
-                gpu_id = (
-                    server_args.base_gpu_id
-                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                gpu_offset = (pp_rank % pp_size_per_node) * tp_size_per_node + (
+                    tp_rank % tp_size_per_node
                 )
+                gpu_id = server_args.base_gpu_id + gpu_offset * server_args.gpu_id_step
                 proc = mp.Process(
                     target=run_scheduler_process,
                     args=(
