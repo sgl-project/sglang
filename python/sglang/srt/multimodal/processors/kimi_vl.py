@@ -17,9 +17,7 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|media_pad|>",
             # TODO: could we convert in MultimodalSpecialTokens?
-            image_token_id=_processor.tokenizer.convert_tokens_to_ids(
-                "<|media_pad|>",
-            ),
+            image_token_id=hf_config.media_placeholder_token_id,
             image_token_regex=re.compile(r"(?:<\|media_pad\|>)+"),
         ).build(_processor)
 
