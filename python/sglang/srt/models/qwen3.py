@@ -387,7 +387,9 @@ class Qwen3ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if "Embedding" in self.config.name_or_path:
+            if str(name).startswith("model"):
+                continue
+            else:
                 name = add_prefix(name, "model")
             layer_id = get_layer_id(name)
             if (
