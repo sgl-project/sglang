@@ -509,7 +509,6 @@ class TestW8A8BlockFP8FusedMoE(CustomTestCase):
                 w1,
                 w2,
                 topk_output,
-                gating_output=score,
                 use_fp8_w8a8=True,
                 w1_scale=w1_s,
                 w2_scale=w2_s,

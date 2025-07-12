@@ -1495,7 +1495,8 @@ def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_output: TopKOutput,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
     inplace: bool = False,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
@@ -1529,7 +1530,6 @@ def fused_experts_impl(
         assert (
             hidden_states.shape[1] == w1.shape[2] - padded_size
         ), "Hidden size mismatch"
-    topk_weights, topk_ids, _ = topk_output
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -1732,7 +1732,6 @@ def fused_moe(
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_output: TopKOutput,
-    gating_output: torch.Tensor,
     inplace: bool = False,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
@@ -1760,8 +1759,6 @@ def fused_moe(
     - w1 (torch.Tensor): The first set of expert weights.
     - w2 (torch.Tensor): The second set of expert weights.
     - topk_output (TopKOutput): The top-k output of the experts.
-    - gating_output (torch.Tensor): The output of the gating operation
-        (before softmax).
     - inplace (bool): If True, perform the operation in-place.
         Defaults to False.
     - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner
@@ -1787,8 +1784,6 @@ def fused_moe(
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
-    # Check constraints.
-    assert gating_output.shape[1] == w1.shape[0], "Number of experts mismatch"
 
     return fused_experts(
         hidden_states,

@@ -3,7 +3,7 @@ import builtins
 import inspect
 import re
 from copy import deepcopy
-from typing import Callable, Dict, Optional, Type, Union
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Type, Union
 
 import torch
 
@@ -71,6 +71,9 @@ from sglang.srt.layers.quantization.qoq import QoQConfig
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import TopKOutput
 
 # Base quantization methods that don't depend on vllm
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
@@ -285,15 +288,8 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
-        custom_routing_function: Optional[Callable] = None,
-        correction_bias: Optional[torch.Tensor] = None,
+        topk_output: "TopKOutput",
+        *,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         inplace: bool = True,
@@ -307,20 +303,8 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
             "self": self,
             "layer": layer,
             "x": x,
-            "router_logits": router_logits,
-            "top_k": top_k,
-            "renormalize": renormalize,
-            "use_grouped_topk": use_grouped_topk,
-            "topk_group": topk_group,
-            "num_expert_group": num_expert_group,
-            "custom_routing_function": custom_routing_function,
+            "topk_output": topk_output,
         }
-        if correction_bias is not None:
-            if not has_correction_bias:
-                raise ValueError(
-                    "Please increase the version of your vllm. Try `pip install vllm==0.9.0.1`"
-                )
-            kwargs["e_score_correction_bias"] = correction_bias
         return original_apply(**kwargs)
 
     setattr(class_obj, "apply", new_apply)
