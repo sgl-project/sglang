@@ -27,7 +27,7 @@ permissions:
 jobs:
   test-disaggregation:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: [h200]
+    runs-on: [h20]
     timeout-minutes: 45
 
     steps:
