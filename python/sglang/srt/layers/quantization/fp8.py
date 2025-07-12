@@ -349,10 +349,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 return
             else:
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
-            layer.weight = torch.nn.Parameter(weight, requires_grad=False)
-            layer.weight_scale_inv = torch.nn.Parameter(
-                weight_scale, requires_grad=False
-            )
+            # layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+            # layer.weight_scale_inv = torch.nn.Parameter(
+            #     weight_scale, requires_grad=False
+            # )
             return
 
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
