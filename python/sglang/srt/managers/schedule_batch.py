@@ -1328,6 +1328,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+    def prepare_for_split_prefill(self):
+        self.prepare_for_extend()
+        # For split prefill, we need to set the forward mode to SPLIT_PREFILL
+        self.forward_mode = ForwardMode.SPLIT_PREFILL
+
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
