@@ -133,6 +133,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 f"Tensor parallel size {self.tp_size} is greater than "
                 f"the number of experts {config.num_experts}."
             )
+        self.activation = config.hidden_act
 
         self.experts = get_moe_impl_class()(
             layer_id=self.layer_id,
@@ -142,6 +143,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
+            activation=self.activation,
             prefix=add_prefix("experts", prefix),
             # Additional args for FusedMoE
             **(
