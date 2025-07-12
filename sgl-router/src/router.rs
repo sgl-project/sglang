@@ -842,6 +842,8 @@ impl Router {
                 if let Ok(mut queue) = running_queue.lock() {
                     if let Some(count) = queue.get_mut(worker_url) {
                         *count = count.saturating_sub(1);
+                        gauge!("sgl_router_running_requests", "worker" => worker_url.to_string())
+                            .set(*count as f64);
                     }
                 }
             }
@@ -874,6 +876,7 @@ impl Router {
                                 let mut locked_queue = running_queue.lock().unwrap();
                                 let count = locked_queue.get_mut(&worker_url).unwrap();
                                 *count = count.saturating_sub(1);
+                                gauge!("sgl_router_running_requests", "worker" => worker_url.to_string()).set(*count as f64);
                                 debug!("Streaming is done!!")
                             }
                         }),

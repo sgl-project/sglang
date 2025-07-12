@@ -231,16 +231,12 @@ impl RouterConfig {
                     PolicyConfig::PowerOfTwo { .. } => {
                         crate::pd_types::PDSelectionPolicy::PowerOfTwo
                     }
-                    PolicyConfig::CacheAware {
-                        cache_threshold,
-                        balance_abs_threshold,
-                        balance_rel_threshold,
-                        ..
-                    } => crate::pd_types::PDSelectionPolicy::CacheAware {
-                        cache_threshold: *cache_threshold,
-                        balance_abs_threshold: *balance_abs_threshold,
-                        balance_rel_threshold: *balance_rel_threshold,
-                    },
+                    PolicyConfig::CacheAware { .. } => {
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason: "CacheAware policy is not supported in PD disaggregated mode"
+                                .to_string(),
+                        });
+                    }
                     PolicyConfig::RoundRobin => {
                         return Err(ConfigError::IncompatibleConfig {
                             reason: "RoundRobin policy is not supported in PD disaggregated mode"
