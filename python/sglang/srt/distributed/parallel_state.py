@@ -687,7 +687,9 @@ class GroupCoordinator:
         )
         return obj_list
 
-    def send_object(self, obj: Any, dst: int) -> None:
+    def send_object(
+        self, obj: Any, dst: int, async_send: bool = False
+    ) -> Optional[torch.distributed.Work]:
         """Send the input object list to the destination rank."""
         """NOTE: `dst` is the local rank of the destination rank."""
 
@@ -697,6 +699,9 @@ class GroupCoordinator:
             "Invalid destination rank. Destination rank is the same "
             "as the current rank."
         )
+        send_func = torch.distributed.send
+        if async_send:
+            send_func = torch.distributed.isend
 
         # Serialize object to tensor and get the size as well
         object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8).cuda(
@@ -710,16 +715,12 @@ class GroupCoordinator:
         )
 
         # Send object size
-        torch.distributed.send(
-            size_tensor, dst=self.ranks[dst], group=self.device_group
-        )
+        work = send_func(size_tensor, dst=self.ranks[dst], group=self.device_group)
 
         # Send object
-        torch.distributed.send(
-            object_tensor, dst=self.ranks[dst], group=self.device_group
-        )
+        work = send_func(object_tensor, dst=self.ranks[dst], group=self.device_group)
 
-        return None
+        return work
 
     def recv_object(self, src: int) -> Any:
         """Receive the input object list from the source rank."""
@@ -846,6 +847,7 @@ class GroupCoordinator:
         tensor_dict: Dict[str, Union[torch.Tensor, Any]],
         dst: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
+        async_send: bool = False,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
@@ -870,13 +872,16 @@ class GroupCoordinator:
             tensor_dict, dict
         ), f"Expecting a dictionary, got {type(tensor_dict)}"
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        send_func = torch.distributed.send
+        if async_send:
+            send_func = torch.distributed.isend
         # Note: While switching to Device-to-Device (D2D) would introduce an extra
         # Device-to-Host (D2H) memory copy overhead for serialization, our benchmarks
         # show better overall transmission performance with D2D due to:
         # 1. Superior D2D transfer bandwidth
         # 2. Ability to overlap send and recv operations
         # Thus the net performance gain justifies this approach.
-        self.send_object(metadata_list, dst=dst)
+        self.send_object(metadata_list, dst=dst, async_send=async_send)
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 # Skip sending empty tensors.
@@ -888,12 +893,10 @@ class GroupCoordinator:
 
             if tensor.is_cpu:
                 # use metadata_group for CPU tensors
-                torch.distributed.send(
-                    tensor, dst=self.ranks[dst], group=metadata_group
-                )
+                send_func(tensor, dst=self.ranks[dst], group=metadata_group)
             else:
                 # use group for GPU tensors
-                torch.distributed.send(tensor, dst=self.ranks[dst], group=group)
+                send_func(tensor, dst=self.ranks[dst], group=group)
         return None
 
     def recv_tensor_dict(

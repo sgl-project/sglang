@@ -883,9 +883,57 @@ class Scheduler(
                         self.pp_group.send_tensor_dict(
                             pp_outputs.tensors,
                             all_gather_group=self.attn_tp_group,
+                            async_send=True,
+                        )
+
+                def send_objes():
+                    # (not last rank)
+                    if self.pp_group.is_last_rank:
+                        return
+                    if self.cur_batch:
+                        bids[mb_id] = result.bid
+                    # carry the outputs to the next stage
+                    # send the outputs from the last round to let the next stage worker run post processing
+                    if pp_outputs:
+                        self.pp_group.send_tensor_dict(
+                            pp_outputs.tensors,
+                            all_gather_group=self.attn_tp_group,
+                            async_send=True,
+                        )
+
+                    # send out reqs to the next stage
+                    dp_offset = self.attn_dp_rank * self.attn_tp_size
+                    if self.attn_tp_rank == 0:
+                        point_to_point_pyobj(
+                            recv_reqs,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            self.world_group.device_group,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            (self.pp_rank + 1) * self.tp_size + dp_offset,
+                            True,
+                        )
+
+                    # send out proxy tensors to the next stage
+                    if self.cur_batch:
+                        tensors = {}
+                        if not self.server_args.disable_cuda_graph:
+                            for k, t in result.pp_hidden_states_proxy_tensors.items():
+                                tensors[k] = (
+                                    t.detach().clone()
+                                )  # deep copy avoid data trace when open cuda-graph
+                        else:
+                            tensors = result.pp_hidden_states_proxy_tensors
+                        self.pp_group.send_tensor_dict(
+                            tensors,
+                            all_gather_group=self.attn_tp_group,
+                            async_send=True,
                         )
 
                 # receive outputs and post-process (filter finished reqs) the coming microbatch
+                # because the pp_size > 2, the send and recv has different cuda stream
+                if self.pp_size > 2:  # when pp_size > 2 could overlap send and recv
+                    send_objes()
+
                 next_mb_id = (mb_id + 1) % self.pp_size
                 next_pp_outputs = None
                 if mbs[next_mb_id] is not None:
@@ -919,36 +967,10 @@ class Scheduler(
                     )
                     self.process_batch_result(mbs[next_mb_id], output_result)
                     last_mbs[next_mb_id] = mbs[next_mb_id]
-
-                # (not last rank)
-                if not self.pp_group.is_last_rank:
-                    if self.cur_batch:
-                        bids[mb_id] = result.bid
-                    # carry the outputs to the next stage
-                    # send the outputs from the last round to let the next stage worker run post processing
-                    if pp_outputs:
-                        self.pp_group.send_tensor_dict(
-                            pp_outputs.tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
-
-                    # send out reqs to the next stage
-                    dp_offset = self.attn_dp_rank * self.attn_tp_size
-                    if self.attn_tp_rank == 0:
-                        point_to_point_pyobj(
-                            recv_reqs,
-                            self.pp_rank * self.tp_size + dp_offset,
-                            self.world_group.device_group,
-                            self.pp_rank * self.tp_size + dp_offset,
-                            (self.pp_rank + 1) * self.tp_size + dp_offset,
-                        )
-
-                    # send out proxy tensors to the next stage
-                    if self.cur_batch:
-                        self.pp_group.send_tensor_dict(
-                            result.pp_hidden_states_proxy_tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
+                # can't overlap
+                # because the pp_size <= 2, the send and recv has same cuda stream
+                if self.pp_size <= 2:
+                    send_objes()  # receive outputs and post-process (filter finished reqs) the coming microbatch
 
                 pp_outputs = next_pp_outputs
 
