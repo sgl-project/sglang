@@ -310,19 +310,11 @@ class PersimmonForCausalLM(nn.Module):
                     continue
                 print(f"Warning: weight {name} not found in model.")
                 continue
+
             param = params_dict[name]
-            if "query_key_value" in name:
-                output_dim = getattr(param, "output_dim", None)
-                if output_dim is not None:
-                    loaded_weight_shape = loaded_weight.shape
-                    num_heads = self.config.num_attention_heads
-                    loaded_weight = loaded_weight.view(
-                        loaded_weight_shape[:output_dim]
-                        + (num_heads, 3, -1)
-                        + loaded_weight_shape[output_dim + 1 :]
-                    )
-                    loaded_weight = loaded_weight.transpose(output_dim, output_dim + 1)
-                    loaded_weight = loaded_weight.reshape(loaded_weight_shape)
+            # Currently testing
+            # The special handling block for "query_key_value" has been removed.
+            # The weight_loader is now called directly for all parameters.
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 
