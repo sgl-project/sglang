@@ -9,10 +9,6 @@ import torch
 
 try:
     from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
-    from vllm.model_executor.layers.quantization.awq_marlin import (
-        AWQMarlinConfig,
-        AWQMoEMethod,
-    )
     from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
         CompressedTensorsW8A8Fp8MoEMethod,
@@ -42,7 +38,7 @@ except ImportError:
         def override_quantization_method(self, *args, **kwargs):
             return None
 
-    AQLMConfig = AWQMarlinConfig = BitsAndBytesConfig = CompressedTensorsConfig = (
+    AQLMConfig = BitsAndBytesConfig = CompressedTensorsConfig = (
         DeepSpeedFPConfig
     ) = ExpertsInt8Config = FBGEMMFp8Config = GGUFConfig = GPTQMarlin24Config = (
         MarlinConfig
@@ -51,6 +47,7 @@ except ImportError:
 
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.quantization.awq import AWQConfig
+from sglang.srt.layers.quantization.awq_marlin import AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -315,7 +312,7 @@ def monkey_patch_quant_configs():
     setattr(GPTQMarlinConfig, "get_quant_method", gptq_get_quant_method)
     setattr(GPTQConfig, "get_quant_method", gptq_get_quant_method)
 
-    monkey_patch_moe_apply(AWQMoEMethod)
+    # monkey_patch_moe_apply(AWQMoEMethod)
     monkey_patch_moe_apply(GPTQMarlinMoEMethod)
     monkey_patch_moe_apply(CompressedTensorsW8A8Fp8MoEMethod)
     monkey_patch_moe_apply(CompressedTensorsWNA16MoEMethod)

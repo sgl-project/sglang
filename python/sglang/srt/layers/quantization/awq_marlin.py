@@ -1,3 +1,4 @@
+import logging
 from typing import Any, Callable, Optional
 
 import torch
@@ -21,13 +22,10 @@ _is_cuda = is_cuda()
 
 try:
     from vllm import _custom_ops as ops
-    from vllm.logger import init_logger
-    from vllm.model_executor.layers.fused_moe.layer import (
+    from vllm.model_executor.layers.quantization.awq_marlin import (
         FusedMoE,
         FusedMoEMethodBase,
         FusedMoeWeightScaleSupported,
-    )
-    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
         apply_awq_marlin_linear,
         awq_to_marlin_zero_points,
         check_marlin_supported,
@@ -61,7 +59,7 @@ except ImportError:
         uint8 = "uint8"
 
 
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class AWQMarlinConfig(QuantizationConfig):
@@ -173,6 +171,8 @@ class AWQMarlinConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
         if isinstance(layer, LinearBase) or (
             isinstance(layer, ParallelLMHead) and self.lm_head_quantized
         ):
@@ -180,7 +180,7 @@ class AWQMarlinConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             # Check if the layer is supported by AWQMarlin.
             if not check_marlin_supports_layer(layer, self.group_size):
-                logger.warning_once(
+                logger.warning(
                     "Layer '%s' is not supported by AWQMarlin. Falling back to unoptimized AWQ kernels.",  # noqa: E501
                     prefix,
                 )
@@ -192,7 +192,7 @@ class AWQMarlinConfig(QuantizationConfig):
             from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
             if not check_moe_marlin_supports_layer(layer, self.group_size):
-                logger.warning_once(
+                logger.warning(
                     f"Layer '{prefix}' is not supported by AWQMoeMarlin. "
                     "Falling back to Moe WNA16 kernels."
                 )
@@ -222,6 +222,10 @@ class AWQMarlinConfig(QuantizationConfig):
 
         if num_bits not in cls.TYPE_MAP:
             return False
+
+        assert (
+            VLLM_AVAILABLE
+        ), "vllm is not installed, to use awq_marlin, please install vllm"
 
         return check_marlin_supported(
             quant_type=cls.TYPE_MAP[num_bits], group_size=group_size, has_zp=zero_point
