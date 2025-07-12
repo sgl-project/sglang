@@ -349,6 +349,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             else:
                 sampling_params[constraint_type] = constraint_value
+
+        sampling_params["enable_thinking"] = self._get_enable_thinking_from_request(
+            request
+        )
+
         return sampling_params
 
     async def _handle_streaming_request(
@@ -795,6 +800,7 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
 
+    @staticmethod
     def _get_enable_thinking_from_request(request: ChatCompletionRequest) -> bool:
         """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
 
