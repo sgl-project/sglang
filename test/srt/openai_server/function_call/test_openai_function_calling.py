@@ -159,6 +159,10 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             "Target function name 'get_current_weather' was not found in the streaming chunks",
         )
 
+        finish_reason = chunks[-1].choices[0].finish_reason
+        self.assertEqual(finish_reason, "tool_calls",
+                         "Final response of function calling should have finish_reason 'tool_calls'")
+
     def test_function_calling_streaming_args_parsing(self):
         """
         Test: Whether the function call arguments returned in streaming mode can be correctly concatenated into valid JSON.
