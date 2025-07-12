@@ -653,7 +653,6 @@ class ModelRunner:
                 f"Setting sliding_window_size to be attention_chunk_size: {self.sliding_window_size}"
             )
 
-        print(f"sliding_window_size: {self.sliding_window_size}")
         self.dtype = self.model_config.dtype
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -999,7 +998,17 @@ class ModelRunner:
             assert self.sliding_window_size is not None and self.sliding_window_size > 0
             full_attention_layer_ids = []
             swa_attention_layer_ids = []
-            for layer in self.model.model.layers:
+
+            try:
+                layers = self.model.model.layers
+            except:
+                try:
+                    layers = self.model.language_model.model.layers
+                except:
+                    self.is_hybrid = False
+                    return
+
+            for layer in layers:
                 if (
                     layer.self_attn.attn.sliding_window_size is None
                     or layer.self_attn.attn.sliding_window_size == -1
@@ -1111,7 +1120,6 @@ class ModelRunner:
             // self.server_args.page_size
             * self.server_args.page_size
         )
-
         # create token size for hybrid cache
         if self.is_hybrid:
             self.set_num_token_hybrid()
