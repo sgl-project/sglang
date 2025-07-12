@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING
 import torch
 import triton
 import triton.language as tl
+import os
+import logging
 
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var, next_power_of_2
@@ -33,6 +35,8 @@ from sglang.srt.utils import get_bool_env_var, next_power_of_2
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
+# Optional KV manager selection. Defaults to the in-tree allocator but can be overridden
+_KV_MANAGER = os.getenv("SGLANG_KV_MANAGER", "default").lower()
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
@@ -115,6 +119,31 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def __init__(self, size: int, dtype: torch.dtype, device: str, kvcache: KVCache):
         super().__init__(size, 1, dtype, device, kvcache)
+
+        # KVBM integration (optional)
+        self._kvbm_manager = None
+        if _KV_MANAGER == "kvbm":
+            try:
+                from sglang.srt.mem_cache.kvbm.conn import get_kvbm_manager
+
+                self._kvbm_manager = get_kvbm_manager()
+
+                # Register backing storage exactly once per process.
+                if not hasattr(self._kvbm_manager, "_registered"):
+                    slab_tensor = torch.empty(
+                        (self.size,), dtype=self.dtype, device=self.device
+                    )
+                    # The underlying KvbmCacheManager implementation owns the tensor via
+                    # ExternalOwnedStorage and keeps it alive.
+                    self._kvbm_manager.register_external_storage(slab_tensor)
+                    self._kvbm_manager._registered = True  # type: ignore[attr-defined]
+            except ImportError as err:
+                logging.getLogger(__name__).warning(
+                    "KVBM requested but bindings are unavailable: %s. Falling back to default allocator.",
+                    err,
+                )
+
+        # Always initialise the local free-page list so the default path keeps working.
         self.clear()
 
     def clear(self):
@@ -130,6 +159,12 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return len(self.free_pages)
 
     def alloc(self, need_size: int):
+        # Use KVBM path if enabled.
+        if self._kvbm_manager is not None:
+            indices = self._kvbm_manager.alloc_blocks(int(need_size)) # TODO: change to actual binding
+            return torch.tensor(indices, dtype=torch.int64, device=self.device)
+
+        # Default allocator path
         if need_size > len(self.free_pages):
             return None
 
@@ -139,6 +174,11 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
+            return
+
+        # Forward to KVBM if in use, otherwise fall back to default behaviour.
+        if self._kvbm_manager is not None and hasattr(self._kvbm_manager, "free_blocks"):
+            self._kvbm_manager.free_blocks(free_index.tolist())
             return
 
         if self.is_not_in_free_group:
