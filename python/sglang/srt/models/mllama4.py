@@ -12,6 +12,7 @@ from transformers.models.llama4.modeling_llama4 import (
     Llama4VisionModel,
 )
 
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization import QuantizationConfig
@@ -515,6 +516,14 @@ class Llama4ForConditionalGeneration(nn.Module):
         param = params_dict[name]
         weight_loader = getattr(param, "weight_loader", default_weight_loader)
         weight_loader(param, loaded_weight)
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_local_experts,
+            num_groups=None,
+        )
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if hasattr(self.language_model, "set_eagle3_layers_to_capture"):
