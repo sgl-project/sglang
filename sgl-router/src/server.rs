@@ -236,8 +236,7 @@ async fn add_worker(
 
 #[get("/list_workers")]
 async fn list_workers(data: web::Data<AppState>) -> impl Responder {
-    let workers = data.router.get_worker_urls();
-    let worker_list = workers.read().unwrap().clone();
+    let worker_list = data.router.get_worker_urls();
     HttpResponse::Ok().json(serde_json::json!({ "urls": worker_list }))
 }
 
@@ -381,7 +380,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     info!("✅ Serving router on {}:{}", config.host, config.port);
     info!(
         "✅ Serving workers on {:?}",
-        app_state.router.get_worker_urls().read().unwrap()
+        app_state.router.get_worker_urls()
     );
 
     HttpServer::new(move || {
