@@ -2742,7 +2742,9 @@ def run_scheduler_process(
 
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
+        set_gpu_proc_affinity(
+            server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
+        )
 
     embedding_cache_size = 100
     if "SGLANG_VLM_CACHE_SIZE_MB" in os.environ:
