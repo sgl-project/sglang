@@ -27,7 +27,11 @@ from sglang.srt.disaggregation.common.conn import (
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_local_ip_by_remote
+from sglang.srt.utils import (
+    format_tcp_address,
+    get_local_ip_auto,
+    is_valid_ipv6_address,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +128,10 @@ class NixlKVManager(CommonKVManager):
                 "to run SGLang with NixlTransferEngine."
             ) from e
         self.agent = nixl_agent(str(uuid.uuid4()))
+        self.local_ip = get_local_ip_auto()
         self.server_socket = zmq.Context().socket(zmq.PULL)
+        if is_valid_ipv6_address(self.local_ip):
+            self.server_socket.setsockopt(zmq.IPV6, 1)
         self.register_buffer_to_engine()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -337,8 +344,11 @@ class NixlKVManager(CommonKVManager):
             return False
         return self.transfer_statuses[room].is_done()
 
+    def _bind_server_socket(self):
+        self.server_socket.bind(format_tcp_address(self.local_ip, self.rank_port))
+
     def _start_bootstrap_thread(self):
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
+        self._bind_server_socket()
 
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
@@ -452,23 +462,20 @@ class NixlKVReceiver(CommonKVReceiver):
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
         for bootstrap_info in self.bootstrap_infos:
-            self.prefill_server_url = (
-                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
-            )
             logger.debug(
                 f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
             )
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
             logger.debug(
-                f"Sending to {self.prefill_server_url} with bootstrap room {self.bootstrap_room} {is_dummy=}"
+                f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
             )
-            sock, lock = self._connect("tcp://" + self.prefill_server_url)
             with lock:
                 sock.send_multipart(
                     [
                         GUARD,
                         str(self.bootstrap_room).encode("ascii"),
-                        get_local_ip_by_remote().encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
                         str(self.kv_mgr.rank_port).encode("ascii"),
                         self.kv_mgr.agent.name.encode("ascii"),
                         kv_indices.tobytes() if not is_dummy else b"",
@@ -494,9 +501,7 @@ class NixlKVReceiver(CommonKVReceiver):
 
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:
-            self.prefill_server_url = (
-                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
-            )
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
             )
@@ -504,13 +509,12 @@ class NixlKVReceiver(CommonKVReceiver):
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
             )
 
-            sock, lock = self._connect("tcp://" + self.prefill_server_url)
             with lock:
                 sock.send_multipart(
                     [
                         GUARD,
                         "None".encode("ascii"),
-                        get_local_ip_by_remote().encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
                         str(self.kv_mgr.rank_port).encode("ascii"),
                         self.kv_mgr.agent.name.encode("ascii"),
                         self.kv_mgr.agent.get_agent_metadata(),
