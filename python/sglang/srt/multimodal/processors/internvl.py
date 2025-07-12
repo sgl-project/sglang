@@ -6,7 +6,10 @@ from decord import VideoReader, cpu
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.models.internvl import InternVLChatModel
+from sglang.srt.models.internvl import (
+    InternVLChatModel,
+    InternVLForConditionalGeneration,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -16,10 +19,19 @@ from sglang.srt.multimodal.processors.base_processor import (
 class InternVLImageProcessor(BaseMultimodalProcessor):
     models = [InternVLChatModel]
 
-    def __init__(self, hf_config, server_args, _image_processor):
+    def __init__(self, hf_config, server_args, _image_processor, hf_version=False):
         super().__init__(hf_config, server_args, _image_processor)
-        image_size = hf_config.force_image_size or hf_config.vision_config.image_size
-        patch_size = hf_config.vision_config.patch_size
+        self.hf_version = hf_version
+        if self.hf_version:
+            image_size = hf_config.vision_config.image_size[0]
+            patch_size = hf_config.vision_config.patch_size[0]
+            tokenizer = self._processor.tokenizer
+        else:
+            image_size = (
+                hf_config.force_image_size or hf_config.vision_config.image_size
+            )
+            patch_size = hf_config.vision_config.patch_size
+            tokenizer = self._processor
 
         self.IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
         self.IMG_START_TOKEN = "<img>"
@@ -29,7 +41,6 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             (image_size // patch_size) ** 2 * (hf_config.downsample_ratio**2)
         )
 
-        tokenizer = self._processor
         self.img_start_token_id = tokenizer.convert_tokens_to_ids(self.IMG_START_TOKEN)
         self.img_end_token_id = tokenizer.convert_tokens_to_ids(self.IMG_END_TOKEN)
         self.img_context_token_id = tokenizer.convert_tokens_to_ids(
@@ -215,7 +226,10 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             )
             input_text = input_text.replace("<image>", image_tokens, 1)
 
-        tokenizer = self._processor
+        if self.hf_version:
+            tokenizer = self._processor.tokenizer
+        else:
+            tokenizer = self._processor
         input_ids = tokenizer(input_text, return_tensors="pt")["input_ids"].flatten()
         image_offsets = self.get_mm_items_offset(
             input_ids=input_ids,
@@ -236,3 +250,10 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             "im_end_id": self.img_end_token_id,
             "im_token_id": self.img_context_token_id,
         }
+
+
+class InternVLImageProcessor_hf(InternVLImageProcessor):
+    models = [InternVLForConditionalGeneration]
+
+    def __init__(self, hf_config, server_args, _image_processor):
+        super().__init__(hf_config, server_args, _image_processor, hf_version=True)
