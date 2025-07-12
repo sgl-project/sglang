@@ -2197,7 +2197,10 @@ class Scheduler(
         exec = None
         try:
             func = getattr(self, recv_req.method)
-            func(recv_req.parameters)
+            if recv_req.parameters is not None:
+                func(**recv_req.parameters)
+            else:
+                func()
         except Exception as e:
             success = False
             exec = e
