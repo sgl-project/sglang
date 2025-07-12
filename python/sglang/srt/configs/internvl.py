@@ -9,6 +9,7 @@ from transformers import (
     LlamaConfig,
     PretrainedConfig,
     PreTrainedTokenizer,
+    Qwen2Config,
 )
 
 from sglang.utils import logger
@@ -301,9 +302,9 @@ class InternVLChatConfig(PretrainedConfig):
             )
 
         if llm_config is None:
-            llm_config = {"architectures": ["InternLM2ForCausalLM"]}
+            llm_config = {"architectures": ["Qwen2ForCausalLM"]}
             logger.info(
-                "llm_config is None. Initializing the LlamaConfig config with default values (`LlamaConfig`)."
+                "llm_config is None. Initializing the Qwen2Config config with default values (`Qwen2Config`)."
             )
 
         self.vision_config = InternVisionConfig(**vision_config)
@@ -311,6 +312,8 @@ class InternVLChatConfig(PretrainedConfig):
             self.llm_config = LlamaConfig(**llm_config)
         elif llm_config.get("architectures")[0] == "InternLM2ForCausalLM":
             self.llm_config = InternLM2Config(**llm_config)
+        elif llm_config.get("architectures")[0] == "Qwen2ForCausalLM":
+            self.llm_config = Qwen2Config(**llm_config)
         else:
             raise ValueError(
                 "Unsupported architecture: {}".format(
