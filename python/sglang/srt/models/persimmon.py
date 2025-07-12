@@ -289,7 +289,7 @@ class PersimmonForCausalLM(nn.Module):
             bias=False,
             quant_config=quant_config,
         )
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.logits_processor = LogitsProcessor(config)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
