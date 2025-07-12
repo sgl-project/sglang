@@ -146,7 +146,8 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
     pre-commit \
     pandas \
     matplotlib \
-    tabulate
+    tabulate \
+    sentencepiece
 
 # Install diff-so-fancy
 RUN curl -LSso /usr/local/bin/diff-so-fancy https://github.com/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
