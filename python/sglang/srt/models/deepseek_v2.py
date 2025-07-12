@@ -1895,11 +1895,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
-            if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
-                # NOTE: this line resolves the degradation of MTP reception rate for non-zero DP ranks.
-                # See discussion here (https://github.com/sgl-project/sglang/pull/6081#discussion_r2147452251).
-                hidden_states = hidden_states.clone()
-
         return hidden_states, residual
 
     def op_comm_prepare_attn(
@@ -2198,7 +2193,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             # This may affect the accuracy of fp8 model.
             # Fix deepseek v3 blockwise bmm by using deep_gemm
             use_deep_gemm_bmm = False
-            model_dtype = torch.get_default_dtype()
 
             if w.dtype in (
                 torch.float8_e4m3fn,
@@ -2224,7 +2218,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                         _is_cuda
                         and weight_block_size[0] == 128
                         and weight_block_size[1] == 128
-                        and model_dtype == torch.bfloat16
                     ):
                         if (
                             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -2238,7 +2231,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 weight,
                                 weight_scale,
                                 weight_block_size,
-                                model_dtype,
+                                torch.bfloat16,
                             )
                     else:
                         w, scale = block_quant_to_tensor_quant(
