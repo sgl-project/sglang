@@ -1797,6 +1797,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         num_tokens: int,
     ) -> None:
+        if isinstance(self.tree_cache, SWAChunkCache):
+            return
+
         if self.is_hybrid:
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
             swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
