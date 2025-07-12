@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import BatchEmbeddingOut, BatchTokenIDOut
+from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 
 if TYPE_CHECKING:
@@ -126,7 +126,15 @@ class SchedulerOutputProcessorMixin:
                         )
 
                     if req.grammar is not None:
-                        req.grammar.accept_token(next_token_id)
+                        try:
+                            req.grammar.accept_token(next_token_id)
+                        except ValueError as e:
+                            # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                            # This can happen if the grammar is not set correctly or the token is invalid.
+                            logger.error(
+                                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                            )
+                            self.abort_request(AbortReq(req.rid))
                         req.grammar.finished = req.finished()
                 else:
                     # being chunked reqs' prefill is not finished
@@ -263,7 +271,15 @@ class SchedulerOutputProcessorMixin:
                 )
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
-                req.grammar.accept_token(next_token_id)
+                try:
+                    req.grammar.accept_token(next_token_id)
+                except ValueError as e:
+                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                    # This can happen if the grammar is not set correctly or the token is invalid.
+                    logger.error(
+                        f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                    )
+                    self.abort_request(AbortReq(req.rid))
                 req.grammar.finished = req.finished()
 
         self.set_next_batch_sampling_info_done(batch)
