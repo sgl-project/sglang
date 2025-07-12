@@ -248,6 +248,7 @@ set(SOURCES
     "csrc/speculative/packbit.cu"
     "csrc/speculative/speculative_sampling.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
+    "csrc/hf3fs/hf3fs_utils.cpp"
     "csrc/kvcacheio/transfer.cu"
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
