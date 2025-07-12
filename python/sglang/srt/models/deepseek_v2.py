@@ -607,9 +607,11 @@ class DeepseekV2MoE(nn.Module):
             self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         pad_size = None
-        if hidden_states.size(0) == 0 or hidden_states.size(0) % get_attention_tp_size() != 0:
-            pad_size = get_attention_tp_size() - (hidden_states.size(0) % get_attention_tp_size())
-            hidden_states = torch.nn.functional.pad(hidden_states, [0, 0, 0, pad_size], "constant", 0)
+        if forward_batch.forward_mode.is_extend():
+            pad_size = (forward_batch.seq_lens_sum // get_attention_tp_size() + 1) - hidden_states.size(0)
+        else:
+            pad_size = (forward_batch.batch_size // get_attention_tp_size() + 1) - hidden_states.size(0)
+        hidden_states = F.pad(hidden_states, [0, 0, 0, pad_size], "constant", 0)
         forward_mode = forward_batch.forward_mode
         shared_output = None
         if is_non_idle_and_non_empty(forward_mode, hidden_states):
@@ -681,14 +683,7 @@ class DeepseekV2MoE(nn.Module):
                 expanded_row_idx=expanded_row_idx,
             )
 
-        if shared_output is not None:
-            x = shared_output
-            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-            final_hidden_states = x
-        else:
-            final_hidden_states *= self.routed_scaling_factor
-
-        if pad_size is not None:
+        if pad_size > 0:
             final_hidden_states = final_hidden_states[:-pad_size, :]
 
         return final_hidden_states
@@ -909,7 +904,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=add_prefix("kv_b_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,

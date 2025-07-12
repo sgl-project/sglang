@@ -785,9 +785,9 @@ class NpuDeepEPDispatcher:
         else:
             self.shared_expert_rank_num = self.n_shared_experts * self.experts_share_num_copy
         epsilon = 1e-2
-        self.experts_scale = torch.nn.Parameter(
-            torch.rand(size=(self.num_experts, self.hidden_size), dtype=torch.float32) * (1 - epsilon) + epsilon
-        )
+        self.smooth_scale = torch.nn.Parameter(
+            torch.ones(size=(self.num_experts, self.hidden_size), dtype=torch.float32) * (1 - epsilon) + epsilon
+        ) # smooth scale, now dpsk use smooth_scale == 1
 
     def dispatch(self,
         hidden_states: torch.Tensor,
@@ -798,7 +798,7 @@ class NpuDeepEPDispatcher:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         topk_ids = topk_idx.to(torch.int)
         if forward_mode.is_extend():
-            return self.dispatch_prefill(hidden_states, topk_ids)
+            return self.dispatch_decode(hidden_states, topk_ids) #TODO: dispatch_prefill precision is wrong
         else:
             return self.dispatch_decode(hidden_states, topk_ids)
 
@@ -811,7 +811,7 @@ class NpuDeepEPDispatcher:
             hidden_states,
             expert_idx=topk_ids,
             active_num=topk_ids.shape[0] * topk_ids.shape[1],
-            scale=self.experts_scale,  # None: non-quant; tensor with shape [num_rows,]: quant
+            scale=self.smooth_scale,  # None: non-quant; tensor with shape [num_rows,]: quant
             expert_num=self.num_experts,
             expert_tokens_num_type=1,  # 0: cumsum mode(not supported now); 1: count mode
             expert_tokens_num_flag=True,
@@ -848,7 +848,7 @@ class NpuDeepEPDispatcher:
             "shared_expert_rank_num": self.shared_expert_rank_num,
             "moe_expert_num": self.num_experts,
             "global_bs": 0,
-            "scales": self.experts_scale,
+            "scales": self.smooth_scale,
             "quant_mode": 2,
             "group_ep": self.group_name,
             "ep_world_size": self.world_size,
@@ -883,8 +883,10 @@ class NpuDeepEPDispatcher:
         if forward_mode.is_extend():
             input_splits = ep_send_counts
             output_splits = tp_send_counts
-            return self.combine_prefill(hidden_states, topk_ids, topk_idx, topk_weights, input_splits, output_splits,
-                                        shared_output, expanded_x, expanded_row_idx)
+            return self.combine_decode(hidden_states, topk_ids, topk_idx, topk_weights, ep_send_counts, tp_send_counts,
+                                       shared_output) # combine_prefill precision is wrong;
+            # return self.combine_prefill(hidden_states, topk_ids, topk_idx, topk_weights, input_splits, output_splits,
+            #                             shared_output, expanded_x, expanded_row_idx)
         else:
             return self.combine_decode(hidden_states, topk_ids, topk_idx, topk_weights, ep_send_counts, tp_send_counts,
                                        shared_output)
