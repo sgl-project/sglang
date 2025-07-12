@@ -297,7 +297,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     ) -> torch.Tensor:
         assert activation == "silu", f"activation = {activation} is not supported."
 
-        if use_intel_amx_backend(layer) and not apply_router_weight_on_input:
+        if use_intel_amx_backend(layer):
+            from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+
             topk_weights, topk_ids = select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
@@ -311,8 +313,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 correction_bias=correction_bias,
                 routed_scaling_factor=routed_scaling_factor,
             )
+            x, topk_weights = apply_topk_weights_cpu(
+                apply_router_weight_on_input, topk_weights, x
+            )
 
-            # TODO: support apply_router_weight_on_input in the fused_experts_cpu kernel
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,
