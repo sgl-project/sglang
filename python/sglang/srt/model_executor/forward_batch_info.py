@@ -453,8 +453,20 @@ class ForwardBatch:
             for mm_input in self.mm_inputs
         )
 
+    def contains_video_inputs(self) -> bool:
+        if self.mm_inputs is None:
+            return False
+        return any(
+            mm_input is not None and mm_input.contains_video_inputs()
+            for mm_input in self.mm_inputs
+        )
+
     def contains_mm_inputs(self) -> bool:
-        return self.contains_audio_inputs() or self.contains_image_inputs()
+        return (
+            self.contains_audio_inputs()
+            or self.contains_video_inputs()
+            or self.contains_image_inputs()
+        )
 
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
