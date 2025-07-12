@@ -61,6 +61,7 @@ from sgl_kernel.marlin import (
     awq_marlin_moe_repack,
     awq_marlin_repack,
     gptq_marlin_repack,
+    gptq_marlin_moe_repack,
 )
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
@@ -86,6 +87,10 @@ from sgl_kernel.speculative import (
     segment_packbits,
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
+)
+from sgl_kernel.scalar_type import (
+    ScalarType, 
+    scalar_types,
 )
 from sgl_kernel.top_k import fast_topk
 from sgl_kernel.version import __version__

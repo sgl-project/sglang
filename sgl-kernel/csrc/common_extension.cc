@@ -338,6 +338,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bool is_full_k, bool use_atomic_add,"
       "bool use_fp32_reduce, bool is_zp_float) -> Tensor");
   m.impl("moe_wna16_marlin_gemm", torch::kCUDA, &moe_wna16_marlin_gemm);
+  m.def(
+      "gptq_marlin_gemm(Tensor! a, Tensor? c_or_none,"
+      "Tensor! b_q_weight, Tensor! b_scales, Tensor? global_scale_or_none,"
+      "Tensor? b_zeros_or_none, Tensor? g_idx_or_none, Tensor? perm_or_none,"
+      "Tensor! workspace, int b_q_type_id, int size_m, int size_n, int size_k,"
+      "bool is_k_full, bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) -> Tensor");
+  m.impl("gptq_marlin_gemm", torch::kCUDA, &gptq_marlin_gemm);
 
   /*
    * From Sparse Flash Attention
