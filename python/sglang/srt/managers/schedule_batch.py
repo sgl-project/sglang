@@ -978,6 +978,51 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             return out_cache_loc
 
+    def alloc_paged_token_slots_fastpass(
+        self,
+        seq_lens: List[int],
+        extend_num_tokens: int,
+        backup_state: bool = False,
+    ):
+        """
+        if prefix_lens is all 0, 
+        there is no need to consider the last_loc, 
+        so we just need to alloc the kv_pool instand of consider the last_loc.
+        """
+        if (
+            self.token_to_kv_pool_allocator.available_size()
+            < extend_num_tokens
+            + len(seq_lens) * self.token_to_kv_pool_allocator.page_size
+        ):
+            if self.tree_cache is not None:
+                self.tree_cache.evict(
+                    extend_num_tokens
+                    + len(seq_lens) * self.token_to_kv_pool_allocator.page_size,
+                )
+
+        if backup_state:
+            state = self.token_to_kv_pool_allocator.backup_state()
+        out_cache_locs = []
+        for pl in seq_lens:
+            # we have to align the seq_len to page_size
+            aligned_seq_len = (pl + self.token_to_kv_pool_allocator.page_size - 1) // self.token_to_kv_pool_allocator.page_size * self.token_to_kv_pool_allocator.page_size
+            loc_seq = self.token_to_kv_pool_allocator.alloc(aligned_seq_len)
+            if loc_seq is None:
+                error_msg = (
+                    f"Prefill out of memory. Try to lower your batch size.\n"
+                    f"Try to allocate {extend_num_tokens} tokens.\n"
+                    f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
+                    f"{self.token_to_kv_pool_allocator.available_size()=}\n"
+                    f"{self.tree_cache.evictable_size()=}\n"
+                )
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
+            out_cache_locs.append(loc_seq[:pl])
+        out_cache_loc = torch.cat(out_cache_locs)
+        if backup_state:
+            return out_cache_loc, state
+        else:
+            return out_cache_loc
     def alloc_paged_token_slots_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -1255,14 +1300,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.token_to_kv_pool_allocator.page_size == 1:
             out_cache_loc = self.alloc_token_slots(extend_num_tokens)
         else:
-            last_loc = get_last_loc(
-                self.req_to_token_pool.req_to_token,
-                req_pool_indices_tensor,
-                prefix_lens_tensor,
-            )
-            out_cache_loc = self.alloc_paged_token_slots_extend(
-                prefix_lens_tensor, seq_lens_tensor, last_loc, extend_num_tokens
-            )
+            if all([x == 0 for x in prefix_lens]):
+                out_cache_loc = self.alloc_paged_token_slots_fastpass(
+                    seq_lens, extend_num_tokens
+                )
+            else:
+                last_loc = get_last_loc(
+                    self.req_to_token_pool.req_to_token,
+                    req_pool_indices_tensor,
+                    prefix_lens_tensor,
+                )
+                out_cache_loc = self.alloc_paged_token_slots_extend(
+                    prefix_lens_tensor, seq_lens_tensor, last_loc, extend_num_tokens
+                )
 
         # Set fields
         self.input_ids = input_ids_tensor
