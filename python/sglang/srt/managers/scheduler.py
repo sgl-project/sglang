@@ -36,7 +36,12 @@ from torch.distributed import barrier
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.constants import (
+    GPU_MEMORY_ALL_TYPES,
+    GPU_MEMORY_TYPE_CUDA_GRAPH,
+    GPU_MEMORY_TYPE_KV_CACHE,
+    GPU_MEMORY_TYPE_WEIGHTS,
+)
 from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
@@ -2348,7 +2353,7 @@ class Scheduler(
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
-            tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
+            tags = GPU_MEMORY_ALL_TYPES
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
@@ -2361,13 +2366,19 @@ class Scheduler(
             torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
+        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
+
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
-            tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
+            tags = GPU_MEMORY_ALL_TYPES
+
+        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
