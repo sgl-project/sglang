@@ -133,11 +133,10 @@ class TestFusedMOE(CustomTestCase):
                     input_scale=a2_scale,
                 )
 
-            topk_output = TopKOutput(
+            topk_output = select_experts(
                 hidden_states=a,
                 router_logits=score,
                 top_k=topk,
-                renormalize=False,
             )
 
             sglang_output = fused_moe(
