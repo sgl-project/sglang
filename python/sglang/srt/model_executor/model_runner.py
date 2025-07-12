@@ -644,11 +644,16 @@ class ModelRunner:
                 )
 
         # Parse other args
-        self.sliding_window_size = (
-            self.model.get_attention_sliding_window_size()
-            if hasattr(self.model, "get_attention_sliding_window_size")
-            else None
-        )
+        self.sliding_window_size = None
+        if hasattr(self.model, "get_attention_sliding_window_size"):
+            self.sliding_window_size = self.model.get_attention_sliding_window_size()
+        elif self.model_config.attention_chunk_size is not None:
+            self.sliding_window_size = self.model_config.attention_chunk_size
+            print(
+                f"Setting sliding_window_size to be attention_chunk_size: {self.sliding_window_size}"
+            )
+
+        print(f"sliding_window_size: {self.sliding_window_size}")
         self.dtype = self.model_config.dtype
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
