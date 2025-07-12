@@ -3,6 +3,7 @@ from __future__ import annotations
 """
 Support attention backend for flashinfer MLA.
 The flashinfer_mla_disable_ragged flag controls whether to use ragged prefill wrapper and defaults to be false.
+The flashinfer_use_cudnn flag controls whether to use cudnn_batch_prefill_with_kv_cache and defaults to be false.
 When it's set to false, all wrappers are BatchMLAPaged wrapper.
 When it's set to true, the backend uses BatchRagged and BatchMLAPaged wrapper for prefilling,
 and uses BatchMLAPaged wrapper for decoding.
@@ -44,6 +45,7 @@ if is_flashinfer_available():
         BatchMLAPagedAttentionWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
     )
+    from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
 
 
 @dataclass
@@ -408,14 +410,36 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             if k_rope is not None:
                 k = torch.cat([k, k_rope], dim=-1)
-            o = self.prefill_wrapper_ragged.forward(
-                qall,
-                k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
-            )
+
+            if global_server_args_dict["flashinfer_use_cudnn"]:
+                qo_lengths = forward_batch.seq_lens - forward_batch.extend_prefix_lens
+                kv_lengths = forward_batch.extend_prefix_lens
+                max_token_per_sequence = int(qo_lengths.max().item())
+                max_sequence_kv = int(kv_lengths.max().item())
+
+                o, _ = cudnn_batch_prefill_with_kv_cache(
+                    q=qall,
+                    k_cache=k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v_cache=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
+                    scale=layer.scaling,
+                    workspace_buffer=self.workspace_buffer.to(torch.int8),
+                    max_token_per_sequence=max_token_per_sequence,
+                    max_sequence_kv=max_sequence_kv,
+                    actual_seq_lens_q=qo_lengths.cpu().int(),
+                    actual_seq_lens_kv=kv_lengths.cpu().int(),
+                    causal=True,
+                    return_lse=True,
+                    is_cuda_graph_compatible=False,
+                )
+            else:
+                o = self.prefill_wrapper_ragged.forward(
+                    qall,
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
         else:
             # mla paged prefill
             k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(

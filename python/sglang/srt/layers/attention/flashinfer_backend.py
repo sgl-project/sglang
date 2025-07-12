@@ -26,6 +26,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.utils import is_sm100_supported
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available, next_power_of_2
@@ -41,6 +42,7 @@ if is_flashinfer_available():
         BatchPrefillWithRaggedKVCacheWrapper,
     )
     from flashinfer.cascade import merge_state
+    from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
     from flashinfer.decode import _get_range_buf, get_seq_lens
 
 
@@ -485,25 +487,53 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale,
             )
         else:
-            if self.forward_metadata.extend_no_prefix:
-                o = self.prefill_wrapper_ragged.forward(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    causal=True,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=logits_soft_cap,
-                )
 
-            else:
-                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+            def _cudnn_prefill():
+                qo_lengths = forward_batch.seq_lens - forward_batch.extend_prefix_lens
+                kv_lengths = forward_batch.extend_prefix_lens
+                max_token_per_sequence = int(qo_lengths.max().item())
+                max_sequence_kv = int(kv_lengths.max().item())
+
+                o, lse = cudnn_batch_prefill_with_kv_cache(
+                    q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache=k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v_cache=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
+                    scale=layer.scaling,
+                    workspace_buffer=self.workspace_buffer.to(torch.int8),
+                    max_token_per_sequence=max_token_per_sequence,
+                    max_sequence_kv=max_sequence_kv,
+                    actual_seq_lens_q=qo_lengths.cpu().int(),
+                    actual_seq_lens_kv=kv_lengths.cpu().int(),
                     causal=True,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=logits_soft_cap,
+                    return_lse=True,
+                    is_cuda_graph_compatible=False,
                 )
+                return o, lse
+
+            if self.forward_metadata.extend_no_prefix:
+                if global_server_args_dict["flashinfer_use_cudnn"]:
+                    o, _ = _cudnn_prefill()
+                else:
+                    o = self.prefill_wrapper_ragged.forward(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                        v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                        causal=True,
+                        sm_scale=layer.scaling,
+                        logits_soft_cap=logits_soft_cap,
+                    )
+            else:
+                if global_server_args_dict["flashinfer_use_cudnn"]:
+                    o1, s1 = _cudnn_prefill()
+                else:
+                    o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                        v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                        causal=True,
+                        sm_scale=layer.scaling,
+                        logits_soft_cap=logits_soft_cap,
+                    )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),

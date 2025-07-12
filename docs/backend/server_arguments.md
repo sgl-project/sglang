@@ -249,6 +249,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--hicache-size` | The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set. | 0 |
 | `--hicache-write-policy` | The write policy of hierarchical cache. | write_through_selective |
 | `--flashinfer-mla-disable-ragged` | Not using ragged prefill wrapper when running flashinfer mla. | False |
+| `--flashinfer-use-cudnn` | Not using cudnn for prefill when running flashinfer mla. | False |
 | `--disable-shared-experts-fusion` | Disable shared experts fusion optimization for deepseek v3/r1. | False |
 | `--disable-chunked-prefix-cache` | Disable chunked prefix cache feature for deepseek, which should save overhead for short sequences. | False |
 | `--disable-fast-image-processor` | Adopt base image processor instead of fast image processor. | False |

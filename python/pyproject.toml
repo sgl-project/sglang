@@ -60,7 +60,7 @@ srt = [
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.7.post1",
+    "flashinfer_python==0.2.8rc1",
 ]
 
 blackwell = [
@@ -71,7 +71,7 @@ blackwell = [
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.7.post1",
+    "flashinfer_python==0.2.8rc1",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
