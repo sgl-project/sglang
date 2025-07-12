@@ -1171,6 +1171,7 @@ class ModelRunner:
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
+                    page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
                         get_attention_tp_size()
@@ -1198,22 +1199,22 @@ class ModelRunner:
                 )
 
         if self.token_to_kv_pool_allocator is None:
-            if self.page_size == 1:
-                if self.is_hybrid:
-                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
-                        self.full_max_total_num_tokens,
-                        self.swa_max_total_num_tokens,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                    )
-                else:
-                    self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                    )
+            if self.is_hybrid:
+                self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                    self.full_max_total_num_tokens,
+                    self.swa_max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                    kvcache=self.token_to_kv_pool,
+                )
+            elif self.page_size == 1:
+                self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                    self.max_total_num_tokens,
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                    kvcache=self.token_to_kv_pool,
+                )
             else:
                 if _is_npu:
                     self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
