@@ -53,8 +53,11 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter import ActivationType
     from aiter.fused_moe import fused_moe
-    from aiter.fused_moe_bf16_asm import ck_moe_2stages
-    from aiter.ops.shuffle import shuffle_weight
+
+    from sglang.srt.layers.moe.rocm_aiter_fused_moe import (
+        rocm_aiter_fused_experts,
+        shuffle_weights,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -136,15 +139,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _use_aiter:
-            layer.w13_weight = torch.nn.Parameter(
-                shuffle_weight(layer.w13_weight.data, (16, 16)),
-                requires_grad=False,
+            shuffled_w13, shuffled_w2 = shuffle_weights(
+                layer.w13_weight.data, layer.w2_weight.data
             )
-            torch.cuda.empty_cache()
-            layer.w2_weight = torch.nn.Parameter(
-                shuffle_weight(layer.w2_weight.data, (16, 16)),
-                requires_grad=False,
-            )
+            layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
             torch.cuda.empty_cache()
 
         # Pack weight for get better performance on CPU

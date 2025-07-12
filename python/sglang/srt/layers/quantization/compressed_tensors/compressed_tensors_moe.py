@@ -18,12 +18,27 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    set_weight_attrs,
+)
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    from sglang.srt.layers.moe.rocm_aiter_fused_moe import (
+        rocm_aiter_fused_experts,
+        shuffle_weights,
+    )
 
 if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
     from vllm import _custom_ops as vllm_ops
@@ -266,6 +281,15 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 max_w13_scales, requires_grad=False
             )
 
+        if _use_aiter:
+            with torch.no_grad():
+                shuffled_w13, shuffled_w2 = shuffle_weights(
+                    layer.w13_weight.data, layer.w2_weight.data
+                )
+                layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
+                layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
+                torch.cuda.empty_cache()
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -305,24 +329,46 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        return fused_experts(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=inplace,
-            activation=activation,
-            use_fp8_w8a8=True,
-            per_channel_quant=self.weight_quant.strategy
-            == QuantizationStrategy.CHANNEL,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            a1_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            routed_scaling_factor=routed_scaling_factor,
-        )
+        if (
+            _use_aiter
+            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and apply_router_weight_on_input
+        ):
+            return rocm_aiter_fused_experts(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                use_fp8_w8a8=True,
+                per_channel_quant=self.weight_quant.strategy
+                == QuantizationStrategy.CHANNEL,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+            )
+        else:
+            return fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=inplace,
+                activation=activation,
+                use_fp8_w8a8=True,
+                per_channel_quant=self.weight_quant.strategy
+                == QuantizationStrategy.CHANNEL,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                routed_scaling_factor=routed_scaling_factor,
+            )
 
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
