@@ -270,19 +270,17 @@ class MooncakeKVManager(BaseKVManager):
 
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            src_addr_list = []
-            dst_addr_list = []
-            length_list = []
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
-                src_addr_list.append(src_addr)
-                dst_addr_list.append(dst_addr)
-                length_list.append(length)
-            return self.engine.batch_transfer_sync(
-                mooncake_session_id, src_addr_list, dst_addr_list, length_list
-            )
+
+                status = self.engine.transfer_sync(
+                    mooncake_session_id, src_addr, dst_addr, length
+                )
+                if status != 0:
+                    return status
+            return 0
 
         futures = [
             executor.submit(
