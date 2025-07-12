@@ -643,6 +643,18 @@ class Req:
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def release_mm_resources(self):
+        if self.multimodal_inputs and self.multimodal_inputs.mm_items:
+            for mm_item in self.multimodal_inputs.mm_items:
+                if mm_item is None:
+                    continue
+                pixel_values = getattr(mm_item, "pixel_values", None)
+                if not isinstance(pixel_values, torch.Tensor):
+                    continue
+                del mm_item.pixel_values
+            del self.multimodal_inputs.mm_items
+        self.multimodal_inputs = None
+
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
@@ -783,7 +795,7 @@ class Req:
     def set_finish_with_abort(self, error_msg: str):
         if get_tensor_model_parallel_rank() == 0:
             logger.error(f"{error_msg}, {self.rid=}")
-        self.multimodal_inputs = None
+        self.release_mm_resources()
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
         self.return_logprob = False
