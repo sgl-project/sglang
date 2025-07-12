@@ -1,7 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
 
 import logging
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -76,6 +76,9 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import TopKOutput
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -985,15 +988,8 @@ class Fp8MoEMethod:
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
-        custom_routing_function: Optional[Callable] = None,
-        correction_bias: Optional[torch.Tensor] = None,
+        topk_output: "TopKOutput",
+        *,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         inplace: bool = True,
@@ -1001,24 +997,9 @@ class Fp8MoEMethod:
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-        from sglang.srt.layers.moe.topk import select_experts
-
-        # Expert selection
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
 
         if use_intel_amx_backend(layer):
+            topk_weights, topk_ids, _ = topk_output
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,
@@ -1040,8 +1021,7 @@ class Fp8MoEMethod:
             ret = self.maybe_apply_hip_fused_experts(
                 layer,
                 x,
-                topk_weights,
-                topk_ids,
+                topk_output,
                 activation,
                 no_combine,
             )
@@ -1056,6 +1036,7 @@ class Fp8MoEMethod:
         ):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
+            topk_weights, topk_ids, _ = topk_output
             return cutlass_fused_experts_fp8(
                 x,
                 layer.w13_weight.transpose(1, 2),
@@ -1084,8 +1065,7 @@ class Fp8MoEMethod:
             x,
             layer.w13_weight,
             layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
+            topk_output=topk_output,
             inplace=inplace and not no_combine,
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
@@ -1109,11 +1089,11 @@ class Fp8MoEMethod:
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
+        topk_output: "TopKOutput",
         activation: str = "silu",
         no_combine: bool = False,
     ) -> Optional[torch.Tensor]:
+        topk_weights, topk_ids, _ = topk_output
         if _use_hip_int4:
             # TODO: add triton kernel and add check _use_aiter
             assert not no_combine, f"{no_combine=} is not supported."
