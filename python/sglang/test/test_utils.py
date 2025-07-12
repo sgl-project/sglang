@@ -75,6 +75,11 @@ DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
 DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
+DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST = (
+    "OPEA/Llama-3.2-11B-Vision-Instruct-qvision-int4-sym-inc",  ## mllm auto_round:auto_gptq
+    "OPEA/Qwen2.5-0.5B-Instruct-int4-sym-inc",  ## auto_round:auto_gptq
+    "Intel/Qwen2-0.5B-Instruct-int4-sym-AutoRound",  ## auto_round:auto_awq
+)
 DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 
 # Nightly tests

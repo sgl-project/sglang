@@ -25,6 +25,7 @@ try:
     from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
     from vllm.model_executor.layers.quantization.gptq_marlin import (
         GPTQMarlinLinearMethod,
+        GPTQMarlinMoEMethod,
     )
     from vllm.model_executor.layers.quantization.gptq_marlin_24 import (
         GPTQMarlin24Config,
@@ -42,14 +43,15 @@ except ImportError:
         def override_quantization_method(self, *args, **kwargs):
             return None
 
-    AQLMConfig = AWQMarlinConfig = BitsAndBytesConfig = CompressedTensorsConfig = (
-        DeepSpeedFPConfig
-    ) = ExpertsInt8Config = FBGEMMFp8Config = GGUFConfig = GPTQMarlin24Config = (
-        MarlinConfig
-    ) = QQQConfig = Int8TpuConfig = DummyConfig
+    AQLMConfig = AWQMarlinConfig = AutoRoundConfig = BitsAndBytesConfig = (
+        CompressedTensorsConfig
+    ) = DeepSpeedFPConfig = ExpertsInt8Config = FBGEMMFp8Config = GGUFConfig = (
+        GPTQMarlin24Config
+    ) = MarlinConfig = QQQConfig = Int8TpuConfig = DummyConfig
 
 
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
+from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
 from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
@@ -57,11 +59,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.gptq import (
-    GPTQConfig,
-    GPTQMarlinConfig,
-    GPTQMarlinMoEMethod,
-)
+from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
@@ -102,6 +100,7 @@ VLLM_QUANTIZATION_METHODS = {
     "experts_int8": ExpertsInt8Config,
     "gptq_marlin": GPTQMarlinConfig,
     "gptq": GPTQConfig,
+    "auto-round": AutoRoundConfig,
 }
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS, **VLLM_QUANTIZATION_METHODS}
