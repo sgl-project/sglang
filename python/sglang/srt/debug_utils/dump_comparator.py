@@ -96,14 +96,16 @@ def check_tensor_pair(path_baseline, path_target):
 
     needs_print = max_abs_diff > 1e-3
 
-    print('\t'.join(
-        f"{'❌' if value > 1e-3 else '✅'} {name}={value}"
-        for name, value in [
-            ("rel_diff", rel_diff),
-            ("max_abs_diff", max_abs_diff),
-            ("mean_abs_diff", mean_abs_diff),
-        ]
-    ))
+    print(
+        "\t".join(
+            f"{'❌' if value > 1e-3 else '✅'} {name}={value}"
+            for name, value in [
+                ("rel_diff", rel_diff),
+                ("max_abs_diff", max_abs_diff),
+                ("mean_abs_diff", mean_abs_diff),
+            ]
+        )
+    )
 
     if needs_print:
         print(f"x_baseline(sample)={get_truncated_value(x_baseline)}")
