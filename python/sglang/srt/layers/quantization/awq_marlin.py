@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional
 
 import torch
 from torch.nn import Parameter
