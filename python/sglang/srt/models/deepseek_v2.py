@@ -2198,7 +2198,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             # This may affect the accuracy of fp8 model.
             # Fix deepseek v3 blockwise bmm by using deep_gemm
             use_deep_gemm_bmm = False
-            model_dtype = torch.get_default_dtype()
+            # model_dtype = torch.get_default_dtype()
+            print(f"HACK!!! {torch.get_default_dtype()=} but force model_dtype=bf16")
+            model_dtype = torch.bfloat16
 
             if w.dtype in (
                 torch.float8_e4m3fn,
