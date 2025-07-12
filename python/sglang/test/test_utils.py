@@ -1,6 +1,7 @@
 """Common utilities for testing and benchmarking"""
 
 import argparse
+import asyncio
 import copy
 import logging
 import os
@@ -16,6 +17,7 @@ from functools import partial
 from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple
 
+import aiohttp
 import numpy as np
 import requests
 import torch
@@ -1238,6 +1240,58 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                                 rank += 1
                             else:
                                 raise
+
+
+def send_generate_requests(base_url: str, num_requests: int) -> List[str]:
+    """Sends generate request serially and returns status codes. Max concurrency is 1."""
+
+    def generate():
+        prompt = """
+        System: You are a helpful assistant.
+        User: What is the capital of France?
+        Assistant: The capital of France is
+        """
+        response = requests.post(
+            f"{base_url}/generate",
+            json={
+                "text": prompt,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 50,
+                },
+            },
+        )
+        return response.status_code
+
+    return [generate() for _ in range(num_requests)]
+
+
+async def send_concurrent_generate_requests(
+    base_url: str, num_requests: int
+) -> List[str]:
+    """Sends generate request concurrently and returns status codes. Max concurrency is num_requests."""
+
+    async def async_generate():
+        async with aiohttp.ClientSession() as session:
+            prompt = """
+            System: You are a helpful assistant.
+            User: What is the capital of France?
+            Assistant: The capital of France is
+            """
+            async with session.post(
+                f"{base_url}/generate",
+                json={
+                    "text": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 50,
+                    },
+                },
+            ) as response:
+                return response.status
+
+    tasks = [asyncio.create_task(async_generate()) for _ in range(num_requests)]
+    return await asyncio.gather(*tasks)
 
 
 class CustomTestCase(unittest.TestCase):

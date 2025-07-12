@@ -38,7 +38,7 @@ import orjson
 import requests
 import uvicorn
 import uvloop
-from fastapi import Depends, FastAPI, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -349,6 +349,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
+        except HTTPException as e:
+            return _create_error_response(e, status_code=e.status_code)
 
 
 @app.api_route("/generate_from_file", methods=["POST"])
@@ -373,6 +375,8 @@ async def generate_from_file_request(file: UploadFile, request: Request):
     except ValueError as e:
         logger.error(f"Error: {e}")
         return _create_error_response(e)
+    except HTTPException as e:
+        return _create_error_response(e, status_code=e.status_code)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
@@ -385,6 +389,8 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
         return ret
     except ValueError as e:
         return _create_error_response(e)
+    except HTTPException as e:
+        return _create_error_response(e, status_code=e.status_code)
 
 
 @app.api_route("/classify", methods=["POST", "PUT"])
@@ -397,6 +403,8 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         return ret
     except ValueError as e:
         return _create_error_response(e)
+    except HTTPException as e:
+        return _create_error_response(e, status_code=e.status_code)
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
@@ -870,10 +878,8 @@ async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
     )
 
 
-def _create_error_response(e):
-    return ORJSONResponse(
-        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-    )
+def _create_error_response(e, status_code=HTTPStatus.BAD_REQUEST):
+    return ORJSONResponse({"error": {"message": str(e)}}, status_code=status_code)
 
 
 def launch_server(
