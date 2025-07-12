@@ -2198,9 +2198,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             # This may affect the accuracy of fp8 model.
             # Fix deepseek v3 blockwise bmm by using deep_gemm
             use_deep_gemm_bmm = False
-            # model_dtype = torch.get_default_dtype()
-            print(f"HACK!!! {torch.get_default_dtype()=} but force model_dtype=bf16")
-            model_dtype = torch.bfloat16
 
             if w.dtype in (
                 torch.float8_e4m3fn,
@@ -2226,7 +2223,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                         _is_cuda
                         and weight_block_size[0] == 128
                         and weight_block_size[1] == 128
-                        and model_dtype == torch.bfloat16
                     ):
                         if (
                             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -2240,7 +2236,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 weight,
                                 weight_scale,
                                 weight_block_size,
-                                model_dtype,
+                                torch.bfloat16,
                             )
                     else:
                         w, scale = block_quant_to_tensor_quant(
