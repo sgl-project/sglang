@@ -151,6 +151,8 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    speculative_relaxed_thinking: bool = False
+    speculative_reasoning_parser: Optional[str] = None
     speculative_token_map: Optional[str] = None
 
     # Expert parallelism
@@ -514,6 +516,11 @@ class ServerArgs:
             # The token generated from the verify step is counted.
             # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
             # assert self.speculative_num_steps < self.speculative_num_draft_tokens
+
+            if self.speculative_relaxed_thinking:
+                assert (
+                    self.speculative_reasoning_parser
+                ), "Must set reasoning parser when using relaxed thinking."
 
         # GGUF
         if (
@@ -1202,6 +1209,19 @@ class ServerArgs:
             type=float,
             help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
             default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--speculative-relaxed-thinking",
+            action="store_true",
+            default=ServerArgs.speculative_relaxed_thinking,
+            help="Relaxed acceptance for thinking tokens.",
+        )
+        parser.add_argument(
+            "--speculative-reasoning-parser",
+            type=str,
+            choices=list(ReasoningParser.DetectorMap.keys()),
+            default=ServerArgs.speculative_reasoning_parser,
+            help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
         )
         parser.add_argument(
             "--speculative-token-map",
