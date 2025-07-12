@@ -1003,6 +1003,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         out_cache_loc = self.token_to_kv_pool_allocator.alloc_extend(
             prefix_lens, seq_lens, last_loc, extend_num_tokens
         )
+
         if out_cache_loc is None:
             error_msg = (
                 f"Prefill out of memory. Try to lower your batch size.\n"

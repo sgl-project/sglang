@@ -153,6 +153,34 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
 
 
+class ElasticTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    def __init__(self, size: int, dtype: torch.dtype, device: str, kvcache: KVCache):
+        super().__init__(size, 1, dtype, device, kvcache)
+        self.clear()
+        assert hasattr(
+            kvcache, "kv_allocator"
+        ), "ElasticTokenToKVPoolAllocator requires kvcache to be an ElasticMHATokenToKVPool"
+        self.kv_allocator = kvcache.kv_allocator
+
+    def available_size(self):
+        return self.kv_allocator.available_size()
+
+    def alloc(self, need_size: int):
+        indices = self.kv_allocator.alloc(need_size)
+        indices = torch.tensor(indices, dtype=torch.int32, device="cuda")
+        return indices
+
+    def free(self, free_index: torch.Tensor):
+        if self.is_not_in_free_group:
+            return self.kv_allocator.free(free_index.cpu().numpy())
+        else:
+            self.free_group.append(free_index)
+
+    def clear(self):
+        if hasattr(self, "kv_allocator"):
+            self.kv_allocator.clear()
+
+
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for SWA hybrid KV cache."""
 
