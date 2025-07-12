@@ -74,6 +74,7 @@ from sgl_kernel.moe import (
     prepare_moe_input,
     topk_softmax,
 )
+from sgl_kernel.rotary_embedding import rotary_embedding
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,
     top_k_renorm_prob,
