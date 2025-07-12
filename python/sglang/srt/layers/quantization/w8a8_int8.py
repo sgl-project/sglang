@@ -1,7 +1,7 @@
 import importlib
 import sys
 from types import MappingProxyType
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
 from torch.nn.parameter import Parameter
@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.utils import (
     apply_module_patch,
@@ -202,6 +203,9 @@ class W8A8Int8Config(QuantizationConfig):
                         "forward_npu",
                         [npu_wrapper_rmsnorm_forward],
                     )
+        else:
+            self.ignore = cast(List[str], quant_config.get("ignore", []))
+            self.packed_modules_mapping = quant_config.get("packed_modules_mapping", {})
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -237,7 +241,7 @@ class W8A8Int8Config(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
-        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if _is_npu:
@@ -263,6 +267,10 @@ class W8A8Int8Config(QuantizationConfig):
                 return NPU_W8A8MoEMethod(self)
             return None
         else:
+            if should_ignore_layer(
+                prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+            ):
+                return UnquantizedLinearMethod()
             if isinstance(layer, LinearBase):
                 return W8A8Int8LinearMethod(self)
             elif isinstance(layer, FusedMoE):
