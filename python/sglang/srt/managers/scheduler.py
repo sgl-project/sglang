@@ -580,7 +580,23 @@ class Scheduler(
                 page_size=self.page_size,
             )
         else:
-            if self.enable_hierarchical_cache:
+            if os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1":
+                # lazy import to avoid JIT overhead
+                from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
+
+                self.tree_cache = RadixCacheCpp(
+                    disable=False,
+                    use_hicache=self.enable_hierarchical_cache,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool=self.token_to_kv_pool_allocator,
+                    tp_cache_group=self.tp_cpu_group,
+                    page_size=self.page_size,
+                    hicache_ratio=server_args.hicache_ratio,
+                    hicache_size=server_args.hicache_size,
+                    hicache_write_policy=server_args.hicache_write_policy,
+                    enable_kv_cache_events=self.enable_kv_cache_events,
+                )
+            elif self.enable_hierarchical_cache:
                 self.tree_cache = HiRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
