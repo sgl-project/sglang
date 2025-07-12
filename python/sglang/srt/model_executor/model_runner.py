@@ -840,19 +840,34 @@ class ModelRunner:
         named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
         load_format: Optional[str] = None,
     ):
-        named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank))
-            for name, tensor in named_tensors
-        ]
-        if load_format == "direct":
-            _model_load_weights_direct(self.model, named_tensors)
-        elif load_format in self.server_args.custom_weight_loader:
-            custom_loader = dynamic_import(load_format)
-            custom_loader(self.model, named_tensors)
-        elif load_format is None:
-            self.model.load_weights(named_tensors)
-        else:
-            raise NotImplementedError(f"Unknown load_format={load_format}")
+        # Export profiler trace to home directory
+        with torch.profiler.profile(
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            named_tensors = [
+                (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank))
+                for name, tensor in named_tensors
+            ]
+            if load_format == "direct":
+                _model_load_weights_direct(self.model, named_tensors)
+            elif load_format in self.server_args.custom_weight_loader:
+                custom_loader = dynamic_import(load_format)
+                custom_loader(self.model, named_tensors)
+            elif load_format is None:
+                self.model.load_weights(named_tensors)
+            else:
+                raise NotImplementedError(f"Unknown load_format={load_format}")
+        import os
+        import time
+
+        prof.export_chrome_trace(
+            os.path.expanduser(
+                f"~/profiler_trace_{self.tp_rank}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+            )
+        )
+
         return True, "Success"
 
     def get_weights_by_name(
