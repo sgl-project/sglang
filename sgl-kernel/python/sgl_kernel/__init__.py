@@ -89,6 +89,7 @@ from sgl_kernel.speculative import (
 )
 from sgl_kernel.top_k import fast_topk
 from sgl_kernel.version import __version__
+from sgl_kernel.cpu_register_fake import *
 
 build_tree_kernel = (
     None  # TODO(ying): remove this after updating the sglang python code.

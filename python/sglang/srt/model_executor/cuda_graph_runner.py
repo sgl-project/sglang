@@ -92,13 +92,15 @@ def patch_model(
     enable_compile: bool,
     num_tokens: int,
     tp_group: GroupCoordinator,
+    device: str = "cuda"  # Default to cuda, can be set to "cpu" for CPU inference
 ):
     """Patch the model to make it compatible with with torch.compile"""
     backup_ca_comm = None
 
     try:
         if enable_compile:
-            _to_torch(model, reverse=False, num_tokens=num_tokens)
+            if device == "cuda":
+                _to_torch(model, reverse=False, num_tokens=num_tokens)
             backup_ca_comm = tp_group.ca_comm
             # Use custom-allreduce here.
             # We found the custom allreduce is much faster than the built-in allreduce in torch,
@@ -115,17 +117,23 @@ def patch_model(
             yield model.forward
     finally:
         if enable_compile:
-            _to_torch(model, reverse=True, num_tokens=num_tokens)
+            if device == "cuda":
+                _to_torch(model, reverse=True, num_tokens=num_tokens)
             tp_group.ca_comm = backup_ca_comm
 
 
-def set_torch_compile_config():
+def set_torch_compile_config(device: str = "cuda"):
     import torch._dynamo.config
     import torch._inductor.config
 
     torch._inductor.config.coordinate_descent_tuning = True
     torch._inductor.config.triton.unique_kernel_names = True
     torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
+
+    if device == "cpu":
+        # size_asserts will cause assertion error when dynamic = True on CPU
+        torch._inductor.config.size_asserts = False
+        torch._inductor.config.freezing = True
 
     # FIXME: tmp workaround
     torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -170,12 +178,14 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     if server_args.enable_two_batch_overlap:
         capture_bs = [bs for bs in capture_bs if bs % 2 == 0]
 
-    if server_args.cuda_graph_max_bs:
+    if server_args.cuda_graph_max_bs and model_runner.device == "cuda":
         capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
         if max(capture_bs) < server_args.cuda_graph_max_bs:
             capture_bs += list(
                 range(max(capture_bs), server_args.cuda_graph_max_bs + 1, 16)
             )
+    if model_runner.device == "cpu":
+        capture_bs = [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
@@ -200,13 +210,15 @@ def set_global_graph_memory_pool(val):
     global_graph_memory_pool = val
 
 
-class CudaGraphRunner:
-    """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
+class GraphRunner:
+    """A GraphRunner runs the forward pass of a model with cuda/cpu graph and torch.compile."""
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(self, model_runner: ModelRunner, device="cuda"):
         # Parse args
+        self.device = device
         self.model_runner = model_runner
         self.graphs = {}
+        self.dynamic_graph = None
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
@@ -228,7 +240,7 @@ class CudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-        rank0_log(f"Capture cuda graph bs {self.capture_bs}")
+        rank0_log(f"Capture graph bs {self.capture_bs}")
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
@@ -248,13 +260,18 @@ class CudaGraphRunner:
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        self.model_runner.attn_backend.init_cuda_graph_state(
-            self.max_bs, self.max_num_token
-        )
-        self.seq_len_fill_value = (
-            self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
-        )
 
+        if device != "cpu":
+            self.model_runner.attn_backend.init_cuda_graph_state(
+                self.max_bs, self.max_num_token
+            )
+            self.seq_len_fill_value = (
+                self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+            )
+        else:
+            self.seq_len_fill_value = (
+                self.model_runner.attn_backend.get_graph_seq_len_fill_value()
+            )
         # FIXME(lsyin): leave it here for now, I don't know whether it is necessary
         self.encoder_len_fill_value = 0
         self.seq_lens_cpu = torch.full(
@@ -262,22 +279,22 @@ class CudaGraphRunner:
         )
 
         if self.enable_torch_compile:
-            set_torch_compile_config()
+            set_torch_compile_config(self.device)
 
         if self.model_runner.server_args.lora_paths is not None:
             self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
 
         # Graph inputs
-        with torch.device("cuda"):
+        with torch.device(self.device):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
+            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32 if self.device == "cuda" else torch.int64)
             self.seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32 if self.device == "cuda" else torch.int64
             )
             self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
-            self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+            self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32 if self.device == "cuda" else torch.int64)
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
             # pipeline parallelism
@@ -327,7 +344,7 @@ class CudaGraphRunner:
                     * self.num_tokens_per_bs
                 ),
                 dtype=torch.bool,
-                device="cuda",
+                device=self.device,
             )
 
         # Capture
@@ -399,9 +416,11 @@ class CudaGraphRunner:
                 record_shapes=True,
             )
 
-        with graph_capture() as graph_capture_context:
+        capture_context = graph_capture if self.device == "cuda" else empty_context
+        with capture_context() as graph_capture_context:
             with profile_context as prof:
-                self.stream = graph_capture_context.stream
+                if self.device == "cuda":
+                    self.stream = graph_capture_context.stream
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
                     self.model_runner.gpu_id,
@@ -454,8 +473,9 @@ class CudaGraphRunner:
             logger.info(log_message)
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
-        graph = torch.cuda.CUDAGraph()
-        stream = self.stream
+        if self.device == "cuda":
+            graph = torch.cuda.CUDAGraph()
+            stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
 
         # Graph inputs
@@ -548,15 +568,23 @@ class CudaGraphRunner:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
-        self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
-            forward_batch.forward_mode,
-            forward_batch.spec_info,
-        )
+        if self.device == "cpu":
+            self.model_runner.attn_backend.init_forward_metadata_capture_graph(
+                bs,
+                seq_lens,
+                forward_batch.forward_mode
+            )
+            assert self.pp_size == 1, "PP is not supported on CPU"
+        else:
+            self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
+                bs,
+                num_tokens,
+                req_pool_indices,
+                seq_lens,
+                encoder_lens,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+            )
 
         # Run and capture
         def run_once():
@@ -580,18 +608,24 @@ class CudaGraphRunner:
             )
             return logits_output_or_pp_proxy_tensors
 
-        for _ in range(2):
-            torch.cuda.synchronize()
-            self.model_runner.tp_group.barrier()
+        contextmanager = torch.no_grad if self.device == "cpu" else empty_context
+        with contextmanager(): 
+            for _ in range(2):
+                if self.device == "cuda":
+                    torch.cuda.synchronize()
+                self.model_runner.tp_group.barrier()
 
-            run_once()
+                out = run_once()
 
-        global global_graph_memory_pool
-        with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=stream):
-            out = run_once()
+        if self.device == "cuda":
+            global global_graph_memory_pool
+            with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=stream):
+                out = run_once()
 
-        global_graph_memory_pool = graph.pool()
-        return graph, out
+            global_graph_memory_pool = graph.pool()
+            return graph, out
+        else:
+            return forward, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
 
@@ -683,17 +717,18 @@ class CudaGraphRunner:
             )
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = self.custom_mask
-        # Attention backend
-        self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            self.req_pool_indices[:bs],
-            self.seq_lens[:bs],
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
-            self.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
-            forward_batch.spec_info,
-            seq_lens_cpu=self.seq_lens_cpu[:bs],
-        )
+        if self.device != "cpu":
+            # Attention backend
+            self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                self.req_pool_indices[:bs],
+                self.seq_lens[:bs],
+                forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+                self.encoder_lens[:bs] if self.is_encoder_decoder else None,
+                self.capture_forward_mode,
+                forward_batch.spec_info,
+                seq_lens_cpu=self.seq_lens_cpu[:bs],
+            )
 
         # Store fields
         self.raw_bs = raw_bs
@@ -714,9 +749,17 @@ class CudaGraphRunner:
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
-        self.graphs[self.bs].replay()
-
-        output = self.output_buffers[self.bs]
+        if self.device != "cpu":
+            self.graphs[self.bs].replay()
+            output = self.output_buffers[self.bs]
+        else:
+            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            assert self.pp_size == 1, "PP is not supported on CPU"
+            output = self.graphs[self.bs](
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+            )
         if isinstance(output, LogitsProcessorOutput):
             return LogitsProcessorOutput(
                 next_token_logits=output.next_token_logits[: self.raw_num_token],

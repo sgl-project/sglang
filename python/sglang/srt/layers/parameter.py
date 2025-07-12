@@ -8,6 +8,8 @@ import torch
 from torch.nn import Parameter
 
 from sglang.srt.utils import is_cpu
+import copy
+import torch.utils._pytree as pytree
 
 __all__ = [
     "BasevLLMParameter",
@@ -293,7 +295,47 @@ class ChannelQuantScaleParameter(_ColumnvLLMParameter):
     channel-wise quantization. Equivalent to _ColumnvLLMParameter.
     """
 
-    pass
+    def __tensor_flatten__(self):
+        return ["data"], [
+            self.requires_grad,
+            self._weight_loader,
+            self._output_dim,
+        ]
+
+    @staticmethod
+    def __tensor_unflatten__(inner_tensors, ctx, outer_size, outer_stride):
+        out = ChannelQuantScaleParameter(data=inner_tensors["data"], output_dim=ctx[2], weight_loader=ctx[1])
+        return out
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args, kwargs):
+        with torch._C._DisableTorchDispatch():
+            if kwargs is None:
+                kwargs = {}
+            args_data = pytree.tree_map_only(ChannelQuantScaleParameter, lambda x: x.data, args)
+            return func(*args_data, **kwargs)
+
+    @classmethod
+    def __metadata_guard__(cls, orig_data, other):
+        return (
+            orig_data[0] == other[0]
+            and orig_data[2] == other[2]
+        )
+
+    def __copy__(self):
+        new_param = ChannelQuantScaleParameter(data=self.data, output_dim=self.output_dim, weight_loader=self.weight_loader)
+        for k, v in self.__dict__.items():
+            if k != "data":
+                setattr(new_param, k, copy.copy(v))
+        return new_param
+
+    def __deepcopy__(self, memo):
+        new_param = ChannelQuantScaleParameter(
+            data=copy.deepcopy(self.data, memo), output_dim=self.output_dim, weight_loader=copy.deepcopy(self.weight_loader, memo)
+        )
+        for k, v in self.__dict__.items():
+            setattr(new_param, k, copy.deepcopy(v, memo))
+        return new_param
 
 
 class BlockQuantScaleParameter(_ColumnvLLMParameter, RowvLLMParameter):

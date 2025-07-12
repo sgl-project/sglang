@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
-    CudaGraphRunner,
+    GraphRunner,
     LogitsProcessorOutput,
     get_batch_sizes_to_capture,
     get_global_graph_memory_pool,
@@ -152,7 +152,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         return is_bs_supported
 
     def capture(self):
-        CudaGraphRunner.capture(self)
+        GraphRunner.capture(self)
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
         graph = torch.cuda.CUDAGraph()
