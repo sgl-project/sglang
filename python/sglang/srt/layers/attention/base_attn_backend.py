@@ -65,7 +65,10 @@ class AttentionBackend(ABC):
         **kwargs,
     ):
         """Run forward on an attention layer."""
-        if forward_batch.forward_mode.is_decode():
+        if (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_naive_verify()
+        ):
             return self.forward_decode(
                 q,
                 k,

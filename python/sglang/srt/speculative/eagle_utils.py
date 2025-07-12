@@ -108,7 +108,6 @@ class EagleDraftInput:
         batch: ScheduleBatch,
         speculative_num_steps: int,
     ):
-        batch.forward_mode = ForwardMode.DRAFT_EXTEND
         batch.input_ids = self.verified_id
         batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
@@ -130,6 +129,35 @@ class EagleDraftInput:
             self.verified_id,
             next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
         )
+
+    def prepare_extend_after_decode_for_naive_eagle(
+        self,
+        batch: ScheduleBatch,
+        speculative_num_steps: int,
+    ):
+        assert len(self.verified_id) == len(batch.out_cache_loc)
+        self.accept_length.add_(1)
+        batch.extend_lens = self.accept_length.clone()
+        batch.extend_num_tokens = sum(batch.extend_lens)
+        batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
+        batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
+
+        self.positions = torch.empty_like(self.verified_id, dtype=torch.long)
+        new_verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
+
+        create_extend_spec_info[(self.accept_length.numel(),)](
+            self.verified_id,
+            batch.seq_lens,
+            self.accept_length,
+            torch.cumsum(self.accept_length, axis=0, dtype=torch.int),
+            self.positions,
+            new_verified_id,
+            next_power_of_2(speculative_num_steps + 1),
+        )
+
+        batch.seq_lens_sum = sum(batch.seq_lens)
+        batch.input_ids = self.verified_id
+        self.verified_id = new_verified_id
 
     def generate_attn_arg_prefill(
         self,
@@ -676,6 +704,30 @@ class EagleVerifyInput:
 
 
 @triton.jit
+def create_extend_spec_info(
+    verified_id,
+    seq_len,
+    accept_len,
+    accept_len_cum,
+    positions,
+    new_verified_id,
+    accept_len_upper: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    offset = 0 if pid == 0 else tl.load(accept_len_cum + pid - 1)
+    seq_length = tl.load(seq_len + pid)
+    accept_length = tl.load(accept_len + pid)
+    positions_ptr = positions + offset
+    data = tl.arange(0, accept_len_upper)
+    mask = data < accept_length
+    tl.store(positions_ptr + data, seq_length - accept_length + data, mask)
+
+    offset = tl.load(accept_len_cum + pid) - 1
+    verified_id_data = tl.load(verified_id + offset)
+    tl.store(new_verified_id + pid, verified_id_data)
+
+
+@triton.jit
 def create_extend_after_decode_spec_info(
     verified_id,
     seq_lens,
@@ -1127,6 +1179,44 @@ def _generate_simulated_accept_index(
     accept_length.fill_(simulate_acc_len - 1)
     predict.fill_(100)  # some legit token id
     return sim_accept_index
+
+
+@triton.jit
+def create_draft_kv_indices(
+    kv_indptr,
+    kv_indices,
+    req_pool,
+    req_to_token,
+    seq_lens,
+    expand_factor: tl.constexpr,  # only support ==2 currently
+    row_stride: tl.constexpr,
+    num_tokens_upper: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 64
+    bid = tl.program_id(0)
+    source_row_id = tl.load(req_pool + bid)
+    batch_offset = tl.arange(0, num_tokens_upper)
+    seq_len_data = tl.load(seq_lens + batch_offset, mask=batch_offset < bid)
+    seq_len = tl.load(seq_lens + bid)
+    cum_seq_len = tl.sum(seq_len_data)
+    kv_offset = cum_seq_len * 2 - bid  # only for expand_factor==1 currently
+
+    kv_indices_ptr = kv_indices + kv_offset
+    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = offset < seq_len - 1
+        data = tl.load(req_to_token + source_row_id * row_stride + offset, mask=mask)
+        tl.store(kv_indices_ptr + offset, data, mask=mask)
+        tl.store(kv_indices_ptr + seq_len - 1 + offset, data, mask=mask)
+
+    data = tl.load(req_to_token + source_row_id * row_stride + seq_len - 1)
+    tl.store(kv_indices_ptr + seq_len * 2 - 2, data)
+
+    tl.store(kv_indptr + bid * expand_factor + 1, kv_offset + seq_len - 1)
+    tl.store(kv_indptr + bid * expand_factor + 2, kv_offset + seq_len * 2 - 1)
+    if bid == 0:
+        tl.store(kv_indptr, 0)
 
 
 def traverse_tree(

@@ -346,7 +346,18 @@ class Scheduler(
         )
 
         # Launch a draft worker for speculative decoding
-        if self.spec_algorithm.is_eagle():
+        if self.spec_algorithm.is_naive_eagle():
+            from sglang.srt.speculative.naive_eagle import NaiveEagleWorker
+
+            self.draft_worker = NaiveEagleWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
+        elif self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
             self.draft_worker = EAGLEWorker(
