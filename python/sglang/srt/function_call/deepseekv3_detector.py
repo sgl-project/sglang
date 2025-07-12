@@ -98,7 +98,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)",
+                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```.*",
                 string=current_text,
                 flags=re.DOTALL,
             )
