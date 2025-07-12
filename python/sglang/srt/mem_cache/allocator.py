@@ -57,11 +57,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def debug_print(self) -> str:
         return ""
 
-    def log_usage(self, evictable_size: int = 0):
-        num_used = self.size - (self.available_size() + evictable_size)
-        msg = f"#token: {num_used}, token usage: {num_used / self.size:.2f}, "
-        return msg, num_used
-
     def available_size(self):
         return len(self.free_pages) * self.page_size
 
@@ -190,7 +185,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
 
     def available_size(self):
-        return min(self.full_available_size(), self.swa_available_size())
+        raise NotImplementedError()
 
     def full_available_size(self):
         return self.full_attn_allocator.available_size()
@@ -213,16 +208,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             f"#full-attn-available-size: {self.full_attn_allocator.available_size()}, "
         )
         return msg
-
-    def log_usage(self, swa_evictable_size: int = 0, full_evictable_size: int = 0):
-        used_full = self.size_full - (self.full_available_size() + full_evictable_size)
-        used_swa = self.size_swa - (self.swa_available_size() + swa_evictable_size)
-        msg = (
-            f"#token: full={used_full}, swa={used_swa}, "
-            f"token usage: full={used_full / self.size_full:.2f}, "
-            f"swa={used_swa / self.size_swa:.2f}, "
-        )
-        return msg, used_full
 
     def get_kvcache(self):
         return self._kvcache
