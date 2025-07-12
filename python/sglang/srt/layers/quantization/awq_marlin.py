@@ -109,6 +109,14 @@ class AWQMarlinConfig(QuantizationConfig):
             f"lm_head_quantized={self.lm_head_quantized}, "
             f"modules_to_not_convert={self.modules_to_not_convert})"
         )
+        )
+
+    def get_scaled_act_names(self) -> List[str]:
+        """Returns the activation function names that should be post-scaled.
+
+        For now, this is only used by AWQ.
+        """
+        raise NotImplementedError
 
     @classmethod
     def get_name(cls) -> str:
