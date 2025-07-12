@@ -547,11 +547,12 @@ mod tests {
 
     // Helper to create a Router instance for testing event handlers
     fn create_test_router() -> Arc<Router> {
-        let worker_urls = Arc::new(RwLock::new(Vec::new()));
+        let workers = Arc::new(RwLock::new(Vec::new()));
         Arc::new(Router::Random {
-            worker_urls,
+            workers,
             timeout_secs: 5,
             interval_secs: 1,
+            _health_checker: None,
         })
     }
 
@@ -878,8 +879,6 @@ mod tests {
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
         assert!(!router
             .get_worker_urls()
-            .read()
-            .unwrap()
             .contains(&pod_info.worker_url(port)));
     }
 
@@ -907,7 +906,7 @@ mod tests {
         .await;
 
         assert!(tracked_pods.lock().unwrap().is_empty());
-        assert!(router.get_worker_urls().read().unwrap().is_empty());
+        assert!(router.get_worker_urls().is_empty());
     }
 
     #[tokio::test]

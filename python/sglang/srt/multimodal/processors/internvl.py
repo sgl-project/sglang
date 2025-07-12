@@ -225,7 +225,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             MultimodalDataItem(
                 pixel_values=pixel_values,
                 modality=Modality.IMAGE,
-                image_offsets=image_offsets,
+                offsets=image_offsets,
             )
         ]
 
