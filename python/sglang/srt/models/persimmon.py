@@ -213,7 +213,7 @@ class PersimmonModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size
         )
-        self.start_layer, self.end_layer, self.layers = make_layers(
+        self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: PersimmonDecoderLayer(
                 config, quant_config=quant_config, prefix=prefix, idx=idx
