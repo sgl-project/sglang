@@ -644,11 +644,19 @@ class ModelRunner:
                 )
 
         # Parse other args
-        self.sliding_window_size = (
-            self.model.get_attention_sliding_window_size()
-            if hasattr(self.model, "get_attention_sliding_window_size")
-            else None
-        )
+        self.sliding_window_size = None
+        if hasattr(self.model, "get_attention_sliding_window_size"):
+            self.sliding_window_size = self.model.get_attention_sliding_window_size()
+            print(
+                f"setting sliding_window_size to be get_attention_sliding_window_size(), {self.sliding_window_size}"
+            )
+        elif self.model_config.attention_chunk_size is not None:
+            self.sliding_window_size = self.model_config.attention_chunk_size
+            print(
+                f"setting sliding_window_size to be attention_chunk_size, {self.sliding_window_size}"
+            )
+
+        print(f"sliding_window_size: {self.sliding_window_size}")
         self.dtype = self.model_config.dtype
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -990,6 +998,7 @@ class ModelRunner:
                 * self.server_args.page_size
             )
             self.max_total_num_tokens = self.full_max_total_num_tokens
+            print(f"Llama4ForConditionalGeneration in model_architectures, swa_max_total_num_tokens: {self.swa_max_total_num_tokens}, full_max_total_num_tokens: {self.full_max_total_num_tokens}, max_total_num_tokens: {self.max_total_num_tokens}")
         else:
             assert self.sliding_window_size is not None and self.sliding_window_size > 0
             full_attention_layer_ids = []

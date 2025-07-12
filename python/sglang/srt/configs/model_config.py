@@ -697,6 +697,7 @@ def is_hybrid_model(
         and model_architectures[0] == "Llama4ForConditionalGeneration"
         and context_length > attention_chunk_size
     ):
+        print(f"model_architectures: {model_architectures}, context_length: {context_length}, attention_chunk_size: {attention_chunk_size}")
         return hybrid_kvcache_ratio
     else:
         return None
@@ -710,6 +711,9 @@ def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int)
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
+        print(
+            f"Llama4ForConditionalGeneration in model_architectures, swa_attention_layer_ids: {swa_attention_layer_ids}, full_attention_layer_ids: {full_attention_layer_ids}"
+        )
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None

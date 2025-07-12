@@ -1181,7 +1181,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
                 )
                 if isinstance(self.tree_cache, SWAChunkCache):
-                    self.tree_cache.evict(
+                    self.tree_cache.evict_swa(
                         req, pre_len, self.model_config.attention_chunk_size
                     )
 
@@ -1574,7 +1574,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # free memory
         if isinstance(self.tree_cache, SWAChunkCache):
             for req in self.reqs:
-                self.tree_cache.evict(
+                self.tree_cache.evict_swa(
                     req, req.seqlen - 1, self.model_config.attention_chunk_size
                 )
 

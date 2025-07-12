@@ -80,7 +80,7 @@ class SWAChunkCache(ChunkCache):
         super().__init__(req_to_token_pool, token_to_kv_pool_allocator, page_size)
         assert isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
 
-    def evict(
+    def evict_swa(
         self,
         req: Req,
         prelen: int,
@@ -95,3 +95,6 @@ class SWAChunkCache(ChunkCache):
             ]
             self.token_to_kv_pool_allocator.free_swa(free_slots)
             req.evicted_seqlen_local = new_evicted_seqlen_local
+
+    def evict(self, num_tokens: int):
+        pass
