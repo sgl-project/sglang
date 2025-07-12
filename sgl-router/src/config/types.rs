@@ -1,4 +1,4 @@
-use super::{ConfigError, ConfigResult};
+use super::ConfigResult;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -215,6 +215,7 @@ impl RouterConfig {
         self.metrics.is_some()
     }
 
+    /* Commented out - no longer needed without compatibility layer
     /// Convert to routing PolicyConfig for internal use
     pub fn to_routing_policy_config(&self) -> ConfigResult<crate::router::PolicyConfig> {
         match (&self.mode, &self.policy) {
@@ -291,4 +292,5 @@ impl RouterConfig {
             }
         }
     }
+    */
 }
