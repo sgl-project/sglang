@@ -945,7 +945,7 @@ class TokenizerManager:
             obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
-        if obj.abort_all_requests:
+        if obj.abort_all_requests and self.server_args.pp_size == 1:
             self.abort_request(abort_all=True)
 
         if True:  # Keep this redundant check to simplify some internal code sync
@@ -959,7 +959,7 @@ class TokenizerManager:
     ) -> Tuple[bool, str]:
         self.send_to_scheduler.send_pyobj(obj)
         self.model_update_result = asyncio.Future()
-        if self.server_args.dp_size == 1:
+        if self.server_args.dp_size == 1 and self.server_args.pp_size == 1:
             result = await self.model_update_result
             if result.success:
                 self.served_model_name = obj.model_path
@@ -967,7 +967,7 @@ class TokenizerManager:
                 self.server_args.load_format = obj.load_format
                 self.model_path = obj.model_path
             return result.success, result.message, result.num_paused_requests
-        else:  # self.server_args.dp_size > 1
+        else:  # self.server_args.dp_size > 1 or self.server_args.pp_size > 1:
             self.model_update_tmp = []
             result = await self.model_update_result
 
@@ -990,6 +990,10 @@ class TokenizerManager:
         assert (
             self.server_args.dp_size == 1
         ), "dp_size must be 1 for init parameter update group"
+        
+        if obj.abort_all_requests and self.server_args.pp_size == 1:
+            self.abort_request(abort_all=True)
+
         result = (await self.init_weights_update_group_communicator(obj))[0]
         return result.success, result.message
 
@@ -1003,7 +1007,7 @@ class TokenizerManager:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
-        if obj.abort_all_requests:
+        if obj.abort_all_requests and self.server_args.pp_size == 1:
             self.abort_request(abort_all=True)
 
         # This means that weight sync
@@ -1022,7 +1026,7 @@ class TokenizerManager:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
 
-        if obj.abort_all_requests:
+        if obj.abort_all_requests and self.server_args.pp_size == 1:
             self.abort_request(abort_all=True)
 
         # This means that weight sync
@@ -1685,12 +1689,12 @@ class TokenizerManager:
         )
 
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
-        if self.server_args.dp_size == 1:
+        if self.server_args.dp_size == 1 and self.server_args.pp_size == 1:
             self.model_update_result.set_result(recv_obj)
-        else:  # self.server_args.dp_size > 1
+        else:  # self.server_args.dp_size > 1 or self.server_args.pp_size > 1
             self.model_update_tmp.append(recv_obj)
             # set future if the all results are received
-            if len(self.model_update_tmp) == self.server_args.dp_size:
+            if len(self.model_update_tmp) == (self.server_args.dp_size * self.server_args.pp_size):
                 self.model_update_result.set_result(self.model_update_tmp)
 
     async def score_request(

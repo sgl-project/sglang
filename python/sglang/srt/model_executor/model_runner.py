@@ -159,6 +159,8 @@ class ModelRunner:
         tp_size: int,
         pp_rank: int,
         pp_size: int,
+        dp_rank: int,
+        dp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
         is_draft_worker: bool = False,
@@ -175,9 +177,10 @@ class ModelRunner:
             logger.addFilter(RankZeroFilter(tp_rank == 0))
         self.tp_rank = tp_rank
         self.tp_size = tp_size
-        self.dp_size = server_args.dp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.dp_rank = dp_rank
+        self.dp_size = dp_size
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -766,7 +769,10 @@ class ModelRunner:
         ), "Default torch process group must be initialized"
         assert group_name != "", "Group name cannot be empty"
 
-        rank = rank_offset + self.tp_rank
+        if self.server_args.enable_dp_attention:
+            rank = rank_offset + self.tp_rank * self.pp_size + self.pp_rank
+        else:
+            rank = rank_offset + self.dp_rank * self.tp_size * self.pp_size + self.tp_rank * self.pp_size + self.pp_rank
 
         logger.info(
             f"init custom process group: master_address={master_address}, master_port={master_port}, "

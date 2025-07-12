@@ -735,7 +735,7 @@ def _launch_subprocesses(
                         gpu_id,
                         tp_rank,
                         pp_rank,
-                        None,
+                        0,
                         writer,
                     ),
                 )
