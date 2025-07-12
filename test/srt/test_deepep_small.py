@@ -144,7 +144,7 @@ class TestTP(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
-@unittest.skip("covered in test_deepep_large.py")
+# @unittest.skip("covered in test_deepep_large.py")
 class TestNoGatherdBuffer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -239,7 +239,7 @@ class TestTBO(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
-@unittest.skip("covered in TestMTPWithTBO")
+# @unittest.skip("covered in TestMTPWithTBO")
 class TestMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
