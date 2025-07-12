@@ -19,6 +19,7 @@ from sglang.srt.utils import get_ip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.scheduler import Scheduler
 
 #########################
 # Constants & Enums
@@ -371,3 +372,9 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
         req.input_top_logprobs_idx = []
         req.input_token_ids_logprobs_val = []
         req.input_token_ids_logprobs_idx = []
+
+
+def get_metrics_collector(scheduler: Scheduler):
+    if scheduler.enable_metrics:
+        return scheduler.metrics_collector
+    return None
