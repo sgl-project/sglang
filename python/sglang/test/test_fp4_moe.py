@@ -163,8 +163,6 @@ def test_cutlass_fp4_moe_no_graph(
         hidden_states=a,
         router_logits=score,
         top_k=topk,
-        use_grouped_topk=False,
-        renormalize=False,
     )
 
     a1_gs = torch.ones((e,), device="cuda", dtype=torch.float32)

@@ -104,8 +104,6 @@ def test_cutlass_w4a8_moe(M, N, K, E, ep_size, topk, group_size, dtype):
         hidden_states=a,
         router_logits=score,
         top_k=topk,
-        use_grouped_topk=False,
-        renormalize=False,
     )
     expert_map = torch.arange(E, dtype=torch.int32, device=device)
     expert_map[local_e:] = E
