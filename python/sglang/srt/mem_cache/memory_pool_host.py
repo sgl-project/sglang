@@ -7,7 +7,10 @@ from functools import wraps
 import psutil
 import torch
 
+from sglang.global_config import global_config
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.gds import Gds
+from sglang.srt.utils import debug_timing
 
 logger = logging.getLogger(__name__)
 
@@ -54,20 +57,22 @@ class HostKVCache(abc.ABC):
         self.page_size = page_size
         self.size_per_token = self.get_size_per_token()
         if host_size > 0:
+            logger.info("xxxx")
             self.size = int(host_size * 1e9 // self.size_per_token)
         else:
+            logger.info(f"{self.device_pool.size},{host_to_device_ratio},{self.page_size},{host_size}")
             self.size = int(device_pool.size * host_to_device_ratio)
         # Align the host memory pool size to the page size
         self.size = self.size - (self.size % self.page_size)
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
-
         assert (
             self.size > device_pool.size
         ), "The host memory should be larger than the device memory with the current protocol"
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
+        logger.info(f"{self.size},{self.size_per_token}")
         requested_bytes = self.size * self.size_per_token
         # preserve at least 10GB for other usage
         ten_gb = 10 * (1024**3)
@@ -83,6 +88,7 @@ class HostKVCache(abc.ABC):
                 f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
             )
 
+        logger.info(f"##device pool size {device_pool.size / 1e9:.2f} , host_to_devcie_ratio is {host_to_device_ratio / 1e9:.2f}#####")
         self.kv_buffer = self.init_kv_buffer()
 
         # A lock for synchronized operations on memory allocation and state transitions.
@@ -96,6 +102,22 @@ class HostKVCache(abc.ABC):
 
     @abc.abstractmethod
     def init_kv_buffer(self):
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def transfer(self, indices, flat_data):
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def get_flat_data(self, indices):
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def get_flat_data_by_layer(self, indices, layer_id):
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def assign_flat_data(self, indices, flat_data):
         raise NotImplementedError()
 
     @synchronized()
@@ -210,6 +232,12 @@ class MHATokenToKVPoolHost(HostKVCache):
         super().__init__(
             device_pool, host_to_device_ratio, host_size, pin_memory, device, page_size
         )
+        if global_config.enable_gds:
+            self.size_per_page = self.head_dim * self.head_num * self.dtype.itemsize
+            self.gds = Gds(
+                gds_file_path = global_config.gds_path + "test.txt",
+                buf_size = self.get_size_per_token(),
+            )
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -219,6 +247,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
 
     def init_kv_buffer(self):
+        logger.info(
+                f"lay:{self.layer_num},dtype:{self.dtype},device:{self.device},size:{self.size},head_num:{self.head_num},head_dim{self.head_dim}"
+            )
         return torch.empty(
             (2, self.layer_num, self.size, self.head_num, self.head_dim),
             dtype=self.dtype,
@@ -226,13 +257,86 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
         )
 
-    @property
-    def k_buffer(self):
-        return self.kv_buffer[0]
+    @debug_timing
+    def transfer(self, indices, flat_data):
+        # backup prepared data from device to host
+        self.kv_buffer[:, :, indices] = flat_data.to(
+            device=self.device, non_blocking=False
+        )
 
-    @property
-    def v_buffer(self):
-        return self.kv_buffer[1]
+    def get_flat_data(self, indices):
+        return self.kv_buffer[:, :, indices]
+
+    def get_flat_data_by_layer(self, indices, layer_id):
+        return self.kv_buffer[:, layer_id - self.start_layer, indices]
+
+    def assign_flat_data(self, indices, flat_data):
+        self.kv_buffer[:, :, indices] = flat_data
+
+    def write_page_all_layers(self, host_indices, device_indices, device_pool):
+        device_indices_cpu = device_indices[:: self.page_size].cpu()
+        for i in range(len(device_indices_cpu)):
+            h_index = host_indices[i * self.page_size]
+            d_index = device_indices_cpu[i]
+            for j in range(self.layer_num):
+                if global_config.enable_gds:
+                    file_path = global_config.gds_path + "k_buffer_layer" + str(j)
+                    self.gds.d2s("WRITE",
+                        file_path,
+                        device_pool.k_buffer[j][d_index : d_index + self.page_size],
+                        h_index * self.size_per_page,
+                        self.page_size * self.size_per_page)
+                    file_path = global_config.gds_path + "v_buffer_layer" + str(j)
+                    self.gds.d2s("WRITE",
+                        file_path,
+                        device_pool.v_buffer[j][d_index : d_index + self.page_size],
+                        h_index * self.size_per_page,
+                        self.page_size * self.size_per_page)
+                else:
+                    self.kv_buffer[0, j, h_index : h_index + self.page_size].copy_(
+                        device_pool.k_buffer[j][d_index : d_index + self.page_size],
+                        non_blocking=True,
+                    )
+                    self.kv_buffer[1, j, h_index : h_index + self.page_size].copy_(
+                        device_pool.v_buffer[j][d_index : d_index + self.page_size],
+                        non_blocking=True,
+                    )
+
+    def load_page_per_layer(self, host_indices, device_indices, device_pool, layer_id):
+        device_indices_cpu = device_indices[:: self.page_size].cpu()
+        for i in range(len(device_indices_cpu)):
+            h_index = host_indices[i * self.page_size]
+            d_index = device_indices_cpu[i]
+            if global_config.enable_gds:
+                    file_path = global_config.gds_path + "k_buffer_layer" + str(layer_id - self.start_layer)
+                    self.gds.d2s("READ",
+                        file_path,
+                        device_pool.k_buffer[layer_id - self.start_layer][d_index : d_index + self.page_size],
+                        h_index * self.size_per_page,
+                        self.page_size * self.size_per_page)
+                    file_path = global_config.gds_path + "v_buffer_layer" + str(layer_id - self.start_layer)
+                    self.gds.d2s("READ",
+                        file_path,
+                        device_pool.v_buffer[layer_id - self.start_layer][d_index : d_index + self.page_size],
+                        h_index * self.size_per_page,
+                        self.page_size * self.size_per_page)
+            else:
+                device_pool.k_buffer[layer_id - self.start_layer][
+                    d_index : d_index + self.page_size
+                ].copy_(
+                    self.kv_buffer[
+                        0, layer_id - self.start_layer, h_index : h_index + self.page_size
+                    ],
+                    non_blocking=True,
+                )
+                device_pool.v_buffer[layer_id - self.start_layer][
+                    d_index : d_index + self.page_size
+                ].copy_(
+                    self.kv_buffer[
+                        1, layer_id - self.start_layer, h_index : h_index + self.page_size
+                    ],
+                    non_blocking=True,
+                )
 
 
 class MLATokenToKVPoolHost(HostKVCache):
@@ -275,3 +379,44 @@ class MLATokenToKVPoolHost(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
         )
+
+    @debug_timing
+    def transfer(self, indices, flat_data):
+        # backup prepared data from device to host
+        self.kv_buffer[:, indices] = flat_data.to(
+            device=self.device, non_blocking=False
+        )
+
+    def get_flat_data(self, indices):
+        return self.kv_buffer[:, indices]
+
+    def get_flat_data_by_layer(self, indices, layer_id):
+        return self.kv_buffer[layer_id - self.start_layer, indices]
+
+    def assign_flat_data(self, indices, flat_data):
+        self.kv_buffer[:, indices] = flat_data
+
+    def write_page_all_layers(self, host_indices, device_indices, device_pool):
+        device_indices_cpu = device_indices[:: self.page_size].cpu()
+        for i in range(len(device_indices_cpu)):
+            h_index = host_indices[i * self.page_size]
+            d_index = device_indices_cpu[i]
+            for j in range(self.layer_num):
+                self.kv_buffer[j, h_index : h_index + self.page_size].copy_(
+                    device_pool.kv_buffer[j][d_index : d_index + self.page_size],
+                    non_blocking=True,
+                )
+
+    def load_page_per_layer(self, host_indices, device_indices, device_pool, layer_id):
+        device_indices_cpu = device_indices[:: self.page_size].cpu()
+        for i in range(len(device_indices_cpu)):
+            h_index = host_indices[i * self.page_size]
+            d_index = device_indices_cpu[i]
+            device_pool.kv_buffer[layer_id - self.start_layer][
+                d_index : d_index + self.page_size
+            ].copy_(
+                self.kv_buffer[
+                    layer_id - self.start_layer, h_index : h_index + self.page_size
+                ],
+                non_blocking=True,
+            )
