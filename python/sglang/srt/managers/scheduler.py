@@ -269,6 +269,9 @@ class Scheduler(
                 self.dp_size,
             )
         )
+        
+        # For regular DP mode, use the actual dp_rank parameter for metrics
+        self.metrics_dp_rank = self.attn_dp_rank if server_args.enable_dp_attention else (dp_rank or 0)
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -656,6 +659,7 @@ class Scheduler(
                 labels={
                     "model_name": self.server_args.served_model_name,
                     "engine_type": engine_type,
+                    "dp_rank": str(self.metrics_dp_rank),
                 },
             )
 
