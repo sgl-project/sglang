@@ -49,7 +49,6 @@ except ImportError:
     ) = QQQConfig = Int8TpuConfig = DummyConfig
 
 
-from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
@@ -185,6 +184,7 @@ def get_linear_quant_method(
 ):
     # Move import here to avoid circular import. This is only used in monkey patching
     # of vllm's QuantizationConfig.
+    from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
     from sglang.srt.layers.vocab_parallel_embedding import (
         ParallelLMHead,
         UnquantizedEmbeddingMethod,
