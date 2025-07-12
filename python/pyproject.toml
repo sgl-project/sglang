@@ -75,11 +75,9 @@ blackwell = [
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
-# => base docker rocm/vllm-dev:20250114, not from public vllm whl
 srt_hip = [
     "sglang[runtime_common]",
     "torch",
-    "vllm==0.6.7.dev2",
 ]
 
 # xpu is not enabled in public vllm and torch whl,
