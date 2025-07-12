@@ -16,6 +16,9 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+
+# At the top of persimmon.py
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -200,6 +203,10 @@ class PersimmonDecoderLayer(nn.Module):
 
 
 class PersimmonModel(nn.Module):
+    """
+    The core transformer model.
+    This version is updated to handle Pipeline Parallelism correctly.
+    """
 
     def __init__(
         self,
@@ -209,20 +216,33 @@ class PersimmonModel(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.vocab_size = config.vocab_size
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size
-        )
-        self.layers = make_layers(
+        self.pp_group = get_pp_group()
+
+        # Handle embedding layer for the first GPU in a pipeline
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+        # This correctly creates the layers AND sets self.start_layer/self.end_layer
+        self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: PersimmonDecoderLayer(
                 config, quant_config=quant_config, prefix=prefix, idx=idx
             ),
-            prefix=add_prefix("layers", prefix),
+            prefix="model.layers",  # Use a fixed prefix consistent with HF
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
         )
-        self.final_layernorm = nn.LayerNorm(
-            config.hidden_size, eps=config.layer_norm_eps
-        )
+
+        if self.pp_group.is_last_rank:
+            self.final_layernorm = nn.LayerNorm(
+                config.hidden_size, eps=config.layer_norm_eps
+            )
+        else:
+            self.final_layernorm = PPMissingLayer()
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -234,20 +254,21 @@ class PersimmonModel(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
+        if self.pp_group.is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.get_input_embeddings(input_ids)
         else:
-            hidden_states = self.get_input_embeddings(input_ids)
+            hidden_states = forward_batch.pp_input_hidden
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-
             hidden_states = layer(
                 position_ids=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
             )
-        hidden_states = self.final_layernorm(hidden_states)
-        return hidden_states
+        return self.final_layernorm(hidden_states)
 
 
 class PersimmonForCausalLM(nn.Module):
@@ -261,9 +282,9 @@ class PersimmonForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-
-        self.vocab_size = config.vocab_size
-        self.model = PersimmonModel(config=config, prefix=add_prefix("model", prefix))
+        self.model = PersimmonModel(
+            config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -288,26 +309,28 @@ class PersimmonForCausalLM(nn.Module):
             positions=positions,
             inputs_embeds=inputs_embeds,
         )
-        return hidden_states
+
+        # Correctly compute the final logits using the LogitsProcessor
+        # (This was also missing)
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        # Your existing load_weights function is correct and should remain here
         params_dict = dict(self.named_parameters())
-
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-
             if name not in params_dict:
+                if name == "lm_head.weight":
+                    continue
                 print(f"Warning: weight {name} not found in model.")
                 continue
-
             param = params_dict[name]
-
             if "query_key_value" in name:
-
                 output_dim = getattr(param, "output_dim", None)
                 if output_dim is not None:
-
                     loaded_weight_shape = loaded_weight.shape
                     num_heads = self.config.num_attention_heads
                     loaded_weight = loaded_weight.view(
@@ -315,7 +338,6 @@ class PersimmonForCausalLM(nn.Module):
                         + (num_heads, 3, -1)
                         + loaded_weight_shape[output_dim + 1 :]
                     )
-
                     loaded_weight = loaded_weight.transpose(output_dim, output_dim + 1)
                     loaded_weight = loaded_weight.reshape(loaded_weight_shape)
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
