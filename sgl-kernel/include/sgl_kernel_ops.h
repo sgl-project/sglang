@@ -388,8 +388,8 @@ void segment_packbits(
 /*
  * From csrc/hf3fs
  */
-void read_shm(const torch::Tensor& shm, std::vector<torch::Tensor> dst, int64_t page_bytes);
-void write_shm(const std::vector<torch::Tensor> src, torch::Tensor& shm, int64_t page_bytes);
+void read_shm(const torch::Tensor& shm, std::vector<torch::Tensor> dst);
+void write_shm(const std::vector<torch::Tensor> src, torch::Tensor& shm);
 
 /*
  * From csrc/kvcacheio

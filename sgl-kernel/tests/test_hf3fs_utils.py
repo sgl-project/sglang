@@ -3,6 +3,7 @@ import multiprocessing.shared_memory
 import pytest
 import torch
 from sgl_kernel.hf3fs_utils import read_shm, write_shm
+from tqdm import tqdm
 
 
 def test_rw_shm():
@@ -14,11 +15,17 @@ def test_rw_shm():
         size=page_num * page_bytes, create=True
     )
     tshm = torch.frombuffer(shm.buf, dtype=torch.uint8)
-    a = [torch.randn(numel, dtype=dtype) for _ in range(page_num)]
-    b = [torch.empty(numel, dtype=dtype) for _ in range(page_num)]
-    write_shm(a, tshm, page_bytes)
-    read_shm(tshm, b, page_bytes)
-    for _a, _b in zip(a, b):
+    a = [
+        torch.randn(numel, dtype=dtype)
+        for _ in tqdm(range(page_num), desc="prepare input")
+    ]
+    b = [
+        torch.empty(numel, dtype=dtype)
+        for _ in tqdm(range(page_num), desc="prepare output")
+    ]
+    write_shm(a, tshm)
+    read_shm(tshm, b)
+    for _a, _b in tqdm(zip(a, b), desc="assert_close"):
         torch.testing.assert_close(_a, _b)
 
     del tshm

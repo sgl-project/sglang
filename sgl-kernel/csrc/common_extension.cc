@@ -242,9 +242,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("segment_packbits", torch::kCUDA, &segment_packbits);
 
   // hf3fs_utils.cpp
-  m.def("read_shm(Tensor! shm, Tensor[] dst, int page_bytes) -> ()");
+  m.def("read_shm(Tensor! shm, Tensor[] dst) -> ()");
   m.impl("read_shm", torch::kCPU, &read_shm);
-  m.def("write_shm(Tensor[] src, Tensor! shm, int page_bytes) -> ()");
+  m.def("write_shm(Tensor[] src, Tensor! shm) -> ()");
   m.impl("write_shm", torch::kCPU, &write_shm);
 
   /*
