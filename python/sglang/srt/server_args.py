@@ -1730,6 +1730,10 @@ class ServerArgs:
                 else:
                     self.lora_paths[lora_path] = lora_path
 
+        model_arch = get_model_arch(self)
+        if "Llama4" in model_arch and self.hybrid_kvcache_ratio is not None:
+            assert self.attention_backend == "fa3"
+
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
