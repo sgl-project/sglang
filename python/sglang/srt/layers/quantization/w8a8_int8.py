@@ -383,7 +383,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config):
+    def __init__(self, quant_config: W8A8Int8Config):
         self.quant_config = quant_config
 
     def create_weights(

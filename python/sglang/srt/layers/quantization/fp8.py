@@ -1,7 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
 
 import logging
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -74,6 +74,9 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -498,7 +501,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config):
+    def __init__(self, quant_config: "Fp8Config"):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
         self.cutlass_fp8_supported = cutlass_fp8_supported()

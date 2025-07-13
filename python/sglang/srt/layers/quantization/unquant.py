@@ -127,8 +127,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self.use_triton_kernels = use_triton_kernels
 
         from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
+
         if torch.cuda.is_available():
             from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+
             if has_triton_kernels:
                 from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
                     triton_kernel_moe_forward,
