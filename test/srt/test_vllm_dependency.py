@@ -42,10 +42,6 @@ def popen_launch_server_wrapper(base_url, model, is_fp8, is_tp2):
         other_args.extend(["--tp", "2"])
     if "DeepSeek" in model:
         other_args.extend(["--mem-frac", "0.85"])
-    if "AWQ" in model:
-        other_args.extend(["--quantization", "awq"])
-    elif "GPTQ" in model:
-        other_args.extend(["--quantization", "gptq"])
 
     process = popen_launch_server(
         model,
