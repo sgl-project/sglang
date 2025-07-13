@@ -84,7 +84,7 @@ In general the TP rank number should match the total number of sub-numa clusters
 
     and set `--tp 3` in the `launch_server` command.
 
-3. An warmup step is automatically triggered when the service is started.
+3. A warmup step is automatically triggered when the service is started.
 When `The server is fired up and ready to roll!` is echoed,
 the server is ready to handle the incoming requests.
 
