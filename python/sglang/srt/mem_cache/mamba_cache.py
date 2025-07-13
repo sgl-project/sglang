@@ -59,8 +59,10 @@ class MambaCacheManager:
         """
         if "seqlen_agnostic_capture_inputs" not in kwargs:
             # We get here only on Prefill/Eager mode runs
-            request_ids_to_seq_ids = kwargs["request_ids_to_seq_ids"]
-            finished_requests_ids = kwargs["finished_requests_ids"]
+            request_ids_to_seq_ids = { 0 : [0]}
+            finished_requests_ids = []
+            # request_ids_to_seq_ids = kwargs["request_ids_to_seq_ids"]
+            # finished_requests_ids = kwargs["finished_requests_ids"]
 
             self._release_finished_requests(finished_requests_ids)
             state_indices = self._prepare_current_run_mamba_cache(

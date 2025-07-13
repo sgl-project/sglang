@@ -8,7 +8,7 @@ from typing import Optional
 import torch
 
 # from vllm import _custom_ops as ops
-from sgl_kernel import causal_conv1d_fwd, causal_conv1d_update
+from sgl_kernel import causal_conv1d_fwd, causal_conv1d_update as causal_conv1d_update_kernel
 PAD_SLOT_ID = -1
 
 
@@ -93,13 +93,13 @@ def causal_conv1d_update(x: torch.Tensor,
     out: (batch, dim) or (batch, dim, seqlen)
     """
     if activation not in [None, "silu", "swish"]:
-        raise NotImplementedError("activation must be None, silu, or swish")
+        raise NotImplementedError(f"activation must be None, silu, or swish, actual: {activation}")
     activation_val = activation in ["silu", "swish"]
     unsqueeze = x.dim() == 2
     if unsqueeze:
         x = x.unsqueeze(-1)
-    causal_conv1d_update(x, conv_state, weight, bias, activation_val,
-                             cache_seqlens, conv_state_indices, pad_slot_id)
+    causal_conv1d_update_kernel(x, conv_state, weight, bias, activation_val,
+                                cache_seqlens, conv_state_indices, pad_slot_id)
     if unsqueeze:
         x = x.squeeze(-1)
     return x

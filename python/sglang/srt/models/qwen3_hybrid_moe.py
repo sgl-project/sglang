@@ -245,7 +245,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         # TODO(cao1zhg):
         # has_initial_states, attn_metadata.query_start_loc
         has_prefill = forward_batch.forward_mode.is_prefill()
-        
+
         if has_prefill:
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "mamba_cache_params.state_indices_tensor"
@@ -314,7 +314,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                 initial_state=recurrent_state,
                 output_final_state=recurrent_state is not None,
                 cu_seqlens=forward_batch.extend_start_loc,
-                head_first=False,
+                # head_first=False,
                 use_qk_l2norm_in_kernel=True
             )
 
@@ -387,10 +387,11 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         sequence_idx: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        forward_batch = kwargs.get("forward_batch", None)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states = self.linear_attn(hidden_states, mamba_cache_params,
+        hidden_states = self.linear_attn(hidden_states, forward_batch, mamba_cache_params,
                                    sequence_idx)
         
         # Fully Connected
@@ -495,6 +496,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.position_embedding_type = getattr(config, "position_embedding_type", "none")
         self.hidden_size = config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = config.num_attention_heads
@@ -641,6 +643,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        **kwargs: Any,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -856,13 +859,19 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        # extend_start_loc shape is batch_size, while hybrid attention need batch_size + 1
+        if forward_batch.extend_start_loc is not None:
+            forward_batch.extend_start_loc = torch.cat([forward_batch.extend_start_loc,
+                                                            torch.tensor([input_ids.shape[0]], dtype=torch.int32,
+                                                                        device=input_ids.device)],
+                                                            dim=0)
         if self.mamba_cache is None:
             layers_block_type_value = self.config.layers_block_type
             if self.config.hybrid_linear_attention:
-                num_mamba_layers = sum(type_value == HybridLayerType.linear_attention for type_value in layers_block_type_value)
+                num_mamba_layers = sum(type_value == HybridLayerType.linear_attention.value for type_value in layers_block_type_value)
                 conv_state_shape, temporal_state_shape = self._get_linear_cache_shape()
             else:
-                num_mamba_layers = sum(type_value == HybridLayerType.mamba2 for type_value in layers_block_type_value)
+                num_mamba_layers = sum(type_value == HybridLayerType.mamba2.value for type_value in layers_block_type_value)
                 conv_state_shape, temporal_state_shape = self._get_mamba_cache_shape()
             self.mamba_cache = MambaCacheManager(
                 self.lm_head.weight.dtype, num_mamba_layers,
@@ -871,7 +880,8 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         mamba_cache_params = self.mamba_cache.current_run_tensors(**kwargs)
 
         hidden_states = self.model(input_ids, positions, forward_batch, mamba_cache_params, inputs_embeds)
-        return hidden_states
+        
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
