@@ -865,6 +865,10 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
                                                             torch.tensor([input_ids.shape[0]], dtype=torch.int32,
                                                                         device=input_ids.device)],
                                                             dim=0)
+        else:
+            forward_batch.extend_start_loc = torch.arange(
+                input_ids.shape[0] + 1, dtype=torch.int32, device=input_ids.device)
+
         if self.mamba_cache is None:
             layers_block_type_value = self.config.layers_block_type
             if self.config.hybrid_linear_attention:

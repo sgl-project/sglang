@@ -38,7 +38,7 @@ import threading
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -629,6 +629,9 @@ class Req:
             self.multimodal_inputs.merge(image_inputs)
 
     def finished(self) -> bool:
+        #(yizhang2077) hook mamba here
+        if self.finished_reason is not None:
+            global_scheduler_batch_dict["finished_requests_ids"].add(self.rid)
         # Whether request reached finished condition
         return self.finished_reason is not None
 
@@ -2015,3 +2018,9 @@ def get_last_loc_triton(
         BLOCK_SIZE,
     )
     return result
+
+# (yizhang2077) hook for mamba
+global_scheduler_batch_dict: Dict[str, Any] = {
+    "request_ids_to_seq_ids": {},  # Maps request IDs to sequence IDs
+    "finished_requests_ids": set(),
+}

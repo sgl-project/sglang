@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import torch
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.schedule_batch import global_server_args_dict, global_scheduler_batch_dict
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +59,8 @@ class MambaCacheManager:
         """
         if "seqlen_agnostic_capture_inputs" not in kwargs:
             # We get here only on Prefill/Eager mode runs
-            request_ids_to_seq_ids = { 0 : [0]}
-            finished_requests_ids = []
+            request_ids_to_seq_ids = global_scheduler_batch_dict["request_ids_to_seq_ids"]
+            finished_requests_ids = list(global_scheduler_batch_dict["finished_requests_ids"])
             # request_ids_to_seq_ids = kwargs["request_ids_to_seq_ids"]
             # finished_requests_ids = kwargs["finished_requests_ids"]
 
