@@ -87,7 +87,7 @@ drun -p 30000:30000 \
 drun v0.4.9.post2-rocm630 python3 -m sglang.bench_one_batch --batch-size 32 --input 1024 --output 128 --model amd/Meta-Llama-3.1-8B-Instruct-FP8-KV --tp 8 --quantization fp8
 ```
 
-Please refer to [the CPU installation guide](https://github.com/sgl-project/sglang/blob/main/docs/references/cpu.md#installation)
+Please refer to [the CPU installation guide](../references/cpu.md#installation)
 to set up the SGLang environment for running the models with CPU servers.
 
 ## Method 4: Using docker compose
