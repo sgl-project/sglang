@@ -667,7 +667,9 @@ class Gemma3ForCausalLM(PreTrainedModel):
             if positions.dim() == 1:
                 positions = einops.rearrange(positions, "s -> 1 s")
             position_embeddings_global = self.model.rotary_emb(hidden_states, positions)
-            position_embeddings_local = self.model.rotary_emb_local(hidden_states, positions)
+            position_embeddings_local = self.model.rotary_emb_local(
+                hidden_states, positions
+            )
 
             forward_batch.hidden_states = hidden_states
             forward_batch.model_specific_states = {
