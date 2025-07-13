@@ -76,7 +76,7 @@ In general the TP rank number should match the total number of sub-numa clusters
 
     If the desired TP rank number is not the same with total SNC number, an explicit setting of env variable
     `SGLANG_CPU_OMP_THREADS_BIND` is needed. For example, if we want to run TP3 on the 1st socket of the server
-    with 120cc x 2 sockets, which has totally 6 SNCs, we need to set
+    with 120c x 2 sockets, which has a total of 6 SNCs, we need to set
 
     ```bash
     export SGLANG_CPU_OMP_THREADS_BIND="0-39|40-79|80-119"
