@@ -4,6 +4,7 @@ from fractions import Fraction
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
+from sgl_kernel import fused_marlin_moe
 from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 from sglang.srt.layers.linear import LinearBase, LinearMethodBase, set_weight_attrs
@@ -814,6 +815,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        # Delay the import to avoid circular dependency
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         intermediate_size = extra_weight_attrs.pop("intermediate_size")
@@ -1047,9 +1049,13 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         e_score_correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
     ) -> torch.Tensor:
+        # Delay the import to avoid circular dependency
         from sglang.srt.layers.moe.topk import select_experts
 
         assert activation == "silu", "Only SiLU activation is supported."
+        assert (
+            scoring_func == "softmax"
+        ), "Only softmax score func is supported for now."
 
         # The input must currently be float16
         orig_dtype = x.dtype
@@ -1064,13 +1070,9 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
-            # scoring_func=scoring_func,
             correction_bias=e_score_correction_bias,
         )
 
-        from sgl_kernel import fused_marlin_moe
-
-        # return torch.ops.vllm.fused_marlin_moe(
         return fused_marlin_moe(
             x,
             layer.w13_qweight,
