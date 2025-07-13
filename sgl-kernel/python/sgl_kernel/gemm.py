@@ -82,6 +82,21 @@ def bmm_fp8(
     return out
 
 
+def dsv3_fused_a_gemm(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if output is None:
+        output = torch.empty(
+            (mat_a.shape[0], mat_b.shape[1]),
+            device=mat_a.device,
+            dtype=mat_a.dtype,
+        )
+    torch.ops.sgl_kernel.dsv3_fused_a_gemm.default(output, mat_a, mat_b)
+    return output
+
+
 def sgl_per_token_group_quant_fp8(
     input: torch.Tensor,
     output_q: torch.Tensor,
@@ -90,9 +105,10 @@ def sgl_per_token_group_quant_fp8(
     eps: float,
     fp8_min: float,
     fp8_max: float,
+    scale_ue8m0: bool,
 ) -> None:
     torch.ops.sgl_kernel.sgl_per_token_group_quant_fp8.default(
-        input, output_q, output_s, group_size, eps, fp8_min, fp8_max
+        input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
     )
 
 
@@ -241,6 +257,24 @@ def qserve_w4a8_per_group_gemm(
         in_feats, kernel, zeros, scales_i8, wscales, ascales, out_feats
     )
     return out_feats
+
+
+def dsv3_router_gemm(
+    hidden_states: torch.Tensor,
+    router_weights: torch.Tensor,
+) -> torch.Tensor:
+    output = torch.empty(
+        hidden_states.shape[0],
+        router_weights.shape[0],
+        device=hidden_states.device,
+        dtype=torch.float32,
+    )
+    torch.ops.sgl_kernel.dsv3_router_gemm(
+        output,
+        hidden_states,
+        router_weights,
+    )
+    return output
 
 
 def shuffle_rows(input_tensor, dst2src_map, output_tensor_shape):
