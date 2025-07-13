@@ -15,6 +15,7 @@ limitations under the License.
 
 import logging
 import math
+import os
 import threading
 from queue import Empty, Full, PriorityQueue, Queue
 from typing import TYPE_CHECKING, List, Optional
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
+from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import HiCacheHF3FS
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +248,20 @@ class HiCacheController:
         if storage_backend is not None:
             if storage_backend == "file":
                 self.storage_backend = HiCacheFile()
+                self.enable_storage = True
+                # tracking prefetch operation progress
+                self.ongoing_prefetch: dict[int, PrefetchOperation] = {}
+                # todo: threshold policy for prefetching
+                self.prefetch_threshold = prefetch_threshold
+            elif storage_backend == "hf3fs":
+                rank = os.getpid()
+                bytes_per_page = (
+                    mem_pool_host.get_size_per_token() * mem_pool_host.page_size
+                )
+                dtype = mem_pool_host.dtype
+                self.storage_backend = HiCacheHF3FS.from_env_config(
+                    rank, bytes_per_page, dtype
+                )
                 self.enable_storage = True
                 # tracking prefetch operation progress
                 self.ongoing_prefetch: dict[int, PrefetchOperation] = {}

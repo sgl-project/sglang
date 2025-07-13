@@ -1,4 +1,6 @@
+import json
 import logging
+import os
 import random
 import time
 from typing import List
@@ -30,20 +32,31 @@ def test():
     store_dtype = torch.bfloat16
     tokens_per_page = 64
 
-    file_path = "/data/test.bin"
+    file_path_prefix = "/data/test"
     file_size = 128 << 20
     numjobs = 16
     bytes_per_page = 16 << 20
     entries = 2
     dtype = store_dtype
-    hicache_hf3fs = HiCacheHF3FS(
-        file_path=file_path,
-        file_size=file_size,
-        numjobs=numjobs,
-        bytes_per_page=bytes_per_page,
-        entries=entries,
-        dtype=dtype,
-    )
+
+    config_path = os.getenv(HiCacheHF3FS.default_env_var)
+    assert config_path
+    try:
+        with open(config_path, "w") as f:
+            json.dump(
+                {
+                    "file_path_prefix": file_path_prefix,
+                    "file_size": file_size,
+                    "numjobs": numjobs,
+                    "entries": entries,
+                },
+                f,
+            )
+    except Exception as e:
+        raise RuntimeError(f"Failed to dump config to {config_path}: {str(e)}")
+
+    rank = os.getpid()
+    hicache_hf3fs = HiCacheHF3FS.from_env_config(rank, bytes_per_page, dtype)
 
     numel = 2 * tokens_per_page * layer_num * head_num * head_dim
     assert numel * dtype.itemsize == bytes_per_page
@@ -102,6 +115,7 @@ def test():
         assert torch.allclose(value, ok, atol=1e-3), f"Tensor mismatch for {key}"
 
     hicache_hf3fs.close()
+    os.remove(hicache_hf3fs.file_path)
 
     print("All test cases passed.")
 

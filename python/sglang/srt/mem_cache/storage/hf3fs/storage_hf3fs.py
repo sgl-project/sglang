@@ -1,5 +1,7 @@
 import concurrent.futures
+import json
 import logging
+import os
 import threading
 from collections import OrderedDict
 from functools import wraps
@@ -40,6 +42,8 @@ def synchronized():
 
 
 class HiCacheHF3FS(HiCacheStorage):
+    default_env_var: str = "SGLANG_HICACHE_HF3FS_CONFIG_PATH"
+
     def __init__(
         self,
         file_path: str,
@@ -61,6 +65,7 @@ class HiCacheHF3FS(HiCacheStorage):
         self.num_pages = self.file_size // self.bytes_per_page
 
         logger.info(
+            "HiCacheHF3FS "
             f"file_path = {self.file_path}, "
             f"file_size = {self.file_size/(2**30):.2f} GB, "
             f"numjobs = {self.numjobs}, "
@@ -86,6 +91,41 @@ class HiCacheHF3FS(HiCacheStorage):
         self.lock = threading.RLock()
         self.free_pages = list(range(self.num_pages))
         self.key_to_index = OrderedDict()
+
+    @staticmethod
+    def from_env_config(
+        rank: int, bytes_per_page: int, dtype: torch.dtype
+    ) -> "HiCacheHF3FS":
+        config_path = os.getenv(HiCacheHF3FS.default_env_var)
+        if not config_path:
+            raise ValueError(
+                f"Environment variable {HiCacheHF3FS.default_env_var} not set"
+            )
+
+        try:
+            with open(config_path, "r") as f:
+                config = json.load(f)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load config from {config_path}: {str(e)}")
+
+        required_keys = {
+            "file_path_prefix",
+            "file_size",
+            "numjobs",
+            "entries",
+        }
+        missing_keys = required_keys - set(config.keys())
+        if missing_keys:
+            raise ValueError(f"Missing required keys in config: {missing_keys}")
+
+        return HiCacheHF3FS(
+            file_path=f"{config['file_path_prefix']}.{rank}.bin",
+            file_size=int(config["file_size"]),
+            numjobs=int(config["numjobs"]),
+            bytes_per_page=bytes_per_page,
+            entries=int(config["entries"]),
+            dtype=dtype,
+        )
 
     def get(
         self, key: str, target_location: Optional[torch.Tensor] = None
