@@ -167,6 +167,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--lora-paths` | The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}. | None |
 | `--max-loras-per-batch` | Maximum number of adapters for a running batch, include base-only request. | 8 |
 | `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | triton |
+| `--max-lora-rank` | The maximum LoRA rank that should be supported. If not specified, it will be automatically inferred from the adapters provided in --lora-paths. | None |
+| `--lora-target-modules` | The list of target modules (e.g., `q_proj`, `k_proj`, `gate_proj`) where LoRA should be applied when available. If not specified, it will be automatically inferred from the adapters provided in --lora-paths. | None |
 
 ## Kernel backend
 
