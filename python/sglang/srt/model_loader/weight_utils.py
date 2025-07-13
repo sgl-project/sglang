@@ -37,8 +37,8 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.utils import print_warning_once
 
 if TYPE_CHECKING:
-    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.configs.load_config import LoadConfig
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.quantization import QuantizationConfig
 
 logger = logging.getLogger(__name__)
@@ -141,7 +141,7 @@ def get_quant_config(
 
     from sglang.srt.layers.quantization import get_quantization_config
     from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
-    
+
     quant_cls = get_quantization_config(model_config.quantization)
 
     # GGUF doesn't have config file

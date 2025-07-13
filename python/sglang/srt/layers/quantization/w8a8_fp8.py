@@ -5,10 +5,10 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
-    FusedMoEMethodBase,
 )
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,

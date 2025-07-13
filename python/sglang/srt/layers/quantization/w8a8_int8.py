@@ -866,6 +866,7 @@ class NPU_W8A8DynamicLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.linear import RowParallelLinear
+
         if isinstance(layer, RowParallelLinear):
             tp_rank = get_tensor_model_parallel_rank()
             return self.quant_method.apply(layer, x, bias, tp_rank)

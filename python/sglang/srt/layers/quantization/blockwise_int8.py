@@ -9,10 +9,10 @@ from torch.nn import Module
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.parameter import BlockQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
-    FusedMoEMethodBase,
 )
 from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod

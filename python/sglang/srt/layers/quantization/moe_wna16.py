@@ -9,9 +9,9 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
-    FusedMoEMethodBase,
 )
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod

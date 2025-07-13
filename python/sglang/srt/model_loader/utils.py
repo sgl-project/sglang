@@ -10,7 +10,6 @@ import transformers
 from torch import nn
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
@@ -28,9 +27,9 @@ def set_default_torch_dtype(dtype: torch.dtype):
 
 
 def resolve_transformers_arch(model_config: "ModelConfig", architectures: list[str]):
-    
+
     from sglang.srt.configs.model_config import ModelImpl
-    
+
     for i, arch in enumerate(architectures):
         if arch == "TransformersForCausalLM":
             continue

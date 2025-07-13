@@ -9,10 +9,10 @@ from torch.nn.parameter import Parameter
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
-    FusedMoEMethodBase,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,

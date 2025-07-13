@@ -126,7 +126,9 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def init_by_eplb(
-        server_args: ServerArgs, model_config: "ModelConfig", logical_count: torch.Tensor
+        server_args: ServerArgs,
+        model_config: "ModelConfig",
+        logical_count: torch.Tensor,
     ):
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)

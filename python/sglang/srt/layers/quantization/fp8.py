@@ -34,10 +34,10 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
-    FusedMoEMethodBase,
 )
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
@@ -1173,7 +1173,7 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         **extra_weight_attrs,
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-        
+
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.float8_e4m3fn
 
@@ -1396,7 +1396,6 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         custom_routing_function: Optional[Callable] = None,
     ) -> torch.Tensor:
         raise NotImplementedError
-
 
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):

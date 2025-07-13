@@ -1,6 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import importlib
+import logging
 from abc import abstractmethod
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
@@ -19,14 +20,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
-from sglang.srt.utils import (
-    cpu_has_amx_support,
-    get_bool_env_var,
-    is_cpu,
-    is_hip,
-)
-
-import logging
+from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var, is_cpu, is_hip
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()

@@ -4,23 +4,15 @@ from typing import Callable, List, Optional
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
-from sglang.srt.custom_op import CustomOp
 
-from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.quantization.base_config import (
-    LinearMethodBase,
-    QuantizeMethodBase,
-    FusedMoEMethodBase,
-)
+from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 from sglang.srt.layers.moe.topk import select_experts
-
-from sglang.srt.utils import (
-    cpu_has_amx_support,
-    is_cpu,
-    set_weight_attrs,
-    use_intel_amx_backend,
+from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
+    LinearMethodBase,
+    QuantizeMethodBase,
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -44,6 +36,7 @@ if _use_aiter:
     from aiter.fused_moe import fused_moe
     from aiter.fused_moe_bf16_asm import ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
+
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
@@ -136,12 +129,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         if torch.cuda.is_available():
             from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+
             self.fused_experts = fused_experts
-    
+
             if has_triton_kernels:
                 from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
                     triton_kernel_moe_forward,
                 )
+
                 self.triton_kernel_moe_forward = triton_kernel_moe_forward
         else:
             self.fused_experts = None  # type: ignore
@@ -219,7 +214,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
-        
+
         return self.forward(
             x=x,
             layer=layer,

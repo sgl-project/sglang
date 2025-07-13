@@ -11,9 +11,9 @@ from sglang.srt.model_loader.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.device_config import DeviceConfig
+    from sglang.srt.configs.load_config import LoadConfig
+    from sglang.srt.configs.model_config import ModelConfig
 
 
 def get_model(

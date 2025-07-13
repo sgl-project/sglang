@@ -35,12 +35,12 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8EPMoEMethod
-from sglang.srt.layers.quantization.unquant import UnquantizedEPMoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     sglang_per_token_group_quant_fp8,
     sglang_per_token_quant_fp8,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedEPMoEMethod
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch

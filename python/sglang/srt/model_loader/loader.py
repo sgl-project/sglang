@@ -14,7 +14,17 @@ import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Generator,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    cast,
+)
 
 import huggingface_hub
 import numpy as np
@@ -67,10 +77,10 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 _is_npu = is_npu()
 
