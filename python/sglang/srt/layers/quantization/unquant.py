@@ -7,7 +7,6 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -127,20 +126,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         super().__init__()
         self.use_triton_kernels = use_triton_kernels
 
+        from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
         if torch.cuda.is_available():
             from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-
-            self.fused_experts = fused_experts
-
             if has_triton_kernels:
                 from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
                     triton_kernel_moe_forward,
                 )
-
-                self.triton_kernel_moe_forward = triton_kernel_moe_forward
         else:
-            self.fused_experts = None  # type: ignore
-            self.triton_kernel_moe_forward = None
+            fused_experts = None  # type: ignore
+            triton_kernel_moe_forward = None
+
+        self.moe_forward_native = moe_forward_native
+        self.fused_experts = fused_experts
+        self.triton_kernel_moe_forward = triton_kernel_moe_forward
 
     def create_weights(
         self,
@@ -373,7 +372,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 True,  # is_vnni
             )
         else:
-            return moe_forward_native(
+            return self.moe_forward_native(
                 layer,
                 x,
                 use_grouped_topk,
@@ -411,7 +410,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
-        return moe_forward_native(
+        return self.moe_forward_native(
             layer,
             x,
             use_grouped_topk,
