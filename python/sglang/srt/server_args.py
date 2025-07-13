@@ -1129,7 +1129,7 @@ class ServerArgs:
             ],
             nargs="*",
             default=None,
-            help="The list of target modules to apply LoRA to when the corresponding weights are available in the adapter. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+            help="The union set of all target modules where LoRA should be applied. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
         )
         parser.add_argument(
             "--lora-paths",
