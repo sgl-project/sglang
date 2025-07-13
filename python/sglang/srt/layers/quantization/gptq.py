@@ -998,7 +998,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             layer.w13_g_idx_sort_indices,
             layer.w13_qweight.shape[1] * self.quant_config.pack_factor,
             layer.w13_qweight.shape[2],
-            4,
+            self.quant_config.weight_bits,
         )
         replace_parameter(layer, "w13_qweight", marlin_w13_qweight)
         marlin_w2_qweight = gptq_marlin_moe_repack(
@@ -1006,7 +1006,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             layer.w2_g_idx_sort_indices,
             layer.w2_qweight.shape[1] * self.quant_config.pack_factor,
             layer.w2_qweight.shape[2],
-            4,
+            self.quant_config.weight_bits,
         )
         replace_parameter(layer, "w2_qweight", marlin_w2_qweight)
         # Repack scales
@@ -1084,6 +1084,6 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             g_idx2=layer.w2_g_idx,
             sort_indices1=layer.w13_g_idx_sort_indices,
             sort_indices2=layer.w2_g_idx_sort_indices,
-            num_bits=4,
+            num_bits=self.quant_config.weight_bits,
             is_k_full=self.is_k_full,
         ).to(orig_dtype)
