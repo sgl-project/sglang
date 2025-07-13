@@ -92,6 +92,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "ep_num_redundant_experts",
     "enable_nan_detection",
     "flashinfer_mla_disable_ragged",
+    "flashinfer_use_cudnn",
     "max_micro_batch_size",
     "disable_shared_experts_fusion",
     "sampling_backend",
