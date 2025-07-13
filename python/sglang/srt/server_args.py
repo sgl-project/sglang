@@ -418,7 +418,7 @@ class ServerArgs:
         if self.enable_dp_lm_head:
             assert (
                 self.enable_dp_attention
-            ), "Please enable dp attention when setting enable_dp_attention. "
+            ), "Please enable dp attention when setting enable_dp_lm_head. "
 
         # DeepEP MoE
         if self.enable_deepep_moe:
@@ -1050,9 +1050,16 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=["qwen25", "mistral", "llama3", "deepseekv3", "pythonic"],
+            choices=[
+                "qwen25",
+                "mistral",
+                "llama3",
+                "deepseekv3",
+                "pythonic",
+                "kimi_k2",
+            ],
             default=ServerArgs.tool_call_parser,
-            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', and 'pythonic'.",
+            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', and 'kimi_k2'.",
         )
 
         # Data parallelism
@@ -1638,7 +1645,7 @@ class ServerArgs:
             "--disaggregation-transfer-backend",
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
-            choices=["mooncake", "nixl"],
+            choices=["mooncake", "nixl", "ascend"],
             help="The backend for disaggregation transfer. Default is mooncake.",
         )
         parser.add_argument(
@@ -1746,6 +1753,10 @@ class ServerArgs:
                     self.lora_paths[name] = path
                 else:
                     self.lora_paths[lora_path] = lora_path
+
+        model_arch = get_model_arch(self)
+        if "Llama4" in model_arch and self.hybrid_kvcache_ratio is not None:
+            assert self.attention_backend == "fa3"
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
