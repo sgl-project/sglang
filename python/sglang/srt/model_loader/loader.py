@@ -14,7 +14,7 @@ import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
 
 import huggingface_hub
 import numpy as np
@@ -26,9 +26,7 @@ from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.load_config import LoadFormat
 from sglang.srt.connector import (
     ConnectorType,
     create_remote_connector,
@@ -39,7 +37,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
@@ -68,6 +65,12 @@ from sglang.srt.utils import (
     is_pin_memory_available,
     set_weight_attrs,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.configs.device_config import DeviceConfig
+    from sglang.srt.configs.load_config import LoadConfig
+    from sglang.srt.configs.model_config import ModelConfig
 
 _is_npu = is_npu()
 
@@ -118,10 +121,10 @@ logger = logging.getLogger(__name__)
 
 
 def _get_quantization_config(
-    model_config: ModelConfig,
-    load_config: LoadConfig,
+    model_config: "ModelConfig",
+    load_config: "LoadConfig",
     packed_modules_mapping: Dict[str, List[str]],
-) -> Optional[QuantizationConfig]:
+) -> Optional["QuantizationConfig"]:
     """Get the quantization config."""
     if model_config.quantization is not None:
         quant_config = get_quant_config(
@@ -155,8 +158,8 @@ def _get_quantization_config(
 
 
 def _initialize_model(
-    model_config: ModelConfig,
-    load_config: LoadConfig,
+    model_config: "ModelConfig",
+    load_config: "LoadConfig",
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
@@ -180,11 +183,11 @@ def _initialize_model(
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
-    def __init__(self, load_config: LoadConfig):
+    def __init__(self, load_config: "LoadConfig"):
         self.load_config = load_config
 
     @abstractmethod
-    def download_model(self, model_config: ModelConfig) -> None:
+    def download_model(self, model_config: "ModelConfig") -> None:
         """Download a model so that it can be immediately loaded."""
         raise NotImplementedError
 
@@ -192,8 +195,8 @@ class BaseModelLoader(ABC):
     def load_model(
         self,
         *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
+        model_config: "ModelConfig",
+        device_config: "DeviceConfig",
     ) -> nn.Module:
         """Load a model with the given configurations."""
         raise NotImplementedError
@@ -222,7 +225,7 @@ class DefaultModelLoader(BaseModelLoader):
         """Whether .pt weights can be used."""
 
         @classmethod
-        def init_new(cls, model_config: ModelConfig, model):
+        def init_new(cls, model_config: "ModelConfig", model):
             return cls(
                 model_config.model_path,
                 model_config.revision,
@@ -230,7 +233,7 @@ class DefaultModelLoader(BaseModelLoader):
                 fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             )
 
-    def __init__(self, load_config: LoadConfig):
+    def __init__(self, load_config: "LoadConfig"):
         super().__init__(load_config)
         extra_config = load_config.model_loader_extra_config
         allowed_keys = {"enable_multithread_load", "num_threads"}
@@ -402,7 +405,7 @@ class DefaultModelLoader(BaseModelLoader):
 
     def _get_all_weights(
         self,
-        model_config: ModelConfig,
+        model_config: "ModelConfig",
         model: nn.Module,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
 
@@ -415,7 +418,7 @@ class DefaultModelLoader(BaseModelLoader):
         for source in secondary_weights:
             yield from self._get_weights_iterator(source)
 
-    def download_model(self, model_config: ModelConfig) -> None:
+    def download_model(self, model_config: "ModelConfig") -> None:
         self._prepare_weights(
             model_config.model_path, model_config.revision, fall_back_to_pt=True
         )
@@ -423,8 +426,8 @@ class DefaultModelLoader(BaseModelLoader):
     def load_model(
         self,
         *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
+        model_config: "ModelConfig",
+        device_config: "DeviceConfig",
     ) -> nn.Module:
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
@@ -460,7 +463,7 @@ class LayeredModelLoader(DefaultModelLoader):
     """Model loader that loads weights layer by layer so that one can quantize a
     layer before loading another to make the peak memory envelope smaller."""
 
-    def __init__(self, load_config: LoadConfig):
+    def __init__(self, load_config: "LoadConfig"):
         # Back to the default load format
         load_config.load_format = LoadFormat.AUTO
         super().__init__(load_config)
@@ -468,8 +471,8 @@ class LayeredModelLoader(DefaultModelLoader):
     def load_model(
         self,
         *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
+        model_config: "ModelConfig",
+        device_config: "DeviceConfig",
     ) -> nn.Module:
         from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
         from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -531,7 +534,7 @@ class LayeredModelLoader(DefaultModelLoader):
 class DummyModelLoader(BaseModelLoader):
     """Model loader that will set model weights to random values."""
 
-    def __init__(self, load_config: LoadConfig):
+    def __init__(self, load_config: "LoadConfig"):
         super().__init__(load_config)
         if load_config.model_loader_extra_config:
             raise ValueError(
@@ -539,14 +542,14 @@ class DummyModelLoader(BaseModelLoader):
                 f"load format {load_config.load_format}"
             )
 
-    def download_model(self, model_config: ModelConfig) -> None:
+    def download_model(self, model_config: "ModelConfig") -> None:
         pass  # Nothing to download
 
     def load_model(
         self,
         *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
+        model_config: "ModelConfig",
+        device_config: "DeviceConfig",
     ) -> nn.Module:
 
         if get_bool_env_var("SGL_CPU_QUANTIZATION"):
@@ -590,7 +593,7 @@ class ShardedStateLoader(BaseModelLoader):
 
     DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
 
-    def __init__(self, load_config: LoadConfig):
+    def __init__(self, load_config: "LoadConfig"):
         super().__init__(load_config)
         extra_config = (
             {}
@@ -654,14 +657,14 @@ class ShardedStateLoader(BaseModelLoader):
                 ignore_patterns=self.load_config.ignore_patterns,
             )
 
-    def download_model(self, model_config: ModelConfig) -> None:
+    def download_model(self, model_config: "ModelConfig") -> None:
         self._prepare_weights(model_config.model_path, model_config.revision)
 
     def load_model(
         self,
         *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
+        model_config: "ModelConfig",
+        device_config: "DeviceConfig",
     ) -> nn.Module:
         from safetensors.torch import safe_open
 
@@ -779,7 +782,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         ".out_proj.",
     ]
 
-    def __init__(self, load_config: LoadConfig):
+    def __init__(self, load_config: "LoadConfig"):
         super().__init__(load_config)
 
         # we don't need to quantize the whole model, only the target modules
@@ -1079,7 +1082,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
 
             yield weight_name, processed_weight
 
-    def _load_weights(self, model_config: ModelConfig, model: nn.Module) -> None:
+    def _load_weights(self, model_config: "ModelConfig", model: nn.Module) -> None:
         if not hasattr(model, "load_weights"):
             raise AttributeError(
                 "The required method 'load_weights' is not defined in class"
@@ -1211,14 +1214,14 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                         param, {"matmul_state": [None] * len(quant_states)}
                     )
 
-    def download_model(self, model_config: ModelConfig) -> None:
+    def download_model(self, model_config: "ModelConfig") -> None:
         self._prepare_weights(model_config.model_path, model_config.revision)
 
     def load_model(
         self,
         *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
+        model_config: "ModelConfig",
+        device_config: "DeviceConfig",
     ) -> nn.Module:
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
@@ -1239,7 +1242,7 @@ class GGUFModelLoader(BaseModelLoader):
     supports loading both full models and sharded models.
     """
 
-    def __init__(self, load_config: LoadConfig):
+    def __init__(self, load_config: "LoadConfig"):
         super().__init__(load_config)
         if load_config.model_loader_extra_config:
             raise ValueError(
@@ -1253,7 +1256,7 @@ class GGUFModelLoader(BaseModelLoader):
         else:
             raise ValueError(f"{model_name_or_path} is not a file.")
 
-    def _get_gguf_weights_map(self, model_config: ModelConfig):
+    def _get_gguf_weights_map(self, model_config: "ModelConfig"):
         """
         GGUF uses this naming convention for their tensors from HF checkpoint:
         `blk.N.BB.weight` and `blk.N.BB.bias`
@@ -1303,14 +1306,14 @@ class GGUFModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         return gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
 
-    def download_model(self, model_config: ModelConfig) -> None:
+    def download_model(self, model_config: "ModelConfig") -> None:
         self._prepare_weights(model_config.model_path)
 
     def load_model(
         self,
         *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
+        model_config: "ModelConfig",
+        device_config: "DeviceConfig",
     ) -> nn.Module:
 
         local_model_path = self._prepare_weights(model_config.model_path)
@@ -1340,7 +1343,7 @@ class GGUFModelLoader(BaseModelLoader):
 class RemoteModelLoader(BaseModelLoader):
     """Model loader that can load Tensors from remote database."""
 
-    def __init__(self, load_config: LoadConfig):
+    def __init__(self, load_config: "LoadConfig"):
         super().__init__(load_config)
         # TODO @DellCurry: move to s3 connector only
         set_runai_streamer_env(load_config)
@@ -1362,7 +1365,7 @@ class RemoteModelLoader(BaseModelLoader):
         assert get_connector_type(client) == ConnectorType.FS
         return client.weight_iterator()
 
-    def download_model(self, model_config: ModelConfig) -> None:
+    def download_model(self, model_config: "ModelConfig") -> None:
         pass
 
     @staticmethod
@@ -1425,7 +1428,7 @@ class RemoteModelLoader(BaseModelLoader):
             raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
     def _load_model_from_remote_fs(
-        self, model, client, model_config: ModelConfig, device_config: DeviceConfig
+        self, model, client, model_config: "ModelConfig", device_config: "DeviceConfig"
     ) -> nn.Module:
 
         target_device = torch.device(device_config.device)
@@ -1446,8 +1449,8 @@ class RemoteModelLoader(BaseModelLoader):
     def load_model(
         self,
         *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
+        model_config: "ModelConfig",
+        device_config: "DeviceConfig",
     ) -> nn.Module:
         logger.info("Loading weights from remote storage ...")
         start = time.perf_counter()
@@ -1487,8 +1490,8 @@ class RemoteModelLoader(BaseModelLoader):
 def load_model_with_cpu_quantization(
     self,
     *,
-    model_config: ModelConfig,
-    device_config: DeviceConfig,
+    model_config: "ModelConfig",
+    device_config: "DeviceConfig",
 ) -> nn.Module:
     target_device = torch.device(device_config.device)
     with set_default_torch_dtype(model_config.dtype):
@@ -1516,7 +1519,7 @@ def load_model_with_cpu_quantization(
     return model.eval()
 
 
-def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
+def get_model_loader(load_config: "LoadConfig") -> BaseModelLoader:
     """Get a model loader based on the load format."""
 
     if isinstance(load_config.load_format, type):

@@ -45,7 +45,6 @@ import triton
 import triton.language as tl
 
 from sglang.global_config import global_config
-from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -66,6 +65,7 @@ from sglang.srt.utils import flatten_nested_list, support_triton
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.configs.model_config import ModelConfig
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -815,7 +815,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     tree_cache: BasePrefixCache = None
 
     # Batch configs
-    model_config: ModelConfig = None
+    model_config: "ModelConfig" = None
     forward_mode: ForwardMode = None
     enable_overlap: bool = False
     # Tell whether the current running batch is full so that we can skip
@@ -910,7 +910,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tree_cache: BasePrefixCache,
-        model_config: ModelConfig,
+        model_config: "ModelConfig",
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         enable_custom_logit_processor: bool,

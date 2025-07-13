@@ -12,6 +12,7 @@ import queue
 import tempfile
 from collections import defaultdict
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -32,12 +33,13 @@ from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
-from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.utils import print_warning_once
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.configs.load_config import LoadConfig
+    from sglang.srt.layers.quantization import QuantizationConfig
 
 logger = logging.getLogger(__name__)
 
@@ -132,10 +134,14 @@ def convert_bin_to_safetensor_file(
 
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
-    model_config: ModelConfig,
-    load_config: LoadConfig,
+    model_config: "ModelConfig",
+    load_config: "LoadConfig",
     packed_modules_mapping: Dict[str, List[str]],
-) -> QuantizationConfig:
+) -> "QuantizationConfig":
+
+    from sglang.srt.layers.quantization import get_quantization_config
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+    
     quant_cls = get_quantization_config(model_config.quantization)
 
     # GGUF doesn't have config file
@@ -723,7 +729,7 @@ def runai_safetensors_weights_iterator(
             yield from streamer.get_tensors()
 
 
-def set_runai_streamer_env(load_config: LoadConfig):
+def set_runai_streamer_env(load_config: "LoadConfig"):
     if load_config.model_loader_extra_config:
         extra_config = load_config.model_loader_extra_config
 

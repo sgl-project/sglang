@@ -8,6 +8,7 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
+    FusedMoEMethodBase,
 )
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
@@ -183,7 +184,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         )
 
 
-class W8A8FP8MoEMethod:
+class W8A8FP8MoEMethod(FusedMoEMethodBase):
     """MoE method for FP8.
     Supports loading FP8 checkpoints with static weight scale and
     dynamic/static activation scale.
@@ -193,24 +194,6 @@ class W8A8FP8MoEMethod:
     Args:
         quant_config: The quantization config.
     """
-
-    def __new__(cls, *args, **kwargs):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
-
-        if not hasattr(cls, "_initialized"):
-            original_init = cls.__init__
-            new_cls = type(
-                cls.__name__,
-                (FusedMoEMethodBase,),
-                {
-                    "__init__": original_init,
-                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
-                },
-            )
-            obj = super(new_cls, new_cls).__new__(new_cls)
-            obj.__init__(*args, **kwargs)
-            return obj
-        return super().__new__(cls)
 
     def __init__(self, quant_config):
         self.quant_config = quant_config

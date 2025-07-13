@@ -3,14 +3,17 @@
 """Utilities for selecting and loading models."""
 import contextlib
 import logging
-from typing import Tuple, Type
+from typing import TYPE_CHECKING, Tuple, Type
 
 import torch
 import transformers
 from torch import nn
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +27,10 @@ def set_default_torch_dtype(dtype: torch.dtype):
     torch.set_default_dtype(old_dtype)
 
 
-def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str]):
+def resolve_transformers_arch(model_config: "ModelConfig", architectures: list[str]):
+    
+    from sglang.srt.configs.model_config import ModelImpl
+    
     for i, arch in enumerate(architectures):
         if arch == "TransformersForCausalLM":
             continue
@@ -79,7 +85,8 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
     return architectures
 
 
-def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], str]:
+def get_model_architecture(model_config: "ModelConfig") -> Tuple[Type[nn.Module], str]:
+    from sglang.srt.configs.model_config import ModelImpl
     from sglang.srt.models.registry import ModelRegistry
 
     architectures = getattr(model_config.hf_config, "architectures", [])
@@ -103,5 +110,5 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     return ModelRegistry.resolve_model_cls(architectures)
 
 
-def get_architecture_class_name(model_config: ModelConfig) -> str:
+def get_architecture_class_name(model_config: "ModelConfig") -> str:
     return get_model_architecture(model_config)[1]

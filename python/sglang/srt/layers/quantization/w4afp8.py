@@ -6,7 +6,7 @@ from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.quantization.base_config import (
-    LinearMethodBase,
+    FusedMoEMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -96,7 +96,7 @@ class W4AFp8Config(QuantizationConfig):
         return []
 
 
-class W4AFp8MoEMethod:
+class W4AFp8MoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config

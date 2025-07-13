@@ -16,16 +16,18 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.distributed
 import torch.nn.functional as F
 
-from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.eplb import eplb_algorithms
 from sglang.srt.model_loader import get_model_architecture
 from sglang.srt.server_args import ServerArgs
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +81,7 @@ class ExpertLocationMetadata:
     # -------------------------------- construction ------------------------------------
 
     @staticmethod
-    def init_trivial(server_args: ServerArgs, model_config: ModelConfig):
+    def init_trivial(server_args: ServerArgs, model_config: "ModelConfig"):
         """Trivial location - logical expert i corresponds to physical expert i"""
         common = ExpertLocationMetadata._init_common(server_args, model_config)
         num_physical_experts = common["num_physical_experts"]
@@ -101,7 +103,7 @@ class ExpertLocationMetadata:
     @staticmethod
     def init_by_mapping(
         server_args: ServerArgs,
-        model_config: ModelConfig,
+        model_config: "ModelConfig",
         physical_to_logical_map,
     ):
         if not isinstance(physical_to_logical_map, torch.Tensor):
@@ -124,7 +126,7 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def init_by_eplb(
-        server_args: ServerArgs, model_config: ModelConfig, logical_count: torch.Tensor
+        server_args: ServerArgs, model_config: "ModelConfig", logical_count: torch.Tensor
     ):
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)
@@ -163,7 +165,7 @@ class ExpertLocationMetadata:
         )
 
     @staticmethod
-    def _init_common(server_args: ServerArgs, model_config: ModelConfig):
+    def _init_common(server_args: ServerArgs, model_config: "ModelConfig"):
         model_config_for_expert_location = (
             ModelConfigForExpertLocation.from_model_config(model_config)
         )
@@ -403,7 +405,7 @@ class ModelConfigForExpertLocation:
         return ModelConfigForExpertLocation(num_layers=1, num_logical_experts=1)
 
     @staticmethod
-    def from_model_config(model_config: ModelConfig):
+    def from_model_config(model_config: "ModelConfig"):
         model_class, _ = get_model_architecture(model_config)
         if hasattr(model_class, "get_model_config_for_expert_location"):
             return model_class.get_model_config_for_expert_location(
@@ -414,7 +416,7 @@ class ModelConfigForExpertLocation:
 
 
 def compute_initial_expert_location_metadata(
-    server_args: ServerArgs, model_config: ModelConfig
+    server_args: ServerArgs, model_config: "ModelConfig"
 ) -> ExpertLocationMetadata:
     data = server_args.init_expert_location
     if data == "trivial":

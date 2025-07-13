@@ -12,6 +12,7 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
+    FusedMoEMethodBase,
 )
 from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -228,7 +229,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
         )
 
 
-class BlockInt8MoEMethod:
+class BlockInt8MoEMethod(FusedMoEMethodBase):
     """MoE method for INT8.
     Supports loading INT8 checkpoints with static weight scale and
     dynamic activation scale.
@@ -239,24 +240,6 @@ class BlockInt8MoEMethod:
     Args:
         quant_config: The quantization config.
     """
-
-    def __new__(cls, *args, **kwargs):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
-
-        if not hasattr(cls, "_initialized"):
-            original_init = cls.__init__
-            new_cls = type(
-                cls.__name__,
-                (FusedMoEMethodBase,),
-                {
-                    "__init__": original_init,
-                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
-                },
-            )
-            obj = super(new_cls, new_cls).__new__(new_cls)
-            obj.__init__(*args, **kwargs)
-            return obj
-        return super().__new__(cls)
 
     def __init__(self, quant_config):
         self.quant_config = quant_config
