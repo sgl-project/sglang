@@ -445,6 +445,7 @@ class NixlKVReceiver(CommonKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
+        prefix_cache_len: Optional[int] = None,
     ):
         self.started_transfer = False
         self.conclude_state = None

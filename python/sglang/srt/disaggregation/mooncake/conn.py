@@ -937,7 +937,7 @@ class MooncakeKVSender(BaseKVSender):
         ].prefix_cache_len
         if decode_prefix_cache_len >= self.curr_idx + len(kv_indices):
             if decode_prefix_cache_len == self.num_kv_indices:
-                kv_indices = npt.empty(0, dtype=np.int32)
+                kv_indices = np.empty(0, dtype=np.int32)
                 self.curr_idx = decode_prefix_cache_len
             else:
                 self.curr_idx += len(kv_indices)
@@ -1022,7 +1022,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
-        prefix_cache_len: Optional[int] = 0,
+        prefix_cache_len: Optional[int] = None,
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
@@ -1032,7 +1032,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.conclude_state = None
         self.init_time = None
         self.data_parallel_rank = data_parallel_rank
-        self.prefix_cache_len = prefix_cache_len
+        self.prefix_cache_len = 0 if prefix_cache_len is None else prefix_cache_len
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
             self.prefill_tp_size, self.prefill_dp_size = (

@@ -237,7 +237,7 @@ class DecodePreallocQueue:
                     self.transfer_backend, KVClassType.RECEIVER
                 )
 
-            if req.prefix_indices.numel() == 0:
+            if len(req.prefix_indices) == 0:
                 prefix_ids = req.adjust_max_prefix_ids()
                 req.prefix_indices, _, _, _ = self.tree_cache.match_prefix(
                     rid=req.rid, key=prefix_ids
