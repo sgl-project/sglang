@@ -2,7 +2,7 @@
 
 The document addresses how to set up the [SGLang](https://github.com/sgl-project/sglang) environment and run LLM inference on CPU servers.
 Specifically, the model service is well optimized on the CPUs equipped with Intel® AMX® Instructions,
-which are the 4th or newer Gen of Intel® Xeon® Scalable Processors.
+which are 4th generation or newer Intel® Xeon® Scalable Processors.
 
 ## Optimized Model List
 
