@@ -21,7 +21,7 @@ def test_dsv3_router_gemm(num_tokens):
 
     ref = F.linear(mat_a, mat_b).to(torch.float32)
 
-    output = dsv3_router_gemm(mat_a, mat_b)
+    output = dsv3_router_gemm(mat_a, mat_b, out_dtype=torch.float32)
 
     assert torch.allclose(
         output, ref, rtol=1e-2, atol=1e-3
