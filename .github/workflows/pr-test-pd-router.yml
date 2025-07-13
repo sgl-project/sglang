@@ -290,9 +290,26 @@ jobs:
 
           # Stop router before testing next policy
           echo "Stopping router for $policy..."
+          # First try graceful shutdown
           kill $ROUTER_PID 2>/dev/null || true
-          wait $ROUTER_PID 2>/dev/null || true
-          sleep 5
+
+          # Wait up to 5 seconds for graceful shutdown
+          for i in {1..5}; do
+            if ! ps -p $ROUTER_PID > /dev/null 2>&1; then
+              echo "Router stopped gracefully"
+              break
+            fi
+            sleep 1
+          done
+
+          # Force kill if still running
+          if ps -p $ROUTER_PID > /dev/null 2>&1; then
+            echo "Force killing router..."
+            kill -9 $ROUTER_PID 2>/dev/null || true
+          fi
+
+          # Short delay to ensure port is released
+          sleep 2
 
           echo "✓ Completed testing for $policy"
         done
