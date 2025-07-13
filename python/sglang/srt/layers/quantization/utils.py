@@ -212,11 +212,11 @@ def get_linear_quant_method(
     linear_method_cls: type,
 ):
     from sglang.srt.layers.linear import LinearBase
-    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-    from sglang.srt.layers.vocab_parallel_embedding import (
-        ParallelLMHead,
+    from sglang.srt.layers.quantization.unquant import (
         UnquantizedEmbeddingMethod,
+        UnquantizedLinearMethod,
     )
+    from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
     cloned_config = deepcopy(config)
     parallel_lm_head_quantized = (
