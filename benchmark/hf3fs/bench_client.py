@@ -25,7 +25,7 @@ def print_stats(x: List[int]):
 
 def test():
     # /path/to/hf3fs
-    file_path = "/data/test.bin"
+    file_path = "/data/bench.bin"
     file_size = 1 << 40
     bytes_per_page = 16 << 20
     entries = 32
@@ -64,7 +64,7 @@ def test():
 
 
 def bench():
-    file_path = "/data/test.bin"
+    file_path = "/data/bench.bin"
     file_size = 1 << 40
     bytes_per_page = 16 << 20
     entries = 8
@@ -149,7 +149,7 @@ def bench():
     executor.shutdown(wait=True)
     for _file_ops in file_ops:
         _file_ops.close()
-    print("bench() done")
+    print("bench done")
 
 
 def main():
