@@ -12,12 +12,12 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
-
 import math
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
@@ -30,7 +30,10 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import (
+    Phi3LongRoPEScaledRotaryEmbedding,
+    get_rope,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -90,6 +93,7 @@ class MiniCPMAttention(nn.Module):
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        **kwargs,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -139,7 +143,8 @@ class MiniCPMAttention(nn.Module):
             rope_scaling=rope_scaling,
         )
         # set rope as fp32 instead of bf16
-        self.rotary_emb.cos_sin_cache = self.rotary_emb._compute_cos_sin_cache()
+        if not isinstance(self.rotary_emb, Phi3LongRoPEScaledRotaryEmbedding):
+            self.rotary_emb.cos_sin_cache = self.rotary_emb._compute_cos_sin_cache()
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -155,6 +160,7 @@ class MiniCPMAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        **kwargs,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -165,6 +171,11 @@ class MiniCPMAttention(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
+
+
+MINICPM_ATTENTION_CLASSES = {
+    "eager": MiniCPMAttention,
+}
 
 
 class MiniCPMDecoderLayer(nn.Module):
@@ -181,7 +192,7 @@ class MiniCPMDecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.self_attn = MiniCPMAttention(
+        self.self_attn = MINICPM_ATTENTION_CLASSES[config._attn_implementation](
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -191,6 +202,7 @@ class MiniCPMDecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
+            config=config,
         )
         self.mlp = MiniCPMMLP(
             hidden_size=self.hidden_size,
@@ -222,7 +234,8 @@ class MiniCPMDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states * (
             self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
         )
-
+        if hidden_states.dim() == 3:
+            hidden_states = hidden_states.squeeze(0)
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
