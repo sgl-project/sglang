@@ -3,14 +3,13 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.linear import LinearMethodBase
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
     ModelWeightParameter,
 )
 from sglang.srt.layers.quantization.base_config import (
+    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )

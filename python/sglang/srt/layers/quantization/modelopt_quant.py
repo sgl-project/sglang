@@ -6,14 +6,10 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.linear import (
-    LinearBase,
-    LinearMethodBase,
-    UnquantizedLinearMethod,
-)
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
+    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -23,6 +19,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     is_sm100_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
     is_layer_skipped,
@@ -110,6 +107,10 @@ class ModelOptFp8Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
+
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
         if self.exclude_modules and any(
             module in prefix
             or (
@@ -124,9 +125,6 @@ class ModelOptFp8Config(QuantizationConfig):
             return ModelOptFp8LinearMethod(self)
         if self.kv_cache_quant_method and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
-
-        # Add MoE support
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
             return ModelOptFp8MoEMethod(self)
@@ -560,6 +558,7 @@ class ModelOptFp4Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):

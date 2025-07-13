@@ -18,12 +18,8 @@ from compressed_tensors.quantization import (
 )
 from pydantic import BaseModel
 
-from sglang.srt.layers.linear import (
-    LinearBase,
-    LinearMethodBase,
-    UnquantizedLinearMethod,
-)
 from sglang.srt.layers.quantization.base_config import (
+    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -40,6 +36,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     is_activation_quantization_format,
     should_ignore_layer,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
 try:
     import vllm
@@ -118,6 +115,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
+        from sglang.srt.layers.linear import LinearBase
 
         # Check if the layer is skipped for quantization.
         # TODO (@robertgshaw2): support module names

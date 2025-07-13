@@ -4,12 +4,14 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 
-from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.utils import replace_parameter
+from sglang.srt.layers.quantization.utils import (
+    get_linear_quant_method,
+    replace_parameter,
+)
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -152,9 +154,6 @@ class GPTQConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[GPTQLinearMethod]:
-        # Delay the import to avoid circular dependency
-        from sglang.srt.layers.quantization import get_linear_quant_method
-
         return get_linear_quant_method(self, layer, prefix, GPTQLinearMethod)
 
 
@@ -309,7 +308,6 @@ class GPTQMarlinConfig(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         # Delay the import to avoid circular dependency
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        from sglang.srt.layers.quantization import get_linear_quant_method
 
         if isinstance(layer, FusedMoE):
             return GPTQMarlinMoEMethod(self)
@@ -443,6 +441,7 @@ class MarlinConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[MarlinLinearMethod]:
         # Delay the import to avoid circular dependency
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         if isinstance(layer, LinearBase) or (
@@ -467,6 +466,8 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.linear import set_weight_attrs
+
         intermediate_size = extra_weight_attrs.pop("intermediate_size")
 
         self.is_k_full = (not self.quant_config.desc_act) or (
