@@ -135,6 +135,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
                     triton_kernel_moe_forward,
                 )
+            else:
+                triton_kernel_moe_forward = None
         else:
             fused_experts = None  # type: ignore
             triton_kernel_moe_forward = None
