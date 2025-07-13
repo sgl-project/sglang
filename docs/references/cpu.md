@@ -71,7 +71,7 @@ Notes:
 1. For running W8A8 quantized models, please add the flag `--quantization w8a8_int8`.
 
 2. The flag `--tp 6` indicates that we will apply tensor parallel with 6 ranks (TP6).
-In general the TP rank number should be in line with the total number of sub-numa clusters (SNCs) on the server
+In general the TP rank number should match the total number of sub-numa clusters (SNCs) on the server
 (e.g. TP6 should be applied on a server having 2 sockets with SNC3 configuration).
 
     If the desired TP rank number is not the same with total SNC number, an explicit setting of env variable
