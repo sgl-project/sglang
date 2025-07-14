@@ -439,7 +439,15 @@ class DecodePreallocQueue:
             else 0
         )
 
-        allocatable_tokens = self.token_to_kv_pool_allocator.available_size() - max(
+        if self.scheduler.model_config.is_hybrid:
+            available_size = min(
+                self.token_to_kv_pool_allocator.full_available_size(),
+                self.token_to_kv_pool_allocator.swa_available_size(),
+            )
+        else:
+            available_size = self.token_to_kv_pool_allocator.available_size()
+
+        allocatable_tokens = available_size - max(
             # preserve some space for future decode
             self.num_reserved_decode_tokens
             * (
