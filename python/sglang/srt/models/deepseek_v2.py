@@ -246,7 +246,7 @@ class MoEGate(nn.Module):
             and not self.is_nextn
             and hidden_states.shape[0] < 4
             and hidden_states.shape[1] == 7168
-            and self.weight.shape[0] == 256
+            and self.weight.shape[0] in [256, 384]
             and _device_sm >= 90
         ):
             logits = dsv3_router_gemm(hidden_states, self.weight).to(
@@ -2111,7 +2111,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             not _is_cuda
             or torch.cuda.get_device_capability("cuda") < (8, 0)
             or self.config.architectures[0] != architecture
-            or self.config.n_routed_experts != 256
+            or self.config.n_routed_experts not in [256, 384]
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
