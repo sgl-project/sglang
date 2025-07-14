@@ -189,9 +189,11 @@ async def health_check():
         # Create the tasks
         tasks = []
         for server in chain(prefill_servers, decode_servers):
-            tasks.append(session.post(f"{server}/health_generate"))
-        for i, response in enumerate(asyncio.as_completed(tasks)):
-            await response
+            tasks.append(session.get(f"{server}/health_generate"))
+        for task in asyncio.as_completed(tasks):
+            response = await task
+            if response.status != 200:
+                raise HTTPException(status_code=response.status)
     return Response(status_code=200)
 
 
