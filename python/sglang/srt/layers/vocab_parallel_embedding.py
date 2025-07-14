@@ -569,8 +569,6 @@ class ParallelLMHead(VocabParallelEmbedding):
         if _is_cpu and _is_cpu_amx_available:
             if hasattr(self, "weight") and self.weight.dtype == torch.bfloat16:
                 self.quant_method = PackWeightMethod(weight_names=["weight"])
-        else:
-            logger.warning("The weight of LmHead is not packed")
 
         if bias:
             self.bias = Parameter(
