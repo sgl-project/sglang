@@ -969,6 +969,20 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
+        name="glm4v",
+        system_template="<|im_start|>system\n{system_message}",
+        system_message="You are a helpful assistant.",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<|im_end|>"],
+        image_token="<|begin_of_image|><|image|><|end_of_image|>",
+        video_token="<|begin_of_video|><|video|><|end_of_video|>",
+    )
+)
+
+register_conv_template(
+    Conversation(
         name="llama_4_vision",
         system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
         system_template="<|header_start|>system<|header_end|>\n\n{system_message}<|eot|>",
@@ -985,6 +999,12 @@ register_conv_template(
 def match_internvl(model_path: str):
     if re.search(r"internvl2_5", model_path, re.IGNORECASE):
         return "internvl-2-5"
+
+
+@register_conv_template_matching_function
+def match_glm4v(model_path: str):
+    if re.search(r"glm-4.*v", model_path, re.IGNORECASE):
+        return "glm4v"
 
 
 @register_conv_template_matching_function
