@@ -702,7 +702,7 @@ class NPUGraphRunner:
         # Replay
         seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (self.bs - self.raw_bs)
         self.graphs[self.bs].update(
-            cpu_update_input=[{"actual_seq_lenghts_kv": seq_lens}]
+            cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
         )
         self.graphs[self.bs].replay()
 
