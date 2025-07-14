@@ -270,15 +270,10 @@ class VILAForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight)
 
     def pad_input_ids(
-        self,
-        input_ids: List[int],
-        image_inputs: MultimodalInputs,
+        self, input_ids: List[int], mm_inputs: MultimodalInputs
     ) -> List[int]:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens(
-            token_ids=[self.config.image_token_id],
-        )
-
-        return pattern.pad_input_tokens(input_ids, image_inputs)
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     ##### BEGIN COPY modeling_vila.py #####
 

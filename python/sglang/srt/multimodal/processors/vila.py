@@ -37,6 +37,8 @@ class VILAMultimodalProcessor(BaseMultimodalProcessor):
         _processor: VILAProcessor,
     ) -> None:
         super().__init__(hf_config, server_args, _processor)
+        self.IM_TOKEN_ID = hf_config.image_token_id
+        self.VIDEO_TOKEN_ID = hf_config.video_token_id
 
     async def process_mm_data_async(
         self,
@@ -46,13 +48,7 @@ class VILAMultimodalProcessor(BaseMultimodalProcessor):
         max_req_input_len: int,
         **kwargs,
     ) -> Optional[Dict[str, Any]]:
-        if not image_data:
-            return None
-
-        if not isinstance(image_data, list):
-            image_data = [image_data]
-
-        mm_data = self.load_mm_data(
+        base_output = self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=MultimodalSpecialTokens(
                 image_token=self._processor.tokenizer.image_token
@@ -61,25 +57,11 @@ class VILAMultimodalProcessor(BaseMultimodalProcessor):
             image_data=image_data,
         )
 
-        inputs = self.process_mm_data(
-            input_text=mm_data.input_text,
-            images=mm_data.images,
-        )
+        mm_items, input_ids = self.process_and_combine_mm_data(base_output)
 
-        image_offsets = self.get_mm_items_offset(
-            input_ids=inputs.input_ids[0],
-            mm_token_id=cast(int, self._processor.tokenizer.image_token_id),
-        )
-
-        mm_items: List[MultimodalDataItem] = [
-            MultimodalDataItem(
-                modality=Modality.IMAGE,
-                image_offsets=image_offsets,
-                pixel_values=inputs.pixel_values,
-            )
-        ]
-
-        return dict(
-            input_ids=inputs.input_ids[0].tolist(),
-            mm_items=mm_items,
-        )
+        return {
+            "input_ids": input_ids.tolist(),
+            "mm_items": mm_items,
+            "im_token_id": self.IM_TOKEN_ID,
+            "video_token_id": self.VIDEO_TOKEN_ID,
+        }

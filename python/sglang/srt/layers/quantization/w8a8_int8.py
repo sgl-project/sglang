@@ -4,6 +4,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.linear import LinearMethodBase
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -12,11 +13,11 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.utils import (
-    _process_weight_after_loading,
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
     set_weight_attrs,
+    use_intel_amx_backend,
 )
 
 _is_cuda = is_cuda()
@@ -84,7 +85,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             assert (
                 _is_cpu_amx_available
             ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
-            _process_weight_after_loading(layer, ["weight"])
+            _amx_process_weight_after_loading(layer, ["weight"])
             return
 
         layer.weight = Parameter(layer.weight.t(), requires_grad=False)
@@ -127,7 +128,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
-        if getattr(layer, "use_intel_amx_backend", False):
+        if use_intel_amx_backend(layer):
             return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
                 x,
                 layer.weight,
@@ -235,7 +236,7 @@ class W8A8Int8MoEMethod:
             assert (
                 _is_cpu_amx_available
             ), "W8A8Int8MoEMethod on CPU requires that CPU has AMX support"
-            _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             return
 
         layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
@@ -284,7 +285,7 @@ class W8A8Int8MoEMethod:
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        if getattr(layer, "use_intel_amx_backend", False):
+        if use_intel_amx_backend(layer):
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,

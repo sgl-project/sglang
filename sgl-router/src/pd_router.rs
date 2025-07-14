@@ -920,20 +920,14 @@ impl PDRouter {
     }
 
     pub async fn get_server_info(&self, client: &reqwest::Client) -> HttpResponse {
-        // Get info from all decode servers (where generation happens)
-        let mut all_internal_states = Vec::new();
-        let mut decode_infos = Vec::new();
+        // Get info from the first decode server to match sglang's server info format
+        let first_decode_url = if let Ok(workers) = self.decode_workers.read() {
+            workers.first().map(|w| w.url.clone())
+        } else {
+            return HttpResponse::InternalServerError().body("Failed to access decode workers");
+        };
 
-        // Clone URLs to avoid holding lock across await
-        let worker_urls: Vec<String> = self
-            .decode_workers
-            .read()
-            .unwrap()
-            .iter()
-            .map(|w| w.url.clone())
-            .collect();
-
-        for worker_url in worker_urls {
+        if let Some(worker_url) = first_decode_url {
             match client
                 .get(format!("{}/get_server_info", worker_url))
                 .send()
@@ -942,38 +936,31 @@ impl PDRouter {
                 Ok(res) if res.status().is_success() => {
                     match res.json::<Value>().await {
                         Ok(info) => {
-                            // Extract internal_states from each decode server
-                            if let Some(states) = info.get("internal_states") {
-                                if let Some(states_array) = states.as_array() {
-                                    all_internal_states.extend(states_array.clone());
-                                }
-                            }
-                            decode_infos.push(info);
+                            // The decode server should already return the proper format
+                            // with tokenizer_path and other fields that bench_one_batch_server.py expects
+                            HttpResponse::Ok().json(info)
                         }
-                        Err(e) => error!("Failed to parse server info: {}", e),
+                        Err(e) => {
+                            error!("Failed to parse server info: {}", e);
+                            HttpResponse::InternalServerError()
+                                .body(format!("Failed to parse server info: {}", e))
+                        }
                     }
                 }
-                _ => {}
+                Ok(res) => {
+                    let status = actix_web::http::StatusCode::from_u16(res.status().as_u16())
+                        .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+                    HttpResponse::build(status)
+                        .body(format!("Decode server returned status: {}", res.status()))
+                }
+                Err(e) => {
+                    error!("Failed to get server info: {}", e);
+                    HttpResponse::InternalServerError()
+                        .body(format!("Failed to get server info: {}", e))
+                }
             }
-        }
-
-        // If we have internal states, return in the format expected by bench_one_batch_server.py
-        if !all_internal_states.is_empty() {
-            // Use the first decode server's internal state (they should all be similar)
-            HttpResponse::Ok().json(serde_json::json!({
-                "internal_states": all_internal_states,
-                // Include original format for compatibility
-                "decode_servers": decode_infos,
-            }))
         } else {
-            // Fallback: create a dummy internal_states entry
-            HttpResponse::Ok().json(serde_json::json!({
-                "internal_states": [{
-                    "last_gen_throughput": 0.0,
-                    "avg_spec_accept_length": null,
-                }],
-                "decode_servers": decode_infos,
-            }))
+            HttpResponse::ServiceUnavailable().body("No decode servers available")
         }
     }
 

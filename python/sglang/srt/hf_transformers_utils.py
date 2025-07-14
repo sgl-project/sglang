@@ -42,7 +42,7 @@ from sglang.srt.configs import (
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
-from sglang.srt.utils import is_remote_url
+from sglang.srt.utils import is_remote_url, lru_cache_frozenset
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ChatGLMConfig.model_type: ChatGLMConfig,
@@ -103,6 +103,7 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
+@lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
     trust_remote_code: bool,

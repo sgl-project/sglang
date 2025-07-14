@@ -52,6 +52,10 @@ pub struct CompletionRequest {
     #[serde(default)]
     pub stream: bool,
 
+    /// Options for streaming response
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+
     /// Include the log probabilities on the logprobs most likely tokens
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<u32>,
@@ -131,6 +135,10 @@ pub struct ChatCompletionRequest {
     /// If set, partial message deltas will be sent
     #[serde(default)]
     pub stream: bool,
+
+    /// Options for streaming response
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
 
     /// Up to 4 sequences where the API will stop generating further tokens
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -256,6 +264,12 @@ pub struct ImageUrl {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>, // "auto", "low", or "high"
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StreamOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_usage: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
