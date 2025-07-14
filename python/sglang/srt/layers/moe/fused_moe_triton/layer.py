@@ -526,7 +526,7 @@ class FusedMoE(torch.nn.Module):
             "CompressedTensorsWNA16MoEMethod",
         ):
             moe_quant_params["intermediate_size_full"] = intermediate_size
-        
+
         self.quant_config = quant_config
         self.quant_method.create_weights(
             layer=self,
