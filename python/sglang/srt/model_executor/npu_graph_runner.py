@@ -62,6 +62,7 @@ torch.cuda.CUDAGraph = torch.npu.NPUGraph
 torch.cuda.synchronize = torch.npu.synchronize
 torch.cuda.graph = torch.npu.graph
 torch.cuda.stream = torch.npu.stream
+torch.cuda.Stream = torch.npu.Stream
 torch.cuda.current_stream = torch.npu.current_stream
 
 
