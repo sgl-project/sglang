@@ -132,13 +132,9 @@ class MooncakeKVManager(BaseKVManager):
     ):
         self.kv_args = args
         self.local_ip = get_local_ip_auto()
-        self.engine = MooncakeTransferEngine(
-            hostname=self.local_ip,
-            gpu_id=self.kv_args.gpu_id,
-            ib_device=self.kv_args.ib_device,
-        )
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
+        self.init_engine()
         # for p/d multi node infer
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
@@ -225,6 +221,13 @@ class MooncakeKVManager(BaseKVManager):
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
+    def init_engine(self):
+        self.engine = MooncakeTransferEngine(
+            hostname=self.local_ip,
+            gpu_id=self.kv_args.gpu_id,
+            ib_device=self.kv_args.ib_device,
+        )
+
     def register_buffer_to_engine(self):
         for kv_data_ptr, kv_data_len in zip(
             self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
@@ -267,19 +270,17 @@ class MooncakeKVManager(BaseKVManager):
 
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            src_addr_list = []
-            dst_addr_list = []
-            length_list = []
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
-                src_addr_list.append(src_addr)
-                dst_addr_list.append(dst_addr)
-                length_list.append(length)
-            return self.engine.batch_transfer_sync(
-                mooncake_session_id, src_addr_list, dst_addr_list, length_list
-            )
+
+                status = self.engine.transfer_sync(
+                    mooncake_session_id, src_addr, dst_addr, length
+                )
+                if status != 0:
+                    return status
+            return 0
 
         futures = [
             executor.submit(
@@ -532,12 +533,12 @@ class MooncakeKVManager(BaseKVManager):
                         if len(chunked_dst_kv_indice) < len(
                             kv_chunk.prefill_kv_indices
                         ):
-                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
-                                : len(chunked_dst_kv_indice)
-                            ]
                             logger.warning(
                                 f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
                             )
+                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
+                                : len(chunked_dst_kv_indice)
+                            ]
 
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
