@@ -12,18 +12,7 @@ class _ModuleOffloader:
         TODO_if_cpu_then_do_not_offload
         assert device != torch.device("cpu")
 
-        pin_memory = is_pin_memory_available()
-        for p in module.parameters():
-            cpu_data = torch.empty_strided(
-                size=p.data.size(),
-                stride=p.data.stride(),
-                dtype=p.data.dtype,
-                layout=p.data.layout,
-                device="cpu",
-                pin_memory=pin_memory,
-            )
-            cpu_data.copy_(p.data)
-            p.data = cpu_data
+        _offload_module_to_cpu(module)
 
         def _create_parameter_and_buffer_dicts():
             return {
@@ -34,6 +23,21 @@ class _ModuleOffloader:
             }
 
         _hook_module_forward(module, _create_parameter_and_buffer_dicts)
+
+
+def _offload_module_to_cpu(module):
+    pin_memory = is_pin_memory_available()
+    for p in module.parameters():
+        cpu_data = torch.empty_strided(
+            size=p.data.size(),
+            stride=p.data.stride(),
+            dtype=p.data.dtype,
+            layout=p.data.layout,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        cpu_data.copy_(p.data)
+        p.data = cpu_data
 
 
 def _hook_module_forward(module, create_parameter_and_buffer_dicts):
