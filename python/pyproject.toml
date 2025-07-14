@@ -50,6 +50,7 @@ runtime_common = [
     "uvicorn",
     "uvloop",
     "xgrammar==0.1.21",
+    "petit_kernel",
 ]
 
 srt = [

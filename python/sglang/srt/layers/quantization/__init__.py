@@ -62,6 +62,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
 )
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
 from sglang.srt.layers.quantization.utils import (
     get_dynamic_override,
@@ -83,6 +84,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "compressed-tensors": CompressedTensorsConfig,
     "qoq": QoQConfig,
     "w4afp8": W4AFp8Config,
+    "petit_nvfp4": PetitNvFp4Config,
 }
 
 # VLLM-dependent quantization methods
