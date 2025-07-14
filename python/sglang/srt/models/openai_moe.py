@@ -660,7 +660,7 @@ class OpenAIMoeAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
-        # todo: check if sinks need exp before exp
+        # todo: check if sinks need fp32 before exp
         sinks = torch.exp(self.sinks)
         sinks = sinks.to(torch.float32)
         attn_output = self.attn(*inner_state, sink=sinks)    
@@ -668,7 +668,7 @@ class OpenAIMoeAttention(nn.Module):
         q = inner_state[0].view(-1, self.num_kv_heads, self.num_heads // self.num_kv_heads, self.head_dim)
         k = inner_state[1].view(-1, self.num_kv_heads, self.head_dim)
         v = inner_state[2].view(-1, self.num_kv_heads, self.head_dim)
-        sdpa_output = sdpa(q, k, v, self.sinks, self.scaling, self.sliding_window)
+        sdpa_output = sdpa(q, k, v, self.sinks, self.scaling, self.sliding_window + 1 if self.sliding_window is not None else 0)
         if self.layer_id % 2 == 1:
             print(f"### layer_id={self.layer_id}, attn_output.shape={attn_output.shape}, o_ref.shape={o_ref.shape}, sdpa_output.shape={sdpa_output.shape}")
             torch.testing.assert_close(o_ref, sdpa_output, rtol=1e-2, atol=1e-2)
