@@ -787,7 +787,9 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             forward_batch=forward_batch,
             get_embedding=get_embedding,
             language_model=self.language_model,
-            image_data_embedding_func=self.get_image_feature,
+            data_embedding_funcs={
+                Modality.IMAGE: self.get_image_feature,
+            },
             placeholder_tokens=None,  # using mm_item.pad_value
             positions=positions,
         )
