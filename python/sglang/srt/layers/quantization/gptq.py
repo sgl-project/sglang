@@ -4,8 +4,6 @@ from fractions import Fraction
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
-from sgl_kernel import fused_marlin_moe
-from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 from sglang.srt.layers.linear import LinearBase, LinearMethodBase, set_weight_attrs
 from sglang.srt.layers.parameter import (
@@ -45,6 +43,11 @@ except ImportError:
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel import fused_marlin_moe
+    from sgl_kernel.scalar_type import ScalarType, scalar_types
+
 
 FusedMoEMethodBase = QuantizeMethodBase
 

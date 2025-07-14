@@ -6,7 +6,6 @@ from typing import Any, Optional
 
 import numpy
 import torch
-from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 from sglang.srt.layers.linear import LinearBase, LinearMethodBase
 from sglang.srt.layers.parameter import (
@@ -24,6 +23,13 @@ try:
     from vllm import _custom_ops as ops
 except ImportError:
     ops = None
+
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 logger = logging.getLogger(__name__)
 
