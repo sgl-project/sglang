@@ -23,6 +23,7 @@ import json
 import logging
 import multiprocessing as multiprocessing
 import os
+import random
 import threading
 import time
 from http import HTTPStatus
@@ -1104,11 +1105,24 @@ def launch_server(
     finally:
         warmup_thread.join()
 
-
 def _execute_server_warmup(
     server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection],
+    pipe_finish_writer: Optional[multiprocessing.connection.Connection]
 ):
+    def _generate_passkey_sample(length):
+        passkey = "The passkey is **000310**. " * 3
+        filler = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
+        repeat = int(length * 1024 / 24 / 2)
+        if "Llama-4" in server_args.model_path:
+            text = f"<|header_start|>user<|header_end|>\n\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.<|eot|><|header_start|>assistant<|header_end|>\n\nThe passkey is **"
+        elif "Llama-3" in server_args.model_path:
+            text = f"<|start_header_id|>user<|end_header_id|>\n\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nThe passkey is **"
+        elif "Qwen3" in server_args.model_path:
+            text = f"<|im_start|>user\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.<|im_end|>\n<|im_start|>assistant\n<think></think>\n\nThe passkey is **"
+        else:
+            text = f"### User\n\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.\n\n### Response\n\nThe passkey is **"
+        return text
+        
     headers = {}
     url = server_args.url()
     if server_args.api_key:
@@ -1156,17 +1170,8 @@ def _execute_server_warmup(
         if server_args.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
     else:
-        passkey = "The passkey is **000310**. " * 3
-        filler = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
-        repeat = int(int(os.getenv("PASSKEY_LEN", "8")) * 1024 / 24 / 2)
-        if "Llama-4" in server_args.model_path:
-            text = f"<|header_start|>user<|header_end|>\n\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.<|eot|><|header_start|>assistant<|header_end|>\n\nThe passkey is **"
-        elif "Llama-3" in server_args.model_path:
-            text = f"<|start_header_id|>user<|end_header_id|>\n\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nThe passkey is **"
-        elif "Qwen3" in server_args.model_path:
-            text = f"<|im_start|>user\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.<|im_end|>\n<|im_start|>assistant\n<think></think>\n\nThe passkey is **"
-        else:
-            text = f"### User\n\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.\n\n### Response\n\nThe passkey is **"
+        passkey_len = int(os.getenv("PASSKEY_LEN", "8"))
+        text = _generate_passkey_sample(passkey_len)
 
         json_data["text"] = [text] * server_args.dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
@@ -1183,12 +1188,50 @@ def _execute_server_warmup(
 
     try:
         if server_args.disaggregation_mode == "null":
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=6000,
-            )
+            warmup_all_seq_lens = os.getenv("SRT_WARMUP_ALL_SEQ_LENS", "0") == "1"
+            if warmup_all_seq_lens:
+                step_size = 1000
+                safe_zero = lambda x: x if x is not None else 0
+                chunk_size = safe_zero(server_args.chunked_prefill_size)
+                chunk_size = max(safe_zero(server_args.context_length) - step_size, chunk_size)
+                assert chunk_size > 0, "consider pass explicit --context-length"
+                while chunk_size > step_size:
+                    text = _generate_passkey_sample(chunk_size // 1024)
+                    json_data["text"] = text
+                    json_data["sampling_params"]["max_new_tokens"] = 10
+                    
+                    res = requests.post(
+                        url + request_name,
+                        json=json_data,
+                        headers=headers,
+                        timeout=6000,
+                    )
+                    assert res.status_code == 200, f"{res}"
+                    print(res.json())
+                    
+                    chunk_size = int(chunk_size - step_size)
+                while chunk_size > 0:
+                    json_data["text"] = f"{random.randint(0, 100000)} " * chunk_size
+                    json_data["sampling_params"]["max_new_tokens"] = 10
+                    
+                    res = requests.post(
+                        url + request_name,
+                        json=json_data,
+                        headers=headers,
+                        timeout=6000,
+                    )
+                    assert res.status_code == 200, f"{res}"
+                    print(res.json())
+                    
+                    chunk_size = int(chunk_size / 2)
+                print('[WARM-UP DONE]')
+            else:
+                res = requests.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=headers,
+                    timeout=6000,
+                )
             assert res.status_code == 200, f"{res}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
             print(res.json())
