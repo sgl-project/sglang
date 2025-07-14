@@ -38,7 +38,6 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        logger.debug(f"{image_data=}")
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
@@ -50,8 +49,7 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         )
 
         mm_items, input_ids, _ = self.process_and_combine_mm_data(base_output)
-        logger.debug(f"{base_output=}")
-        logger.debug(f"{mm_items=}")
+
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
