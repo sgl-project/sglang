@@ -209,6 +209,17 @@ def get_quant_config(
             config["adapter_name_or_path"] = model_name_or_path
         elif model_config.quantization == "modelopt":
             if config["producer"]["name"] == "modelopt":
+                # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
+                if config["quantization"]["quant_algo"] is None:
+                    if (
+                        model_config.hf_config.architectures[0]
+                        != "LlamaForCausalLMEagle3"
+                    ):
+                        raise ValueError(
+                            f"Invalid quant_config, quantization method: {model_config.quantization},"
+                            f"hf architectures: {model_config.hf_config.architectures[0]}. "
+                        )
+                    return None
                 if "FP4" in config["quantization"]["quant_algo"]:
                     return ModelOptFp4Config.from_config(config)
                 else:
@@ -449,10 +460,12 @@ def safetensors_weights_iterator(
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
+                for name, param in result.items():
+                    yield name, param
         else:
-            result = safetensors.torch.load_file(st_file, device="cpu")
-        for name, param in result.items():
-            yield name, param
+            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                for name in f.keys():
+                    yield name, f.get_tensor(name)
 
 
 def multi_thread_safetensors_weights_iterator(
@@ -485,7 +498,8 @@ def multi_thread_safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
         else:
-            result = safetensors.torch.load_file(st_file, device="cpu")
+            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                result = {k: f.get_tensor(k) for k in f.keys()}
 
         return result
 
@@ -947,3 +961,57 @@ def kv_cache_scales_loader(
         tp_rank,
     )
     return []
+
+
+def get_actual_shard_size(shard_size, weight_start, weight_end):
+    if weight_end < weight_start:
+        return 0
+
+    return min(shard_size, weight_end - weight_start)
+
+
+def reset_param_data_if_needed(param_data, dim, start, length):
+    if length == 0:
+        return
+
+    assert length > 0, f"Length should be positive, but got {length}"
+
+    param_data.narrow(dim, start, length).zero_()
+    return
+
+
+def narrow_padded_param_and_loaded_weight(
+    param_data,
+    loaded_weight,
+    param_data_start,
+    weight_start,
+    dim,
+    shard_size,
+    narrow_weight=True,
+):
+    actual_shard_size = get_actual_shard_size(
+        shard_size, weight_start, loaded_weight.size(dim)
+    )
+
+    if narrow_weight:
+        if actual_shard_size > 0:
+            loaded_weight = loaded_weight.narrow(dim, weight_start, actual_shard_size)
+        else:
+            # No real data to load; create a dummy tensor filled with zeros
+            loaded_weight = torch.zeros_like(
+                param_data.narrow(dim, param_data_start, actual_shard_size)
+            )
+
+    # [Note] Reset padded weights to zero.
+    # If the actual shard size is less than the shard size, we need to reset
+    # the padded param_data to zero and then copy the loaded_weight into it.
+    reset_param_data_if_needed(
+        param_data,
+        dim,
+        param_data_start + actual_shard_size,
+        shard_size - actual_shard_size,
+    )
+
+    param_data = param_data.narrow(dim, param_data_start, actual_shard_size)
+
+    return param_data, loaded_weight
