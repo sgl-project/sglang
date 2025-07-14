@@ -28,21 +28,27 @@ class _ModuleOffloader:
             cpu_data.copy_(p.data)
             p.data = cpu_data
 
-        original_forward = module.forward
-        def forward(*args, **kwargs):
-            module.forward = original_forward
-            device_state = {
+        def _create_parameter_and_buffer_dicts():
+            return {
                 # here we blindly call `to(device)`
                 # if the parameter is already on the device, it will be a no-op
                 k: v.to(device, non_blocking=True)
                 for k, v in module.state_dict().items()
             }
-            output = functional_call(module, device_state, args=args, kwargs=kwargs)
-            module.forward = forward
-            return output
-        module.forward = forward
 
-        return module
+        _hook_module_forward(module, _create_parameter_and_buffer_dicts)
+
+
+def _hook_module_forward(module, create_parameter_and_buffer_dicts):
+    original_forward = module.forward
+
+    def forward(*args, **kwargs):
+        module.forward = original_forward
+        output = functional_call(module, create_parameter_and_buffer_dicts(), args=args, kwargs=kwargs)
+        module.forward = forward
+        return output
+
+    module.forward = forward
 
 
 def wrap_layers_for_offload(layers: List[torch.nn.Module]):
