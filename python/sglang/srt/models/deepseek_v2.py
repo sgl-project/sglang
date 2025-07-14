@@ -2193,6 +2193,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         elif get_moe_expert_parallel_world_size() > 1:
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under expert parallelism."
+        elif self.quant_config.get_name() == "w4afp8":
+            disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
 
         if disable_reason is not None:
             global_server_args_dict["disable_shared_experts_fusion"] = True
@@ -2482,6 +2484,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
+        # Params for special naming rules in mixed-precision models, for example:
+        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
+        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
         if self.quant_config and self.quant_config.get_name() == "w4afp8":
             expert_params_mapping += (
                 get_moe_impl_class().make_expert_input_scale_params_mapping(
@@ -2677,6 +2682,25 @@ class DeepseekV2ForCausalLM(nn.Module):
             # Wait for all tasks to complete and raise any exceptions.
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+
+        # print(
+        #     f"params_dict: first moe w13 weights: {params_dict['model.layers.3.mlp.experts.w13_weight']}, shape {params_dict['model.layers.3.mlp.experts.w13_weight'].shape}"
+        # )
+        # print(
+        #     f"w2 weights: {params_dict['model.layers.3.mlp.experts.w2_weight']}, shape {params_dict['model.layers.3.mlp.experts.w2_weight'].shape}"
+        # )
+        # print(
+        #     f"params_dict: first moe w13 weights scale: {params_dict['model.layers.3.mlp.experts.w13_weight_scale_inv']}, shape {params_dict['model.layers.3.mlp.experts.w13_weight_scale_inv'].shape}"
+        # )
+        # print(
+        #     f"w2 weights scale: {params_dict['model.layers.3.mlp.experts.w2_weight_scale_inv']}, shape {params_dict['model.layers.3.mlp.experts.w2_weight_scale_inv'].shape}"
+        # )
+        # print(
+        #     f"params_dict: first moe w13 input scale: {params_dict['model.layers.3.mlp.experts.w13_input_scale']}, shape {params_dict['model.layers.3.mlp.experts.w13_input_scale'].shape}"
+        # )
+        # print(
+        #     f"w2 input scale: {params_dict['model.layers.3.mlp.experts.w2_input_scale']}, shape {params_dict['model.layers.3.mlp.experts.w2_input_scale'].shape}"
+        # )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
