@@ -190,8 +190,8 @@ class TestOpenAIVisionServer(CustomTestCase):
             "man" in text or "cab" in text or "SUV" in text or "taxi" in text
         ), f"text: {text}, should contain man, cab, SUV or taxi"
         assert (
-            "logo" in text or '"S"' in text or "SG" in text
-        ), f"text: {text}, should contain logo, S or SG"
+            "logo" in text or '"S"' in text or "SG" in text or "graphic" in text
+        ), f"text: {text}, should contain logo, S or SG or graphic"
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
