@@ -356,10 +356,10 @@ class MHATokenToKVPool(KVCache):
         io_backend,
     ):
         transfer_kv_per_layer(
-            src_k=host_pool.k_buffer[layer_id],
-            dst_k=self.k_buffer[layer_id],
-            src_v=host_pool.v_buffer[layer_id],
-            dst_v=self.v_buffer[layer_id],
+            src_k=host_pool.k_buffer,
+            dst_k=self.k_buffer,
+            src_v=host_pool.v_buffer,
+            dst_v=self.v_buffer,
             src_indices=host_indices,
             dst_indices=device_indices,
             io_backend=io_backend,
@@ -377,10 +377,10 @@ class MHATokenToKVPool(KVCache):
                     f"Layer ID {layer_id} exceeds the number of layers in host pool."
                 )
             transfer_kv_per_layer(
-                src_k=self.k_buffer[layer_id],
-                dst_k=host_pool.k_buffer[layer_id],
-                src_v=self.v_buffer[layer_id],
-                dst_v=host_pool.v_buffer[layer_id],
+                src_k=self.k_buffer,
+                dst_k=host_pool.k_buffer,
+                src_v=self.v_buffer,
+                dst_v=host_pool.v_buffer,
                 src_indices=device_indices,
                 dst_indices=host_indices,
                 io_backend=io_backend,
