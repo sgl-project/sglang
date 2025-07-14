@@ -15,6 +15,7 @@ from sglang.srt.layers.parameter import (
     PackedvLLMParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
 from sglang.srt.layers.quantization.utils import pack_cols, unpack_cols
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.utils import get_device_capability
@@ -23,13 +24,6 @@ try:
     from vllm import _custom_ops as ops
 except ImportError:
     ops = None
-
-from sglang.srt.utils import is_cuda
-
-_is_cuda = is_cuda()
-
-if _is_cuda:
-    from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 logger = logging.getLogger(__name__)
 
