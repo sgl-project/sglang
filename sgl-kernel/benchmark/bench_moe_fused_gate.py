@@ -26,12 +26,12 @@ def biased_grouped_topk_org_kernel(scores, bias, num_expert_group, topk_group, t
 
 
 seq_length_range = [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000]
-configs = [(sq,) for sq in seq_length_range]
-
+configs = [(sq, 256, 8, 4, 8) for sq in seq_length_range]  # original config
+configs.extend([(sq, 64, 1, 1, 6) for sq in seq_length_range])  # kimi vl config
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["seq_length"],
+        x_names=["seq_length", "num_experts", "num_expert_group", "topk_group", "topk"],
         x_vals=[list(_) for _ in configs],
         line_arg="provider",
         line_vals=["original", "kernel"],
@@ -42,10 +42,9 @@ configs = [(sq,) for sq in seq_length_range]
         args={},
     )
 )
-def benchmark(seq_length, provider):
+def benchmark(seq_length, num_experts, num_expert_group, topk_group, topk, provider):
     dtype = torch.bfloat16
     device = torch.device("cuda")
-    num_experts, num_expert_group, topk_group, topk = 256, 8, 4, 8
 
     scores = torch.randn((seq_length, num_experts), device=device, dtype=dtype)
     bias = torch.rand(num_experts, device=device, dtype=dtype)
