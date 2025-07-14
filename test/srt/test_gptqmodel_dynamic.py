@@ -106,7 +106,7 @@ class TestGPTQModelDynamic(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--dtype", "bfloat16"],
+            other_args=["--dtype", "float16"],
         )
 
     @classmethod
@@ -161,7 +161,7 @@ class TestGPTQModelDynamicWithMarlin(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--dtype", "bfloat16"],
+            other_args=["--dtype", "float16"],
         )
 
     @classmethod

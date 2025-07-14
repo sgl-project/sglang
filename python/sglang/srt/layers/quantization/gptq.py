@@ -528,7 +528,7 @@ class GPTQLinearMethod(LinearMethodBase):
             layer.scales,
             layer.g_idx,
             False,
-            4,
+            self.quant_config.weight_bits,
         )
         if bias is not None:
             output.add_(bias)
