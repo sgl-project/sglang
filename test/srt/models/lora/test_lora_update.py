@@ -173,6 +173,64 @@ BASIC_TESTS = [
         ],
     ),
     TestCase(
+        description="dynamic lora update without initial lora_paths",
+        base="meta-llama/Llama-3.1-8B-Instruct",
+        enable_lora=True,
+        max_lora_rank=256,
+        lora_target_modules=["all"],
+        max_loras_per_batch=4,
+        all_adapters=[
+            "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+            "pbevan11/llama-3.1-8b-ocr-correction",
+        ],
+        op_sequence=[
+            Operation(
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="pbevan11/llama-3.1-8b-ocr-correction",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                        "pbevan11/llama-3.1-8b-ocr-correction",
+                        None,
+                    ]
+                ),
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data("philschmid/code-llama-3-1-8b-text-to-sql-lora"),
+                expected_error="not loaded",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        None,
+                        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                        "pbevan11/llama-3.1-8b-ocr-correction",
+                        None,
+                    ]
+                ),
+            ),
+        ],
+    ),
+    TestCase(
         description="dynamic lora update with evictions",
         base="meta-llama/Llama-3.1-8B-Instruct",
         max_loras_per_batch=1,
@@ -251,64 +309,6 @@ BASIC_TESTS = [
             Operation(
                 type=OperationType.FORWARD,
                 data=create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
-            ),
-        ],
-    ),
-    TestCase(
-        description="dynamic lora update without initial lora_paths",
-        base="meta-llama/Llama-3.1-8B-Instruct",
-        enable_lora=True,
-        max_lora_rank=256,
-        lora_target_modules=["all"],
-        max_loras_per_batch=4,
-        all_adapters=[
-            "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
-            "pbevan11/llama-3.1-8b-ocr-correction",
-        ],
-        op_sequence=[
-            Operation(
-                type=OperationType.LOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="pbevan11/llama-3.1-8b-ocr-correction",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
-                        "pbevan11/llama-3.1-8b-ocr-correction",
-                        None,
-                    ]
-                ),
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("philschmid/code-llama-3-1-8b-text-to-sql-lora"),
-                expected_error="not loaded",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        None,
-                        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
-                        "pbevan11/llama-3.1-8b-ocr-correction",
-                        None,
-                    ]
-                ),
             ),
         ],
     ),
@@ -430,7 +430,7 @@ TARGET_MODULE_TESTS = [
             Operation(
                 type=OperationType.LOAD,
                 data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
-                expected_error="updating LoRA shapes",
+                expected_error="incompatible",
             ),
             Operation(
                 type=OperationType.FORWARD,
@@ -490,7 +490,7 @@ MAX_LORA_RANK_TESTS = [
             Operation(
                 type=OperationType.LOAD,
                 data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                expected_error="updating LoRA shapes",
+                expected_error="incompatible",
             ),
             Operation(
                 type=OperationType.FORWARD,
@@ -529,7 +529,7 @@ MAX_LORA_RANK_TESTS = [
             Operation(
                 type=OperationType.LOAD,
                 data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                expected_error="updating LoRA shapes",
+                expected_error="incompatible",
             ),
             Operation(
                 type=OperationType.FORWARD,
@@ -751,8 +751,8 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
     def __enter__(self):
         other_args = [
             "--cuda-graph-max-bs",
-            str(self.cuda_graph_max_bs),
-            "--lora-paths",
+            str(self.cuda_graph_max_bs),            
+            "--max-loras-per-batch",
             str(self.max_loras_per_batch),
             "--lora-backend",
             self.lora_backend,
