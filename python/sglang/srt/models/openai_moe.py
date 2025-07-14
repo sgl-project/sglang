@@ -170,8 +170,8 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
                 deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]]
             )
         else:
-            extra_args = dict(is_openai_moe=True, 
-                              swiglu_alpha=1.702, 
+            extra_args = dict(is_openai_moe=True,
+                              swiglu_alpha=1.702,
                               swiglu_beta=1.0,
                               enable_mxfp4_moe=global_server_args_dict["enable_w4_mxfp4_moe"] or global_server_args_dict["enable_w4a8_mxfp4_moe"],
                               enable_fp8_activation=global_server_args_dict["enable_w4a8_mxfp4_moe"])
@@ -662,9 +662,11 @@ class OpenAIMoeDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        # Todo: remove this, simple WA for orangina
+        # hidden_states, residual = self.layer_communicator.prepare_mlp(
+        #     hidden_states, residual, forward_batch
+        # )
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         hidden_states = self.mlp(hidden_states, forward_batch)
 
@@ -824,6 +826,7 @@ class OpenAIMoeModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+
         return hidden_states
 
 
@@ -913,7 +916,7 @@ class OpenAIMoeForCausalLM(nn.Module):
             num_experts=self.config.num_experts,
         )
 
-        
+
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
@@ -929,7 +932,7 @@ class OpenAIMoeForCausalLM(nn.Module):
 
             if "rotary_emb.inv_freq" in name:
                 continue
-            
+
             # OpenAIMoe use router to name gate
             if ".mlp.router." in name:
                 name = name.replace(".mlp.router.", ".mlp.gate.")
@@ -981,8 +984,8 @@ class OpenAIMoeForCausalLM(nn.Module):
                     if name.endswith("_bias"):
                         param_name = name.replace(".experts.gate_up_proj_bias", ".experts.w13_bias")
                     else:
-                        param_name = name.replace(".experts.gate_up_proj", ".experts.w13_weight") 
-                    
+                        param_name = name.replace(".experts.gate_up_proj", ".experts.w13_weight")
+
                     if param_name in params_dict:
                         param = params_dict[param_name]
                         weight_loader = param.weight_loader
@@ -1003,7 +1006,7 @@ class OpenAIMoeForCausalLM(nn.Module):
                         param_name = name.replace(".experts.down_proj_bias", ".experts.w2_bias")
                     else:
                         param_name = name.replace(".experts.down_proj", ".experts.w2_weight")
-                    
+
                     if param_name in params_dict:
                         param = params_dict[param_name]
                         weight_loader = param.weight_loader

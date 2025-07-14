@@ -443,6 +443,9 @@ class UnquantizedFusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
         if _use_aiter:
             raise NotImplementedError("Aiter is not supported for OpenAI MoE")
         else:
+            w2_bias = None
+            if get_tensor_model_parallel_rank() == 0:
+                w2_bias = getattr(layer, 'w2_bias', None)
             return fused_experts_oai(
                 hidden_states=x,
                 w13=layer.w13_weight,
@@ -451,7 +454,7 @@ class UnquantizedFusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
                 top_k=top_k,
                 activation=activation,
                 w1_bias=getattr(layer, 'w13_bias', None),
-                w2_bias=getattr(layer, 'w2_bias', None),
+                w2_bias=w2_bias,
                 swiglu_alpha=self.swiglu_alpha,
                 swiglu_beta=self.swiglu_beta,
                 dtype=x.dtype,
@@ -666,6 +669,7 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
         raise NotImplementedError("TPU is not supported for OpenAI MoE")
     
     forward_native = forward_cpu
+
 
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
@@ -1159,22 +1163,19 @@ class FusedMoE(torch.nn.Module):
                     # Apply TP sharding to the full weight based on shard_dim
                     tp_size = get_tensor_model_parallel_world_size()
                     if tp_size > 1 and not self.use_presharded_weights:
+                        # Split into gate and up parts
+                        up_weight = loaded_weight[:loaded_weight.shape[0]//2, :]
+                        gate_weight = loaded_weight[loaded_weight.shape[0]//2:, :]
+                        assert up_weight.shape[0] == gate_weight.shape[0]
                         # Use shard_dim instead of hardcoded dim 0
-                        weight_per_partition = loaded_weight.shape[shard_dim] // tp_size
+                        weight_per_partition = up_weight.shape[shard_dim] // tp_size
                         start_idx = tp_rank * weight_per_partition
                         end_idx = start_idx + weight_per_partition
-                        if shard_dim == 0:
-                            loaded_weight = loaded_weight[start_idx:end_idx, :]
-                        else:  # shard_dim == 1
-                            loaded_weight = loaded_weight[:, start_idx:end_idx]
-                    
-                    # Now split into gate and up parts
-                    gate_weight = loaded_weight[:loaded_weight.shape[0]//2, :]
-                    up_weight = loaded_weight[loaded_weight.shape[0]//2:, :]
-                    
+                        up_weight = up_weight[start_idx:end_idx, :]
+                        gate_weight = gate_weight[start_idx:end_idx, :]
+                        loaded_weight = torch.cat((up_weight, gate_weight), dim=0)
                     # Load into w13_weight
-                    weight_param.data[expert_id][:weight_param.data[expert_id].shape[0]//2, :] = gate_weight
-                    weight_param.data[expert_id][weight_param.data[expert_id].shape[0]//2:, :] = up_weight
+                    weight_param.data[expert_id].copy_(loaded_weight)
             else:
                 self._load_model_weight_or_group_weight_scale(
                     shard_id=shard_id,
@@ -1194,19 +1195,19 @@ class FusedMoE(torch.nn.Module):
                     # Apply TP sharding to the full bias (bias is 1D, always shard along dim 0)
                     tp_size = get_tensor_model_parallel_world_size()
                     if tp_size > 1 and not self.use_presharded_weights:
+                        # Split into gate and up parts
+                        up_bias = loaded_weight[loaded_weight.shape[0]//2:]
+                        gate_bias = loaded_weight[:loaded_weight.shape[0]//2]
+                        assert gate_bias.shape[0] == up_bias.shape[0]
                         # For w13 bias, we shard along dim 0 (output dimension)
-                        bias_per_partition = loaded_weight.shape[0] // tp_size
+                        bias_per_partition = up_bias.shape[0] // tp_size
                         start_idx = tp_rank * bias_per_partition
                         end_idx = start_idx + bias_per_partition
-                        loaded_weight = loaded_weight[start_idx:end_idx]
-                    
-                    # Now split into gate and up parts
-                    gate_bias = loaded_weight[:loaded_weight.shape[0]//2]
-                    up_bias = loaded_weight[loaded_weight.shape[0]//2:]
-                    
+                        up_bias = up_bias[start_idx:end_idx]
+                        gate_bias = gate_bias[start_idx:end_idx]
+                        loaded_weight = torch.cat((gate_bias, up_bias), dim=0)
                     # Load into w13_bias
-                    bias_param.data[expert_id][:bias_param.data[expert_id].shape[0]//2] = gate_bias
-                    bias_param.data[expert_id][bias_param.data[expert_id].shape[0]//2:] = up_bias
+                    bias_param.data[expert_id].copy_(loaded_weight)
             elif shard_id in ("w1", "w3"):
                 # For w1 and w3, we need to load bias into w13_bias
                 bias_param = getattr(self, "w13_bias", None)
