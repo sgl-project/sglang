@@ -689,7 +689,7 @@ class GroupCoordinator:
 
     def send_object(
         self, obj: Any, dst: int, async_send: bool = False
-    ) -> Optional[torch.distributed.Work]:
+    ) -> List[Optional[torch.distributed.Work]]:
         """Send the input object list to the destination rank."""
         """NOTE: `dst` is the local rank of the destination rank."""
 
@@ -713,14 +713,19 @@ class GroupCoordinator:
             dtype=torch.long,
             device=torch.cuda.current_device(),
         )
+        works = []
 
         # Send object size
-        work = send_func(size_tensor, dst=self.ranks[dst], group=self.device_group)
+        works.append(
+            send_func(size_tensor, dst=self.ranks[dst], group=self.device_group)
+        )
 
         # Send object
-        work = send_func(object_tensor, dst=self.ranks[dst], group=self.device_group)
+        works.append(
+            send_func(object_tensor, dst=self.ranks[dst], group=self.device_group)
+        )
 
-        return work
+        return works
 
     def recv_object(self, src: int) -> Any:
         """Receive the input object list from the source rank."""
