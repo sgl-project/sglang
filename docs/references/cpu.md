@@ -51,6 +51,8 @@ docker run \
 
 If you'd prefer to install SGLang in a bare metal environment,
 please take the command list in the Dockerfile as reference.
+Please note that the environmental variable `SGLANG_USE_CPU_ENGINE=1`
+is required to be set to enable SGLang service with CPU engine.
 
 ## Launch of the Serving Engine
 
@@ -70,19 +72,23 @@ Notes:
 
 1. For running W8A8 quantized models, please add the flag `--quantization w8a8_int8`.
 
-2. The flag `--tp 6` indicates that we will apply tensor parallel with 6 ranks (TP6).
-In general the TP rank number should match the total number of sub-numa clusters (SNCs) on the server
-(e.g. TP6 should be applied on a server having 2 sockets with SNC3 configuration).
+2. The flag `--tp 6` specifies that tensor parallelism will be applied using 6 ranks (TP6).
+    In general, the number of TP ranks should correspond to the total number of sub-NUMA clusters (SNCs) on the server.
+    For instance, TP6 is suitable for a server with 2 sockets configured with SNC3.
 
-    If the desired TP rank number is not the same with total SNC number, an explicit setting of env variable
-    `SGLANG_CPU_OMP_THREADS_BIND` is needed. For example, if we want to run TP3 on the 1st socket of the server
-    with 120c x 2 sockets, which has a total of 6 SNCs, we need to set
+    If the desired TP rank number differs from the total SNC count, the system will automatically
+    utilize the first `n` SNCs, provided `--tp n` is set and `n` is less than the total SNC count.
+    Note that `n` cannot exceed the total SNC number, doing so will result in an error.
+
+    To specify the cores to be used, we need to explicitly set the environment variable `SGLANG_CPU_OMP_THREADS_BIND`.
+    For example, if we want to run the SGLang service using the first 40 cores of each SNC on a Xeon® 6980P server,
+    which has 43-43-42 cores per socket (reserving the remaining 16 cores for other tasks), we should set:
 
     ```bash
-    export SGLANG_CPU_OMP_THREADS_BIND="0-39|40-79|80-119"
+    export SGLANG_CPU_OMP_THREADS_BIND="0-39|43-82|86-125|128-167|171-210|214-253"
     ```
 
-    and set `--tp 3` in the `launch_server` command.
+    Additionally, include `--tp 6` in the `launch_server` command.
 
 3. A warmup step is automatically triggered when the service is started.
 When `The server is fired up and ready to roll!` is echoed,
