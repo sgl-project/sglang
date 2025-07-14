@@ -1359,7 +1359,7 @@ class TokenizerManager:
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
-            self.last_receive_tstamp = time.time()
+            self.last_receive_tstamp = time.perf_counter()
 
     def _handle_batch_output(
         self,
