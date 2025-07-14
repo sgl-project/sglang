@@ -116,10 +116,10 @@ def main():
     occupy_size = test_device_indices.numel() * test_device_indices.element_size()
     logger.info("Write tensor to k buffer 0 and gds to local file")
     logger.info(k_buffer)
-    gds_backend = Gds(gds_file_path="/tmp/gds/try.txt",buf_size=128)
-    gds_backend.d2s("WRITE", "/tmp/gds/k_buffer_layer1", test_device_indices, 0, occupy_size)
+    gds_backend = Gds(gds_file_path="/mnt/gds/try.txt",buf_size=128)
+    gds_backend.d2s("WRITE", "/mnt/gds/k_buffer_layer1", test_device_indices, 0, occupy_size)
     test2_device_indices = k_buffer[1][0:3]
-    gds_backend.d2s(test2_device_indices, "READ", "/tmp/gds/k_buffer_layer1", 0, occupy_size)
+    gds_backend.d2s("READ", "/mnt/gds/k_buffer_layer1", test2_device_indices, 0, occupy_size)
     logger.info("GDS Read tensor back from local file to k buffer 1")
     logger.info(k_buffer)
     if k_buffer[1][0, 0, 0] != 2.0:
