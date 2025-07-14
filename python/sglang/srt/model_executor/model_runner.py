@@ -89,6 +89,7 @@ from sglang.srt.mem_cache.memory_pool import (
     SWAKVPool,
 )
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
@@ -321,6 +322,9 @@ class ModelRunner:
             self.init_cublas()
             self.init_attention_backend()
             self.init_cuda_graphs()
+        elif self.device == "npu":
+            self.init_attention_backend()
+            self.init_npu_graphs()
         else:
             self.cuda_graph_runner = None
             self.cuda_graph_mem_usage = 0
@@ -1430,6 +1434,31 @@ class ModelRunner:
         self.cuda_graph_mem_usage = before_mem - after_mem
         logger.info(
             f"Capture cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+            f"mem usage={self.cuda_graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+        )
+
+    def init_npu_graphs(self):
+        """Capture npu graphs."""
+        self.cuda_graph_runner = None
+        self.cuda_graph_mem_usage = 0
+
+        if not self.is_generation:
+            # TODO: Currently, npu graph only captures decode steps, which only exists for generation models
+            return
+
+        if self.server_args.disable_cuda_graph:
+            return
+
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"Capture npu graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+        )
+        self.cuda_graph_runner = NPUGraphRunner(self)
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        self.cuda_graph_mem_usage = before_mem - after_mem
+        logger.info(
+            f"Capture npu graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.cuda_graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
