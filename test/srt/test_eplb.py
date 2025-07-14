@@ -22,7 +22,7 @@ class _BaseTestDynamicEPLB(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = try_cached_model(DEFAULT_MLA_MODEL_NAME_FOR_TEST)
+        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
