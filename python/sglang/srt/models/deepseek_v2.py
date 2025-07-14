@@ -248,7 +248,6 @@ class MoEGate(nn.Module):
                 hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
             )
 
-
         if (
             _is_cuda
             and not self.is_nextn
@@ -441,8 +440,9 @@ class DeepseekV2MoE(nn.Module):
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
-
-    def forward_normal_dual_stream(self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False) -> torch.Tensor:
+    def forward_normal_dual_stream(
+        self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False
+    ) -> torch.Tensor:
         if not ENABLE_TRTLMM_GEN_MOE:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
