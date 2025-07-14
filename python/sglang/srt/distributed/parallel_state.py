@@ -246,7 +246,7 @@ class GroupCoordinator:
         if is_cuda_alike():
             self.device = torch.device(f"cuda:{local_rank}")
         elif is_npu():
-            self.device = torch.device(f"npu:{local_rank}")        
+            self.device = torch.device(f"npu:{local_rank}")
         else:
             self.device = torch.device("cpu")
 

@@ -234,7 +234,7 @@ class AscendAttnBackend(AttentionBackend):
                 ).view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
                 v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
                     layer.layer_id
-                ).view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)    
+                ).view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
                 query = q.view(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
                 num_tokens = query.shape[0]
                 workspace = (
@@ -262,19 +262,21 @@ class AscendAttnBackend(AttentionBackend):
                     k_cache,
                     v_cache,
                     block_table=self.forward_metadata.block_tables,
-                    block_size=self.page_size,                    
+                    block_size=self.page_size,
                     num_heads=layer.tp_q_head_num,
                     num_key_value_heads=layer.tp_k_head_num,
                     input_layout="BSH",
                     scale=layer.scaling,
                     actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_list,
                     workspace=workspace,
-                    out=[output,softmax_lse],
+                    out=[output, softmax_lse],
                 )
             else:
                 k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
-    
+                v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
+                    layer.layer_id
+                )
+
                 query = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_tokens = query.shape[0]
                 output = torch.empty(
@@ -282,7 +284,7 @@ class AscendAttnBackend(AttentionBackend):
                     dtype=query.dtype,
                     device=query.device,
                 )
-    
+
                 torch_npu._npu_paged_attention(
                     query=query,
                     key_cache=k_cache,

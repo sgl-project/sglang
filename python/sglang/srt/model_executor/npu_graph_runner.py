@@ -64,6 +64,7 @@ torch.cuda.graph = torch.npu.graph
 torch.cuda.stream = torch.npu.stream
 torch.cuda.current_stream = torch.npu.current_stream
 
+
 def get_is_capture_mode():
     return is_capture_mode
 
@@ -570,7 +571,7 @@ class NPUGraphRunner:
             graph,
             pool=global_graph_memory_pool,
             stream=stream,
-            auto_dispatch_capture=True
+            auto_dispatch_capture=True,
         ):
             out = run_once()
 
