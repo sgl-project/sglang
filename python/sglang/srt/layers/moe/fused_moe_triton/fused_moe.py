@@ -24,20 +24,26 @@ from sglang.srt.layers.quantization.int8_kernel import (
     sglang_per_token_group_quant_int8,
 )
 from sglang.srt.utils import (
+    ceil_div,
+    cpu_has_amx_support,
     direct_register_custom_op,
     get_bool_env_var,
     get_device_name,
+    is_cpu,
     is_cuda,
     is_hip,
-    log_info_on_rank0,
     next_power_of_2,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
+elif _is_cpu and _is_cpu_amx_available:
+    pass
 else:
     from vllm import _custom_ops as vllm_ops
     from vllm._custom_ops import scaled_fp8_quant
@@ -518,10 +524,6 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-def ceil_div(a, b):
-    return (a + b - 1) // b
-
-
 @triton.jit
 def moe_align_block_size_stage1(
     topk_ids_ptr,
@@ -747,9 +749,11 @@ def moe_align_block_size(
         by block_size for proper block matrix operations.
     """
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
-    sorted_ids, cumsum_buffer = init_sorted_ids_and_cumsum_buffer(
-        max_num_tokens_padded, topk_ids.numel(), num_experts, topk_ids.device
+    sorted_ids = torch.empty(
+        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
+    sorted_ids.fill_(topk_ids.numel())
+
     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
     expert_ids = torch.empty(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
@@ -765,6 +769,9 @@ def moe_align_block_size(
             num_tokens_post_pad,
         )
     else:
+        cumsum_buffer = torch.empty(
+            (num_experts + 1,), dtype=torch.int32, device=topk_ids.device
+        )
         token_cnts_buffer = torch.empty(
             (num_experts + 1) * num_experts,
             dtype=torch.int32,
@@ -1730,6 +1737,7 @@ def fused_moe(
     renormalize: bool,
     inplace: bool = False,
     activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
     use_grouped_topk: bool = False,
     num_expert_group: Optional[int] = None,
     num_fused_shared_experts: int = 0,
@@ -1815,6 +1823,7 @@ def fused_moe(
         topk_ids,
         inplace=inplace,
         activation=activation,
+        apply_router_weight_on_input=apply_router_weight_on_input,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,

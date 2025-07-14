@@ -1,5 +1,7 @@
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/linear.py"""
 
+from __future__ import annotations
+
 import itertools
 import logging
 from abc import abstractmethod
@@ -17,6 +19,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -30,7 +33,13 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_npu,
+    set_weight_attrs,
+    use_intel_amx_backend,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,56 +61,47 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "IPEXAWQLinearMethod",
 ]
 
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
+_is_npu = is_npu()
+
 
 def adjust_marlin_shard(param, shard_size, shard_offset):
     marlin_tile_size = getattr(param, "marlin_tile_size", None)
     if marlin_tile_size is None:
         return shard_size, shard_offset
-
     return shard_size * marlin_tile_size, shard_offset * marlin_tile_size
 
 
 def adjust_bitsandbytes_4bit_shard(
     param: Parameter, shard_offsets: Dict[str, Tuple[int, int]], loaded_shard_id: str
 ) -> Tuple[int, int]:
-    """Adjust the quantization offsets and sizes for BitsAndBytes sharding."""
-
     total, _ = shard_offsets["total"]
     orig_offset, orig_size = shard_offsets[loaded_shard_id]
-
     quantized_total = param.data.shape[0]
     quantized_offset = orig_offset * quantized_total // total
     quantized_size = orig_size * quantized_total // total
-
     return quantized_size, quantized_offset
 
 
 def adjust_scalar_to_fused_array(param, loaded_weight, shard_id):
-    """For fused modules (QKV and MLP) we have an array of length
-    N that holds 1 scale for each "logical" matrix. So the param
-    is an array of length N. The loaded_weight corresponds to
-    one of the shards on disk. Here, we slice the param based on
-    the shard_id for loading.
-    """
     qkv_idxs = {"q": 0, "k": 1, "v": 2}
-
     if isinstance(shard_id, str):
         shard_id = qkv_idxs[shard_id]
     elif not isinstance(shard_id, int):
         raise ValueError(f"Unknown Shard Id {shard_id}")
-
-    # AutoFP8 scales do not have a shape
-    # compressed-tensors scales do have a shape
     if len(loaded_weight.shape) != 0:
         assert loaded_weight.shape[0] == 1
         loaded_weight = loaded_weight[0]
-
     return param[shard_id], loaded_weight
 
 
-class LinearMethodBase(QuantizeMethodBase):
-    """Base class for different (maybe quantized) linear methods."""
+# ======================================================================
+#  Quant-method abstractions
+# ======================================================================
 
+
+class LinearMethodBase(QuantizeMethodBase):
     @abstractmethod
     def create_weights(
         self,
@@ -113,19 +113,6 @@ class LinearMethodBase(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        """Create weights for a linear layer.
-           The weights will be set as attributes of the layer.
-
-        Args:
-            layer: The layer that is using the LinearMethodBase factory.
-            input_size_per_partition: Size of the weight input dim on rank X.
-            output_partition_sizes: Sizes of the output dim of each logical
-                weight on rank X. E.g., output_partition_sizes for QKVLinear
-                is a list contains the width of Wq, Wk, Wv on rank X.
-            input_size: Size of the input dim of the weight across all ranks.
-            output_size: Size of the output dim of the weight across all ranks.
-            params_dtype: Datatype of the parameters.
-        """
         raise NotImplementedError
 
     @abstractmethod
@@ -135,14 +122,10 @@ class LinearMethodBase(QuantizeMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Apply the weights in layer to the input tensor.
-        Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
 
 
 class UnquantizedLinearMethod(LinearMethodBase):
-    """Linear method without quantization."""
-
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -165,28 +148,30 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _is_cpu and _is_cpu_amx_available:
+            _amx_process_weight_after_loading(layer, ["weight"])
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if use_intel_amx_backend(layer):
+            return torch.ops.sgl_kernel.weight_packed_linear(
+                x, layer.weight, bias, True  # is_vnni
+            )
 
         return F.linear(x, layer.weight, bias)
 
 
+# ======================================================================
+#  Base classes – replicated / TP variants
+# ======================================================================
+
+
 class LinearBase(torch.nn.Module):
-    """Base linear layer.
-
-    Args:
-        input_size: input dimension of the linear layer.
-        output_size: output dimension of the linear layer.
-        bias: If true, add bias.
-        skip_bias_add: If true, skip adding bias but instead return it.
-        params_dtype: Data type for the parameters.
-        quant_config: Quantization configure.
-    """
-
     def __init__(
         self,
         input_size: int,
@@ -197,20 +182,19 @@ class LinearBase(torch.nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-
-        # Keep input parameters
         self.input_size = input_size
         self.output_size = output_size
         self.skip_bias_add = skip_bias_add
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
+        self.quant_method: Optional[QuantizeMethodBase]
         if quant_config is None:
-            self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
+            self.quant_method = UnquantizedLinearMethod()
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # noqa: D401
         raise NotImplementedError
 
 
@@ -278,6 +262,14 @@ class ReplicatedLinear(LinearBase):
         # (such scales for AutoFp8).
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
+
+        # The per-tensor quant-scale must be 1 dimension
+        if _is_npu:
+            if param.size() != loaded_weight.size() and param.size(0) == 1:
+                if torch.allclose(loaded_weight, loaded_weight[0]):
+                    loaded_weight = loaded_weight[:1]
+                else:
+                    raise ValueError(f"{loaded_weight} are not all equal")
 
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
@@ -408,8 +400,26 @@ class ColumnParallelLinear(LinearBase):
         if output_dim is not None and not use_bitsandbytes_4bit:
             shard_size = param_data.shape[output_dim]
             start_idx = self.tp_rank * shard_size
-            if not self.use_presharded_weights:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+
+            if _is_cpu:
+                from sglang.srt.model_loader.weight_utils import (
+                    narrow_padded_param_and_loaded_weight,
+                )
+
+                param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                    param_data,
+                    loaded_weight,
+                    0,  # param_data_start
+                    start_idx,
+                    output_dim,
+                    shard_size,
+                    not self.use_presharded_weights,
+                )
+            else:
+                if not self.use_presharded_weights:
+                    loaded_weight = loaded_weight.narrow(
+                        output_dim, start_idx, shard_size
+                    )
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
@@ -626,10 +636,29 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size
-            # bitsandbytes loads the weights of the specific portion
-            # no need to narrow here
-            if not use_bitsandbytes_4bit and not self.use_presharded_weights:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+
+            if _is_cpu:
+                from sglang.srt.model_loader.weight_utils import (
+                    narrow_padded_param_and_loaded_weight,
+                )
+
+                param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                    param_data,
+                    loaded_weight,
+                    0,  # param_data_start
+                    start_idx,
+                    output_dim,
+                    shard_size,
+                    not use_bitsandbytes_4bit and not self.use_presharded_weights,
+                )
+            else:
+                # bitsandbytes loads the weights of the specific portion
+                # no need to narrow here
+                if not use_bitsandbytes_4bit and not self.use_presharded_weights:
+                    loaded_weight = loaded_weight.narrow(
+                        output_dim, start_idx, shard_size
+                    )
+
         # Special case for AQLM codebooks.
         elif is_metadata:
             # metadata indicates fixed size concatenated along dim 0
@@ -1094,10 +1123,27 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_id = self.tp_rank // self.num_kv_head_replicas
             start_idx = shard_id * shard_size
 
-            # bitsandbytes loads the weights of the specific portion
-            # no need to narrow here
-            if not use_bitsandbytes_4bit and not self.use_presharded_weights:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+            if _is_cpu:
+                from sglang.srt.model_loader.weight_utils import (
+                    narrow_padded_param_and_loaded_weight,
+                )
+
+                param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                    param_data,
+                    loaded_weight,
+                    0,  # param_data_start
+                    start_idx,
+                    output_dim,
+                    shard_size,
+                    not use_bitsandbytes_4bit and not self.use_presharded_weights,
+                )
+            else:
+                # bitsandbytes loads the weights of the specific portion
+                # no need to narrow here
+                if not use_bitsandbytes_4bit and not self.use_presharded_weights:
+                    loaded_weight = loaded_weight.narrow(
+                        output_dim, start_idx, shard_size
+                    )
 
         # Special case for for AQLM codebooks.
         elif is_metadata:
@@ -1239,7 +1285,22 @@ class RowParallelLinear(LinearBase):
         ):
             shard_size = param_data.shape[input_dim]
             start_idx = self.tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
+
+            if _is_cpu:
+                from sglang.srt.model_loader.weight_utils import (
+                    narrow_padded_param_and_loaded_weight,
+                )
+
+                param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                    param_data,
+                    loaded_weight,
+                    0,  # param_data_start
+                    start_idx,
+                    input_dim,
+                    shard_size,
+                )
+            else:
+                loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
@@ -1270,7 +1331,7 @@ class RowParallelLinear(LinearBase):
             # It does not support additional parameters.
             param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, can_fuse_mlp_allreduce=False):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1285,7 +1346,7 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
-        if self.reduce_results and self.tp_size > 1:
+        if self.reduce_results and self.tp_size > 1 and not can_fuse_mlp_allreduce:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel

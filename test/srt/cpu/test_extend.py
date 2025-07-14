@@ -6,6 +6,8 @@ from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.test.test_utils import CustomTestCase
 
+torch.manual_seed(1234)
+
 
 class TestExtendAttention(CustomTestCase):
 
@@ -121,7 +123,8 @@ class TestExtendAttention(CustomTestCase):
                 (b_seq_len_extend[i], H_Q, D), dtype=dtype
             )
 
-        # k_extend, v_extend, k_buffer and v_buffer supports non-contiguous tensors
+        # q_extend, k_extend, v_extend, k_buffer and v_buffer supports non-contiguous tensors
+        q_extend = q_extend.transpose(0, 1).contiguous().transpose(0, 1)
         k_extend = k_extend.transpose(0, 1).contiguous().transpose(0, 1)
         v_extend = v_extend.transpose(0, 1).contiguous().transpose(0, 1)
         k_buffer = k_buffer.transpose(0, 1).contiguous().transpose(0, 1)
