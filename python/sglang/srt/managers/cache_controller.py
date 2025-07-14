@@ -32,9 +32,8 @@ from sglang.srt.distributed import (
     get_world_group
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
-from sglang.srt.mem_cache.mooncake_store import MooncakeStore
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str, get_hash_str_mooncake
+from sglang.srt.mem_cache.hicache_storage import HiCacheFile, MooncakeStore, get_hash_str, get_hash_str_mooncake
 
 logger = logging.getLogger(__name__)
 
@@ -729,9 +728,11 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if self.storage_batchedio:
                     if self.storage_zerocopy:
-                        key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(operation.hash_value,
-                                                                                     operation.host_indices)
+
+                        key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(operation.hash_value[:-1],
+                                                                                     operation.host_indices[:-self.page_size])
                         self.storage_backend.get(key_strs, buffer_ptrs, buffer_sizes)
+
                     else:
                         pass
                     operation.completed_tokens += len(operation.hash_value) * self.page_size
@@ -797,20 +798,29 @@ class HiCacheController:
                                 ],
                                 local_rank
                             )
-                    
-                    if self.storage_backend.exists(last_hash):
+                    if not self.storage_batchedio:
+                        exist_result = self.storage_backend.exists(last_hash)
+                    if (not self.storage_batchedio) and exist_result:
+                        storage_hit_count += self.page_size
+                        hash_value.append(last_hash)
+                        remaining_tokens -= self.page_size
+                    elif self.storage_batchedio:
                         storage_hit_count += self.page_size
                         hash_value.append(last_hash)
                         remaining_tokens -= self.page_size
                     else:
                         break
+                if self.storage_batchedio:
+                    exist_result = self.storage_backend.exists(hash_value)
+                    storage_hit_count = sum(1 for v in exist_result.values() if v != 0) * self.page_size
 
                 if storage_hit_count < self.prefetch_threshold:
+                    logger.info("not enough for prefetching")
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                 else:
                     operation.hash_value = hash_value
-                    logger.debug(
+                    logger.info(
                         f"Prefetching {len(hash_value)} pages for request {operation.request_id}."
                     )
                     self.prefetch_buffer.put(operation)
@@ -868,7 +878,7 @@ class HiCacheController:
                     hash_value.append(last_hash)
                     remaining_tokens -= self.page_size
                     operation.hash_value = hash_value
-                    
+
                 if self.storage_batchedio:
                     if self.storage_zerocopy:
                         exist_hashvalues = self.storage_backend.exists(hash_value)
@@ -882,7 +892,7 @@ class HiCacheController:
                         if len(non_exist_keys) > 0:
                             key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(non_exist_keys,
                                                                                              non_exist_indices)
-                            self.storage_backend.set(key_strs, buffer_ptrs, buffer_sizes)
+                            self.storage_backend.set(key_strs, target_location=buffer_ptrs, target_sizes=buffer_sizes)
 
                         operation.comleted_tokens += len(hash_value) * self.page_size
                     else:

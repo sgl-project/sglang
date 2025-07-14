@@ -99,7 +99,7 @@ class HiRadixCache(RadixCache):
         self.tp_group = tp_cache_group
         self.enable_storage = hicache_storage_backend is not None
         # todo: customizable storage prefetch threshold
-        self.prefetch_threshold = 256
+        self.prefetch_threshold = 32
 
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
@@ -123,7 +123,7 @@ class HiRadixCache(RadixCache):
         self.write_through_threshold = (
             1 if hicache_write_policy == "write_through" else 3
         )
-        self.write_through_threshold_storage = 3
+        self.write_through_threshold_storage = 1
         self.load_back_threshold = 10
         super().__init__(
             req_to_token_pool, token_to_kv_pool_allocator, page_size, disable=False
@@ -142,47 +142,6 @@ class HiRadixCache(RadixCache):
             height += 1
         return height
 
-    # def write_backup(
-    #     self, node: TreeNode, write_back=False, token_ids: Optional[List] = None
-    # ):
-    #     l3_keys = []
-    #     if self.enable_mooncake_store_l3_cache:
-    #         # The KV cache of each rank in the MLA model is the same, so only one copy needs to be stored
-    #         local_rank =  torch.cuda.current_device()
-    #         prefix_block_key = (
-    #             ""
-    #             if node.parent is None or len(node.parent.l3_keys) == 0
-    #             else node.parent.l3_keys[-1]
-    #         )
-    #         l3_keys = get_node_l3_keys(
-    #             token_ids, len(node.value), prefix_block_key, local_rank, self.page_size
-    #         )
-
-    #     host_indices = self.cache_controller.write(
-    #         device_indices=node.value,
-    #         node_id=node.id,
-    #         l3_keys=l3_keys if self.enable_mooncake_store_l3_cache else None,
-    #     )
-    #     if host_indices is None:
-    #         self.evict_host(len(node.value))
-    #         host_indices = self.cache_controller.write(
-    #             device_indices=node.value,
-    #             node_id=node.id,
-    #             l3_keys=l3_keys if self.enable_mooncake_store_l3_cache else None,
-    #         )
-    #     if host_indices is not None:
-    #         node.host_value = host_indices
-    #         self.ongoing_write_through[node.id] = node
-    #         if not write_back:
-    #             # no need to lock nodes if write back
-    #             self.inc_lock_ref(node)
-    #     else:
-    #         return 0
-
-    #     if len(l3_keys) > 0:
-    #         node.l3_keys = l3_keys
-
-    #     return len(host_indices)
     
     def write_backup(self, node: TreeNode, write_back=False):
         host_indices = self.cache_controller.write(
@@ -214,7 +173,7 @@ class HiRadixCache(RadixCache):
         node.protect_host()
 
     def inc_hit_count(self, node: TreeNode, token_ids: Optional[List] = None):
-        if node.backuped or self.cache_controller.write_policy == "write_back":
+        if self.cache_controller.write_policy == "write_back":
             return
         node.hit_count += 1
         # if node.hit_count >= self.write_through_threshold:
@@ -506,8 +465,8 @@ class HiRadixCache(RadixCache):
     def ready_to_load_host_cache(self):
         producer_index = self.cache_controller.layer_done_counter.next_producer()
         self.load_cache_event.set()
-        if self.mooncake_l3_load_cache_event:
-            self.mooncake_l3_load_cache_event.set()
+        # if self.mooncake_l3_load_cache_event:
+        #     self.mooncake_l3_load_cache_event.set()
         return producer_index
 
     def check_hicache_events(self):
@@ -556,10 +515,9 @@ class HiRadixCache(RadixCache):
     def check_prefetch_progress(self, req_id: str):
         if req_id not in self.outstanding_prefetch:
             return
-
         # todo: more policies for prefetch progress such as timeout
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(req_id)
-        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+        logger.info(f"Prefetch {req_id} completed with {completed_tokens} tokens")
         min_completed_tokens = torch.tensor(completed_tokens, dtype=torch.int)
         if torch.distributed.get_world_size(group=self.tp_group) > 1:
             # synchrnoize TP workers to make the same update to hiradix cache
@@ -608,16 +566,16 @@ class HiRadixCache(RadixCache):
 
         last_l3_node = None
         l3_hit_length = 0
-        if self.enable_mooncake_store_l3_cache:
-            while last_node.evicted and last_node.l3_backuped and not last_node.l2_backuped:
-                if not last_l3_node:
-                    last_l3_node = last_node
-                l3_hit_length += len(last_node.l3_keys) * self.page_size
-                last_node = last_node.parent
+        # if self.enable_mooncake_store_l3_cache:
+        #     while last_node.evicted and last_node.l3_backuped and not last_node.l2_backuped:
+        #         if not last_l3_node:
+        #             last_l3_node = last_node
+        #         l3_hit_length += len(last_node.l3_keys) * self.page_size
+        #         last_node = last_node.parent
 
         host_hit_length = 0
         last_host_node = last_node
-        while last_node.evicted and last_node.l2_backuped:
+        while last_node.evicted:
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
 
@@ -725,24 +683,18 @@ class HiRadixCache(RadixCache):
                     child_key = self.get_child_key_fn(key)
 
         # if self.enable_mooncake_store_l3_cache and do_prefetch:
-        #     prefetch_begin = time.time()
         #     # try to get the cross instance shared kv cache
         #     if len(key) and (not node.evicted or node.backuped):
         #         local_rank =  torch.cuda.current_device()
         #         prefix_block_key = (
         #             ""
-        #             if node.parent is None or len(node.parent.l3_keys) == 0
-        #             else node.parent.l3_keys[-1]
+        #             if node.parent is None or len(node.parent.hash_value) == 0
+        #             else node.parent.hash_value[-1]
         #         )
         #         l3_keys = get_node_l3_keys(
         #             total_key, len(key), prefix_block_key, local_rank, self.page_size
         #         )
         #         mooncake_exist_keys = self.cache_controller.is_batch_exist(l3_keys, node.id)
-        #         try:
-        #             ack_id = self.cache_controller.mooncake_l3_ack_load_queue.get(timeout=self.prefetch_threshold)
-        #             is_batch_exist_end = time.time()
-        #         except TimeoutError:
-        #             return value, node
         #         l3_exist_keys = []
         #         for l3_key in l3_keys:
         #             if mooncake_exist_keys[l3_key]:
@@ -760,25 +712,6 @@ class HiRadixCache(RadixCache):
         #             node.children[child_key] = new_node
         #             new_node.l3_keys = l3_exist_keys
         #             node = new_node
-        #     #TODO L2 lock
-        #     time_left = self.prefetch_threshold if not is_batch_exist_end else self.prefetch_threshold - (is_batch_exist_end - prefetch_begin)
-        #     nodes_to_prefetch: list[TreeNode] = []
-        #     while node.evicted and node.l2_backuped:
-        #         if node.l3_backuped:
-        #             nodes_to_prefetch.insert(0, node)
-
-        #     l3_keys = [key for node in nodes_to_prefetch for key in node.l3_keys]
-        #     slots_required = len(l3_keys) * self.page_size
-        #     nodes_id = [node.id for node in nodes_to_prefetch]
-        #     self.cache_controller.mooncake_load(l3_keys, slots_required, node_id=nodes_id)
-        #     try:
-        #         first_id = self.cache_controller.mooncake_l3_ack_load_queue.get(timeout=time_left)
-        #         while not self.cache_controller.mooncake_l3_ack_load_queue.empty():
-        #             self.cache_controller.mooncake_l3_ack_load_queue.get()
-
-        #     except TimeoutError:
-        #         #TODO: halt message
-        #         pass
 
         return value, node
 
@@ -798,12 +731,13 @@ class HiRadixCache(RadixCache):
         else:
             new_node.value = child.value[:split_len]
             child.value = child.value[split_len:]
-        if child.l2_backuped:
+        if child.backuped:
             new_node.host_value = child.host_value[:split_len]
             child.host_value = child.host_value[split_len:]
-        if child.l3_backuped:
-            new_node.l3_keys = child.l3_keys[: split_len // self.page_size]
-            child.l3_keys = child.l3_keys[split_len // self.page_size :]
+
+        if child.hash_value:
+            new_node.hash_value = child.hash_value[:split_len // self.page_size]
+            child.hash_value = child.hash_value[split_len // self.page_size:]
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node

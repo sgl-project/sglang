@@ -25,15 +25,16 @@ def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
 	return hasher.hexdigest()
 
 def get_hash_str_mooncake(
-    prefix_block_key: str, current_page_ids: List, local_rank: int
+	prefix_block_key: str, current_page_ids: List, local_rank: int
 ):
-    prefix_str = ""
-    if len(prefix_block_key):
-        prefix_str = hashlib.sha256(prefix_block_key.encode()).hexdigest()
-    current_token_ids_bytes = np.array(current_page_ids).tobytes()
-    current_hash_object = hashlib.sha256(current_token_ids_bytes)
-    current_hash_hex = current_hash_object.hexdigest()
-    return f"{prefix_str}_{int(current_hash_hex[:16], 16)}_{local_rank}"
+	prefix_str = ""
+	if prefix_block_key:
+		if len(prefix_block_key):
+			prefix_str = hashlib.sha256(prefix_block_key.encode()).hexdigest()
+	current_token_ids_bytes = np.array(current_page_ids).tobytes()
+	current_hash_object = hashlib.sha256(current_token_ids_bytes)
+	current_hash_hex = current_hash_object.hexdigest()
+	return f"{prefix_str}_{int(current_hash_hex[:16], 16)}_{local_rank}"
 
 
 # todo: batch API for better performance
@@ -78,7 +79,7 @@ class HiCacheStorage(ABC):
 		pass
 
 	@abstractmethod
-	def exists(self, key) -> bool | Dict:
+	def exists(self, key) -> bool | dict:
 		"""
 		Check if the key exists in the storage.
 		Returns True if the key exists, False otherwise.
@@ -143,7 +144,7 @@ class HiCacheFile(HiCacheStorage):
 			logger.warning(f"Key {key} does not exist. Cannot delete.")
 			return
 
-	def exists(self, key) -> bool | Dict:
+	def exists(self, key) -> bool | dict:
 		tensor_path = f"{self.file_path}/{key}.bin"
 		return os.path.exists(tensor_path)
 
@@ -258,7 +259,7 @@ class MooncakeStore(HiCacheStorage):
 	def set(
 		self, 
 		key, 
-		value, 
+		value: Optional[Any] = None, 
 		target_location: Optional[List[int]] = None,
 		target_sizes: Optional[List[int]] = None) -> bool:
 		assert len(key) == len(target_location) == len(target_sizes)
@@ -291,15 +292,16 @@ class MooncakeStore(HiCacheStorage):
 
 		return self._get_batch_zero_copy_impl(key, target_location, target_sizes)
 	
-	def exists(self, key) -> bool | Dict:
+	def exists(self, keys) -> bool | dict:
 		_keys = []
-		for key in key:
+		for key in keys:
 			if key is None:
 				return None
 			# Since mooncake store is stored in layer by layer,
 			# only the first layer is checked here.
 			_keys.append(f"{key}_0_k")
-		return {k: v for k, v in zip(key, self.store.batch_is_exist(_keys))}
+		result = {k: v for k, v in zip(keys, self.store.batch_is_exist(_keys))}
+		return result
 
 	def delete(self, key) -> None:
 		raise(NotImplementedError)

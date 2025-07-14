@@ -1213,6 +1213,7 @@ class Scheduler(
             self._add_request_to_queue(req)
 
     def _add_request_to_queue(self, req: Req):
+        logger.info("add request to queue")
         req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.disagg_prefill_bootstrap_queue.add(
@@ -1226,6 +1227,8 @@ class Scheduler(
                 last_hash = req.last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 if (matched_len > 0 and last_hash is not None) or matched_len == 0:
+                    logger.info("do prefetch")
+                    logger.info(f"matched len:{matched_len}")
                     new_input_tokens = req.fill_ids[matched_len:]
                     self.tree_cache.prefetch_from_storage(
                         req.rid, req.last_host_node, new_input_tokens, last_hash
