@@ -144,6 +144,7 @@ def bench():
     )
 
     numel = 2 * tokens_per_page * layer_num * head_num * head_dim
+    assert numel * dtype.itemsize == bytes_per_page
 
     num_page = 128
     values = [torch.randn((numel,)).to(dtype=dtype) for _ in tqdm(range(num_page))]
@@ -180,10 +181,61 @@ def bench():
     hicache_hf3fs.close()
 
 
+def allclose():
+    # Qwen3-32B
+    layer_num = 64
+    head_num, head_dim = 8, 128
+    kv_lora_rank, qk_rope_head_dim = 0, 0
+    store_dtype = torch.bfloat16
+    tokens_per_page = 64
+
+    file_path = "/data/test.bin"
+    file_size = 1 << 40
+    numjobs = 16
+    bytes_per_page = 16 << 20
+    entries = 8
+    dtype = store_dtype
+    hicache_hf3fs = HiCacheHF3FS(
+        file_path=file_path,
+        file_size=file_size,
+        numjobs=numjobs,
+        bytes_per_page=bytes_per_page,
+        entries=entries,
+        dtype=dtype,
+    )
+
+    numel = 2 * tokens_per_page * layer_num * head_num * head_dim
+    assert numel * dtype.itemsize == bytes_per_page
+
+    num_page = 128
+    values = [torch.randn((numel,)).to(dtype=dtype) for _ in tqdm(range(num_page))]
+
+    iteration = 100
+
+    for i in tqdm(range(iteration), desc="Benchmarking write (GB/s)"):
+        keys = [f"{j}" for j in range(i * num_page, (i + 1) * num_page)]
+        results = hicache_hf3fs.batch_set(keys, values)
+        assert all(results)
+
+    read_keys, read_results = [], []
+    for i in tqdm(range(iteration), desc="Benchmarking read (GB/s)"):
+        keys = random.sample(list(hicache_hf3fs.key_to_index.keys()), num_page)
+        results = hicache_hf3fs.batch_get(keys)
+        read_keys.extend(keys)
+        read_results.extend(results)
+        assert all([r is not None for r in results])
+
+    for key, result in tqdm(zip(read_keys, read_results)):
+        assert torch.allclose(values[int(key) % num_page], result, atol=1e-3)
+
+    hicache_hf3fs.close()
+
+
 def main():
     logging.basicConfig(level=logging.INFO)
     test()
     bench()
+    allclose()
 
 
 if __name__ == "__main__":

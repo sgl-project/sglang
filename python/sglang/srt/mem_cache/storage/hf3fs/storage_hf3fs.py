@@ -98,8 +98,13 @@ class HiCacheHF3FS(HiCacheStorage):
     ) -> "HiCacheHF3FS":
         config_path = os.getenv(HiCacheHF3FS.default_env_var)
         if not config_path:
-            raise ValueError(
-                f"Environment variable {HiCacheHF3FS.default_env_var} not set"
+            return HiCacheHF3FS(
+                file_path=f"/data/hicache.{rank}.bin",
+                file_size=1 << 40,
+                numjobs=16,
+                bytes_per_page=bytes_per_page,
+                entries=8,
+                dtype=dtype,
             )
 
         try:

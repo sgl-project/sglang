@@ -6,16 +6,20 @@ from functools import wraps
 from typing import List
 
 import torch
-from hf3fs_fuse.io import (
-    deregister_fd,
-    extract_mount_point,
-    make_ioring,
-    make_iovec,
-    register_fd,
-)
 from sgl_kernel.hf3fs_utils import read_shm, write_shm
 
 logger = logging.getLogger(__name__)
+
+try:
+    from hf3fs_fuse.io import (
+        deregister_fd,
+        extract_mount_point,
+        make_ioring,
+        make_iovec,
+        register_fd,
+    )
+except ImportError:
+    logger.warning("hf3fs_fuse.io is not available")
 
 
 def rsynchronized():
