@@ -54,6 +54,7 @@ class RadixAttention(nn.Module):
         attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
         prefix: str = "",
+        enable_attention_sink: bool = False,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -68,6 +69,7 @@ class RadixAttention(nn.Module):
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
         self.use_irope = use_irope
+        self.enable_attention_sink = enable_attention_sink
         self.k_scale = None
         self.v_scale = None
         self.k_scale_float = None

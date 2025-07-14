@@ -234,6 +234,8 @@ def throughput_test_once(
 
     st = time.perf_counter()
     gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
+    print(f"prompt: {prompt}")
+    print(f"gen_out: {gen_out}")
     latency = time.perf_counter() - st
 
     if profile:
