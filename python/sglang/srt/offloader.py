@@ -6,13 +6,8 @@ from sglang.srt.utils import is_pin_memory_available
 class _ModuleOffloader:
     def __init__(self, module: torch.nn.Module):
         device = next(module.parameters()).device
-
-        if device == torch.device("cpu"):
-            return module
-
-        global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
-        if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
-            return module
+        TODO_if_cpu_then_do_not_offload
+        assert device != torch.device("cpu")
 
         pin_memory = is_pin_memory_available()
         # offload parameters to CPU
