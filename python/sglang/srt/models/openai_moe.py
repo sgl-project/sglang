@@ -192,7 +192,6 @@ def sink_attention_ref(
     return o_ref
 
 
-
 # Todo: to make sure sliding window size for flashinfer is correct
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
@@ -598,6 +597,39 @@ class OpenAIMoeAttention(nn.Module):
         )
         self.layer_id = layer_id
 
+    def flashinfer_attention_ref(self, inner_state):
+        q, k, v, forward_batch = inner_state
+        
+        # Reshape q, k, v to match what sink_attention_ref expects
+        # Current shapes: q=[seq_len, num_heads * head_dim], k/v=[seq_len, num_kv_heads * head_dim]
+        # Need: [batch_size * seq_len, num_heads, head_dim]
+        batch_size = forward_batch.batch_size
+        
+        if batch_size > 0 and q.shape[0] > 0:
+            seq_len = q.shape[0]
+            
+            # Reshape tensors to [seq_len, num_heads, head_dim]
+            q_reshaped = q.view(seq_len, self.num_heads, self.head_dim)
+            k_reshaped = k.view(seq_len, self.num_kv_heads, self.head_dim)
+            v_reshaped = v.view(seq_len, self.num_kv_heads, self.head_dim)
+            
+            # Expand k and v to match q's num_heads if using MQA/GQA
+            if self.num_kv_heads != self.num_heads:
+                k_reshaped = k_reshaped.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+                v_reshaped = v_reshaped.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+            
+            o_ref = sink_attention_ref(
+                batch_size=batch_size,
+                q=q_reshaped,
+                k=k_reshaped,
+                v=v_reshaped,
+                sink=sinks,
+                causal=True,
+                sm_scale=self.scaling,
+                window_left=127 if self.layer_id % 2 == 0 else -1,
+            )    
+        return o_ref.view(seq_len, self.num_heads * self.head_dim)
+
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
             positions=state.positions,
@@ -632,55 +664,17 @@ class OpenAIMoeAttention(nn.Module):
         sinks = torch.exp(self.sinks)
         sinks = sinks.to(torch.float32)
         attn_output = self.attn(*inner_state, sink=sinks)    
-        q, k, v, forward_batch = inner_state
-        
-        # Reshape q, k, v to match what sink_attention_ref expects
-        # Current shapes: q=[seq_len, num_heads * head_dim], k/v=[seq_len, num_kv_heads * head_dim]
-        # Need: [batch_size * seq_len, num_heads, head_dim]
-        batch_size = forward_batch.batch_size
-        
-        if batch_size > 0 and q.shape[0] > 0:
-            seq_len = q.shape[0]
-            
-            # Reshape tensors to [seq_len, num_heads, head_dim]
-            q_reshaped = q.view(seq_len, self.num_heads, self.head_dim)
-            k_reshaped = k.view(seq_len, self.num_kv_heads, self.head_dim)
-            v_reshaped = v.view(seq_len, self.num_kv_heads, self.head_dim)
-            
-            # Expand k and v to match q's num_heads if using MQA/GQA
-            if self.num_kv_heads != self.num_heads:
-                k_reshaped = k_reshaped.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-                v_reshaped = v_reshaped.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-            
-            o_ref = sink_attention_ref(
-                batch_size=batch_size,
-                q=q_reshaped,
-                k=k_reshaped,
-                v=v_reshaped,
-                sink=sinks,
-                causal=True,
-                sm_scale=self.scaling,
-                window_left=127 if self.layer_id % 2 == 0 else -1,
-            )
-            # Reshape o_ref back to match attn_output shape
-            o_ref = o_ref.view(seq_len, self.num_heads * self.head_dim)
-            if self.layer_id % 2 == 1:
-                print(f"### layer_id={self.layer_id}, attn_output.shape={attn_output.shape}, o_ref.shape={o_ref.shape}")
-                torch.testing.assert_close(attn_output, o_ref, rtol=1e-2, atol=1e-2)
-
-
-        '''
-        # Todo: use hyperparam self.sinks
-        sinks = torch.exp(self.sinks.to(torch.float32))
-        sinks = sinks.to(torch.float32)
-        attn_output = self.attn(*inner_state, sink=sinks)
-        '''
+        o_ref = self.flashinfer_attention_ref(inner_state)
         # # Todo: sdpa as a WA for attn_kernel
         q = inner_state[0].view(-1, self.num_kv_heads, self.num_heads // self.num_kv_heads, self.head_dim)
         k = inner_state[1].view(-1, self.num_kv_heads, self.head_dim)
         v = inner_state[2].view(-1, self.num_kv_heads, self.head_dim)
-        attn_output = sdpa(q, k, v, self.sinks, self.scaling, self.sliding_window)
-        output, _ = self.o_proj(attn_output)
+        sdpa_output = sdpa(q, k, v, self.sinks, self.scaling, self.sliding_window)
+        if self.layer_id % 2 == 1:
+            print(f"### layer_id={self.layer_id}, attn_output.shape={attn_output.shape}, o_ref.shape={o_ref.shape}, sdpa_output.shape={sdpa_output.shape}")
+            torch.testing.assert_close(o_ref, sdpa_output, rtol=1e-2, atol=1e-2)
+            torch.testing.assert_close(attn_output, o_ref, rtol=1e-2, atol=1e-2)   
+        output, _ = self.o_proj(sdpa_output)
         return output
 
     def forward(
