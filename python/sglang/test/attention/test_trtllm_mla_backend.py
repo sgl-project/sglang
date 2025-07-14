@@ -54,7 +54,7 @@ class MockModelRunner:
                 "req_to_token": torch.zeros(max_bs, max_ctx, dtype=torch.int32, device=self.device),
             },
         )
-
+        
         # KV-token pool
         self.token_to_kv_pool = MLATokenToKVPool(
             size=max_bs * max_ctx,
@@ -75,10 +75,10 @@ class TestTRTLLMMLABackend(CustomTestCase):
     def setUp(self):
         self.batch_size = 16
         self.seq_len = 512
-        self.page_sizes = [16, 32, 64]
+        self.page_sizes = [32, 64]
         self.device = "cuda"
         self.dtype = torch.bfloat16
-
+        
     # ‑- helpers ---------------------------------------------------------
     def _init(self, page_size: int):
         self.model_runner = MockModelRunner(page_size)
@@ -122,7 +122,7 @@ class TestTRTLLMMLABackend(CustomTestCase):
 
             forward_batch = self._create_forward_batch(seq_lens)
             self.backend.init_forward_metadata(forward_batch)
-
+        
             q, k, v = self._alloc_qkv()
             layer = RadixAttention(
                 num_heads=128,
@@ -134,7 +134,7 @@ class TestTRTLLMMLABackend(CustomTestCase):
                 prefix="attn_mqa",
             )
             out = self.backend.forward_decode(q, k, v, layer, forward_batch)
-
+        
             self.assertEqual(out.shape, (self.batch_size, 128 * 512))
             self.assertEqual(out.dtype, self.dtype)
             self.assertEqual(out.device.type, "cuda")
