@@ -1,6 +1,7 @@
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/linear.py"""
 
 from __future__ import annotations
+
 import itertools
 import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple

@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/moe_wna16.py
 from __future__ import annotations
+
 import logging
 from typing import Any, Callable, Dict, List, Optional
 

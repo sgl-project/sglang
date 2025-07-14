@@ -2,6 +2,7 @@
 
 # ruff: noqa: SIM117
 from __future__ import annotations
+
 import collections
 import concurrent
 import dataclasses

@@ -1,6 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/v0.8.2/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
+
 import logging
 from contextlib import suppress
 from typing import Any, Dict, List, Literal, NamedTuple, Optional, Tuple, cast

@@ -2,6 +2,7 @@
 
 """Utilities for downloading and initializing model weights."""
 from __future__ import annotations
+
 import concurrent.futures
 import fnmatch
 import glob
@@ -35,6 +36,8 @@ from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.layers.quantization import get_quantization_config
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.utils import print_warning_once
 
 if TYPE_CHECKING:
@@ -139,9 +142,6 @@ def get_quant_config(
     load_config: LoadConfig,
     packed_modules_mapping: Dict[str, List[str]],
 ) -> QuantizationConfig:
-
-    from sglang.srt.layers.quantization import get_quantization_config
-    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 
     quant_cls = get_quantization_config(model_config.quantization)
 

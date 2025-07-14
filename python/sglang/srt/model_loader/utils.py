@@ -2,6 +2,7 @@
 
 """Utilities for selecting and loading models."""
 from __future__ import annotations
+
 import contextlib
 import logging
 from typing import TYPE_CHECKING, Tuple, Type
@@ -10,6 +11,8 @@ import torch
 import transformers
 from torch import nn
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+from sglang.srt.configs.model_config import ModelImpl
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -28,8 +31,6 @@ def set_default_torch_dtype(dtype: torch.dtype):
 
 
 def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str]):
-
-    from sglang.srt.configs.model_config import ModelImpl
 
     for i, arch in enumerate(architectures):
         if arch == "TransformersForCausalLM":
@@ -86,7 +87,6 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
 
 
 def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], str]:
-    from sglang.srt.configs.model_config import ModelImpl
     from sglang.srt.models.registry import ModelRegistry
 
     architectures = getattr(model_config.hf_config, "architectures", [])

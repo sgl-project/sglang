@@ -7,7 +7,6 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -267,6 +266,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 renormalize=renormalize,
             )
         else:
+            from sglang.srt.layers.moe.topk import select_experts
+
             topk_weights, topk_ids = select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
@@ -344,6 +345,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         assert activation == "silu", f"activation = {activation} is not supported."
 
         if use_intel_amx_backend(layer) and not apply_router_weight_on_input:
+
+            from sglang.srt.layers.moe.topk import select_experts
+
             topk_weights, topk_ids = select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
