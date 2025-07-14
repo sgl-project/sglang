@@ -2,9 +2,11 @@
 
 import argparse
 import copy
+import json
 import logging
 import os
 import random
+import re
 import subprocess
 import threading
 import time
@@ -99,6 +101,15 @@ def is_in_ci():
 def is_in_amd_ci():
     """Return whether it is in an AMD CI runner."""
     return get_bool_env_var("SGLANG_AMD_CI")
+
+
+def _use_cached_default_models(model_repo: str):
+    cache_dir = os.getenv("DEFAULT_MODEL_CACHE_DIR")
+    if cache_dir and model_repo:
+        model_path = os.path.join(cache_dir, model_repo)
+        if os.path.isdir(model_path):
+            return os.path.abspath(model_path)
+    return ""
 
 
 if is_in_ci():
@@ -416,6 +427,31 @@ def get_call_select(args: argparse.Namespace):
             raise
 
     return func
+
+
+def _get_default_models():
+    import inspect
+
+    current_module = inspect.getmodule(_get_default_models)
+    default_models = set()
+    for name, value in current_module.__dict__.items():
+        if (
+            isinstance(name, str)
+            and "DEFAULT_" in name
+            and "MODEL_" in name
+            and isinstance(value, str)
+        ):
+            if "," in value:
+                parts = [part.strip() for part in value.split(",")]
+                default_models.update(parts)
+            else:
+                default_models.add(value.strip())
+    return json.dumps(list(default_models))
+
+
+def try_cached_model(model_repo: str):
+    model_dir = _use_cached_default_models(model_repo)
+    return model_dir if model_dir else model_repo
 
 
 def popen_launch_server(
@@ -840,12 +876,23 @@ def run_bench_one_batch(model, other_args):
         print(f"Output: {output}", flush=True)
         print(f"Error: {error}", flush=True)
 
-        lastline = output.split("\n")[-3]
-        output_throughput = float(lastline.split(" ")[-2])
+        # Return prefill_latency, decode_throughput, decode_latency
+        prefill_line = output.split("\n")[-9]
+        decode_line = output.split("\n")[-3]
+        pattern = (
+            r"latency: (?P<latency>\d+\.\d+).*?throughput:\s*(?P<throughput>\d+\.\d+)"
+        )
+        match = re.search(pattern, prefill_line)
+        if match:
+            prefill_latency = float(match.group("latency"))
+        match = re.search(pattern, decode_line)
+        if match:
+            decode_latency = float(match.group("latency"))
+            decode_throughput = float(match.group("throughput"))
     finally:
         kill_process_tree(process.pid)
 
-    return output_throughput
+    return prefill_latency, decode_throughput, decode_latency
 
 
 def run_bench_offline_throughput(model, other_args):
