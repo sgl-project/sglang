@@ -1,57 +1,36 @@
-# coding=utf-8
-# Adapted from 
-# https://github.com/huggingface/transformers/blob/main/src/transformers/models/glm4v/modular_glm4v.py
-# Copyright 2025 The ZhipuAI Inc. team and HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Inference-only GLM-4V model compatible with HuggingFace weights."""
-
 import logging
-import math
 from functools import lru_cache, partial
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
-from transformers.activations import ACT2FN
 from transformers.models.glm4v.configuration_glm4v import Glm4vConfig, Glm4vVisionConfig
-from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VisionBlock
-from sglang.srt.layers.activation import SiluAndMul
 
 from sglang.srt.hf_transformers_utils import get_processor
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear, MergedColumnParallelLinear, QKVParallelLinear
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-    general_mm_embed_routine,
-)
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
+from sglang.srt.models.qwen2_5_vl import (
+    Qwen2_5_VisionBlock,
+    Qwen2_5_VLForConditionalGeneration,
+)
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
 cached_get_processor = lru_cache(get_processor)
+
 
 class Glm4vRMSNorm(RMSNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -77,14 +56,14 @@ class Glm4vVisionMLP(nn.Module):
             output_sizes=[hidden_features] * 2,
             bias=bias,
             quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix)
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             hidden_features,
             in_features,
             bias=bias,
             quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix)
+            prefix=add_prefix("down_proj", prefix),
         )
         self.act_fn = SiluAndMul()
 
@@ -115,7 +94,7 @@ class Glm4vVisionBlock(Qwen2_5_VisionBlock):
         )
         self.norm1 = Glm4vRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm2 = Glm4vRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        
+
         self.mlp = Glm4vVisionMLP(
             config.hidden_size,
             config.out_hidden_size,
@@ -123,6 +102,7 @@ class Glm4vVisionBlock(Qwen2_5_VisionBlock):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
+
 
 class Glm4vVisionPatchEmbed(nn.Module):
     def __init__(
@@ -169,7 +149,7 @@ class Glm4vPatchMerger(nn.Module):
             self.hidden_size,
             bias=bias,
             quant_config=quant_config,
-            prefix=add_prefix("proj", prefix)
+            prefix=add_prefix("proj", prefix),
         )
         self.post_projection_norm = nn.LayerNorm(self.hidden_size)
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -177,14 +157,14 @@ class Glm4vPatchMerger(nn.Module):
             output_sizes=[context_dim] * 2,
             bias=bias,
             quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix)
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             context_dim,
             self.hidden_size,
             bias=bias,
             quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix)
+            prefix=add_prefix("down_proj", prefix),
         )
         self.extra_activation_func = nn.GELU()
 
@@ -215,7 +195,9 @@ class Glm4vVisionEmbeddings(nn.Module):
             persistent=False,
         )
 
-    def forward(self, embeddings, lengths, image_shapes, h_coords, w_coords) -> torch.Tensor:
+    def forward(
+        self, embeddings, lengths, image_shapes, h_coords, w_coords
+    ) -> torch.Tensor:
         pos_embed_weight = self.position_embedding.weight
         hidden_size = pos_embed_weight.shape[1]
         total_seq = h_coords.shape[0]
@@ -226,13 +208,17 @@ class Glm4vVisionEmbeddings(nn.Module):
 
         # Handle empty sequence case
         if total_seq == 0:
-            adapted_pos_embed = torch.empty(0, hidden_size, device=device, dtype=pos_embed_weight.dtype)
+            adapted_pos_embed = torch.empty(
+                0, hidden_size, device=device, dtype=pos_embed_weight.dtype
+            )
         else:
             # Convert inputs to tensors if needed
             if isinstance(lengths, list):
                 lengths = torch.tensor(lengths, device=device, dtype=torch.long)
             if not isinstance(image_shapes, torch.Tensor):
-                image_shapes = torch.tensor(image_shapes, device=device, dtype=torch.long)
+                image_shapes = torch.tensor(
+                    image_shapes, device=device, dtype=torch.long
+                )
 
             # Prepare 2D position embedding
             orig_size_sq = pos_embed_weight.shape[0]
@@ -245,12 +231,12 @@ class Glm4vVisionEmbeddings(nn.Module):
             )
 
             # Calculate target dimensions for each patch
-            target_h = torch.cat([
-                image_shapes[i, 1].repeat(lengths[i]) for i in range(len(lengths))
-            ]).to(device=device, dtype=torch.float32)
-            target_w = torch.cat([
-                image_shapes[i, 2].repeat(lengths[i]) for i in range(len(lengths))
-            ]).to(device=device, dtype=torch.float32)
+            target_h = torch.cat(
+                [image_shapes[i, 1].repeat(lengths[i]) for i in range(len(lengths))]
+            ).to(device=device, dtype=torch.float32)
+            target_w = torch.cat(
+                [image_shapes[i, 2].repeat(lengths[i]) for i in range(len(lengths))]
+            ).to(device=device, dtype=torch.float32)
 
             # Normalize coordinates to [-1, 1] range for grid_sample
             h_coords = h_coords.to(device=device, dtype=torch.float32)
@@ -271,8 +257,12 @@ class Glm4vVisionEmbeddings(nn.Module):
             )
 
             # Reshape and convert back to original dtype
-            adapted_pos_embed_fp32 = interpolated_embed_fp32.squeeze(0).squeeze(-1).permute(1, 0)
-            adapted_pos_embed = adapted_pos_embed_fp32.to(pos_embed_weight.dtype).to(embeddings.device)
+            adapted_pos_embed_fp32 = (
+                interpolated_embed_fp32.squeeze(0).squeeze(-1).permute(1, 0)
+            )
+            adapted_pos_embed = adapted_pos_embed_fp32.to(pos_embed_weight.dtype).to(
+                embeddings.device
+            )
 
         # Add adapted position encoding to embeddings
         embeddings = embeddings + adapted_pos_embed
@@ -293,10 +283,22 @@ class Glm4vVisionRotaryEmbedding(nn.Module):
         if seqlen > self._seq_len_cached:
             seqlen *= 2
             self._seq_len_cached = seqlen
-            self.inv_freq = 1.0 / (self.theta ** (torch.arange(
-                0, self.dim, 2, dtype=torch.float, device=self.inv_freq.device,
-            ) / self.dim))
-            seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+            self.inv_freq = 1.0 / (
+                self.theta
+                ** (
+                    torch.arange(
+                        0,
+                        self.dim,
+                        2,
+                        dtype=torch.float,
+                        device=self.inv_freq.device,
+                    )
+                    / self.dim
+                )
+            )
+            seq = torch.arange(
+                seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype
+            )
             freqs = torch.outer(seq, self.inv_freq)
             self._freqs_cached = freqs
 
@@ -314,14 +316,14 @@ class Glm4vVisionModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        
+
         patch_size = vision_config.patch_size
         temporal_patch_size = vision_config.temporal_patch_size
         in_channels = vision_config.in_channels
         depth = vision_config.depth
         self.hidden_size = vision_config.hidden_size
         self.num_heads = vision_config.num_heads
-        
+
         self.patch_size = vision_config.patch_size
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.out_hidden_size = vision_config.out_hidden_size
@@ -336,16 +338,19 @@ class Glm4vVisionModel(nn.Module):
         norm_layer = partial(Glm4vRMSNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = Glm4vVisionRotaryEmbedding(head_dim // 2)
-        
-        self.blocks = nn.ModuleList([
-            Glm4vVisionBlock(
-                config=vision_config,
-                norm_layer=norm_layer,
-                quant_config=quant_config,
-                prefix=add_prefix(f"blocks.{layer_idx}", prefix),
-            ) for layer_idx in range(depth)
-        ])
-        
+
+        self.blocks = nn.ModuleList(
+            [
+                Glm4vVisionBlock(
+                    config=vision_config,
+                    norm_layer=norm_layer,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"blocks.{layer_idx}", prefix),
+                )
+                for layer_idx in range(depth)
+            ]
+        )
+
         self.merger = Glm4vPatchMerger(
             d_model=vision_config.out_hidden_size,
             context_dim=vision_config.intermediate_size,
@@ -353,17 +358,21 @@ class Glm4vVisionModel(nn.Module):
             bias=False,
             prefix=add_prefix("merger", prefix),
         )
-        
+
         self.embeddings = Glm4vVisionEmbeddings(vision_config)
 
-        self.post_conv_layernorm = Glm4vRMSNorm(vision_config.hidden_size, eps=vision_config.rms_norm_eps)
+        self.post_conv_layernorm = Glm4vRMSNorm(
+            vision_config.hidden_size, eps=vision_config.rms_norm_eps
+        )
         self.downsample = nn.Conv2d(
             in_channels=vision_config.hidden_size,
             out_channels=vision_config.out_hidden_size,
             kernel_size=vision_config.spatial_merge_size,
             stride=vision_config.spatial_merge_size,
         )
-        self.post_layernorm = Glm4vRMSNorm(vision_config.hidden_size, eps=vision_config.rms_norm_eps)
+        self.post_layernorm = Glm4vRMSNorm(
+            vision_config.hidden_size, eps=vision_config.rms_norm_eps
+        )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -420,8 +429,10 @@ class Glm4vVisionModel(nn.Module):
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
 
         seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        x = self.embeddings(x, seqlens, grid_thw, image_type_ids[:, 0], image_type_ids[:, 1])
-        
+        x = self.embeddings(
+            x, seqlens, grid_thw, image_type_ids[:, 0], image_type_ids[:, 1]
+        )
+
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         rotary_pos_emb_tuple = (emb.cos(), emb.sin())
 
@@ -451,7 +462,7 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         nn.Module.__init__(self)
 
         self.config = config
-        
+
         self.model = Glm4Model(
             config,
             quant_config,
@@ -473,13 +484,11 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
-        
+
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
-        
-        
-    
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -529,4 +538,4 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = [Glm4vForConditionalGeneration] 
+EntryClass = [Glm4vForConditionalGeneration]

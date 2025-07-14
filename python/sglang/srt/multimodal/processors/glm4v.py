@@ -2,10 +2,9 @@ import asyncio
 import re
 from typing import List, Union
 
-import torch
 from PIL import Image
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -15,7 +14,6 @@ from sglang.srt.multimodal.processors.qwen_vl import (
     preprocess_video,
     resize_image_async,
 )
-from sglang.utils import logger
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
@@ -23,7 +21,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        
+
         # GLM-4V specific tokens
         self.IMAGE_TOKEN = "<|image|>"
         self.VIDEO_TOKEN = "<|video|>"
@@ -31,7 +29,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         self.IMAGE_END_TOKEN = "<|end_of_image|>"
         self.VIDEO_START_TOKEN = "<|begin_of_video|>"
         self.VIDEO_END_TOKEN = "<|end_of_video|>"
-        
+
         # Token IDs
         self.IM_TOKEN_ID = hf_config.image_token_id
         self.VIDEO_TOKEN_ID = hf_config.video_token_id
@@ -39,12 +37,12 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         self.IMAGE_END_TOKEN_ID = hf_config.image_end_token_id
         self.VIDEO_START_TOKEN_ID = hf_config.video_start_token_id
         self.VIDEO_END_TOKEN_ID = hf_config.video_end_token_id
-        
+
         # Vision config
         self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = 4 * 28 * 28
         self.MAX_PIXELS = 16384 * 28 * 28
-        
+
         # Setup regex patterns
         self.IMAGE_TOKEN_REGEX = re.compile(
             r"<\|begin_of_image\|>(?:<\|image\|>)+<\|end_of_image\|>"
@@ -52,7 +50,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         self.VIDEO_TOKEN_REGEX = re.compile(
             r"<\|begin_of_video\|>(?:<\|video\|>)+<\|end_of_video\|>"
         )
-        
+
         self.mm_special_tokens = MultimodalSpecialTokens(
             image_token=self.IMAGE_TOKEN,
             image_token_regex=self.IMAGE_TOKEN_REGEX,
@@ -93,7 +91,10 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.IM_TOKEN_ID,
             video_token_id=self.VIDEO_TOKEN_ID,
-            vision_start_token_id=[self.IMAGE_START_TOKEN_ID, self.VIDEO_START_TOKEN_ID],
+            vision_start_token_id=[
+                self.IMAGE_START_TOKEN_ID,
+                self.VIDEO_START_TOKEN_ID,
+            ],
             model_type=self.hf_config.model_type,
             tokens_per_second=getattr(
                 self.hf_config.vision_config, "tokens_per_second", None
@@ -104,7 +105,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             second_per_grid_ts=getattr(ret, "second_per_grid_ts", None),
         )
         mrope_positions = mrope_positions.squeeze(1)
-        
+
         mm_inputs = {
             "input_ids": input_ids.flatten().tolist(),
             "mm_items": mm_items,
@@ -116,6 +117,6 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             "video_end_id": self.VIDEO_END_TOKEN_ID,
             "mrope_positions": mrope_positions,
             "mrope_position_delta": mrope_position_delta,
-        } 
+        }
 
         return mm_inputs
