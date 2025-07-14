@@ -46,7 +46,7 @@ class GlobalConfig:
         self.enable_parallel_encoding = True
 
         self.enable_gds = os.environ.get("enable_gds", "false").lower() in ("true", "1")
-        self.gds_path = os.environ.get("gds_path", "/tmp/gds/")
+        self.gds_path = os.environ.get("gds_path", "/mnt/gds/")
 
 
 global_config = GlobalConfig()
