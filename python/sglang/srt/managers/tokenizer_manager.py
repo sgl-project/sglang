@@ -497,6 +497,13 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
+        if self.disaggregation_mode != DisaggregationMode.NULL and (
+            obj.bootstrap_host is None or obj.bootstrap_room is None
+        ):
+            raise ValueError(
+                "bootstrap_host and bootstrap_room are required fields in PD disaggregation mode."
+            )
+
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
             logger.info(
