@@ -1,9 +1,9 @@
 #!/bin/bash
 set -euxo pipefail
 
-models=$(python3 -c "from sglang.test.test_utils import _get_default_models; print(_get_default_models())" | jq -r '.[]')
+mapfile -t models < <(python3 -c "from sglang.test.test_utils import _get_default_models; print(_get_default_models())" | jq -r '.[]')
 
-if [ -z "$models" ]; then
+if [ ${#models[@]} -eq 0 ]; then
     echo "Failed to get default models."
     exit 1
 fi
@@ -25,6 +25,7 @@ for model in "${models[@]}"; do
         --local-dir "$local_model_dir" \
         --local-dir-use-symlinks False 2>/dev/null; then
         echo "WARNING: Failed to cache model: $model"
+        rm -rf "$local_model_dir"
         failed_models+=("$model")
         continue
     fi
