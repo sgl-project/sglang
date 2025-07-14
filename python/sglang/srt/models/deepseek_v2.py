@@ -77,6 +77,7 @@ from sglang.srt.layers.quantization.int8_utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope, get_rope_wrapper
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -100,6 +101,7 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cpu,
     is_cuda,
+    is_flashinfer_available,
     is_hip,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
@@ -131,6 +133,9 @@ if _is_hip:
     from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
         decode_attention_fwd_grouped_rope,
     )
+
+_is_flashinfer_available = is_flashinfer_available()
+_is_sm100_supported = is_cuda() and is_sm100_supported()
 
 
 logger = logging.getLogger(__name__)
@@ -195,13 +200,13 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, forward_batch=None):
+    def forward(self, x, forward_batch=None, can_fuse_mlp_allreduce=False):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, can_fuse_mlp_allreduce=can_fuse_mlp_allreduce)
         return x
 
 
@@ -409,7 +414,10 @@ class DeepseekV2MoE(nn.Module):
         ]
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        can_fuse_mlp_allreduce: bool = False,
     ) -> torch.Tensor:
         if not self._enable_deepep_moe:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
@@ -418,33 +426,39 @@ class DeepseekV2MoE(nn.Module):
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             ):
-                return self.forward_normal_dual_stream(hidden_states)
+                return self.forward_normal_dual_stream(
+                    hidden_states, can_fuse_mlp_allreduce
+                )
             else:
-                return self.forward_normal(hidden_states)
+                return self.forward_normal(hidden_states, can_fuse_mlp_allreduce)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
-    def forward_normal_dual_stream(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states)
+    def forward_normal_dual_stream(
+        self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False
+    ) -> torch.Tensor:
 
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states)
 
         with torch.cuda.stream(self.alt_stream):
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
-        final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1:
+        final_hidden_states += shared_output
+        if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
-    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_normal(
+        self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False
+    ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
@@ -461,7 +475,7 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
@@ -514,7 +528,7 @@ class DeepseekV2MoE(nn.Module):
             None,  # a2_scale
             True,  # is_vnni
         )
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not self.can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
@@ -1818,6 +1832,29 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id % self.config.moe_layer_freq == 0
         )
 
+    def _should_fuse_mlp_allreduce_with_next_layer(self, forward_batch) -> bool:
+        """Check if MLP allreduce can be fused with next layer's add_rmsnorm"""
+
+        if (
+            self.layer_id == self.config.num_hidden_layers - 1
+            or get_tensor_model_parallel_world_size() <= 1
+        ):
+            return False
+
+        if not global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False):
+            return False
+
+        if not _is_sm100_supported or not _is_flashinfer_available:
+            return False
+
+        if hasattr(forward_batch, "input_ids") and (
+            forward_batch.input_ids.shape[0] == 0
+            or forward_batch.input_ids.shape[0] > 128
+        ):
+            return False
+
+        return True
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1842,11 +1879,21 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
+        can_fuse_mlp_allreduce = (
+            self._should_fuse_mlp_allreduce_with_next_layer(forward_batch)
+            and not (self.enable_dp_attention and self.speculative_algorithm.is_eagle())
+            and not self.is_nextn
         )
+
+        hidden_states = self.mlp(hidden_states, forward_batch, can_fuse_mlp_allreduce)
+
+        if can_fuse_mlp_allreduce:
+            hidden_states._sglang_needs_allreduce_fusion = True
+
+        if not can_fuse_mlp_allreduce:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
 
         return hidden_states, residual
 
@@ -2146,7 +2193,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             # This may affect the accuracy of fp8 model.
             # Fix deepseek v3 blockwise bmm by using deep_gemm
             use_deep_gemm_bmm = False
-            model_dtype = torch.get_default_dtype()
 
             if w.dtype in (
                 torch.float8_e4m3fn,
@@ -2172,7 +2218,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                         _is_cuda
                         and weight_block_size[0] == 128
                         and weight_block_size[1] == 128
-                        and model_dtype == torch.bfloat16
                     ):
                         if (
                             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -2186,7 +2231,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 weight,
                                 weight_scale,
                                 weight_block_size,
-                                model_dtype,
+                                torch.bfloat16,
                             )
                     else:
                         w, scale = block_quant_to_tensor_quant(

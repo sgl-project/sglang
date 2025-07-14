@@ -164,6 +164,7 @@ class ScaledActivation(nn.Module):
 _ACTIVATION_REGISTRY = {
     "gelu": nn.GELU(),
     "gelu_pytorch_tanh": nn.GELU(approximate="tanh"),
+    "gelu_new": NewGELU(),
 }
 
 
