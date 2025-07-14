@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 pub mod config;
 pub mod logging;
 use std::collections::HashMap;
+pub mod core;
 pub mod openai_api_types;
 pub mod pd_router;
 pub mod pd_types;
