@@ -16,8 +16,6 @@ class _ModuleOffloader:
 
         def _create_parameter_and_buffer_dicts():
             return {
-                # here we blindly call `to(device)`
-                # if the parameter is already on the device, it will be a no-op
                 k: v.to(device, non_blocking=True)
                 for k, v in module.state_dict().items()
             }
