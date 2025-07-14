@@ -24,6 +24,9 @@ import psutil
 import setproctitle
 import zmq
 
+from fastapi import FastAPI, Request, HTTPException
+import uvicorn
+
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
@@ -53,6 +56,73 @@ class LoadBalanceMethod(Enum):
         except KeyError as exc:
             raise ValueError(f"Invalid load balance method: {method}") from exc
 
+class LoadTable:
+    def __init__(self,dp_size):
+        self._table = {
+            rank:{
+                "pending_requests":0,
+                "nums_tokens":0,
+                "last_updateTime":time.time(),
+                "estimated_completed_time":0.0,
+                "avg_processing_speed":5000, 
+                "processing_history":[]
+            } for rank in range(dp_size)
+        }
+        self._lock = threading.Lock()
+        
+    def update_processing_speed(self, rank, completed_tokens, time_taken):
+        """update processing speed"""
+        if time_taken <= 0:
+            return
+            
+        with self._lock:
+            current_speed = completed_tokens / time_taken
+            
+            alpha = 0.3  # smoothing factor
+            old_speed = self._table[rank]["avg_processing_speed"]
+            new_speed = alpha * current_speed + (1 - alpha) * old_speed
+            
+            self._table[rank]["avg_processing_speed"] = new_speed
+            
+    def _update_estimated_completion_time(self, rank):
+        """def update estimated completion time"""
+        with self._lock:
+            rank_info = self._table[rank]
+            pending_tokens = rank_info["nums_tokens"]
+            processing_speed = rank_info["avg_processing_speed"]
+            if processing_speed > 0:
+                estimated_time = pending_tokens / processing_speed                
+                self._table[rank]["estimated_completion_time"] = estimated_time
+            else:
+                rank_info["estimated_completion_time"] = float('inf')
+            
+    def update_add(self,rank,requests=0,tokens = 0):
+        self._table[rank]["pending_requests"] += requests
+        self._table[rank]["nums_tokens"] += tokens
+        self._table[rank]["last_update"] = time.time()
+        self._update_estimated_completion_time(rank)
+        
+        
+    def update_sub(self, rank, requests=0, completed_tokens=0,processing_time = None):
+        self._table[rank]["pending_requests"] = max(0, self._table[rank]["pending_requests"] - requests)
+        self._table[rank]["nums_tokens"] = max(0, self._table[rank]["nums_tokens"] - completed_tokens)
+        self._table[rank]["last_update"] = time.time()
+        
+        if processing_time is not None and processing_time > 0 and completed_tokens > 0:
+            self.update_processing_speed(rank, completed_tokens, processing_time)
+        self._update_estimated_completion_time(rank)
+
+    def get_min_load_rank(self):
+        """get minimal load rank"""
+        with self._lock: 
+            return min(
+                self._table.items(), 
+                key=lambda x: (       
+                    x[1]["estimated_completed_time"], 
+                    x[1]["nums_tokens"]  
+                )
+            )[0]
+    
 
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
@@ -103,6 +173,36 @@ class DataParallelController:
                 )
 
         self.max_req_input_len = None
+        
+        if server_args.dp_size!=1 and server_args.load_balance_method=="shortest_queue":
+            if server_args.node_rank == 0:
+                self.load_table = LoadTable(server_args.dp_size)
+
+                self.app = FastAPI()
+                @self.app.post("/update_load")
+                async def update_load(request:Request):
+                    try:
+                        data = await request.json()
+                        rank = data["rank"]
+                        completed_requests = data["completed_requests"]
+                        completed_tokens = data["completed_tokens"]
+                        taken_time = data["taken_time"]
+                        self.load_table.update_sub(rank,requests=completed_requests,tokens=completed_tokens,processing_time = taken_time)
+                        return {"status":"success"}
+                    except Exception as e:
+                        raise HTTPException(status_code=400,detail=str(e))
+                if self.server_args.dist_init_addr != "null":   
+                    self.master_ip = server_args.dist_init_addr.split(":")[0]
+                    self.master_port = 8001
+                    self.http_thread = threading.Thread(
+                        target=self._run_http_server,
+                        args=(self.master_port,),
+                        daemon=True
+                    )
+                    self.http_thread.start()
+                else:
+                    raise NotImplementedError()
+                
 
     def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
@@ -264,7 +364,15 @@ class DataParallelController:
                 self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, input_requests):
-        raise NotImplementedError()
+        if input_requests.data_parallel_rank is not None:
+            logger.debug(f"Direct routing to DP rank {input_requests.data_parallel_rank}")
+            self.workers[input_requests.data_parallel_rank].send_pyobj(input_requests)
+            return
+        
+        seq_len = len(input_requests.input_ids)
+        selected_rank = self.load_table.get_min_load_rank()
+        self.load_table.update_add(rank=selected_rank,requests=1,tokens=seq_len)
+        self.workers[selected_rank].send_pyobj(input_requests)
 
     def event_loop(self):
         while True:

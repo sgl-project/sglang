@@ -28,6 +28,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 
+import requests
 import psutil
 import setproctitle
 import torch
@@ -541,6 +542,44 @@ class Scheduler(
 
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
+            
+        if self.server_args.dp_size!=1 and self.server_args.load_balance_method=="shortest_queue":
+            if self.master_ip != "null":
+                self.master_ip = self.server_args.dist_init_addr.split(":")[0]
+                self.master_port = 8001
+                self.dp_rank = dp_rank
+                self.controller_url = f"http://{self.master_ip}:{self.master_port}/update_load"  
+                self.pending_updates = {"requests": 0, "tokens": 0,"taken_time":0}
+                self.last_report_time = time.time()
+            else:
+                raise NotImplementedError()
+    
+    def _send_load_update(self):
+        """Send load update to rank 0"""
+        if self.pending_updates["requests"] == 0:
+            return
+        
+        try:
+            payload = {
+                "rank": self.dp_rank,
+                "completed_requests": self.pending_updates["requests"],
+                "time":self.pending_updates["taken_time"],
+                "completed_tokens": self.pending_updates["tokens"]
+            }
+            
+            response = requests.post(
+                self.controller_url,
+                json=payload,
+                timeout=1  
+            )
+            if response.status_code == 200:
+                self.pending_updates = {"requests": 0, "tokens": 0,"taken_time":0}
+                self.last_report_time = time.time()
+            else:
+                logger.error(f"Load update failed with status {response.status_code}")
+        except Exception as e:
+            logger.error(f"Failed to send load update: {str(e)}")
+
 
     def current_scheduler_metrics_enabled(self):
         return self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
@@ -801,8 +840,20 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                start_time = time.time()
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                end_time = time.time()
+                
+                if self.server_args.dp_size != 1 and self.server_args.load_balance_method == "shortest_queue":
+                    completed_count = len(batch.requests)
+                    completed_tokens = sum(len(req.input_ids) for req in batch.requests)
+                    
+                    self.pending_updates["requests"] += completed_count
+                    self.pending_updates["tokens"] += completed_tokens
+                    self.pending_updates["taken_time"] +=(end_time-start_time)
+                    self._send_load_update()    
+                    
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
