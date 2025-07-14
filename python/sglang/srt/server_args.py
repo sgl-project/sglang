@@ -38,6 +38,18 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
+SUPPORTED_LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+LORA_TARGET_ALL_MODULES = "all"
+
 
 @dataclasses.dataclass
 class ServerArgs:
@@ -134,8 +146,9 @@ class ServerArgs:
     preferred_sampling_params: Optional[str] = None
 
     # LoRA
+    enable_lora: Optional[bool] = None
     max_lora_rank: Optional[int] = None
-    lora_target_modules: Optional[List[str]] = None
+    lora_target_modules: Optional[Union[set[str], List[str]]] = None
     lora_paths: Optional[Union[dict[str, str], List[str]]] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
@@ -1132,6 +1145,12 @@ class ServerArgs:
 
         # LoRA
         parser.add_argument(
+            "--enable-lora",
+            default=ServerArgs.enable_lora,
+            action="store_true",
+            help="Enable LoRA support for the model. This argument is automatically set to True if any other LoRA argument is provided.",
+        )
+        parser.add_argument(
             "--max-lora-rank",
             default=ServerArgs.max_lora_rank,
             type=int,
@@ -1140,18 +1159,12 @@ class ServerArgs:
         parser.add_argument(
             "--lora-target-modules",
             type=str,
-            choices=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
+            choices=SUPPORTED_LORA_TARGET_MODULES + [LORA_TARGET_ALL_MODULES],
             nargs="*",
             default=None,
-            help="The union set of all target modules where LoRA should be applied. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+            help="The union set of all target modules where LoRA should be applied. If not specified, "
+            "it will be automatically inferred from the adapters provided in --lora-paths. If 'all' is specified, "
+            "all supported modules will be targeted.",
         )
         parser.add_argument(
             "--lora-paths",
@@ -1766,15 +1779,46 @@ class ServerArgs:
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
-        if isinstance(self.lora_paths, list):
-            lora_paths = self.lora_paths
-            self.lora_paths = {}
-            for lora_path in lora_paths:
-                if "=" in lora_path:
-                    name, path = lora_path.split("=", 1)
-                    self.lora_paths[name] = path
-                else:
-                    self.lora_paths[lora_path] = lora_path
+        self.check_lora_server_args()
+
+    def check_lora_server_args(self):
+        # Enable LoRA if any LoRA paths are provided for backward compatibility.
+        if self.lora_paths:
+            if self.enable_lora is None:
+                self.enable_lora = True
+                logger.info(
+                    "--enable-lora is set to True because --lora-paths is provided."
+                )
+            elif self.enable_lora is False:
+                logger.warning(
+                    "--enable-lora is set to False, any provided lora_paths will be ignored."
+                )
+
+        if self.enable_lora:
+            # Normalize lora_paths to a dictionary if it is a list.
+            if isinstance(self.lora_paths, list):
+                lora_paths = self.lora_paths
+                self.lora_paths = {}
+                for lora_path in lora_paths:
+                    if "=" in lora_path:
+                        name, path = lora_path.split("=", 1)
+                        self.lora_paths[name] = path
+                    else:
+                        self.lora_paths[lora_path] = lora_path
+
+            # Expand target modules
+            if self.lora_target_modules:
+                self.lora_target_modules = set(self.lora_target_modules)
+                if "all" in self.lora_target_modules:
+                    assert (
+                        len(self.lora_target_modules) == 1
+                    ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                    self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
+
+            # Ensure sufficient information is provided for LoRA initialization.
+            assert self.lora_paths or (
+                self.max_lora_rank and self.lora_target_modules
+            ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
