@@ -13,11 +13,11 @@ and the phenomenal high-quality reasoning model DeepSeek-R1.
 | Model Name | BF16 | w8a8_int8 | FP8 |
 |:---:|:---:|:---:|:---:|
 | DeepSeek-R1 |   | [meituan/DeepSeek-R1-Channel-INT8](https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8) | [deepseek-ai/DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1) |
-| Llama-3.2-1B | [meta-llama/Llama-3.2-1B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) | [RedHatAI/Llama-3.2-1B-quantized.w8a8](https://huggingface.co/RedHatAI/Llama-3.2-1B-Instruct-quantized.w8a8) |   |
 | Llama-3.2-3B | [meta-llama/Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct) | [RedHatAI/Llama-3.2-3B-quantized.w8a8](https://huggingface.co/RedHatAI/Llama-3.2-3B-Instruct-quantized.w8a8) |   |
 | Llama-3.1-8B | [meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) | [RedHatAI/Meta-Llama-3.1-8B-quantized.w8a8](https://huggingface.co/RedHatAI/Meta-Llama-3.1-8B-quantized.w8a8) |   |
 | QwQ-32B |   | [RedHatAI/QwQ-32B-quantized.w8a8](https://huggingface.co/RedHatAI/QwQ-32B-quantized.w8a8) |   |
 | DeepSeek-Distilled-Llama |   | [RedHatAI/DeepSeek-R1-Distill-Llama-70B-quantized.w8a8](https://huggingface.co/RedHatAI/DeepSeek-R1-Distill-Llama-70B-quantized.w8a8) |   |
+| Qwen3-235B |   |   | [Qwen/Qwen3-235B-A22B-FP8](https://huggingface.co/Qwen/Qwen3-235B-A22B-FP8) |
 
 **Note:** In the above table, if the model identifier is listed in the grid,
 it means the model is verified.
@@ -51,7 +51,7 @@ docker run \
 
 If you'd prefer to install SGLang in a bare metal environment,
 please take the command list in the Dockerfile as reference.
-Please note that the environmental variable `SGLANG_USE_CPU_ENGINE=1`
+Please note that the environment variable `SGLANG_USE_CPU_ENGINE=1`
 is required to be set to enable SGLang service with CPU engine.
 
 ## Launch of the Serving Engine
