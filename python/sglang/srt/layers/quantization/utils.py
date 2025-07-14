@@ -7,7 +7,7 @@ import numpy
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
+from sglang.srt.layers.quantization.scalar_type import ScalarType
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_npu
 
 _is_cuda = is_cuda()

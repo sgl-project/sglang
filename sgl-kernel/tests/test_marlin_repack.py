@@ -6,6 +6,7 @@ import pytest
 import torch
 from sgl_kernel import awq_marlin_repack
 
+from sglang.srt.layers.quantization.scalar_types import scalar_types
 from sglang.srt.layers.quantization.utils import (
     get_pack_factor,
     pack_cols,
