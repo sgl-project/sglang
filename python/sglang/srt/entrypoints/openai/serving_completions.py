@@ -267,15 +267,15 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 final_usage_data = final_usage_chunk.model_dump_json(exclude_none=True)
                 yield f"data: {final_usage_data}\n\n"
 
-        except Exception as e:
-            error = self.create_streaming_error_response(str(e))
-            yield f"data: {error}\n\n"
         except HTTPException as e:
             error = self.create_streaming_error_response(
                 e.detail,
                 err_type=str(e.status_code),
                 status_code=e.status_code,
             )
+            yield f"data: {error}\n\n"
+        except Exception as e:
+            error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
 
         yield "data: [DONE]\n\n"

@@ -775,7 +775,7 @@ class ServerArgs:
             "--max-queued-requests",
             type=int,
             default=ServerArgs.max_queued_requests,
-            help="The maximum number of queued requests.",
+            help="The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
         )
         parser.add_argument(
             "--max-total-tokens",
