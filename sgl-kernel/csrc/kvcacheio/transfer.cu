@@ -176,9 +176,13 @@ void transfer_kv_all_layer(
     int64_t num_layers,
     int64_t src_layout_dim,
     int64_t dst_layout_dim,
+    bool src_layer_first,
+    bool dst_layer_first,
     int64_t block_quota,
     int64_t num_warps_per_block) {
-  transfer_kv_launcher<get_global_offset_lf, get_global_offset_lf, false>(
+  auto src_offset_fn = src_layer_first ? get_global_offset_lf : get_global_offset_pf
+  auto dst_offset_fn = dst_layer_first ? get_global_offset_lf : get_global_offset_pf
+  transfer_kv_launcher<src_offset_fn, dst_offset_fn, false>(
       src_k,
       dst_k,
       src_v,
@@ -235,10 +239,14 @@ void transfer_kv_all_layer_mla(
     int64_t num_layers,
     int64_t src_layout_dim,
     int64_t dst_layout_dim,
+    bool src_layer_first,
+    bool dst_layer_first,
     int64_t block_quota,
     int64_t num_warps_per_block) {
   at::Tensor empty_tensor = at::Tensor();
-  transfer_kv_launcher<get_global_offset_lf, get_global_offset_lf, true>(
+  auto src_offset_fn = src_layer_first ? get_global_offset_lf : get_global_offset_pf
+  auto dst_offset_fn = dst_layer_first ? get_global_offset_lf : get_global_offset_pf
+  transfer_kv_launcher<src_offset_fn, dst_offset_fn, true>(
       src,
       dst,
       empty_tensor,
