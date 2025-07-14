@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
 
+from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
@@ -76,7 +77,7 @@ class BlockInt8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "BlockInt8Config":
+    def from_config(cls, config: Dict[str, Any]) -> BlockInt8Config:
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_int8_serialized = "int8" in quant_method
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
@@ -91,7 +92,7 @@ class BlockInt8Config(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
@@ -241,7 +242,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: "BlockInt8Config"):
+    def __init__(self, quant_config: BlockInt8Config):
         self.quant_config = quant_config
         assert self.quant_config.weight_block_size is not None
         assert self.quant_config.is_checkpoint_int8_serialized

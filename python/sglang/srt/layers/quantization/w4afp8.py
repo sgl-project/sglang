@@ -1,3 +1,4 @@
+from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -63,7 +64,7 @@ class W4AFp8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "W4AFp8Config":
+    def from_config(cls, config: Dict[str, Any]) -> W4AFp8Config:
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp8_serialized = "fp8" in quant_method
         is_checkpoint_w4afp8_serialized = "w4afp8" in quant_method
@@ -80,7 +81,7 @@ class W4AFp8Config(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 

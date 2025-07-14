@@ -1,6 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/utils.py
 
 """Utilities for selecting and loading models."""
+from __future__ import annotations
 import contextlib
 import logging
 from typing import TYPE_CHECKING, Tuple, Type
@@ -26,7 +27,7 @@ def set_default_torch_dtype(dtype: torch.dtype):
     torch.set_default_dtype(old_dtype)
 
 
-def resolve_transformers_arch(model_config: "ModelConfig", architectures: list[str]):
+def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str]):
 
     from sglang.srt.configs.model_config import ModelImpl
 
@@ -84,7 +85,7 @@ def resolve_transformers_arch(model_config: "ModelConfig", architectures: list[s
     return architectures
 
 
-def get_model_architecture(model_config: "ModelConfig") -> Tuple[Type[nn.Module], str]:
+def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], str]:
     from sglang.srt.configs.model_config import ModelImpl
     from sglang.srt.models.registry import ModelRegistry
 
@@ -109,5 +110,5 @@ def get_model_architecture(model_config: "ModelConfig") -> Tuple[Type[nn.Module]
     return ModelRegistry.resolve_model_cls(architectures)
 
 
-def get_architecture_class_name(model_config: "ModelConfig") -> str:
+def get_architecture_class_name(model_config: ModelConfig) -> str:
     return get_model_architecture(model_config)[1]

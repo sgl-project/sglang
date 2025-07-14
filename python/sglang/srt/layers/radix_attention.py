@@ -13,6 +13,7 @@
 # ==============================================================================
 """Radix attention."""
 
+from __future__ import annotations
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -52,7 +53,7 @@ class RadixAttention(nn.Module):
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
         is_cross_attention: bool = False,
-        quant_config: Optional["QuantizationConfig"] = None,
+        quant_config: Optional[QuantizationConfig] = None,
         attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
         prefix: str = "",

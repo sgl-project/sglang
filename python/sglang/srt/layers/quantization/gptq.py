@@ -1,3 +1,4 @@
+from __future__ import annotations
 import logging
 from fractions import Fraction
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -141,7 +142,7 @@ class GPTQConfig(QuantizationConfig):
         return ["quantize_config.json"]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "GPTQConfig":
+    def from_config(cls, config: Dict[str, Any]) -> GPTQConfig:
         dynamic = cls.get_from_keys_or(config, ["dynamic"], default={})
         dynamic = {} if dynamic is None else dynamic
 
@@ -257,7 +258,7 @@ class GPTQMarlinConfig(QuantizationConfig):
         return ["quantize_config.json"]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "GPTQMarlinConfig":
+    def from_config(cls, config: Dict[str, Any]) -> GPTQMarlinConfig:
         dynamic = cls.get_from_keys_or(config, ["dynamic"], default={})
         dynamic = {} if dynamic is None else dynamic
 
@@ -415,7 +416,7 @@ class MarlinConfig(QuantizationConfig):
         return ["quantize_config.json"]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "MarlinConfig":
+    def from_config(cls, config: Dict[str, Any]) -> MarlinConfig:
         group_size = cls.get_from_keys(config, ["group_size"])
         lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
         return cls(group_size, lm_head_quantized)

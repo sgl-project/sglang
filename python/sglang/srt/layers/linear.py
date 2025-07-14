@@ -1,5 +1,6 @@
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/linear.py"""
 
+from __future__ import annotations
 import itertools
 import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -121,7 +122,7 @@ class LinearBase(torch.nn.Module):
         output_size: int,
         skip_bias_add: bool = False,
         params_dtype: Optional[torch.dtype] = None,
-        quant_config: Optional["QuantizationConfig"] = None,
+        quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -163,7 +164,7 @@ class ReplicatedLinear(LinearBase):
         bias: bool = True,
         skip_bias_add: bool = False,
         params_dtype: Optional[torch.dtype] = None,
-        quant_config: Optional["QuantizationConfig"] = None,
+        quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__(
@@ -264,7 +265,7 @@ class ColumnParallelLinear(LinearBase):
         gather_output: bool = False,
         skip_bias_add: bool = False,
         params_dtype: Optional[torch.dtype] = None,
-        quant_config: Optional["QuantizationConfig"] = None,
+        quant_config: Optional[QuantizationConfig] = None,
         output_sizes: Optional[List[int]] = None,
         prefix: str = "",
         tp_rank: Optional[int] = None,
@@ -445,7 +446,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         gather_output: bool = False,
         skip_bias_add: bool = False,
         params_dtype: Optional[torch.dtype] = None,
-        quant_config: Optional["QuantizationConfig"] = None,
+        quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
@@ -1148,7 +1149,7 @@ class RowParallelLinear(LinearBase):
         skip_bias_add: bool = False,
         params_dtype: Optional[torch.dtype] = None,
         reduce_results: bool = True,
-        quant_config: Optional["QuantizationConfig"] = None,
+        quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,

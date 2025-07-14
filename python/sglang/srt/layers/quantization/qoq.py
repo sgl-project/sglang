@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -82,7 +83,7 @@ class QoQConfig(QuantizationConfig):
         ]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "QoQConfig":
+    def from_config(cls, config: Dict[str, Any]) -> QoQConfig:
         weight_bits = cls.get_from_keys(config, ["wbits"])
         group_size = cls.get_from_keys(config, ["group_size"])
         return cls(weight_bits, group_size)
@@ -91,7 +92,7 @@ class QoQConfig(QuantizationConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
 
         if isinstance(layer, LinearBase):

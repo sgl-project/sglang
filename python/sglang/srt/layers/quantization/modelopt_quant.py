@@ -1,4 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
+from __future__ import annotations
 
 import logging
 from typing import Any, Callable, Dict, List, Optional
@@ -84,7 +85,7 @@ class ModelOptFp8Config(QuantizationConfig):
         return ["hf_quant_config.json"]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "ModelOptFp8Config":
+    def from_config(cls, config: Dict[str, Any]) -> ModelOptFp8Config:
         quant_method = cls.get_from_keys(config, ["quantization"]).get("quant_algo")
         kv_cache_quant_method = cls.get_from_keys(config, ["quantization"]).get(
             "kv_cache_quant_algo"
@@ -107,7 +108,7 @@ class ModelOptFp8Config(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
 
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -489,7 +490,7 @@ class ModelOptFp4Config(QuantizationConfig):
         return ["hf_quant_config.json"]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "ModelOptFp4Config":
+    def from_config(cls, config: Dict[str, Any]) -> ModelOptFp4Config:
         quant_config = cls.get_from_keys(config, ["quantization"])
         quant_method = quant_config["quant_algo"]
         if not quant_method in ["FP8", "NVFP4"]:
@@ -534,7 +535,7 @@ class ModelOptFp4Config(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 

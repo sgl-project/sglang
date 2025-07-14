@@ -1,5 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/moe_wna16.py
-
+from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
@@ -89,7 +89,7 @@ class MoeWNA16Config(QuantizationConfig):
         raise NotImplementedError
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "MoeWNA16Config":
+    def from_config(cls, config: Dict[str, Any]) -> MoeWNA16Config:
         quant_method = cls.get_from_keys(config, ["quant_method"])
         weight_bits = cls.get_from_keys(config, ["bits"])
         group_size = cls.get_from_keys(config, ["group_size"])
@@ -148,7 +148,7 @@ class MoeWNA16Config(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
         # avoid circular import
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE

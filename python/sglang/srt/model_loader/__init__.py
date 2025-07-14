@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/__init__.py
 
+from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from torch import nn
@@ -18,9 +19,9 @@ if TYPE_CHECKING:
 
 def get_model(
     *,
-    model_config: "ModelConfig",
-    load_config: "LoadConfig",
-    device_config: "DeviceConfig",
+    model_config: ModelConfig,
+    load_config: LoadConfig,
+    device_config: DeviceConfig,
 ) -> nn.Module:
     loader = get_model_loader(load_config)
     return loader.load_model(

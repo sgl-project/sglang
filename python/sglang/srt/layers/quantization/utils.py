@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/quant_utils.py
 
+from __future__ import annotations
 import re
 from copy import deepcopy
 from types import MappingProxyType
@@ -152,7 +153,7 @@ def replace_parameter(
 
 # Match dynamic rules with module name (prefix) and override quantize
 # config if module (prefix) matches a rule
-def override_config(config: "QuantizationConfig", prefix: str):
+def override_config(config: QuantizationConfig, prefix: str):
     weight_bits = get_dynamic_override(config, prefix, "bits", config.weight_bits)
     if isinstance(weight_bits, int):
         config.weight_bits = weight_bits
@@ -185,7 +186,7 @@ def override_config(config: "QuantizationConfig", prefix: str):
 
 
 def get_dynamic_override(
-    config: "QuantizationConfig",
+    config: QuantizationConfig,
     layer_name: str,
     key: Optional[str] = None,
     default_value: Union[int, bool, None] = None,
@@ -206,7 +207,7 @@ def get_dynamic_override(
 
 
 def get_linear_quant_method(
-    config: "QuantizationConfig",
+    config: QuantizationConfig,
     layer: torch.nn.Module,
     prefix: str,
     linear_method_cls: type,

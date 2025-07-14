@@ -1,3 +1,4 @@
+from __future__ import annotations
 import importlib
 import sys
 from types import MappingProxyType
@@ -227,14 +228,14 @@ class W8A8Int8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "W8A8Int8Config":
+    def from_config(cls, config: Dict[str, Any]) -> W8A8Int8Config:
         return cls(config)
 
     def get_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 

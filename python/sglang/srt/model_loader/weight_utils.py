@@ -1,6 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/weight_utils.py
 
 """Utilities for downloading and initializing model weights."""
+from __future__ import annotations
 import concurrent.futures
 import fnmatch
 import glob
@@ -134,10 +135,10 @@ def convert_bin_to_safetensor_file(
 
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
-    model_config: "ModelConfig",
-    load_config: "LoadConfig",
+    model_config: ModelConfig,
+    load_config: LoadConfig,
     packed_modules_mapping: Dict[str, List[str]],
-) -> "QuantizationConfig":
+) -> QuantizationConfig:
 
     from sglang.srt.layers.quantization import get_quantization_config
     from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
@@ -729,7 +730,7 @@ def runai_safetensors_weights_iterator(
             yield from streamer.get_tensors()
 
 
-def set_runai_streamer_env(load_config: "LoadConfig"):
+def set_runai_streamer_env(load_config: LoadConfig):
     if load_config.model_loader_extra_config:
         extra_config = load_config.model_loader_extra_config
 
@@ -861,7 +862,7 @@ class KVCacheQuantSchema(BaseModel):
     scaling_factor: Dict[int, Dict[int, float]]
 
     @model_validator(mode="after")
-    def check_is_fp8(self) -> "KVCacheQuantSchema":
+    def check_is_fp8(self) -> KVCacheQuantSchema:
         assert self.dtype == "float8_e4m3fn", (
             "Loaded scaling factors intended for KV cache dtype = "
             f"{self.dtype} rather than float8_e4m3fn!"
@@ -869,7 +870,7 @@ class KVCacheQuantSchema(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def check_tp_ranks(self, info: ValidationInfo) -> "KVCacheQuantSchema":
+    def check_tp_ranks(self, info: ValidationInfo) -> KVCacheQuantSchema:
         context = info.context
         if context:
             tp_size = context["tp_size"]
@@ -891,7 +892,7 @@ class KVCacheQuantSchema(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def check_current_rank(self, info: ValidationInfo) -> "KVCacheQuantSchema":
+    def check_current_rank(self, info: ValidationInfo) -> KVCacheQuantSchema:
         context = info.context
         if context:
             tp_rank = context["tp_rank"]
@@ -913,7 +914,7 @@ class QuantParamSchema(BaseModel):
     kv_cache: KVCacheQuantSchema
 
     @model_validator(mode="after")
-    def check_model_type(self, info: ValidationInfo) -> "QuantParamSchema":
+    def check_model_type(self, info: ValidationInfo) -> QuantParamSchema:
         context = info.context
         if context:
             model_type = context.get("model_type", None)
