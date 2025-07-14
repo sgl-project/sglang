@@ -1,7 +1,10 @@
+from typing import List
+
 import torch
 from torch.func import functional_call
 
 from sglang.srt.utils import is_pin_memory_available
+
 
 class _ModuleOffloader:
     def __init__(self, module: torch.nn.Module):
@@ -51,3 +54,8 @@ class _ModuleOffloader:
             module.forward = forward
 
         return module
+
+
+def wrap_layers_for_offload(layers: List[torch.nn.Module]):
+    TODO
+    return layers
