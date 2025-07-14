@@ -753,8 +753,6 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
             "--cuda-graph-max-bs",
             str(self.cuda_graph_max_bs),
             "--lora-paths",
-            *self.lora_paths,
-            "--max-loras-per-batch",
             str(self.max_loras_per_batch),
             "--lora-backend",
             self.lora_backend,
@@ -768,6 +766,8 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
         ]
         if self.enable_lora:
             other_args.append("--enable-lora")
+        if self.lora_paths:
+            other_args.extend(["--lora-paths"] + self.lora_paths)
         if self.disable_cuda_graph:
             other_args.append("--disable-cuda-graph")
         if self.max_lora_rank is not None:
@@ -1026,7 +1026,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
         """
         Test dynamic LoRA updates in engine mode.
         """
-        test_cases = BASIC_TESTS[2:]  ## FIXME
+        test_cases = ALL_TESTS
         self._run_dynamic_adapter_updates(
             mode=LoRAUpdateTestSessionMode.ENGINE,
             test_cases=test_cases,
