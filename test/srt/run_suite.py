@@ -17,7 +17,7 @@ suites = {
         TestFile("models/lora/test_lora_backend.py", 99),
         TestFile("models/lora/test_multi_lora_backend.py", 60),
         TestFile("models/lora/test_lora_cuda_graph.py", 250),
-        TestFile("models/lora/test_lora_update.py", 400),
+        TestFile("models/lora/test_lora_update.py", 700),
         TestFile("models/test_embedding_models.py", 73),
         # TestFile("models/test_clip_models.py", 52),
         TestFile("models/test_encoder_embedding_models.py", 100),
@@ -67,6 +67,7 @@ suites = {
         TestFile("test_hidden_states.py", 55),
         TestFile("test_int8_kernel.py", 8),
         TestFile("test_input_embeddings.py", 38),
+        TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
         TestFile("test_mla.py", 167),
@@ -86,6 +87,7 @@ suites = {
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_engine.py", 261),
         TestFile("test_srt_endpoint.py", 130),
+        TestFile("test_start_profile.py", 60),
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 172),
         TestFile("test_torch_native_attention_backend.py", 123),
@@ -169,20 +171,21 @@ suites = {
         TestFile("test_pp_single_node.py", 150),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
     ],
+    "per-commit-4-gpu-deepep": [
+        TestFile("test_deepep_small.py", 531),
+    ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
     ],
     "per-commit-8-gpu": [
-        # Disabled deepep tests temporarily because it takes too much time.
-        # TODO: re-enable them after reducing the test time with compilation cache and smaller models.
-        # TestFile("test_deepep_intranode.py", 50),
-        # TestFile("test_deepep_low_latency.py", 50),
-        # TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
         # Disabled because it hangs on the CI.
         # TestFile("test_moe_ep.py", 181),
         TestFile("test_disaggregation.py", 270),
         TestFile("test_disaggregation_different_tp.py", 155),
         TestFile("test_full_deepseek_v3.py", 463),
+    ],
+    "per-commit-8-gpu-deepep": [
+        TestFile("test_deepep_large.py", 485),
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
