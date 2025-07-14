@@ -328,6 +328,5 @@ class AscendAttnBackend(AttentionBackend):
             )
             return attn_output.view(num_tokens, layer.tp_q_head_num * self.kv_lora_rank)
 
-
-def get_cuda_graph_seq_len_fill_value(self):
-    return 0
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 0
