@@ -190,6 +190,7 @@ class Gemma2DecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.self_attn = Gemma2Attention(
             layer_id=layer_id,
