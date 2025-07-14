@@ -1,15 +1,17 @@
+import logging
 import re
 from typing import Dict, List, Union
 
 from sglang.srt.managers.multimodal_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 
 # Copied from: https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/image_processing_gemma3_fast.py
 # will be removed in the future
+
+logger = logging.getLogger(__name__)
 
 
 class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
@@ -36,7 +38,7 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        print(f"{image_data=}")
+        logger.debug(f"{image_data=}")
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
@@ -48,8 +50,8 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         )
 
         mm_items, input_ids, _ = self.process_and_combine_mm_data(base_output)
-        print(f"{base_output=}")
-        print(f"{mm_items=}")
+        logger.debug(f"{base_output=}")
+        logger.debug(f"{mm_items=}")
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
