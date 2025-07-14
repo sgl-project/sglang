@@ -11,25 +11,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from __future__ import annotations
-
 import json
 import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional
+from typing import List, Optional
 
 import torch
 import torch.distributed
 import torch.nn.functional as F
 
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.eplb import eplb_algorithms
 from sglang.srt.model_loader import get_model_architecture
 from sglang.srt.server_args import ServerArgs
-
-if TYPE_CHECKING:
-    from sglang.srt.configs.model_config import ModelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -128,9 +124,7 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def init_by_eplb(
-        server_args: ServerArgs,
-        model_config: ModelConfig,
-        logical_count: torch.Tensor,
+        server_args: ServerArgs, model_config: ModelConfig, logical_count: torch.Tensor
     ):
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)

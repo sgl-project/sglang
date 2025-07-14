@@ -1,8 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/model_loader/loader.py
 
 # ruff: noqa: SIM117
-from __future__ import annotations
-
 import collections
 import concurrent
 import dataclasses
@@ -16,17 +14,7 @@ import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Dict,
-    Generator,
-    Iterable,
-    List,
-    Optional,
-    Tuple,
-    cast,
-)
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
 
 import huggingface_hub
 import numpy as np
@@ -38,7 +26,9 @@ from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from sglang.srt.configs.load_config import LoadFormat
+from sglang.srt.configs.device_config import DeviceConfig
+from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.connector import (
     ConnectorType,
     create_remote_connector,
@@ -49,6 +39,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
@@ -77,12 +68,6 @@ from sglang.srt.utils import (
     is_pin_memory_available,
     set_weight_attrs,
 )
-
-if TYPE_CHECKING:
-    from sglang.srt.configs.device_config import DeviceConfig
-    from sglang.srt.configs.load_config import LoadConfig
-    from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 _is_npu = is_npu()
 
@@ -365,7 +350,7 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: Source
+        self, source: "Source"
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config

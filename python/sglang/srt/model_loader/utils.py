@@ -1,22 +1,16 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/utils.py
 
 """Utilities for selecting and loading models."""
-from __future__ import annotations
-
 import contextlib
 import logging
-from typing import TYPE_CHECKING, Tuple, Type
+from typing import Tuple, Type
 
 import torch
 import transformers
 from torch import nn
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-from sglang.srt.configs.model_config import ModelImpl
-
-if TYPE_CHECKING:
-    from sglang.srt.configs.model_config import ModelConfig
-
+from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +25,6 @@ def set_default_torch_dtype(dtype: torch.dtype):
 
 
 def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str]):
-
     for i, arch in enumerate(architectures):
         if arch == "TransformersForCausalLM":
             continue
