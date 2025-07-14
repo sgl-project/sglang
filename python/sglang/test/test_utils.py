@@ -2,9 +2,11 @@
 
 import argparse
 import copy
+import json
 import logging
 import os
 import random
+import re
 import subprocess
 import threading
 import time
@@ -37,10 +39,13 @@ from sglang.utils import get_exception_traceback
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE = "meta-llama/Llama-3.2-1B"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
 
 # MLA test models
+DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
+DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST = "cross-encoder/ms-marco-MiniLM-L6-v2"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
@@ -81,12 +86,11 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-In
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4,hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
-DEFAULT_VLM_CHAT_TEMPLATE_FOR_TEST = "qwen2-vl"
 
 DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
 
-DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1000
+DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 
 
 def is_in_ci():
@@ -97,6 +101,15 @@ def is_in_ci():
 def is_in_amd_ci():
     """Return whether it is in an AMD CI runner."""
     return get_bool_env_var("SGLANG_AMD_CI")
+
+
+def _use_cached_default_models(model_repo: str):
+    cache_dir = os.getenv("DEFAULT_MODEL_CACHE_DIR")
+    if cache_dir and model_repo:
+        model_path = os.path.join(cache_dir, model_repo)
+        if os.path.isdir(model_path):
+            return os.path.abspath(model_path)
+    return ""
 
 
 if is_in_ci():
@@ -414,6 +427,31 @@ def get_call_select(args: argparse.Namespace):
             raise
 
     return func
+
+
+def _get_default_models():
+    import inspect
+
+    current_module = inspect.getmodule(_get_default_models)
+    default_models = set()
+    for name, value in current_module.__dict__.items():
+        if (
+            isinstance(name, str)
+            and "DEFAULT_" in name
+            and "MODEL_" in name
+            and isinstance(value, str)
+        ):
+            if "," in value:
+                parts = [part.strip() for part in value.split(",")]
+                default_models.update(parts)
+            else:
+                default_models.add(value.strip())
+    return json.dumps(list(default_models))
+
+
+def try_cached_model(model_repo: str):
+    model_dir = _use_cached_default_models(model_repo)
+    return model_dir if model_dir else model_repo
 
 
 def popen_launch_server(
@@ -838,12 +876,23 @@ def run_bench_one_batch(model, other_args):
         print(f"Output: {output}", flush=True)
         print(f"Error: {error}", flush=True)
 
-        lastline = output.split("\n")[-3]
-        output_throughput = float(lastline.split(" ")[-2])
+        # Return prefill_latency, decode_throughput, decode_latency
+        prefill_line = output.split("\n")[-9]
+        decode_line = output.split("\n")[-3]
+        pattern = (
+            r"latency: (?P<latency>\d+\.\d+).*?throughput:\s*(?P<throughput>\d+\.\d+)"
+        )
+        match = re.search(pattern, prefill_line)
+        if match:
+            prefill_latency = float(match.group("latency"))
+        match = re.search(pattern, decode_line)
+        if match:
+            decode_latency = float(match.group("latency"))
+            decode_throughput = float(match.group("throughput"))
     finally:
         kill_process_tree(process.pid)
 
-    return output_throughput
+    return prefill_latency, decode_throughput, decode_latency
 
 
 def run_bench_offline_throughput(model, other_args):

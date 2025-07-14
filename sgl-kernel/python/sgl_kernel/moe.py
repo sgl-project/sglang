@@ -12,6 +12,7 @@ def moe_align_block_size(
     num_tokens_post_pad,
     token_cnts_buffer,
     cumsum_buffer,
+    pad_sorted_token_ids=False,
 ):
     torch.ops.sgl_kernel.moe_align_block_size.default(
         topk_ids,
@@ -22,17 +23,18 @@ def moe_align_block_size(
         num_tokens_post_pad,
         token_cnts_buffer,
         cumsum_buffer,
+        pad_sorted_token_ids,
     )
 
 
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    token_expert_indices: torch.Tensor,
     gating_output: float,
+    renormalize: bool = False,
 ) -> None:
     torch.ops.sgl_kernel.topk_softmax.default(
-        topk_weights, topk_ids, token_expert_indices, gating_output
+        topk_weights, topk_ids, gating_output, renormalize
     )
 
 
@@ -85,6 +87,24 @@ def ep_moe_pre_reorder(
         end_expert_id,
         topk,
         use_per_token_if_dynamic,
+    )
+
+
+def ep_moe_silu_and_mul(
+    gateup_output,
+    down_input,
+    reorder_topk_ids,
+    scales,
+    start_expert_id,
+    end_expert_id,
+):
+    return torch.ops.sgl_kernel.ep_moe_silu_and_mul.default(
+        gateup_output,
+        down_input,
+        reorder_topk_ids,
+        scales,
+        start_expert_id,
+        end_expert_id,
     )
 
 
