@@ -178,30 +178,33 @@ class W8A8Int8Config(QuantizationConfig):
     - Activation: dynamic, per-token, symmetric
     """
 
-    def __init__(self, quant_config: Dict[str, Any]):
+    def __init__(self, quant_config: Dict[str, Any] = None):
         super().__init__()
-        self.quant_description = quant_config
-        self.is_dynamic = quant_config.get("is_dynamic", False)
-        if _is_npu:
-            if (
-                "packed_modules_mapping" in quant_config
-                and quant_config["packed_modules_mapping"] is not None
-            ):
-                self.packed_modules_mapping = quant_config["packed_modules_mapping"]
+        if quant_config is None:
+            pass
+        else:
+            self.quant_description = quant_config
+            self.is_dynamic = quant_config.get("is_dynamic", False)
+            if _is_npu:
+                if (
+                    "packed_modules_mapping" in quant_config
+                    and quant_config["packed_modules_mapping"] is not None
+                ):
+                    self.packed_modules_mapping = quant_config["packed_modules_mapping"]
 
-            # Ascend w8a8_int8 quantization with bias, use wrappers to isolate the effects between models
-            for name in self.quant_description.keys():
-                if "norm.bias" in name:
-                    apply_module_patch(
-                        "sglang.srt.layers.layernorm.RMSNorm",
-                        "__init__",
-                        [npu_wrapper_rmsnorm_init],
-                    )
-                    apply_module_patch(
-                        "sglang.srt.layers.layernorm.RMSNorm",
-                        "forward_npu",
-                        [npu_wrapper_rmsnorm_forward],
-                    )
+                # Ascend w8a8_int8 quantization with bias, use wrappers to isolate the effects between models
+                for name in self.quant_description.keys():
+                    if "norm.bias" in name:
+                        apply_module_patch(
+                            "sglang.srt.layers.layernorm.RMSNorm",
+                            "__init__",
+                            [npu_wrapper_rmsnorm_init],
+                        )
+                        apply_module_patch(
+                            "sglang.srt.layers.layernorm.RMSNorm",
+                            "forward_npu",
+                            [npu_wrapper_rmsnorm_forward],
+                        )
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
