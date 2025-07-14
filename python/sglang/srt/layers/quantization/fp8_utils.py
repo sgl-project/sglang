@@ -42,7 +42,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
     import aiter
-    from aiter import gemm_a8w8_blockscale_CK, get_hip_quant
+    from aiter import gemm_a8w8_blockscale, get_hip_quant
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
@@ -274,7 +274,7 @@ def aiter_w8a8_block_fp8_linear(
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
-    output = gemm_a8w8_blockscale_CK(
+    output = gemm_a8w8_blockscale(
         q_input, weight, x_scale, weight_scale, dtype=input.dtype
     )
 
