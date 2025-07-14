@@ -597,7 +597,7 @@ class OpenAIMoeAttention(nn.Module):
         )
         self.layer_id = layer_id
 
-    def flashinfer_attention_ref(self, inner_state):
+    def flashinfer_attention_ref(self, inner_state, sinks):
         q, k, v, forward_batch = inner_state
         
         # Reshape q, k, v to match what sink_attention_ref expects
@@ -664,8 +664,7 @@ class OpenAIMoeAttention(nn.Module):
         sinks = torch.exp(self.sinks)
         sinks = sinks.to(torch.float32)
         attn_output = self.attn(*inner_state, sink=sinks)    
-        o_ref = self.flashinfer_attention_ref(inner_state)
-        # # Todo: sdpa as a WA for attn_kernel
+        o_ref = self.flashinfer_attention_ref(inner_state, sinks)
         q = inner_state[0].view(-1, self.num_kv_heads, self.num_heads // self.num_kv_heads, self.head_dim)
         k = inner_state[1].view(-1, self.num_kv_heads, self.head_dim)
         v = inner_state[2].view(-1, self.num_kv_heads, self.head_dim)
