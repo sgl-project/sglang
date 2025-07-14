@@ -191,7 +191,9 @@ def get_context_length(config):
     if rope_scaling:
         rope_scaling_factor = rope_scaling.get("factor", 1)
         if "original_max_position_embeddings" in rope_scaling:
-            rope_scaling_factor = 1
+            return (
+                rope_scaling["original_max_position_embeddings"] * rope_scaling_factor
+            )
         if rope_scaling.get("rope_type", None) == "llama3":
             rope_scaling_factor = 1
     else:
