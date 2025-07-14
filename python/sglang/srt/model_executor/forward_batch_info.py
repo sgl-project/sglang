@@ -241,6 +241,8 @@ class ForwardBatch:
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool: KVCache = None
     attn_backend: AttentionBackend = None
+    # For cascade decoding
+    max_common_prefix_len: Optional[int] = None
 
     # For DP attention
     global_num_tokens_cpu: Optional[List[int]] = None
