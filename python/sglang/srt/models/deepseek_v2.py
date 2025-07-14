@@ -22,6 +22,7 @@ import os
 from enum import IntEnum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+from sglang.srt.distributed.device_communicators.pynccl_allocator import SymmMemoryTensor, use_symmetric_memory
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -416,6 +417,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self._enable_deepep_moe = global_server_args_dict["enable_deepep_moe"]
+        self.symm_tensor = SymmMemoryTensor(parallel_state.get_tp_group())
 
     def get_moe_weights(self):
         return [
@@ -463,7 +465,10 @@ class DeepseekV2MoE(nn.Module):
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
-        final_hidden_states += shared_output
+        final_hidden_states_out = self.symm_tensor.get_tensor(final_hidden_states.shape, final_hidden_states.dtype)
+        torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
+        final_hidden_states = final_hidden_states_out
+        final_hidden_states.symmetric_memory = True
         if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -487,7 +492,10 @@ class DeepseekV2MoE(nn.Module):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+            final_hidden_states_out = self.symm_tensor.get_tensor(final_hidden_states.shape, final_hidden_states.dtype)
+            torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
+            final_hidden_states = final_hidden_states_out
+            final_hidden_states.symmetric_memory = True
         if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states

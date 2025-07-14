@@ -465,6 +465,16 @@ class GroupCoordinator:
             return self.npu_communicator.all_reduce(input_)
 
         if (
+            self.pynccl_comm is not None
+            and self.pynccl_comm.nccl_version >= 22703
+            and hasattr(input_, "symmetric_memory")
+            and input_.symmetric_memory
+        ):
+            with self.pynccl_comm.change_state(enable=True, stream=torch.cuda.current_stream()):
+                self.pynccl_comm.all_reduce(input_)
+                return input_
+
+        if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
