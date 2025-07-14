@@ -751,7 +751,7 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
     def __enter__(self):
         other_args = [
             "--cuda-graph-max-bs",
-            str(self.cuda_graph_max_bs),            
+            str(self.cuda_graph_max_bs),
             "--max-loras-per-batch",
             str(self.max_loras_per_batch),
             "--lora-backend",
