@@ -88,6 +88,7 @@ class MiniLoadBalancer:
             # Wait for both responses to complete. Prefill should end first.
             prefill_response, decode_response = await asyncio.gather(*tasks)
 
+            ret_json = None
             if "return_logprob" in modified_request:
 
                 prefill_json = await prefill_response.json()
@@ -100,6 +101,12 @@ class MiniLoadBalancer:
                             prefill_json["meta_info"]["input_token_logprobs"]
                             + ret_json["meta_info"]["input_token_logprobs"]
                         )
+            elif endpoint == "health_generate":
+                decode_response.status = (
+                    prefill_response.status
+                    if prefill_response.status != 200
+                    else decode_response.status
+                )
             else:
                 ret_json = await decode_response.json()
 
@@ -180,18 +187,20 @@ async def health_check():
 
 @app.get("/health_generate")
 async def health_check():
-    prefill_servers, decode_servers = (
-        load_balancer.prefill_servers,
-        load_balancer.decode_servers,
+    prefill_server, bootstrap_port, decode_server = load_balancer.select_pair()
+
+    # Parse and transform prefill_server for bootstrap data
+    parsed_url = urllib.parse.urlparse(prefill_server)
+    hostname = parsed_url.hostname
+    request = {
+        "bootstrap_host": hostname,
+        "bootstrap_port": bootstrap_port,
+        "bootstrap_room": _generate_bootstrap_room(),
+    }
+
+    return await load_balancer.generate(
+        request, prefill_server, decode_server, "health_generate"
     )
-    async with aiohttp.ClientSession() as session:
-        # Create the tasks
-        tasks = []
-        for server in chain(prefill_servers, decode_servers):
-            tasks.append(session.post(f"{server}/health_generate"))
-        for i, response in enumerate(asyncio.as_completed(tasks)):
-            await response
-    return Response(status_code=200)
 
 
 @app.post("/flush_cache")
