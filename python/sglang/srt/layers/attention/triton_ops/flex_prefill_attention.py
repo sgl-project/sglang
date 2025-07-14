@@ -947,8 +947,8 @@ def get_active_blocks(
     slash = sum_all_diagonal_matrix(qk) / qk.shape[-2]
     vertical = qk.mean(-2)
     # get vertical slash size to make sure attention score >= gamma. shape: [batch_size, num_heads]
-    num_vertical_blocks = score_cover_topk(vertical, gamma) // 128 + 1
-    num_slash_blocks = score_cover_topk(slash, gamma) // 128 + 1
+    num_vertical_blocks = score_cover_topk(vertical, gamma) // block_size + 1
+    num_slash_blocks = score_cover_topk(slash, gamma) // block_size + 1
     num_vertical_blocks[num_vertical_blocks < min_budget] = min_budget
     num_vertical_blocks[num_vertical_blocks > max_budget] = max_budget
     num_slash_blocks[num_slash_blocks < min_budget] = min_budget
