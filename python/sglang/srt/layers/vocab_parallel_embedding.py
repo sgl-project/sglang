@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/layers/vocab_parallel_embedding.py
 
+import logging
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
@@ -13,6 +14,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -20,9 +22,14 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, set_weight_attrs
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
+
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
+
+logger = logging.getLogger(__name__)
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -242,8 +249,16 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.tp_size = 1
 
         self.num_embeddings = num_embeddings
-        self.padding_size = padding_size
         self.org_vocab_size = org_num_embeddings or num_embeddings
+
+        # Support the case where the vocab size is not divisible by the TP size.
+        if (
+            _is_cpu
+            and pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size != 0
+        ):
+            padding_size *= self.tp_size
+        self.padding_size = padding_size
+
         num_added_embeddings = num_embeddings - self.org_vocab_size
         self.use_presharded_weights = use_presharded_weights
         if use_presharded_weights:
@@ -549,6 +564,14 @@ class ParallelLMHead(VocabParallelEmbedding):
             use_presharded_weights=use_presharded_weights,
         )
         self.quant_config = quant_config
+
+        # We only support pack LMHead if it's not quantized.
+        if _is_cpu and _is_cpu_amx_available:
+            if hasattr(self, "weight") and self.weight.dtype == torch.bfloat16:
+                self.quant_method = PackWeightMethod(weight_names=["weight"])
+        else:
+            logger.warning("The weight of LmHead is not packed")
+
         if bias:
             self.bias = Parameter(
                 torch.empty(self.num_embeddings_per_partition, dtype=params_dtype)

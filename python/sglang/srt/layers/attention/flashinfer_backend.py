@@ -26,6 +26,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.utils import is_sm100_supported
+from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available, next_power_of_2
@@ -262,11 +263,14 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
     def init_cuda_graph_state(
-        self, max_bs: int, kv_indices_buf: Optional[torch.Tensor] = None
+        self,
+        max_bs: int,
+        max_num_tokens: int,
+        kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
-                (max_bs * self.max_context_len,),
+                (max_num_tokens * self.max_context_len,),
                 dtype=torch.int32,
                 device="cuda",
             )
@@ -285,7 +289,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_bs * self.max_context_len),
+                (max_num_tokens * self.max_context_len),
                 dtype=torch.uint8,
                 device="cuda",
             )
@@ -440,7 +444,7 @@ class FlashInferAttnBackend(AttentionBackend):
             raise ValueError("Invalid forward mode")
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return 0
+        return 1
 
     def forward_extend(
         self,
@@ -586,6 +590,7 @@ class FlashInferIndicesUpdaterDecode:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -652,6 +657,10 @@ class FlashInferIndicesUpdaterDecode:
                 paged_kernel_lens_sum_tmp = seq_lens_sum
                 kv_start_idx_tmp = None
 
+            use_sliding_window_kv_pool = wrapper_id == 0 and isinstance(
+                self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+            )
+
             self.call_begin_forward(
                 decode_wrappers[wrapper_id],
                 req_pool_indices,
@@ -660,6 +669,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.kv_indptr[wrapper_id],
                 kv_start_idx_tmp,
                 spec_info,
+                use_sliding_window_kv_pool=use_sliding_window_kv_pool,
             )
 
     def update_cross_attention(
@@ -701,6 +711,7 @@ class FlashInferIndicesUpdaterDecode:
         kv_indptr: torch.Tensor,
         kv_start_idx: torch.Tensor,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        use_sliding_window_kv_pool: bool = False,
     ):
         if spec_info is None:
             bs = len(req_pool_indices)
@@ -727,6 +738,14 @@ class FlashInferIndicesUpdaterDecode:
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
+
+        if use_sliding_window_kv_pool:
+            kv_last_index = kv_indptr[-1]
+            kv_indices[:kv_last_index] = (
+                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    kv_indices[:kv_last_index]
+                )
+            )
 
         wrapper.begin_forward(
             kv_indptr,
@@ -762,6 +781,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
         # Dispatch the update function
@@ -845,6 +865,9 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens_sum = seq_lens_sum
 
             kv_start_idx = seq_lens - paged_kernel_lens
+            use_sliding_window_kv_pool = wrapper_id == 0 and isinstance(
+                self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+            )
 
             self.call_begin_forward(
                 self.prefill_wrapper_ragged,
@@ -859,6 +882,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.qo_indptr[wrapper_id],
                 use_ragged,
                 spec_info,
+                use_sliding_window_kv_pool=use_sliding_window_kv_pool,
             )
 
     def update_cross_attention(
@@ -913,6 +937,7 @@ class FlashInferIndicesUpdaterPrefill:
         qo_indptr: torch.Tensor,
         use_ragged: bool,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        use_sliding_window_kv_pool: bool = False,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -959,6 +984,14 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
+            )
+
+        if use_sliding_window_kv_pool:
+            kv_last_index = kv_indptr[-1]
+            kv_indices[:kv_last_index] = (
+                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    kv_indices[:kv_last_index]
+                )
             )
 
         # cached part
@@ -1049,14 +1082,13 @@ class FlashInferMultiStepDraftBackend:
             kv_indices_buffer,
             self.kv_indptr,
             forward_batch.positions,
-            num_seqs,
-            self.topk,
             self.pool_len,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
             next_power_of_2(num_seqs),
             next_power_of_2(self.speculative_num_steps),
             next_power_of_2(bs),
+            self.page_size,
         )
 
         assert forward_batch.spec_info is not None
@@ -1097,7 +1129,7 @@ class FlashInferMultiStepDraftBackend:
 
         self.common_template(forward_batch, kv_indices, call_fn)
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, max_bs * self.max_context_len),
             dtype=torch.int32,
@@ -1106,7 +1138,7 @@ class FlashInferMultiStepDraftBackend:
 
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_cuda_graph_state(
-                max_bs, kv_indices_buf=self.cuda_graph_kv_indices[i]
+                max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
             )
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):

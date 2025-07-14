@@ -18,11 +18,14 @@ limitations under the License.
 #include <ATen/ATen.h>
 #include <ATen/Tensor.h>
 #include <Python.h>
+#include <torch/all.h>
 #include <torch/library.h>
 #include <torch/torch.h>
 
 #include <tuple>
 #include <vector>
+
+#include "scalar_type.hpp"
 
 #define _CONCAT(A, B) A##B
 #define CONCAT(A, B) _CONCAT(A, B)
@@ -105,14 +108,19 @@ void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void cutlass_mla_decode(
     torch::Tensor const& out,
-    torch::Tensor const& q_nope_and_q_pe,
+    torch::Tensor const& q_nope,
+    torch::Tensor const& q_pe,
     torch::Tensor const& kv_c_and_k_pe_cache,
     torch::Tensor const& seq_lens,
     torch::Tensor const& page_table,
     torch::Tensor const& workspace,
-    int64_t num_kv_splits = -1);
+    double sm_scale,
+    int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
 int64_t cutlass_mla_get_workspace_size(
-    int64_t max_seq_len, int64_t num_batches, int64_t sm_count = 0, int64_t num_kv_splits = -1);
+    int64_t max_seq_len,
+    int64_t num_batches,
+    int64_t sm_count = 0,
+    int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
 /*
  * From csrc/elementwise
  */
@@ -174,7 +182,8 @@ void sgl_per_token_group_quant_fp8(
     int64_t group_size,
     double eps,
     double fp8_min,
-    double fp8_max);
+    double fp8_max,
+    bool scale_ue8m0);
 void sgl_per_token_group_quant_int8(
     at::Tensor input,
     at::Tensor output_q,
@@ -194,6 +203,9 @@ void bmm_fp8(
     at::Tensor workspace_buffer,
     int64_t cublas_handle,
     int64_t cuda_stream);
+void dsv3_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
+
+void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
 
 /*
  * From csrc/moe
@@ -206,13 +218,11 @@ void moe_align_block_size(
     torch::Tensor experts_ids,
     torch::Tensor num_tokens_post_pad,
     torch::Tensor token_cnts_buffer,
-    torch::Tensor cumsum_buffer);
+    torch::Tensor cumsum_buffer,
+    bool pad_sorted_token_ids);
 
 void topk_softmax(
-    torch::Tensor& topk_weights,
-    torch::Tensor& topk_indices,
-    torch::Tensor& token_expert_indices,
-    torch::Tensor& gating_output);
+    torch::Tensor& topk_weights, torch::Tensor& topk_indices, torch::Tensor& gating_output, bool renormalize);
 
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
@@ -266,6 +276,14 @@ void ep_moe_pre_reorder(
     int64_t topk,
     bool use_per_token_if_dynamic);
 
+void ep_moe_silu_and_mul(
+    torch::Tensor gateup_output,
+    torch::Tensor down_input,
+    torch::Tensor reorder_topk_ids,
+    torch::Tensor scales,
+    int64_t start_expert_id,
+    int64_t end_expert_id);
+
 void ep_moe_post_reorder(
     torch::Tensor down_output,
     torch::Tensor output,
@@ -305,6 +323,15 @@ void scaled_fp4_experts_quant(
     torch::Tensor const& input_offset_by_experts,
     torch::Tensor const& output_scale_offset_by_experts);
 
+namespace marlin_moe_wna16 {
+
+torch::Tensor
+gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm, int64_t size_k, int64_t size_n, int64_t num_bits);
+
+torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64_t size_n, int64_t num_bits);
+
+}  // namespace marlin_moe_wna16
+
 /*
  * From csrc/speculative
  */
@@ -317,6 +344,7 @@ void tree_speculative_sampling_target_only(
     at::Tensor retrive_next_token,
     at::Tensor retrive_next_sibling,
     at::Tensor uniform_samples,
+    at::Tensor uniform_samples_for_final_sampling,
     at::Tensor target_probs,
     at::Tensor draft_probs,
     double threshold_single = 1,
@@ -346,10 +374,128 @@ void build_tree_kernel_efficient(
     at::Tensor retrive_next_sibling,
     int64_t topk,
     int64_t depth,
-    int64_t draft_token_num);
+    int64_t draft_token_num,
+    int64_t tree_mask_mode);
 
 void segment_packbits(
-    at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr, at::Tensor y, int64_t cuda_stream);
+    at::Tensor x,
+    at::Tensor input_indptr,
+    at::Tensor output_indptr,
+    at::Tensor y,
+    int64_t batch_size,
+    int64_t cuda_stream = 0);
+
+/*
+ * From csrc/kvcacheio
+ */
+void transfer_kv_per_layer(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_per_layer_direct(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t page_size);
+
+void transfer_kv_all_layer(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t src_layer_offset,
+    int64_t dst_layer_offset,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_all_layer_direct(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t page_size,
+    int64_t num_layers);
+
+void transfer_kv_per_layer_mla(
+    const at::Tensor src,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_per_layer_mla_direct(
+    const at::Tensor src,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t page_size);
+
+void transfer_kv_all_layer_mla(
+    const at::Tensor src,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t src_layer_offset,
+    int64_t dst_layer_offset,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_all_layer_mla_direct(
+    const at::Tensor src,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t page_size,
+    int64_t num_layers);
+
+/*
+ * From csrc/moe/cutlass_moe/w4a8
+ */
+void get_cutlass_w4a8_moe_mm_data(
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_offsets,
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& problem_sizes2,
+    torch::Tensor& input_permutation,
+    torch::Tensor& output_permutation,
+    const int64_t num_experts,
+    const int64_t n,
+    const int64_t k);
+
+void cutlass_w4a8_moe_mm(
+    torch::Tensor& d_tensors,
+    torch::Tensor const& a_tensors,
+    torch::Tensor const& b_tensors,
+    torch::Tensor const& a_scales,
+    torch::Tensor const& b_scales,
+    torch::Tensor const& expert_offsets,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor const& a_strides,
+    torch::Tensor const& b_strides,
+    torch::Tensor const& d_strides,
+    torch::Tensor const& s_strides,
+    int64_t chunk_size,
+    int64_t topk);
 
 /*
  * From FlashInfer
@@ -388,6 +534,31 @@ void top_p_sampling_from_probs(
     double top_p_val,
     bool deterministic,
     std::optional<at::Generator> gen);
+torch::Tensor moe_wna16_marlin_gemm(
+    torch::Tensor& a,
+    std::optional<torch::Tensor> const& c_or_none,
+    torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales,
+    std::optional<torch::Tensor> const& b_zeros_or_none,
+    std::optional<torch::Tensor> const& g_idx_or_none,
+    std::optional<torch::Tensor> const& perm_or_none,
+    torch::Tensor& workspace,
+    torch::Tensor& sorted_token_ids,
+    torch::Tensor& expert_ids,
+    torch::Tensor& num_tokens_past_padded,
+    torch::Tensor& topk_weights,
+    int64_t moe_block_size,
+    int64_t top_k,
+    bool mul_topk_weights,
+    bool is_ep,
+    sglang::ScalarTypeId const& b_q_type_id,
+    int64_t size_m,
+    int64_t size_n,
+    int64_t size_k,
+    bool is_k_full,
+    bool use_atomic_add,
+    bool use_fp32_reduce,
+    bool is_zp_float);
 
 namespace flash {
 /*
