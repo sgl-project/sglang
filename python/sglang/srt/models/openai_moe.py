@@ -94,6 +94,15 @@ def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
     if sliding_window is not None and sliding_window > 0:
         mask += torch.tril(
             mask.new_full((n_tokens, n_tokens), -float("inf")), diagonal=-sliding_window
+        )            
+    QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
+    QK *= sm_scale
+    QK += mask[None, None, :, :]
+    QK = torch.cat([QK, S], dim=-1)
+    W = torch.softmax(QK, dim=-1)
+    W = W[..., :-1]
+    attn = torch.einsum("hmqk,khmd->qhmd", W, V)
+    return attn.reshape(n_tokens, -1)
 # ================================================================================================================
 # Oai RoPE Reference
 # ================================================================================================================
@@ -182,54 +191,6 @@ def sink_attention_ref(
 
     return o_ref
 
-def _apply_rotary_emb(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> torch.Tensor:
-    cos = cos.unsqueeze(-2).to(x.dtype)
-    sin = sin.unsqueeze(-2).to(x.dtype)
-    x1, x2 = torch.chunk(x, 2, dim=-1)
-    o1 = x1 * cos - x2 * sin
-    o2 = x2 * cos + x1 * sin
-    return torch.cat((o1, o2), dim=-1)
-
-class RotaryEmbedding(torch.nn.Module):
-    def __init__(
-        self,
-        head_dim: int,
-        base: int,
-        dtype: torch.dtype,
-        initial_context_length: int = 4096,
-        scaling_factor: float = 1.0,
-        ntk_alpha: float = 1.0,
-        ntk_beta: float = 32.0,
-        device: torch.device | None = None,
-    ) -> None:
-        super().__init__()
-        self.head_dim = head_dim
-        self.base = base
-        self.dtype = dtype
-        self.initial_context_length = initial_context_length
-        self.scaling_factor = scaling_factor
-        self.ntk_alpha = ntk_alpha
-        self.ntk_beta = ntk_beta
-        self.device = device
-
-    def _compute_concentration_and_inv_freq(self) -> torch.Tensor:
-        """See YaRN paper: https://arxiv.org/abs/2309.00071"""
-        freq = self.base ** (
-            torch.arange(0, self.head_dim, 2, dtype=torch.float, device=self.device)
-            / self.head_dim
-        )
-    QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
-    QK *= sm_scale
-    QK += mask[None, None, :, :]
-    QK = torch.cat([QK, S], dim=-1)
-    W = torch.softmax(QK, dim=-1)
-    W = W[..., :-1]
-    attn = torch.einsum("hmqk,khmd->qhmd", W, V)
-    return attn.reshape(n_tokens, -1)
 
 
 # Todo: to make sure sliding window size for flashinfer is correct
@@ -715,10 +676,10 @@ class OpenAIMoeAttention(nn.Module):
         attn_output = self.attn(*inner_state, sink=sinks)
         '''
         # # Todo: sdpa as a WA for attn_kernel
-        # q = inner_state[0].view(-1, self.num_kv_heads, self.num_heads // self.num_kv_heads, self.head_dim)
-        # k = inner_state[1].view(-1, self.num_kv_heads, self.head_dim)
-        # v = inner_state[2].view(-1, self.num_kv_heads, self.head_dim)
-        # attn_output = sdpa(q, k, v, self.sinks, self.scaling, self.sliding_window)
+        q = inner_state[0].view(-1, self.num_kv_heads, self.num_heads // self.num_kv_heads, self.head_dim)
+        k = inner_state[1].view(-1, self.num_kv_heads, self.head_dim)
+        v = inner_state[2].view(-1, self.num_kv_heads, self.head_dim)
+        attn_output = sdpa(q, k, v, self.sinks, self.scaling, self.sliding_window)
         output, _ = self.o_proj(attn_output)
         return output
 
