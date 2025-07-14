@@ -24,6 +24,9 @@ class MultiModalCache:
         self.current_size += data_size
         return True
 
+    def has(self, mm_hash: int) -> bool:
+        return mm_hash in self.mm_cache
+
     def get(self, mm_hash: int) -> torch.Tensor:
         return self.mm_cache.get(mm_hash)
 

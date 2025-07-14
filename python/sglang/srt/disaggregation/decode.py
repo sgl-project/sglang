@@ -416,6 +416,12 @@ class DecodePreallocQueue:
 
         return preallocated_reqs
 
+    @property
+    def num_tokens_pre_allocated(self):
+        return sum(
+            len(decode_req.req.fill_ids) for decode_req in self.transfer_queue.queue
+        )
+
     def _allocatable_tokens(
         self, retractable_tokens: Optional[int] = None, count_retracted: bool = True
     ) -> int:
@@ -433,7 +439,15 @@ class DecodePreallocQueue:
             else 0
         )
 
-        allocatable_tokens = self.token_to_kv_pool_allocator.available_size() - max(
+        if self.scheduler.model_config.is_hybrid:
+            available_size = min(
+                self.token_to_kv_pool_allocator.full_available_size(),
+                self.token_to_kv_pool_allocator.swa_available_size(),
+            )
+        else:
+            available_size = self.token_to_kv_pool_allocator.available_size()
+
+        allocatable_tokens = available_size - max(
             # preserve some space for future decode
             self.num_reserved_decode_tokens
             * (
@@ -766,7 +780,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.last_batch_in_queue = last_batch_in_queue
 
     def _prepare_idle_batch_and_run(self: Scheduler, batch, delay_process=False):
-        batch, _ = self.prepare_mlp_sync_batch(batch)
+        batch = self.prepare_mlp_sync_batch(batch)
         result = None
         if batch:
             result = self.run_batch(batch)
