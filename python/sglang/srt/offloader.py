@@ -13,10 +13,7 @@ class _ModuleOffloader:
         assert device != torch.device("cpu")
 
         pin_memory = is_pin_memory_available()
-        # offload parameters to CPU
-        # use pin_memory if possible, which helps cudagraph capture speed
         for p in module.parameters():
-            # `torch.empty_like` does not support `pin_memory` argument
             cpu_data = torch.empty_strided(
                 size=p.data.size(),
                 stride=p.data.stride(),
