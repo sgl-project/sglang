@@ -592,7 +592,7 @@ class OpenAIMoeAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            sliding_window_size=self.sliding_window,
+            sliding_window_size=(self.sliding_window),
             enable_attention_sink=True,
             prefix=add_prefix("attn", prefix),
         )
