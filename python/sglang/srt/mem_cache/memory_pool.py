@@ -497,16 +497,15 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool):
         self.custom_mem_pool = None
 
         try:
-            from kvcached import ops as kvcached_ops
-            from kvcached.slab_allocator import KVCacheManager
+            import kvcached.integration.sglang.interfaces as kvcached_interfaces
 
-            self.kvcached_ops = kvcached_ops
-            self.kvcached_ops.init_kvcached()
+            self.kvcached_interfaces = kvcached_interfaces
+            self.kvcached_interfaces.init_kvcached()
 
             # Initialize KV allocator based on per-token KV size (cell_size)
             self.cell_size = self.head_num * self.head_dim * self.dtype.itemsize
 
-            self.kv_allocator = KVCacheManager(
+            self.kvcached_allocator = kvcached_interfaces.get_kv_cache_manager(
                 self.size,
                 self.page_size,
                 self.cell_size,
@@ -530,23 +529,24 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool):
         self.mem_usage = (k_size + v_size) / GB
 
     def __del__(self):
-        self.kvcached_ops.shutdown_kvcached()
-        del self.kv_allocator
+        self.kvcached_interfaces.shutdown_kvcached()
+        del self.kvcached_allocator
         self.k_buffer = None
         self.v_buffer = None
 
     def _create_buffers(self):
-        assert "cuda" in self.device, "kvcached only supports cuda device"
-        k_buffer, v_buffer = self.kvcached_ops.sgl_alloc_kv_cache(
+        if "cuda" not in self.device:
+            raise ValueError("ElasticMHATokenToKVPool only supports cuda device")
+
+        self.k_buffer, self.v_buffer = self.kvcached_interfaces.alloc_kv_cache(
             self.size,
             self.head_num,
             self.head_dim,
             self.dtype,
             "cuda",
             self.layer_num,
+            self.page_size,
         )
-        self.k_buffer = k_buffer
-        self.v_buffer = v_buffer
 
 
 class SWAKVPool(KVCache):

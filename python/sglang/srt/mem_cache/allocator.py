@@ -152,28 +152,37 @@ class ElasticTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def __init__(self, size: int, dtype: torch.dtype, device: str, kvcache: KVCache):
         super().__init__(size, 1, dtype, device, kvcache)
         self.clear()
-        assert hasattr(
-            kvcache, "kv_allocator"
-        ), "ElasticTokenToKVPoolAllocator requires kvcache to be an ElasticMHATokenToKVPool"
-        self.kv_allocator = kvcache.kv_allocator
+
+        # sanity check
+        from sglang.srt.mem_cache.memory_pool import ElasticMHATokenToKVPool
+
+        if not isinstance(kvcache, ElasticMHATokenToKVPool):
+            raise ValueError(
+                f"ElasticTokenToKVPoolAllocator requires kvcache to be an ElasticMHATokenToKVPool, but got {type(kvcache)}"
+            )
+
+        self.kvcached_allocator = kvcache.kvcached_allocator
+
+        if "cuda" not in device:
+            raise ValueError("ElasticTokenToKVPoolAllocator only supports cuda device")
 
     def available_size(self):
-        return self.kv_allocator.available_size()
+        return self.kvcached_allocator.available_size()
 
     def alloc(self, need_size: int):
-        indices = self.kv_allocator.alloc(need_size)
+        indices = self.kvcached_allocator.alloc(need_size)
         indices = torch.tensor(indices, dtype=torch.int32, device="cuda")
         return indices
 
     def free(self, free_index: torch.Tensor):
         if self.is_not_in_free_group:
-            return self.kv_allocator.free(free_index.cpu().numpy())
+            return self.kvcached_allocator.free(free_index.cpu().numpy())
         else:
             self.free_group.append(free_index)
 
     def clear(self):
-        if hasattr(self, "kv_allocator"):
-            self.kv_allocator.clear()
+        if hasattr(self, "kvcached_allocator"):
+            self.kvcached_allocator.clear()
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):

@@ -1494,12 +1494,13 @@ class Scheduler(
                 self.max_total_num_tokens
                 if not self.enable_hierarchical_cache
                 else self.max_total_num_tokens - protected_size
-      
+            )
+            token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+
         # disable memory leak check for elastic allocator, since the available size changes dynamically.
         if isinstance(self.token_to_kv_pool_allocator, ElasticTokenToKVPoolAllocator):
             memory_leak = False
 
-        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
         if memory_leak:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
             raise ValueError(msg)
