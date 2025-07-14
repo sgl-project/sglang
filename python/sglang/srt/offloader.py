@@ -52,5 +52,9 @@ def _hook_module_forward(module, create_parameter_and_buffer_dicts):
 
 
 def wrap_layers_for_offload(layers: List[torch.nn.Module]):
+    offloaders = [
+        _ModuleOffloader(layer) if TODO else None
+        for layer_id, layer in enumerate(layers)
+    ]
     TODO
     return layers
