@@ -27,5 +27,7 @@ class TestGLM4_1VThinkingServer(TestOpenAIVisionServer):
         )
         cls.base_url += "/v1"
 
+
 if __name__ == "__main__":
+    del TestOpenAIVisionServer  # avoid duplicate test
     unittest.main()
