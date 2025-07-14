@@ -52,10 +52,14 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -185,6 +189,10 @@ class Modality(Enum):
                 f"Invalid modality string: {modality_str}. Valid modalities are: {[m.name for m in Modality]}"
             )
 
+    @staticmethod
+    def all():
+        return [Modality.IMAGE, Modality.VIDEO, Modality.AUDIO]
+
 
 @dataclasses.dataclass
 class MultimodalDataItem:
@@ -200,7 +208,7 @@ class MultimodalDataItem:
     hash: int = None
     pad_value: int = None
     image_sizes: Tuple[int, int] = None
-    image_offsets: Optional[list] = None
+    offsets: Optional[list] = None
 
     # the real data, pixel_values or audio_features
     # data: Union[List[torch.Tensor], List[np.ndarray]]
@@ -253,11 +261,16 @@ class MultimodalDataItem:
                     self.hash = hash_feature(self.audio_features)
                 elif self.input_features is not None:
                     self.hash = hash_feature(self.input_features)
+            elif self.is_video():
+                self.hash = hash_feature(self.pixel_values_videos)
             else:
                 self.hash = hash_feature(self.pixel_values)
 
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
+
+    def is_modality(self, modality: Modality) -> bool:
+        return self.modality == modality
 
     def is_audio(self):
         return (self.modality == Modality.AUDIO) and (
@@ -268,7 +281,7 @@ class MultimodalDataItem:
 
     def is_image(self):
         return (
-            self.modality == Modality.IMAGE or self.modality == Modality.MULTI_IMAGES
+            self.is_modality(Modality.IMAGE) or self.is_modality(Modality.MULTI_IMAGES)
         ) and (
             self.precomputed_features is not None
             or not MultimodalDataItem.is_empty_list(self.pixel_values)
@@ -277,7 +290,7 @@ class MultimodalDataItem:
     def is_video(self):
         return (self.modality == Modality.VIDEO) and (
             self.precomputed_features is not None
-            or not MultimodalDataItem.is_empty_list(self.pixel_values)
+            or not MultimodalDataItem.is_empty_list(self.pixel_values_videos)
         )
 
     def is_valid(self) -> bool:
@@ -351,6 +364,7 @@ class MultimodalInputs:
             "im_token_id",
             "im_start_id",
             "im_end_id",
+            "video_token_id",
             "slice_start_id",
             "slice_end_id",
             "audio_start_id",
@@ -364,11 +378,12 @@ class MultimodalInputs:
         return ret
 
     def contains_image_inputs(self) -> bool:
-        """ """
         return any(item.is_image() for item in self.mm_items)
 
+    def contains_video_inputs(self) -> bool:
+        return any(item.is_video() for item in self.mm_items)
+
     def contains_audio_inputs(self) -> bool:
-        """ """
         return any(item.is_audio() for item in self.mm_items)
 
     def contains_mm_input(self) -> bool:
@@ -516,6 +531,8 @@ class Req:
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.host_hit_length = 0
+        # The node to lock until for swa radix tree lock ref
+        self.swa_uuid_for_lock: Optional[int] = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -734,6 +751,7 @@ class Req:
     def reset_for_retract(self):
         self.prefix_indices = []
         self.last_node = None
+        self.swa_uuid_for_lock = None
         self.extend_input_len = 0
         self.is_retracted = True
         self.input_token_logprobs = None
@@ -802,6 +820,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
+    is_hybrid: bool = False
 
     # Batch configs
     model_config: ModelConfig = None
@@ -843,7 +862,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens_for_logprob: Optional[List[int]] = None
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
-    is_extend_in_batch: bool = False
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
 
@@ -908,11 +926,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
+        is_hybrid = False
+        if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+            assert isinstance(tree_cache, SWARadixCache) or isinstance(
+                tree_cache, SWAChunkCache
+            ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
+            is_hybrid = True
+
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
+            is_hybrid=is_hybrid,
             model_config=model_config,
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
@@ -943,9 +969,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return req_pool_indices
 
     def alloc_token_slots(self, num_tokens: int, backup_state: bool = False):
-        if self.token_to_kv_pool_allocator.available_size() < num_tokens:
-            if self.tree_cache is not None:
-                self.tree_cache.evict(num_tokens)
+        self._evict_tree_cache_if_needed(num_tokens)
 
         if backup_state:
             state = self.token_to_kv_pool_allocator.backup_state()
@@ -956,7 +980,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             error_msg = (
                 f"{phase_str} out of memory. Try to lower your batch size.\n"
                 f"Try to allocate {num_tokens} tokens.\n"
-                f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
+                f"{self._available_and_evictable_str()}"
             )
             logger.error(error_msg)
             if self.tree_cache is not None:
@@ -976,16 +1000,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         extend_num_tokens: int,
         backup_state: bool = False,
     ):
-        if (
-            self.token_to_kv_pool_allocator.available_size()
-            < extend_num_tokens
+        num_tokens = (
+            extend_num_tokens
             + len(seq_lens) * self.token_to_kv_pool_allocator.page_size
-        ):
-            if self.tree_cache is not None:
-                self.tree_cache.evict(
-                    extend_num_tokens
-                    + len(seq_lens) * self.token_to_kv_pool_allocator.page_size,
-                )
+        )
+        self._evict_tree_cache_if_needed(num_tokens)
 
         if backup_state:
             state = self.token_to_kv_pool_allocator.backup_state()
@@ -997,9 +1016,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             error_msg = (
                 f"Prefill out of memory. Try to lower your batch size.\n"
                 f"Try to allocate {extend_num_tokens} tokens.\n"
-                f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
-                f"{self.token_to_kv_pool_allocator.available_size()=}\n"
-                f"{self.tree_cache.evictable_size()=}\n"
+                f"{self._available_and_evictable_str()}"
             )
             logger.error(error_msg)
             raise RuntimeError(error_msg)
@@ -1015,14 +1032,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         last_loc: torch.Tensor,
         backup_state: bool = False,
     ):
-        if self.tree_cache is not None:
-            if (
-                self.token_to_kv_pool_allocator.available_size()
-                < len(seq_lens) * self.token_to_kv_pool_allocator.page_size
-            ):
-                self.tree_cache.evict(
-                    len(seq_lens) * self.token_to_kv_pool_allocator.page_size,
-                )
+        num_tokens = len(seq_lens) * self.token_to_kv_pool_allocator.page_size
+
+        self._evict_tree_cache_if_needed(num_tokens)
 
         if backup_state:
             state = self.token_to_kv_pool_allocator.backup_state()
@@ -1032,9 +1044,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             error_msg = (
                 f"Decode out of memory. Try to lower your batch size.\n"
                 f"Try to allocate {len(seq_lens)} tokens.\n"
-                f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
-                f"{self.token_to_kv_pool_allocator.available_size()=}\n"
-                f"{self.tree_cache.evictable_size()=}\n"
+                f"{self._available_and_evictable_str()}"
             )
             logger.error(error_msg)
             raise RuntimeError(error_msg)
@@ -1171,7 +1181,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
                 )
                 if isinstance(self.tree_cache, SWAChunkCache):
-                    self.tree_cache.evict(
+                    self.tree_cache.evict_swa(
                         req, pre_len, self.model_config.attention_chunk_size
                     )
 
@@ -1361,17 +1371,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def check_decode_mem(self, buf_multiplier=1):
-        tokens_required = (
+        num_tokens = (
             self.new_page_count_next_decode()
             * buf_multiplier
             * self.token_to_kv_pool_allocator.page_size
         )
-        if self.token_to_kv_pool_allocator.available_size() >= tokens_required:
-            return True
 
-        self.tree_cache.evict(tokens_required)
-
-        return self.token_to_kv_pool_allocator.available_size() >= tokens_required
+        self._evict_tree_cache_if_needed(num_tokens)
+        return self._is_available_size_sufficient(num_tokens)
 
     def retract_decode(self, server_args: ServerArgs):
         """Retract the decoding requests when there is not enough memory."""
@@ -1404,19 +1411,38 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 num_reqs * global_config.retract_decode_steps + headroom_for_spec_decode
             )
 
+        def _get_available_size():
+            if self.is_hybrid:
+                return min(
+                    self.token_to_kv_pool_allocator.full_available_size(),
+                    self.token_to_kv_pool_allocator.swa_available_size(),
+                )
+            else:
+                return self.token_to_kv_pool_allocator.available_size()
+
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
         first_iter = True
         while (
-            self.token_to_kv_pool_allocator.available_size()
-            < get_required_tokens(len(sorted_indices))
+            _get_available_size() < get_required_tokens(len(sorted_indices))
             or first_iter
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
-                assert (
-                    self.token_to_kv_pool_allocator.available_size() > 0
-                ), "No space left for only one request"
+                if self.is_hybrid:
+                    full_available_size = (
+                        self.token_to_kv_pool_allocator.full_available_size()
+                    )
+                    swa_available_size = (
+                        self.token_to_kv_pool_allocator.swa_available_size()
+                    )
+                    assert (
+                        full_available_size > 0 and swa_available_size > 0
+                    ), f"No space left for only one request in SWA mode {full_available_size=}, {swa_available_size=}"
+                else:
+                    assert (
+                        self.token_to_kv_pool_allocator.available_size() > 0
+                    ), f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
                 break
 
             first_iter = False
@@ -1448,15 +1474,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_to_token_pool.free(req.req_pool_idx)
 
                 # release the last node
-                self.tree_cache.dec_lock_ref(req.last_node)
+                if self.is_hybrid:
+                    self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+                else:
+                    self.tree_cache.dec_lock_ref(req.last_node)
 
                 # NOTE(lsyin): we should use the newly evictable memory instantly.
-                residual_size = (
-                    len(sorted_indices) * global_config.retract_decode_steps
-                    - self.token_to_kv_pool_allocator.available_size()
-                )
-                residual_size = max(0, residual_size)
-                self.tree_cache.evict(residual_size)
+                num_tokens = len(sorted_indices) * global_config.retract_decode_steps
+                self._evict_tree_cache_if_needed(num_tokens)
 
             req.reset_for_retract()
 
@@ -1549,7 +1574,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # free memory
         if isinstance(self.tree_cache, SWAChunkCache):
             for req in self.reqs:
-                self.tree_cache.evict(
+                self.tree_cache.evict_swa(
                     req, req.seqlen - 1, self.model_config.attention_chunk_size
                 )
 
@@ -1767,6 +1792,53 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
         )
+
+    def _evict_tree_cache_if_needed(
+        self,
+        num_tokens: int,
+    ) -> None:
+        if isinstance(self.tree_cache, SWAChunkCache):
+            return
+
+        if self.is_hybrid:
+            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+
+            if full_available_size < num_tokens or swa_available_size < num_tokens:
+                if self.tree_cache is not None:
+                    full_num_tokens = max(0, num_tokens - full_available_size)
+                    swa_num_tokens = max(0, num_tokens - swa_available_size)
+                    self.tree_cache.evict(full_num_tokens, swa_num_tokens)
+        else:
+            if self.token_to_kv_pool_allocator.available_size() < num_tokens:
+                if self.tree_cache is not None:
+                    self.tree_cache.evict(num_tokens)
+
+    def _is_available_size_sufficient(self, num_tokens: int) -> bool:
+        if self.is_hybrid:
+            return (
+                self.token_to_kv_pool_allocator.full_available_size() >= num_tokens
+                and self.token_to_kv_pool_allocator.swa_available_size() >= num_tokens
+            )
+        else:
+            return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+
+    def _available_and_evictable_str(self) -> str:
+        if self.is_hybrid:
+            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+            full_evictable_size = self.tree_cache.full_evictable_size()
+            swa_evictable_size = self.tree_cache.swa_evictable_size()
+            return (
+                f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
+                f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
+                f"Full LRU list evictable size: {self.tree_cache.full_lru_list_evictable_size()}\n"
+                f"SWA LRU list evictable size: {self.tree_cache.swa_lru_list_evictable_size()}\n"
+            )
+        else:
+            available_size = self.token_to_kv_pool_allocator.available_size()
+            evictable_size = self.tree_cache.evictable_size()
+            return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
 
     def __str__(self):
         return (
