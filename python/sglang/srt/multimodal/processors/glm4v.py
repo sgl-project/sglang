@@ -75,7 +75,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             max_req_input_len=max_req_input_len,
         )
 
-        # GLM-4V specific: resize images if they are raw Image objects
+        # TODO(Xinyuan): GLM-4V specific: resize images, current methods are inherited from Qwen2.5VL
         if base_output.images and isinstance(base_output.images[0], Image.Image):
             resize_tasks = [resize_image_async(image) for image in base_output.images]
             base_output.images = await asyncio.gather(*resize_tasks)
