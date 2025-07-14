@@ -82,7 +82,7 @@ Notes:
 
     To specify the cores to be used, we need to explicitly set the environment variable `SGLANG_CPU_OMP_THREADS_BIND`.
     For example, if we want to run the SGLang service using the first 40 cores of each SNC on a Xeon® 6980P server,
-    which has 43-43-42 cores per socket (reserving the remaining 16 cores for other tasks), we should set:
+    which has 43-43-42 cores on the 3 SNCs of a socket (reserving the remaining 16 cores for other tasks), we should set:
 
     ```bash
     export SGLANG_CPU_OMP_THREADS_BIND="0-39|43-82|86-125|128-167|171-210|214-253"
