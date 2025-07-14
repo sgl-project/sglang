@@ -76,6 +76,7 @@ def adjust_marlin_shard(param, shard_size, shard_offset):
 def adjust_bitsandbytes_4bit_shard(
     param: Parameter, shard_offsets: Dict[str, Tuple[int, int]], loaded_shard_id: str
 ) -> Tuple[int, int]:
+    """Adjust the quantization offsets and sizes for BitsAndBytes sharding."""
     total, _ = shard_offsets["total"]
     orig_offset, orig_size = shard_offsets[loaded_shard_id]
     quantized_total = param.data.shape[0]
@@ -85,11 +86,19 @@ def adjust_bitsandbytes_4bit_shard(
 
 
 def adjust_scalar_to_fused_array(param, loaded_weight, shard_id):
+    """For fused modules (QKV and MLP) we have an array of length
+    N that holds 1 scale for each "logical" matrix. So the param
+    is an array of length N. The loaded_weight corresponds to
+    one of the shards on disk. Here, we slice the param based on
+    the shard_id for loading.
+    """
     qkv_idxs = {"q": 0, "k": 1, "v": 2}
     if isinstance(shard_id, str):
         shard_id = qkv_idxs[shard_id]
     elif not isinstance(shard_id, int):
         raise ValueError(f"Unknown Shard Id {shard_id}")
+    # AutoFP8 scales do not have a shape
+    # compressed-tensors scales do have a shape
     if len(loaded_weight.shape) != 0:
         assert loaded_weight.shape[0] == 1
         loaded_weight = loaded_weight[0]
@@ -102,6 +111,8 @@ def adjust_scalar_to_fused_array(param, loaded_weight, shard_id):
 
 
 class LinearMethodBase(QuantizeMethodBase):
+    """Base class for different (maybe quantized) linear methods."""
+
     @abstractmethod
     def create_weights(
         self,
@@ -113,6 +124,19 @@ class LinearMethodBase(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        """Create weights for a linear layer.
+           The weights will be set as attributes of the layer.
+
+        Args:
+            layer: The layer that is using the LinearMethodBase factory.
+            input_size_per_partition: Size of the weight input dim on rank X.
+            output_partition_sizes: Sizes of the output dim of each logical
+                weight on rank X. E.g., output_partition_sizes for QKVLinear
+                is a list contains the width of Wq, Wk, Wv on rank X.
+            input_size: Size of the input dim of the weight across all ranks.
+            output_size: Size of the output dim of the weight across all ranks.
+            params_dtype: Datatype of the parameters.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -122,10 +146,14 @@ class LinearMethodBase(QuantizeMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Apply the weights in layer to the input tensor.
+        Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
 
 
 class UnquantizedLinearMethod(LinearMethodBase):
+    """Linear method without quantization."""
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -172,6 +200,17 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
 
 class LinearBase(torch.nn.Module):
+    """Base linear layer.
+
+    Args:
+        input_size: input dimension of the linear layer.
+        output_size: output dimension of the linear layer.
+        bias: If true, add bias.
+        skip_bias_add: If true, skip adding bias but instead return it.
+        params_dtype: Data type for the parameters.
+        quant_config: Quantization configure.
+    """
+
     def __init__(
         self,
         input_size: int,
@@ -194,7 +233,7 @@ class LinearBase(torch.nn.Module):
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # noqa: D401
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
 
