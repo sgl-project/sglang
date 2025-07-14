@@ -9,8 +9,7 @@ from sglang.srt.utils import is_pin_memory_available
 class _ModuleOffloader:
     def __init__(self, module: torch.nn.Module):
         device = next(module.parameters()).device
-        TODO_if_cpu_then_do_not_offload
-        assert device != torch.device("cpu")
+        assert device != torch.device("cpu"), "not handled device=cpu case yet (should skip this tensor)"
 
         _offload_module_to_cpu(module)
 
