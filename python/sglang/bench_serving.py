@@ -814,9 +814,9 @@ def sample_mmmu_requests(
         List of tuples (prompt, prompt_token_len, output_token_len).
     """
     try:
-        import base64
         import io
 
+        import pybase64
         from datasets import load_dataset
     except ImportError:
         raise ImportError("Please install datasets: pip install datasets")
@@ -867,7 +867,7 @@ def sample_mmmu_requests(
                     # Encode image to base64
                     buffered = io.BytesIO()
                     image.save(buffered, format="JPEG")
-                    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                    img_str = pybase64.b64encode(buffered.getvalue()).decode("utf-8")
                     image_data = f"data:image/jpeg;base64,{img_str}"
                 else:
                     continue

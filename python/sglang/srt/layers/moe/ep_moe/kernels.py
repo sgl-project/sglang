@@ -6,6 +6,7 @@ import triton
 
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import ceil_div, dispose_tensor, is_cuda
+from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +236,8 @@ def pre_reorder_triton_kernel(
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
 
-    src_idx = tl.program_id(0)
+    src_idx_int32 = tl.program_id(0)
+    src_idx = src_idx_int32.to(tl.int64)
     src2dst_ptr = src2dst_ptr + src_idx * topk
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
     src_ptr = input_ptr + src_idx * hidden_size
@@ -254,7 +256,8 @@ def pre_reorder_triton_kernel(
             else:
                 scale = 1.0
 
-            dst_idx = tl.load(src2dst_ptr + idx)
+            dst_idx_int32 = tl.load(src2dst_ptr + idx)
+            dst_idx = dst_idx_int32.to(tl.int64)
             dst_ptr = gateup_input_ptr + dst_idx * hidden_size
             for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
                 offset = start_offset + vec
@@ -1058,7 +1061,7 @@ def ep_gather(
     input_index: torch.Tensor,
     output_tensor: torch.Tensor,
 ):
-    BLOCK_D = 1024  # block size of quantization
+    BLOCK_D = 1024 if not is_in_ci() else 128  # block size of quantization
     num_warps = 2
     num_tokens = output_tensor.shape[0]
     hidden_size = input_tensor.shape[1]
