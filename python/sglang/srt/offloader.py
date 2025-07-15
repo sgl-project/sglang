@@ -66,7 +66,7 @@ class _ModuleOffloader:
         ), "not handled device=cpu case yet (should skip this tensor)"
 
         self._device_tensors = None
-        _StatelessOffloaderUtil.offload(module)
+        _StatelessOffloaderUtil.move_params_to_cpu(module)
 
     def start_onload(self):
         self.alt_stream.wait_stream(torch.cuda.current_stream())
@@ -86,7 +86,7 @@ class _ModuleOffloader:
 
 class _StatelessOffloaderUtil:
     @staticmethod
-    def offload(module):
+    def move_params_to_cpu(module):
         pin_memory = is_pin_memory_available()
         for p in module.parameters():
             cpu_data = torch.empty_strided(
