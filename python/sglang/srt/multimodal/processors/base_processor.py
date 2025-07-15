@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
+
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import load_audio, load_image, load_video, logger
 

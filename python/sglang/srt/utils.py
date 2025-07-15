@@ -74,7 +74,6 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
-from video_reader import PyVideoReader
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
@@ -85,6 +84,7 @@ from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager
+from video_reader import PyVideoReader
 
 logger = logging.getLogger(__name__)
 
@@ -759,7 +759,8 @@ def load_image(
 def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
     # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
     from video_reader import PyVideoReader
-    device = 'cuda' if use_gpu and torch.cuda.is_available() else None
+
+    device = "cuda" if use_gpu and torch.cuda.is_available() else None
     tmp_file = None
     vr = None
     try:
