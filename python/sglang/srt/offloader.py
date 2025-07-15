@@ -8,7 +8,7 @@ from sglang.srt.utils import is_pin_memory_available
 
 class _StatelessOffloaderUtil:
     @staticmethod
-    def offload_module_to_cpu(module):
+    def offload(module):
         pin_memory = is_pin_memory_available()
         for p in module.parameters():
             cpu_data = torch.empty_strided(
@@ -23,7 +23,7 @@ class _StatelessOffloaderUtil:
             p.data = cpu_data
 
     @staticmethod
-    def create_onload_params(module, device):
+    def onload(module, device):
         return {
             k: v.to(device, non_blocking=True)
             for k, v in module.state_dict().items()
@@ -35,10 +35,10 @@ class _ModuleOffloader:
         self.device = next(module.parameters()).device
         assert self.device != torch.device("cpu"), "not handled device=cpu case yet (should skip this tensor)"
 
-        _StatelessOffloaderUtil.offload_module_to_cpu(module)
+        _StatelessOffloaderUtil.offload(module)
 
         def _create_parameter_and_buffer_dicts():
-            return _StatelessOffloaderUtil.create_onload_params(module, self.device)
+            return _StatelessOffloaderUtil.onload(module, self.device)
 
         _hook_module_forward(module, _create_parameter_and_buffer_dicts)
 
