@@ -486,6 +486,8 @@ class Scheduler(
             enable=server_args.enable_memory_saver
         )
         self.init_profier()
+
+        # Init metrics stats
         self.init_metrics()
         self.init_kv_events(server_args.kv_events_config)
 
@@ -630,6 +632,7 @@ class Scheduler(
         self.torch_profiler_output_dir: Optional[str] = None
         self.profiler_activities: Optional[List[str]] = None
         self.profile_id: Optional[str] = None
+        self.profiler_start_forward_ct: Optional[int] = None
         self.profiler_target_forward_ct: Optional[int] = None
         self.profiler_target_prefill_ct: Optional[int] = None
         self.profiler_target_decode_ct: Optional[int] = None
@@ -2403,9 +2406,10 @@ class Scheduler(
 
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
-            if recv_req.profile_by_stage:
+            if recv_req.profile_by_stage or recv_req.start_step:
                 return self.init_profile(
                     recv_req.output_dir,
+                    recv_req.start_step,
                     recv_req.num_steps,
                     recv_req.activities,
                     recv_req.with_stack,
@@ -2416,6 +2420,7 @@ class Scheduler(
             else:
                 self.init_profile(
                     recv_req.output_dir,
+                    recv_req.start_step,
                     recv_req.num_steps,
                     recv_req.activities,
                     recv_req.with_stack,
@@ -2430,6 +2435,7 @@ class Scheduler(
     def init_profile(
         self,
         output_dir: Optional[str],
+        start_step: Optional[int],
         num_steps: Optional[int],
         activities: Optional[List[str]],
         with_stack: Optional[bool],
@@ -2456,6 +2462,9 @@ class Scheduler(
         self.profiler_activities = activities
         self.profile_id = profile_id
 
+        if start_step:
+            self.profiler_start_forward_ct = max(start_step, self.forward_ct + 1)
+
         if num_steps:
             self.profile_steps = num_steps
             if self.profile_by_stage:
@@ -2463,6 +2472,10 @@ class Scheduler(
                 self.profiler_target_decode_ct = num_steps
                 self.profiler_prefill_ct = 0
                 self.profiler_decode_ct = 0
+            elif start_step:
+                self.profiler_target_forward_ct = (
+                    self.profiler_start_forward_ct + num_steps
+                )
             else:
                 self.profiler_target_forward_ct = self.forward_ct + num_steps
             # The caller will be notified when reaching profiler_target_forward_ct
@@ -2535,6 +2548,7 @@ class Scheduler(
 
         if "CUDA_PROFILER" in activities:
             torch.cuda.cudart().cudaProfilerStart()
+            self.profile_in_progress = True
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
@@ -2598,6 +2612,7 @@ class Scheduler(
         )
         self.torch_profiler = None
         self.profile_in_progress = False
+        self.profiler_start_forward_ct = None
 
         return ProfileReqOutput(success=True, message="Succeeded.")
 
@@ -2631,6 +2646,11 @@ class Scheduler(
                 and self.profiler_target_forward_ct <= self.forward_ct
             ):
                 self.stop_profile()
+            if (
+                self.profiler_start_forward_ct
+                and self.profiler_start_forward_ct == self.forward_ct
+            ):
+                self.start_profile()
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         if recv_req == ExpertDistributionReq.START_RECORD:
