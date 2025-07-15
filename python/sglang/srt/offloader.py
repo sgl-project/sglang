@@ -9,6 +9,8 @@ from sglang.srt.utils import get_int_env_var, is_pin_memory_available
 def wrap_modules_for_offload(all_modules: List[torch.nn.Module]):
     module_interval = get_int_env_var("SGLANG_OFFLOAD_MODULE_INTERVAL", 5)
 
+    TODO_offload_lazily
+
     alt_stream = torch.cuda.Stream()
     offload_modules = all_modules[module_interval - 1 :: module_interval]
     offloaders = [_ModuleOffloader(layer, alt_stream) for layer in offload_modules]
