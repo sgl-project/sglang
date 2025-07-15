@@ -2325,7 +2325,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         ):
             self._weight_requant_ue8m0(is_nextn)
 
-        offload_modules(self.model.layers)
+        offload_modules([x.mlp for x in self.model.layers])
 
     def _weight_requant_ue8m0(self, is_nextn=False):
         weight_block_size = self.quant_config.weight_block_size
