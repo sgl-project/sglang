@@ -63,7 +63,12 @@ def _hook_module_forward(module, on_forward_start, on_forward_end):
 
 def wrap_layers_for_offload(layers: List[torch.nn.Module]):
     layer_interval = get_int_env_var("SGLANG_OFFLOAD_LAYER_INTERVAL", 5)
-    offloading_layers = layers[layer_interval - 1::layer_interval]
-    offloaders = [_ModuleOffloader(layer) for layer in offloading_layers]
-    TODO
+    offload_layers = layers[layer_interval - 1::layer_interval]
+    offloaders = [_ModuleOffloader(layer) for layer in offload_layers]
+
+    offloaders[0].start_onload()
+
+    for layer in offload_layers:
+        _hook_module_forward(layer, on_forward_start=TODO, on_forward_end=TODO)
+
     return layers
