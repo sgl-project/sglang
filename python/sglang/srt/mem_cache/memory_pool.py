@@ -266,6 +266,7 @@ class MHATokenToKVPool(KVCache):
             ],
             device=self.device,
         )
+        self.layout_dim = (self.size + self.page_size) * self.head_num * self.head_dim
 
     def _clear_buffers(self):
         del self.k_buffer
@@ -365,6 +366,9 @@ class MHATokenToKVPool(KVCache):
             io_backend=io_backend,
             page_size=self.page_size,
             item_size=self.token_stride,
+            layer_id=layer_id,
+            src_layout_dim=host_pool.layout_dim,
+            dst_layout_dim=self.layout_dim,
         )
 
     def backup_to_host_all_layer(
@@ -386,6 +390,9 @@ class MHATokenToKVPool(KVCache):
                 io_backend=io_backend,
                 page_size=self.page_size,
                 item_size=self.token_stride,
+                layer_id=layer_id,
+                src_layout_dim=self.layout_dim,
+                dst_layout_dim=host_pool.layout_dim,
             )
 
     def _get_key_buffer(self, layer_id: int):
@@ -824,6 +831,7 @@ class MLATokenToKVPool(KVCache):
                 ]
 
         self.token_stride = kv_lora_rank + qk_rope_head_dim
+        self.layout_dim = (size + page_size) * (kv_lora_rank + qk_rope_head_dim)
         self.layer_transfer_counter = None
 
         kv_size = self.get_kv_size_bytes()
@@ -913,13 +921,16 @@ class MLATokenToKVPool(KVCache):
         self, host_pool, host_indices, device_indices, layer_id, io_backend
     ):
         transfer_kv_per_layer_mla(
-            src=host_pool.kv_buffer[layer_id],
-            dst=self.kv_buffer[layer_id],
+            src=host_pool.kv_buffer,
+            dst=self.kv_buffer,
             src_indices=host_indices,
             dst_indices=device_indices,
             io_backend=io_backend,
             page_size=self.page_size,
             item_size=self.token_stride,
+            layer_id=layer_id,
+            src_layout_dim=host_pool.layout_dim,
+            dst_layout_dim=self.layout_dim,
         )
 
     def backup_to_host_all_layer(
@@ -939,6 +950,9 @@ class MLATokenToKVPool(KVCache):
                 io_backend=io_backend,
                 page_size=self.page_size,
                 item_size=self.token_stride,
+                layer_id=layer_id,
+                src_layout_dim=self.layout_dim,
+                dst_layout_dim=host_pool.layout_dim,
             )
 
     def get_cpu_copy(self, indices):

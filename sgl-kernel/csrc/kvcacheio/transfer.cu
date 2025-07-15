@@ -159,8 +159,8 @@ void transfer_kv_per_layer(
     bool dst_layer_first,
     int64_t block_quota,
     int64_t num_warps_per_block) {
-  auto src_offset_fn = src_layer_first ? get_global_offset_lf : get_global_offset_pf
-  auto dst_offset_fn = dst_layer_first ? get_global_offset_lf : get_global_offset_pf
+  auto src_offset_fn = src_layer_first ? get_global_offset_lf : get_global_offset_pf;
+  auto dst_offset_fn = dst_layer_first ? get_global_offset_lf : get_global_offset_pf;
   transfer_kv_launcher<src_offset_fn, dst_offset_fn, false>(
       src_k, dst_k, src_v, dst_v, src_indices, dst_indices, layer_id, 1, item_size, src_layout_dim, dst_layout_dim, block_quota, num_warps_per_block);
 }
@@ -180,8 +180,8 @@ void transfer_kv_all_layer(
     bool dst_layer_first,
     int64_t block_quota,
     int64_t num_warps_per_block) {
-  auto src_offset_fn = src_layer_first ? get_global_offset_lf : get_global_offset_pf
-  auto dst_offset_fn = dst_layer_first ? get_global_offset_lf : get_global_offset_pf
+  auto src_offset_fn = src_layer_first ? get_global_offset_lf : get_global_offset_pf;
+  auto dst_offset_fn = dst_layer_first ? get_global_offset_lf : get_global_offset_pf;
   transfer_kv_launcher<src_offset_fn, dst_offset_fn, false>(
       src_k,
       dst_k,
@@ -212,8 +212,8 @@ void transfer_kv_per_layer_mla(
     int64_t block_quota,
     int64_t num_warps_per_block) {
   at::Tensor empty_tensor = at::Tensor();
-  auto src_offset_fn = src_layer_first ? get_global_offset_lf : get_global_offset_pf
-  auto dst_offset_fn = dst_layer_first ? get_global_offset_lf : get_global_offset_pf
+  auto src_offset_fn = src_layer_first ? get_global_offset_lf : get_global_offset_pf;
+  auto dst_offset_fn = dst_layer_first ? get_global_offset_lf : get_global_offset_pf;
   transfer_kv_launcher<src_offset_fn, dst_offset_fn, true>(
       src,
       dst,
@@ -244,8 +244,8 @@ void transfer_kv_all_layer_mla(
     int64_t block_quota,
     int64_t num_warps_per_block) {
   at::Tensor empty_tensor = at::Tensor();
-  auto src_offset_fn = src_layer_first ? get_global_offset_lf : get_global_offset_pf
-  auto dst_offset_fn = dst_layer_first ? get_global_offset_lf : get_global_offset_pf
+  auto src_offset_fn = src_layer_first ? get_global_offset_lf : get_global_offset_pf;
+  auto dst_offset_fn = dst_layer_first ? get_global_offset_lf : get_global_offset_pf;
   transfer_kv_launcher<src_offset_fn, dst_offset_fn, true>(
       src,
       dst,
