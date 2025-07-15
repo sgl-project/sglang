@@ -25,6 +25,7 @@ from transformers import PretrainedConfig
 from sglang.srt.hf_transformers_utils import (
     get_config,
     get_context_length,
+    get_generation_config,
     get_hf_text_config,
 )
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
@@ -80,6 +81,13 @@ class ModelConfig:
             trust_remote_code=trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
+            **kwargs,
+        )
+
+        self.hf_generation_config = get_generation_config(
+            self.model_path,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
             **kwargs,
         )
 
@@ -359,7 +367,17 @@ class ModelConfig:
                 if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
                     quant_cfg = modelopt_quant_config
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
-                quant_cfg = modelopt_quant_config
+                quant_config_file = os.path.join(
+                    self.model_path, "hf_quant_config.json"
+                )
+                with open(quant_config_file) as f:
+                    quant_config_dict = json.load(f)
+                json_quant_configs = quant_config_dict["quantization"]
+                quant_algo = json_quant_configs.get("quant_algo", None)
+                if quant_algo == "MIXED_PRECISION":
+                    quant_cfg = {"quant_method": "w4afp8"}
+                else:
+                    quant_cfg = modelopt_quant_config
         return quant_cfg
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
@@ -390,6 +408,7 @@ class ModelConfig:
             "w8a8_fp8",
             "moe_wna16",
             "qoq",
+            "w4afp8",
         ]
         compatible_quantization_methods = {
             "modelopt_fp4": ["modelopt"],
@@ -403,7 +422,9 @@ class ModelConfig:
         quant_cfg = self._parse_quant_hf_config()
 
         if quant_cfg is not None:
-            quant_method = quant_cfg.get("quant_method", "").lower()
+            quant_method = quant_cfg.get(
+                "quant_method", "" if not self.quantization else self.quantization
+            ).lower()
 
             # Detect which checkpoint is it
             for _, method in QUANTIZATION_METHODS.items():
@@ -455,6 +476,19 @@ class ModelConfig:
         if eos_ids:
             # it can be either int or list of int
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
+        if eos_ids is None:
+            eos_ids = set()
+        if self.hf_generation_config:
+            generation_eos_ids = getattr(
+                self.hf_generation_config, "eos_token_id", None
+            )
+            if generation_eos_ids:
+                generation_eos_ids = (
+                    {generation_eos_ids}
+                    if isinstance(generation_eos_ids, int)
+                    else set(generation_eos_ids)
+                )
+                eos_ids = eos_ids | generation_eos_ids
         return eos_ids
 
     def maybe_pull_model_tokenizer_from_remote(self) -> None:
@@ -678,7 +712,6 @@ def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int)
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
     else:
-        raise ValueError(
-            "get_hybrid_layer_ids is only implemented for Llama4ForConditionalGeneration"
-        )
+        swa_attention_layer_ids = None
+        full_attention_layer_ids = None
     return swa_attention_layer_ids, full_attention_layer_ids
