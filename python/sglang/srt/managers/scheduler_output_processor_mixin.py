@@ -126,6 +126,7 @@ class SchedulerOutputProcessorMixin:
                         )
 
                     if req.grammar is not None:
+                        # FIXME: this try-except block is for handling unexpected xgrammar issue.
                         try:
                             req.grammar.accept_token(next_token_id)
                         except ValueError as e:
@@ -271,6 +272,7 @@ class SchedulerOutputProcessorMixin:
                 )
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
+                # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
                     req.grammar.accept_token(next_token_id)
                 except ValueError as e:
