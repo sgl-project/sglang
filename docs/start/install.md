@@ -11,40 +11,38 @@ It is recommended to use uv to install the dependencies for faster installation:
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install "sglang[all]>=0.4.6.post4"
+uv pip install "sglang[all]>=0.4.9.post2"
 ```
 
 **Quick Fixes to Common Problems**
 
-- SGLang currently uses torch 2.5, so you need to install flashinfer for torch 2.5. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html). Please note that the FlashInfer pypi package is called `flashinfer-python` instead of `flashinfer`.
+- SGLang currently uses torch 2.7.1, so you need to install flashinfer for torch 2.7.1. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html). Please note that the FlashInfer pypi package is called `flashinfer-python` instead of `flashinfer`.
 
 - If you encounter `OSError: CUDA_HOME environment variable is not set`. Please set it to your CUDA install root with either of the following solutions:
 
   1. Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
   2. Install FlashInfer first following [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html), then install SGLang as described above.
 
-- If you encounter `ImportError; cannot import name 'is_valid_list_of_images' from 'transformers.models.llama.image_processing_llama'`, try to use the specified version of `transformers` in [pyproject.toml](https://github.com/sgl-project/sglang/blob/main/python/pyproject.toml). Currently, just running `pip install transformers==4.51.1`.
-
 ## Method 2: From source
 
 ```bash
 # Use the last release branch
-git clone -b v0.4.6.post4 https://github.com/sgl-project/sglang.git
+git clone -b v0.4.9.post2 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
 pip install -e "python[all]"
 ```
 
-Note: SGLang currently uses torch 2.5, so you need to install flashinfer for torch 2.5. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html).
+Note: SGLang currently uses torch 2.7.1, so you need to install flashinfer for torch 2.7.1. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html).
 
-If you want to develop SGLang, it is recommended to use docker. Please refer to [setup docker container](https://github.com/sgl-project/sglang/blob/main/docs/developer/development_guide_using_docker.md#setup-docker-container) for guidance. The docker image is `lmsysorg/sglang:dev`.
+If you want to develop SGLang, it is recommended to use docker. Please refer to [setup docker container](https://github.com/sgl-project/sglang/blob/main/docs/references/development_guide_using_docker.md#setup-docker-container) for guidance. The docker image is `lmsysorg/sglang:dev`.
 
 Note: For AMD ROCm system with Instinct/MI GPUs, do following instead:
 
 ```bash
 # Use the last release branch
-git clone -b v0.4.6.post4 https://github.com/sgl-project/sglang.git
+git clone -b v0.4.9.post2 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
@@ -73,7 +71,7 @@ docker run --gpus all \
 Note: For AMD ROCm system with Instinct/MI GPUs, it is recommended to use `docker/Dockerfile.rocm` to build images, example and usage as below:
 
 ```bash
-docker build --build-arg SGL_BRANCH=v0.4.6.post4 -t v0.4.6.post4-rocm630 -f Dockerfile.rocm .
+docker build --build-arg SGL_BRANCH=v0.4.9.post2 -t v0.4.9.post2-rocm630 -f Dockerfile.rocm .
 
 alias drun='docker run -it --rm --network=host --device=/dev/kfd --device=/dev/dri --ipc=host \
     --shm-size 16G --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
@@ -82,11 +80,11 @@ alias drun='docker run -it --rm --network=host --device=/dev/kfd --device=/dev/d
 drun -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<secret>" \
-    v0.4.6.post4-rocm630 \
+    v0.4.9.post2-rocm630 \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
 
 # Till flashinfer backend available, --attention-backend triton --sampling-backend pytorch are set by default
-drun v0.4.6.post4-rocm630 python3 -m sglang.bench_one_batch --batch-size 32 --input 1024 --output 128 --model amd/Meta-Llama-3.1-8B-Instruct-FP8-KV --tp 8 --quantization fp8
+drun v0.4.9.post2-rocm630 python3 -m sglang.bench_one_batch --batch-size 32 --input 1024 --output 128 --model amd/Meta-Llama-3.1-8B-Instruct-FP8-KV --tp 8 --quantization fp8
 ```
 
 ## Method 4: Using docker compose
@@ -164,4 +162,4 @@ sky status --endpoint 30000 sglang
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer) is the default attention kernel backend. It only supports sm75 and above. If you encounter any FlashInfer-related issues on sm75+ devices (e.g., T4, A10, A100, L4, L40S, H100), please switch to other kernels by adding `--attention-backend triton --sampling-backend pytorch` and open an issue on GitHub.
 - If you only need to use OpenAI models with the frontend language, you can avoid installing other dependencies by using `pip install "sglang[openai]"`.
 - The language frontend operates independently of the backend runtime. You can install the frontend locally without needing a GPU, while the backend can be set up on a GPU-enabled machine. To install the frontend, run `pip install sglang`, and for the backend, use `pip install sglang[srt]`. `srt` is the abbreviation of SGLang runtime.
-- To reinstall flashinfer locally, use the following command: `pip install "flashinfer-python==0.2.5" -i https://flashinfer.ai/whl/cu124/torch2.6 --force-reinstall --no-deps` and then delete the cache with `rm -rf ~/.cache/flashinfer`.
+- To reinstall flashinfer locally, use the following command: `pip3 install --upgrade flashinfer-python --force-reinstall --no-deps` and then delete the cache with `rm -rf ~/.cache/flashinfer`.

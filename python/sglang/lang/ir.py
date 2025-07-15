@@ -606,3 +606,30 @@ class SglCommitLazy(SglExpr):
 
     def __repr__(self):
         return "CommitLazy()"
+
+
+class SglSeparateReasoning(SglExpr):
+    def __init__(self, model_type: str, expr: SglExpr):
+        super().__init__()
+        self.model_type = model_type
+
+        self.expr = expr
+        self.name = None
+        self._process_expr(expr)
+
+    def process_name_for_reasoning(self, name):
+        if not name:
+            raise ValueError("name must be provided")
+        return f"{name}_reasoning_content"
+
+    def _process_expr(self, expr):
+        if isinstance(expr, SglGen):
+            self.name = self.process_name_for_reasoning(expr.name)
+        elif isinstance(expr, SglSelect):
+            self.name = self.process_name_for_reasoning(expr.name)
+        elif isinstance(expr, SglExprList):
+            for x in expr.expr_list:
+                self._process_expr(x)
+
+    def __repr__(self):
+        return f"SeparateReasoning(model_type={self.model_type}, name={self.name})"

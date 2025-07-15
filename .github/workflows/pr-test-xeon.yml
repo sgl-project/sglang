@@ -1,0 +1,81 @@
+name: PR Test (Xeon)
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: pr-test-xeon
+  cancel-in-progress: false
+
+jobs:
+  build-test:
+    if: github.event_name == 'pull_request'
+    runs-on: sglang-pvc
+    strategy:
+      matrix:
+        build_type: ['all']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build and Push
+        run: |
+          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          tag=v${version}-xeon
+
+          docker build . -f docker/Dockerfile.xeon  -t sglang_xeon --no-cache
+
+      - name: Run container
+        run: |
+          docker run -dt \
+            -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
+            --name ci_sglang_xeon \
+            sglang_xeon
+
+      - name: Install Dependency
+        timeout-minutes: 20
+        run: |
+          docker exec ci_sglang_xeon bash -c "python3 -m pip install --upgrade pip"
+          docker exec ci_sglang_xeon pip uninstall sgl-kernel -y || true
+          docker exec -w /sglang-checkout/sgl-kernel ci_sglang_xeon bash -c "cp pyproject_cpu.toml pyproject.toml && pip install -v ."
+          docker exec -w /sglang-checkout/ ci_sglang_xeon bash -c "pip install -e "python[all_cpu]""
+          docker exec ci_sglang_xeon bash -c "python3 -m pip install pytest expecttest"
+
+      - name: Check AMX Support
+        id: check_amx
+        timeout-minutes: 5
+        run: |
+          docker exec -w /sglang-checkout/ ci_sglang_xeon \
+            bash -c "python3 -c 'import torch; import sgl_kernel; assert torch._C._cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, \"convert_weight_packed\"); '"
+        continue-on-error: true
+
+      - name: Run UT Cases
+        if: steps.check_amx.outcome == 'success'
+        timeout-minutes: 20
+        run: |
+          docker exec -w /sglang-checkout/ ci_sglang_xeon \
+            bash -c "cd ./test/srt && python3 run_suite.py --suite per-commit-cpu"
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f ci_sglang_xeon || true
+
+  finish:
+    if: always()
+    needs: [build-test]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          results=(${{ join(needs.*.result, ' ') }})
+          for result in "${results[@]}"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "Job failed with result: $result"
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0

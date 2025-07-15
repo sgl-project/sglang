@@ -68,6 +68,8 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
 )
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+from sglang.srt.layers.quantization.qoq import QoQConfig
+from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
@@ -81,6 +83,8 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "w8a8_fp8": W8A8Fp8Config,
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
+    "qoq": QoQConfig,
+    "w4afp8": W4AFp8Config,
     "quark": QuarkConfig
 }
 
@@ -114,7 +118,7 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     if quantization in VLLM_QUANTIZATION_METHODS and not VLLM_AVAILABLE:
         raise ValueError(
             f"{quantization} quantization requires some operators from vllm. "
-            "Please install vllm by `pip install vllm==0.8.4`"
+            "Please install vllm by `pip install vllm==0.9.0.1`"
         )
 
     return QUANTIZATION_METHODS[quantization]
@@ -289,6 +293,7 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
         use_grouped_topk: bool,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
@@ -315,7 +320,7 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
         if correction_bias is not None:
             if not has_correction_bias:
                 raise ValueError(
-                    "Please increase the version of your vllm. Try `pip install vllm==0.8.4`"
+                    "Please increase the version of your vllm. Try `pip install vllm==0.9.0.1`"
                 )
             kwargs["e_score_correction_bias"] = correction_bias
         return original_apply(**kwargs)

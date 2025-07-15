@@ -343,6 +343,7 @@ class TestW8A8BlockFP8Matmul(CustomTestCase):
         OUT_DTYPES = [torch.bfloat16]
         M = [64, 128, 512, 1024, 4096]
         NKs = [
+            (2112, 7168),
             (1536, 7168),
             (3072, 1536),
             (24576, 7168),

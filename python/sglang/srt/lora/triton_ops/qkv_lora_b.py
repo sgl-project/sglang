@@ -33,29 +33,45 @@ def _qkv_lora_b_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    # For fused output scaling and adding
-    fuse_scaling_add,
+    # For fused output scaling
     scalings,
 ):
-    # This kernel packs 3 sgemms (q/k/v) into a single kernel.
+    """
+    This kernel packs 3 sgemms (q/k/v) into a single kernel. The multiplication
+    results are accumulated into the output tensor.
 
-    # x: (s, 3 * K), s is the sum of sequence lengths, K equals to lora rank
-    # weights: (num_lora, N_Q + 2 * N_KV, K)
-    # output: (s, N_Q + 2 * N_KV)
-    # N_Q >> K, N_KV >> K
+    When a sequence's rank is 0, the kernel is essentially a no-op, following
+    the convention in pytorch where the product of two matrices of shape (m, 0)
+    and (0, n) is an all-zero matrix of shape (m, n).
+
+    Args:
+        x (Tensor): The input tensor, which is the result of the LoRA A projection.
+            Shape: (s, 3 * K), where s is the sum of all sequence lengths in the
+            batch and K is the maximum LoRA rank. The second dimension is partitioned
+            for Q, K, and V.
+        weights (Tensor): The LoRA B weights for all adapters.
+            Shape: (num_lora, N_Q + 2 * N_KV, K).
+        output (Tensor): The output tensor where the result is stored.
+            Shape: (s, N_Q + 2 * N_KV).
+    """
 
     # Current block computes sequence with batch_id,
     # which starts from row seg_start of x with length seg_len.
     # qkv_id decides which of q,k,v to compute (0: q, 1: k, 2: v)
     batch_id = tl.program_id(axis=2)
+    w_index = tl.load(weight_indices + batch_id)
+    rank = tl.load(lora_ranks + w_index)
+
+    # If rank is 0, this kernel is a no-op.
+    if rank == 0:
+        return
+
     qkv_id = tl.program_id(axis=1)
     pid = tl.program_id(axis=0)
     seg_len = tl.load(seg_lens + batch_id)
-    w_index = tl.load(weight_indices + batch_id)
     seg_start = tl.load(seg_indptr + batch_id)
     n_start = tl.load(n_offs + qkv_id)
     n_size = tl.load(n_offs + qkv_id + 1) - n_start
-    rank = tl.load(lora_ranks + w_index)
     scaling = tl.load(scalings + w_index)
     # Adjust K (rank) according to the specific LoRA adapter
     K = tl.minimum(K, rank)
@@ -84,13 +100,12 @@ def _qkv_lora_b_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset[:, None] < seg_len)
-            and (k_offset[None, :] < K - k * BLOCK_K),
+            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
             other=0.0,
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K) and (n_offset[None, :] < n_size),
+            mask=(k_offset[:, None] < K - k * BLOCK_K) & (n_offset[None, :] < n_size),
             other=0.0,
         )
         partial_sum += tl.dot(x_tile, w_tile)
@@ -105,8 +120,7 @@ def _qkv_lora_b_kernel(
         s_offset[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
     output_mask = (s_offset[:, None] < seg_len) and (n_offset[None, :] < n_size)
-    if fuse_scaling_add:
-        partial_sum += tl.load(output_ptr, mask=output_mask)
+    partial_sum += tl.load(output_ptr, mask=output_mask)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
@@ -153,11 +167,9 @@ def qkv_lora_b_fwd(
     )
 
     if base_output is None:
-        output = torch.empty((s, output_dim), device=x.device, dtype=x.dtype)
-        fuse_scaling_add = False
+        output = torch.zeros((s, output_dim), device=x.device, dtype=x.dtype)
     else:
         output = base_output
-        fuse_scaling_add = True
 
     _qkv_lora_b_kernel[grid_b](
         x,
@@ -180,7 +192,6 @@ def qkv_lora_b_fwd(
         BLOCK_S,
         BLOCK_OUT,
         BLOCK_R,
-        fuse_scaling_add,
         batch_info.scalings,
     )
 

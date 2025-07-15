@@ -15,11 +15,13 @@ python3 -m sglang.launch_server \
 
 Below the supported models are summarized in a table.
 
-If unsure if a specific architecture is implemented you may look it up via Github search. For example to search for `Qwen2_5_VLForConditionalGeneration` use the expression
+If you are unsure if a specific architecture is implemented, you can search for it via GitHub. For example, to search for `Qwen2_5_VLForConditionalGeneration`, use the expression:
+
 ```
 repo:sgl-project/sglang path:/^python\/sglang\/srt\/models\// Qwen2_5_VLForConditionalGeneration
 ```
-in Github search.
+
+in the GitHub search bar.
 
 
 | Model Family (Variants)    | Example HuggingFace Identifier             | Chat Template    | Description                                                                                                                                                                                                     |
@@ -35,3 +37,5 @@ in Github search.
 | **Gemma 3 (Multimodal)**   | `google/gemma-3-4b-it`                     | `gemma-it`       | Gemma 3's larger models (4B, 12B, 27B) accept images (each image encoded as 256 tokens) alongside text in a combined 128K-token context.                                                                        |
 | **Kimi-VL** (A3B)          | `moonshotai/Kimi-VL-A3B-Instruct`          | `kimi-vl`        | Kimi-VL is a multimodal model that can understand and generate text from images.                                                                                                                                |
 | **Mistral-Small-3.1-24B**  | `mistralai/Mistral-Small-3.1-24B-Instruct-2503` | `mistral`   | Mistral 3.1 is a multimodal model that can generate text from text or images input. It also supports tool calling and structured output. |
+| **Phi-4-multimodal-instruct**  | `microsoft/Phi-4-multimodal-instruct` | `phi-4-mm`   | Phi-4-multimodal-instruct is the multimodal variant of the Phi-4-mini model, enhanced with LoRA for improved multimodal capabilities. Currently, it supports only text and vision modalities in SGLang. |
+| **MiMo-VL** (7B)           | `XiaomiMiMo/MiMo-VL-7B-RL`                 | `mimo-vl`        | Xiaomi's compact yet powerful vision-language model featuring a native resolution ViT encoder for fine-grained visual details, an MLP projector for cross-modal alignment, and the MiMo-7B language model optimized for complex reasoning tasks. |

@@ -1,18 +1,10 @@
 import itertools
 import unittest
 
+# TODO: use interface in cpu.py
+import sgl_kernel
 import torch
 import torch.nn as nn
-
-# TODO: use interface in cpu.py
-from sgl_kernel.common_ops import (
-    convert_weight_packed,
-    fp8_scaled_mm_cpu,
-    int8_scaled_mm_cpu,
-    int8_scaled_mm_with_quant,
-    per_token_quant_int8_cpu,
-    weight_packed_linear,
-)
 from utils import (
     convert_weight,
     native_w8a8_per_token_matmul,
@@ -21,6 +13,8 @@ from utils import (
 )
 
 from sglang.test.test_utils import CustomTestCase
+
+torch.manual_seed(1234)
 
 
 class Mod(nn.Module):
@@ -34,7 +28,7 @@ class Mod(nn.Module):
 
 class TestGemm(CustomTestCase):
     M = [1, 101]
-    N = [32 * 13]
+    N = [16, 32 * 13]
     K = [32 * 16]
     has_bias = [False, True]
 
@@ -58,14 +52,18 @@ class TestGemm(CustomTestCase):
 
         ref = ref.bfloat16()
 
-        out = weight_packed_linear(mat1, mat2, bias if has_bias else None, False)
+        out = torch.ops.sgl_kernel.weight_packed_linear(
+            mat1, mat2, bias if has_bias else None, False
+        )
 
-        packed_mat2 = convert_weight_packed(mat2)
-        out2 = weight_packed_linear(mat1, packed_mat2, bias if has_bias else None, True)
+        packed_mat2 = torch.ops.sgl_kernel.convert_weight_packed(mat2)
+        out2 = torch.ops.sgl_kernel.weight_packed_linear(
+            mat1, packed_mat2, bias if has_bias else None, True
+        )
 
         atol = rtol = precision[ref.dtype]
-        self.assertTrue(torch.allclose(ref, out, atol=atol, rtol=rtol))
-        self.assertTrue(torch.allclose(ref, out2, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(ref, out2, atol=atol, rtol=rtol)
 
     def test_bf16_gemm(self):
         for params in itertools.product(
@@ -100,17 +98,17 @@ class TestGemm(CustomTestCase):
 
         atol = rtol = precision[ref_out.dtype]
 
-        Aq2, As2 = per_token_quant_int8_cpu(A)
-        out = int8_scaled_mm_cpu(
+        Aq2, As2 = torch.ops.sgl_kernel.per_token_quant_int8_cpu(A)
+        out = torch.ops.sgl_kernel.int8_scaled_mm_cpu(
             Aq2, Bq, As2, Bs, bias if has_bias else None, torch.bfloat16, False
         )
-        self.assertTrue(torch.allclose(ref_out, out, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
         # test the fused version
-        fused_out = int8_scaled_mm_with_quant(
+        fused_out = torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
             A, Bq, Bs, bias if has_bias else None, torch.bfloat16, False
         )
-        self.assertTrue(torch.allclose(ref_out, fused_out, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref_out, fused_out, atol=atol, rtol=rtol)
 
     def test_int8_gemm(self):
         for params in itertools.product(
@@ -157,9 +155,9 @@ class TestGemm(CustomTestCase):
             ref = torch.matmul(data.to(A_dtype), dq_weight.T)
 
         if prepack:
-            fp8_weight = convert_weight_packed(fp8_weight)
+            fp8_weight = torch.ops.sgl_kernel.convert_weight_packed(fp8_weight)
 
-        opt = fp8_scaled_mm_cpu(
+        opt = torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
             data,
             fp8_weight,
             scales,
@@ -169,7 +167,7 @@ class TestGemm(CustomTestCase):
             prepack,
         )
         atol = rtol = precision[ref.dtype]
-        self.assertTrue(torch.allclose(ref, opt, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref, opt, atol=atol, rtol=rtol)
 
     def test_fp8_gemm(self):
         for params in itertools.product(

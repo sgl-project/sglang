@@ -116,8 +116,7 @@ class MoeWNA16Config(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
-        can_convert = cls.is_moe_wna16_compatible(hf_quant_cfg)
-        if can_convert and user_quant == "moe_wna16":
+        if user_quant == "moe_wna16" and cls.is_moe_wna16_compatible(hf_quant_cfg):
             return cls.get_name()
         return None
 
@@ -131,7 +130,7 @@ class MoeWNA16Config(QuantizationConfig):
         capability_tuple = get_device_capability()
         device_capability = (
             -1
-            if capability_tuple is None
+            if all(capability is None for capability in capability_tuple)
             else capability_tuple[0] * 10 + capability_tuple[1]
         )
         # Avoid circular import
@@ -341,6 +340,7 @@ class MoeWNA16Method:
         use_grouped_topk: bool = False,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
@@ -362,6 +362,7 @@ class MoeWNA16Method:
             renormalize=renormalize,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
+            num_fused_shared_experts=num_fused_shared_experts,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
@@ -386,6 +387,7 @@ class MoeWNA16Method:
             w2_zp=layer.w2_qzeros if has_zp else None,
             block_shape=[0, layer.group_size],
             no_combine=no_combine,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
     @staticmethod

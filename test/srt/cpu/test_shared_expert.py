@@ -2,12 +2,10 @@ import itertools
 import math
 import unittest
 
+# TODO: use interface in cpu.py
+import sgl_kernel
 import torch
 import torch.nn as nn
-
-# TODO: use interface in cpu.py
-from sgl_kernel.common_ops import convert_weight_packed
-from sgl_kernel.common_ops import shared_expert_cpu as shared_expert
 from utils import (
     BLOCK_K,
     BLOCK_N,
@@ -23,6 +21,8 @@ from utils import (
 )
 
 from sglang.test.test_utils import CustomTestCase
+
+torch.manual_seed(1234)
 
 
 class TestSharedExpert(CustomTestCase):
@@ -55,7 +55,7 @@ class TestSharedExpert(CustomTestCase):
             fused_output.float(),
             routed_scaling_factor,
         ).to(dtype=dtype)
-        res = shared_expert(
+        res = torch.ops.sgl_kernel.shared_expert_cpu(
             hidden_states,
             w1,
             w2,
@@ -73,7 +73,7 @@ class TestSharedExpert(CustomTestCase):
         )
 
         atol = rtol = precision[ref.dtype]
-        self.assertTrue(torch.allclose(ref, res, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref, res, atol=atol, rtol=rtol)
 
     def test_bf16_shared_expert(self):
         for params in itertools.product(
@@ -113,7 +113,7 @@ class TestSharedExpert(CustomTestCase):
             fused_output.float(),
             routed_scaling_factor,
         ).to(dtype=dtype)
-        res2 = shared_expert(
+        res2 = torch.ops.sgl_kernel.shared_expert_cpu(
             hidden_states2,
             w1_q,
             w2_q,
@@ -131,7 +131,7 @@ class TestSharedExpert(CustomTestCase):
         )
 
         atol = rtol = precision[ref2.dtype]
-        self.assertTrue(torch.allclose(ref2, res2, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref2, res2, atol=atol, rtol=rtol)
 
     def test_int8_shared_expert(self):
         for params in itertools.product(
@@ -181,9 +181,9 @@ class TestSharedExpert(CustomTestCase):
         ref_out = shared_out + fused_out.float() * routed_scaling_factor
         ref_out = ref_out.to(dtype=dtype)
 
-        w1 = convert_weight_packed(w1)  # [2N, K]
-        w2 = convert_weight_packed(w2)  # [K, N]
-        out = shared_expert(
+        w1 = torch.ops.sgl_kernel.convert_weight_packed(w1)  # [2N, K]
+        w2 = torch.ops.sgl_kernel.convert_weight_packed(w2)  # [K, N]
+        out = torch.ops.sgl_kernel.shared_expert_cpu(
             a2,
             w1,
             w2,
@@ -201,7 +201,7 @@ class TestSharedExpert(CustomTestCase):
         )
 
         atol = rtol = precision[ref_out.dtype]
-        self.assertTrue(torch.allclose(ref_out, out, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
     def test_fp8_shared_expert(self):
         for params in itertools.product(
