@@ -243,14 +243,13 @@ class MoEGate(nn.Module):
         # NOTE: For some unknown reason, router_gemm seems degrade accept length.
         if (
             _is_cuda
-            and not self.is_nextn
-            and hidden_states.shape[0] < 4
+            and hidden_states.shape[0] <= 16
             and hidden_states.shape[1] == 7168
             and self.weight.shape[0] == 256
             and _device_sm >= 90
         ):
-            logits = dsv3_router_gemm(hidden_states, self.weight).to(
-                hidden_states.dtype
+            logits = dsv3_router_gemm(
+                hidden_states, self.weight, out_dtype=torch.bfloat16
             )
         else:
             logits = F.linear(hidden_states, self.weight, None)
