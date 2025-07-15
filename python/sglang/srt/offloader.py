@@ -32,15 +32,17 @@ class _StatelessOffloaderUtil:
 
 class _ModuleOffloader:
     def __init__(self, module: torch.nn.Module):
+        self.module = module
         self.device = next(module.parameters()).device
         assert self.device != torch.device("cpu"), "not handled device=cpu case yet (should skip this tensor)"
 
+        self.device_tensors = None
         _StatelessOffloaderUtil.offload(module)
 
-        def _create_parameter_and_buffer_dicts():
-            return _StatelessOffloaderUtil.create_onload_tensors(module, self.device)
+        _hook_module_forward(module, lambda: self.device_tensors)
 
-        _hook_module_forward(module, _create_parameter_and_buffer_dicts)
+    def onload_async(self):
+        self.device_tensors = _StatelessOffloaderUtil.create_onload_tensors(self.module, self.device)
 
 
 def _hook_module_forward(module, create_parameter_and_buffer_dicts):
