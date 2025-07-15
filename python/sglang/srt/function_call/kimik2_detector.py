@@ -234,13 +234,19 @@ class KimiK2Detector(BaseFormatDetector):
         return get_info
 
     def build_ebnf(self, tools: List[Tool]) -> str:
-        """Build EBNF grammar for KimiK2 tool call format."""
+        """
+        Build EBNF grammar for KimiK2 tool call format.
+
+        NOTE: The call_rule_fmt uses [0-9]+ for the function index to allow the grammar
+        to accept any numeric index (0, 1, 2, etc.) for proper sequential indexing in
+        multiple function call scenarios, while still maintaining the correct KimiK2
+        format structure for constrained generation.
+        """
         return EBNFComposer.build_ebnf(
             tools,
             sequence_start_token=self.bot_token,
             sequence_end_token=self.eot_token,
-            individual_call_start_token=self.tool_call_start_token,
-            individual_call_end_token=self.tool_call_end_token,
-            function_format="json",
             tool_call_separator="",
+            call_rule_fmt='"<|tool_call_begin|>functions.{name}:" [0-9]+ " <|tool_call_argument_begin|>" {arguments_rule} "<|tool_call_end|>"',
+            function_format="json",
         )
