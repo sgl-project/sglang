@@ -29,7 +29,7 @@ def ref_copy_with_indices_page_first_to_layer_first(
 @pytest.mark.parametrize("total_items_in_pool", [10240])
 @pytest.mark.parametrize("is_mla", [False, True])
 @pytest.mark.parametrize("all_layers", [False, True])
-@pytest.mark.parametrize("layer_first", [False, True])
+@pytest.mark.parametrize("layer_first_to_layer_first", [False, True])
 def test_transfer_kv(
     dtype: torch.dtype,
     num_items_to_transfer: int,
@@ -38,7 +38,7 @@ def test_transfer_kv(
     total_items_in_pool: int,
     is_mla: bool,
     all_layers: bool,
-    layer_first: bool
+    layer_first_to_layer_first: bool
 ):
     """
     Tests the per-layer transfer functions, treating tensors as memory pools.
@@ -72,7 +72,7 @@ def test_transfer_kv(
     )
     dst_indices_device = dst_indices_host.to(device)
 
-    if layer_first:
+    if layer_first_to_layer_first:
 
         # Prepare memory pools based on whether it's an MLA case.
         if is_mla:
