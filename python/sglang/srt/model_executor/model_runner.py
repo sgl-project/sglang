@@ -1443,11 +1443,11 @@ class ModelRunner:
 
             return CutlassMLABackend(self)
         elif self.server_args.attention_backend == "trtllm_mla":
-            from sglang.srt.layers.attention.trtllm_mla_backend import (
-                TRTLLMMLABackend,
+            from sglang.srt.layers.attention.trtllm_gen_mla_backend import (
+                TRTLLMGENMLABackend,
             )
 
-            return TRTLLMMLABackend(self)
+            return TRTLLMGENMLABackend(self)
         elif self.server_args.attention_backend == "intel_amx":
             from sglang.srt.layers.attention.intel_amx_backend import (
                 IntelAMXAttnBackend,
