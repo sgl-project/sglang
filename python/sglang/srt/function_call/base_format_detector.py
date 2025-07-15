@@ -25,15 +25,25 @@ class BaseFormatDetector(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
     def __init__(self):
-        # initialize properties used for state when parsing tool calls in
+        # Streaming state management
+        # Buffer for accumulating incomplete patterns that arrive across multiple streaming chunks
         self._buffer = ""
-        # streaming mode
+        # Stores complete tool call info (name and arguments) for each tool being parsed.
+        # Used by serving layer for completion handling when streaming ends.
+        # Format: [{"name": str, "arguments": dict}, ...]
         self.prev_tool_call_arr: List[Dict] = []
+        # Index of currently streaming tool call. Starts at -1 (no active tool),
+        # increments as each tool completes. Tracks which tool's arguments are streaming.
         self.current_tool_id: int = -1
+        # Flag for whether current tool's name has been sent to client.
+        # Tool names sent first with empty parameters, then arguments stream incrementally.
         self.current_tool_name_sent: bool = False
-        self.streamed_args_for_tool: List[str] = (
-            []
-        )  # map what has been streamed for each tool so far to a list
+        # Tracks raw JSON string content streamed to client for each tool's arguments.
+        # Critical for serving layer to calculate remaining content when streaming ends.
+        # Each index corresponds to a tool_id. Example: ['{"location": "San Francisco"', '{"temp": 72']
+        self.streamed_args_for_tool: List[str] = []
+
+        # Token configuration (override in subclasses)
         self.bot_token = ""
         self.eot_token = ""
         self.tool_call_separator = ", "
