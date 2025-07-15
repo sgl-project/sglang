@@ -105,7 +105,6 @@ def create_flashinfer_kv_indices(
     kv_indices_ptr,
     req_to_token_ptr_stride,
 ):
-    BLOCK_SIZE = 128
     req_to_token_ptr = req_to_token_ptr.view(-1)
     kv_indices_ptr = kv_indices_ptr.view(-1)
 
@@ -117,22 +116,16 @@ def create_flashinfer_kv_indices(
         kv_start = 0
         kv_end = page_kernel_lens_ptr[pid]
 
-        num_loop = (kv_end - kv_start + BLOCK_SIZE - 1) // BLOCK_SIZE
-        for i in range(num_loop):
-            # index into req_to_token_ptr needs to be int64
-            offset = i * BLOCK_SIZE
-            data = req_to_token_ptr[
-                req_pool_index * req_to_token_ptr_stride
-                + kv_start
-                + offset : req_pool_index * req_to_token_ptr_stride
-                + kv_start
-                + offset
-                + BLOCK_SIZE
-            ]
+        data = req_to_token_ptr[
+            req_pool_index * req_to_token_ptr_stride
+            + kv_start : req_pool_index * req_to_token_ptr_stride
+            + kv_start
+            + kv_end
+        ]
 
-            kv_indices_ptr[
-                kv_indices_offset + offset : kv_indices_offset + offset + BLOCK_SIZE
-            ] = data
+        kv_indices_ptr[
+            kv_indices_offset + kv_start : kv_indices_offset + kv_start + kv_end
+        ] = data
 
 
 def create_flashmla_kv_indices(

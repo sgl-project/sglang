@@ -2507,7 +2507,7 @@ class Scheduler(
                 record_op_args=False,
             )
 
-            self.torch_profiler = torch.profiler.profile(
+            self.torch_profiler = torch_npu.profiler.profile(
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,
                 record_shapes=record_shapes if record_shapes is not None else False,

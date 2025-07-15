@@ -414,9 +414,9 @@ def alloc_extend_kernel_npu(
 
         # Return value
         if pid == bs - 1:
-            merged_value = (sum_num_new_pages.to(tl.int64)) << 32 | sum_extend_lens.to(
-                torch.int64
-            )
+            merged_value = (
+                sum_num_new_pages.to(torch.int64)
+            ) << 32 | sum_extend_lens.to(torch.int64)
             ret_values[:] = merged_value
 
         # Part 1: fill the old partial page
