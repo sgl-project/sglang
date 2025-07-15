@@ -142,7 +142,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
                         )
                     )
                     self.current_tool_name_sent = True
-                    # Store the tool call info for adapter.py
+                    # Store the tool call info for serving layer completions endpoint
                     self.prev_tool_call_arr[self.current_tool_id] = {
                         "name": func_name,
                         "arguments": {},
@@ -168,7 +168,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
                         ] += argument_diff
 
                     if _is_complete_json(func_args_raw):
-                        # Update the stored arguments for adapter.py
+                        # Update the stored arguments
                         try:
                             parsed_args = json.loads(func_args_raw)
                             self.prev_tool_call_arr[self.current_tool_id][
