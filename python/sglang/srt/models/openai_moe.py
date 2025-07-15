@@ -584,7 +584,7 @@ class OpenAIMoeAttention(nn.Module):
         # Todo: remove this, use CUDA impl. Currently sgl-kernel apply_rope_with_cos_sin_cache_inplace is not supported for Oai rope
         self.rotary_emb._forward_method = self.rotary_emb.forward_native
         use_sliding_window = True if config.layer_types[layer_id] == "sliding_attention" else False
-        self.sliding_window = get_attention_sliding_window_size(config) if use_sliding_window else None
+        self.sliding_window = get_attention_sliding_window_size(config) if use_sliding_window else -1
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -626,7 +626,7 @@ class OpenAIMoeAttention(nn.Module):
                 sink=sinks,
                 causal=True,
                 sm_scale=self.scaling,
-                window_left=127 if self.layer_id % 2 == 0 else -1,
+                window_left=self.sliding_window,
             )    
         return o_ref.view(seq_len, self.num_heads * self.head_dim)
 
@@ -668,11 +668,12 @@ class OpenAIMoeAttention(nn.Module):
         q = inner_state[0].view(-1, self.num_kv_heads, self.num_heads // self.num_kv_heads, self.head_dim)
         k = inner_state[1].view(-1, self.num_kv_heads, self.head_dim)
         v = inner_state[2].view(-1, self.num_kv_heads, self.head_dim)
-        attn_output = sdpa(q, k, v, self.sinks, self.scaling, self.sliding_window + 1 if self.sliding_window is not None else 0)
-        # if self.layer_id % 2 == 1:
-        #     print(f"### layer_id={self.layer_id}, attn_output.shape={attn_output.shape}, o_ref.shape={o_ref.shape}, sdpa_output.shape={sdpa_output.shape}")
-        #     torch.testing.assert_close(o_ref, flashinfer_output, rtol=1e-2, atol=1e-2)
-        #     torch.testing.assert_close(attn_output, o_ref, rtol=1e-2, atol=1e-2)   
+        attn_output = sdpa(q, k, v, self.sinks, self.scaling, self.sliding_window + 1)
+
+        # print(f"### layer_id={self.layer_id}, attn_output.shape={attn_output.shape}, o_ref.shape={o_ref.shape}, flashinfer_output.shape={flashinfer_output.shape}")
+        # torch.testing.assert_close(o_ref, flashinfer_output, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(attn_output, o_ref, rtol=1e-2, atol=1e-2)   
+        
         output, _ = self.o_proj(attn_output)
         return output
 
