@@ -1666,7 +1666,7 @@ class FlashAttentionBackend(AttentionBackend):
                 max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                 metadata.max_seq_len_k = max_len
 
-                normal_decode_set_medadata(
+                normal_decode_set_metadata(
                     metadata.cache_seqlens_int32,
                     metadata.cu_seqlens_k,
                     metadata.page_table,
