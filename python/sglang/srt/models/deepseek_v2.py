@@ -437,21 +437,21 @@ class DeepseekV2MoE(nn.Module):
     def forward_normal_dual_stream(
         self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False
     ) -> torch.Tensor:
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states)
 
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states)
 
         with torch.cuda.stream(self.alt_stream):
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
-        final_hidden_states = final_hidden_states + shared_output
+        final_hidden_states += shared_output
         if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -462,7 +462,7 @@ class DeepseekV2MoE(nn.Module):
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
-            return self.forward_cpu(hidden_states)
+            return self.forward_cpu(hidden_states, can_fuse_mlp_allreduce)
 
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
@@ -479,7 +479,9 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
-    def forward_cpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_cpu(
+        self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False
+    ) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         fused_experts_out = self.experts(
@@ -528,7 +530,7 @@ class DeepseekV2MoE(nn.Module):
             None,  # a2_scale
             True,  # is_vnni
         )
-        if self.tp_size > 1 and not self.can_fuse_mlp_allreduce:
+        if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
@@ -1895,11 +1897,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
-            if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
-                # NOTE: this line resolves the degradation of MTP reception rate for non-zero DP ranks.
-                # See discussion here (https://github.com/sgl-project/sglang/pull/6081#discussion_r2147452251).
-                hidden_states = hidden_states.clone()
-
         return hidden_states, residual
 
     def op_comm_prepare_attn(
@@ -2198,7 +2195,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             # This may affect the accuracy of fp8 model.
             # Fix deepseek v3 blockwise bmm by using deep_gemm
             use_deep_gemm_bmm = False
-            model_dtype = torch.get_default_dtype()
 
             if w.dtype in (
                 torch.float8_e4m3fn,
@@ -2224,7 +2220,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                         _is_cuda
                         and weight_block_size[0] == 128
                         and weight_block_size[1] == 128
-                        and model_dtype == torch.bfloat16
                     ):
                         if (
                             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -2238,7 +2233,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 weight,
                                 weight_scale,
                                 weight_block_size,
-                                model_dtype,
+                                torch.bfloat16,
                             )
                     else:
                         w, scale = block_quant_to_tensor_quant(
