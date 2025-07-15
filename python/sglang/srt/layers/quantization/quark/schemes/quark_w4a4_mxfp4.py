@@ -5,6 +5,7 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.utils import print_warning_once
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
 from sglang.srt.layers.quantization.mxfp4_utils import (
     OCP_MX_BLOCK_SIZE,
@@ -12,9 +13,11 @@ from sglang.srt.layers.quantization.mxfp4_utils import (
     dequant_mxfp4,
 )
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
-from sglang.srt.utils import get_bool_env_var, supports_mx
+from sglang.srt.utils import supports_mx
 
 __all__ = ["QuarkW4A4MXFP4"]
+
+logger = logging.getLogger(__name__)
 
 
 class QuarkW4A4MXFP4(QuarkScheme):
@@ -25,12 +28,22 @@ class QuarkW4A4MXFP4(QuarkScheme):
         self.qscheme = "per_group"
         self.weight_quant_spec = weight_quant_spec
         self.input_quant_spec = input_quant_spec
-        self.emulate = not supports_mx()
 
-        if get_bool_env_var("SGLANG_QUARK_EMU_MEM_OPT"):
-            self.emulate_memory = True
+        if not supports_mx():
+            self.emulate = True
+            print_warning_once(
+                "The current platform does not support native MXFP4 "
+                "computation. Simulated weight dequantization and activation "
+                "QDQ (quantize and dequantize) will be used, with the linear "
+                "layers computed in high precision.")
         else:
-            self.emulate_memory = False
+            self.emulate = True
+            print_warning_once(
+                "The current platform supports native MXFP4 "
+                "computation, but kernels are not yet integrated in vLLM. "
+                "Simulated weight dequantization and activation "
+                "QDQ (quantize and dequantize) will be used, with the linear "
+                "layers computed in high precision.")
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -41,16 +54,6 @@ class QuarkW4A4MXFP4(QuarkScheme):
                                           requires_grad=False)
         layer.weight_scale = torch.nn.Parameter(layer.weight_scale.data,
                                                 requires_grad=False)
-
-        if self.emulate and not self.emulate_memory:
-            layer.weight = torch.nn.Parameter(
-                dequant_mxfp4(layer.weight.data, layer.weight_scale.data, self.out_dtype),
-                requires_grad=False,
-            )
-            layer.weight_scale = None
-
-            # This call is necessary to release the scales memory.
-            torch.cuda.empty_cache()
 
     def create_weights(self, layer: torch.nn.Module,
                        output_partition_sizes: list[int],
@@ -93,11 +96,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
                       x: torch.Tensor,
                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.emulate:
-            if self.emulate_memory:
-                dq_w = dequant_mxfp4(layer.weight, layer.weight_scale, x.dtype)
-            else:
-                dq_w = layer.weight
-
+            dq_w = dequant_mxfp4(layer.weight, layer.weight_scale, x.dtype)
             x = quant_dequant_mxfp4(x)
 
             return F.linear(x, dq_w, bias)

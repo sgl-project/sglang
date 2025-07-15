@@ -5,12 +5,12 @@ from typing import Any, Callable, Optional
 import torch
 import logging
 
-from sglang.srt.layers.quantization.mxfp4_utils import (
-    OCP_MX_BLOCK_SIZE, dequant_mxfp4)
+from sglang.srt.layers.quantization.mxfp4_utils import OCP_MX_BLOCK_SIZE
 
+from sglang.srt.utils import print_warning_once
 from sglang.srt.utils import set_weight_attrs
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase, FusedMoeWeightScaleSupported
-from sglang.srt.utils import get_bool_env_var, supports_mx
+from sglang.srt.utils import supports_mx
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,23 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                 f"{weight_qscheme}, {input_qscheme}")  # noqa E501
 
         self.static_input_scales = not self.input_quant.get("is_dynamic")
-        self.emulate = not supports_mx()
+
+        if not supports_mx():
+            self.emulate = True
+            print_warning_once(
+                "The current platform does not support native MXFP4 "
+                "computation. Simulated weight dequantization and activation "
+                "QDQ (quantize and dequantize) will be used, with the linear "
+                "layers computed in high precision.")
+        else:
+            self.emulate = True
+            print_warning_once(
+                "The current platform supports native MXFP4 "
+                "computation, but kernels are not yet integrated in vLLM. "
+                "Simulated weight dequantization and activation "
+                "QDQ (quantize and dequantize) will be used, with the linear "
+                "layers computed in high precision.")
+
 
     def create_weights(self, layer: torch.nn.Module, num_experts: int,
                        hidden_size: int, intermediate_size_per_partition: int,
@@ -116,29 +132,6 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
 
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        float_dtype = torch.get_default_dtype()
-
-        if self.emulate and not get_bool_env_var("SGLANG_QUARK_EMU_MEM_OPT"):
-            # Unpack and dequantize the weights, the operators are in
-            # high-precision, with simulated quantization).
-            layer.w13_weight = torch.nn.Parameter(
-                dequant_mxfp4(layer.w13_weight.data,
-                              layer.w13_weight_scale.data, float_dtype),
-                requires_grad=False,
-            )
-            layer.w13_weight_scale = None
-
-            layer.w2_weight = torch.nn.Parameter(
-                dequant_mxfp4(layer.w2_weight.data, layer.w2_weight_scale.data,
-                              float_dtype),
-                requires_grad=False,
-            )
-            layer.w2_weight_scale = None
-
-            # This call is necessary to release the scales memory.
-            torch.cuda.empty_cache()
 
     def apply(
         self,

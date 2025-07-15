@@ -48,8 +48,6 @@ class TestQuarkMXFP4Loading(CustomTestCase):
                 srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
     def test_load_and_run_mem_emulation(self):
-        os.environ["SGLANG_QUARK_EMU_MEM_OPT"] = "1"
-
         for model_case in ALL_MODELS:
             prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
             max_new_tokens = 20
@@ -64,7 +62,6 @@ class TestQuarkMXFP4Loading(CustomTestCase):
             ) as srt_runner:
                 srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
         
-        del os.environ['SGLANG_QUARK_EMU_MEM_OPT']
 
 class TestR1MXFP4Accuracy(CustomTestCase):
     @classmethod

@@ -869,9 +869,12 @@ def invoke_fused_moe_kernel(
     elif use_mxfp4_w4a4:
         assert block_shape is None
         if not supports_mx():
+            # OCP MX quantization simulation on hardware that does not support it natively, as AMD Instinct MI300.
             A = quant_dequant_mxfp4(A)
         else:
-            raise NotImplementedError()
+            # TODO: the eventual fused moe kernel call should support mxfp4
+            # inputs on hardware that support mxfp4 math natively (as AMD Instinct MI350, MI355).
+            A = quant_dequant_mxfp4(A)
     else:
         assert A_scale is None
         assert B_scale is None
@@ -1549,7 +1552,7 @@ def fused_experts_impl(
     if use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     elif use_mxfp4_w4a4:
-        if supports_mx() or get_bool_env_var("SGLANG_QUARK_EMU_MEM_OPT"):
+        if supports_mx():
             # 16bit activation and fp4x2 packed weight
             assert hidden_states.shape[1] // 2 == w1.shape[
                 2], "hidden size mismatch"
@@ -1623,7 +1626,10 @@ def fused_experts_impl(
     else:
         out_hidden_states = torch.empty_like(hidden_states)
 
-    if use_mxfp4_w4a4 and not supports_mx() and get_bool_env_var("SGLANG_QUARK_EMU_MEM_OPT"):
+    if use_mxfp4_w4a4:
+        # TODO: the eventual fused moe kernel call should support mxfp4
+        # inputs on hardware that support mxfp4 math natively (as AMD Instinct MI350, MI355).
+
         # Weight has to be dequantized for mxfp4 emulation.
         w1 = dequant_mxfp4(w1, w1_scale, hidden_states.dtype)
         w1_scale = None
