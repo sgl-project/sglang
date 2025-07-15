@@ -35,6 +35,9 @@ class TestQwen2VLServer(TestOpenAIVisionServer):
         )
         cls.base_url += "/v1"
 
+    def test_video_chat_completion(self):
+        self._test_video_chat_completion()
+
 
 class TestQwen2_5_VLServer(TestOpenAIVisionServer):
     @classmethod
@@ -53,6 +56,9 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
             ],
         )
         cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        self._test_video_chat_completion()
 
 
 class TestVLMContextLengthIssue(CustomTestCase):
