@@ -27,37 +27,6 @@ from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 logger = logging.getLogger(__name__)
 
 
-# def page_token_ids_to_key(
-#     prefix_block_key: str, current_page_ids: List, local_rank: int
-# ):
-#     prefix_str = ""
-#     if len(prefix_block_key):
-#         prefix_str = hashlib.sha256(prefix_block_key.encode()).hexdigest()
-#     current_token_ids_bytes = np.array(current_page_ids).tobytes()
-#     current_hash_object = hashlib.sha256(current_token_ids_bytes)
-#     current_hash_hex = current_hash_object.hexdigest()
-#     return f"{prefix_str}_{int(current_hash_hex[:16], 16)}_{local_rank}"
-
-
-# def get_node_l3_keys(
-#     token_ids: List,
-#     current_token_len: int,
-#     prefix_block_key: str = "",
-#     local_rank: int = 0,
-#     page_size: int = 1,
-# ):
-#     l3_keys = []
-#     total_block_len = len(token_ids) // page_size
-#     current_block_len = current_token_len // page_size
-#     for i in range(total_block_len - current_block_len, total_block_len):
-#         current_block_token_ids = token_ids[i * page_size : (i + 1) * page_size]
-#         current_block_key = page_token_ids_to_key(
-#             prefix_block_key, current_block_token_ids, local_rank
-#         )
-#         l3_keys.append(current_block_key)
-#         prefix_block_key = current_block_key
-
-#     return l3_keys
 
 
 class HiRadixCache(RadixCache):
@@ -465,8 +434,7 @@ class HiRadixCache(RadixCache):
     def ready_to_load_host_cache(self):
         producer_index = self.cache_controller.layer_done_counter.next_producer()
         self.load_cache_event.set()
-        # if self.mooncake_l3_load_cache_event:
-        #     self.mooncake_l3_load_cache_event.set()
+        
         return producer_index
 
     def check_hicache_events(self):
@@ -682,36 +650,6 @@ class HiRadixCache(RadixCache):
                 if len(key):
                     child_key = self.get_child_key_fn(key)
 
-        # if self.enable_mooncake_store_l3_cache and do_prefetch:
-        #     # try to get the cross instance shared kv cache
-        #     if len(key) and (not node.evicted or node.backuped):
-        #         local_rank =  torch.cuda.current_device()
-        #         prefix_block_key = (
-        #             ""
-        #             if node.parent is None or len(node.parent.hash_value) == 0
-        #             else node.parent.hash_value[-1]
-        #         )
-        #         l3_keys = get_node_l3_keys(
-        #             total_key, len(key), prefix_block_key, local_rank, self.page_size
-        #         )
-        #         mooncake_exist_keys = self.cache_controller.is_batch_exist(l3_keys, node.id)
-        #         l3_exist_keys = []
-        #         for l3_key in l3_keys:
-        #             if mooncake_exist_keys[l3_key]:
-        #                 l3_exist_keys.append(l3_key)
-        #             else:
-        #                 break
-
-        #         if len(l3_exist_keys) > 0:
-        #             child_key = self.get_child_key_fn(
-        #                 key[: len(l3_exist_keys) * self.page_size]
-        #             )
-        #             new_node = TreeNode()
-        #             new_node.parent = node
-        #             new_node.key = key[: len(l3_exist_keys) * self.page_size]
-        #             node.children[child_key] = new_node
-        #             new_node.l3_keys = l3_exist_keys
-        #             node = new_node
 
         return value, node
 
