@@ -11,6 +11,16 @@ from sgl_kernel.kvcacheio import (
 def ref_copy_with_indices(src_pool, dst_pool, src_indices, dst_indices):
     dst_pool[dst_indices] = src_pool[src_indices].to(dst_pool.device)
 
+def ref_copy_with_indices_page_first_to_layer_first(
+    src_pool,
+    dst_pool,
+    src_indices,
+    dst_indices,
+    layer_id
+):
+    for i in range(len(src_indices)):
+        dst_pool[layer_id][dst_indices[i]] = src_pool[src_indices[i]][layer_id].to(dst_pool.device)
+
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_items_to_transfer", [1, 128, 1024])
@@ -19,6 +29,7 @@ def ref_copy_with_indices(src_pool, dst_pool, src_indices, dst_indices):
 @pytest.mark.parametrize("total_items_in_pool", [10240])
 @pytest.mark.parametrize("is_mla", [False, True])
 @pytest.mark.parametrize("all_layers", [False, True])
+@pytest.mark.parametrize("layer_first", [False, True])
 def test_transfer_kv(
     dtype: torch.dtype,
     num_items_to_transfer: int,
@@ -27,6 +38,7 @@ def test_transfer_kv(
     total_items_in_pool: int,
     is_mla: bool,
     all_layers: bool,
+    layer_first: bool
 ):
     """
     Tests the per-layer transfer functions, treating tensors as memory pools.
@@ -60,186 +72,333 @@ def test_transfer_kv(
     )
     dst_indices_device = dst_indices_host.to(device)
 
-    # Prepare memory pools based on whether it's an MLA case.
-    if is_mla:
-        src_pool_host = torch.randn(
-            num_layers, total_items_in_pool, item_size
-        ).pin_memory()
-        dst_pool_ref = torch.zeros_like(src_pool_host).to(device)
-        dst_pool_kernel = torch.zeros_like(dst_pool_ref)
-        dst_pool_direct = torch.zeros_like(dst_pool_ref)
-    else:
-        src_k_pool = torch.randn(
-            num_layers, total_items_in_pool, item_size
-        ).pin_memory()
-        src_v_pool = torch.randn(
-            num_layers, total_items_in_pool, item_size
-        ).pin_memory()
-        dst_k_pool_ref = torch.zeros_like(src_k_pool).to(device)
-        dst_v_pool_ref = torch.zeros_like(src_v_pool).to(device)
-        dst_k_pool_kernel = torch.zeros_like(dst_k_pool_ref)
-        dst_v_pool_kernel = torch.zeros_like(dst_v_pool_ref)
-        dst_k_pool_direct = torch.zeros_like(dst_k_pool_ref)
-        dst_v_pool_direct = torch.zeros_like(dst_v_pool_ref)
+    if layer_first:
 
-    torch.cuda.synchronize()
-
-    # We will test the per-layer function on the first layer (index 0) of the pool.
-    layer_idx_to_test = 0
-
-    if is_mla:
-        if not all_layers:
-            ref_copy_with_indices(
-                src_pool_host[layer_idx_to_test],
-                dst_pool_ref[layer_idx_to_test],
-                src_indices_host,
-                dst_indices_device,
-            )
-            transfer_kv_per_layer_mla(
-                src_pool_host,
-                dst_pool_kernel,
-                src_indices_device,
-                dst_indices_device,
-                io_backend="kernel",
-                page_size=page_size,
-                item_size=item_size,
-                layer_id=layer_idx_to_test,
-                src_layout_dim=total_items_in_pool * item_size,
-                dst_layout_dim=total_items_in_pool * item_size
-            )
-            transfer_kv_per_layer_mla(
-                src_pool_host,
-                dst_pool_direct,
-                src_indices_host,
-                dst_indices_device,
-                io_backend="direct",
-                page_size=page_size,
-                item_size=item_size,
-                layer_id=layer_idx_to_test
-            )
+        # Prepare memory pools based on whether it's an MLA case.
+        if is_mla:
+            src_pool_host = torch.randn(
+                num_layers, total_items_in_pool, item_size
+            ).pin_memory()
+            dst_pool_ref = torch.zeros_like(src_pool_host).to(device)
+            dst_pool_kernel = torch.zeros_like(dst_pool_ref)
+            dst_pool_direct = torch.zeros_like(dst_pool_ref)
         else:
-            for layer_id in range(num_layers):
-                ref_copy_with_indices(
-                    src_pool_host[layer_id],
-                    dst_pool_ref[layer_id],
-                    src_indices_host,
-                    dst_indices_device,
-                )
-            transfer_kv_all_layer_mla(
-                src_pool_host,
-                dst_pool_kernel,
-                src_indices_device,
-                dst_indices_device,
-                io_backend="kernel",
-                page_size=page_size,
-                item_size=item_size,
-                num_layers=num_layers,
-                src_layout_dim=total_items_in_pool * item_size,
-                dst_layout_dim=total_items_in_pool * item_size,
-            )
-            transfer_kv_all_layer_mla(
-                src_pool_host,
-                dst_pool_direct,
-                src_indices_host,
-                dst_indices_device,
-                io_backend="direct",
-                page_size=page_size,
-                item_size=item_size,
-                num_layers=num_layers,
-                src_layout_dim=total_items_in_pool * item_size,
-                dst_layout_dim=total_items_in_pool * item_size,
-            )
-        torch.cuda.synchronize()
-        torch.testing.assert_close(dst_pool_kernel, dst_pool_ref)
-        torch.testing.assert_close(dst_pool_direct, dst_pool_ref)
-    else:
-        if not all_layers:
-            ref_copy_with_indices(
-                src_k_pool[layer_idx_to_test],
-                dst_k_pool_ref[layer_idx_to_test],
-                src_indices_host,
-                dst_indices_device,
-            )
-            ref_copy_with_indices(
-                src_v_pool[layer_idx_to_test],
-                dst_v_pool_ref[layer_idx_to_test],
-                src_indices_host,
-                dst_indices_device,
-            )
-            transfer_kv_per_layer(
-                src_k_pool,
-                dst_k_pool_kernel,
-                src_v_pool,
-                dst_v_pool_kernel,
-                src_indices_device,
-                dst_indices_device,
-                io_backend="kernel",
-                page_size=page_size,
-                item_size=item_size,
-                layer_id=layer_idx_to_test,
-                src_layout_dim=total_items_in_pool * item_size,
-                dst_layout_dim=total_items_in_pool * item_size
-            )
-            transfer_kv_per_layer(
-                src_k_pool,
-                dst_k_pool_direct,
-                src_v_pool,
-                dst_v_pool_direct,
-                src_indices_host,
-                dst_indices_device,
-                io_backend="direct",
-                page_size=page_size,
-                item_size=item_size,
-                layer_id=layer_idx_to_test
-            )
-        else:
-            for layer_id in range(num_layers):
-                ref_copy_with_indices(
-                    src_k_pool[layer_id],
-                    dst_k_pool_ref[layer_id],
-                    src_indices_host,
-                    dst_indices_device,
-                )
-                ref_copy_with_indices(
-                    src_v_pool[layer_id],
-                    dst_v_pool_ref[layer_id],
-                    src_indices_host,
-                    dst_indices_device,
-                )
-            transfer_kv_all_layer(
-                src_k_pool,
-                dst_k_pool_kernel,
-                src_v_pool,
-                dst_v_pool_kernel,
-                src_indices_device,
-                dst_indices_device,
-                io_backend="kernel",
-                page_size=page_size,
-                item_size=item_size,
-                num_layers=num_layers,
-                src_layout_dim=total_items_in_pool * item_size,
-                dst_layout_dim=total_items_in_pool * item_size,
-            )
-            transfer_kv_all_layer(
-                src_k_pool,
-                dst_k_pool_direct,
-                src_v_pool,
-                dst_v_pool_direct,
-                src_indices_host,
-                dst_indices_device,
-                io_backend="direct",
-                page_size=page_size,
-                item_size=item_size,
-                num_layers=num_layers,
-                src_layout_dim=total_items_in_pool * item_size,
-                dst_layout_dim=total_items_in_pool * item_size,
-            )
-        torch.cuda.synchronize()
-        torch.testing.assert_close(dst_k_pool_kernel, dst_k_pool_ref)
-        torch.testing.assert_close(dst_v_pool_kernel, dst_v_pool_ref)
-        torch.testing.assert_close(dst_k_pool_direct, dst_k_pool_ref)
-        torch.testing.assert_close(dst_v_pool_direct, dst_v_pool_ref)
+            src_k_pool = torch.randn(
+                num_layers, total_items_in_pool, item_size
+            ).pin_memory()
+            src_v_pool = torch.randn(
+                num_layers, total_items_in_pool, item_size
+            ).pin_memory()
+            dst_k_pool_ref = torch.zeros_like(src_k_pool).to(device)
+            dst_v_pool_ref = torch.zeros_like(src_v_pool).to(device)
+            dst_k_pool_kernel = torch.zeros_like(dst_k_pool_ref)
+            dst_v_pool_kernel = torch.zeros_like(dst_v_pool_ref)
+            dst_k_pool_direct = torch.zeros_like(dst_k_pool_ref)
+            dst_v_pool_direct = torch.zeros_like(dst_v_pool_ref)
 
+        torch.cuda.synchronize()
+
+        # We will test the per-layer function on the first layer (index 0) of the pool.
+        layer_idx_to_test = 0
+
+        if is_mla:
+            if not all_layers:
+                ref_copy_with_indices(
+                    src_pool_host[layer_idx_to_test],
+                    dst_pool_ref[layer_idx_to_test],
+                    src_indices_host,
+                    dst_indices_device,
+                )
+                transfer_kv_per_layer_mla(
+                    src_pool_host,
+                    dst_pool_kernel,
+                    src_indices_device,
+                    dst_indices_device,
+                    io_backend="kernel",
+                    page_size=page_size,
+                    item_size=item_size,
+                    layer_id=layer_idx_to_test,
+                    src_layout_dim=total_items_in_pool * item_size,
+                    dst_layout_dim=total_items_in_pool * item_size
+                )
+                transfer_kv_per_layer_mla(
+                    src_pool_host,
+                    dst_pool_direct,
+                    src_indices_host,
+                    dst_indices_device,
+                    io_backend="direct",
+                    page_size=page_size,
+                    item_size=item_size,
+                    layer_id=layer_idx_to_test
+                )
+            else:
+                for layer_id in range(num_layers):
+                    ref_copy_with_indices(
+                        src_pool_host[layer_id],
+                        dst_pool_ref[layer_id],
+                        src_indices_host,
+                        dst_indices_device,
+                    )
+                transfer_kv_all_layer_mla(
+                    src_pool_host,
+                    dst_pool_kernel,
+                    src_indices_device,
+                    dst_indices_device,
+                    io_backend="kernel",
+                    page_size=page_size,
+                    item_size=item_size,
+                    num_layers=num_layers,
+                    src_layout_dim=total_items_in_pool * item_size,
+                    dst_layout_dim=total_items_in_pool * item_size,
+                )
+                transfer_kv_all_layer_mla(
+                    src_pool_host,
+                    dst_pool_direct,
+                    src_indices_host,
+                    dst_indices_device,
+                    io_backend="direct",
+                    page_size=page_size,
+                    item_size=item_size,
+                    num_layers=num_layers,
+                    src_layout_dim=total_items_in_pool * item_size,
+                    dst_layout_dim=total_items_in_pool * item_size,
+                )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(dst_pool_kernel, dst_pool_ref)
+            torch.testing.assert_close(dst_pool_direct, dst_pool_ref)
+        else:
+            if not all_layers:
+                ref_copy_with_indices(
+                    src_k_pool[layer_idx_to_test],
+                    dst_k_pool_ref[layer_idx_to_test],
+                    src_indices_host,
+                    dst_indices_device,
+                )
+                ref_copy_with_indices(
+                    src_v_pool[layer_idx_to_test],
+                    dst_v_pool_ref[layer_idx_to_test],
+                    src_indices_host,
+                    dst_indices_device,
+                )
+                transfer_kv_per_layer(
+                    src_k_pool,
+                    dst_k_pool_kernel,
+                    src_v_pool,
+                    dst_v_pool_kernel,
+                    src_indices_device,
+                    dst_indices_device,
+                    io_backend="kernel",
+                    page_size=page_size,
+                    item_size=item_size,
+                    layer_id=layer_idx_to_test,
+                    src_layout_dim=total_items_in_pool * item_size,
+                    dst_layout_dim=total_items_in_pool * item_size
+                )
+                transfer_kv_per_layer(
+                    src_k_pool,
+                    dst_k_pool_direct,
+                    src_v_pool,
+                    dst_v_pool_direct,
+                    src_indices_host,
+                    dst_indices_device,
+                    io_backend="direct",
+                    page_size=page_size,
+                    item_size=item_size,
+                    layer_id=layer_idx_to_test
+                )
+            else:
+                for layer_id in range(num_layers):
+                    ref_copy_with_indices(
+                        src_k_pool[layer_id],
+                        dst_k_pool_ref[layer_id],
+                        src_indices_host,
+                        dst_indices_device,
+                    )
+                    ref_copy_with_indices(
+                        src_v_pool[layer_id],
+                        dst_v_pool_ref[layer_id],
+                        src_indices_host,
+                        dst_indices_device,
+                    )
+                transfer_kv_all_layer(
+                    src_k_pool,
+                    dst_k_pool_kernel,
+                    src_v_pool,
+                    dst_v_pool_kernel,
+                    src_indices_device,
+                    dst_indices_device,
+                    io_backend="kernel",
+                    page_size=page_size,
+                    item_size=item_size,
+                    num_layers=num_layers,
+                    src_layout_dim=total_items_in_pool * item_size,
+                    dst_layout_dim=total_items_in_pool * item_size,
+                )
+                transfer_kv_all_layer(
+                    src_k_pool,
+                    dst_k_pool_direct,
+                    src_v_pool,
+                    dst_v_pool_direct,
+                    src_indices_host,
+                    dst_indices_device,
+                    io_backend="direct",
+                    page_size=page_size,
+                    item_size=item_size,
+                    num_layers=num_layers,
+                    src_layout_dim=total_items_in_pool * item_size,
+                    dst_layout_dim=total_items_in_pool * item_size,
+                )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(dst_k_pool_kernel, dst_k_pool_ref)
+            torch.testing.assert_close(dst_v_pool_kernel, dst_v_pool_ref)
+            torch.testing.assert_close(dst_k_pool_direct, dst_k_pool_ref)
+            torch.testing.assert_close(dst_v_pool_direct, dst_v_pool_ref)
+
+    else:
+        # test page first to layer first
+
+        if is_mla:
+            src_pool_host = torch.randn(
+                total_items_in_pool, num_layers, item_size
+            ).pin_memory()
+            dst_pool_ref = torch.zeros(
+                [num_layers, total_items_in_pool, item_size]
+            ).to(device)
+            dst_pool_kernel = torch.zeros_like(dst_pool_ref)
+        else:
+            src_k_pool = torch.randn(
+                total_items_in_pool, num_layers,  item_size
+            ).pin_memory()
+            src_v_pool = torch.randn(
+                total_items_in_pool, num_layers, item_size
+            ).pin_memory()
+            dst_k_pool_ref = torch.zeros(
+                [num_layers, total_items_in_pool, item_size]
+            ).to(device)
+            dst_v_pool_ref = torch.zeros(
+                [num_layers, total_items_in_pool, item_size]
+            ).to(device)
+            dst_k_pool_kernel = torch.zeros_like(dst_k_pool_ref)
+            dst_v_pool_kernel = torch.zeros_like(dst_v_pool_ref)
+
+        torch.cuda.synchronize()
+        layer_idx_to_test = 0
+
+        if is_mla:
+            if not all_layers:
+                ref_copy_with_indices_page_first_to_layer_first(
+                    src_pool_host,
+                    dst_pool_ref,
+                    src_indices_host,
+                    dst_indices_device,
+                    layer_idx_to_test
+                )
+                transfer_kv_per_layer_mla(
+                    src_pool_host,
+                    dst_pool_kernel,
+                    src_indices_device,
+                    dst_indices_device,
+                    io_backend="kernel",
+                    page_size=page_size,
+                    item_size=item_size,
+                    layer_id=layer_idx_to_test,
+                    src_layout_dim=num_layers * item_size,
+                    dst_layout_dim=total_items_in_pool * item_size,
+                    src_layer_first=False,
+                    dst_layer_first=True
+                )
+            else:
+                for layer_id in range(num_layers):
+                    ref_copy_with_indices_page_first_to_layer_first(
+                        src_pool_host,
+                        dst_pool_ref,
+                        src_indices_host,
+                        dst_indices_device,
+                        layer_id
+                    )
+                transfer_kv_all_layer_mla(
+                    src_pool_host,
+                    dst_pool_kernel,
+                    src_indices_device,
+                    dst_indices_device,
+                    io_backend="kernel",
+                    page_size=page_size,
+                    item_size=item_size,
+                    num_layers=num_layers,
+                    src_layout_dim=num_layers * item_size,
+                    dst_layout_dim=total_items_in_pool * item_size,
+                    src_layer_first=False,
+                    dst_layer_first=True
+                )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(dst_pool_kernel, dst_pool_ref)
+        else:
+            if not all_layers:
+                ref_copy_with_indices_page_first_to_layer_first(
+                    src_k_pool,
+                    dst_k_pool_ref,
+                    src_indices_host,
+                    dst_indices_device,
+                    layer_idx_to_test
+                )
+                ref_copy_with_indices_page_first_to_layer_first(
+                    src_v_pool,
+                    dst_v_pool_ref,
+                    src_indices_host,
+                    dst_indices_device,
+                    layer_idx_to_test
+                )
+                transfer_kv_per_layer(
+                    src_k_pool,
+                    dst_k_pool_kernel,
+                    src_v_pool,
+                    dst_v_pool_kernel,
+                    src_indices_device,
+                    dst_indices_device,
+                    io_backend="kernel",
+                    page_size=page_size,
+                    item_size=item_size,
+                    layer_id=layer_idx_to_test,
+                    src_layout_dim=num_layers * item_size,
+                    dst_layout_dim=total_items_in_pool * item_size,
+                    src_layer_first=False,
+                    dst_layer_first=True
+                )
+            else:
+                for layer_id in range(num_layers):
+                    ref_copy_with_indices_page_first_to_layer_first(
+                        src_k_pool,
+                        dst_k_pool_ref,
+                        src_indices_host,
+                        dst_indices_device,
+                        layer_id
+                    )
+                    ref_copy_with_indices_page_first_to_layer_first(
+                        src_v_pool,
+                        dst_v_pool_ref,
+                        src_indices_host,
+                        dst_indices_device,
+                        layer_id
+                    )
+                transfer_kv_per_layer(
+                    src_k_pool,
+                    dst_k_pool_kernel,
+                    src_v_pool,
+                    dst_v_pool_kernel,
+                    src_indices_device,
+                    dst_indices_device,
+                    io_backend="kernel",
+                    page_size=page_size,
+                    item_size=item_size,
+                    num_layers=num_layers,
+                    src_layout_dim=num_layers * item_size,
+                    dst_layout_dim=total_items_in_pool * item_size,
+                    src_layer_first=False,
+                    dst_layer_first=True
+                )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(dst_k_pool_kernel, dst_k_pool_ref)
+            torch.testing.assert_close(dst_v_pool_kernel, dst_v_pool_ref)
     torch.set_default_dtype(original_dtype)
 
 
