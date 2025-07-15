@@ -675,6 +675,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
 
     await _global_state.tokenizer_manager.start_profile(
         output_dir=obj.output_dir,
+        start_step=obj.start_step,
         num_steps=obj.num_steps,
         activities=obj.activities,
         with_stack=obj.with_stack,

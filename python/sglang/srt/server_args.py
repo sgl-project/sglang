@@ -63,6 +63,7 @@ class ServerArgs:
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
     hybrid_kvcache_ratio: Optional[float] = None
+    swa_full_tokens_ratio: float = 0.8
     impl: str = "auto"
 
     # Port for the HTTP server
@@ -134,6 +135,8 @@ class ServerArgs:
     preferred_sampling_params: Optional[str] = None
 
     # LoRA
+    max_lora_rank: Optional[int] = None
+    lora_target_modules: Optional[List[str]] = None
     lora_paths: Optional[Union[dict[str, str], List[str]]] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
@@ -226,6 +229,7 @@ class ServerArgs:
     enable_return_hidden_states: bool = False
     enable_triton_kernel_moe: bool = False
     warmups: Optional[str] = None
+    disable_hybrid_swa_memory: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -247,6 +251,10 @@ class ServerArgs:
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
+
+    # For PD-Multiplexing
+    enable_pdmux: bool = False
+    sm_group_num: int = 3
 
     def __post_init__(self):
         # Expert parallelism
@@ -417,7 +425,7 @@ class ServerArgs:
         if self.enable_dp_lm_head:
             assert (
                 self.enable_dp_attention
-            ), "Please enable dp attention when setting enable_dp_attention. "
+            ), "Please enable dp attention when setting enable_dp_lm_head. "
 
         # DeepEP MoE
         if self.enable_deepep_moe:
@@ -482,13 +490,21 @@ class ServerArgs:
 
             model_arch = get_model_arch(self)
 
-            # Auto set draft_model_path DeepSeek-V3/R1
             if model_arch == "DeepseekV3ForCausalLM":
+                # Auto set draft_model_path DeepSeek-V3/R1
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
                 else:
                     logger.warning(
                         "DeepSeek MTP does not require setting speculative_draft_model_path."
+                    )
+            elif "Llama4" in model_arch:
+                # TODO: remove this after Llama4 supports in other backends
+                if self.attention_backend != "fa3":
+                    self.attention_backend = "fa3"
+                    logger.warning(
+                        "Llama4 requires using fa3 attention backend. "
+                        "Attention backend is automatically set to fa3."
                     )
 
             # Auto choose parameters
@@ -715,6 +731,7 @@ class ServerArgs:
                 "w8a8_fp8",
                 "moe_wna16",
                 "qoq",
+                "w4afp8",
             ],
             help="The quantization method.",
         )
@@ -857,6 +874,18 @@ class ServerArgs:
                 "(0.0 = pure uniform: swa_size / full_size = 1)"
                 "(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length)"
             ),
+        )
+        parser.add_argument(
+            "--swa-full-tokens-ratio",
+            type=float,
+            default=ServerArgs.swa_full_tokens_ratio,
+            help="The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. "
+            "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.",
+        )
+        parser.add_argument(
+            "--disable-hybrid-swa-memory",
+            action="store_true",
+            help="Disable the hybrid SWA memory.",
         )
 
         # Other runtime options
@@ -1054,9 +1083,16 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=["qwen25", "mistral", "llama3", "deepseekv3", "pythonic"],
+            choices=[
+                "qwen25",
+                "mistral",
+                "llama3",
+                "deepseekv3",
+                "pythonic",
+                "kimi_k2",
+            ],
             default=ServerArgs.tool_call_parser,
-            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', and 'pythonic'.",
+            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', and 'kimi_k2'.",
         )
 
         # Data parallelism
@@ -1106,6 +1142,28 @@ class ServerArgs:
         )
 
         # LoRA
+        parser.add_argument(
+            "--max-lora-rank",
+            default=ServerArgs.max_lora_rank,
+            type=int,
+            help="The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+        )
+        parser.add_argument(
+            "--lora-target-modules",
+            type=str,
+            choices=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+            nargs="*",
+            default=None,
+            help="The union set of all target modules where LoRA should be applied. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+        )
         parser.add_argument(
             "--lora-paths",
             type=str,
@@ -1620,7 +1678,7 @@ class ServerArgs:
             "--disaggregation-transfer-backend",
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
-            choices=["mooncake", "nixl"],
+            choices=["mooncake", "nixl", "ascend"],
             help="The backend for disaggregation transfer. Default is mooncake.",
         )
         parser.add_argument(
@@ -1673,6 +1731,17 @@ class ServerArgs:
             nargs="*",
             default=None,
             help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
+        )
+        parser.add_argument(
+            "--enable-pdmux",
+            action="store_true",
+            help="Enable PD-Multiplexing, PD running on greenctx stream.",
+        )
+        parser.add_argument(
+            "--sm-group-num",
+            type=int,
+            default=ServerArgs.sm_group_num,
+            help="Number of sm partition groups.",
         )
         parser.add_argument(
             "--weight-loader-disable-mmap",

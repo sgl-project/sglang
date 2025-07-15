@@ -34,6 +34,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
+    is_npu,
     set_weight_attrs,
     use_intel_amx_backend,
 )
@@ -60,6 +61,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 
 
 def adjust_marlin_shard(param, shard_size, shard_offset):
@@ -296,6 +298,14 @@ class ReplicatedLinear(LinearBase):
         # (such scales for AutoFp8).
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
+
+        # The per-tensor quant-scale must be 1 dimension
+        if _is_npu:
+            if param.size() != loaded_weight.size() and param.size(0) == 1:
+                if torch.allclose(loaded_weight, loaded_weight[0]):
+                    loaded_weight = loaded_weight[:1]
+                else:
+                    raise ValueError(f"{loaded_weight} are not all equal")
 
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
@@ -1357,7 +1367,7 @@ class RowParallelLinear(LinearBase):
             # It does not support additional parameters.
             param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, can_fuse_mlp_allreduce=False):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1372,7 +1382,7 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
-        if self.reduce_results and self.tp_size > 1:
+        if self.reduce_results and self.tp_size > 1 and not can_fuse_mlp_allreduce:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
