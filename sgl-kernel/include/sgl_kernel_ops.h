@@ -396,7 +396,7 @@ void transfer_kv_per_layer(
     const at::Tensor src_indices,
     const at::Tensor dst_indices,
     int64_t item_size,
-    int64_t layer_id
+    int64_t layer_id,
     int64_t src_layout_dim,
     int64_t dst_layout_dim,
     bool src_layer_first,
