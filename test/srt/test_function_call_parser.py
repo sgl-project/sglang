@@ -1183,7 +1183,7 @@ class TestKimiK2Detector(unittest.TestCase):
 
     def test_single_tool_call(self):
         """Test parsing a single tool call in a complete text."""
-        text = '<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city": "Paris"}<|tool_call_end|><|tool_calls_section_end|>'
+        text = '<|tool_calls_section_begin|><|tool_call_begin|>function.get_weather:0<|tool_call_argument_begin|>{"city": "Paris"}<|tool_call_end|><|tool_calls_section_end|>'
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
@@ -1192,7 +1192,7 @@ class TestKimiK2Detector(unittest.TestCase):
 
     def test_multiple_tool_calls(self):
         """Test parsing multiple tool calls in a complete text."""
-        text = '<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city": "Paris"}<|tool_call_end|><|tool_call_begin|>functions.get_tourist_attractions:1<|tool_call_argument_begin|>{"city": "London"}<|tool_call_end|><|tool_calls_section_end|>'
+        text = '<|tool_calls_section_begin|><|tool_call_begin|>function.get_weather:0<|tool_call_argument_begin|>{"city": "Paris"}<|tool_call_end|><|tool_call_begin|>function.get_tourist_attractions:1<|tool_call_argument_begin|>{"city": "London"}<|tool_call_end|><|tool_calls_section_end|>'
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 2)
         self.assertEqual(result.calls[0].name, "get_weather")
@@ -1204,7 +1204,7 @@ class TestKimiK2Detector(unittest.TestCase):
     def test_streaming_tool_call(self):
         """Test streaming incremental parsing of a tool call."""
         chunks = [
-            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            "<|tool_calls_section_begin|><|tool_call_begin|>function.get_weather:0<|tool_call_argument_begin|>{",
             '"city": "Paris"',
             "}",
             "<|tool_call_end|><|tool_calls_section_end|>",
@@ -1233,10 +1233,10 @@ class TestKimiK2Detector(unittest.TestCase):
     def test_streaming_multiple_tool_calls(self):
         """Test streaming incremental parsing of multiple tool calls."""
         chunks = [
-            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            "<|tool_calls_section_begin|><|tool_call_begin|>function.get_weather:0<|tool_call_argument_begin|>{",
             '"city": "Paris"',
             "}<|tool_call_end|>",
-            "<|tool_call_begin|>functions.get_tourist_attractions:1<|tool_call_argument_begin|>{",
+            "<|tool_call_begin|>function.get_tourist_attractions:1<|tool_call_argument_begin|>{",
             '"city": "London"',
             "}<|tool_call_end|>",
             "<|tool_calls_section_end|>",
@@ -1267,7 +1267,7 @@ class TestKimiK2Detector(unittest.TestCase):
     def test_tool_call_completion(self):
         """Test that the buffer and state are reset after a tool call is completed."""
         chunks = [
-            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            "<|tool_calls_section_begin|><|tool_call_begin|>function.get_weather:0<|tool_call_argument_begin|>{",
             '"city": "Paris"',
             "}",
             "<|tool_call_end|>",
@@ -1284,11 +1284,11 @@ class TestKimiK2Detector(unittest.TestCase):
     def test_tool_name_streaming(self):
         """Test that tool names are streamed correctly with the right index."""
         chunks = [
-            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            "<|tool_calls_section_begin|><|tool_call_begin|>function.get_weather:0<|tool_call_argument_begin|>{",
             '"city": "Paris"',
             "}",
             "<|tool_call_end|>",
-            "<|tool_call_begin|>functions.get_tourist_attractions:1<|tool_call_argument_begin|>{",
+            "<|tool_call_begin|>function.get_tourist_attractions:1<|tool_call_argument_begin|>{",
         ]
 
         tool_calls = []
@@ -1322,7 +1322,7 @@ class TestKimiK2Detector(unittest.TestCase):
     def test_partial_tool_call(self):
         """Test that partial tool calls are handled correctly in streaming mode."""
         chunks = [
-            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            "<|tool_calls_section_begin|><|tool_call_begin|>function.get_weather:0<|tool_call_argument_begin|>{",
             '"city": "Paris"',
         ]
 
@@ -1345,6 +1345,37 @@ class TestKimiK2Detector(unittest.TestCase):
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"')
+
+    def test_build_ebnf(self):
+        """Test that the KimiK2Detector generates valid EBNF."""
+        ebnf = self.detector.build_ebnf(self.tools)
+        self.assertIsNotNone(ebnf)
+
+        # Check that the EBNF contains expected Kimi K2 format patterns
+        self.assertIn("<|tool_calls_section_begin|>", ebnf)
+        self.assertIn("<|tool_calls_section_end|>", ebnf)
+        self.assertIn("<|tool_call_begin|>", ebnf)
+        self.assertIn("<|tool_call_argument_begin|>", ebnf)
+        self.assertIn("<|tool_call_end|>", ebnf)
+        self.assertIn('"function.get_weather:"', ebnf)
+        self.assertIn('"function.get_tourist_attractions:"', ebnf)
+        self.assertIn("[0-9]+", ebnf)  # Tool ID pattern
+
+        # Validate that the EBNF can be compiled by GrammarCompiler
+        try:
+            tokenizer_info = TokenizerInfo.from_pretrained(
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST, trust_remote_code=True
+            )
+            grammar_compiler = GrammarCompiler(tokenizer_info)
+            ctx = grammar_compiler.compile_grammar(ebnf)
+            self.assertIsNotNone(ctx, "EBNF should be valid and compile successfully")
+        except RuntimeError as e:
+            self.fail(f"Failed to compile EBNF: {e}")
+
+    def test_build_ebnf_empty_tools(self):
+        """Test that build_ebnf returns None for empty tools list."""
+        ebnf = self.detector.build_ebnf([])
+        self.assertIsNone(ebnf)
 
 
 if __name__ == "__main__":
