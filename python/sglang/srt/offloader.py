@@ -23,7 +23,7 @@ class _StatelessOffloaderUtil:
             p.data = cpu_data
 
     @staticmethod
-    def onload(module, device):
+    def create_onload_tensors(module, device):
         return {
             k: v.to(device, non_blocking=True)
             for k, v in module.state_dict().items()
@@ -38,7 +38,7 @@ class _ModuleOffloader:
         _StatelessOffloaderUtil.offload(module)
 
         def _create_parameter_and_buffer_dicts():
-            return _StatelessOffloaderUtil.onload(module, self.device)
+            return _StatelessOffloaderUtil.create_onload_tensors(module, self.device)
 
         _hook_module_forward(module, _create_parameter_and_buffer_dicts)
 
