@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
     get_device_memory_capacity,
+    is_npu,
     rank0_log,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -53,17 +54,21 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
+_is_npu = is_npu()
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 # Detect whether the current forward pass is in capture mode
 is_capture_mode = False
-torch.cuda.CUDAGraph = torch.npu.NPUGraph
-torch.cuda.synchronize = torch.npu.synchronize
-torch.cuda.graph = torch.npu.graph
-torch.cuda.stream = torch.npu.stream
-torch.cuda.Stream = torch.npu.Stream
-torch.cuda.current_stream = torch.npu.current_stream
+
+if _is_npu:
+    torch.cuda.CUDAGraph = torch.npu.NPUGraph
+    torch.cuda.synchronize = torch.npu.synchronize
+    torch.cuda.graph = torch.npu.graph
+    torch.cuda.stream = torch.npu.stream
+    torch.cuda.Stream = torch.npu.Stream
+    torch.cuda.current_stream = torch.npu.current_stream
 
 
 def get_is_capture_mode():
