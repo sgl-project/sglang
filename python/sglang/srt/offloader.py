@@ -24,6 +24,7 @@ class _StatelessOffloaderUtil:
 
     @staticmethod
     def create_onload_tensors(module, device):
+        TODO_maybe_stream
         return {
             k: v.to(device, non_blocking=True)
             for k, v in module.state_dict().items()
@@ -39,18 +40,21 @@ class _ModuleOffloader:
         self.device_tensors = None
         _StatelessOffloaderUtil.offload(module)
 
-        _hook_module_forward(module, lambda: self.device_tensors)
-
-    def onload_async(self):
+    def start_onload(self):
         self.device_tensors = _StatelessOffloaderUtil.create_onload_tensors(self.module, self.device)
 
+    def offload(self):
+        self.device_tensors = None
 
-def _hook_module_forward(module, create_parameter_and_buffer_dicts):
+
+def _hook_module_forward(module, on_forward_start, on_forward_end):
     original_forward = module.forward
 
     def forward(*args, **kwargs):
         module.forward = original_forward
-        output = functional_call(module, create_parameter_and_buffer_dicts(), args=args, kwargs=kwargs)
+        parameter_and_buffer_dicts = on_forward_start()
+        output = functional_call(module, parameter_and_buffer_dicts, args=args, kwargs=kwargs)
+        on_forward_end()
         module.forward = forward
         return output
 
