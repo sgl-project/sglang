@@ -772,7 +772,7 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
         elif self.disaggregation_mode == DisaggregationMode.EMBEDDING:
             buffer_size = int(os.environ.get("SGLANG_EMBEDDING_BUFFER_SIZE", "16"))
-            req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
             logger.debug(
@@ -782,7 +782,7 @@ class Scheduler(
                 buffer_size, self.max_prefill_tokens, self.model_config.hidden_size
             )
             self.disagg_embedding_bootstrap_queue = MultimodalEmbeddingBootstrapQueue(
-                req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
+                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
@@ -794,7 +794,7 @@ class Scheduler(
             self.disagg_embedding_inflight_queue: List[Req] = []
         elif self.disaggregation_mode == DisaggregationMode.LANGUAGE:
             buffer_size = int(os.environ.get("SGLANG_LANGUAGE_BUFFER_SIZE", "16"))
-            req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
             logger.debug(
@@ -805,13 +805,13 @@ class Scheduler(
             )
             self.disagg_language_transfer_queue = MultimodalLanguageTransferQueue(
                 gloo_group=self.attn_tp_cpu_group,
-                req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
+                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 tree_cache=self.tree_cache,
             )
             self.disagg_language_prealloc_queue = MultimodalLanguagePreallocQueue(
-                req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
+                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
@@ -2874,9 +2874,6 @@ def run_scheduler_process(
             else:
                 scheduler.event_loop_normal_disagg_decode()
         elif disaggregation_mode == DisaggregationMode.EMBEDDING:
-            if scheduler.enable_overlap:
-                scheduler.event_loop_overlap_disagg_multimodal_embedding()
-            else:
                 scheduler.event_loop_normal_disagg_multimodal_embedding()
         elif disaggregation_mode == DisaggregationMode.LANGUAGE:
             if scheduler.enable_overlap:

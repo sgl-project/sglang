@@ -390,10 +390,14 @@ class MetaMultiModaldataBuffers:
 
     def get_buf_chunk_info(self, req: Req):
         # (offset, size)
+        # return [
+        #     (
+        #         (len(req.fill_ids) - req.extend_input_len) * self.embedding_dim * self.input_embeddings.itemsize,
+        #         req.extend_input_len * self.embedding_dim * self.input_embeddings.itemsize),
+        #     (0, self.embedding_lengths.shape[1] * self.embedding_lengths.itemsize)
+        # ]
         return [
-            (
-                (len(req.fill_ids) - req.extend_input_len) * self.embedding_dim * self.input_embeddings.itemsize,
-                req.extend_input_len * self.embedding_dim * self.input_embeddings.itemsize),
+            (0, len(req.fill_ids) * self.embedding_dim * self.input_embeddings.itemsize),
             (0, self.embedding_lengths.shape[1] * self.embedding_lengths.itemsize)
         ]
 

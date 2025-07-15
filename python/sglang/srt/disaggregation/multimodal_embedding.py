@@ -182,9 +182,8 @@ class SchedulerDisaggregationMultimodalEmbeddingMixin:
             self.waiting_queue.extend(
                 self.disagg_embedding_bootstrap_queue.pop_bootstrapped()
             )
-            # batch = self.get_next_batch_to_run()
+            self.process_embedding_chunk()
             batch = self.get_new_batch_prefill()
-            # batch = self.get_new_batch_multimodal_embedding()
 
             self.cur_batch = batch
 
@@ -211,25 +210,29 @@ class SchedulerDisaggregationMultimodalEmbeddingMixin:
         """
         Transfer embedding results for completed requests and add it into disagg_multimodal_embedding_inflight_queue
         """
-        # TODO: support overlap scheduler
-        # TODO: check chunk forward for vision embedding
-        # TODO: support batch embedding
-
         embeddings = result.embeddings
-        # if len(batch.reqs) > 1:
-        #     raise NotImplementedError(
-        #         "Multimodal embedding with multiple requests is not supported"
-        #     )
 
+        embedding_offsets = 0
+        dummy_output_ids = []
         for i, req in enumerate(batch.reqs):
             if req.is_retracted:
                 continue
 
-            req.embedding = embeddings[i]
+            embedding = embeddings[
+                embedding_offsets : embedding_offsets + req.extend_input_len
+            ]
+            if req.embedding is None:
+                req.embedding = embedding
+            else:
+                req.embedding = torch.cat([req.embedding, embedding])
+            embedding_offsets += req.extend_input_len
             if req.is_chunked <= 0:
                 # Dummy output token for embedding models
                 req.output_ids.append(0)
-                self.tree_cache.cache_unfinished_req(req)
+                dummy_output_ids.append(0)
+                # release kv cache immediately for embedding models
+                # in order to speed up for batch forward
+                self.tree_cache.cache_finished_req(req)
                 self.disagg_embedding_inflight_queue.append(req)
                 self.send_embedding_chunk(req, last_chunk=True)
 
@@ -237,11 +240,10 @@ class SchedulerDisaggregationMultimodalEmbeddingMixin:
                     req.grammar.accept_token(0)
                     req.grammar.finished = req.finished()
             else:
-                raise NotImplementedError(
-                    "Chunked forward for multimodal embedding is not supported"
-                )
+                req.is_chunked -= 1
 
-        # self.stream_output(batch.reqs, batch.return_logprob, skip_req=None)
+        if len(dummy_output_ids) > 0:
+            batch.output_ids = torch.tensor(dummy_output_ids).to(self.device, non_blocking=True)
 
     def process_multimodal_embedding_inflight_queue(self: Scheduler):
         """
@@ -266,8 +268,9 @@ class SchedulerDisaggregationMultimodalEmbeddingMixin:
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
-                self.tree_cache.cache_finished_req(req)
                 req.finished_reason = FINISH_LENGTH(length=0)
+                # dummy embedding for embedding models
+                req.embedding = [0]
                 # FIXME: clean up req's data in transfer engine
                 if hasattr(req.disagg_embedding_sender, "clear"):
                     req.disagg_embedding_sender.clear()
@@ -279,175 +282,37 @@ class SchedulerDisaggregationMultimodalEmbeddingMixin:
                 except Exception as e:
                     error_message += f" with exception {e}"
                 logger.warning(error_message)
+                self.tree_cache.cache_finished_req(req)
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
                 done_reqs.append(req)
-
-        for req in done_reqs:
-            self.disagg_embedding_bootstrap_queue.req_to_metadata_buffer_idx_allocator.free(
-                req.metadata_buffer_index
-            )
-            # clean embedding to reduce latency for embedding
-            req.embedding = [0]
 
         self.stream_output(
             done_reqs,
             any(req.return_logprob for req in done_reqs),
             None,
         )
+
+        for req in done_reqs:
+            self.req_to_metadata_buffer_idx_allocator.free(
+                req.metadata_buffer_index
+            )
+            req.metadata_buffer_index = -1
         self.disagg_embedding_inflight_queue = undone_reqs
 
-    def get_new_batch_multimodal_embedding(self: Scheduler):
-        # TODO: check necessary
-        if self.grammar_queue:
-            self.move_ready_grammar_requests()
+        return done_reqs
 
-        if (
-            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
-            return None
-
-        running_bs = len(self.running_batch.reqs)
-        if self.get_num_allocatable_reqs(running_bs) <= 0 and not self.chunked_req:
-            self.running_batch.batch_is_full = True
-            return None
-
-        if self.enable_hierarchical_cache:
-            # check for completion of hierarchical cache activities to release memory
-            self.tree_cache.writing_check()
-            self.tree_cache.loading_check()
-
-        # Get priority queue
-        prefix_computed = self.policy.calc_priority(self.waiting_queue)
-
-        # Prefill policy
-        adder = PrefillAdder(
-            self.tree_cache,
-            self.token_to_kv_pool_allocator,
-            self.running_batch,
-            self.new_token_ratio,
-            self.max_prefill_tokens,
-            self.chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
-        )
-
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
-
-        if self.lora_paths:
-            lora_set = set([req.lora_path for req in self.running_batch.reqs])
-
-        # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
-            if (
-                self.lora_paths
-                and len(
-                    lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
-                )
-                > self.max_loras_per_batch
-            ):
-                self.running_batch.batch_is_full = True
-                break
-
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
-                self.running_batch.batch_is_full = True
-                break
-
-            if self.disaggregation_mode in [
-                DisaggregationMode.PREFILL,
-                DisaggregationMode.EMBEDDING,
-            ]:
-                # In prefill mode, prealloc queue and transfer queue can also take memory,
-                # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
-                    self.running_batch.batch_is_full = True
-                    break
-
-            req.init_next_round_input(
-                None if prefix_computed else self.tree_cache,
-                self.enable_hierarchical_cache,
-            )
-
-            res = adder.add_one_req(
-                req, self.chunked_req, self.enable_hierarchical_cache
-            )
-
-            if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
-                        # Set batch_is_full after making sure there are requests that can be served
-                        self.running_batch.batch_is_full = len(
-                            adder.can_run_list
-                        ) > 0 or (not self.running_batch.is_empty())
-                    else:
-                        self.running_batch.batch_is_full = True
-                break
-
-        # Update waiting queue
-        can_run_list: List[Req] = adder.can_run_list
-        if len(can_run_list) == 0:
-            return None
-
-        if self.enable_metrics:
-            # only record queue time when enable_metrics is True to avoid overhead
-            for req in can_run_list:
-                req.queue_time_end = time.perf_counter()
-
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
-        ]
-
-        if self.enable_hierarchical_cache:
-            self.tree_cache.ready_to_load_cache()
-
-        if adder.new_chunked_req is not None:
-            assert self.chunked_req is None
-            self.chunked_req = adder.new_chunked_req
-
-        if self.chunked_req:
-            self.chunked_req.is_chunked += 1
-
-        # Print stats
-        if self.attn_tp_rank == 0:
-            self.log_prefill_stats(adder, can_run_list, running_bs)
-
-        # Create a new batch
-        new_batch = ScheduleBatch.init_new(
-            can_run_list,
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            self.tree_cache,
-            self.model_config,
-            self.enable_overlap,
-            self.spec_algorithm,
-            self.server_args.enable_custom_logit_processor,
-            chunked_req=self.chunked_req,
-        )
-        new_batch.prepare_for_extend()
-
-        # Mixed-style chunked prefill
-        if (
-            self.is_mixed_chunk
-            and not self.running_batch.is_empty()
-            and not (new_batch.return_logprob or self.running_batch.return_logprob)
-        ):
-            # TODO (lianmin): support return_logprob + mixed chunked prefill
-            self.running_batch.filter_batch()
-            if not self.running_batch.is_empty():
-                self.running_batch.prepare_for_decode()
-                new_batch.mix_with_running(self.running_batch)
-                new_batch.decoding_reqs = self.running_batch.reqs
-            self.running_batch = ScheduleBatch(
-                reqs=[], batch_is_full=self.running_batch.batch_is_full
-            )
-        else:
-            new_batch.decoding_reqs = None
-
-        return new_batch
+    def process_embedding_chunk(self: Scheduler):
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            if self.chunked_req:
+                # keep same logic with prefill mode
+                self.last_batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
+                self.tree_cache.cache_unfinished_req(self.chunked_req)
+                # only send the last chunk
+                # self.send_embedding_chunk(self.chunked_req, last_chunk=False)
+                self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+                self.running_batch.batch_is_full = False
 
     def send_embedding_chunk(
         self: Scheduler,

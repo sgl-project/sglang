@@ -579,8 +579,7 @@ class Qwen2_5_VLForConditionalEmbedding(nn.Module):
             get_embedding=get_embedding,
         )
 
-        # TODO: support batch infer
-        return EmbeddingPoolerOutput(embeddings=hidden_states.unsqueeze(0))
+        return EmbeddingPoolerOutput(embeddings=hidden_states)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
