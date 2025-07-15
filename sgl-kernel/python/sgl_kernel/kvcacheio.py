@@ -11,6 +11,11 @@ def transfer_kv_per_layer(
     io_backend: str,
     page_size: int,
     item_size: int,
+    layer_id: int,
+    src_layout_dim: int = 0,
+    dst_layout_dim: int = 0,
+    src_layer_first: bool = True,
+    dst_layer_first: bool = True,
     block_quota: int = 2,
     num_warps_per_block: int = 32,
 ):
@@ -23,12 +28,25 @@ def transfer_kv_per_layer(
             src_indices,
             dst_indices,
             item_size,
+            layer_id,
+            src_layout_dim,
+            dst_layout_dim,
+            src_layer_first,
+            dst_layer_first,
             block_quota,
             num_warps_per_block,
         )
     elif io_backend == "direct":
+        assert src_layer_first
+        assert dst_layer_first
         torch.ops.sgl_kernel.transfer_kv_per_layer_direct(
-            src_k, dst_k, src_v, dst_v, src_indices, dst_indices, page_size
+            src_k[layer_id],
+            dst_k[layer_id],
+            src_v[layer_id],
+            dst_v[layer_id],
+            src_indices,
+            dst_indices,
+            page_size
         )
     else:
         raise ValueError(f"Unsupported io backend")
@@ -45,8 +63,10 @@ def transfer_kv_all_layer(
     page_size: int,
     item_size: int,
     num_layers: int,
-    src_layer_offset: int,
-    dst_layer_offset: int,
+    src_layout_dim: int,
+    dst_layout_dim: int,
+    src_layer_first: bool = True,
+    dst_layer_first: bool = True,
     block_quota: int = 2,
     num_warps_per_block: int = 32,
 ):
@@ -60,12 +80,16 @@ def transfer_kv_all_layer(
             dst_indices,
             item_size,
             num_layers,
-            src_layer_offset,
-            dst_layer_offset,
+            src_layout_dim,
+            dst_layout_dim,
+            src_layer_first,
+            dst_layer_first,
             block_quota,
             num_warps_per_block,
         )
     elif io_backend == "direct":
+        assert src_layer_first
+        assert dst_layer_first
         torch.ops.sgl_kernel.transfer_kv_all_layer_direct(
             src_k, dst_k, src_v, dst_v, src_indices, dst_indices, page_size, num_layers
         )
@@ -81,6 +105,11 @@ def transfer_kv_per_layer_mla(
     io_backend: str,
     page_size: int,
     item_size: int,
+    layer_id: int,
+    src_layout_dim: int = 0,
+    dst_layout_dim: int = 0,
+    src_layer_first: bool = True,
+    dst_layer_first: bool = True,
     block_quota: int = 2,
     num_warps_per_block: int = 32,
 ):
@@ -91,12 +120,19 @@ def transfer_kv_per_layer_mla(
             src_indices,
             dst_indices,
             item_size,
+            layer_id,
+            src_layout_dim,
+            dst_layout_dim,
+            src_layer_first,
+            dst_layer_first,
             block_quota,
             num_warps_per_block,
         )
     elif io_backend == "direct":
+        assert src_layer_first
+        assert dst_layer_first
         torch.ops.sgl_kernel.transfer_kv_per_layer_mla_direct(
-            src, dst, src_indices, dst_indices, page_size
+            src[layer_id], dst[layer_id], src_indices, dst_indices, page_size
         )
     else:
         raise ValueError(f"Unsupported io backend")
@@ -111,8 +147,10 @@ def transfer_kv_all_layer_mla(
     page_size: int,
     item_size: int,
     num_layers: int,
-    src_layer_offset: int,
-    dst_layer_offset: int,
+    src_layout_dim: int,
+    dst_layout_dim: int,
+    src_layer_first: bool = True,
+    dst_layer_first: bool = True,
     block_quota: int = 2,
     num_warps_per_block: int = 32,
 ):
@@ -124,12 +162,16 @@ def transfer_kv_all_layer_mla(
             dst_indices,
             item_size,
             num_layers,
-            src_layer_offset,
-            dst_layer_offset,
+            src_layout_dim,
+            dst_layout_dim,
+            src_layer_first,
+            dst_layer_first,
             block_quota,
             num_warps_per_block,
         )
     elif io_backend == "direct":
+        assert src_layer_first
+        assert dst_layer_first
         torch.ops.sgl_kernel.transfer_kv_all_layer_mla_direct(
             src, dst, src_indices, dst_indices, page_size, num_layers
         )
