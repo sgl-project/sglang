@@ -79,13 +79,15 @@ class _ModuleOffloader:
             self._device_tensors = _StatelessOffloaderUtil.create_device_tensors(
                 self.module, self.device
             )
+            self._load_event = torch.cuda.Event()
+            self._load_event.record()
 
     def offload(self):
         self._device_tensors = None
 
     def wait_and_get_device_tensors(self):
         assert self._device_tensors is not None
-        torch.cuda.current_stream().wait_stream(self.alt_stream)
+        self._load_event.wait()
         return self._device_tensors
 
 
