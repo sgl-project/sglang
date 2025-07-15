@@ -42,8 +42,21 @@ class SessionParams:
     drop_previous_output: Optional[bool] = None
 
 
-AudioDataItem = Union[str, Dict]
-ImageDataItem = Union[Image, str, Dict]
+# Type definitions for multimodal input data
+# Individual data item types for each modality
+ImageDataInputItem = Union[Image, str, Dict]
+AudioDataInputItem = Union[str, Dict]
+VideoDataInputItem = Union[str, Dict]
+# Union type for any multimodal data item
+MultimodalDataInputItem = Union[
+    ImageDataInputItem, VideoDataInputItem, AudioDataInputItem
+]
+# Format types supporting single items, lists, or nested lists for batch processing
+MultimodalDataInputFormat = Union[
+    List[List[MultimodalDataInputItem]],
+    List[MultimodalDataInputItem],
+    MultimodalDataInputItem,
+]
 
 
 @dataclass
@@ -60,13 +73,11 @@ class GenerateReqInput:
     # - List of images (one per request in a batch)
     # - List of lists of images (multiple images per request)
     # See also python/sglang/srt/utils.py:load_image for more details.
-    image_data: Optional[
-        Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]
-    ] = None
-    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
-    audio_data: Optional[Union[List[AudioDataItem], AudioDataItem]] = None
+    image_data: Optional[MultimodalDataInputFormat] = None
     # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
-    video_data: Optional[Union[List[List[str]], List[str], str]] = None
+    video_data: Optional[MultimodalDataInputFormat] = None
+    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
+    audio_data: Optional[MultimodalDataInputFormat] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # The request id.
@@ -524,13 +535,11 @@ class EmbeddingReqInput:
     # - List of images (one per request in a batch)
     # - List of lists of images (multiple images per request)
     # See also python/sglang/srt/utils.py:load_image for more details.
-    image_data: Optional[
-        Union[List[List[Union[Image, str]]], List[Union[Image, str]], Union[Image, str]]
-    ] = None
+    image_data: Optional[MultimodalDataInputFormat] = None
     # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
-    video_data: Optional[Union[List[str], str]] = None
+    video_data: Optional[MultimodalDataInputFormat] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
-    audio_data: Optional[Union[List[str], str]] = None
+    audio_data: Optional[MultimodalDataInputFormat] = None
     # The token ids for text; one can either specify text or input_ids.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The request id.
@@ -610,8 +619,6 @@ class EmbeddingReqInput:
         if self.is_cross_encoder_request:
             return EmbeddingReqInput(
                 text=[self.text[i]] if self.text is not None else None,
-                input_ids=None,
-                image_data=None,
                 sampling_params=self.sampling_params[i],
                 rid=self.rid[i],
                 is_cross_encoder_request=True,
@@ -621,6 +628,8 @@ class EmbeddingReqInput:
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             image_data=self.image_data[i] if self.image_data is not None else None,
+            audio_data=self.audio_data[i] if self.audio_data is not None else None,
+            video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
         )
