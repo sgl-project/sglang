@@ -10,7 +10,7 @@ def wrap_modules_for_offload(all_modules: List[torch.nn.Module]):
     module_interval = get_int_env_var("SGLANG_OFFLOAD_MODULE_INTERVAL", 5)
 
     alt_stream = torch.cuda.Stream()
-    offload_modules = all_modules[module_interval - 1:: module_interval]
+    offload_modules = all_modules[module_interval - 1 :: module_interval]
     offloaders = [_ModuleOffloader(layer, alt_stream) for layer in offload_modules]
 
     offloaders[0].start_onload()
@@ -28,9 +28,11 @@ def _hook_module_forward_for_offloader(index, module, offloaders):
         module,
         on_forward_start=lambda: offloaders[
             (index + 1) % len(offloaders)
-            ].start_onload(),
+        ].start_onload(),
         on_forward_end=lambda: offloaders[index].offload(),
-        get_parameter_and_buffer_dicts=lambda: offloaders[index].wait_and_get_device_tensors(),
+        get_parameter_and_buffer_dicts=lambda: offloaders[
+            index
+        ].wait_and_get_device_tensors(),
     )
 
 
