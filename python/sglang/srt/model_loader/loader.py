@@ -160,7 +160,6 @@ def _initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
-
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
     if _is_npu:
         packed_modules_mapping["fused_qkv_a_proj_with_mqa"] = [

@@ -14,7 +14,7 @@
 """Radix attention."""
 
 from enum import Enum
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from torch import nn
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -52,6 +52,7 @@ class RadixAttention(nn.Module):
         sliding_window_size: int = -1,
         is_cross_attention: bool = False,
         quant_config: Optional["QuantizationConfig"] = None,
+        attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
         prefix: str = "",
     ):

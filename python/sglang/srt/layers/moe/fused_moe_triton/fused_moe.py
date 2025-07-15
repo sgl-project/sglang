@@ -1171,6 +1171,7 @@ def get_config_dtype_str(
         # avoiding cases where kernel fails when float32 MoE
         # use fp16/bfloat16 configs
         return "float32"
+    # TODO: Once OCP MX is natively supported in the fused MOE kernel, we should return add it here.
     return None
 
 
@@ -1552,14 +1553,8 @@ def fused_experts_impl(
     if use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     elif use_mxfp4_w4a4:
-        if supports_mx():
-            # 16bit activation and fp4x2 packed weight
-            assert hidden_states.shape[1] // 2 == w1.shape[
-                2], "hidden size mismatch"
-        else:
-            # 16bit activation and dequantized 16bit weight
-            assert hidden_states.shape[1] == w1.shape[
-                2], "hidden size mismatch"
+        # 2 fp4 weights packed on one byte for the weight.
+        assert hidden_states.shape[1] == w1.shape[2] * 2, "hidden size mismatch"
     else:
         assert (
             hidden_states.shape[1] == w1.shape[2] - padded_size

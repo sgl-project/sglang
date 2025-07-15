@@ -3,7 +3,6 @@
 from typing import Any, Callable, Optional
 
 import torch
-import logging
 
 from sglang.srt.layers.quantization.mxfp4_utils import OCP_MX_BLOCK_SIZE
 
@@ -11,8 +10,6 @@ from sglang.srt.utils import print_warning_once
 from sglang.srt.utils import set_weight_attrs
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase, FusedMoeWeightScaleSupported
 from sglang.srt.utils import supports_mx
-
-logger = logging.getLogger(__name__)
 
 __all__ = ["QuarkMoEMethod", "QuarkW4A4MXFp4MoEMethod"]
 
@@ -143,19 +140,19 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         use_grouped_topk: bool = False,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
-        global_num_experts: int = -1,
-        expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
-        scoring_func: str = "softmax",
         no_combine: bool = False,
         correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
         inplace: bool = True,
         routed_scaling_factor: Optional[float] = None,
+        num_fused_shared_experts: int = 0,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.topk import select_experts
         from sglang.srt.layers.moe.fused_moe_triton import fused_experts
+
+        assert not no_combine, f"{no_combine=} is not supported."
 
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
@@ -165,9 +162,10 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             renormalize=renormalize,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
+            num_fused_shared_experts=num_fused_shared_experts,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         out = fused_experts(

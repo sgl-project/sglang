@@ -509,6 +509,7 @@ class SRTRunner:
         sleep_on_idle=False,
         max_lora_rank: Optional[int] = None,
         lora_target_modules: Optional[List[str]] = None,
+        context_length: Optional[int] = None,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -549,6 +550,7 @@ class SRTRunner:
             sleep_on_idle=sleep_on_idle,
             max_lora_rank=max_lora_rank,
             lora_target_modules=lora_target_modules,
+            context_length=context_length,
             **spec_kwargs,
         )
 

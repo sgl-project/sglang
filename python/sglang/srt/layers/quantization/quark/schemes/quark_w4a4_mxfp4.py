@@ -17,8 +17,6 @@ from sglang.srt.utils import supports_mx
 
 __all__ = ["QuarkW4A4MXFP4"]
 
-logger = logging.getLogger(__name__)
-
 
 class QuarkW4A4MXFP4(QuarkScheme):
 
