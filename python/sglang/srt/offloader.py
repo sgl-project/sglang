@@ -94,6 +94,7 @@ class _StatelessOffloaderUtil:
     def move_params_to_cpu(module):
         pin_memory = is_pin_memory_available()
         for name, param in module.named_parameters():
+            print(f"move_params_to_cpu {name=} {param.nbytes=}")
             cpu_data = torch.empty_strided(
                 size=param.data.size(),
                 stride=param.data.stride(),
