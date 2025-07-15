@@ -26,22 +26,12 @@ class Phi4MMImageProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
+        audio_data,
         input_text,
         request_obj,
         max_req_input_len,
         **kwargs,
     ):
-        audio_data = request_obj.audio_data
-
-        if not image_data and not audio_data:
-            return None
-
-        if not isinstance(image_data, list):
-            image_data = [image_data]
-
-        if not isinstance(audio_data, list):
-            audio_data = [audio_data]
-
         if audio_data:
             logger.warning(
                 "Currently SGLang does not support audio data for Phi4MM. We are working on it. You can file an issue to help us prioritize."
@@ -75,7 +65,7 @@ class Phi4MMImageProcessor(BaseMultimodalProcessor):
                 pixel_values=res["input_image_embeds"],
                 image_sizes=res["image_sizes"],
                 image_emb_mask=res["image_attention_mask"],
-                image_offsets=image_offsets,
+                offsets=image_offsets,
                 modality=Modality.IMAGE,
             )
         ]

@@ -227,7 +227,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
-            image_data_embedding_func=self.get_image_feature,
+            multimodal_model=self,
             language_model=self.language_model,
         )
 
@@ -253,11 +253,9 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 weights_loader = getattr(param, "weight_loader", default_weight_loader)
                 weights_loader(param, loaded_weight)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
-        helper = MultiModalityDataPaddingPatternMultimodalTokens(
-            [image_inputs.im_token_id]
-        )
-        return helper.pad_input_tokens(input_ids, image_inputs)
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]):
 
