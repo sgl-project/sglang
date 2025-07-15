@@ -229,11 +229,62 @@ class TestMiniCPMUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTest
         pass
 
     def _pixel_values_image_data(self, processor_output):
-        return dict(
-            modality="IMAGE",
-            pixel_values=processor_output["pixel_values"],
-            tgt_size=processor_output["tgt_sizes"]
+        image_slice_patch_size = len(processor_output.pixel_values[0])
+        pre_dicts = []
+        for i in range(image_slice_patch_size):
+            pre_dicts.append(dict(
+                modality="IMAGE",
+                pixel_values=processor_output.pixel_values[0][i],
+                tgt_size=processor_output.tgt_sizes[0][i],
+            ))
+        return pre_dicts
+
+    async def test_understands_pixel_values(self):
+        req = self.get_completion_request()
+        processor_output = self.get_processor_output(req=req)
+        output = await self.engine.async_generate(
+            input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
+            image_data=self._pixel_values_image_data(processor_output),
+            sampling_params=dict(temperature=0.0),
         )
+        self.verify_response(output)
+
+    async def test_understands_pixel_values_with_imgs(self):
+        def local_get_completion_request() -> ChatCompletionRequest:
+            json_structure = {
+            "model": self.model_path,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": self.image_url}},
+                        {"type": "image_url", "image_url": {"url": self.image_url}},
+                        {"type": "text", "text": "What's the difference between these two pictures? focus angel"},
+                    ],
+                }
+                ],
+            }
+            json_str = json.dumps(json_structure)
+            return ChatCompletionRequest.model_validate_json(json_str)
+        def local_get_processor_output(req: ChatCompletionRequest):
+            image2 = self.main_image.rotate(90).crop((0,0, 300, 300))
+            conv = generate_chat_conv(req, template_name=self.chat_template)
+            text = conv.get_prompt()
+            inputs = self.processor(
+                text=[text],
+                images=[[self.main_image, image2]],
+                return_tensors="pt",
+            ).to(self.device)
+            return inputs
+        req = local_get_completion_request()
+        processor_output = local_get_processor_output(req=req)
+        output = await self.engine.async_generate(
+            input_ids=[processor_output["input_ids"][0].detach().cpu().tolist()],
+            image_data=[self._pixel_values_image_data(processor_output)],
+            sampling_params=dict(temperature=0.0),
+        )
+        self.verify_response(output[0])
+
 
 
 if __name__ == "__main__":
