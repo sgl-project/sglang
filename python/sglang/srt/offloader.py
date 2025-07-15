@@ -5,9 +5,14 @@ from torch.func import functional_call
 
 from sglang.srt.utils import get_int_env_var, is_pin_memory_available
 
+logger = logging.getLogger(__name__)
 
 def offload_modules(all_modules: List[torch.nn.Module]):
-    module_interval = get_int_env_var("SGLANG_OFFLOAD_MODULE_INTERVAL", 5)
+    module_interval = get_int_env_var("SGLANG_OFFLOAD_MODULE_INTERVAL", -1)
+    if module_interval < 0:
+        return
+
+    logger.info(f"offload_module module_interval={module_interval} num_modules={len(all_modules)}")
 
     alt_stream = torch.cuda.Stream()
     offload_modules = all_modules[module_interval - 1 :: module_interval]
@@ -19,8 +24,6 @@ def offload_modules(all_modules: List[torch.nn.Module]):
         _hook_module_forward_for_offloader(
             index=index, module=module, offloaders=offloaders
         )
-
-    return all_modules
 
 
 def _hook_module_forward_for_offloader(index, module, offloaders):
