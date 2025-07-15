@@ -36,6 +36,7 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.eplb.lp_token_dispatch import get_log2phy_prob
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -489,6 +490,9 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         forward_mode = forward_batch.forward_mode
         shared_output = None
+        expert_location_dispatch_info = ExpertLocationDispatchInfo.init_new(
+            layer_id=self.layer_id,
+        )
         if is_non_idle_and_non_empty(forward_mode, hidden_states):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
@@ -505,14 +509,13 @@ class DeepseekV2MoE(nn.Module):
                 correction_bias=self.correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
                 num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
+                expert_location_dispatch_info=expert_location_dispatch_info,
                 lp_dispatch=self._lp_dispatch,
             )
         else:
             if self._lp_dispatch:
-                torch.distributed.all_reduce(torch.zeros(256), group=get_world_group().cpu_group, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.reduce(torch.zeros(expert_location_dispatch_info.partial_logical_to_all_physical_map_num_valid.shape[0]), dst=0, group=get_world_group().cpu_group, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.broadcast(torch.zeros_like(expert_location_dispatch_info.partial_logical_to_valid_physical_map), src=0, group=get_world_group().cpu_group)
             topk_idx = torch.full(
                 (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
             )
@@ -591,7 +594,9 @@ class DeepseekV2MoE(nn.Module):
     def op_select_experts(self, state):
         router_logits = state.pop("router_logits")
         hidden_states = state.hidden_states_mlp_input
-
+        expert_location_dispatch_info = ExpertLocationDispatchInfo.init_new(
+            layer_id=self.layer_id,
+        )
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
@@ -608,11 +613,13 @@ class DeepseekV2MoE(nn.Module):
                     correction_bias=self.correction_bias,
                     routed_scaling_factor=self.routed_scaling_factor,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                    lp_dispatch=self._lp_dispatch,
                 )
         else:
+            if self._lp_dispatch:
+                torch.distributed.reduce(torch.zeros(expert_location_dispatch_info.partial_logical_to_all_physical_map_num_valid.shape[0]), dst=0, group=get_world_group().cpu_group, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.broadcast(torch.zeros_like(expert_location_dispatch_info.partial_logical_to_valid_physical_map), src=0, group=get_world_group().cpu_group)
             state.topk_idx_local = torch.full(
                 (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
             )

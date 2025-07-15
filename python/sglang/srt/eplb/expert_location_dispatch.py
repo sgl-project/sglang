@@ -16,8 +16,10 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 import torch
+import numpy as np
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.eplb.lp_matrices_prep import get_global_token_dispatch_metadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 
@@ -31,11 +33,16 @@ class ExpertLocationDispatchInfo:
     # (num_logical_experts,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
+    # (num_logical_experts, X)
+    partial_logical_to_valid_physical_map: torch.Tensor
+    lp_metadata: Optional[dict[str, np.ndarray]]
+
 
     @classmethod
     def init_new(cls, layer_id: int):
         ep_dispatch_algorithm = global_server_args_dict["ep_dispatch_algorithm"]
         expert_location_metadata = get_global_expert_location_metadata()
+        lp_metadata = get_global_token_dispatch_metadata()
 
         if ep_dispatch_algorithm is None:
             return None
@@ -57,6 +64,22 @@ class ExpertLocationDispatchInfo:
                 layer_id, :
             ],
             num_physical_experts=expert_location_metadata.num_physical_experts,
+            partial_logical_to_valid_physical_map=expert_location_metadata.logical_to_all_physical_map[
+                layer_id, :, :expert_location_metadata.logical_to_all_physical_map_num_valid[layer_id, :].max()
+            ],
+            lp_metadata={
+                "B1": lp_metadata.B1[layer_id].toarray(),
+                "B2": lp_metadata.B2[layer_id].toarray(),
+                "C": lp_metadata.C[layer_id].toarray(),
+                "c": lp_metadata.c[layer_id],
+                "G": lp_metadata.G[layer_id].toarray(),
+                "A": lp_metadata.A[layer_id].toarray(),
+                "single_expert_array": lp_metadata.single_expert_array[layer_id],
+                "log_replicated_expert_array": lp_metadata.log_replicated_expert_array[layer_id],
+                "phy_replicated_expert_array": lp_metadata.phy_replicated_expert_array[layer_id],
+                "dims": lp_metadata.dims,
+                "ecos_opts": lp_metadata.ecos_opts,
+            }
         )
 
 
