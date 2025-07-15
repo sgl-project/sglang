@@ -25,8 +25,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
-
-from sglang.srt.offloader import offload_modules
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -87,6 +85,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.offloader import offload_modules
 from sglang.srt.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
     model_forward_maybe_tbo,
