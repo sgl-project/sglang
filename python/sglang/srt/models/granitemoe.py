@@ -15,6 +15,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -77,7 +78,6 @@ class GraniteMoeMoE(nn.Module):
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
-        # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(hidden_states, router_logits)
         return final_hidden_states.view(orig_shape)
@@ -181,7 +181,6 @@ class GraniteMoeDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        # Requires transformers > 4.32.0
         rope_theta = getattr(config, "rope_theta", 10000)
         self.self_attn = GraniteMoeAttention(
             hidden_size=self.hidden_size,
@@ -216,9 +215,9 @@ class GraniteMoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # Self Attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -242,12 +241,8 @@ class GraniteMoeModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-
-        self.config = config
-        self.vocab_size = config.vocab_size
-        self.org_vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
+            config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
         )
@@ -294,22 +289,6 @@ class GraniteMoeModel(nn.Module):
 
 
 class GraniteMoeForCausalLM(nn.Module):
-    fall_back_to_pt_during_load = False
-
-    packed_modules_mapping = {
-        "qkv_proj": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-        ],
-    }
-
-    # LoRA specific attributes
-    embedding_modules = {
-        "embed_tokens": "input_embeddings",
-        "lm_head": "output_embeddings",
-    }
-    embedding_padding_modules = ["lm_head"]
 
     def __init__(
         self,
@@ -324,9 +303,8 @@ class GraniteMoeForCausalLM(nn.Module):
         self.model = GraniteMoeModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
-        self.unpadded_vocab_size = config.vocab_size
         self.lm_head = ParallelLMHead(
-            self.unpadded_vocab_size,
+            config.vocab_size,
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
@@ -340,6 +318,7 @@ class GraniteMoeForCausalLM(nn.Module):
         else:
             logit_scale = None
         self.logits_processor = LogitsProcessor(config, logit_scale=logit_scale)
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
     @torch.no_grad()
     def forward(
