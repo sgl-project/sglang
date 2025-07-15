@@ -102,7 +102,16 @@ class ScheduleBatchDisaggregationDecodeMixin:
             self.output_ids.append(req.output_ids[-1])
             self.tree_cache.cache_unfinished_req(req)
             if req.grammar is not None:
-                req.grammar.accept_token(req.output_ids[-1])
+                # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                try:
+                    req.grammar.accept_token(req.output_ids[-1])
+                except ValueError as e:
+                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                    # This can happen if the grammar is not set correctly or the token is invalid.
+                    error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
+                    prepare_abort(
+                        req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                    )
                 req.grammar.finished = req.finished()
         self.output_ids = torch.tensor(self.output_ids, device=self.device)
 
