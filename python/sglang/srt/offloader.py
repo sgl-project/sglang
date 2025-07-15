@@ -3,7 +3,7 @@ from typing import List
 import torch
 from torch.func import functional_call
 
-from sglang.srt.utils import is_pin_memory_available
+from sglang.srt.utils import is_pin_memory_available, get_int_env_var
 
 
 class _StatelessOffloaderUtil:
@@ -56,10 +56,8 @@ def _hook_module_forward(module, create_parameter_and_buffer_dicts):
 
 
 def wrap_layers_for_offload(layers: List[torch.nn.Module]):
-    TODO_is_the_offload_too_early_now
-    offloaders = [
-        _ModuleOffloader(layer) if TODO else None
-        for layer_id, layer in enumerate(layers)
-    ]
+    layer_interval = get_int_env_var("SGLANG_OFFLOAD_LAYER_INTERVAL", 5)
+    offloading_layers = layers[layer_interval - 1::layer_interval]
+    offloaders = [_ModuleOffloader(layer) for layer in offloading_layers]
     TODO
     return layers
