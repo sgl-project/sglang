@@ -923,6 +923,18 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
 
+    async def dump_latest_expert_distribution(self):
+        self.auto_create_handle_loop()
+        await self.expert_distribution_communicator(
+            ExpertDistributionReq.DUMP_LATEST
+        )
+    
+    async def dump_sum_expert_distribution(self):
+        self.auto_create_handle_loop()
+        await self.expert_distribution_communicator(
+            ExpertDistributionReq.DUMP_SUM
+        )
+        
     async def pause_generation(self):
         async with self._cond:
             self._updating = True

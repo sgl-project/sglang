@@ -2791,6 +2791,10 @@ class Scheduler(
             get_global_expert_distribution_recorder().stop_record()
         elif recv_req == ExpertDistributionReq.DUMP_RECORD:
             get_global_expert_distribution_recorder().dump_record()
+        elif recv_req == ExpertDistributionReq.DUMP_LATEST:
+            get_global_expert_distribution_recorder().dump_latest()
+        elif recv_req == ExpertDistributionReq.DUMP_SUM:
+            get_global_expert_distribution_recorder().dump_sum()
         else:
             raise ValueError("Unrecognized ExpertDistributionReq value")
         return ExpertDistributionReqOutput()
