@@ -69,9 +69,10 @@ def wrap_layers_for_offload(layers: List[torch.nn.Module]):
     offloaders[0].start_onload()
 
     for index, layer in enumerate(offload_layers):
+        TODO_closure_index
         _hook_module_forward(
             layer,
-            on_forward_start=TODO,
+            on_forward_start=lambda: offloaders[(index + 1) % len(offloaders)].start_onload(),
             on_forward_end=lambda: offloaders[index].offload(),
         )
 
