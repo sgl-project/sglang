@@ -134,6 +134,83 @@ RUN apt update -y \
     && apt update -y \
     && apt install nsight-systems-cli -y
 
+# NIXL and UCX build & Python deps
+ARG TARGETPLATFORM
+RUN apt-get update -y && \
+    apt-get install -y \
+      cmake \
+      meson \
+      ninja-build \
+      pybind11-dev \
+      patchelf \
+      net-tools \
+      libibverbs-dev \
+      rdma-core \
+      ibverbs-utils \
+      libibumad-dev \
+      libnuma-dev \
+      librdmacm-dev \
+      ibverbs-providers \
+      autoconf \
+      libtool
+RUN pip install --break-system-packages meson-python wheel build
+# Build and install UCX
+ARG NIXL_UCX_REF=v1.19.x
+RUN cd /usr/local/src && \
+    rm -rf ucx || true && \
+    git clone https://github.com/openucx/ucx.git ucx && \
+    cd ucx && \
+    git checkout "${NIXL_UCX_REF}" && \
+    ./autogen.sh && \
+    ./configure \
+      --prefix=/usr/local/ucx \
+      --enable-shared \
+      --disable-static \
+      --disable-doxygen-doc \
+      --enable-optimizations \
+      --enable-cma \
+      --enable-devel-headers \
+      --with-cuda=/usr/local/cuda \
+      --with-verbs \
+      --with-efa \
+      --with-dm \
+      --with-gdrcopy=/usr/local \
+      --enable-mt && \
+    make -j"$(nproc)" && \
+    make -j"$(nproc)" install-strip && \
+    ldconfig
+# NIXL 0.3.1
+ARG NIXL_COMMIT="3503658e71143b56f9d5b1b440d84a94b9c41af8"
+RUN if [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
+      cd /opt && \
+      git clone https://github.com/ai-dynamo/nixl.git && \
+      cd nixl && \
+      git checkout "${NIXL_COMMIT}" && \
+      pip install --break-system-packages . \
+        --config-settings="setup-args=-Ducx_path=/usr/local/ucx"; \
+    fi
+RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+      git clone https://github.com/ai-dynamo/nixl.git /opt/nixl && \
+      cd /opt/nixl && \
+      git checkout ${NIXL_COMMIT} && \
+      pip install meson && \
+      mkdir build && \
+      meson setup build/ \
+        --buildtype=release \
+        --prefix=/usr/local/nixl \
+        -Ddisable_gds_backend=true \
+        -Dgds_path=/usr/local/cuda/targets/sbsa-linux && \
+      cd build && ninja && ninja install && \
+      cd /opt/nixl && \
+      uv build . --out-dir /tmp/nixl-wheels && \
+      pip install /tmp/nixl-wheels/*.whl && \
+      rm -rf /tmp/nixl-wheels; \
+    fi
+# Set required paths for NIXL
+ARG TARGETARCH
+ENV LD_LIBRARY_PATH=/usr/lib:/usr/local/ucx/lib:/usr/local/nixl/lib/${TARGETARCH}-linux-gnu:/usr/local/nixl/lib/${TARGETARCH}-linux-gnu/plugins:$LD_LIBRARY_PATH
+ENV NIXL_PLUGIN_DIR=/usr/local/nixl/lib/${TARGETARCH}-linux-gnu/plugins
+
 # Set up locale
 RUN locale-gen en_US.UTF-8
 ENV LANG en_US.UTF-8
