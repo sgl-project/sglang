@@ -22,7 +22,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
 
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.utils import (
@@ -1206,9 +1205,7 @@ def _per_token_group_quant_fp8_hopper_moe_mn_major(
         inp = tl.load(a_ptrs, mask=a_mask).to(tl.float32)  # [BLOCK_M, BLOCK_K]
         inp_amax = tl.max(tl.abs(inp), axis=1)  # [BLOCK_M,]
         inp_amax = tl.clamp(inp_amax, min=1e-4, max=float("inf"))
-        inp_fp8 = (inp * libdevice.fast_dividef(float(448.0), inp_amax[:, None])).to(
-            a_fp8.dtype.element_ty
-        )
+        inp_fp8 = (inp * (448.0 / inp_amax[:, None])).to(tl.float8e4nv)
 
         # Store fp8
         a_fp8_ptrs = (
@@ -1221,9 +1218,7 @@ def _per_token_group_quant_fp8_hopper_moe_mn_major(
         sfa_ptrs = (
             sfa + current_expert_offset * k + k_offset * m + coord_m
         )  # MN-Major with sfa
-        tl.store(
-            sfa_ptrs, libdevice.fast_dividef(inp_amax, float(448.0)), mask=coord_m < m
-        )
+        tl.store(sfa_ptrs, inp_amax / 448.0, mask=coord_m < m)
 
 
 def per_token_group_quant_fp8_hopper_moe_mn_major(
