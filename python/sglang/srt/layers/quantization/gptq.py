@@ -193,9 +193,14 @@ class GPTQConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
         # Delay the import to avoid circular dependency
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization import get_linear_quant_method
 
-        return get_linear_quant_method(self, layer, prefix, GPTQLinearMethod)
+        if isinstance(layer, LinearBase):
+            return get_linear_quant_method(self, layer, prefix, GPTQLinearMethod)
+        elif isinstance(layer, FusedMoE):
+            raise TypeError("GPTQ Method does not support MoE, please use gptq_marlin")
+        return None
 
 
 class GPTQMarlinConfig(QuantizationConfig):
@@ -353,14 +358,6 @@ class GPTQMarlinConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             return GPTQMarlinMoEMethod(self)
-            # TODO: re-enable after SGLang syncs with vllm >= 0.7.3
-            # if layer.num_experts > 32:
-            #     # For MoEs with many experts the moe_wna16 kernel is faster
-            #     return MoeWNA16Config.from_config(self.full_config).get_quant_method(
-            #         layer, prefix
-            #     )
-            # else:
-            #     return GPTQMarlinMoEMethod(self)
         return get_linear_quant_method(self, layer, prefix, GPTQMarlinLinearMethod)
 
     @classmethod
