@@ -2,7 +2,8 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.rtn import RTNConfig, rtn_dequantize, rtn_quantize
+from sglang.srt.layers.quantization.rtn import RTNConfig
+from sglang.srt.layers.quantization.rtn_utils import rtn_dequantize, rtn_quantize
 from sglang.test.test_utils import CustomTestCase
 
 
