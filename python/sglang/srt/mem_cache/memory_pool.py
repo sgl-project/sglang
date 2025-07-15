@@ -602,6 +602,16 @@ class SWAKVPool(KVCache):
                 layer_id_override=layer_id_pool,
             )
 
+    def load_from_host_per_layer(
+        self, host_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        raise NotImplementedError("HiCache not supported for SWAKVPool.")
+
+    def backup_to_host_all_layer(
+        self, host_pool, host_indices, device_indices, io_backend
+    ):
+        raise NotImplementedError("HiCache not supported for SWAKVPool.")
+
 
 class AscendTokenToKVPool(MHATokenToKVPool):
 
