@@ -143,6 +143,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
+            # Additional args for FusedMoE
+            **(
+                dict(
+                    enable_flashinfer_moe=True,
+                    enable_ep_moe=global_server_args_dict["enable_ep_moe"],
+                )
+                if global_server_args_dict["enable_flashinfer_moe"]
+                else {}
+            ),
         )
 
         self.gate = ReplicatedLinear(
@@ -291,6 +300,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -393,6 +403,7 @@ class Qwen2MoeModel(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         decoder_layer_type: type[nn.Module] = Qwen2MoeDecoderLayer,
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -418,6 +429,7 @@ class Qwen2MoeModel(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
+                alt_stream=alt_stream,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
@@ -427,6 +439,9 @@ class Qwen2MoeModel(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
+
+        # For EAGLE3 support
+        self.layers_to_capture = []
 
     def forward(
         self,
@@ -447,6 +462,7 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        aux_hidden_states = []
         if forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
@@ -459,6 +475,12 @@ class Qwen2MoeModel(nn.Module):
             )
         else:
             for i in range(self.start_layer, self.end_layer):
+                if i in self.layers_to_capture:
+                    aux_hidden_states.append(
+                        hidden_states + residual
+                        if residual is not None
+                        else hidden_states
+                    )
                 with get_global_expert_distribution_recorder().with_current_layer(i):
                     layer = self.layers[i]
                     hidden_states, residual = layer(
@@ -477,7 +499,11 @@ class Qwen2MoeModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
 
 class Qwen2MoeForCausalLM(nn.Module):
