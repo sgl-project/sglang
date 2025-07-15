@@ -293,7 +293,7 @@ jobs:
       - name: Run CustomAllReduce test
         timeout-minutes: 10
         run: |
-          CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash scripts/amd_ci_exec.sh python3 -m unittest test_custom_allreduce.TestCustomAllReduce
+          bash scripts/amd_ci_exec.sh -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 -m unittest test_custom_allreduce.TestCustomAllReduce
 
   unit-test-sgl-kernel-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
