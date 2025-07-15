@@ -25,6 +25,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
+
+from sglang.srt.offloader import offload_modules
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -2323,6 +2325,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             and self.quant_config.weight_block_size is not None
         ):
             self._weight_requant_ue8m0(is_nextn)
+
+        offload_modules(self.model.layers)
 
     def _weight_requant_ue8m0(self, is_nextn=False):
         weight_block_size = self.quant_config.weight_block_size
