@@ -37,13 +37,12 @@ echo "Found available image: rocm/sgl-dev:${image_tag}" >&2
 IMAGE=$(find_latest_mi30x_image)
 if [ $? -eq 0 ]; then
   echo "Pulling Docker image: $IMAGE"
-  docker pull "$IMAGE"
 else
-  echo "No mi30x image found in last 30 days, using fallback image"
+  echo "No mi30x image found in last 30 days, using fallback image" >&2
   IMAGE="rocm/sgl-dev:v0.4.9.post2-rocm630-mi30x-20250715"
   echo "Pulling fallback Docker image: $IMAGE"
-  docker pull "$IMAGE"
 fi
+docker pull "$IMAGE"
 
 # Run the container
 echo "Starting container: ci_sglang"
