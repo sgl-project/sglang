@@ -52,8 +52,8 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
     uint32_t num_speculative_tokens,
     uint32_t num_draft_tokens,
     uint32_t d,
-    DType threshold_single,
-    DType threshold_acc) {
+    DType* threshold_singles,
+    DType* threshold_accs) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   extern __shared__ __align__(alignof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>))
@@ -68,7 +68,10 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   accept_index[bx * num_speculative_tokens] = last_accepted_retrive_idx;
   uint32_t num_accepted_tokens = 0;
   IdType2 cur_index = 0;
+  DType threshold_single = threshold_singles[bx];
+  DType threshold_acc = threshold_accs[bx];
 
+  float capped_threshold_acc = fmaxf(threshold_acc, 1e-9f);
   for (uint32_t j = 1; j < num_speculative_tokens; ++j) {
     cur_index = retrive_next_token[bx * num_draft_tokens + cur_index];
     while (cur_index != -1) {
@@ -77,7 +80,7 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
       DType target_prob_single = target_probs[cur_prob_offset + draft_token_id];
       prob_acc += target_prob_single;
 
-      if (coin <= prob_acc / threshold_acc || target_prob_single >= threshold_single) {
+      if (coin <= prob_acc / capped_threshold_acc || target_prob_single >= threshold_single) {
         // accept token
         prob_acc = 0.;
         cur_prob_offset = (bx * num_draft_tokens + cur_index) * d;
@@ -178,8 +181,8 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
     uint32_t num_speculative_tokens,
     uint32_t num_draft_tokens,
     uint32_t d,
-    DType threshold_single = 1,
-    DType threshold_acc = 1,
+    DType* threshold_singles,
+    DType* threshold_accs,
     bool deterministic = true,
     cudaStream_t stream = 0) {
   constexpr uint32_t BLOCK_THREADS = 1024;
@@ -188,7 +191,7 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
   const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
-  float capped_threshold_acc = fmaxf(threshold_acc, 1e-9f);
+
   void* args[] = {
       &predicts,
       &output_token_ids,
@@ -205,8 +208,8 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
       &num_speculative_tokens,
       &num_draft_tokens,
       &d,
-      &threshold_single,
-      &capped_threshold_acc};
+      &threshold_singles,
+      &threshold_accs};
   DISPATCH_ALIGNED_VEC_SIZE(
       vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
         auto kernel = TreeSpeculativeSamplingTargetOnly<

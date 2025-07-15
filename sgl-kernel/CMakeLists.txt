@@ -51,7 +51,7 @@ FetchContent_Declare(
 FetchContent_Populate(repo-cutlass)
 
 # DeepGEMM
-if("${CUDA_VERSION}" VERSION_EQUAL "12.8")
+if("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
   set(DeepGEMM_REPO "https://github.com/sgl-project/DeepGEMM")
   set(DeepGEMM_TAG "blackwell")
 else()
