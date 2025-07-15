@@ -30,7 +30,7 @@ def _hook_module_forward_for_offloader(index, module, offloaders):
             (index + 1) % len(offloaders)
             ].start_onload(),
         on_forward_end=lambda: offloaders[index].offload(),
-        get_parameter_and_buffer_dicts=lambda: offloaders[index].device_tensors,
+        get_parameter_and_buffer_dicts=lambda: offloaders[index].wait_and_get_device_tensors(),
     )
 
 
@@ -61,16 +61,23 @@ class _ModuleOffloader:
             "cpu"
         ), "not handled device=cpu case yet (should skip this tensor)"
 
-        self.device_tensors = None
+        self._device_tensors = None
         _StatelessOffloaderUtil.offload(module)
 
     def start_onload(self):
-        self.device_tensors = _StatelessOffloaderUtil.create_onload_tensors(
-            self.module, self.device
-        )
+        self.alt_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.alt_stream):
+            self._device_tensors = _StatelessOffloaderUtil.create_onload_tensors(
+                self.module, self.device
+            )
 
     def offload(self):
-        self.device_tensors = None
+        self._device_tensors = None
+
+    def wait_and_get_device_tensors(self):
+        assert self._device_tensors is not None
+        torch.cuda.current_stream().wait_stream(self.alt_stream)
+        return self._device_tensors
 
 
 class _StatelessOffloaderUtil:
