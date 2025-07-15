@@ -104,6 +104,8 @@ suites = {
         TestFile("test_vision_openai_server_a.py", 584),
         TestFile("test_vision_openai_server_b.py", 556),
         TestFile("test_w8a8_quantization.py", 46),
+        TestFile("test_rtn_basic.py", 15),
+        TestFile("test_rtn_quantization.py", 60),
         TestFile("test_reasoning_parser.py", 5),
     ],
     "per-commit-amd": [
