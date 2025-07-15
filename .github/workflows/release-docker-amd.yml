@@ -10,7 +10,7 @@ on:
 jobs:
   publish:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: amd-docker
+    runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
       matrix:

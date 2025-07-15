@@ -15,7 +15,7 @@ concurrency:
 jobs:
   publish:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: amd-docker
+    runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
       matrix:
@@ -72,8 +72,3 @@ jobs:
 
           docker build . -f docker/Dockerfile.rocm --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} -t rocm/sgl-dev:${tag}-${{ env.DATE }}${tag_suffix} --no-cache
           docker push rocm/sgl-dev:${tag}-${{ env.DATE }}${tag_suffix}
-
-      - name: "Remove docker image"
-        run: |
-          sudo rm -rf /var/lib/docker
-          sudo systemctl restart docker
