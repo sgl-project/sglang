@@ -11,7 +11,6 @@ fi
 # Function to find latest available mi30x image
 find_latest_mi30x_image() {
   local base_tag="v0.4.9.post2-rocm630-mi30x"
-  local current_date=$(date +%Y%m%d)
   local days_back=0
 
   while [ $days_back -lt 30 ]; do
