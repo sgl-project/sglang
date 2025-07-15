@@ -45,20 +45,11 @@ class DPBalanceMeta:
         self.shared_state.local_tokens = data
 
     def __getstate__(self):
-        """
-        自定义序列化方法。
-        在序列化时，排除掉无法被 pickle 的 _manager 属性。
-        """
         state = self.__dict__.copy()
         del state["_manager"]
         return state
 
     def __setstate__(self, state):
-        """
-        自定义反序列化方法。
-        在新进程中恢复对象状态。_manager 属性将不存在，这没关系，
-        因为子进程只需要代理对象（mutex, shared_state），而不需要 manager 本身。
-        """
         self.__dict__.update(state)
         # 在子进程中，self._manager 会是 None
         self._manager = None

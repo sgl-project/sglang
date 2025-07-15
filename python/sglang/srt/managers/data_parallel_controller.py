@@ -363,5 +363,5 @@ def run_data_parallel_controller_process(
         logger.error(f"DataParallelController hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
     finally:
-        # we need to free shared mem manually, because POSIX shm is a named file
+        # we need to destruct mp.Manager() in balance_meta
         balance_meta.destructor()
