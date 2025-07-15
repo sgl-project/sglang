@@ -388,6 +388,14 @@ class MetaMultiModaldataBuffers:
         self.max_prefill_tokens = max_prefill_tokens
         self.embedding_dim = embedding_dim
 
+    def get_buf_chunk_info(self, req: Req):
+        # (offset, size)
+        return [
+            (
+                (len(req.fill_ids) - req.extend_input_len) * self.embedding_dim * self.input_embeddings.itemsize,
+                req.extend_input_len * self.embedding_dim * self.input_embeddings.itemsize),
+            (0, self.embedding_lengths.shape[1] * self.embedding_lengths.itemsize)
+        ]
 
     def get_buf_infos(self):
         ptrs = [self.input_embeddings.data_ptr(), self.embedding_lengths.data_ptr()]

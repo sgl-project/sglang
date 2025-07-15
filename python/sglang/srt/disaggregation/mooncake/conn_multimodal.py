@@ -58,6 +58,7 @@ class TransferEmbeddingChunk:
     room: int
     embedding_index: int
     is_last: bool
+    chunk_info: List[Tuple[int, int]]
 
 
 @dataclasses.dataclass
@@ -209,27 +210,26 @@ class MooncakeEmbeddingManager(BaseKVManager):
         embedding_index: int,
         dst_embedding_ptrs: list[int],
         dst_embedding_index: int,
+        chunk_info: List[Tuple[int, int]],
     ):
 
         status_list = []
+
         for i in range(len(self.data_args.aux_item_lens)):
+            chunk_offset, chunk_size = chunk_info[i]
             embedding_item_len = self.data_args.aux_item_lens[i]
             embedding_addr = (
-                self.data_args.aux_data_ptrs[i] + embedding_index * embedding_item_len
+                self.data_args.aux_data_ptrs[i] + embedding_index * embedding_item_len + chunk_offset
             )
             dst_embedding_addr = (
-                dst_embedding_ptrs[i] + dst_embedding_index * embedding_item_len
+                dst_embedding_ptrs[i] + dst_embedding_index * embedding_item_len + chunk_offset
             )
 
-            # buffer = (ctypes.c_uint16 * embedding_item_len).from_address(embedding_addr)
-            # arr = np.ctypeslib.as_array(buffer)
-            # new_tensor = torch.frombuffer(arr.tobytes(), dtype=torch.bfloat16, count=embedding_item_len).flatten()
-            # logger.debug(f"send_embedding: session_id={mooncake_session_id},{embedding_addr=},{dst_embedding_addr=};{embedding_item_len=};{new_tensor[:100]}")
             status = self.engine.transfer_sync(
                 mooncake_session_id,
                 embedding_addr,
                 dst_embedding_addr,
-                embedding_item_len,
+                chunk_size,
             )
             status_list.append(status)
 
@@ -295,6 +295,7 @@ class MooncakeEmbeddingManager(BaseKVManager):
                             req.mooncake_session_id
                         ].dst_embedding_ptrs,
                         req.dst_embedding_index,
+                        embedding_chunk.chunk_info,
                     )
                     if ret != 0:
                         with self.session_lock:
@@ -475,6 +476,7 @@ class MooncakeEmbeddingManager(BaseKVManager):
         bootstrap_room: int,
         embedding_index: int,
         is_last: bool,
+        chunk_info: List[Tuple[int, int]],
     ):
         assert self.disaggregation_mode == DisaggregationMode.EMBEDDING
         assert is_last  # For embedding data, we only send once at the end
@@ -509,6 +511,7 @@ class MooncakeEmbeddingManager(BaseKVManager):
                 room=bootstrap_room,
                 embedding_index=embedding_index,
                 is_last=is_last,
+                chunk_info=chunk_info,
             )
         )
 
@@ -631,10 +634,10 @@ class MooncakeEmbeddingSender(BaseKVSender):
         # We only send embedding data once at the end
         pass
 
-    def send_embedding(self, embedding_index: int):
+    def send_embedding(self, embedding_index: int, last_chunk: bool, chunk_info: List[Tuple[int, int]]):
         """Send embedding data to language instances"""
         self.embedding_mgr.add_transfer_request(
-            self.bootstrap_room, embedding_index, True
+            self.bootstrap_room, embedding_index, last_chunk, chunk_info
         )
 
     def poll(self) -> KVPoll:
