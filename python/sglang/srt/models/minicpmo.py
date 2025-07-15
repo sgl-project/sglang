@@ -1827,8 +1827,7 @@ class MiniCPMO(MiniCPMBaseModel):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.llm,
-            image_data_embedding_func=self.get_image_feature,
-            audio_data_embedding_func=self.get_audio_feature,
+            multimodal_model=self,
             positions=positions,
         )
         return hidden_states

@@ -270,6 +270,12 @@ impl ConfigValidator {
                         .to_string(),
                 });
             }
+            (RoutingMode::PrefillDecode { .. }, PolicyConfig::CacheAware { .. }) => {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "CacheAware policy is not supported in PD disaggregated mode"
+                        .to_string(),
+                });
+            }
             _ => {}
         }
 
@@ -469,6 +475,31 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("RoundRobin policy is not supported in PD disaggregated mode"));
+    }
+
+    #[test]
+    fn test_validate_cache_aware_with_pd_mode() {
+        // CacheAware with PD mode should fail
+        let config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+            },
+            PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 60,
+                max_tree_size: 1000,
+            },
+        );
+
+        let result = ConfigValidator::validate(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("CacheAware policy is not supported in PD disaggregated mode"));
     }
 
     #[test]
