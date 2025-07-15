@@ -578,15 +578,18 @@ class GroupCoordinator:
         )
 
         # All-gather.
+        if input_.is_cpu and is_shm_available(
+            input_.dtype, self.world_size, self.local_size
+        ):
+            return torch.ops.sgl_kernel.shm_allgather(input_, dim)
+
         if input_.is_cpu:
-            if is_shm_available(input_.dtype, self.world_size, self.local_size):
-                return torch.ops.sgl_kernel.shm_allgather(input_, dim)
-            else:
-                torch.distributed.all_gather_into_tensor(
-                    output_tensor, input_, group=self.device_group
-                )
+            torch.distributed.all_gather_into_tensor(
+                output_tensor, input_, group=self.device_group
+            )
         else:
             self.all_gather_into_tensor(output_tensor, input_)
+
         # Reshape
         output_tensor = output_tensor.reshape((world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
