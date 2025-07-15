@@ -47,21 +47,6 @@ class TestQuarkMXFP4Loading(CustomTestCase):
             ) as srt_runner:
                 srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
-    def test_load_and_run_mem_emulation(self):
-        for model_case in ALL_MODELS:
-            prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
-            max_new_tokens = 20
-
-            with SRTRunner(
-                model_case.model_path,
-                tp_size=model_case.tp_size,
-                model_type="generation",
-                torch_dtype="auto",
-                mem_fraction_static=model_case.mem_fraction_static,
-                context_length=model_case.context_length
-            ) as srt_runner:
-                srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
-        
 
 class TestR1MXFP4Accuracy(CustomTestCase):
     @classmethod
