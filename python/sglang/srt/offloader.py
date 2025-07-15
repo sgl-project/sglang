@@ -53,7 +53,7 @@ def _hook_module_forward(module, on_forward_start, on_forward_end, get_parameter
     def forward(*args, **kwargs):
         module.forward = original_forward
         on_forward_start()
-        output = functional_call(module, get_parameter_and_buffer_dicts() , args=args, kwargs=kwargs)
+        output = functional_call(module, get_parameter_and_buffer_dicts(), args=args, kwargs=kwargs)
         on_forward_end()
         module.forward = forward
         return output
