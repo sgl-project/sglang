@@ -47,13 +47,13 @@ class _ModuleOffloader:
         self.device_tensors = None
 
 
-def _hook_module_forward(module, on_forward_start, on_forward_end):
+def _hook_module_forward(module, on_forward_start, on_forward_end, get_parameter_and_buffer_dicts):
     original_forward = module.forward
 
     def forward(*args, **kwargs):
         module.forward = original_forward
-        parameter_and_buffer_dicts = on_forward_start()
-        output = functional_call(module, parameter_and_buffer_dicts, args=args, kwargs=kwargs)
+        on_forward_start()
+        output = functional_call(module, get_parameter_and_buffer_dicts() , args=args, kwargs=kwargs)
         on_forward_end()
         module.forward = forward
         return output
@@ -74,6 +74,7 @@ def wrap_layers_for_offload(layers: List[torch.nn.Module]):
             layer,
             on_forward_start=lambda: offloaders[(index + 1) % len(offloaders)].start_onload(),
             on_forward_end=lambda: offloaders[index].offload(),
+            get_parameter_and_buffer_dicts=lambda: offloaders[index].device_tensors,
         )
 
     return layers
