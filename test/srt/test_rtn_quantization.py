@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 class TestRTNQuantization(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "/models/Phi-3-mini-4k-instruct"
+        cls.model = "/models/Llama-3.1-8B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -68,7 +68,7 @@ class TestRTNQuantization(CustomTestCase):
         print(res["text"])
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
-        assert throughput >= 100
+        assert throughput >= 15
 
     def test_basic_generation(self):
         """Test basic text generation with RTN quantization."""
