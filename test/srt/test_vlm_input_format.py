@@ -15,7 +15,7 @@ from transformers import (
 
 from sglang import Engine
 from sglang.srt.conversation import generate_chat_conv
-from sglang.srt.openai_api.protocol import ChatCompletionRequest
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
 TEST_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
 

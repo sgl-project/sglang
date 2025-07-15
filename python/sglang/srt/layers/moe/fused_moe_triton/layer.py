@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
+import importlib
 from abc import abstractmethod
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
@@ -12,26 +13,46 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_bool_env_var,
+    is_cpu,
+    is_hip,
+    set_weight_attrs,
+    use_intel_amx_backend,
+)
+
+has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
 
 if torch.cuda.is_available():
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+
+    if has_triton_kernels:
+        from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
+            triton_kernel_moe_forward,
+        )
 else:
     fused_experts = None  # type: ignore
 
 import logging
 
 _is_hip = is_hip()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
     from aiter import ActivationType
+    from aiter.fused_moe import fused_moe
     from aiter.fused_moe_bf16_asm import ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
 
@@ -75,6 +96,10 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     """MoE method without quantization."""
 
+    def __init__(self, use_triton_kernels: bool = False):
+        super().__init__()
+        self.use_triton_kernels = use_triton_kernels
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -85,20 +110,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         **extra_weight_attrs,
     ):
         # Fused gate_up_proj (column parallel)
+        w13_weight_n, w13_weight_k = 2 * intermediate_size, hidden_size
+        if self.use_triton_kernels:
+            w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
         w13_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts, 2 * intermediate_size, hidden_size, dtype=params_dtype
-            ),
+            torch.empty(num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype),
             requires_grad=False,
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         # down_proj (row parallel)
+        w2_weight_n, w2_weight_k = (
+            hidden_size,
+            intermediate_size,
+        )
+        if self.use_triton_kernels:
+            w2_weight_n, w2_weight_k = w2_weight_k, w2_weight_n
         w2_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts, hidden_size, intermediate_size, dtype=params_dtype
-            ),
+            torch.empty(num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight", w2_weight)
@@ -116,6 +146,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 requires_grad=False,
             )
             torch.cuda.empty_cache()
+
+        # Pack weight for get better performance on CPU
+        if _is_cpu and _is_cpu_amx_available:
+            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+
         return
 
     def apply(
@@ -175,60 +210,146 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
 
-        if _use_aiter:
-            assert not no_combine, "unsupported"
-            if apply_router_weight_on_input:
-                assert (
-                    topk_weights.dim() == 2
-                ), "`topk_weights` should be in shape (num_tokens, topk)"
-                _, topk = topk_weights.shape
-                assert (
-                    topk == 1
-                ), "Only support topk=1 when `apply_router_weight_on_input` is True"
-                x = x * topk_weights.to(x.dtype)
-                topk_weights = torch.ones_like(
-                    topk_weights, dtype=torch.float32
-                )  # topk_weights must be FP32 (float32)
+        if self.use_triton_kernels:
+            return triton_kernel_moe_forward(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                gating_output=router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+            )
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                num_fused_shared_experts=num_fused_shared_experts,
+                custom_routing_function=custom_routing_function,
+                correction_bias=correction_bias,
+                routed_scaling_factor=routed_scaling_factor,
+            )
 
-            return ck_moe_2stages(
+            if _use_aiter:
+                assert not no_combine, "unsupported"
+                if apply_router_weight_on_input:
+                    assert (
+                        topk_weights.dim() == 2
+                    ), "`topk_weights` should be in shape (num_tokens, topk)"
+                    _, topk = topk_weights.shape
+                    assert (
+                        topk == 1
+                    ), "Only support topk=1 when `apply_router_weight_on_input` is True"
+                    x = x * topk_weights.to(x.dtype)
+                    topk_weights = torch.ones_like(
+                        topk_weights, dtype=torch.float32
+                    )  # topk_weights must be FP32 (float32)
+
+                return fused_moe(
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    activation=(
+                        ActivationType.Silu
+                        if activation == "silu"
+                        else ActivationType.Gelu
+                    ),
+                )
+            else:
+                return fused_experts(
+                    hidden_states=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    inplace=inplace and not no_combine,
+                    activation=activation,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    no_combine=no_combine,
+                    routed_scaling_factor=routed_scaling_factor,
+                )
+
+    def forward_cpu(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
+    ) -> torch.Tensor:
+        assert activation == "silu", f"activation = {activation} is not supported."
+
+        if use_intel_amx_backend(layer) and not apply_router_weight_on_input:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                num_fused_shared_experts=num_fused_shared_experts,
+                custom_routing_function=custom_routing_function,
+                correction_bias=correction_bias,
+                routed_scaling_factor=routed_scaling_factor,
+            )
+
+            # TODO: support apply_router_weight_on_input in the fused_experts_cpu kernel
+            return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                activation=(
-                    ActivationType.Silu if activation == "silu" else ActivationType.Gelu
-                ),
+                False,  # inplace # See [Note] inplace should be False in fused_experts.
+                False,  # use_int8_w8a8
+                False,  # use_fp8_w8a16
+                None,  # w1_scale
+                None,  # w2_scale
+                None,  # block_size
+                None,  # a1_scale
+                None,  # a2_scale
+                True,  # is_vnni
             )
         else:
-            return fused_experts(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                inplace=inplace and not no_combine,
-                activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                no_combine=no_combine,
-                routed_scaling_factor=routed_scaling_factor,
+            return moe_forward_native(
+                layer,
+                x,
+                use_grouped_topk,
+                top_k,
+                router_logits,
+                renormalize,
+                topk_group,
+                num_expert_group,
+                num_fused_shared_experts,
+                custom_routing_function,
+                correction_bias,
+                activation,
+                apply_router_weight_on_input,
+                inplace,
+                no_combine,
+                routed_scaling_factor,
             )
 
-    def forward_cpu(
+    def forward_npu(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
@@ -259,6 +380,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             num_fused_shared_experts,
             custom_routing_function,
             correction_bias,
+            activation,
+            apply_router_weight_on_input,
+            inplace,
+            no_combine,
+            routed_scaling_factor,
         )
 
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
@@ -314,6 +440,8 @@ class FusedMoE(torch.nn.Module):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
+        enable_flashinfer_moe: Optional[bool] = False,
+        enable_ep_moe: Optional[bool] = False,
     ):
         super().__init__()
 
@@ -324,9 +452,40 @@ class FusedMoE(torch.nn.Module):
         self.tp_size = (
             tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
         )
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.num_experts = num_experts
+        self.expert_map = None
+
+        if enable_flashinfer_moe and quant_config is None:
+            logger.warning("Disable flashinfer MoE when quantization config is None.")
+            enable_flashinfer_moe = False
+            enable_ep_moe = False
+
+        self.enable_flashinfer_moe = enable_flashinfer_moe
+        if enable_ep_moe:
+            assert (
+                self.enable_flashinfer_moe
+            ), "FusedMoE only supports EP with --enable-flashinfer-moe"
+            self.ep_size = self.tp_size
+            self.ep_rank = self.tp_rank
+            self.tp_size = 1
+            self.tp_rank = 0
+            # Create a tensor of size num_experts filled with -1
+            self.expert_map = torch.full((self.num_experts,), -1, dtype=torch.int32)
+            # Create a expert map for the local experts
+            assert num_experts % self.ep_size == 0
+            self.local_num_experts = num_experts // self.ep_size
+            self.expert_map[
+                self.ep_rank
+                * self.local_num_experts : (self.ep_rank + 1)
+                * self.local_num_experts
+            ] = torch.arange(0, self.local_num_experts, dtype=torch.int32, device="cpu")
+        else:
+            self.ep_size = 1
+            self.ep_rank = 0
+            self.local_num_experts = num_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.top_k = top_k
-        self.num_experts = num_experts
         assert intermediate_size % self.tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
         self.reduce_results = reduce_results
@@ -344,19 +503,25 @@ class FusedMoE(torch.nn.Module):
         self.use_presharded_weights = use_presharded_weights
         self.inplace = inplace
         self.no_combine = no_combine
-        self.local_num_experts = num_experts
+
+        self.use_triton_kernels = (
+            not _is_cpu and global_server_args_dict["enable_triton_kernel_moe"]
+        )
 
         if quant_config is None:
-            self.quant_method: Optional[QuantizeMethodBase] = (
-                UnquantizedFusedMoEMethod()
+            self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
+                self.use_triton_kernels
             )
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix)
+            if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod":
+                self.quant_method.enable_flashinfer_moe = self.enable_flashinfer_moe
         assert self.quant_method is not None
 
+        self.quant_config = quant_config
         self.quant_method.create_weights(
             layer=self,
-            num_experts=num_experts,
+            num_experts=self.local_num_experts,
             hidden_size=hidden_size,
             # FIXME: figure out which intermediate_size to use
             intermediate_size=self.intermediate_size_per_partition,
@@ -443,19 +608,36 @@ class FusedMoE(torch.nn.Module):
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         shard_size = expert_data.shape[shard_dim] // 2
 
-        if not self.use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
-            )
-
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
-        if shard_id == "w1":
-            expert_data = expert_data.narrow(shard_dim, 0, shard_size)
         # w3, up_proj: Load into second logical weight of w13.
+        # trtllm cutlass kernel assumes differently
+        assert shard_id in ("w1", "w3")
+        switch_w13 = getattr(self.quant_method, "load_up_proj_weight_first", False)
+        if (switch_w13 and shard_id == "w1") or (not switch_w13 and shard_id == "w3"):
+            start = shard_size
         else:
-            assert shard_id == "w3"
-            expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+            start = 0
+
+        if _is_cpu:
+            expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                expert_data,
+                loaded_weight,
+                start,
+                shard_size * tp_rank,
+                shard_dim,
+                shard_size,
+                not self.use_presharded_weights,
+            )
+        else:
+            if not self.use_presharded_weights:
+                if self.use_triton_kernels:
+                    loaded_weight = loaded_weight.transpose(-2, -1)
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, shard_size * tp_rank, shard_size
+                )
+
+            expert_data = expert_data.narrow(shard_dim, start, shard_size)
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
@@ -466,16 +648,58 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.tensor,
         tp_rank: int,
     ):
+        """Load w2 weights for down projection.
+
+        Args:
+            expert_data: The expert data tensor to load into
+            shard_dim: The dimension to shard along
+            shard_id: The shard ID (must be "w2")
+            loaded_weight: The weight tensor to load from
+            tp_rank: The tensor parallel rank
+        """
+        if not isinstance(expert_data, torch.Tensor) or not isinstance(
+            loaded_weight, torch.Tensor
+        ):
+            raise ValueError("expert_data and loaded_weight must be torch.Tensor")
+
+        if (
+            self.quant_config is not None
+            and "modelopt" in self.quant_config.get_name()
+            and (expert_data.dim() != 2 or loaded_weight.dim() != 2)
+        ):
+            raise ValueError(
+                f"Expected 2D tensors, got expert_data shape {expert_data.shape} and loaded_weight shape {loaded_weight.shape}"
+            )
+
+        if shard_id != "w2":
+            raise ValueError(f"shard_id must be 'w2', got {shard_id}")
 
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
 
-        if not self.use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
+        if _is_cpu:
+            expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                expert_data,
+                loaded_weight,
+                0,  # param_data_start
+                shard_size * tp_rank,
+                shard_dim,
+                shard_size,
+                not self.use_presharded_weights,
             )
+        else:
+            if not self.use_presharded_weights:
+                if self.use_triton_kernels:
+                    loaded_weight = loaded_weight.transpose(-2, -1)
+                if shard_size * tp_rank + shard_size > loaded_weight.shape[shard_dim]:
+                    raise ValueError(
+                        f"Shard size {shard_size} at rank {tp_rank} exceeds loaded_weight dimension {loaded_weight.shape[shard_dim]}"
+                    )
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, shard_size * tp_rank, shard_size
+                )
 
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
@@ -509,6 +733,11 @@ class FusedMoE(torch.nn.Module):
             assert shard_id in ("w1", "w3")
             expert_data.copy_(loaded_weight)
 
+    def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
+        if self.expert_map is None:
+            return expert_id
+        return self.expert_map[expert_id].item()
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
@@ -517,6 +746,13 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+        if expert_id == -1:
+            return
+
+        # TP rank is set to 0 if EP is enabled
+        tp_rank = 0 if self.ep_size > 1 else get_tensor_model_parallel_rank()
+
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
@@ -541,15 +777,16 @@ class FusedMoE(torch.nn.Module):
         SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
 
         expert_data = param.data[expert_id]
-        tp_rank = get_tensor_model_parallel_rank()
 
         # is_transposed: if the dim to shard the weight
         # should be flipped. Required by GPTQ, compressed-tensors
         # should be whatever dimension intermediate_size is
         is_transposed = getattr(param, "is_transposed", False)
         shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
+        if self.use_triton_kernels:
+            is_transposed = True
         if is_transposed:
-            shard_dim = ~shard_dim
+            shard_dim = int(not shard_dim)
 
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:
@@ -586,8 +823,21 @@ class FusedMoE(torch.nn.Module):
                 tp_rank=tp_rank,
             )
             return
+
         if "ModelOpt" in self.quant_method.__class__.__name__:
-            if "weight_scale_2" in weight_name or "input_scale" in weight_name:
+            # Determine per-tensor weight scale patterns based on variant
+            is_fp4_variant = (
+                "ModelOptNvFp4FusedMoEMethod" in self.quant_method.__class__.__name__
+            )
+
+            # FP4 uses "weight_scale_2" for per-tensor, FP8 uses "weight_scale" for per-tensor
+            per_tensor_conditions = (
+                "weight_scale_2" in weight_name
+                if is_fp4_variant
+                else "weight_scale" in weight_name
+            ) or "input_scale" in weight_name
+
+            if per_tensor_conditions:
                 self._load_per_tensor_weight_scale(
                     shard_id=shard_id,
                     param=param,
@@ -605,7 +855,7 @@ class FusedMoE(torch.nn.Module):
             return
 
         # Case weight scales and zero_points
-        if "scale" in weight_name or "zero" in weight_name:
+        if "scale" in weight_name or "zero" in weight_name or "offset" in weight_name:
             # load the weight scales and zp based on the quantization scheme
             # supported weight scales/zp can be found in
             # FusedMoeWeightScaleSupported
@@ -690,9 +940,19 @@ class FusedMoE(torch.nn.Module):
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             routed_scaling_factor=self.routed_scaling_factor,
+            **(
+                dict(
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    ep_rank=self.ep_rank,
+                    ep_size=self.ep_size,
+                )
+                if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod"
+                else {}
+            ),
         )
 
-        if self.reduce_results and self.tp_size > 1:
+        if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states

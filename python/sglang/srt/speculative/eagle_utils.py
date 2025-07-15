@@ -21,7 +21,7 @@ from sglang.srt.managers.schedule_batch import (
     get_last_loc,
     global_server_args_dict,
 )
-from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
@@ -89,17 +89,18 @@ class EagleDraftInput:
         cls,
         device: torch.device,
         hidden_size: int,
+        dtype: torch.dtype,
         topk: int,
         capture_hidden_mode: CaptureHiddenMode,
     ):
         return cls(
             verified_id=None,
-            hidden_states=torch.empty(
-                (0, hidden_size), device=device, dtype=torch.float32
-            ),
+            hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
+            accept_length=torch.empty((0,), device=device, dtype=torch.int32),
+            accept_length_cpu=[],
         )
 
     def prepare_extend_after_decode(
@@ -315,7 +316,7 @@ class EagleVerifyInput:
         self,
         batch: ScheduleBatch,
         logits_output: torch.Tensor,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
     ) -> torch.Tensor:
@@ -334,6 +335,7 @@ class EagleVerifyInput:
                 draft_input=EagleDraftInput.create_idle_input(
                     device=batch.device,
                     hidden_size=batch.model_config.hidden_size,
+                    dtype=batch.model_config.dtype,
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 ),

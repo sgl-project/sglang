@@ -7,12 +7,12 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
-    TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
@@ -28,12 +28,13 @@ class HiRadixCache(RadixCache):
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_cache_group: torch.distributed.ProcessGroup,
         page_size: int,
         hicache_ratio: float,
         hicache_size: int,
         hicache_write_policy: str,
+        hicache_io_backend: str,
     ):
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
@@ -56,6 +57,7 @@ class HiRadixCache(RadixCache):
             page_size,
             load_cache_event=self.load_cache_event,
             write_policy=hicache_write_policy,
+            io_backend=hicache_io_backend,
         )
 
         # record the nodes with ongoing write through

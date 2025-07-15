@@ -15,9 +15,7 @@
 
 
 import dataclasses
-import json
 import logging
-import os
 from enum import auto
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
@@ -55,46 +53,6 @@ class CompletionTemplate:
 
 # A global registry for all completion templates
 completion_templates: dict[str, CompletionTemplate] = {}
-
-
-def load_completion_template_for_openai_api(completion_template_arg):
-    global completion_template_name
-
-    logger.info(
-        f"Use completion template for the OpenAI-compatible API server: {completion_template_arg}"
-    )
-
-    if not completion_template_exists(completion_template_arg):
-        if not os.path.exists(completion_template_arg):
-            raise RuntimeError(
-                f"Completion template {completion_template_arg} is not a built-in template name "
-                "or a valid completion template file path."
-            )
-
-        assert completion_template_arg.endswith(
-            ".json"
-        ), "unrecognized format of completion template file"
-        with open(completion_template_arg, "r") as filep:
-            template = json.load(filep)
-            try:
-                fim_position = FimPosition[template["fim_position"]]
-            except KeyError:
-                raise ValueError(
-                    f"Unknown fim position: {template['fim_position']}"
-                ) from None
-            register_completion_template(
-                CompletionTemplate(
-                    name=template["name"],
-                    fim_begin_token=template["fim_begin_token"],
-                    fim_middle_token=template["fim_middle_token"],
-                    fim_end_token=template["fim_end_token"],
-                    fim_position=fim_position,
-                ),
-                override=True,
-            )
-        completion_template_name = template["name"]
-    else:
-        completion_template_name = completion_template_arg
 
 
 def register_completion_template(template: CompletionTemplate, override: bool = False):

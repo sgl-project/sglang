@@ -18,34 +18,43 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.managers import expert_location_dispatch
-from sglang.srt.managers.expert_distribution import (
+from sglang.srt.eplb import expert_location_dispatch
+from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
 )
-from sglang.srt.managers.expert_location_dispatch import (
+from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    get_bool_env_var,
     get_compiler_backend,
     is_cpu,
     is_cuda,
     is_hip,
+    is_npu,
 )
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
 
 if _is_cuda or _is_hip:
     from sgl_kernel import topk_softmax
+if _use_aiter:
+    try:
+        from aiter import biased_grouped_topk as aiter_biased_grouped_topk
+    except ImportError:
+        raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 
 
 def fused_topk_torch_native(
@@ -74,13 +83,18 @@ def fused_topk_cpu(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
-    return torch.ops.sgl_kernel.topk_softmax_cpu(
+    topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
         hidden_states=hidden_states,
         gating_output=gating_output,
         topk=topk,
         renormalize=renormalize,
     )
+    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    return topk_weights, topk_ids
 
 
 def fused_topk(
@@ -99,37 +113,14 @@ def fused_topk(
         M, topk, dtype=torch.float32, device=hidden_states.device
     )
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
-    token_expert_indicies = torch.empty(
-        M, topk, dtype=torch.int32, device=hidden_states.device
-    )
 
     topk_softmax(
         topk_weights,
         topk_ids,
-        token_expert_indicies,
-        gating_output.float(),
-    )
-    del token_expert_indicies
-
-    return _fused_topk_postprocess(
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        renormalize=renormalize,
-        expert_location_dispatch_info=expert_location_dispatch_info,
-        num_token_non_padded=num_token_non_padded,
+        gating_output,
+        renormalize,
     )
 
-
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def _fused_topk_postprocess(
-    topk_weights,
-    topk_ids,
-    renormalize,
-    expert_location_dispatch_info,
-    num_token_non_padded,
-):
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
@@ -152,6 +143,9 @@ def grouped_topk_gpu(
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     scores = torch.softmax(gating_output, dim=-1)
+    # NPU compiler limitation
+    if _is_npu and scores.dtype == torch.bfloat16:
+        scores = scores.to(torch.float16)
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
     group_scores = (
@@ -314,7 +308,7 @@ def biased_grouped_topk_gpu(
     renormalize: bool,
     num_expert_group: int = 0,
     topk_group: int = 0,
-    compiled: bool = True,
+    compiled: bool = not _is_npu,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -346,6 +340,25 @@ def biased_grouped_topk_gpu(
             topk_ids = _biased_grouped_topk_postprocess(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
+        return topk_weights, topk_ids
+    elif _use_aiter:
+        token = gating_output.shape[0]
+        device = gating_output.device
+        assert (
+            hidden_states.shape[0] == gating_output.shape[0]
+        ), f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
+        topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
+        topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
+        aiter_biased_grouped_topk(
+            gating_output,
+            correction_bias,
+            topk_weights,
+            topk_ids,
+            num_expert_group,
+            topk_group,
+            renormalize,
+            routed_scaling_factor,
+        )
         return topk_weights, topk_ids
     else:
         biased_grouped_topk_fn = (
@@ -403,6 +416,7 @@ if _is_cpu and _is_cpu_amx_available:
     biased_grouped_topk = biased_grouped_topk_cpu
     grouped_topk = grouped_topk_cpu
     fused_topk_native = fused_topk_cpu
+    fused_topk = fused_topk_cpu
 else:
     biased_grouped_topk = biased_grouped_topk_gpu
     grouped_topk = grouped_topk_gpu
