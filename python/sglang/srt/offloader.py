@@ -102,7 +102,6 @@ class _StatelessOffloaderUtil:
 
     @staticmethod
     def create_onload_tensors(module, device):
-        TODO_maybe_stream
         return {
             k: v.to(device, non_blocking=True) for k, v in module.state_dict().items()
         }
