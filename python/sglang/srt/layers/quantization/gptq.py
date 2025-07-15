@@ -191,7 +191,7 @@ class GPTQConfig(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional["LinearMethodBase"]:
         # Delay the import to avoid circular dependency
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization import get_linear_quant_method
