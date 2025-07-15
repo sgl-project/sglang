@@ -246,6 +246,7 @@ set(SOURCES
     "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/packbit.cu"
+    "csrc/spatial/greenctx_stream.cu"
     "csrc/speculative/speculative_sampling.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
     "csrc/kvcacheio/transfer.cu"

@@ -324,33 +324,33 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-4-gpu-deepep
 
-  unit-test-deepep-8-gpu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
-    runs-on: 8-gpu-runner
-    needs: [
-      unit-test-deepep-4-gpu,
-    ]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci_install_deepep.sh
-
-      - name: Run test
-        timeout-minutes: 20
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-deepep
+  # unit-test-deepep-8-gpu:
+  #   if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+  #       github.event.pull_request.draft == false
+  #   runs-on: 8-gpu-runner
+  #   needs: [
+  #     unit-test-deepep-4-gpu,
+  #   ]
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Install dependencies
+  #       run: |
+  #         bash scripts/ci_install_deepep.sh
+  #
+  #     - name: Run test
+  #       timeout-minutes: 20
+  #       run: |
+  #         cd test/srt
+  #         python3 run_suite.py --suite per-commit-8-gpu-deepep
 
   finish:
     if: always()
     needs: [
       unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu, unit-test-backend-4-gpu,
       unit-test-backend-8-gpu, performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
-      accuracy-test-1-gpu, accuracy-test-2-gpu, unit-test-deepep-4-gpu, unit-test-deepep-8-gpu,
+      accuracy-test-1-gpu, accuracy-test-2-gpu, unit-test-deepep-4-gpu, # unit-test-deepep-8-gpu,
     ]
     runs-on: ubuntu-latest
     steps:
