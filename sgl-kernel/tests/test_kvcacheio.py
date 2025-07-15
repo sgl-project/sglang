@@ -380,7 +380,7 @@ def test_transfer_kv(
                         dst_indices_device,
                         layer_id
                     )
-                transfer_kv_per_layer(
+                transfer_kv_all_layer(
                     src_k_pool,
                     dst_k_pool_kernel,
                     src_v_pool,

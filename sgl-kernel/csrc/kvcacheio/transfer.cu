@@ -228,18 +228,18 @@ void transfer_kv_per_layer_mla(
   at::Tensor empty_tensor = at::Tensor();
   if (src_layer_first) {
     if (dst_layer_first) {
-      transfer_kv_launcher<get_global_offset_lf, get_global_offset_lf, false>(
+      transfer_kv_launcher<get_global_offset_lf, get_global_offset_lf, true>(
         src, dst, empty_tensor, empty_tensor, src_indices, dst_indices, layer_id, 1, item_size, src_layout_dim, dst_layout_dim, block_quota, num_warps_per_block);
     } else {
-      transfer_kv_launcher<get_global_offset_lf, get_global_offset_pf, false>(
+      transfer_kv_launcher<get_global_offset_lf, get_global_offset_pf, true>(
         src, dst, empty_tensor, empty_tensor, src_indices, dst_indices, layer_id, 1, item_size, src_layout_dim, dst_layout_dim, block_quota, num_warps_per_block);
     }
   } else {
     if (dst_layer_first) {
-      transfer_kv_launcher<get_global_offset_pf, get_global_offset_lf, false>(
+      transfer_kv_launcher<get_global_offset_pf, get_global_offset_lf, true>(
         src, dst, empty_tensor, empty_tensor, src_indices, dst_indices, layer_id, 1, item_size, src_layout_dim, dst_layout_dim, block_quota, num_warps_per_block);
     } else {
-      transfer_kv_launcher<get_global_offset_pf, get_global_offset_pf, false>(
+      transfer_kv_launcher<get_global_offset_pf, get_global_offset_pf, true>(
         src, dst, empty_tensor, empty_tensor, src_indices, dst_indices, layer_id, 1, item_size, src_layout_dim, dst_layout_dim, block_quota, num_warps_per_block);
     }
   }
@@ -261,18 +261,18 @@ void transfer_kv_all_layer_mla(
   at::Tensor empty_tensor = at::Tensor();
   if (src_layer_first) {
     if (dst_layer_first) {
-      transfer_kv_launcher<get_global_offset_lf, get_global_offset_lf, false>(
+      transfer_kv_launcher<get_global_offset_lf, get_global_offset_lf, true>(
         src, dst, empty_tensor, empty_tensor, src_indices, dst_indices, 0, num_layers, item_size, src_layout_dim, dst_layout_dim, block_quota, num_warps_per_block);
     } else {
-      transfer_kv_launcher<get_global_offset_lf, get_global_offset_pf, false>(
+      transfer_kv_launcher<get_global_offset_lf, get_global_offset_pf, true>(
         src, dst, empty_tensor, empty_tensor, src_indices, dst_indices, 0, num_layers, item_size, src_layout_dim, dst_layout_dim, block_quota, num_warps_per_block);
     }
   } else {
     if (dst_layer_first) {
-      transfer_kv_launcher<get_global_offset_pf, get_global_offset_lf, false>(
+      transfer_kv_launcher<get_global_offset_pf, get_global_offset_lf, true>(
         src, dst, empty_tensor, empty_tensor, src_indices, dst_indices, 0, num_layers, item_size, src_layout_dim, dst_layout_dim, block_quota, num_warps_per_block);
     } else {
-      transfer_kv_launcher<get_global_offset_pf, get_global_offset_pf, false>(
+      transfer_kv_launcher<get_global_offset_pf, get_global_offset_pf, true>(
         src, dst, empty_tensor, empty_tensor, src_indices, dst_indices, 0, num_layers, item_size, src_layout_dim, dst_layout_dim, block_quota, num_warps_per_block);
     }
   }
