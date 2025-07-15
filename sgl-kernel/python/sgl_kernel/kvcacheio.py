@@ -46,7 +46,7 @@ def transfer_kv_per_layer(
             dst_v[layer_id],
             src_indices,
             dst_indices,
-            page_size
+            page_size,
         )
     else:
         raise ValueError(f"Unsupported io backend")

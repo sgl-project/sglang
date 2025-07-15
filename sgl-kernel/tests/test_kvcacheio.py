@@ -11,15 +11,14 @@ from sgl_kernel.kvcacheio import (
 def ref_copy_with_indices(src_pool, dst_pool, src_indices, dst_indices):
     dst_pool[dst_indices] = src_pool[src_indices].to(dst_pool.device)
 
+
 def ref_copy_with_indices_page_first_to_layer_first(
-    src_pool,
-    dst_pool,
-    src_indices,
-    dst_indices,
-    layer_id
+    src_pool, dst_pool, src_indices, dst_indices, layer_id
 ):
     for i in range(len(src_indices)):
-        dst_pool[layer_id][dst_indices[i]] = src_pool[src_indices[i]][layer_id].to(dst_pool.device)
+        dst_pool[layer_id][dst_indices[i]] = src_pool[src_indices[i]][layer_id].to(
+            dst_pool.device
+        )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -38,7 +37,7 @@ def test_transfer_kv(
     total_items_in_pool: int,
     is_mla: bool,
     all_layers: bool,
-    layer_first_to_layer_first: bool
+    layer_first_to_layer_first: bool,
 ):
     """
     Tests the per-layer transfer functions, treating tensors as memory pools.
@@ -119,7 +118,7 @@ def test_transfer_kv(
                     item_size=item_size,
                     layer_id=layer_idx_to_test,
                     src_layout_dim=total_items_in_pool * item_size,
-                    dst_layout_dim=total_items_in_pool * item_size
+                    dst_layout_dim=total_items_in_pool * item_size,
                 )
                 transfer_kv_per_layer_mla(
                     src_pool_host,
@@ -129,7 +128,7 @@ def test_transfer_kv(
                     io_backend="direct",
                     page_size=page_size,
                     item_size=item_size,
-                    layer_id=layer_idx_to_test
+                    layer_id=layer_idx_to_test,
                 )
             else:
                 for layer_id in range(num_layers):
@@ -192,7 +191,7 @@ def test_transfer_kv(
                     item_size=item_size,
                     layer_id=layer_idx_to_test,
                     src_layout_dim=total_items_in_pool * item_size,
-                    dst_layout_dim=total_items_in_pool * item_size
+                    dst_layout_dim=total_items_in_pool * item_size,
                 )
                 transfer_kv_per_layer(
                     src_k_pool,
@@ -204,7 +203,7 @@ def test_transfer_kv(
                     io_backend="direct",
                     page_size=page_size,
                     item_size=item_size,
-                    layer_id=layer_idx_to_test
+                    layer_id=layer_idx_to_test,
                 )
             else:
                 for layer_id in range(num_layers):
@@ -261,13 +260,13 @@ def test_transfer_kv(
             src_pool_host = torch.randn(
                 total_items_in_pool, num_layers, item_size
             ).pin_memory()
-            dst_pool_ref = torch.zeros(
-                [num_layers, total_items_in_pool, item_size]
-            ).to(device)
+            dst_pool_ref = torch.zeros([num_layers, total_items_in_pool, item_size]).to(
+                device
+            )
             dst_pool_kernel = torch.zeros_like(dst_pool_ref)
         else:
             src_k_pool = torch.randn(
-                total_items_in_pool, num_layers,  item_size
+                total_items_in_pool, num_layers, item_size
             ).pin_memory()
             src_v_pool = torch.randn(
                 total_items_in_pool, num_layers, item_size
@@ -291,7 +290,7 @@ def test_transfer_kv(
                     dst_pool_ref,
                     src_indices_host,
                     dst_indices_device,
-                    layer_idx_to_test
+                    layer_idx_to_test,
                 )
                 transfer_kv_per_layer_mla(
                     src_pool_host,
@@ -305,7 +304,7 @@ def test_transfer_kv(
                     src_layout_dim=num_layers * item_size,
                     dst_layout_dim=total_items_in_pool * item_size,
                     src_layer_first=False,
-                    dst_layer_first=True
+                    dst_layer_first=True,
                 )
             else:
                 for layer_id in range(num_layers):
@@ -314,7 +313,7 @@ def test_transfer_kv(
                         dst_pool_ref,
                         src_indices_host,
                         dst_indices_device,
-                        layer_id
+                        layer_id,
                     )
                 transfer_kv_all_layer_mla(
                     src_pool_host,
@@ -328,7 +327,7 @@ def test_transfer_kv(
                     src_layout_dim=num_layers * item_size,
                     dst_layout_dim=total_items_in_pool * item_size,
                     src_layer_first=False,
-                    dst_layer_first=True
+                    dst_layer_first=True,
                 )
             torch.cuda.synchronize()
             torch.testing.assert_close(dst_pool_kernel, dst_pool_ref)
@@ -339,14 +338,14 @@ def test_transfer_kv(
                     dst_k_pool_ref,
                     src_indices_host,
                     dst_indices_device,
-                    layer_idx_to_test
+                    layer_idx_to_test,
                 )
                 ref_copy_with_indices_page_first_to_layer_first(
                     src_v_pool,
                     dst_v_pool_ref,
                     src_indices_host,
                     dst_indices_device,
-                    layer_idx_to_test
+                    layer_idx_to_test,
                 )
                 transfer_kv_per_layer(
                     src_k_pool,
@@ -362,7 +361,7 @@ def test_transfer_kv(
                     src_layout_dim=num_layers * item_size,
                     dst_layout_dim=total_items_in_pool * item_size,
                     src_layer_first=False,
-                    dst_layer_first=True
+                    dst_layer_first=True,
                 )
             else:
                 for layer_id in range(num_layers):
@@ -371,14 +370,14 @@ def test_transfer_kv(
                         dst_k_pool_ref,
                         src_indices_host,
                         dst_indices_device,
-                        layer_id
+                        layer_id,
                     )
                     ref_copy_with_indices_page_first_to_layer_first(
                         src_v_pool,
                         dst_v_pool_ref,
                         src_indices_host,
                         dst_indices_device,
-                        layer_id
+                        layer_id,
                     )
                 transfer_kv_all_layer(
                     src_k_pool,
@@ -394,7 +393,7 @@ def test_transfer_kv(
                     src_layout_dim=num_layers * item_size,
                     dst_layout_dim=total_items_in_pool * item_size,
                     src_layer_first=False,
-                    dst_layer_first=True
+                    dst_layer_first=True,
                 )
             torch.cuda.synchronize()
             torch.testing.assert_close(dst_k_pool_kernel, dst_k_pool_ref)
