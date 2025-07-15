@@ -21,14 +21,15 @@ def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
     return hasher.hexdigest()
 
 
-# todo: batch API for better performance
-
-
 class HiCacheStorage(ABC):
     """
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
+
+    # todo, translate tensor object access for different TP ranks
+    # potentially pass model and TP configs into storage backend
+    # todo, the page size of storage backend does not have to be the same as the same as host memory pool
 
     @abstractmethod
     def get(
@@ -140,6 +141,7 @@ class HiCacheFile(HiCacheStorage):
         for key, value in zip(keys, values):
             if not self.set(key, value):
                 return False
+        return True
 
     def delete(self, key: str) -> None:
         tensor_path = os.path.join(self.file_path, f"{key}.bin")

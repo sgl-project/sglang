@@ -71,7 +71,7 @@ class HiRadixCache(RadixCache):
         # record the node segments with ongoing load back
         self.ongoing_load_back = {}
         # record the ongoing prefetch requests
-        self.outstanding_prefetch = {}
+        self.ongoing_prefetch = {}
         self.ongoing_backup = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
@@ -362,11 +362,11 @@ class HiRadixCache(RadixCache):
             )
         for _ in range(queue_size.item()):
             req_id = self.cache_controller.prefetch_revoke_queue.get()
-            if req_id in self.outstanding_prefetch:
-                last_host_node, _, host_indices = self.outstanding_prefetch[req_id]
+            if req_id in self.ongoing_prefetch:
+                last_host_node, _, host_indices, _ = self.ongoing_prefetch[req_id]
                 last_host_node.release_host()
                 self.cache_controller.mem_pool_host.free(host_indices)
-                del self.outstanding_prefetch[req_id]
+                del self.ongoing_prefetch[req_id]
 
     def check_backup_progress(self):
         queue_size = torch.tensor(
@@ -386,13 +386,20 @@ class HiRadixCache(RadixCache):
             del self.ongoing_backup[ack_id]
 
     def check_prefetch_progress(self, req_id: str):
-        if req_id not in self.outstanding_prefetch:
+        if req_id not in self.ongoing_prefetch:
+            # there is no ongoing prefetch for this request or it has been revoked
             return
 
         # todo: more policies for prefetch progress such as timeout
         # the current policy is to prefetch with best effort and terminate when queuing is over
-        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(req_id)
+        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
+            req_id
+        ]
+        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
+            operation
+        )
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+
         min_completed_tokens = torch.tensor(completed_tokens, dtype=torch.int)
         if torch.distributed.get_world_size(group=self.tp_group) > 1:
             # synchrnoize TP workers to make the same update to hiradix cache
@@ -402,7 +409,6 @@ class HiRadixCache(RadixCache):
                 group=self.tp_group,
             )
         min_completed_tokens = min_completed_tokens.item()
-        last_host_node, token_ids, host_indices = self.outstanding_prefetch[req_id]
         fetched_token_ids = token_ids[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(
@@ -417,7 +423,7 @@ class HiRadixCache(RadixCache):
             host_indices[min_completed_tokens:completed_tokens]
         )
         last_host_node.release_host()
-        del self.outstanding_prefetch[req_id]
+        del self.ongoing_prefetch[req_id]
 
     def match_prefix(self, key: List[int], **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -473,13 +479,14 @@ class HiRadixCache(RadixCache):
             last_host_node.release_host()
             # no sufficient host memory to prefetch
             return
-        self.cache_controller.prefetch(
+        operation = self.cache_controller.prefetch(
             req_id, host_indices, new_input_tokens, last_hash
         )
-        self.outstanding_prefetch[req_id] = (
+        self.ongoing_prefetch[req_id] = (
             last_host_node,
             new_input_tokens,
             host_indices,
+            operation,
         )
 
     def _insert_helper_host(self, node: TreeNode, key: List, host_value, hash_value):
