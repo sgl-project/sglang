@@ -297,6 +297,9 @@ class GenerateReqInput:
                         self.modalities.append("image")
                     elif len(self.image_data[i]) > 1:
                         self.modalities.append("multi-images")
+                    else:
+                        # Ensure len(self.modalities) == len(self.image_data)
+                        self.modalities.append(None)
                 # Expand parallel_sample_num
                 self.image_data = self.image_data * self.parallel_sample_num
                 self.modalities = self.modalities * self.parallel_sample_num
