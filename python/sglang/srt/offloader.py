@@ -71,7 +71,7 @@ class _ModuleOffloader:
     def start_onload(self):
         self.alt_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.alt_stream):
-            self._device_tensors = _StatelessOffloaderUtil.create_onload_tensors(
+            self._device_tensors = _StatelessOffloaderUtil.create_device_tensors(
                 self.module, self.device
             )
 
@@ -101,7 +101,7 @@ class _StatelessOffloaderUtil:
             p.data = cpu_data
 
     @staticmethod
-    def create_onload_tensors(module, device):
+    def create_device_tensors(module, device):
         return {
             k: v.to(device, non_blocking=True) for k, v in module.state_dict().items()
         }
