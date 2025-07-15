@@ -432,6 +432,7 @@ class SchedulerDisaggregationPrefillMixin:
                         # Grammar accept_token can raise ValueError if the token is not in the grammar.
                         # This can happen if the grammar is not set correctly or the token is invalid.
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                        self.tree_cache.cache_finished_req(req)
                         prepare_abort(
                             req,
                             error_message,
