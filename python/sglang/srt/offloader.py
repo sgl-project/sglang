@@ -59,10 +59,10 @@ class _ModuleOffloader:
         ), "not handled device=cpu case yet (should skip this tensor)"
 
         self.device_tensors = None
-        _OffloaderUtil.offload(module)
+        _StatelessOffloaderUtil.offload(module)
 
     def start_onload(self):
-        self.device_tensors = _OffloaderUtil.create_onload_tensors(
+        self.device_tensors = _StatelessOffloaderUtil.create_onload_tensors(
             self.module, self.device
         )
 
@@ -70,11 +70,9 @@ class _ModuleOffloader:
         self.device_tensors = None
 
 
-class _OffloaderUtil:
-    def __init__(self):
-        self.alt_stream = torch.cuda.Stream()
-
-    def offload(self, module):
+class _StatelessOffloaderUtil:
+    @staticmethod
+    def offload(module):
         pin_memory = is_pin_memory_available()
         for p in module.parameters():
             cpu_data = torch.empty_strided(
@@ -88,11 +86,9 @@ class _OffloaderUtil:
             cpu_data.copy_(p.data)
             p.data = cpu_data
 
-    def create_onload_tensors(self, module, device):
-        self.alt_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.alt_stream):
-            ans = {
-                k: v.to(device, non_blocking=True) for k, v in module.state_dict().items()
-            }
-        TODO_wait_back
-        return ans
+    @staticmethod
+    def create_onload_tensors(module, device):
+        TODO_maybe_stream
+        return {
+            k: v.to(device, non_blocking=True) for k, v in module.state_dict().items()
+        }
