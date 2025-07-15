@@ -38,10 +38,26 @@ class BaseFormatDetector(ABC):
         self.eot_token = ""
         self.tool_call_separator = ", "
 
-    def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
-        tool_indices = {
+    def _get_tool_indices(self, tools: List[Tool]) -> Dict[str, int]:
+        """
+        Get a mapping of tool names to their indices in the tools list.
+
+        This utility method creates a dictionary mapping function names to their
+        indices in the tools list, which is commonly needed for tool validation
+        and ToolCallItem creation.
+
+        Args:
+            tools: List of available tools
+
+        Returns:
+            Dictionary mapping tool names to their indices
+        """
+        return {
             tool.function.name: i for i, tool in enumerate(tools) if tool.function.name
         }
+
+    def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
+        tool_indices = self._get_tool_indices(tools)
         if not isinstance(action, list):
             action = [action]
 
@@ -130,11 +146,7 @@ class BaseFormatDetector(ABC):
 
         # Build tool indices if not already built
         if not hasattr(self, "_tool_indices"):
-            self._tool_indices = {
-                tool.function.name: i
-                for i, tool in enumerate(tools)
-                if tool.function and tool.function.name
-            }
+            self._tool_indices = self._get_tool_indices(tools)
 
         flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
 
@@ -294,12 +306,48 @@ class BaseFormatDetector(ABC):
 
     @abstractmethod
     def has_tool_call(self, text: str) -> bool:
+        """
+        Check if the given text contains function call markers specific to this format.
+        """
         raise NotImplementedError()
 
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
+        """
+        Return a function that creates StructureInfo for constrained generation.
+
+        The returned function takes a tool name and returns a StructureInfo object
+        containing the begin/end patterns and trigger tokens needed for constrained
+        generation of function calls in this format.
+
+        Returns:
+            A function that takes a tool name (str) and returns StructureInfo
+        """
         raise NotImplementedError()
 
     @abstractmethod
     def build_ebnf(self, tools: List[Tool]) -> str:
+        """
+        Build an EBNF grammar for constrained generation of function calls.
+
+        This method generates an Extended Backus-Naur Form (EBNF) grammar that
+        constrains the model's output to valid function calls in this format.
+        The grammar should include all available tools and their parameter schemas.
+
+        Args:
+            tools: List of available tools/functions that can be called
+
+        Returns:
+            A string containing the EBNF grammar for this function call format
+
+        The EBNF grammar should:
+            - Define the overall structure of function calls in this format
+            - Include all tool names from the provided tools list
+            - Define valid JSON structures for function arguments
+            - Handle multiple function calls if the format supports them
+
+        Note:
+            Most implementations use EBNFComposer.build_ebnf() utility with
+            format-specific parameters rather than writing EBNF from scratch.
+        """
         raise NotImplementedError()

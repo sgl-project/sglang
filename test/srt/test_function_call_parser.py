@@ -542,6 +542,30 @@ class TestEBNFGeneration(unittest.TestCase):
         except RuntimeError as e:
             self.fail(f"Failed to compile EBNF: {e}")
 
+    def test_kimik2_detector_ebnf(self):
+        """Test that the KimiK2Detector generates valid EBNF."""
+        ebnf = self.kimik2_detector.build_ebnf(self.tools)
+        self.assertIsNotNone(ebnf)
+
+        # Check that the EBNF contains expected patterns for KimiK2 format
+        self.assertIn("<|tool_calls_section_begin|>", ebnf)
+        self.assertIn("<|tool_call_begin|>", ebnf)
+        self.assertIn("<|tool_call_argument_begin|>", ebnf)
+        self.assertIn("<|tool_call_end|>", ebnf)
+        self.assertIn("<|tool_calls_section_end|>", ebnf)
+
+        # Check for function-specific patterns
+        self.assertIn('\\"name\\"" ":" "\\"get_weather\\"', ebnf)
+        self.assertIn('\\"name\\"" ":" "\\"search\\"', ebnf)
+        self.assertIn('"\\"arguments\\"" ":"', ebnf)
+
+        # Validate that the EBNF can be compiled by GrammarCompiler
+        try:
+            ctx = self.grammar_compiler.compile_grammar(ebnf)
+            self.assertIsNotNone(ctx, "EBNF should be valid and compile successfully")
+        except RuntimeError as e:
+            self.fail(f"Failed to compile EBNF: {e}")
+
     def test_llama32_detector_ebnf(self):
         """Test that the Llama32Detector generates valid EBNF."""
         ebnf = self.llama32_detector.build_ebnf(self.tools)
