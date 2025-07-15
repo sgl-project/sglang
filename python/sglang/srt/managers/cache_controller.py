@@ -369,33 +369,7 @@ class HiCacheController:
         self.write_thread.start()
         self.load_thread.start()
 
-        # self.enable_mooncake_store_l3_cache = enable_mooncake_store_l3_cache
-        # if self.enable_mooncake_store_l3_cache:
-
-        #     self.mooncake_l3_kv_pool = mooncake_l3_kv_pool
-
-        #     self.mooncake_l3_write_queue = PriorityQueue()
-        #     self.mooncake_load_queue = PriorityQueue()
-        #     self.l3_load_queue = PriorityQueue()
-
-        #     self.mooncake_l3_stop_event = threading.Event()
-
-        #     self.mooncake_l3_load_cache_event = mooncake_l3_load_cache_event
-
-        #     self.mooncake_l3_ack_load_queue = Queue()
-
-        #     # L2 -> L3
-        #     self.mooncake_l3_write_thread = threading.Thread(
-        #         target=self.mooncake_l3_write_thread_func_direct,
-        #         daemon=True,
-        #     )
-        #     # L3 -> L2
-        #     self.mooncake_load_thread = threading.Thread(
-        #         target=self.mooncake_load_thread_func, daemon=True
-        #     )
-
-        #     self.mooncake_l3_write_thread.start()
-        #     self.mooncake_load_thread.start()
+        
         if self.enable_storage:
             self.prefetch_thread = threading.Thread(
                 target=self.prefetch_thread_func, daemon=True
@@ -441,29 +415,7 @@ class HiCacheController:
         self.write_thread.start()
         self.load_thread.start()
 
-        # if self.enable_mooncake_store_l3_cache:
-        #     self.mooncake_l3_stop_event.set()
-        #     self.mooncake_l3_write_thread.join()
-        #     self.mooncake_load_thread.join()
-
-        #     self.mooncake_l3_write_queue.queue.clear()
-        #     self.mooncake_load_queue.queue.clear()
-        #     self.l3_load_queue.queue.clear()
-
-        #     self.mooncake_l3_ack_load_queue.queue.clear()
-
-        #     self.mooncake_l3_write_thread = threading.Thread(
-        #         target=self.mooncake_l3_write_thread_func_direct,
-        #         daemon=True,
-        #     )
-        #     self.mooncake_load_thread = threading.Thread(
-        #         target=self.mooncake_load_thread_func, daemon=True
-        #     )
-
-        #     self.mooncake_l3_stop_event.clear()
-
-        #     self.mooncake_l3_write_thread.start()
-        #     self.mooncake_load_thread.start()
+        
         if self.enable_storage:
             self.prefetch_thread = threading.Thread(
                 target=self.prefetch_thread_func, daemon=True
@@ -561,16 +513,6 @@ class HiCacheController:
                 self.write_stream.synchronize()
                 self.mem_pool_host.complete_io(operation.host_indices)
 
-                # write L3 cache
-                # if self.enable_mooncake_store_l3_cache:
-                #     mooncake_operation = MooncakeStoreCacheOperation(
-                #         operation.l3_keys,
-                #         operation.host_indices,
-                #         operation.node_ids,
-                #         priority=operation.priority,
-                #     )
-
-                #     self.mooncake_l3_write_queue.put(mooncake_operation)
 
                 for node_id in operation.node_ids:
                     if node_id != 0:
@@ -603,29 +545,6 @@ class HiCacheController:
             except Exception as e:
                 logger.error(e)
 
-
-    # def mooncake_load_thread_func(self):
-    #     while not self.mooncake_l3_stop_event.is_set():
-    #         try:
-    #             operation = self.mooncake_load_queue.get(block=True, timeout=0.001)
-    #             if isinstance(operation, MooncakeStoreCacheOperation):
-    #                 key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(operation.mooncake_keys,
-    #                                                                                  operation.host_indices)
-    #                 self.mooncake_l3_kv_pool.batch_get(key_strs, buffer_ptrs, buffer_sizes)
-
-    #                 for node_id in operation.node_ids:
-    #                     if node_id != 0:
-    #                         self.mooncake_l3_ack_load_queue.put(node_id)
-    #             elif isinstance(operation, MooncakeIsBatchExistOperation):
-    #                 self.mooncake_l3_kv_pool.is_batch_exist(operation.l3_keys)
-    #                 for node_id in operation.node_ids:
-    #                     if node_id != 0:
-    #                         self.mooncake_l3_ack_load_queue.put(node_id)
-
-    #         except Empty:
-    #             continue
-    #         except Exception as e:
-    #             logger.error(e)
 
     def load_thread_func_layer_by_layer(self):
         """

@@ -54,16 +54,8 @@ class HiRadixCache(RadixCache):
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
 
-        # self.mooncake_l3_kv_pool = None
-        # self.mooncake_l3_load_cache_event = None
+    
         self.page_size = page_size
-        # if hicache_storage_backend == "mooncake":
-        #     # TODO(huangtingwei9988):L3 cache only support write_through_selective and write_through write policy
-        #     assert hicache_write_policy in ["write_through_selective", "write_through"]
-        #     self.mooncake_l3_kv_pool = MooncakeStore()
-        #     self.mooncake_l3_kv_pool.register_buffer(self.token_to_kv_pool_host.kv_buffer)
-        #     self.mooncake_l3_load_cache_event = threading.Event()
-        #     self.l3_ongoing_load_back = {}
 
         self.tp_group = tp_cache_group
         self.enable_storage = hicache_storage_backend is not None
@@ -534,12 +526,6 @@ class HiRadixCache(RadixCache):
 
         last_l3_node = None
         l3_hit_length = 0
-        # if self.enable_mooncake_store_l3_cache:
-        #     while last_node.evicted and last_node.l3_backuped and not last_node.l2_backuped:
-        #         if not last_l3_node:
-        #             last_l3_node = last_node
-        #         l3_hit_length += len(last_node.l3_keys) * self.page_size
-        #         last_node = last_node.parent
 
         host_hit_length = 0
         last_host_node = last_node
