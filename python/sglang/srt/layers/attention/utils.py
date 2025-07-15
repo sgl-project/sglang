@@ -4,7 +4,8 @@ import triton.language as tl
 # Keep this in sync with the Triton kernel inside `create_flashmla_kv_indices_triton`.
 # Number of pages that the kernel writes per iteration.
 # Exposed here so other Python modules can import it instead of hard-coding 64.
-NUM_PAGE_PER_BLOCK = 64 
+NUM_PAGE_PER_BLOCK = 64
+
 
 @triton.jit
 def create_flashinfer_kv_indices_triton(
