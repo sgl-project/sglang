@@ -33,13 +33,6 @@ class KimiK2Detector(BaseFormatDetector):
 
     def __init__(self):
         super().__init__()
-        self._buffer = ""
-        self.current_tool_name_sent: bool = False
-        self.prev_tool_call_arr: list[dict] = []
-        self.current_tool_id: int = -1
-        self.streamed_args_for_tool: list[str] = (
-            []
-        )  # map what has been streamed for each tool so far to a list
 
         self.bot_token: str = "<|tool_calls_section_begin|>"
         self.eot_token: str = "<|tool_calls_section_end|>"
