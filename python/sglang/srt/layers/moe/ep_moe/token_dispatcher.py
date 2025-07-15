@@ -798,7 +798,7 @@ class NpuDeepEPDispatcher:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         topk_ids = topk_idx.to(torch.int)
         if forward_mode.is_extend():
-            return self.dispatch_decode(hidden_states, topk_ids) #TODO: dispatch_prefill precision is wrong
+            return self.dispatch_prefill(hidden_states, topk_ids)
         else:
             return self.dispatch_decode(hidden_states, topk_ids)
 
@@ -830,7 +830,8 @@ class NpuDeepEPDispatcher:
         output_splits = combine_tokens_cpu[0]
         gathered_tokens = expanded_x.new_empty(all_tokens.item(), expanded_x.shape[1])
         dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits, group=self.group)
-        gathered_pertoken_scale = None
+        gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0])
+        dist.all_to_all_single(gathered_pertoken_scale, pertoken_scale, output_splits, input_splits, group=self.group)
 
         # reroute
         hidden_states_ordered_by_experts, gathered_pertoken_scale, gathered_idxs_unsort, expert_tokens = \
@@ -883,10 +884,8 @@ class NpuDeepEPDispatcher:
         if forward_mode.is_extend():
             input_splits = ep_send_counts
             output_splits = tp_send_counts
-            return self.combine_decode(hidden_states, topk_ids, topk_idx, topk_weights, ep_send_counts, tp_send_counts,
-                                       shared_output) # combine_prefill precision is wrong;
-            # return self.combine_prefill(hidden_states, topk_ids, topk_idx, topk_weights, input_splits, output_splits,
-            #                             shared_output, expanded_x, expanded_row_idx)
+            return self.combine_prefill(hidden_states, topk_ids, topk_idx, topk_weights, input_splits, output_splits,
+                                        shared_output, expanded_x, expanded_row_idx)
         else:
             return self.combine_decode(hidden_states, topk_ids, topk_idx, topk_weights, ep_send_counts, tp_send_counts,
                                        shared_output)
