@@ -711,7 +711,6 @@ def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int)
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
     else:
-        raise ValueError(
-            "get_hybrid_layer_ids is only implemented for Llama4ForConditionalGeneration"
-        )
+        swa_attention_layer_ids = None
+        full_attention_layer_ids = None
     return swa_attention_layer_ids, full_attention_layer_ids
