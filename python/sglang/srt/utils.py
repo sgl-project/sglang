@@ -85,7 +85,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager
 
-from sglang.srt.offloader import wrap_layers_for_offload
+from sglang.srt.offloader import wrap_modules_for_offload
 
 logger = logging.getLogger(__name__)
 
@@ -524,7 +524,7 @@ def make_layers(
     )
     modules = torch.nn.ModuleList(
         [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
-        + wrap_layers_for_offload(
+        + wrap_modules_for_offload(
             [
                 maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
                 for idx in range(start_layer, end_layer)

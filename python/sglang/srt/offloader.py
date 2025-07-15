@@ -6,27 +6,27 @@ from torch.func import functional_call
 from sglang.srt.utils import get_int_env_var, is_pin_memory_available
 
 
-def wrap_layers_for_offload(layers: List[torch.nn.Module]):
-    layer_interval = get_int_env_var("SGLANG_OFFLOAD_LAYER_INTERVAL", 5)
-    offload_layers = layers[layer_interval - 1 :: layer_interval]
-    offloaders = [_ModuleOffloader(layer) for layer in offload_layers]
+def wrap_modules_for_offload(all_modules: List[torch.nn.Module]):
+    module_interval = get_int_env_var("SGLANG_OFFLOAD_MODULE_INTERVAL", 5)
+    offload_modules = all_modules[module_interval - 1:: module_interval]
+    offloaders = [_ModuleOffloader(layer) for layer in offload_modules]
 
     offloaders[0].start_onload()
 
-    for index, layer in enumerate(offload_layers):
+    for index, module in enumerate(offload_modules):
         _hook_module_forward_for_offloader(
-            index=index, layer=layer, offloaders=offloaders
+            index=index, module=module, offloaders=offloaders
         )
 
-    return layers
+    return all_modules
 
 
-def _hook_module_forward_for_offloader(index, layer, offloaders):
+def _hook_module_forward_for_offloader(index, module, offloaders):
     _hook_module_forward_raw(
-        layer,
+        module,
         on_forward_start=lambda: offloaders[
             (index + 1) % len(offloaders)
-        ].start_onload(),
+            ].start_onload(),
         on_forward_end=lambda: offloaders[index].offload(),
         get_parameter_and_buffer_dicts=lambda: offloaders[index].device_tensors,
     )
