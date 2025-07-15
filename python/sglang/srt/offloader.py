@@ -93,17 +93,17 @@ class _StatelessOffloaderUtil:
     @staticmethod
     def move_params_to_cpu(module):
         pin_memory = is_pin_memory_available()
-        for p in module.parameters():
+        for name, param in module.named_parameters():
             cpu_data = torch.empty_strided(
-                size=p.data.size(),
-                stride=p.data.stride(),
-                dtype=p.data.dtype,
-                layout=p.data.layout,
+                size=param.data.size(),
+                stride=param.data.stride(),
+                dtype=param.data.dtype,
+                layout=param.data.layout,
                 device="cpu",
                 pin_memory=pin_memory,
             )
-            cpu_data.copy_(p.data)
-            p.data = cpu_data
+            cpu_data.copy_(param.data)
+            param.data = cpu_data
 
     @staticmethod
     def create_device_tensors(module, device):
