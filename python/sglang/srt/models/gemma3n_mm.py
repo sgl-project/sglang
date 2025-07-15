@@ -1,7 +1,7 @@
 import logging
 import re
 from functools import lru_cache
-from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict, Union
+from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
 
 import torch
 from torch import nn
@@ -25,6 +25,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import (
+    Modality,
     MultimodalDataItem,
     MultimodalInputs,
     flatten_nested_list,
@@ -434,8 +435,10 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
-            image_data_embedding_func=self.get_image_feature,
-            audio_data_embedding_func=self.get_audio_feature,
+            data_embedding_funcs={
+                Modality.IMAGE: self.get_image_feature,
+                Modality.AUDIO: self.get_audio_feature,
+            },
             positions=positions,
             per_layer_inputs=per_layer_inputs,
         )

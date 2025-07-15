@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 pub mod config;
 pub mod logging;
 use std::collections::HashMap;
+pub mod core;
 pub mod openai_api_types;
 pub mod pd_router;
 pub mod pd_types;
@@ -37,8 +38,8 @@ struct Router {
     eviction_interval_secs: u64,
     max_tree_size: usize,
     max_payload_size: usize,
-    verbose: bool,
     log_dir: Option<String>,
+    log_level: Option<String>,
     service_discovery: bool,
     selector: HashMap<String, String>,
     service_discovery_port: u16,
@@ -129,7 +130,7 @@ impl Router {
             discovery,
             metrics,
             log_dir: self.log_dir.clone(),
-            verbose: self.verbose,
+            log_level: self.log_level.clone(),
         })
     }
 }
@@ -150,8 +151,8 @@ impl Router {
         eviction_interval_secs = 60,
         max_tree_size = 2usize.pow(24),
         max_payload_size = 256 * 1024 * 1024,  // 256MB default for large batches
-        verbose = false,
         log_dir = None,
+        log_level = None,
         service_discovery = false,
         selector = HashMap::new(),
         service_discovery_port = 80,
@@ -179,8 +180,8 @@ impl Router {
         eviction_interval_secs: u64,
         max_tree_size: usize,
         max_payload_size: usize,
-        verbose: bool,
         log_dir: Option<String>,
+        log_level: Option<String>,
         service_discovery: bool,
         selector: HashMap<String, String>,
         service_discovery_port: u16,
@@ -208,8 +209,8 @@ impl Router {
             eviction_interval_secs,
             max_tree_size,
             max_payload_size,
-            verbose,
             log_dir,
+            log_level,
             service_discovery,
             selector,
             service_discovery_port,
@@ -283,9 +284,9 @@ impl Router {
                 port: self.port,
                 worker_urls: self.worker_urls.clone(),
                 policy_config,
-                verbose: self.verbose,
                 max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
+                log_level: self.log_level.clone(),
                 service_discovery_config,
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,

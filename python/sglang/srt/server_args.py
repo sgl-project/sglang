@@ -46,6 +46,7 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
+    skip_server_warmup: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
@@ -62,11 +63,13 @@ class ServerArgs:
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
     hybrid_kvcache_ratio: Optional[float] = None
+    swa_full_tokens_ratio: float = 0.8
     impl: str = "auto"
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
+    nccl_port: Optional[int] = None
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -131,6 +134,8 @@ class ServerArgs:
     preferred_sampling_params: Optional[str] = None
 
     # LoRA
+    max_lora_rank: Optional[int] = None
+    lora_target_modules: Optional[List[str]] = None
     lora_paths: Optional[Union[dict[str, str], List[str]]] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
@@ -158,6 +163,7 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     enable_flashinfer_moe: bool = False
+    enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -216,12 +222,15 @@ class ServerArgs:
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
+    hicache_io_backend: str = ""
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
+    enable_triton_kernel_moe: bool = False
     warmups: Optional[str] = None
+    disable_hybrid_swa_memory: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -243,6 +252,10 @@ class ServerArgs:
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
+
+    # For PD-Multiplexing
+    enable_pdmux: bool = False
+    sm_group_num: int = 3
 
     def __post_init__(self):
         # Expert parallelism
@@ -319,6 +332,14 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
+            # Lazy init to avoid circular import
+            from sglang.srt.configs.model_config import ModelConfig
+
+            # Multimodal models need more memory for the image processor
+            model_config = ModelConfig.from_server_args(self)
+            if model_config.is_multimodal:
+                self.mem_fraction_static *= 0.90
+
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
             if gpu_mem is not None:
@@ -380,6 +401,12 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
 
+        if self.attention_backend == "ascend":
+            logger.warning(
+                "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
+            )
+            self.page_size = 128
+
         # Choose grammar backend
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
@@ -399,14 +426,10 @@ class ServerArgs:
         if self.enable_dp_lm_head:
             assert (
                 self.enable_dp_attention
-            ), "Please enable dp attention when setting enable_dp_attention. "
+            ), "Please enable dp attention when setting enable_dp_lm_head. "
 
         # DeepEP MoE
         if self.enable_deepep_moe:
-            if self.deepep_mode == "auto":
-                assert (
-                    not self.enable_dp_attention
-                ), "DeepEP MoE `auto` mode is not supported with DP Attention."
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
@@ -468,13 +491,21 @@ class ServerArgs:
 
             model_arch = get_model_arch(self)
 
-            # Auto set draft_model_path DeepSeek-V3/R1
             if model_arch == "DeepseekV3ForCausalLM":
+                # Auto set draft_model_path DeepSeek-V3/R1
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
                 else:
                     logger.warning(
                         "DeepSeek MTP does not require setting speculative_draft_model_path."
+                    )
+            elif "Llama4" in model_arch:
+                # TODO: remove this after Llama4 supports in other backends
+                if self.attention_backend != "fa3":
+                    self.attention_backend = "fa3"
+                    logger.warning(
+                        "Llama4 requires using fa3 attention backend. "
+                        "Attention backend is automatically set to fa3."
                     )
 
             # Auto choose parameters
@@ -591,6 +622,12 @@ class ServerArgs:
             help="The port of the HTTP server.",
         )
         parser.add_argument(
+            "--nccl-port",
+            type=int,
+            default=ServerArgs.nccl_port,
+            help="The port for NCCL distributed environment setup. Defaults to a random port.",
+        )
+        parser.add_argument(
             "--tokenizer-mode",
             type=str,
             default=ServerArgs.tokenizer_mode,
@@ -603,6 +640,11 @@ class ServerArgs:
             "--skip-tokenizer-init",
             action="store_true",
             help="If set, skip init tokenizer and pass input_ids in generate request.",
+        )
+        parser.add_argument(
+            "--skip-server-warmup",
+            action="store_true",
+            help="If set, skip warmup.",
         )
         parser.add_argument(
             "--load-format",
@@ -689,6 +731,7 @@ class ServerArgs:
                 "w8a8_fp8",
                 "moe_wna16",
                 "qoq",
+                "w4afp8",
             ],
             help="The quantization method.",
         )
@@ -831,6 +874,18 @@ class ServerArgs:
                 "(0.0 = pure uniform: swa_size / full_size = 1)"
                 "(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length)"
             ),
+        )
+        parser.add_argument(
+            "--swa-full-tokens-ratio",
+            type=float,
+            default=ServerArgs.swa_full_tokens_ratio,
+            help="The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. "
+            "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.",
+        )
+        parser.add_argument(
+            "--disable-hybrid-swa-memory",
+            action="store_true",
+            help="Disable the hybrid SWA memory.",
         )
 
         # Other runtime options
@@ -1028,9 +1083,16 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=["qwen25", "mistral", "llama3", "deepseekv3", "pythonic"],
+            choices=[
+                "qwen25",
+                "mistral",
+                "llama3",
+                "deepseekv3",
+                "pythonic",
+                "kimi_k2",
+            ],
             default=ServerArgs.tool_call_parser,
-            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', and 'pythonic'.",
+            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', and 'kimi_k2'.",
         )
 
         # Data parallelism
@@ -1081,6 +1143,28 @@ class ServerArgs:
 
         # LoRA
         parser.add_argument(
+            "--max-lora-rank",
+            default=ServerArgs.max_lora_rank,
+            type=int,
+            help="The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+        )
+        parser.add_argument(
+            "--lora-target-modules",
+            type=str,
+            choices=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+            nargs="*",
+            default=None,
+            help="The union set of all target modules where LoRA should be applied. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+        )
+        parser.add_argument(
             "--lora-paths",
             type=str,
             nargs="*",
@@ -1113,6 +1197,7 @@ class ServerArgs:
                 "flashmla",
                 "intel_amx",
                 "torch_native",
+                "ascend",
                 "triton",
             ],
             default=ServerArgs.attention_backend,
@@ -1219,6 +1304,11 @@ class ServerArgs:
             "--enable-flashinfer-moe",
             action="store_true",
             help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP with --enable-ep-moe",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-allreduce-fusion",
+            action="store_true",
+            help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
         )
         parser.add_argument(
             "--enable-deepep-moe",
@@ -1520,6 +1610,13 @@ class ServerArgs:
             help="The write policy of hierarchical cache.",
         )
         parser.add_argument(
+            "--hicache-io-backend",
+            type=str,
+            choices=["direct", "kernel"],
+            default=ServerArgs.hicache_io_backend,
+            help="The IO backend for KV cache transfer between CPU and GPU",
+        )
+        parser.add_argument(
             "--flashinfer-mla-disable-ragged",
             action="store_true",
             help="Not using ragged prefill wrapper when running flashinfer mla",
@@ -1543,6 +1640,11 @@ class ServerArgs:
             "--enable-return-hidden-states",
             action="store_true",
             help="Enable returning hidden states with responses.",
+        )
+        parser.add_argument(
+            "--enable-triton-kernel-moe",
+            action="store_true",
+            help="Use triton moe grouped gemm kernel.",
         )
         parser.add_argument(
             "--warmups",
@@ -1589,7 +1691,7 @@ class ServerArgs:
             "--disaggregation-transfer-backend",
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
-            choices=["mooncake", "nixl"],
+            choices=["mooncake", "nixl", "ascend"],
             help="The backend for disaggregation transfer. Default is mooncake.",
         )
         parser.add_argument(
@@ -1642,6 +1744,17 @@ class ServerArgs:
             nargs="*",
             default=None,
             help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
+        )
+        parser.add_argument(
+            "--enable-pdmux",
+            action="store_true",
+            help="Enable PD-Multiplexing, PD running on greenctx stream.",
+        )
+        parser.add_argument(
+            "--sm-group-num",
+            type=int,
+            default=ServerArgs.sm_group_num,
+            help="Number of sm partition groups.",
         )
         parser.add_argument(
             "--weight-loader-disable-mmap",
@@ -1740,14 +1853,17 @@ class PortArgs:
 
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
-        port = server_args.port + random.randint(100, 1000)
-        while True:
-            if is_port_available(port):
-                break
-            if port < 60000:
-                port += 42
-            else:
-                port -= 43
+        if server_args.nccl_port is None:
+            port = server_args.port + random.randint(100, 1000)
+            while True:
+                if is_port_available(port):
+                    break
+                if port < 60000:
+                    port += 42
+                else:
+                    port -= 43
+        else:
+            port = server_args.nccl_port
 
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
