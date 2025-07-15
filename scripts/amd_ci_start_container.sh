@@ -18,11 +18,11 @@ find_latest_mi30x_image() {
     local check_date=$(date -d "$days_back days ago" +%Y%m%d)
     local image_tag="${base_tag}-${check_date}"
 
-    echo "Checking for image: rocm/sgl-dev:${image_tag}"
+echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
 
     # Check if the image exists by trying to get its manifest
     if docker manifest inspect "rocm/sgl-dev:${image_tag}" >/dev/null 2>&1; then
-      echo "Found available image: rocm/sgl-dev:${image_tag}"
+echo "Found available image: rocm/sgl-dev:${image_tag}" >&2
       echo "rocm/sgl-dev:${image_tag}"
       return 0
     fi
