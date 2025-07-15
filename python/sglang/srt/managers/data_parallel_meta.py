@@ -51,5 +51,4 @@ class DPBalanceMeta:
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        # 在子进程中，self._manager 会是 None
         self._manager = None
