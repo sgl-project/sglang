@@ -661,22 +661,18 @@ class OpenAIMoeAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
-        attn_output_torch_native = self.attn(*inner_state)
+        attn_output = self.attn(*inner_state)
         # todo: check if sinks need fp32 before exp
         sinks = torch.exp(self.sinks)
         sinks = sinks.to(torch.float32)
         # flashinfer_output = self.attn(*inner_state, sink=sinks)
         # o_ref = self.flashinfer_attention_ref(inner_state, sinks)
-        # q = inner_state[0].view(-1, self.num_kv_heads, self.num_heads // self.num_kv_heads, self.head_dim)
-        # k = inner_state[1].view(-1, self.num_kv_heads, self.head_dim)
-        # v = inner_state[2].view(-1, self.num_kv_heads, self.head_dim)
-        # attn_output = sdpa(q, k, v, self.sinks, self.scaling, self.sliding_window + 1)
 
         # print(f"### layer_id={self.layer_id}, attn_output.shape={attn_output.shape}, o_ref.shape={o_ref.shape}, flashinfer_output.shape={flashinfer_output.shape}")
         # torch.testing.assert_close(o_ref, flashinfer_output, rtol=1e-2, atol=1e-2)
         # torch.testing.assert_close(attn_output, o_ref, rtol=1e-2, atol=1e-2)
 
-        output, _ = self.o_proj(attn_output_torch_native)
+        output, _ = self.o_proj(attn_output)
         return output
 
     def forward(

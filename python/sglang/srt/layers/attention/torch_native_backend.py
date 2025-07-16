@@ -339,21 +339,25 @@ class TorchNativeAttnSinkBackend(TorchNativeAttnBackend):
         """Run the extend forward by using custom sdpa op.
 
         Args:
-            query: [num_tokens, num_heads, head_size]
-            output: [num_tokens, num_heads, head_size]
-            k_cache: [max_total_num_tokens, num_heads, head_size]
-            v_cache: [max_total_num_tokens, num_heads, head_size]
+            query: [num_tokens, num_q_heads, head_size]
+            output: [num_tokens, num_q_heads, head_size]
+            k_cache: [max_total_num_tokens, num_kv_heads, head_size]
+            v_cache: [max_total_num_tokens, num_kv_heads, head_size]
             req_to_token: [max_num_reqs, max_context_len]
             req_pool_indices: [num_seqs]
             seq_lens: [num_seqs]
             extend_prefix_lens: [num_seqs]
             extend_seq_lens: [num_seqs]
+            num_kv_heads: int
+            q_mult: int
             scaling: float or None
+            sliding_window: int or None
+            attention_sinks: torch.Tensor or None
             enable_gqa: bool
             causal: bool
 
         Returns:
-            output: [num_tokens, num_heads, head_size]
+            output: [num_tokens, num_q_heads, head_size]
         """
 
         assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
@@ -428,19 +432,23 @@ class TorchNativeAttnSinkBackend(TorchNativeAttnBackend):
         """Run the decode forward by using custom sdpa op.
 
         Args:
-            query: [num_tokens, num_heads, head_size]
-            output: [num_tokens, num_heads, head_size]
-            k_cache: [max_total_num_tokens, num_heads, head_size]
-            v_cache: [max_total_num_tokens, num_heads, head_size]
+            query: [num_tokens, num_q_heads, head_size]
+            output: [num_tokens, num_q_heads, head_size]
+            k_cache: [max_total_num_tokens, num_kv_heads, head_size]
+            v_cache: [max_total_num_tokens, num_kv_heads, head_size]
             req_to_token: [max_num_reqs, max_context_len]
             req_pool_indices: [num_seqs]
             seq_lens: [num_seqs]
+            num_kv_heads: int
+            q_mult: int
             scaling: float or None
+            sliding_window: int or None
+            attention_sinks: torch.Tensor or None
             enable_gqa: bool
             causal: bool
 
         Returns:
-            output: [num_tokens, num_heads, head_size]
+            output: [num_tokens, num_q_heads, head_size]
         """
 
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
