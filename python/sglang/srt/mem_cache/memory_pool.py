@@ -520,8 +520,13 @@ class SWAKVPool(KVCache):
             self.layers_mapping[global_layer_id] = (swa_layer_id, True)
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
 
+        k_size, v_size = self.get_kv_size_bytes()
+        self.mem_usage = (k_size + v_size) / GB
+
     def get_kv_size_bytes(self):
-        raise NotImplementedError
+        k_size, v_size = self.full_kv_pool.get_kv_size_bytes()
+        k_size_swa, v_size_swa = self.swa_kv_pool.get_kv_size_bytes()
+        return k_size + k_size_swa, v_size + v_size_swa
 
     def get_contiguous_buf_infos(self):
         full_kv_data_ptrs, full_kv_data_lens, full_kv_item_lens = (
@@ -596,6 +601,16 @@ class SWAKVPool(KVCache):
                 v_scale,
                 layer_id_override=layer_id_pool,
             )
+
+    def load_from_host_per_layer(
+        self, host_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        raise NotImplementedError("HiCache not supported for SWAKVPool.")
+
+    def backup_to_host_all_layer(
+        self, host_pool, host_indices, device_indices, io_backend
+    ):
+        raise NotImplementedError("HiCache not supported for SWAKVPool.")
 
 
 class AscendTokenToKVPool(MHATokenToKVPool):
