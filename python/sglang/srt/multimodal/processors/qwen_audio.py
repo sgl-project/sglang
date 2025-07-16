@@ -3,12 +3,12 @@ from typing import List, Union
 
 import torch
 
-from sglang.srt.managers.multimodal_processors.base_processor import (
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.models.qwen2_audio import Qwen2AudioForConditionalGeneration
+from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.models.qwen2_audio import Qwen2AudioForConditionalGeneration
 
 
 class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
