@@ -344,7 +344,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
             
             if not has_tool_calls and not self.content:
                 raise ValueError(
-                    "The contents of the assistant message is required unless tool_calls is specified."
+                    "The content field is required for assistant role messages unless tool_calls is specified."
                 )
         elif self.role in ["system", "tool"]:
             # For system and tool roles: content is always required
