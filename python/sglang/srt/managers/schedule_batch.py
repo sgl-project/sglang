@@ -307,7 +307,6 @@ class MultimodalDataItem:
     def merge(self, other):
         self.feature += other.feature
         self.image_sizes += other.image_sizes
-        self.image_offsets += other.image_offsets
         self.hash = hash((self.hash, other.hash))
         self.set_pad_value()
 
