@@ -259,7 +259,8 @@ class MultimodalDataItem:
                 self.hash = hash_feature(self.precomputed_features)
             else:
                 self.hash = hash_feature(self.feature)
-
+        print(f"{self.hash=}")
+        print(f"{self.feature=}")
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
 
@@ -304,9 +305,8 @@ class MultimodalDataItem:
         return ret
 
     def merge(self, other):
-        self.pixel_values += other.pixel_values
+        self.feature += other.feature
         self.image_sizes += other.image_sizes
-        self.image_offsets += other.image_offsets
         self.hash = hash((self.hash, other.hash))
         self.set_pad_value()
 
