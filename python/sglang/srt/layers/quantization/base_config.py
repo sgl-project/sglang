@@ -18,14 +18,14 @@ class QuantizeMethodBase(ABC):
         """Create weights for a layer.
 
         The weights will be set as attributes of the layer."""
-        raise NotImplementedError
+        raise NotImplementedError()
 
     @abstractmethod
     def apply(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
         """Apply the weights in layer to the input tensor.
 
         Expects create_weights to have been called before on the layer."""
-        raise NotImplementedError
+        raise NotImplementedError()
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """Process the weight after loading.
@@ -62,7 +62,7 @@ class LinearMethodBase(QuantizeMethodBase):
             output_size: Size of the output dim of the weight across all ranks.
             params_dtype: Datatype of the parameters.
         """
-        raise NotImplementedError
+        raise NotImplementedError()
 
     @abstractmethod
     def apply(
@@ -73,7 +73,7 @@ class LinearMethodBase(QuantizeMethodBase):
     ) -> torch.Tensor:
         """Apply the weights in layer to the input tensor.
         Expects create_weights to have been called before on the layer."""
-        raise NotImplementedError
+        raise NotImplementedError()
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):
@@ -88,7 +88,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        raise NotImplementedError
+        raise NotImplementedError()
 
     @abstractmethod
     def apply(
@@ -100,7 +100,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         renormalize: bool,
         use_grouped_topk: bool,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        raise NotImplementedError()
 
 
 class QuantizationConfig(ABC):
@@ -114,12 +114,12 @@ class QuantizationConfig(ABC):
     @abstractmethod
     def get_name(self) -> str:
         """Name of the quantization method."""
-        raise NotImplementedError
+        raise NotImplementedError()
 
     @abstractmethod
     def get_supported_act_dtypes(self) -> List[torch.dtype]:
         """List of supported activation dtypes."""
-        raise NotImplementedError
+        raise NotImplementedError()
 
     @classmethod
     @abstractmethod
@@ -130,19 +130,19 @@ class QuantizationConfig(ABC):
         This requirement is due to the custom CUDA kernels used by the
         quantization method.
         """
-        raise NotImplementedError
+        raise NotImplementedError()
 
     @staticmethod
     @abstractmethod
     def get_config_filenames() -> List[str]:
         """List of filenames to search for in the model directory."""
-        raise NotImplementedError
+        raise NotImplementedError()
 
     @classmethod
     @abstractmethod
     def from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
         """Create a config class from the model's quantization config."""
-        raise NotImplementedError
+        raise NotImplementedError()
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
@@ -185,7 +185,7 @@ class QuantizationConfig(ABC):
             The quantize method. None if the given layer doesn't support quant
             method.
         """
-        raise NotImplementedError
+        raise NotImplementedError()
 
     @abstractmethod
     def get_scaled_act_names(self) -> List[str]:
@@ -193,7 +193,7 @@ class QuantizationConfig(ABC):
 
         For now, this is only used by AWQ.
         """
-        raise NotImplementedError
+        raise NotImplementedError()
 
 
 def method_has_implemented_embedding(method_class: Type[QuantizeMethodBase]) -> bool:
