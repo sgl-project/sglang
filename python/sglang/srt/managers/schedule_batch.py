@@ -1271,7 +1271,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if mm_input is None:
                 continue
             for mm_item in mm_input.mm_items:
-                pixel_values = getattr(mm_item, "pixel_values", None)
+                pixel_values = getattr(mm_item, "feature", None)
                 if isinstance(pixel_values, torch.Tensor):
                     mm_item.feature = pixel_values.to(self.device, non_blocking=True)
         self.multimodal_inputs = multimodal_inputs
