@@ -52,6 +52,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_hip,
     is_npu,
+    next_power_of_2,
 )
 
 _is_hip = is_hip()
@@ -158,17 +159,11 @@ class GroupedGemmRunner(torch.nn.Module):
         return c
 
 
-def next_positive_power_of_2(x: int) -> int:
-    if x < 1:
-        return 1
-    return 1 << (x - 1).bit_length()
-
-
 def _get_tile_tokens_dim(num_tokens, top_k, num_experts):
     # Guess tokens per expert assuming perfect expert distribution first.
     num_tokens_per_expert = (num_tokens * top_k) // num_experts
     # And pad the number to the next power of 2.
-    tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
+    tile_tokens_dim = next_power_of_2(num_tokens_per_expert)
     # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
     tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
     return tile_tokens_dim
@@ -521,27 +516,27 @@ class EPMoE(torch.nn.Module):
             a_sf_t = a_sf.t().contiguous()
             assert fi_fused_moe is not None
             fi_fused_moe.trtllm_fp8_block_scale_moe(
-                router_logits.to(torch.float32),
-                self.correction_bias,
-                a_q,
-                a_sf_t,
-                self.w13_weight,
-                self.w13_weight_scale_inv,
-                self.w2_weight,
-                self.w2_weight_scale_inv,
-                output,
-                self.num_experts,
-                self.top_k,
-                self.num_expert_group,
-                self.topk_group,
-                self.w2_weight.shape[2],
-                self.start_expert_id,
-                self.end_expert_id - self.start_expert_id,
+                expert_logits=router_logits.to(torch.float32),
+                routing_bias=self.correction_bias,
+                hidden_states=a_q,
+                hidden_states_scale=a_sf_t,
+                gemm1_weights=self.w13_weight,
+                gemm1_scales=self.w13_weight_scale_inv,
+                gemm2_weights=self.w2_weight,
+                gemm2_scales=self.w2_weight_scale_inv,
+                output=output,
+                num_experts=self.num_experts,
+                top_k=self.top_k,
+                n_groups=self.num_expert_group,
+                top_k_groups=self.topk_group,
+                intermediate_size=self.w2_weight.shape[2],
+                local_expert_offset=self.start_expert_id,
+                local_num_experts=self.end_expert_id - self.start_expert_id,
                 routed_scaling=self.routed_scaling_factor,
                 tile_tokens_dim=_get_tile_tokens_dim(
                     hidden_states.shape[0], self.top_k, self.num_experts
                 ),
-                routing_method_type=2,
+                routing_method_type=2, # DeepSeek-styled routing method
             )
             return output
 
@@ -896,22 +891,21 @@ class EPMoE(torch.nn.Module):
             )
             return
 
-        if shard_id == "w2":
-            param.data[expert_id] = loaded_weight
-        elif shard_id in ["w1", "w3"]:
-            # Effectively, flashinfer assumes w31 format for w13_weight. Same for the scales.
-            if _use_flashinfer_blockscale_fp8_moe:
-                if shard_id == "w1":
-                    param.data[expert_id][self.intermediate_size :, :] = loaded_weight
-                elif shard_id == "w3":
-                    param.data[expert_id][: self.intermediate_size, :] = loaded_weight
-            else:
-                if shard_id == "w1":
-                    param.data[expert_id][: self.intermediate_size, :] = loaded_weight
-                elif shard_id == "w3":
-                    param.data[expert_id][self.intermediate_size :, :] = loaded_weight
+        # Effectively, flashinfer assumes w31 format for w13_weight. Same for
+        # the scales.
+        if _use_flashinfer_blockscale_fp8_moe:
+            effective_shard_id = {"w1":"w3","w3":"w1", "w2":"w2"}[shard_id]
         else:
-            raise ValueError(f"Expected shard_id w1,w2 or w3 but got {shard_id}")
+            effective_shard_id = shard_id
+
+        if effective_shard_id == "w2":
+            param.data[expert_id] = loaded_weight
+        elif effective_shard_id == "w1":
+            param.data[expert_id][: self.intermediate_size, :] = loaded_weight
+        elif effective_shard_id == "w3":
+            param.data[expert_id][self.intermediate_size :, :] = loaded_weight
+        else:
+            raise ValueError(f"Expected shard_id w1,w2 or w3 but got {effective_shard_id}")
 
     def _load_fp8_scale(
         self,
@@ -948,26 +942,21 @@ class EPMoE(torch.nn.Module):
         # Weight scales
         elif "weight_scale" in weight_name:
             if self.use_block_quant:
+                if _use_flashinfer_blockscale_fp8_moe:
+                    effective_shard_id = {"w1":"w3","w3":"w1", "w2":"w2"}[shard_id]
+                else:
+                    effective_shard_id = shard_id
+
                 block_n, block_k = self.block_shape[0], self.block_shape[1]
-                if shard_id in ["w1", "w3"]:
-                    if _use_flashinfer_blockscale_fp8_moe:
-                        if shard_id == "w1":
-                            param_data[expert_id][
-                                (self.intermediate_size + block_n - 1) // block_n :, :
-                            ] = loaded_weight
-                        elif shard_id == "w3":
-                            param_data[expert_id][
-                                : (self.intermediate_size + block_n - 1) // block_n, :
-                            ] = loaded_weight
-                    else:
-                        if shard_id == "w1":
-                            param_data[expert_id][
-                                : (self.intermediate_size + block_n - 1) // block_n, :
-                            ] = loaded_weight
-                        elif shard_id == "w3":
-                            param_data[expert_id][
-                                (self.intermediate_size + block_n - 1) // block_n :, :
-                            ] = loaded_weight
+            
+                if effective_shard_id == "w1":
+                    param_data[expert_id][
+                        : (self.intermediate_size + block_n - 1) // block_n, :
+                    ] = loaded_weight
+                elif effective_shard_id == "w3":
+                    param_data[expert_id][
+                        (self.intermediate_size + block_n - 1) // block_n :, :
+                    ] = loaded_weight
                 else:  # w2
                     param_data[expert_id] = loaded_weight
             elif self.use_w4afp8:
