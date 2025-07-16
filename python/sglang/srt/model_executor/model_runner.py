@@ -264,11 +264,7 @@ class ModelRunner:
         )
         self.expert_location_updater = ExpertLocationUpdater()
 
-<<<<<<< HEAD
-        if self.server_args.ep_dispatch_algorithm == "lp":
-=======
         if self.server_args.ep_dispatch_algorithm == 'lp':
->>>>>>> 981a3d39 (Inplemented LP ep dispatch.)
             set_global_token_dispatch_metadata(
                 TokenDispatchMetadata.init(
                     get_global_expert_location_metadata().physical_to_logical_map.cpu().numpy(),
@@ -674,11 +670,7 @@ class ModelRunner:
             nnodes=self.server_args.nnodes,
             rank=self.tp_rank,
         )
-<<<<<<< HEAD
-        if self.server_args.ep_dispatch_algorithm == "lp":
-=======
         if self.server_args.ep_dispatch_algorithm == 'lp':
->>>>>>> 981a3d39 (Inplemented LP ep dispatch.)
             set_global_token_dispatch_metadata(
                 TokenDispatchMetadata.init(
                     get_global_expert_location_metadata().physical_to_logical_map.cpu().numpy(),

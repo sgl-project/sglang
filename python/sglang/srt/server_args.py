@@ -158,11 +158,7 @@ class ServerArgs:
     enable_flashinfer_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
-<<<<<<< HEAD
-    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake", "lp", "test"]] = None
-=======
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake", "lp"]] = None
->>>>>>> 981a3d39 (Inplemented LP ep dispatch.)
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
     eplb_algorithm: str = "auto"
