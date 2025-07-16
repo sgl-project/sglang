@@ -297,6 +297,8 @@ class SchedulerDisaggregationPrefillMixin:
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
             # Otherwise, it hangs under high concurrency
             self.running_batch.batch_is_full = False
+
+        # Flush the disaggregation resources
         self.flush_disaggregation_resources()
         del self.stop_prefill_event
 
@@ -349,6 +351,12 @@ class SchedulerDisaggregationPrefillMixin:
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
             # Otherwise, it hangs under high concurrency
             self.running_batch.batch_is_full = False
+        
+        # Flush the disaggregation resources
+        if "tmp_batch" in locals():
+            del tmp_batch
+        if "tmp_result" in locals():
+            del tmp_result
         self.flush_disaggregation_resources()
         del self.stop_prefill_event
 

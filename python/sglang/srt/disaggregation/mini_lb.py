@@ -434,6 +434,7 @@ async def convert_pd_role(obj: PDConvertRequest):
             status_code=500,
             detail=f"Invalid URL:{server_url}. The server may be not registered.",
         )
+    
     # flush the cache first, when flush cache is success, then we can try to convert pd role
     # wait 10s for server to finish all requests
     max_tries = 10
@@ -448,7 +449,7 @@ async def convert_pd_role(obj: PDConvertRequest):
                         f"There are some request to server {server_url} haven't been done. Waiting..."
                     )
                 max_tries -= 1
-                await asyncio.sleep(1)
+                await asyncio.sleep(5)
         except:
             raise HTTPException(
                 status_code=500,

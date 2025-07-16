@@ -1180,12 +1180,10 @@ class TokenizerManager:
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            if responses[0].success:
-                # stop the bootstrap server then
-                await asyncio.sleep(2)
-                self.bootstrap_server.close()
-                del self.bootstrap_server
-                self.disaggregation_mode = DisaggregationMode.DECODE
+            # stop the bootstrap server then
+            self.bootstrap_server.close()
+            del self.bootstrap_server
+            self.disaggregation_mode = DisaggregationMode.DECODE
             return responses[0].success, responses[0].message, None
         else:
             self.disaggregation_mode = DisaggregationMode.PREFILL
