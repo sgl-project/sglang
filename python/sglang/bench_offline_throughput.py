@@ -449,6 +449,7 @@ if __name__ == "__main__":
 
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
+
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
         format="%(message)s",
