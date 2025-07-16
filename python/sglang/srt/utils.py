@@ -84,7 +84,6 @@ from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager
-from video_reader import PyVideoReader
 
 logger = logging.getLogger(__name__)
 

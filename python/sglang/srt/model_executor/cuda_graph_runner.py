@@ -29,9 +29,9 @@ from torch.profiler import ProfilerActivity, profile
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
+from sglang.srt.layers.dp_attention import DPGatherMode, get_attention_tp_size
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -169,6 +169,10 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
 
     if server_args.enable_two_batch_overlap:
         capture_bs = [bs for bs in capture_bs if bs % 2 == 0]
+
+    if require_gathered_buffer(server_args):
+        attn_tp_size = get_attention_tp_size()
+        capture_bs = [bs for bs in capture_bs if bs % attn_tp_size == 0]
 
     if server_args.cuda_graph_max_bs:
         capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
@@ -533,6 +537,7 @@ class CudaGraphRunner:
             return_logprob=False,
             positions=positions,
             global_num_tokens_gpu=global_num_tokens,
+            dp_gather_mode=DPGatherMode.ALL_GATHER,
             gathered_buffer=gathered_buffer,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,

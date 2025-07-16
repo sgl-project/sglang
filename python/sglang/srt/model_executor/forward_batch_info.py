@@ -38,7 +38,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.dp_attention import get_attention_dp_rank
+from sglang.srt.layers.dp_attention import (
+    DPGatherMode,
+    get_attention_dp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import (
     flatten_nested_list,
@@ -249,6 +253,8 @@ class ForwardBatch:
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    # The gather mode for DP attention
+    dp_gather_mode: Optional[DPGatherMode] = None
     # for extend, local start pos and num tokens is different in logits processor
     # this will be computed in get_dp_local_info
     # this will be recomputed in LogitsMetadata.from_forward_batch
@@ -274,7 +280,7 @@ class ForwardBatch:
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
-    tbo_children: Optional[List["ForwardBatch"]] = None
+    tbo_children: Optional[List[ForwardBatch]] = None
 
     @classmethod
     def init_new(
@@ -578,15 +584,110 @@ class ForwardBatch:
         )
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
+
         assert self.global_num_tokens_cpu is not None
+        assert self.global_num_tokens_for_logprob_cpu is not None
+
         global_num_tokens = self.global_num_tokens_cpu
-        sum_len = sum(global_num_tokens)
+        global_num_tokens_for_logprob = self.global_num_tokens_for_logprob_cpu
+        sync_group_size = len(global_num_tokens)
+
+        dp_gather_mode = DPGatherMode.get_dp_gather_mode(global_num_tokens)
+        self.dp_gather_mode = dp_gather_mode
+
+        if dp_gather_mode.is_all_gather():
+            # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter
+            # across attn_tp dim
+            max_num_tokens = max(global_num_tokens)
+            attn_tp_size = get_attention_tp_size()
+            max_num_tokens = ((max_num_tokens - 1) // attn_tp_size + 1) * attn_tp_size
+            # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
+            max_num_tokens_for_logprob = max(global_num_tokens_for_logprob)
+            # tokens across all ranks should be padded to the same length
+            buffer_len = max_num_tokens * sync_group_size
+        else:
+            buffer_len = sum(global_num_tokens)
+
         self.gathered_buffer = torch.zeros(
-            (sum_len, model_runner.model_config.hidden_size),
+            (buffer_len, model_runner.model_config.hidden_size),
             dtype=model_runner.dtype,
             device=model_runner.device,
         )
-        if self.forward_mode.is_draft_extend():
+
+        if dp_gather_mode.is_all_gather():
+            # When DP gather mode is all gather, we will use all_gather_into_tensor to gather hidden states,
+            # where transferred tokens should be padded to the same length.
+            if len(global_num_tokens) > 1:
+                num_tokens = global_num_tokens[get_attention_dp_rank()]
+                num_tokens_for_logprob = global_num_tokens_for_logprob[
+                    get_attention_dp_rank()
+                ]
+            else:
+                num_tokens = global_num_tokens[0]
+                num_tokens_for_logprob = global_num_tokens_for_logprob[0]
+            # get batch size
+            if self.spec_info is not None:
+                if isinstance(self.spec_info, EagleDraftInput):
+                    bs = num_tokens // self.spec_info.num_tokens_per_batch
+                else:
+                    assert isinstance(self.spec_info, EagleVerifyInput)
+                    bs = num_tokens // self.spec_info.draft_token_num
+            else:
+                bs = num_tokens
+            # padding
+            global_num_tokens = [max_num_tokens] * sync_group_size
+            global_num_tokens_for_logprob = [
+                max_num_tokens_for_logprob
+            ] * sync_group_size
+            self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
+            self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
+            self.seq_lens = self._pad_tensor_to_size(self.seq_lens, bs)
+            self.out_cache_loc = self._pad_tensor_to_size(
+                self.out_cache_loc, num_tokens
+            )
+            if self.encoder_lens is not None:
+                self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
+            self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
+            self.global_num_tokens_cpu = self.global_num_tokens_gpu
+            self.global_num_tokens_gpu = self.global_num_tokens_gpu.new_tensor(
+                self.global_num_tokens_gpu
+            )
+            self.global_num_tokens_for_logprob_cpu = (
+                self.global_num_tokens_for_logprob_gpu
+            )
+            self.global_num_tokens_for_logprob_gpu = (
+                self.global_num_tokens_for_logprob_gpu.new_tensor(
+                    self.global_num_tokens_for_logprob_gpu
+                )
+            )
+            if self.mrope_positions is not None:
+                self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)
+
+            if self.extend_seq_lens is not None:
+                self.extend_seq_lens = self._pad_tensor_to_size(
+                    self.extend_seq_lens, bs
+                )
+
+            if self.spec_info is not None and isinstance(
+                self.spec_info, EagleDraftInput
+            ):
+                spec_info = self.spec_info
+                if spec_info.topk_p is not None:
+                    spec_info.topk_p = self._pad_tensor_to_size(spec_info.topk_p, bs)
+                if spec_info.topk_index is not None:
+                    spec_info.topk_index = self._pad_tensor_to_size(
+                        spec_info.topk_index, bs
+                    )
+                if spec_info.accept_length is not None:
+                    spec_info.accept_length = self._pad_tensor_to_size(
+                        spec_info.accept_length, bs
+                    )
+                spec_info.hidden_states = self._pad_tensor_to_size(
+                    spec_info.hidden_states, num_tokens
+                )
+
+        elif self.forward_mode.is_draft_extend():
+            # Under draft extend, the actual accepted tokens can be less than num_tokens. Padding is needed.
             if len(global_num_tokens) > 1:
                 num_tokens = global_num_tokens[get_attention_dp_rank()]
             else:

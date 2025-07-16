@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
+from sglang.srt.layers.dp_attention import DPGatherMode
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
@@ -233,6 +234,7 @@ class EAGLEDraftCudaGraphRunner:
             return_logprob=False,
             positions=positions,
             global_num_tokens_gpu=global_num_tokens,
+            dp_gather_mode=DPGatherMode.ALL_GATHER,
             gathered_buffer=gathered_buffer,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,

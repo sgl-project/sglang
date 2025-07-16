@@ -499,6 +499,15 @@ class GroupCoordinator:
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
+    def reduce_scatter_tensor(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+    ) -> None:
+        # TODO(ch-wan): support other backends
+        torch.distributed.reduce_scatter_tensor(output, input, group=self.device_group)
+        return output
+
     def reduce_scatter(
         self,
         output: torch.Tensor,
