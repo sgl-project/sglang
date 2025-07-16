@@ -964,6 +964,7 @@ class Scheduler(
                             self.world_group.device_group,
                             self.pp_rank * self.tp_size + dp_offset,
                             (self.pp_rank + 1) * self.tp_size + dp_offset,
+                            device=self.device,
                         )
 
                     # send out proxy tensors to the next stage
@@ -1012,6 +1013,7 @@ class Scheduler(
                     self.world_group.device_group,
                     (self.pp_rank - 1) * self.tp_size + dp_offset,
                     self.pp_rank * self.tp_size + dp_offset,
+                    device=self.device,
                 )
             else:
                 recv_reqs = None
@@ -1042,6 +1044,7 @@ class Scheduler(
                     self.attn_tp_group.rank,
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
+                    device=self.device,
                 )
             if self.tp_size != 1:
                 control_reqs = broadcast_pyobj(
@@ -1049,6 +1052,7 @@ class Scheduler(
                     self.tp_group.rank,
                     self.tp_cpu_group,
                     src=self.tp_group.ranks[0],
+                    device=self.device,
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
@@ -1057,6 +1061,7 @@ class Scheduler(
                 self.tp_group.rank,
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
+                device=self.device,
             )
         return recv_reqs
 
@@ -1955,7 +1960,7 @@ class Scheduler(
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
-            tp_cpu_group=self.tp_cpu_group,
+            tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
             spec_algorithm=self.spec_algorithm,
@@ -1964,6 +1969,7 @@ class Scheduler(
             enable_deepep_moe=self.server_args.enable_deepep_moe,
             deepep_mode=DeepEPMode[self.server_args.deepep_mode],
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
+            disable_overlap_schedule=self.server_args.disable_overlap_schedule,
         )
 
     @staticmethod
@@ -1971,7 +1977,7 @@ class Scheduler(
         local_batch: ScheduleBatch,
         dp_size,
         attn_tp_size: int,
-        tp_cpu_group,
+        tp_group,
         get_idle_batch,
         disable_cuda_graph: bool,
         spec_algorithm,
@@ -1980,6 +1986,7 @@ class Scheduler(
         enable_deepep_moe: bool,
         deepep_mode: DeepEPMode,
         require_mlp_tp_gather: bool,
+        disable_overlap_schedule: bool,
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -2010,6 +2017,12 @@ class Scheduler(
         )
 
         tbo_preparer = TboDPAttentionPreparer()
+        if disable_overlap_schedule:
+            group = tp_group.device_group
+            device = tp_group.device
+        else:
+            group = tp_group.cpu_group
+            device = "cpu"
 
         local_info = torch.tensor(
             [
@@ -2025,15 +2038,17 @@ class Scheduler(
                 ),
             ],
             dtype=torch.int64,
+            device=device,
         )
         global_info = torch.empty(
             (dp_size, attn_tp_size, 6),
             dtype=torch.int64,
+            device=device,
         )
         torch.distributed.all_gather_into_tensor(
             global_info.flatten(),
             local_info,
-            group=tp_cpu_group,
+            group=group,
         )
         global_num_tokens = global_info[:, 0, 0].tolist()
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
