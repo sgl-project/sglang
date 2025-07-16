@@ -39,7 +39,6 @@ jobs:
         run: bash scripts/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          RUNNER_NAME: ${{ matrix.runner }}
 
       - name: Install dependencies
         run: bash scripts/amd_ci_install_dependency.sh
@@ -66,7 +65,6 @@ jobs:
         run: bash scripts/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          RUNNER_NAME: ${{ matrix.runner }}
 
       - name: Install dependencies
         run: bash scripts/amd_ci_install_dependency.sh
@@ -91,7 +89,6 @@ jobs:
         run: bash scripts/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          RUNNER_NAME: ${{ matrix.runner }}
 
       - name: Install dependencies
         run: bash scripts/amd_ci_install_dependency.sh
@@ -116,7 +113,6 @@ jobs:
         run: bash scripts/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          RUNNER_NAME: ${{ matrix.runner }}
 
       - name: Install dependencies
         run: bash scripts/amd_ci_install_dependency.sh
@@ -157,7 +153,6 @@ jobs:
         run: bash scripts/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          RUNNER_NAME: ${{ matrix.runner }}
 
       - name: Install dependencies
         run: bash scripts/amd_ci_install_dependency.sh
@@ -192,7 +187,6 @@ jobs:
         run: bash scripts/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          RUNNER_NAME: ${{ matrix.runner }}
 
       - name: Install dependencies
         run: bash scripts/amd_ci_install_dependency.sh
@@ -239,7 +233,6 @@ jobs:
         run: bash scripts/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          RUNNER_NAME: ${{ matrix.runner }}
 
       - name: Install dependencies
         run: bash scripts/amd_ci_install_dependency.sh
@@ -264,7 +257,6 @@ jobs:
         run: bash scripts/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          RUNNER_NAME: ${{ matrix.runner }}
 
       - name: Install dependencies
         run: bash scripts/amd_ci_install_dependency.sh
@@ -289,7 +281,6 @@ jobs:
         run: bash scripts/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          RUNNER_NAME: ${{ matrix.runner }}
 
       - name: Install dependencies
         run: bash scripts/amd_ci_install_dependency.sh
@@ -320,7 +311,6 @@ jobs:
         run: bash scripts/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          RUNNER_NAME: ${{ matrix.runner }}
 
       - name: Install dependencies
         run: |

@@ -59,7 +59,19 @@ find_latest_mi35x_image() {
 }
 
 # Determine image finder and fallback based on runner
-echo "The runner is: ${RUNNER_NAME:="unknown"}"
+# In Kubernetes, the hostname contains the GPU type (e.g., linux-mi300-gpu-1-bgg8r-runner-vknlb)
+# Extract the GPU type from hostname
+HOSTNAME_VALUE=$(hostname)
+RUNNER_NAME="unknown"
+
+if [[ "${HOSTNAME_VALUE}" =~ ^(linux-mi[0-9]+-gpu-[0-9]+) ]]; then
+  RUNNER_NAME="${BASH_REMATCH[1]}"
+  echo "Extracted runner from hostname: ${RUNNER_NAME}"
+else
+  echo "Could not extract runner info from hostname: ${HOSTNAME_VALUE}"
+fi
+
+echo "The runner is: ${RUNNER_NAME}"
 FIND_IMAGE_CMD="find_latest_mi30x_image"
 FALLBACK_IMAGE="rocm/sgl-dev:v0.4.9.post2-rocm630-mi30x-20250715"
 FALLBACK_MSG="No mi30x image found in last 30 days, using fallback image"
@@ -74,7 +86,7 @@ if [[ "${RUNNER_NAME}" =~ ^linux-mi350-gpu-[0-9]+$ ]] || [[ "${RUNNER_NAME}" =~ 
 elif [[ "${RUNNER_NAME}" =~ ^linux-mi300-gpu-[0-9]+$ ]] || [[ "${RUNNER_NAME}" =~ ^linux-mi325-gpu-[0-9]+$ ]]; then
   echo "Runner is ${RUNNER_NAME}, will find mi30x image."
 else
-  echo "RUNNER_NAME env is not set or not recognized: '${RUNNER_NAME}'"
+  echo "Runner type not recognized: '${RUNNER_NAME}'"
   echo "Defaulting to find mi30x image"
 fi
 
