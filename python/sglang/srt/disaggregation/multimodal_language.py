@@ -28,7 +28,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     FAKE_BOOTSTRAP_HOST,
     KVClassType,
-    MetaMultiModaldataBuffers,
+    MultimodalDataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
@@ -58,7 +58,7 @@ class MultimodalLanguagePreallocQueue:
     def __init__(
         self,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
-        metadata_buffers: MetaMultiModaldataBuffers,
+        metadata_buffers: MultimodalDataBuffers,
         tp_rank: int,
         tp_size: int,
         scheduler: Scheduler,
@@ -201,7 +201,7 @@ class MultimodalLanguageTransferQueue:
         self,
         gloo_group: ProcessGroup,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
-        metadata_buffers: MetaMultiModaldataBuffers,
+        metadata_buffers: MultimodalDataBuffers,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
     ):

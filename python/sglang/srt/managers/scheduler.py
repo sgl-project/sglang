@@ -63,7 +63,7 @@ from sglang.srt.disaggregation.prefill import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     MetadataBuffers,
-    MetaMultiModaldataBuffers,
+    MultimodalDataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     prepare_abort,
@@ -795,9 +795,9 @@ class Scheduler(
                 buffer_size
             )
             logger.debug(
-                f"init MetaMultiModaldataBuffers: {buffer_size=};{self.max_prefill_tokens=};{self.model_config.hidden_size=}"
+                f"init MultimodalDataBuffers: {buffer_size=};{self.max_prefill_tokens=};{self.model_config.hidden_size=}"
             )
-            self.disagg_metadata_buffers = MetaMultiModaldataBuffers(
+            self.disagg_metadata_buffers = MultimodalDataBuffers(
                 buffer_size, self.max_prefill_tokens, self.model_config.hidden_size
             )
             self.disagg_embedding_bootstrap_queue = MultimodalEmbeddingBootstrapQueue(
@@ -817,9 +817,9 @@ class Scheduler(
                 buffer_size
             )
             logger.debug(
-                f"init MetaMultiModaldataBuffers: {buffer_size=};{self.max_prefill_tokens=};{self.model_config.hidden_size=}"
+                f"init MultimodalDataBuffers: {buffer_size=};{self.max_prefill_tokens=};{self.model_config.hidden_size=}"
             )
-            self.disagg_metadata_buffers = MetaMultiModaldataBuffers(
+            self.disagg_metadata_buffers = MultimodalDataBuffers(
                 buffer_size, self.max_prefill_tokens, self.model_config.hidden_size
             )
             self.disagg_language_transfer_queue = MultimodalLanguageTransferQueue(

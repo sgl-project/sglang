@@ -152,7 +152,6 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         embedding_objects = []
         prompt_tokens = 0
 
-        print(f"ret: {ret}", flush=True)
         for idx, ret_item in enumerate(ret):
             embedding_objects.append(
                 EmbeddingObject(

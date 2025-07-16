@@ -306,9 +306,8 @@ class MooncakeEmbeddingManager(BaseKVManager):
                                 logger.error(
                                     f"Session {req.mooncake_session_id} failed."
                                 )
-                            print(
-                                f"Session {req.mooncake_session_id} failed with {embedding_chunk.room=};{req.endpoint=};{req.dst_port=};{req.room=}",
-                                flush=True,
+                            logger.error(
+                                f"Session {req.mooncake_session_id} failed with {embedding_chunk.room=};{req.endpoint=};{req.dst_port=};{req.room=}"
                             )
                         self.record_failure(
                             embedding_chunk.room,

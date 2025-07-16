@@ -66,7 +66,7 @@ class MiniLoadBalancer:
         self.prefill_configs = prefill_configs
         self.prefill_servers = [p.url for p in prefill_configs]
         self.decode_servers = decode_servers
-        self.enable_multimodal_disagg = vision_configs is not None
+        self.enable_multimodal_disagg = bool(vision_configs)
 
         # round robin selection of vision server and prefill server
         self.vision_server_index = 0
@@ -86,14 +86,12 @@ class MiniLoadBalancer:
     def select_pair(self):
         # TODO: return some message instead of panic
         if self.enable_multimodal_disagg:
-            assert len(self.vision_configs) > 0, "No vision servers available"
-            assert len(self.prefill_servers) > 0, "No prefill servers available"
-        else:
-            assert len(self.prefill_configs) > 0, "No prefill servers available"
-            assert len(self.decode_servers) > 0, "No decode servers available"
-
-        if self.enable_multimodal_disagg:
             # support random selection of vision server and prefill server
+            if len(self.vision_configs) == 0 or len(self.prefill_servers) == 0:
+                raise HTTPException(
+                    status_code=500,
+                    detail="No vision servers or prefill servers available"
+                )
             vision_config = self.vision_configs[self.vision_server_index]
             prefill_server = self.prefill_servers[self.prefill_server_index]
             self.vision_server_index = (self.vision_server_index + 1) % len(
@@ -104,6 +102,11 @@ class MiniLoadBalancer:
             )
             return vision_config.url, vision_config.bootstrap_port, prefill_server
         else:
+            if len(self.prefill_configs) == 0 or len(self.decode_servers) == 0:
+                raise HTTPException(
+                    status_code=500,
+                    detail="No prefill servers or decode servers available"
+                )
             prefill_config = random.choice(self.prefill_configs)
             decode_server = random.choice(self.decode_servers)
             return prefill_config.url, prefill_config.bootstrap_port, decode_server
@@ -475,10 +478,16 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
 
 
 async def _forward_to_backend_multimodal(request_data: dict, endpoint_name: str):
-    assert (
-        endpoint_name == "v1/chat/completions"
-    ), f"Endpoint name should be 'v1/chat/completions', but got {endpoint_name}"
-    assert len(request_data["messages"]) == 1, "Only support one message for now"
+    if endpoint_name != "v1/chat/completions":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Endpoint name should be 'v1/chat/completions', but got {endpoint_name}"
+        )
+    if len(request_data["messages"]) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Currently only one message per request is supported"
+        )
 
     vision_server, bootstrap_port, prefill_server = load_balancer.select_pair()
 
@@ -496,8 +505,11 @@ async def _forward_to_backend_multimodal(request_data: dict, endpoint_name: str)
         for _d in request_data["messages"][0]["content"]
         if _d["type"] == "text"
     ]
-    assert len(image_data) == 1, "Only support one image for now"
-    assert len(text_data) == 1, "Only support one text for now"
+    if len(image_data) != 1 or len(text_data) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Currently only one image and one text segment per request is supported"
+        )
 
     vision_endpoint = "v1/embeddings"
     vision_modified_request = {

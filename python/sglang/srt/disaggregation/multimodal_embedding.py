@@ -22,12 +22,10 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     FAKE_BOOTSTRAP_HOST,
     KVClassType,
-    MetaMultiModaldataBuffers,
+    MultimodalDataBuffers,
+    ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
-    is_mla_backend,
-    kv_to_page_indices,
-    kv_to_page_num,
     poll_and_all_reduce,
     prepare_abort,
 )
@@ -51,7 +49,7 @@ class MultimodalEmbeddingBootstrapQueue:
     def __init__(
         self,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
-        metadata_buffers: MetaMultiModaldataBuffers,
+        metadata_buffers: MultimodalDataBuffers,
         tp_rank: int,
         tp_size: int,
         bootstrap_port: int,

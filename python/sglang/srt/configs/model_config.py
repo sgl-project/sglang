@@ -657,14 +657,10 @@ def is_multimodal_gen_model(model_architectures: List[str]):
 
 
 def is_multimodal_embedding_model(model_architectures: List[str]):
-    if is_multimodal_model(model_architectures):
-        if any(
-            "Embedding" in multi_model_arch
-            for multi_model_arch in multimodal_model_archs
-        ):
-            return True
-        else:
-            return False
+    if is_multimodal_model(model_architectures) and any(
+        "Embedding" in arch for arch in model_architectures
+    ):
+        return True
     else:
         return False
 

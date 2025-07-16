@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import dataclasses
-import logging
 import os
 import random
 import threading
@@ -396,7 +395,7 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
         req.input_token_ids_logprobs_idx = []
 
 
-class MetaMultiModaldataBuffers:
+class MultimodalDataBuffers:
     def __init__(
         self, size: int, max_prefill_tokens: int, embedding_dim: int = 8192
     ) -> None:
@@ -432,16 +431,10 @@ class MetaMultiModaldataBuffers:
             self.max_prefill_tokens, self.embedding_dim
         )
         embedding_lengths = self.embedding_lengths[idx][0]
-        logger.debug(
-            f"Get embedding buffer: {idx=} {input_embeddings.shape=} {input_embeddings.data_ptr()=} {embedding_lengths=} {self.input_embeddings.data_ptr()=}"
-        )
         return input_embeddings, embedding_lengths
 
     def set_buf(self, req: Req):
         embed_length = req.embedding.shape[0]
-        logger.debug(
-            f"Set embedding buffer: {req.metadata_buffer_index=} {embed_length=} {req.embedding.shape=}"
-        )
         self.input_embeddings[req.metadata_buffer_index, :embed_length * self.embedding_dim] = (
             req.embedding.flatten()
         )
