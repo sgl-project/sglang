@@ -137,6 +137,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class FlattenedTensorMetadata:
     """Metadata for a tensor in a flattened bucket"""
+
     name: str
     shape: torch.Size
     dtype: torch.dtype
@@ -147,28 +148,30 @@ class FlattenedTensorMetadata:
 
 class FlattenedTensorBucket:
     """Helper class to reconstruct tensors from flattened bucket data"""
-    
-    def __init__(self, flattened_tensor: torch.Tensor, metadata: List[FlattenedTensorMetadata]):
+
+    def __init__(
+        self, flattened_tensor: torch.Tensor, metadata: List[FlattenedTensorMetadata]
+    ):
         self.flattened_tensor = flattened_tensor
         self.metadata = metadata
         self.total_elements = flattened_tensor.numel()
-    
+
     def reconstruct_tensors(self) -> List[Tuple[str, torch.Tensor]]:
         """Reconstruct original tensors from flattened tensor"""
         reconstructed = []
         for meta in self.metadata:
             # Extract the slice for this tensor
-            tensor_slice = self.flattened_tensor[meta.start_idx:meta.end_idx]
-            
+            tensor_slice = self.flattened_tensor[meta.start_idx : meta.end_idx]
+
             # Reshape to original shape
             tensor = tensor_slice.reshape(meta.shape)
-            
+
             # Ensure correct dtype
             if tensor.dtype != meta.dtype:
-                tensor = tensor.to(meta.dtype)
-                
+                tensor = tensor.view(meta.dtype)
+
             reconstructed.append((meta.name, tensor))
-        
+
         return reconstructed
 
 
@@ -891,7 +894,7 @@ class ModelRunner:
         if load_format == "flattened_bucket":
             # Handle flattened bucket format
             return self._update_weights_from_flattened_bucket(named_tensors)
-        
+
         named_tensors = [
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank))
             for name, tensor in named_tensors
@@ -912,69 +915,66 @@ class ModelRunner:
         named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
     ):
         """Handle flattened bucket format for weight updates"""
-        try:
-            
-            # There should be exactly one entry with the flattened data
-            if len(named_tensors) != 1:
-                raise ValueError(f"Expected exactly 1 flattened bucket, got {len(named_tensors)}")
-            
-            bucket_name, flattened_tensor_data = named_tensors[0]
-            
-            # First unwrap the LocalSerializedTensor to get serialized dict data
-            # But don't call .to() since the unwrapped data is dict, not tensor
-            if isinstance(flattened_tensor_data, LocalSerializedTensor):
-                from sglang.srt.patch_torch import monkey_patch_torch_reductions
-                monkey_patch_torch_reductions()
-                bucket_data = flattened_tensor_data.get(self.tp_rank)
-            else:
-                bucket_data = flattened_tensor_data
-            
-            # Extract serialized tensors and metadata for this rank
-            serialized_tensors = bucket_data['serialized_tensors']
-            metadata_list = bucket_data['metadata']
-            
-            rank_serialized_tensor = serialized_tensors[self.tp_rank]
-            rank_metadata = metadata_list[self.tp_rank]
-            
-            logger.debug(f"Rank {self.tp_rank}: Processing flattened bucket with {len(rank_metadata)} tensors")
-            
-            # Deserialize the flattened tensor for this rank
-            # Import here to avoid circular imports
-            from sglang.srt.utils import MultiprocessingSerializer
-            rank_flattened_tensor = MultiprocessingSerializer.deserialize(rank_serialized_tensor)
-            
-            # Convert metadata to our format
-            converted_metadata = []
-            for meta in rank_metadata:
-                converted_meta = FlattenedTensorMetadata(
-                    name=meta.name,
-                    shape=meta.shape,
-                    dtype=meta.dtype,
-                    start_idx=meta.start_idx,
-                    end_idx=meta.end_idx,
-                    numel=meta.numel
-                )
-                converted_metadata.append(converted_meta)
-
-            # Create bucket and reconstruct tensors
-            bucket = FlattenedTensorBucket(rank_flattened_tensor, converted_metadata)
-            reconstructed_tensors = bucket.reconstruct_tensors()
-            
-            # Load the reconstructed tensors using the standard method
-            self.model.load_weights(reconstructed_tensors)
-
-            del reconstructed_tensors
-            torch.cuda.empty_cache()
-            return True, "Success"
-            
-        except Exception as e:
-            error_msg = (
-                f"Failed to update weights from flattened bucket: {e}. "
-                f"The full weights of the ModelRunner are partially updated. "
-                f"Please discard the whole weights."
+        # There should be exactly one entry with the flattened data
+        if len(named_tensors) != 1:
+            raise ValueError(
+                f"Expected exactly 1 flattened bucket, got {len(named_tensors)}"
             )
-            logger.error(error_msg)
-            return False, error_msg
+
+        bucket_name, flattened_tensor_data = named_tensors[0]
+
+        # First unwrap the LocalSerializedTensor to get serialized dict data
+        # But don't call .to() since the unwrapped data is dict, not tensor
+        if isinstance(flattened_tensor_data, LocalSerializedTensor):
+            from sglang.srt.patch_torch import monkey_patch_torch_reductions
+
+            monkey_patch_torch_reductions()
+            bucket_data = flattened_tensor_data.get(self.tp_rank)
+        else:
+            bucket_data = flattened_tensor_data
+
+        # Extract serialized tensors and metadata for this rank
+        serialized_tensors = bucket_data["serialized_tensors"]
+        metadata_list = bucket_data["metadata"]
+
+        rank_serialized_tensor = serialized_tensors[self.tp_rank]
+        rank_metadata = metadata_list[self.tp_rank]
+
+        logger.debug(
+            f"Rank {self.tp_rank}: Processing flattened bucket with {len(rank_metadata)} tensors"
+        )
+
+        # Deserialize the flattened tensor for this rank
+        # Import here to avoid circular imports
+        from sglang.srt.utils import MultiprocessingSerializer
+
+        rank_flattened_tensor = MultiprocessingSerializer.deserialize(
+            rank_serialized_tensor
+        )
+
+        # Convert metadata to our format
+        converted_metadata = []
+        for meta in rank_metadata:
+            converted_meta = FlattenedTensorMetadata(
+                name=meta.name,
+                shape=meta.shape,
+                dtype=meta.dtype,
+                start_idx=meta.start_idx,
+                end_idx=meta.end_idx,
+                numel=meta.numel,
+            )
+            converted_metadata.append(converted_meta)
+
+        # Create bucket and reconstruct tensors
+        bucket = FlattenedTensorBucket(rank_flattened_tensor, converted_metadata)
+        reconstructed_tensors = bucket.reconstruct_tensors()
+
+        # Load the reconstructed tensors using the standard method
+        self.model.load_weights(reconstructed_tensors)
+
+        # del reconstructed_tensors
+        torch.cuda.empty_cache()
+        return True, "Success"
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100
