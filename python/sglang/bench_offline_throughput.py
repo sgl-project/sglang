@@ -437,11 +437,11 @@ if __name__ == "__main__":
                 args.model_path,
                 cache_dir=os.getenv("MODELSCOPE_CACHE"),
                 revision=os.getenv("MODEL_REVISION"),
-                local_files_only=False
+                local_files_only=False,
             )
             print(f"Model downloaded to: {args.model_path}")
 
-            if hasattr(args, 'tokenizer_path') and args.tokenizer_path is None:
+            if hasattr(args, "tokenizer_path") and args.tokenizer_path is None:
                 args.tokenizer_path = args.model_path
         except Exception as e:
             print(f"ModelScope download failed: {str(e)}")
