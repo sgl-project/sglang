@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import PIL
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -40,6 +42,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
+import PIL.Image
 import torch
 import triton
 import triton.language as tl
@@ -212,6 +215,8 @@ class MultimodalDataItem:
     feature: Union[torch.Tensor, np.ndarray] = None
 
     # the precomputed embeddings for the modality, e.g. image_emb for image, audio_emb for audio
+
+
     precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     # Model-specific data stored in a dictionary
