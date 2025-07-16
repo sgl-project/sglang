@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import PIL
-
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -255,12 +253,11 @@ class MultimodalDataItem:
         from sglang.srt.managers.mm_utils import hash_feature
 
         if self.hash is None:
-            if self.precomputed_features is not None:
-                self.hash = hash_feature(self.precomputed_features)
+            if self.feature is not None:
+                hashed_feature = self.feature
             else:
-                self.hash = hash_feature(self.feature)
-        print(f"{self.hash=}")
-        print(f"{self.feature=}")
+                hashed_feature = self.precomputed_features
+            self.hash = hash_feature(hashed_feature)
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
 
@@ -347,7 +344,6 @@ class MultimodalInputs:
 
         assert isinstance(ret.mm_items, list)
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
-
         for item in ret.mm_items:
             item.set_pad_value()
 
