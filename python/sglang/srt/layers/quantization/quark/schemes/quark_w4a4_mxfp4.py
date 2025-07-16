@@ -5,12 +5,19 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
+import aiter
+
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.utils import get_bool_env_var, supports_mx
 
 from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
+from aiter.ops.gemm_op_a4w4 import gemm_a4w4
+from aiter.ops.shuffle import shuffle_weight
+
+from aiter.utility import dtypes
+from aiter.utility.fp4_utils import e8m0_shuffle
 
 __all__ = ["QuarkW4A4MXFP4"]
 
@@ -91,32 +98,21 @@ class QuarkW4A4MXFP4(QuarkScheme):
                       layer: torch.nn.Module,
                       x: torch.Tensor,
                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        #if self.emulate:
-        #    if self.emulate_memory:
-        #        dq_w = dequant_mxfp4(layer.weight, layer.weight_scale, x.dtype)
-        #    else:
-        #        dq_w = layer.weight
 
-        #    x = quant_dequant_mxfp4(x)
+        M = x.shape[0]
+        N = layer.weight.shape[0]
 
-        #    return F.linear(x, dq_w, bias)
-        #else:
-        #   x_q, x_s = dynamic_mxfp4_quant(x)
-        #   y = torch.empty(x_q.shape[0],
-        #                   layer.weight.shape[0],
-        #                   device=x_q.device,
-        #                   dtype=self.out_dtype)
-        #   #gemm_afp4wfp4(x_q, layer.weight.T, y, x_s, layer.weight_scale,
-        #   #              self.out_dtype)
-        #   gemm_afp4wfp4(x_q, layer.weight.T, x_s, layer.weight_scale, self.out_dtype, y)
-        #   return y 
+        print(f"x: {x.shape} layer.weight: {layer.weight.shape} layer.weight_scale: {layer.weight_scale.shape}", flush=True)
 
-        x_q, x_s = dynamic_mxfp4_quant(x)
-        y = torch.empty(x_q.shape[0],
-                        layer.weight.shape[0],
-                        device=x_q.device,
-                        dtype=self.out_dtype)
-        #gemm_afp4wfp4(x_q, layer.weight.T, y, x_s, layer.weight_scale,
-        #              self.out_dtype)
-        gemm_afp4wfp4(x_q, layer.weight.T, x_s, layer.weight_scale, self.out_dtype, y)
-        return y 
+        quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+        x, x_scales_shuffle = quant_func(x, shuffle=True)
+
+        wshuffle = shuffle_weight(layer.weight.data, layout=(16, 16))
+
+        w_scales_shuffle = e8m0_shuffle(layer.weight_scale.data).view(dtypes.fp8_e8m0)
+
+        y = torch.zeros((M + 255) // 256 * 256, N, device=x.device, dtype=self.out_dtype)
+
+        print(f"x: {x} wshuffle: {wshuffle} w_scales_shuffle: {w_scales_shuffle} x_scales_shuffle: {x_scales_shuffle} y: {y}", flush=True)
+
+        return gemm_a4w4(x, wshuffle, x_scales_shuffle, w_scales_shuffle, y)
