@@ -83,10 +83,7 @@ std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, i
       stream_handles[0],  // streamA
       stream_handles[1],  // streamB
       (int64_t)smCountA,
-      (int64_t)smCountB,
-      (int64_t)gctx[0],  // gctxA
-      (int64_t)gctx[1]   // gctxB
-  };
+      (int64_t)smCountB};
 
   return vec;
 }
