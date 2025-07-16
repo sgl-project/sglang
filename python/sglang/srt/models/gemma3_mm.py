@@ -374,7 +374,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
             input_ids=llm_input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
-            image_data_embedding_func=self.get_image_feature,
+            multimodal_model=self,
             positions=positions,
         )
 
