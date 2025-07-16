@@ -235,6 +235,7 @@ def _fwd_kv_parallel(
         V_block_ptr += CBLOCK * e
         k_decay_ptr += CBLOCK
 
+    # Store the result
     tl.store(KV_block_ptr, kv.to(KV_block_ptr.dtype.element_ty))
 
 
@@ -400,9 +401,11 @@ class _attention(torch.autograd.Function):
         capability = torch.cuda.get_device_capability()
         if capability[0] < 8:
             raise RuntimeError(
-                "Flash attention currently only supported for compute capability >= 80"
+                "Flash attention currently only supported",
+                "for compute capability >= 80",
             )
 
+        # Get input dimensions
         b, h, n, d = q.shape
         e = v.shape[-1]
 
@@ -450,7 +453,7 @@ class _attention(torch.autograd.Function):
         NUM_CBLOCK = BLOCK // CBLOCK
         assert BLOCK % CBLOCK == 0, "BLOCK must be a multiple of CBLOCK"
 
-        # Compute key-value outer products for each block in parallel
+        # Step 2: Compute key-value outer products for each block in parallel
         kv = torch.empty((b, h, NUM_BLOCK, d, e), dtype=torch.float32, device=q.device)
         grid = (b * h, NUM_BLOCK)
         _fwd_kv_parallel[grid](
@@ -472,7 +475,8 @@ class _attention(torch.autograd.Function):
             NUM_CBLOCK=NUM_CBLOCK,
         )
 
-        # Reduce key-value outer products across blocks and update KV history
+        # Step 3: Reduce key-value outer products
+        # across blocks and update KV history
         grid = (b * h, NUM_FBLOCK)
         _fwd_kv_reduce[grid](
             s,
@@ -515,6 +519,7 @@ class _attention(torch.autograd.Function):
         return o, torch.cat([kv, kv_history.unsqueeze(2)], dim=2)
 
 
+# Apply the lightning attention function
 lightning_attention_ = _attention.apply
 
 
@@ -522,8 +527,19 @@ def lightning_attention(q, k, v, ed, block_size=256, kv_history=None):
     """
     Apply lightning attention algorithm
     to compute attention efficiently.
-    """
 
+    Args:
+        q: Query tensor of shape [batch, heads, seq_len, dim]
+        k: Key tensor of shape [batch, heads, seq_len, dim]
+        v: Value tensor of shape [batch, heads, seq_len, dim_v]
+        ed: Decay rate tensor of shape [heads]
+        block_size: Size of blocks for block-sparse attention
+        kv_history: Optional key-value history from previous computations
+
+    Returns:
+        output: Attention output
+        kv: Updated key-value history
+    """
     d = q.shape[-1]
     e = v.shape[-1]
 
@@ -537,7 +553,7 @@ def lightning_attention(q, k, v, ed, block_size=256, kv_history=None):
     if arr[-1] != d:
         arr.append(d)
     n = len(arr)
-    output = torch.zeros_like(q)
+    output = 0
 
     # Initialize or clone key-value history
     if kv_history is None:
@@ -649,8 +665,21 @@ def linear_decode_forward_triton(
     slot_idx: torch.Tensor,
     BLOCK_SIZE: int = 32,
 ) -> torch.Tensor:
+    """
+    Perform linear attention decoding using Triton kernels.
 
-    # Performs linear attention decoding using Triton kernels.
+    Args:
+        q: Query tensor of shape [B, H, 1, D]
+        k: Key tensor of shape [B, H, 1, D]
+        v: Value tensor of shape [B, H, 1, D]
+        kv_caches: Key-value cache tensor
+        slope_rate: Decay rate tensor
+        slot_idx: Slot indices for batches
+        BLOCK_SIZE: Size of blocks for processing
+
+    Returns:
+        output: Attention output tensor
+    """
     B, H, _, D = q.shape
     assert k.shape == (B, H, 1, D)
     assert v.shape == (B, H, 1, D)

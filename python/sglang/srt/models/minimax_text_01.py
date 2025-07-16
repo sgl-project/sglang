@@ -79,12 +79,6 @@ def weight_loader_with_alias(alias: str):
 
 
 class MiniMaxText01RMSNormTP(CustomOp):
-    """
-    Performs RMSNorm on the input tensor
-    It is specifically designed for tensor parallel training.
-    It shards the normalization weights across tensor parallel ranks
-    """
-
     name = "MiniMaxText01RMSNormTP"
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
@@ -294,9 +288,9 @@ class AttentionMetadata:
     num_prefills: int
     num_prefill_tokens: int
     num_decode_tokens: int
-    slot_mapping: torch.Tensor
-    multi_modal_placeholder_index_maps: Any
-    enable_kv_scales_calculation: bool
+    query_start_loc: Optional[torch.Tensor] = None
+    context_lens_tensor: Optional[torch.Tensor] = None
+    rotary_emb: Optional[Any] = None
 
     @property
     def prefill_metadata(self) -> Optional["AttentionMetadata"]:
@@ -317,6 +311,235 @@ class AttentionMetadata:
             for field in fields(self)
             if field.name not in skip_fields
         }
+
+
+class AttentionMetadataManager:
+    """Manager for creating and updating AttentionMetadata for MiniMaxText01 model."""
+
+    def __init__(self, config=None):
+        self.config = config
+
+    def create_metadata_from_batch_info(
+        self,
+        batch_size: int,
+        seq_lens: torch.Tensor,
+        extend_seq_lens: Optional[torch.Tensor] = None,
+        context_lens: Optional[torch.Tensor] = None,
+        is_prefill_batch: bool = False,
+        device: Optional[torch.device] = None,
+    ) -> AttentionMetadata:
+        """
+        Create AttentionMetadata from batch information.
+
+        Args:
+            batch_size: Number of sequences in the batch
+            seq_lens: Current sequence lengths [batch_size]
+            extend_seq_lens: New tokens being added in this step [batch_size]
+            context_lens: Context lengths for each sequence [batch_size]
+            is_prefill_batch: Whether this is a prefill batch
+            device: Device to place tensors on
+
+        Returns:
+            AttentionMetadata: Initialized metadata
+        """
+        if device is None:
+            device = seq_lens.device
+
+        metadata = AttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decode_tokens=0,
+            query_start_loc=None,
+            context_lens_tensor=None,
+            rotary_emb=None,
+        )
+
+        if is_prefill_batch or (
+            extend_seq_lens is not None and extend_seq_lens.sum() > batch_size
+        ):
+            # Prefill/Extend mode - processing new sequences or extending existing ones
+            if extend_seq_lens is not None:
+                actual_extend_lens = extend_seq_lens
+            else:
+                # Assume single token decode if no extend_seq_lens provided
+                actual_extend_lens = torch.ones(
+                    batch_size, dtype=torch.int32, device=device
+                )
+
+            metadata.num_prefills = batch_size
+            metadata.num_prefill_tokens = actual_extend_lens.sum().item()
+            metadata.num_decode_tokens = 0
+
+            # Create cumulative sequence lengths for query start locations
+            metadata.query_start_loc = torch.nn.functional.pad(
+                torch.cumsum(actual_extend_lens, dim=0, dtype=torch.int32), (1, 0)
+            )
+        else:
+            # Pure decode mode - single token generation
+            metadata.num_prefills = 0
+            metadata.num_prefill_tokens = 0
+            metadata.num_decode_tokens = batch_size
+
+            # For decode, each sequence contributes 1 token
+            metadata.query_start_loc = torch.arange(
+                0, batch_size + 1, dtype=torch.int32, device=device
+            )
+
+        # Set context lengths
+        if context_lens is not None:
+            metadata.context_lens_tensor = context_lens.to(torch.int32)
+        else:
+            metadata.context_lens_tensor = seq_lens.to(torch.int32)
+
+        return metadata
+
+    def create_mixed_metadata(
+        self,
+        prefill_seq_lens: List[int],
+        decode_seq_count: int,
+        device: torch.device,
+        context_lens: Optional[torch.Tensor] = None,
+    ) -> AttentionMetadata:
+        """
+        Create metadata for mixed prefill and decode batch.
+
+        Args:
+            prefill_seq_lens: List of sequence lengths for prefill requests
+            decode_seq_count: Number of decode requests
+            device: Device to place tensors on
+            context_lens: Context lengths for all sequences
+
+        Returns:
+            AttentionMetadata: Metadata for mixed batch
+        """
+        num_prefills = len(prefill_seq_lens)
+        num_prefill_tokens = sum(prefill_seq_lens)
+        num_decode_tokens = decode_seq_count
+
+        # Build query start locations
+        query_starts = [0]
+
+        # Add prefill sequences
+        for seq_len in prefill_seq_lens:
+            query_starts.append(query_starts[-1] + seq_len)
+
+        # Add decode sequences (1 token each)
+        for _ in range(decode_seq_count):
+            query_starts.append(query_starts[-1] + 1)
+
+        metadata = AttentionMetadata(
+            num_prefills=num_prefills,
+            num_prefill_tokens=num_prefill_tokens,
+            num_decode_tokens=num_decode_tokens,
+            query_start_loc=torch.tensor(
+                query_starts, dtype=torch.int32, device=device
+            ),
+            context_lens_tensor=(
+                context_lens.to(torch.int32) if context_lens is not None else None
+            ),
+            rotary_emb=None,
+        )
+
+        return metadata
+
+    def update_for_next_step(
+        self,
+        metadata: AttentionMetadata,
+        new_tokens_per_seq: Optional[torch.Tensor] = None,
+    ) -> AttentionMetadata:
+        """
+        Update metadata for the next generation step.
+
+        Args:
+            metadata: Current metadata
+            new_tokens_per_seq: Number of new tokens added per sequence
+
+        Returns:
+            Updated metadata (creates new instance)
+        """
+        if new_tokens_per_seq is None:
+            # Default: add 1 token per sequence
+            total_seqs = metadata.num_prefills + metadata.num_decode_tokens
+            new_tokens_per_seq = torch.ones(
+                total_seqs,
+                dtype=torch.int32,
+                device=metadata.context_lens_tensor.device,
+            )
+
+        # Update context lengths
+        updated_context_lens = metadata.context_lens_tensor + new_tokens_per_seq
+
+        # For next step, everything becomes decode (single token generation)
+        total_batch_size = len(updated_context_lens)
+
+        updated_metadata = AttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decode_tokens=total_batch_size,
+            query_start_loc=torch.arange(
+                0,
+                total_batch_size + 1,
+                dtype=torch.int32,
+                device=updated_context_lens.device,
+            ),
+            context_lens_tensor=updated_context_lens,
+            rotary_emb=metadata.rotary_emb,  # Preserve rotary embedding
+        )
+
+        return updated_metadata
+
+
+def init_attention_metadata_from_forward_batch(forward_batch) -> AttentionMetadata:
+    """
+    Initialize AttentionMetadata from a forward batch.
+    This function serves as the main entry point for creating metadata.
+    """
+    manager = AttentionMetadataManager()
+
+    # Determine batch properties
+    batch_size = getattr(forward_batch, "batch_size", len(forward_batch.seq_lens))
+    seq_lens = forward_batch.seq_lens
+    device = seq_lens.device
+
+    # Check if we have extend information
+    extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+
+    # Determine if this is a prefill batch
+    is_prefill = False
+    if hasattr(forward_batch, "forward_mode"):
+        is_prefill = forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+    elif extend_seq_lens is not None:
+        # If extend_seq_lens has values > 1, it's likely prefill
+        is_prefill = (extend_seq_lens > 1).any().item()
+
+    # Create metadata
+    metadata = manager.create_metadata_from_batch_info(
+        batch_size=batch_size,
+        seq_lens=seq_lens,
+        extend_seq_lens=extend_seq_lens,
+        context_lens=seq_lens,  # Use seq_lens as context_lens by default
+        is_prefill_batch=is_prefill,
+        device=device,
+    )
+
+    return metadata
+
+
+def set_forward_context_metadata(metadata: AttentionMetadata) -> None:
+    """
+    Set the attention metadata in the global forward context.
+    """
+    global _forward_context
+    if _forward_context is None:
+        _forward_context = ForwardContext(attn_metadata=metadata)
+    else:
+        _forward_context.attn_metadata = metadata
+
+
+def clear_forward_context() -> None:
+    """Clear the global forward context."""
+    global _forward_context
+    _forward_context = None
 
 
 class Attention(nn.Module):
@@ -394,9 +617,7 @@ class ForwardContext:
     Forward context for MiniMaxText01 model.
     """
 
-    no_compile_layers: dict[str, Any]
     attn_metadata: Union[AttentionMetadata, dict[str, AttentionMetadata]]
-    virtual_engine: int
 
 
 _forward_context: Optional[ForwardContext] = None
@@ -404,7 +625,9 @@ _forward_context: Optional[ForwardContext] = None
 
 def get_forward_context() -> ForwardContext:
     """Get the current forward context."""
-    assert _forward_context is not None
+    global _forward_context
+    if _forward_context is None:
+        return None
     return _forward_context
 
 
@@ -547,7 +770,7 @@ class MiniMaxText01LinearAttention(nn.Module):
             )
 
         if not hidden:
-            return torch.empty((0, q.size(-1)), device=q.device, dtype=q.dtype)
+            return torch.empty((0, self.tp_hidden), device=q.device, dtype=q.dtype)
 
         hidden = torch.concat(hidden, dim=0).contiguous()
         return hidden
@@ -708,11 +931,9 @@ class MiniMaxText01DecoderLayer(nn.Module):
         head_dim = getattr(config, "head_dim", None)
         if head_dim is None:
             head_dim = config.hidden_size // config.num_attention_heads
+        max_position_embeddings = config.max_position_embeddings
         if hasattr(config, "max_model_len") and isinstance(config.max_model_len, int):
-            max_position_embeddings = min(
-                config.max_position_embeddings, config.max_model_len
-            )
-        max_position_embeddings = 10240000
+            max_position_embeddings = min(max_position_embeddings, config.max_model_len)
         if config.attention_type == 0:
             use_headxdim = True
             hidden_inner = (
@@ -1115,7 +1336,39 @@ class MiniMaxText01Model(nn.Module):
         **kwargs,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         forward_context = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
+        attn_metadata = forward_context.attn_metadata if forward_context else None
+
+        # Auto-initialize AttentionMetadata if not provided
+        if attn_metadata is None:
+            # Try to create metadata from available information
+            if "forward_batch" in kwargs:
+                attn_metadata = init_attention_metadata_from_forward_batch(
+                    kwargs["forward_batch"]
+                )
+            else:
+                # Fallback: create simple decode metadata
+                batch_size = (
+                    input_ids.shape[0]
+                    if input_ids is not None
+                    else inputs_embeds.shape[0]
+                )
+                device = (
+                    input_ids.device if input_ids is not None else inputs_embeds.device
+                )
+
+                manager = AttentionMetadataManager()
+                # Create dummy seq_lens for fallback
+                seq_lens = torch.ones(batch_size, dtype=torch.int32, device=device)
+                attn_metadata = manager.create_metadata_from_batch_info(
+                    batch_size=batch_size,
+                    seq_lens=seq_lens,
+                    is_prefill_batch=False,
+                    device=device,
+                )
+
+            # Set the metadata in forward context
+            set_forward_context_metadata(attn_metadata)
+
         if attn_metadata is None:
             return None
         if "request_ids_to_seq_ids" not in kwargs:
