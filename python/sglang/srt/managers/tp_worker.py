@@ -144,6 +144,7 @@ class TpModelWorker:
             self.tp_size * self.pp_rank + tp_rank,
             self.world_group.cpu_group,
             src=self.world_group.ranks[0],
+            device=self.device,
         )[0]
         set_random_seed(self.random_seed)
 
@@ -172,6 +173,20 @@ class TpModelWorker:
             self.model_runner.req_to_token_pool.size,
             self.model_runner.req_to_token_pool.max_context_len,
             self.model_runner.token_to_kv_pool.size,
+        )
+
+    @property
+    def sliding_window_size(self) -> Optional[int]:
+        return self.model_runner.sliding_window_size
+
+    @property
+    def is_hybrid(self) -> bool:
+        return self.model_runner.is_hybrid is not None
+
+    def get_tokens_per_layer_info(self):
+        return (
+            self.model_runner.full_max_total_num_tokens,
+            self.model_runner.swa_max_total_num_tokens,
         )
 
     def get_pad_input_ids_func(self):
