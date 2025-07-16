@@ -18,7 +18,6 @@
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer;
-
 void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor q,
     at::Tensor k,
@@ -26,8 +25,7 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor k_rope,
     at::Tensor cos_sin_cache,
     at::Tensor pos_ids,
-    bool interleave,
-    int64_t cuda_stream) {
+    bool interleave) {
   CHECK_LAST_DIM_CONTIGUOUS(q);
   CHECK_LAST_DIM_CONTIGUOUS(k);
   CHECK_INPUT(cos_sin_cache);
@@ -57,7 +55,8 @@ void apply_rope_pos_ids_cos_sin_cache(
   size_t k_rope_stride_n = k_rope.stride(0);
   size_t k_rope_stride_h = k_rope.stride(1);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCache(
         static_cast<c_type*>(q.data_ptr()),
