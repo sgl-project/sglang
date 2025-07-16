@@ -517,10 +517,7 @@ class BaseMultimodalProcessor(ABC):
 
                 if attr_name in self.FEATURE_NAMES:
                     attr_name = "feature"
-                    print(f"{type(value)=}")
-                    print(f"{self.transport_mode=}")
                     if isinstance(value, torch.Tensor):
-
                         value = TransportableTensor(
                             transport_mode=self.transport_mode, feature=value
                         )

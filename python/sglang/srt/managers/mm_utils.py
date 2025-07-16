@@ -59,9 +59,6 @@ class TransportableTensor:
         self.serialize()
 
     def serialize(self):
-        print(f"serialize {self.transport_mode=}")
-        print(f"{type(self.feature)}=")
-        print(f"{self.feature.is_cuda}=")
         if isinstance(self.feature, torch.Tensor) and self.feature.is_cuda:
             if self.transport_mode == "cuda_ipc":
                 try:
@@ -107,7 +104,6 @@ class TransportableTensor:
                     self.transport_mode = "default"
 
     def deserialize(self) -> torch.Tensor:
-        print(f"deserialize {self.transport_mode=}")
         if self.transport_mode == "cuda_ipc":
             handle, shape, dtype, stride, source_device_index = (
                 self.extra["handle"],
