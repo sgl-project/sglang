@@ -472,7 +472,7 @@ class TboForwardBatchPreparer:
                 or key == "extend_prefix_lens_cpu"
                 or key == "extend_seq_lens_cpu"
                 or key == "extend_logprob_start_lens_cpu"
-                or key == "extend_input_logprob_token_gpu"
+                or key == "extend_input_logprob_token_ids_gpu"
             ):
                 output_dict[key] = None
                 continue
