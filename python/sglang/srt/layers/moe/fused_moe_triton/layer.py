@@ -648,6 +648,9 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
+        w2_bias = None
+        if get_tensor_model_parallel_rank() == 0:
+            w2_bias = getattr(layer, 'w2_bias', None)
         return fused_experts_mxfp4_oai(
             hidden_states=x,
             w13=layer.w13_weight.data,
@@ -660,7 +663,7 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
             w2_scale=layer.w2_weight_scale,
             activation=activation,
             w1_bias=getattr(layer, 'w13_bias', None),
-            w2_bias=getattr(layer, 'w2_bias', None),
+            w2_bias=w2_bias,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             dtype=x.dtype,
