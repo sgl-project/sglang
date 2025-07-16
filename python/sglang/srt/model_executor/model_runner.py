@@ -324,7 +324,7 @@ class ModelRunner:
             self.init_cuda_graphs()
         elif self.device == "npu":
             self.init_attention_backend()
-            self.init_npu_graphs()
+            self.init_cuda_graphs()
         else:
             self.cuda_graph_runner = None
             self.cuda_graph_mem_usage = 0
@@ -1429,36 +1429,13 @@ class ModelRunner:
         logger.info(
             f"Capture cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        self.cuda_graph_runner = CudaGraphRunner(self)
+        self.cuda_graph_runner = (
+            CudaGraphRunner(self) if not _is_npu else NPUGraphRunner(self)
+        )
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.cuda_graph_mem_usage = before_mem - after_mem
         logger.info(
             f"Capture cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
-            f"mem usage={self.cuda_graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
-        )
-
-    def init_npu_graphs(self):
-        """Capture npu graphs."""
-        self.cuda_graph_runner = None
-        self.cuda_graph_mem_usage = 0
-
-        if not self.is_generation:
-            # TODO: Currently, npu graph only captures decode steps, which only exists for generation models
-            return
-
-        if self.server_args.disable_cuda_graph:
-            return
-
-        tic = time.perf_counter()
-        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(
-            f"Capture npu graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
-        )
-        self.cuda_graph_runner = NPUGraphRunner(self)
-        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        self.cuda_graph_mem_usage = before_mem - after_mem
-        logger.info(
-            f"Capture npu graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.cuda_graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
