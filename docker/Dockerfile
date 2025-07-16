@@ -71,7 +71,6 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
  && tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && mv nvshmem_src nvshmem \
  && cd nvshmem \
  && rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
- && CUDA_ARCH=$([ "$BUILD_TYPE" = "blackwell" ] && echo 100 || echo 90) \
  && if [ "$BUILD_TYPE" = "blackwell" ]; then CUDA_ARCH=100; else CUDA_ARCH=90; fi \
  && NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
