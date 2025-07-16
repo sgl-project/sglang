@@ -214,7 +214,17 @@ class KimiK2Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=current_text)
 
     def structure_info(self) -> _GetInfoFunc:
-        raise NotImplementedError()
+        return lambda name: StructureInfo(
+            begin='<|tool_call_begin|>functions.' + name + ':',
+            end="<|tool_call_end|>",
+            trigger="<|tool_call_begin|>",
+        )
 
     def build_ebnf(self, tools: List[Tool]):
-        raise NotImplementedError()
+        return EBNFComposer.build_ebnf(
+            tools,
+            sequence_start_token=self.bot_token,
+            sequence_end_token=self.eot_token,
+            tool_call_separator="",
+            function_format="json",
+        )
