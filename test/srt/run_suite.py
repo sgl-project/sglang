@@ -143,7 +143,7 @@ suites = {
         TestFile("test_triton_attention_backend.py", 150),
         TestFile("test_update_weights_from_disk.py", 114),
         TestFile("test_vertex_endpoint.py", 31),
-        # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
+        TestFile("test_vision_chunked_prefill.py", 175),
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_rope_rocm.py", 3),
     ],
