@@ -428,8 +428,6 @@ if __name__ == "__main__":
             # download the model and replace args.model_path
             args.model_path = snapshot_download(
                 args.model_path,
-                cache_dir=os.getenv("MODELSCOPE_CACHE"),
-                local_files_only=False,
             )
             print(f"Model downloaded to: {args.model_path}")
         except Exception as e:
