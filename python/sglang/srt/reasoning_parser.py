@@ -66,12 +66,23 @@ class BaseReasoningFormatDetector:
         self._buffer += new_text
         current_text = self._buffer
 
-        # If the current text is a prefix of the think token, keep buffering
-        if any(
-            token.startswith(current_text) and token != current_text
-            for token in [self.think_start_token, self.think_end_token]
-        ):
+        # Check if current_text is a prefix of think tokens
+        is_prefix_of_start = self.think_start_token.startswith(current_text)
+        is_prefix_of_end = self.think_end_token.startswith(current_text)
+
+        # If the current text is a prefix of the think tokens, keep buffering
+        if is_prefix_of_start or is_prefix_of_end:
             return StreamingParseResult()
+
+        # Check if current text starts with a prefix that can't possibly form a complete token
+        if (
+            current_text.startswith("<")
+            and not self._in_reasoning
+            and not self.think_start_token.startswith(current_text)
+            and not current_text.startswith(self.think_start_token)
+        ):
+            self._buffer = ""
+            return StreamingParseResult(normal_text=current_text)
 
         # Strip `<think>` token if present
         if not self.stripped_think_start and self.think_start_token in current_text:
@@ -105,7 +116,7 @@ class BaseReasoningFormatDetector:
         # If we're not in a reasoning block return as normal text
         if not self._in_reasoning:
             self._buffer = ""
-            return StreamingParseResult(normal_text=new_text)
+            return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult()
 
@@ -211,3 +222,16 @@ class ReasoningParser:
         """Streaming call: incremental parsing"""
         ret = self.detector.parse_streaming_increment(chunk_text)
         return ret.reasoning_text, ret.normal_text
+
+
+if __name__ == "__main__":
+    detector = Qwen3Detector(stream_reasoning=True)
+    text = "<Direct answer without thinking."
+    text_chunks = ["<", "Direct", " an", "swer", " without", " thinking."]
+    mormal_texts = []
+    for chunk in text_chunks:
+        result = detector.parse_streaming_increment(chunk)
+        mormal_texts.append(result.normal_text)
+    assert (
+        "".join(mormal_texts) == text
+    ), "Streaming parsing failed to reconstruct the text"
