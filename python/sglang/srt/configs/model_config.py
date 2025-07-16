@@ -392,6 +392,7 @@ class ModelConfig:
             "fbgemm_fp8",
             "w8a8_fp8",
             "petit_nvfp4",
+            "quark",
         ]
         optimized_quantization_methods = [
             "fp8",
