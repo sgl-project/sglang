@@ -26,8 +26,8 @@ class TestOpenAIMoE(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                # "--cuda-graph-bs",
-                # "4",
+                "--cuda-graph-bs",
+                "128",
                 "--disable-cuda-graph",
                 "--disable-radix-cache",
                 "--attention-backend",
@@ -39,35 +39,35 @@ class TestOpenAIMoE(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    # def test_gsm8k(self):
-    #     args = SimpleNamespace(
-    #         num_shots=5,
-    #         data_path=None,
-    #         num_questions=200,
-    #         max_new_tokens=512,
-    #         parallel=128,
-    #         host="http://127.0.0.1",
-    #         port=int(self.base_url.split(":")[-1]),
-    #     )
-    #     metrics = run_eval_few_shot_gsm8k(args)
-    #     print(f"Eval accuracy of GSM8K: {metrics=}")
-    #     # self.assertGreater(metrics["accuracy"], 0.71) # target
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"Eval accuracy of GSM8K: {metrics=}")
+        self.assertGreater(metrics["accuracy"], 0.71) # target
 
-    # def test_mmlu(self):
-    #     args = SimpleNamespace(
-    #         base_url=self.base_url,
-    #         model=self.model,
-    #         eval_name="mmlu",
-    #         num_examples=64,
-    #         num_threads=32,
-    #     )
+    def test_mmlu(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=64,
+            num_threads=32,
+        )
 
-    #     metrics = run_eval(args)
-    #     print(f"Eval accuracy of MMLU: {metrics=}")
-    #     # self.assertGreaterEqual(metrics["score"], 0.759) # target
+        metrics = run_eval(args)
+        print(f"Eval accuracy of MMLU: {metrics=}")
+        # self.assertGreaterEqual(metrics["score"], 0.759) # target
 
     def test_bs_1_speed(self):
-        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=10, prompt="Human: How are you?\n\nAssistant:") # What is the capital of France?
+        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=10, prompt="Human: What is the capital of France?\n\nAssistant:") # What is the capital of France?
         acc_length, speed = send_one_prompt(args)
 
         print(f"{speed=:.2f}")
