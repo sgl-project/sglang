@@ -40,6 +40,8 @@ class Qwen3ForSequenceClassification(nn.Module):
         )
         self.score = nn.Linear(config.hidden_size, config.num_labels)
         # Use normalize=True for qwen3 embedding based on official implementation
+        # Reference: https://github.com/QwenLM/Qwen3-Embedding/blob/main/examples/qwen3_embedding_transformers.py#L55
+        # Official code: output = F.normalize(output, p=2, dim=1)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
         self.eos_token_id = config.eos_token_id
