@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy
 import torch
