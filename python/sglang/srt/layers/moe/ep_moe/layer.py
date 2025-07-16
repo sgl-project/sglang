@@ -510,35 +510,32 @@ class EPMoE(torch.nn.Module):
             assert (
                 self.num_fused_shared_experts == 0
             ), "Fused shared experts are not supported for flashinfer blockscale fp8 moe"
-            output = torch.empty_like(hidden_states)
             a_q, a_sf = per_token_group_quant_fp8(hidden_states, self.block_shape[1])
             # NOTE: scales of hidden states have to be transposed!
             a_sf_t = a_sf.t().contiguous()
             assert fi_fused_moe is not None
-            fi_fused_moe.trtllm_fp8_block_scale_moe(
-                expert_logits=router_logits.to(torch.float32),
+            return fi_fused_moe.trtllm_fp8_block_scale_moe(
+                routing_logits=router_logits.to(torch.float32),
                 routing_bias=self.correction_bias,
                 hidden_states=a_q,
                 hidden_states_scale=a_sf_t,
                 gemm1_weights=self.w13_weight,
-                gemm1_scales=self.w13_weight_scale_inv,
+                gemm1_weights_scale=self.w13_weight_scale_inv,
                 gemm2_weights=self.w2_weight,
-                gemm2_scales=self.w2_weight_scale_inv,
-                output=output,
+                gemm2_weights_scale=self.w2_weight_scale_inv,
                 num_experts=self.num_experts,
                 top_k=self.top_k,
-                n_groups=self.num_expert_group,
-                top_k_groups=self.topk_group,
+                n_group=self.num_expert_group,
+                topk_group=self.topk_group,
                 intermediate_size=self.w2_weight.shape[2],
                 local_expert_offset=self.start_expert_id,
-                local_num_experts=self.end_expert_id - self.start_expert_id,
-                routed_scaling=self.routed_scaling_factor,
+                local_num_experts=self.num_experts_per_partition,
+                routed_scaling_factor=self.routed_scaling_factor,
                 tile_tokens_dim=_get_tile_tokens_dim(
                     hidden_states.shape[0], self.top_k, self.num_experts
                 ),
                 routing_method_type=2,  # DeepSeek-styled routing method
             )
-            return output
 
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
