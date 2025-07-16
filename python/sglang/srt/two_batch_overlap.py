@@ -14,7 +14,11 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    compute_position,
+)
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -63,7 +67,38 @@ def compute_split_seq_index(
         raise NotImplementedError()
 
 
+def _is_enabled_two_chunk_split(left_sum, overall_sum):
+    threshold = global_server_args_dict["two_batch_token_distribution_threshold"]
+    return left_sum < overall_sum * threshold or left_sum > overall_sum * (1 - threshold)
+
+
 def _split_array_by_half_sum(arr: Sequence[int]) -> int:
+    split_seq_index = _split_array_by_sequence(arr)
+
+    left_sum = sum(arr[:split_seq_index])
+    overall_sum = sum(arr)
+    if _is_enabled_two_chunk_split(left_sum, overall_sum):
+       return _split_array_by_token(arr)
+
+    return split_seq_index
+
+
+def _split_array_by_token(arr):
+    left_sum = 0
+    overall_sum = sum(arr)
+    half_sum = overall_sum // 2
+    split_seq_index = 0
+
+    for i in range(len(arr)):
+        left_sum += arr[i]
+        if left_sum > half_sum:
+            split_seq_index = i
+            break
+
+    return split_seq_index
+
+
+def _split_array_by_sequence(arr: Sequence[int]) -> int:
     overall_sum = sum(arr)
     left_sum = 0
     min_diff = float("inf")
@@ -175,7 +210,11 @@ def compute_split_token_index(
 ) -> int:
     if forward_mode == ForwardMode.EXTEND:
         assert extend_seq_lens is not None
-        return sum(extend_seq_lens[:split_seq_index])
+        split_token_index = sum(extend_seq_lens[:split_seq_index])
+        overall_sum = sum(extend_seq_lens)
+        if _is_enabled_two_chunk_split(split_token_index, overall_sum):
+            return overall_sum // 2
+        return split_token_index
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
         return split_seq_index * token_num_per_seq
@@ -379,9 +418,16 @@ class TboForwardBatchPreparer:
 
         tbo_split_token_index = cls._compute_split_token_index(batch)
 
+        is_enable_two_chunk = batch.forward_mode == ForwardMode.EXTEND and \
+                              batch.extend_seq_lens_cpu is not None and \
+                              tbo_split_token_index != sum(
+                                batch.extend_seq_lens_cpu[:batch.tbo_split_seq_index]
+                              )
+
         if _tbo_debug:
             logger.info(
                 f"TboForwardBatchPreparer.prepare "
+                f"is_enable_two_chunk={is_enable_two_chunk} "
                 f"tbo_split_seq_index={batch.tbo_split_seq_index} "
                 f"tbo_split_token_index={tbo_split_token_index} "
                 f"extend_seq_lens={batch.extend_seq_lens_cpu} "
@@ -401,7 +447,7 @@ class TboForwardBatchPreparer:
             start_token_index=0,
             end_token_index=tbo_split_token_index,
             start_seq_index=0,
-            end_seq_index=batch.tbo_split_seq_index,
+            end_seq_index=batch.tbo_split_seq_index + 1 if is_enable_two_chunk else batch.tbo_split_seq_index,
             output_attn_backend=attn_backend_child_a,
             out_num_token_non_padded=out_num_token_non_padded_a,
         )
@@ -415,8 +461,66 @@ class TboForwardBatchPreparer:
             out_num_token_non_padded=out_num_token_non_padded_b,
         )
 
+        if is_enable_two_chunk:
+            cls.filter_batch_for_two_chunk(
+                batch,
+                child_a=child_a,
+                child_b=child_b,
+                tbo_split_seq_index=batch.tbo_split_seq_index,
+            )
+
         assert batch.tbo_children is None
         batch.tbo_children = [child_a, child_b]
+
+    @classmethod
+    def filter_batch_for_two_chunk(
+        cls,
+        batch: ForwardBatch,
+        *,
+        child_a: ForwardBatch,
+        child_b: ForwardBatch,
+        tbo_split_seq_index: int,
+    ):
+        extend_seq_lens_cpu = batch.extend_seq_lens_cpu
+        overall_sum = sum(extend_seq_lens_cpu)
+        half_sum = overall_sum // 2
+        left_token_num = half_sum - sum(extend_seq_lens_cpu[:tbo_split_seq_index])
+        right_token_num = extend_seq_lens_cpu[tbo_split_seq_index] - left_token_num
+
+        child_a.extend_seq_lens_cpu[-1] = left_token_num
+        child_b.extend_seq_lens_cpu[0] = right_token_num
+
+        child_a.extend_seq_lens = torch.tensor(
+            child_a.extend_seq_lens_cpu, dtype=batch.extend_seq_lens.dtype
+        ).to(device=global_server_args_dict["device"], non_blocking=True)
+        child_b.extend_seq_lens = torch.tensor(
+            child_b.extend_seq_lens_cpu, dtype=batch.extend_seq_lens.dtype
+        ).to(device=global_server_args_dict["device"], non_blocking=True)
+
+        child_a.extend_num_tokens = sum(child_a.extend_seq_lens_cpu)
+        child_b.extend_num_tokens = sum(child_b.extend_seq_lens_cpu)
+
+        assert (child_a.extend_num_tokens == half_sum), f"{child_a.extend_num_tokens=}, {half_sum=}"
+
+        seq_lens_cpu = child_a.seq_lens_cpu.clone()  # create a new seq_lens_cpu for child_a
+        seq_lens_cpu[-1] = child_a.extend_seq_lens_cpu[-1] + child_a.extend_prefix_lens_cpu[-1]
+        child_a.seq_lens_cpu = seq_lens_cpu
+        child_a.seq_lens = seq_lens_cpu.to(
+            device=global_server_args_dict["device"], non_blocking=True
+        )
+        child_a.seq_lens_sum = child_a.seq_lens_cpu.sum().item()
+
+        child_b.extend_prefix_lens_cpu[0] += left_token_num
+        child_b.extend_prefix_lens = torch.tensor(child_b.extend_prefix_lens_cpu,
+            dtype=batch.extend_prefix_lens.dtype
+        ).to(device=global_server_args_dict["device"], non_blocking=True)
+        _, child_b.extend_start_loc = compute_position(
+            global_server_args_dict["attention_backend"],
+            child_b.extend_prefix_lens,
+            child_b.extend_seq_lens,
+            child_b.extend_num_tokens,
+        )
+
 
     @classmethod
     def filter_batch(
