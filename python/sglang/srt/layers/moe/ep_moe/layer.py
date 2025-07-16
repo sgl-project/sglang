@@ -536,7 +536,7 @@ class EPMoE(torch.nn.Module):
                 tile_tokens_dim=_get_tile_tokens_dim(
                     hidden_states.shape[0], self.top_k, self.num_experts
                 ),
-                routing_method_type=2, # DeepSeek-styled routing method
+                routing_method_type=2,  # DeepSeek-styled routing method
             )
             return output
 
@@ -894,7 +894,7 @@ class EPMoE(torch.nn.Module):
         # Effectively, flashinfer assumes w31 format for w13_weight. Same for
         # the scales.
         if _use_flashinfer_blockscale_fp8_moe:
-            effective_shard_id = {"w1":"w3","w3":"w1", "w2":"w2"}[shard_id]
+            effective_shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
         else:
             effective_shard_id = shard_id
 
@@ -905,7 +905,9 @@ class EPMoE(torch.nn.Module):
         elif effective_shard_id == "w3":
             param.data[expert_id][self.intermediate_size :, :] = loaded_weight
         else:
-            raise ValueError(f"Expected shard_id w1,w2 or w3 but got {effective_shard_id}")
+            raise ValueError(
+                f"Expected shard_id w1,w2 or w3 but got {effective_shard_id}"
+            )
 
     def _load_fp8_scale(
         self,
@@ -943,12 +945,12 @@ class EPMoE(torch.nn.Module):
         elif "weight_scale" in weight_name:
             if self.use_block_quant:
                 if _use_flashinfer_blockscale_fp8_moe:
-                    effective_shard_id = {"w1":"w3","w3":"w1", "w2":"w2"}[shard_id]
+                    effective_shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
                 else:
                     effective_shard_id = shard_id
 
                 block_n, block_k = self.block_shape[0], self.block_shape[1]
-            
+
                 if effective_shard_id == "w1":
                     param_data[expert_id][
                         : (self.intermediate_size + block_n - 1) // block_n, :
