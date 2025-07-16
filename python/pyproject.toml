@@ -21,7 +21,6 @@ runtime_common = [
     "build",
     "compressed-tensors",
     "datasets",
-    "video-reader-rs",
     "fastapi",
     "hf_transfer",
     "huggingface_hub",

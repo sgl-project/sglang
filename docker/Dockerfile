@@ -2,6 +2,7 @@ ARG CUDA_VERSION=12.6.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
 
 ARG BUILD_TYPE=all
+ARG DEEPEP_COMMIT=b6ce310bb0b75079682d09bc2ebc063a074fbd58
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
@@ -14,7 +15,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     tzdata \
     software-properties-common netcat-openbsd kmod unzip openssh-server \
     curl wget lsof zsh ccache tmux htop git-lfs tree \
-    python3 python3-pip python3-dev libpython3-dev \
+    python3 python3-pip python3-dev libpython3-dev python3-venv \
     build-essential cmake \
     libopenmpi-dev libnuma1 libnuma-dev \
     libibverbs-dev libibverbs1 libibumad3 \
@@ -62,13 +63,12 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
     fi
 
 # Build and install NVSHMEM + DeepEP
-RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz \
+RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
  && git clone https://github.com/deepseek-ai/DeepEP.git \
- && tar -xf nvshmem_src_3.2.5-1.txz && mv nvshmem_src nvshmem \
+ && cd DeepEP && git checkout ${DEEPEP_COMMIT} && cd .. \
+ && tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && mv nvshmem_src nvshmem \
  && cd nvshmem \
- && git apply /sgl-workspace/DeepEP/third-party/nvshmem.patch \
- && sed -i '1i#include <unistd.h>' examples/moe_shuffle.cu \
- && rm -f /sgl-workspace/nvshmem_src_3.2.5-1.txz \
+ && rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
  && NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
