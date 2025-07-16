@@ -118,6 +118,9 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.IDLE
         )
 
+    def is_cpu_graph(self):
+        return self == ForwardMode.DECODE
+
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
 
