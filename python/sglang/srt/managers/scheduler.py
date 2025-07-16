@@ -962,6 +962,7 @@ class Scheduler(
                             self.world_group.device_group,
                             self.pp_rank * self.tp_size + dp_offset,
                             (self.pp_rank + 1) * self.tp_size + dp_offset,
+                            device=self.device,
                         )
 
                     # send out proxy tensors to the next stage
@@ -1010,6 +1011,7 @@ class Scheduler(
                     self.world_group.device_group,
                     (self.pp_rank - 1) * self.tp_size + dp_offset,
                     self.pp_rank * self.tp_size + dp_offset,
+                    device=self.device,
                 )
             else:
                 recv_reqs = None
@@ -1040,6 +1042,7 @@ class Scheduler(
                     self.attn_tp_group.rank,
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
+                    device=self.device,
                 )
             if self.tp_size != 1:
                 control_reqs = broadcast_pyobj(
@@ -1047,6 +1050,7 @@ class Scheduler(
                     self.tp_group.rank,
                     self.tp_cpu_group,
                     src=self.tp_group.ranks[0],
+                    device=self.device,
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
@@ -1055,6 +1059,7 @@ class Scheduler(
                 self.tp_group.rank,
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
+                device=self.device,
             )
         return recv_reqs
 
