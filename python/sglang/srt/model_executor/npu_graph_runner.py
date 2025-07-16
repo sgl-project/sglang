@@ -55,7 +55,12 @@ class NPUGraphRunner(CudaGraphRunner):
             run_once_fn()
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
-        with torch.cuda.graph(graph, pool=pool, stream=stream):
+        with torch.npu.graph(
+            graph,
+            pool=pool,
+            stream=stream,
+            auto_dispatch_capture=True,
+        ):
             out = run_once_fn()
             return out
 
