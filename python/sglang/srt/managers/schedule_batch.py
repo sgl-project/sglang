@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import PIL
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -40,6 +42,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
+import PIL.Image
 import torch
 import triton
 import triton.language as tl
@@ -207,12 +210,12 @@ class MultimodalDataItem:
     modality: Modality
     hash: int = None
     pad_value: int = None
-    image_sizes: Tuple[int, int] = None
     offsets: Optional[list] = None
+    # the raw features returned by processor, e.g. pixel_values or audio_features
+    feature: Union[torch.Tensor, np.ndarray, "PIL.Image"] = None
 
-    # the real data, pixel_values or audio_features
-    # data: Union[List[torch.Tensor], List[np.ndarray]]
-    pixel_values: Union[torch.Tensor, np.ndarray, "PIL.Image"] = None
+    image_sizes: Tuple[int, int] = None
+
     audio_features: Union[torch.Tensor, np.ndarray] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
     audio_offsets: Optional[List[Tuple[int, int]]] = None
@@ -262,9 +265,9 @@ class MultimodalDataItem:
                 elif self.input_features is not None:
                     self.hash = hash_feature(self.input_features)
             elif self.is_video():
-                self.hash = hash_feature(self.pixel_values_videos)
+                self.hash = hash_feature(self.feature)
             else:
-                self.hash = hash_feature(self.pixel_values)
+                self.hash = hash_feature(self.feature)
 
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
@@ -284,13 +287,13 @@ class MultimodalDataItem:
             self.is_modality(Modality.IMAGE) or self.is_modality(Modality.MULTI_IMAGES)
         ) and (
             self.precomputed_features is not None
-            or not MultimodalDataItem.is_empty_list(self.pixel_values)
+            or not MultimodalDataItem.is_empty_list(self.feature)
         )
 
     def is_video(self):
         return (self.modality == Modality.VIDEO) and (
             self.precomputed_features is not None
-            or not MultimodalDataItem.is_empty_list(self.pixel_values_videos)
+            or not MultimodalDataItem.is_empty_list(self.feature)
         )
 
     def is_valid(self) -> bool:
@@ -1280,9 +1283,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             for mm_item in mm_input.mm_items:
                 pixel_values = getattr(mm_item, "pixel_values", None)
                 if isinstance(pixel_values, torch.Tensor):
-                    mm_item.pixel_values = pixel_values.to(
-                        self.device, non_blocking=True
-                    )
+                    mm_item.feature = pixel_values.to(self.device, non_blocking=True)
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)

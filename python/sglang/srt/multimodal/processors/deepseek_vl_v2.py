@@ -68,7 +68,7 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
             input_ids=input_ids, mm_token_id=self._processor.image_token_id
         )
         item = MultimodalDataItem(
-            pixel_values=res["images"],
+            feature=res["images"],
             offsets=image_offsets,
             modality=Modality.IMAGE,
             image_emb_mask=images_seq_mask,
