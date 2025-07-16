@@ -94,7 +94,7 @@ def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
     if sliding_window is not None and sliding_window > 0:
         mask += torch.tril(
             mask.new_full((n_tokens, n_tokens), -float("inf")), diagonal=-sliding_window
-        )            
+        )
     QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
     QK *= sm_scale
     QK += mask[None, None, :, :]
@@ -155,14 +155,14 @@ def sink_attention_ref(
     else:
         # Prefill: queries from kv_len-qo_len to kv_len-1
         q_indices = torch.arange(kv_len - qo_len, kv_len, device=q.device)
-    
+
     k_indices = torch.arange(0, kv_len, device=q.device)
-    
+
     if causal:
         mask = q_indices.unsqueeze(1) >= k_indices.unsqueeze(0)
     else:
         mask = torch.ones(qo_len, kv_len, device=q.device, dtype=torch.bool)
-    
+
     # Apply sliding window mask
     if window_left >= 0:
         # For sliding window, we can only attend to at most window_left + 1 tokens
@@ -593,31 +593,32 @@ class OpenAIMoeAttention(nn.Module):
             layer_id=layer_id,
             sliding_window_size=(self.sliding_window),
             enable_attention_sink=True,
+            attention_sinks=self.sinks,
             prefix=add_prefix("attn", prefix),
         )
         self.layer_id = layer_id
 
     def flashinfer_attention_ref(self, inner_state, sinks):
         q, k, v, forward_batch = inner_state
-        
+
         # Reshape q, k, v to match what sink_attention_ref expects
         # Current shapes: q=[seq_len, num_heads * head_dim], k/v=[seq_len, num_kv_heads * head_dim]
         # Need: [batch_size * seq_len, num_heads, head_dim]
         batch_size = forward_batch.batch_size
-        
+
         if batch_size > 0 and q.shape[0] > 0:
             seq_len = q.shape[0]
-            
+
             # Reshape tensors to [seq_len, num_heads, head_dim]
             q_reshaped = q.view(seq_len, self.num_heads, self.head_dim)
             k_reshaped = k.view(seq_len, self.num_kv_heads, self.head_dim)
             v_reshaped = v.view(seq_len, self.num_kv_heads, self.head_dim)
-            
+
             # Expand k and v to match q's num_heads if using MQA/GQA
             if self.num_kv_heads != self.num_heads:
                 k_reshaped = k_reshaped.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
                 v_reshaped = v_reshaped.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-            
+
             o_ref = sink_attention_ref(
                 batch_size=batch_size,
                 q=q_reshaped,
@@ -627,7 +628,7 @@ class OpenAIMoeAttention(nn.Module):
                 causal=True,
                 sm_scale=self.scaling,
                 window_left=self.sliding_window,
-            )    
+            )
         return o_ref.view(seq_len, self.num_heads * self.head_dim)
 
     def op_prepare(self, state):
@@ -660,21 +661,22 @@ class OpenAIMoeAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+        attn_output_torch_native = self.attn(*inner_state)
         # todo: check if sinks need fp32 before exp
         sinks = torch.exp(self.sinks)
         sinks = sinks.to(torch.float32)
-        flashinfer_output = self.attn(*inner_state, sink=sinks)    
-        o_ref = self.flashinfer_attention_ref(inner_state, sinks)
-        q = inner_state[0].view(-1, self.num_kv_heads, self.num_heads // self.num_kv_heads, self.head_dim)
-        k = inner_state[1].view(-1, self.num_kv_heads, self.head_dim)
-        v = inner_state[2].view(-1, self.num_kv_heads, self.head_dim)
-        attn_output = sdpa(q, k, v, self.sinks, self.scaling, self.sliding_window + 1)
+        # flashinfer_output = self.attn(*inner_state, sink=sinks)
+        # o_ref = self.flashinfer_attention_ref(inner_state, sinks)
+        # q = inner_state[0].view(-1, self.num_kv_heads, self.num_heads // self.num_kv_heads, self.head_dim)
+        # k = inner_state[1].view(-1, self.num_kv_heads, self.head_dim)
+        # v = inner_state[2].view(-1, self.num_kv_heads, self.head_dim)
+        # attn_output = sdpa(q, k, v, self.sinks, self.scaling, self.sliding_window + 1)
 
         # print(f"### layer_id={self.layer_id}, attn_output.shape={attn_output.shape}, o_ref.shape={o_ref.shape}, flashinfer_output.shape={flashinfer_output.shape}")
         # torch.testing.assert_close(o_ref, flashinfer_output, rtol=1e-2, atol=1e-2)
-        torch.testing.assert_close(attn_output, o_ref, rtol=1e-2, atol=1e-2)   
-        
-        output, _ = self.o_proj(attn_output)
+        # torch.testing.assert_close(attn_output, o_ref, rtol=1e-2, atol=1e-2)
+
+        output, _ = self.o_proj(attn_output_torch_native)
         return output
 
     def forward(

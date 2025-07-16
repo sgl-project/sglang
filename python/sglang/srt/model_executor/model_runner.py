@@ -1085,6 +1085,12 @@ class ModelRunner:
             )
 
             return TorchNativeAttnBackend(self)
+        elif self.server_args.attention_backend == "torch_native_sink":
+            from sglang.srt.layers.attention.torch_native_backend import (
+                TorchNativeAttnSinkBackend,
+            )
+
+            return TorchNativeAttnSinkBackend(self)
         elif self.server_args.attention_backend == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 

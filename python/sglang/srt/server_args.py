@@ -372,7 +372,7 @@ class ServerArgs:
                 "flashinfer" if is_flashinfer_available() else "pytorch"
             )
 
-        if self.attention_backend == "torch_native":
+        if self.attention_backend in ("torch_native", "torch_native_sink"):
             logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"
             )
@@ -1094,6 +1094,7 @@ class ServerArgs:
                 "flashmla",
                 "intel_amx",
                 "torch_native",
+                "torch_native_sink",
                 "triton",
             ],
             default=ServerArgs.attention_backend,

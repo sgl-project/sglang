@@ -16,6 +16,7 @@
 from enum import Enum
 from typing import Optional
 
+import torch
 from torch import nn
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -55,6 +56,7 @@ class RadixAttention(nn.Module):
         use_irope: bool = False,
         prefix: str = "",
         enable_attention_sink: bool = False,
+        attention_sinks: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -70,6 +72,9 @@ class RadixAttention(nn.Module):
         self.is_cross_attention = is_cross_attention
         self.use_irope = use_irope
         self.enable_attention_sink = enable_attention_sink
+        self.attention_sinks = attention_sinks
+        if self.attention_sinks is not None:
+            assert self.enable_attention_sink, "attention_sinks is not None but enable_attention_sink is False"
         self.k_scale = None
         self.v_scale = None
         self.k_scale_float = None

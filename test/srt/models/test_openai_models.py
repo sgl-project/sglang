@@ -25,9 +25,13 @@ class TestOpenAIMoE(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "2",
-                "--cuda-graph-max-bs",
-                "128",
+                "4",
+                # "--cuda-graph-bs",
+                # "4",
+                "--disable-cuda-graph",
+                "--disable-radix-cache",
+                "--attention-backend",
+                "torch_native_sink", # "triton",
             ],
         )
 
