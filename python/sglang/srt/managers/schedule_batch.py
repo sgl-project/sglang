@@ -40,7 +40,6 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
-import PIL.Image
 import torch
 import triton
 import triton.language as tl
