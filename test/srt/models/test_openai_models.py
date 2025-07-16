@@ -64,7 +64,7 @@ class TestOpenAIMoE(CustomTestCase):
 
         metrics = run_eval(args)
         print(f"Eval accuracy of MMLU: {metrics=}")
-        # self.assertGreaterEqual(metrics["score"], 0.759) # target
+        self.assertGreaterEqual(metrics["score"], 0.759) # target
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=10, prompt="Human: What is the capital of France?\n\nAssistant:") # What is the capital of France?
