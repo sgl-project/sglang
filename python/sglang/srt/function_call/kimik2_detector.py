@@ -221,10 +221,4 @@ class KimiK2Detector(BaseFormatDetector):
         )
 
     def build_ebnf(self, tools: List[Tool]):
-        return EBNFComposer.build_ebnf(
-            tools,
-            sequence_start_token=self.bot_token,
-            sequence_end_token=self.eot_token,
-            tool_call_separator="",
-            function_format="json",
-        )
+        raise NotImplementedError()
