@@ -1169,6 +1169,7 @@ class ModelRunner:
                 end_layer=self.end_layer,
             )
         elif self.server_args.use_multilevel_backend:
+            print("using MultiLevelKVCache")
             self.token_to_kv_pool = MultiLevelKVCache(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
