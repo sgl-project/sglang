@@ -552,10 +552,9 @@ class ModelRunner:
                     "intel_amx",
                     "torch_native",
                 ]:
-                    if self.should_log:
-                        logger.info(
-                            f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
-                        )
+                    logger.info(
+                        f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
+                    )
                 else:
                     raise ValueError(
                         f"Invalid attention backend for MLA: {server_args.attention_backend}"
