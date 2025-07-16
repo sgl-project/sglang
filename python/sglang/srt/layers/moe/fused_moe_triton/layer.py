@@ -310,12 +310,13 @@ class UnquantizedFusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
         swiglu_alpha: Optional[float] = 1.702, 
         swiglu_beta: Optional[float] = 1.0,
         bias: bool = True,
+        shuffle_weight: bool = True,
     ):
         super().__init__()
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.bias = bias
-
+        self.shuffle_weight = shuffle_weight
         if not bias:
             raise ValueError("bias is required for OpenAI MoE")
 
@@ -372,13 +373,17 @@ class UnquantizedFusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
             layer.register_parameter("w2_bias", None)
     
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight.data = shuffle_for_activation_kernel(torch.transpose(layer.w13_weight.data, 1, 2).contiguous())
-        torch.cuda.empty_cache()
+        layer.w13_weight.data = torch.transpose(layer.w13_weight.data, 1, 2).contiguous()
+        if self.shuffle_weight:
+            layer.w13_weight.data = shuffle_for_activation_kernel(layer.w13_weight.data)
+            torch.cuda.empty_cache()
         layer.w2_weight.data = torch.transpose(layer.w2_weight.data, 1, 2).contiguous()
         torch.cuda.empty_cache()
         if self.bias:
-            layer.w13_bias.data = shuffle_for_activation_kernel(layer.w13_bias.data.to(torch.float32))
-            torch.cuda.empty_cache()
+            layer.w13_bias.data = layer.w13_bias.data.to(torch.float32)
+            if self.shuffle_weight:
+                layer.w13_bias.data = shuffle_for_activation_kernel(layer.w13_bias.data)
+                torch.cuda.empty_cache()
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
             torch.cuda.empty_cache()
         return
@@ -474,12 +479,14 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
         swiglu_beta: Optional[float] = 1.0,
         bias: bool = True,
         activation_dtype: torch.dtype = torch.float8_e4m3fn,
+        shuffle_weight: bool = True,
     ):
         super().__init__()
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.bias = bias
         self.activation_dtype = activation_dtype
+        self.shuffle_weight = shuffle_weight
         self.swizzle_value, self.swizzle_scale = get_swizzle_type(activation_dtype)
         if not bias:
             raise ValueError("bias is required for OpenAI MoE")
@@ -543,11 +550,13 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
 
         tmp_w13_weight = torch.cat([w1_weight_fp4, w3_weight_fp4], dim=1)  # (num_experts, 2 * intermediate_size, hidden_size // 2)
         tmp_w13_weight = torch.transpose(tmp_w13_weight, 1, 2).contiguous()  # (num_experts, hidden_size // 2, 2 * intermediate_size)
-        tmp_w13_weight = shuffle_for_activation_kernel(tmp_w13_weight)
+        if self.shuffle_weight:
+            tmp_w13_weight = shuffle_for_activation_kernel(tmp_w13_weight)
 
         tmp_w13_scale = torch.cat([w1_weight_scale, w3_weight_scale], dim=1)
         tmp_w13_scale = torch.transpose(tmp_w13_scale, 1, 2).contiguous()
-        tmp_w13_scale = shuffle_for_activation_kernel(tmp_w13_scale)
+        if self.shuffle_weight:
+            tmp_w13_scale = shuffle_for_activation_kernel(tmp_w13_scale)
         
         tmp_w2_weight = torch.transpose(w2_weight_fp4, 1, 2).contiguous()
         tmp_w2_scale = torch.transpose(w2_weight_scale, 1, 2).contiguous()
@@ -570,8 +579,10 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
         layer.w2_weight.data = tmp_w2_weight
         torch.cuda.empty_cache()
         if self.bias:
-            tmp_w13_bias = shuffle_for_activation_kernel(layer.w13_bias.data.to(torch.float32))
+            tmp_w13_bias = layer.w13_bias.data.to(torch.float32)
             tmp_w2_bias = layer.w2_bias.data.to(torch.float32)
+            if self.shuffle_weight:
+                tmp_w13_bias = shuffle_for_activation_kernel(tmp_w13_bias)
             layer.w13_bias.data = tmp_w13_bias
             torch.cuda.empty_cache()
             layer.w2_bias.data = tmp_w2_bias
@@ -726,6 +737,7 @@ class FusedMoE(torch.nn.Module):
         is_openai_moe: Optional[bool] = False,
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
+        shuffle_weight: bool = True,
     ):
         super().__init__()
 
@@ -807,6 +819,7 @@ class FusedMoE(torch.nn.Module):
                         swiglu_alpha=swiglu_alpha or 1.0,
                         swiglu_beta=swiglu_beta or 0.0,
                         bias=bias,
+                        shuffle_weight=shuffle_weight,
                     )
                 elif enable_mxfp4_moe:
                     activation_dtype = torch.bfloat16 if not enable_fp8_activation else torch.float8_e4m3fn
@@ -816,6 +829,7 @@ class FusedMoE(torch.nn.Module):
                         swiglu_beta=swiglu_beta or 0.0,
                         bias=bias,
                         activation_dtype=activation_dtype,
+                        shuffle_weight=shuffle_weight,
                     )
                 else:
                     raise ValueError("Invalid quantization method")
