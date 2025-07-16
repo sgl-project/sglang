@@ -27,7 +27,7 @@ std::vector<int64_t> create_greenctx_stream_fallback(CUgreenCtx gctx[2]) {
 }
 
 #if CUDA_VERSION >= 12050
-std::vector<int64_t> create_greenctx_stream_direct(CUgreenCtx gctx[2], int smCountA, int smCountB) {
+std::vector<int64_t> create_greenctx_stream_direct(CUgreenCtx gctx[2]) {
   CUstream streamA;
   CUstream streamB;
 
@@ -37,20 +37,10 @@ std::vector<int64_t> create_greenctx_stream_direct(CUgreenCtx gctx[2], int smCou
   std::vector<int64_t> vec = {(int64_t)streamA, (int64_t)streamB};
   return vec;
 }
-#endif  // End of CUDA_VERSION >= 12050 block
+#endif
 
 std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, int64_t device) {
   TORCH_CHECK(CUDA_VERSION >= 12040, "Green Contexts feature requires CUDA Toolkit 12.4 or newer.");
-
-  CUDA_RT(cudaSetDevice(device));
-  cudaDeviceProp props;
-  CUDA_RT(cudaGetDeviceProperties(&props, device));
-  TORCH_CHECK(
-      props.major >= 9,
-      "Green Contexts require Hopper (SM 9.0) or newer architecture. Current device is SM ",
-      props.major,
-      ".",
-      props.minor);
 
   CUgreenCtx gctx[3];
   CUdevResourceDesc desc[3];
@@ -82,9 +72,9 @@ std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, i
   std::vector<int64_t> stream_handles;
 
 #if CUDA_VERSION >= 12050
-  stream_handles = create_greenctx_stream_direct(gctx, smCountA, smCountB);
+  stream_handles = create_greenctx_stream_direct(gctx);
 #else
-  stream_handles = create_greenctx_stream_fallback(gctx, smCountA, smCountB);
+  stream_handles = create_greenctx_stream_fallback(gctx);
 #endif
 
   CUDA_DRV(cuGreenCtxDestroy(gctx[2]));
