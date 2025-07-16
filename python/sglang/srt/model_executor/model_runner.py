@@ -972,8 +972,6 @@ class ModelRunner:
         # Load the reconstructed tensors using the standard method
         self.model.load_weights(reconstructed_tensors)
 
-        # del reconstructed_tensors
-        torch.cuda.empty_cache()
         return True, "Success"
 
     def get_weights_by_name(

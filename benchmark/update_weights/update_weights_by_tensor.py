@@ -1,5 +1,3 @@
-# Copyright (c) 2025 RedAccel Authors. All Rights Reserved.
-
 import argparse
 import asyncio
 import os
@@ -12,12 +10,15 @@ import torch
 import torch.distributed as dist
 import tqdm
 from loguru import logger
+from transformers import AutoModelForCausalLM
+from verl.workers.rollout.sglang_rollout.sglang_rollout import AsyncEngine
+
+from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+from sglang.srt.utils import MultiprocessingSerializer
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=str)
-parser.add_argument(
-    "--profile_dir", type=str, default="/home/jobuser/profiling_results/"
-)
+parser.add_argument("--profile_dir", type=str, default="/tmp/verl_sglang_profile/")
 parser.add_argument(
     "--bucket_bytes",
     type=int,
@@ -99,10 +100,6 @@ class TensorBucket:
         # Concatenate all flattened tensors
         self.flattened_tensor = torch.cat(flattened_tensors, dim=0)
         self.total_elements = self.flattened_tensor.numel()
-
-        # logger.debug(f"Created tensor bucket with {len(named_tensors)} tensors, "
-        #             f"total elements: {self.total_elements:,}, "
-        #             f"memory: {self.flattened_tensor.element_size() * self.total_elements / 1024**2:.2f} MB")
 
     def get_flattened_tensor(self) -> torch.Tensor:
         """Get the flattened tensor containing all bucket tensors"""
@@ -274,7 +271,6 @@ def patch_profiler():
     logger.info(f"Profiling will be saved to {args.profile_dir}")
 
     def update_with_profiler(self, named_tensors, load_format=None):
-        # Handle flattened bucket format before profiling
         # Call the original method for other formats
         res = ori_update(self, named_tensors, load_format)
         prof.step()
@@ -283,89 +279,14 @@ def patch_profiler():
     ModelRunner.update_weights_from_tensor = update_with_profiler
 
 
-patch_profiler()
+if args.profile_dir:
+    patch_profiler()
 
 
 def per_tensor_generator(model) -> Iterable[Tuple[str, torch.Tensor]]:
     """Generate tensors one by one, moving to GPU only when needed"""
     for name, tensor in model.named_parameters():
         yield name, tensor.cuda()
-
-
-def analyze_bucket_distribution(model, bucket_bytes, rank, use_flattened=False):
-    """Analyze how tensors are distributed into buckets (CPU-only analysis)"""
-    if bucket_bytes == 0:
-        return
-
-    if rank == 0:
-        bucket_type = "flattened" if use_flattened else "regular"
-        logger.info(
-            f"\nBUCKET DISTRIBUTION ANALYSIS ({bucket_type} buckets, bucket_size={bucket_bytes/1024**2:.1f}MB):"
-        )
-
-        # Use CPU-only tensor info for analysis to avoid GPU OOM
-        def cpu_tensor_generator():
-            for name, tensor in model.named_parameters():
-                # Don't move to GPU, just analyze metadata
-                yield name, tensor.cpu()
-
-        named_tensors = list(cpu_tensor_generator())
-
-        if use_flattened:
-            buckets = list(
-                get_flattened_tensor_buckets(iter(named_tensors), bucket_bytes)
-            )
-            bucket_sizes = [bucket.size_bytes() for bucket in buckets]
-        else:
-            buckets = list(get_named_tensor_buckets(iter(named_tensors), bucket_bytes))
-            bucket_sizes = [
-                sum(tensor.element_size() * tensor.numel() for _, tensor in bucket)
-                for bucket in buckets
-            ]
-
-        logger.info(f"Total tensors: {len(named_tensors)}")
-        logger.info(f"Total buckets: {len(buckets)}")
-
-        avg_bucket_size = sum(bucket_sizes) / len(bucket_sizes) if bucket_sizes else 0
-        max_bucket_size = max(bucket_sizes) if bucket_sizes else 0
-        min_bucket_size = min(bucket_sizes) if bucket_sizes else 0
-
-        logger.info(f"Average bucket size: {avg_bucket_size/1024**2:.1f} MB")
-        logger.info(f"Max bucket size: {max_bucket_size/1024**2:.1f} MB")
-        logger.info(f"Min bucket size: {min_bucket_size/1024**2:.1f} MB")
-
-        # Show first few buckets as examples
-        logger.info("\nFirst 3 buckets:")
-        for i, bucket in enumerate(buckets[:3]):
-            if use_flattened:
-                bucket_size_bytes = bucket.size_bytes()
-                logger.info(
-                    f"  Bucket {i+1}: {len(bucket)} tensors, {bucket_size_bytes/1024**2:.1f} MB (flattened: {bucket.total_elements:,} elements)"
-                )
-                for meta in bucket.get_metadata()[:2]:  # Show first 2 tensors in bucket
-                    tensor_size = (
-                        meta.numel * torch.tensor([], dtype=meta.dtype).element_size()
-                    )
-                    logger.info(
-                        f"    - {meta.name}: {meta.shape} ({tensor_size/1024**2:.1f} MB)"
-                    )
-                if len(bucket) > 2:
-                    logger.info(f"    - ... and {len(bucket)-2} more tensors")
-            else:
-                bucket_size_bytes = sum(
-                    tensor.element_size() * tensor.numel() for _, tensor in bucket
-                )
-                logger.info(
-                    f"  Bucket {i+1}: {len(bucket)} tensors, {bucket_size_bytes/1024**2:.1f} MB"
-                )
-                for name, tensor in bucket[:2]:  # Show first 2 tensors in bucket
-                    tensor_size = tensor.element_size() * tensor.numel()
-                    logger.info(
-                        f"    - {name}: {tensor.shape} ({tensor_size/1024**2:.1f} MB)"
-                    )
-                if len(bucket) > 2:
-                    logger.info(f"    - ... and {len(bucket)-2} more tensors")
-        logger.info("")
 
 
 def main():
@@ -631,20 +552,14 @@ def main():
         bucket_sizes = [
             (0, "per-tensor"),
             (512 * 1024 * 1024, "512MB"),  # 512MB
-            # (1024 * 1024 * 1024, "1GB"),  # 1GB
-            # (2 * 1024 * 1024 * 1024, "2GB"),  # 2GB - comment out large sizes to avoid OOM
+            (1024 * 1024 * 1024, "1GB"),  # 1GB
         ]
 
         # Add flattened bucket variants
         flattened_bucket_sizes = [
-            (128 * 1024 * 1024, "128MB-flat"),  # 128MB flattened
-            (256 * 1024 * 1024, "512MB-flat"),  # 512MB flattened
             (512 * 1024 * 1024, "512MB-flat"),  # 512MB flattened
             (1024 * 1024 * 1024, "1GB-flat"),  # 1GB flattened
             (2 * 1024 * 1024 * 1024, "2GB-flat"),  # 2GB flattened
-            (4 * 1024 * 1024 * 1024, "4GB-flat"),  # 4GB flattened
-            (8 * 1024 * 1024 * 1024, "8GB-flat"),  # 8GB flattened
-            (16 * 1024 * 1024 * 1024, "16GB-flat"),  # 16GB flattened
         ]
         bucket_sizes.extend(flattened_bucket_sizes)
 
@@ -666,7 +581,6 @@ def main():
 
             # Analyze bucket distribution first
             use_flattened = size_name.endswith("-flat")
-            # analyze_bucket_distribution(model, bucket_bytes, rank, use_flattened)
 
             # Reset memory stats before each test
             torch.cuda.empty_cache()
@@ -749,9 +663,6 @@ def main():
     if args.benchmark:
         loop.run_until_complete(benchmark_different_bucket_sizes())
     else:
-        # Analyze bucket distribution for single run
-        # analyze_bucket_distribution(model, args.bucket_bytes, rank, args.use_flattened_buckets)
-
         named_tensors = per_tensor_generator(model)
         if args.bucket_bytes == 0:
             loop.run_until_complete(update_weights(named_tensors))
