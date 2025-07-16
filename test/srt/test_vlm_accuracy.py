@@ -161,7 +161,6 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
         return self.model_runner.model
 
 
-# TODO: MiniCPMV is not compatible with transformers==4.52.3, temporarily disabled
 class TestMiniCPMVLogits(VisionLLMLogitsBase):
     @classmethod
     def setUpClass(cls):

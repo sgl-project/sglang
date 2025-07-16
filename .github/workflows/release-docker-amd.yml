@@ -10,26 +10,15 @@ on:
 jobs:
   publish:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: amd-docker
+    runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
       matrix:
-        rocm_version: ['6.3.0']
+        gpu_arch: ['gfx942', 'gfx950']
         build_type: ['all', 'srt']
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          docker-images: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: false
 
       - name: Login to Docker Hub
         uses: docker/login-action@v2
@@ -41,10 +30,12 @@ jobs:
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
 
-          if [ "${{ matrix.rocm_version }}" = "6.3.0" ]; then
-            rocm_tag="rocm630"
+          if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
+            rocm_tag="rocm630-mi30x"
+          elif [ "${{ matrix.gpu_arch }}" = "gfx950" ]; then
+            rocm_tag="rocm700-mi35x"
           else
-            echo "Unsupported ROCm version"
+            echo "Unsupported gfx arch"
             exit 1
           fi
 
@@ -59,5 +50,5 @@ jobs:
             exit 1
           fi
 
-          docker build . -f docker/Dockerfile.rocm --build-arg BUILD_TYPE=${{ matrix.build_type }} -t lmsysorg/sglang:${tag}${tag_suffix} --no-cache
+          docker build . -f docker/Dockerfile.rocm --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} -t lmsysorg/sglang:${tag}${tag_suffix} --no-cache
           docker push lmsysorg/sglang:${tag}${tag_suffix}
