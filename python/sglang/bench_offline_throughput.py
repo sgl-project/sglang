@@ -422,12 +422,7 @@ if __name__ == "__main__":
     # handling Modelscope model downloads
     if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() in ("true", "1"):
         try:
-            os.environ["TRANSFORMERS_OFFLINE"] = "1"
-            os.environ["HF_DATASETS_OFFLINE"] = "1"
-            os.environ["HF_EVALUATE_OFFLINE"] = "1"
-
             from modelscope import snapshot_download
-
             print(f"Using ModelScope to download model: {args.model_path}")
 
             # download the model and replace args.model_path
@@ -437,9 +432,6 @@ if __name__ == "__main__":
                 local_files_only=False,
             )
             print(f"Model downloaded to: {args.model_path}")
-
-            if hasattr(args, "tokenizer_path") and args.tokenizer_path is None:
-                args.tokenizer_path = args.model_path
         except Exception as e:
             print(f"ModelScope download failed: {str(e)}")
             raise e
