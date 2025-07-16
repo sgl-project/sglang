@@ -57,7 +57,7 @@ if _use_aiter:
     from aiter.fused_moe_bf16_asm import ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
 
-TRTLMM_GEN_MOE_EP_SIZE = get_int_env_var("SGLANG_TRTLMM_GEN_MOE_EP_SIZE", "0")
+TRTLMM_GEN_MOE_EP_SIZE = get_int_env_var("SGLANG_TRTLLM_GEN_MOE_EP_SIZE", "0")
 
 logger = logging.getLogger(__name__)
 
