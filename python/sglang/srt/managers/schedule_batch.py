@@ -40,7 +40,6 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
-import PIL.Image
 import torch
 import triton
 import triton.language as tl
@@ -305,6 +304,7 @@ class MultimodalDataItem:
     def merge(self, other):
         self.feature += other.feature
         self.image_sizes += other.image_sizes
+        self.image_offsets += other.image_offsets
         self.hash = hash((self.hash, other.hash))
         self.set_pad_value()
 
