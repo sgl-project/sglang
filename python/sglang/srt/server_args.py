@@ -134,6 +134,8 @@ class ServerArgs:
     preferred_sampling_params: Optional[str] = None
 
     # LoRA
+    max_lora_rank: Optional[int] = None
+    lora_target_modules: Optional[List[str]] = None
     lora_paths: Optional[Union[dict[str, str], List[str]]] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
@@ -248,6 +250,10 @@ class ServerArgs:
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
+
+    # For PD-Multiplexing
+    enable_pdmux: bool = False
+    sm_group_num: int = 3
 
     def __post_init__(self):
         # Expert parallelism
@@ -1130,6 +1136,28 @@ class ServerArgs:
 
         # LoRA
         parser.add_argument(
+            "--max-lora-rank",
+            default=ServerArgs.max_lora_rank,
+            type=int,
+            help="The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+        )
+        parser.add_argument(
+            "--lora-target-modules",
+            type=str,
+            choices=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+            nargs="*",
+            default=None,
+            help="The union set of all target modules where LoRA should be applied. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+        )
+        parser.add_argument(
             "--lora-paths",
             type=str,
             nargs="*",
@@ -1696,6 +1724,17 @@ class ServerArgs:
             nargs="*",
             default=None,
             help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
+        )
+        parser.add_argument(
+            "--enable-pdmux",
+            action="store_true",
+            help="Enable PD-Multiplexing, PD running on greenctx stream.",
+        )
+        parser.add_argument(
+            "--sm-group-num",
+            type=int,
+            default=ServerArgs.sm_group_num,
+            help="Number of sm partition groups.",
         )
         parser.add_argument(
             "--weight-loader-disable-mmap",
