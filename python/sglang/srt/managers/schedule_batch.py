@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import PIL
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -40,6 +42,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
+import PIL.Image
 import torch
 import triton
 import triton.language as tl
@@ -212,6 +215,7 @@ class MultimodalDataItem:
     feature: Union[torch.Tensor, np.ndarray] = None
 
     image_sizes: Tuple[int, int] = None
+
 
     audio_feature_lens: Optional[List[torch.Tensor]] = None
     audio_offsets: Optional[List[Tuple[int, int]]] = None
