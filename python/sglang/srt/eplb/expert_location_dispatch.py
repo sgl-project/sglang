@@ -25,7 +25,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 @dataclass
 class ExpertLocationDispatchInfo:
-    ep_dispatch_algorithm: Literal["static", "random", "dynamic", "fake", "probability", "test"]
+    ep_dispatch_algorithm: Literal["static", "random", "dynamic", "fake", "lp", "test"]
     # (num_logical_experts,)
     partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # (num_logical_experts, X)
@@ -42,7 +42,8 @@ class ExpertLocationDispatchInfo:
     def init_new(cls, layer_id: int):
         ep_dispatch_algorithm = global_server_args_dict["ep_dispatch_algorithm"]
         expert_location_metadata = get_global_expert_location_metadata()
-        lp_metadata = get_global_token_dispatch_metadata()
+        if ep_dispatch_algorithm == "lp":
+            lp_metadata = get_global_token_dispatch_metadata()
 
         if ep_dispatch_algorithm is None:
             return None
@@ -79,7 +80,7 @@ class ExpertLocationDispatchInfo:
                 "phy_replicated_expert_array": lp_metadata.phy_replicated_expert_array[layer_id],
                 "dims": lp_metadata.dims,
                 "ecos_opts": lp_metadata.ecos_opts,
-            }
+            } if ep_dispatch_algorithm == "lp" else None
         )
 
 
@@ -107,7 +108,7 @@ def topk_ids_logical_to_physical(
         return _topk_ids_logical_to_physical_static(topk_ids, info)
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
         return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
-    if info.ep_dispatch_algorithm == "probability" and logical_expert_probabilities is not None:
+    if info.ep_dispatch_algorithm == "lp" and logical_expert_probabilities is not None:
         return _topk_ids_logical_to_physical_probability(topk_ids, info, logical_expert_probabilities)
     if info.ep_dispatch_algorithm == "test":
         # Generate random probabilities with same shape as logical_to_all_physical_map
@@ -156,7 +157,7 @@ def _topk_ids_logical_to_physical_probability(
         logical_expert_probabilities: Probability distribution tensor with same shape as 
                                      logical_to_all_physical_map (num_logical_experts, max_physical_per_logical)
                                      Each element represents probability of selecting that physical expert
-                                     -1 indicates no such physical expert
+                                     0 indicates no such physical expert
         
     Returns:
         Physical expert IDs with same shape as topk_ids
@@ -166,18 +167,18 @@ def _topk_ids_logical_to_physical_probability(
     topk_ids = topk_ids.flatten()
 
     # Get the mapping from logical to physical experts
-    logical_to_all_physical_map = info.partial_logical_to_all_physical_map
+    log2phy_map = info.partial_logical_to_valid_physical_map
     num_valid_physical = info.partial_logical_to_all_physical_map_num_valid
     
     # Verify probability tensor has correct shape
-    expected_shape = logical_to_all_physical_map.shape
+    expected_shape = log2phy_map.shape
     if logical_expert_probabilities.shape != expected_shape:
         raise ValueError(
             f"Probability tensor shape {logical_expert_probabilities.shape} "
             f"does not match expected shape {expected_shape}"
         )
     # Create mask for valid physical experts (-1 indicates invalid)
-    valid_mask = logical_to_all_physical_map != -1
+    valid_mask = log2phy_map != -1
     
     # Zero out probabilities for invalid physical experts
     masked_probabilities = logical_expert_probabilities * valid_mask
@@ -185,7 +186,7 @@ def _topk_ids_logical_to_physical_probability(
     topk_probs = masked_probabilities[topk_ids]
     chosen_dispatch_index = torch.multinomial(topk_probs, 1).flatten()
 
-    topk_ids = logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
+    topk_ids = log2phy_map[topk_ids, chosen_dispatch_index]
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
     return topk_ids

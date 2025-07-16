@@ -366,7 +366,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self._enable_deepep_moe = global_server_args_dict["enable_deepep_moe"]
-        self._lp_dispatch = global_server_args_dict["lp_dispatch"]
+        self._lp_dispatch = global_server_args_dict["ep_dispatch_algorithm"] == "lp"
 
     def get_moe_weights(self):
         return [
