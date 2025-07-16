@@ -150,7 +150,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
     def load_video(video_path, bound=None, input_size=448, max_num=1, num_segments=32):
         vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
         max_frame = len(vr) - 1
-        fps = float(vr.get_fps())
+        fps = float(vr.get_avg_fps())
 
         pixel_values_list, num_patches_list = [], []
         transform = InternVLImageProcessor.build_transform(input_size=input_size)
@@ -158,7 +158,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             bound, fps, max_frame, first_idx=0, num_segments=num_segments
         )
         for frame_index in frame_indices:
-            img = Image.fromarray(vr[frame_index]).convert("RGB")
+            img = Image.fromarray(vr[frame_index].asnumpy()).convert("RGB")
             img = InternVLImageProcessor.dynamic_preprocess(
                 img, image_size=input_size, use_thumbnail=True, max_num=max_num
             )
