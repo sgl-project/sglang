@@ -215,9 +215,9 @@ class KimiK2Detector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin='<|tool_call_begin|>functions.' + name + ':',
+            begin="<|tool_call_begin|>function." + name + ":",
             end="<|tool_call_end|>",
-            trigger="<|tool_call_begin|>",
+            trigger="<|tool_call_begin|>function." + name + ":",
         )
 
     def build_ebnf(self, tools: List[Tool]):
