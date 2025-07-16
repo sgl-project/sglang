@@ -421,7 +421,7 @@ if __name__ == "__main__":
 
     # handling ModelScope model downloads
     if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() in ("true", "1"):
-        if os.path.exists(args.model_path) or os.path.sep in args.model_path:
+        if os.path.exists(args.model_path):
             print(f"Using local model path: {args.model_path}")
         else:
             try:
