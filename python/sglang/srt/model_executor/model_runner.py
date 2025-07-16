@@ -539,6 +539,7 @@ class ModelRunner:
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
+                duplicate_tp_group=self.server_args.enable_pdmux,
             )
             initialize_dp_attention(
                 enable_dp_attention=self.server_args.enable_dp_attention,
