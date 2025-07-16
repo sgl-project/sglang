@@ -105,6 +105,15 @@ class RTNTensor:
         self.scale = scale
         self.quant_config = quant_config
 
+    def dim(self):
+        """Return number of dimensions, matching torch.Tensor.dim() behavior"""
+        return len(self.shape)
+
+    @property
+    def __class__(self):
+        """Make isinstance(rtn_tensor, torch.Tensor) return True"""
+        return torch.Tensor
+
     def narrow(self, dim, start, length):
         factor = 1 if self.quant_config.weight_bits == 8 else 2
         return RTNTensor(
