@@ -66,9 +66,6 @@ if not _is_npu:
 
     from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 
-if _is_hip:
-    from vllm._custom_ops import scaled_fp8_quant
-
 if _use_aiter:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
