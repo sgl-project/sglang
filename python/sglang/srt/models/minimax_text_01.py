@@ -1051,6 +1051,7 @@ class MiniMaxText01Model(nn.Module):
         head_dim = getattr(config, "head_dim", None)
         if head_dim is None:
             head_dim = config.hidden_size // config.num_attention_heads
+        max_position_embeddings = config.max_position_embeddings
         if hasattr(config, "max_model_len") and isinstance(config.max_model_len, int):
             max_position_embeddings = min(
                 config.max_position_embeddings, config.max_model_len
@@ -1058,10 +1059,10 @@ class MiniMaxText01Model(nn.Module):
         self.rotary_emb = RotaryEmbedding(
             head_dim,
             rotary_dim=config.rotary_dim if hasattr(config, "rotary_dim") else head_dim,
-            max_position=max_position_embeddings,
+            max_position_embeddings=max_position_embeddings,
             base=int(rope_theta),
             is_neox_style=True,
-            cache_dtype=torch.float32,
+            dtype=torch.float32,
         )
 
         norm_kwargs = {}
