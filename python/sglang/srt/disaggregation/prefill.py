@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
@@ -246,6 +247,8 @@ class PrefillBootstrapQueue:
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
+            if req.time_stats.wait_queue_entry_time == 0.0:
+                req.time_stats.wait_queue_entry_time = time.perf_counter()
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -392,6 +395,8 @@ class SchedulerDisaggregationPrefillMixin:
             zip(batch.reqs, next_token_ids, strict=True)
         ):
             req: Req
+            if req.time_stats.prefill_transfer_queue_entry_time == 0.0:
+                req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
             if req.is_chunked <= 0:
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
@@ -490,6 +495,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if hasattr(req.disagg_kv_sender, "clear"):
                     req.disagg_kv_sender.clear()
                 done_reqs.append(req)
+                req.time_stats.completion_time = time.perf_counter()
             elif poll == KVPoll.Failed:
                 error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
                 try:
