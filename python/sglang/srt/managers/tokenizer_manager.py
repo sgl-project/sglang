@@ -111,6 +111,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -165,6 +166,28 @@ class ReqState:
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
 
 
+def _determine_tensor_transport_mode(
+    tensor_transport_mode: Optional[TensorTransportMode], server_args: ServerArgs
+) -> TensorTransportMode:
+    if tensor_transport_mode is not None and tensor_transport_mode != "auto":
+        return tensor_transport_mode
+
+    is_cross_node = server_args.dist_init_addr
+    # --nccl-init-addr
+    # Fallback to cpu transport for multi-node deployments, as cuda_ipc is not applicable.
+    # We use bootstrap_host as an indicator for multi-node/disaggregated inference.
+    # is_remote_bootstrap = (
+    #     self.bootstrap_host is not None
+    #     and self.bootstrap_host not in ["localhost", "127.0.0.1"]
+    # )
+
+    if is_cross_node:
+        # Fallback to default CPU transport for multi-node
+        return "default"
+    else:
+        return "cuda_ipc"
+
+
 class TokenizerManager:
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -215,12 +238,13 @@ class TokenizerManager:
                 revision=server_args.revision,
                 use_fast=not server_args.disable_fast_image_processor,
             )
+            transport_mode = _determine_tensor_transport_mode(None, self.server_args)
 
             # We want to parallelize the image pre-processing so we create an executor for it
             # We create mm_processor for any skip_tokenizer_init to make sure we still encode
             # images even with skip_tokenizer_init=False.
             self.mm_processor = get_mm_processor(
-                self.model_config.hf_config, server_args, _processor
+                self.model_config.hf_config, server_args, _processor, transport_mode
             )
 
             if server_args.skip_tokenizer_init:
