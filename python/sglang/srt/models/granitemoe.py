@@ -24,9 +24,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models import mixtral
 from sglang.srt.utils import add_prefix
-
-from . import mixtral
 
 
 class GraniteMoeMoE(nn.Module):
