@@ -223,7 +223,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi300-gpu-1, linux-mi325-gpu-1]
-        part: [0, 1, 2, 3, 4, 5]
+        part: [0, 1, 2, 3, 4, 5, 6]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -238,9 +238,9 @@ jobs:
         run: bash scripts/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 40
+        timeout-minutes: 50
         run: |
-          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 6
+          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 7
 
   unit-test-backend-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -293,7 +293,7 @@ jobs:
       - name: Run CustomAllReduce test
         timeout-minutes: 10
         run: |
-          CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash scripts/amd_ci_exec.sh python3 -m unittest test_custom_allreduce.TestCustomAllReduce
+          bash scripts/amd_ci_exec.sh -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 -m unittest test_custom_allreduce.TestCustomAllReduce
 
   unit-test-sgl-kernel-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
