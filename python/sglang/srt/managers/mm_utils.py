@@ -76,7 +76,6 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         This function will replace the data-tokens in between with pad_values accordingly
         """
         pad_values = [item.pad_value for item in mm_inputs.mm_items]
-        print(f"{mm_inputs.mm_items=}")
         data_token_pairs = self.data_token_id_pairs
         mm_inputs.data_offsets = []
         if data_token_pairs is None:

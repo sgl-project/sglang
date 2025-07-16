@@ -197,7 +197,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return backend not in ["torch_native", "intel_amx", "ascend"]
 
 
 try:
@@ -1114,15 +1114,15 @@ def broadcast_pyobj(
     rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
-    force_cpu_device: bool = True,
+    device: Optional[str] = None,
 ):
     """Broadcast inputs from src rank to all other ranks with torch.dist backend.
     The `rank` here refer to the source rank on global process group (regardless
     of dist_group argument).
     """
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
-    )
+
+    if device is None:
+        device = get_device()
 
     if rank == src:
         if len(data) == 0:
@@ -1162,44 +1162,38 @@ def point_to_point_pyobj(
     group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
     dst: int = 1,
+    device: Optional[str] = None,
 ):
     """Send data from src to dst in group using DeviceToDevice communication."""
-
+    if device is None:
+        device = get_device()
     if rank == src:
         if len(data) == 0:
-            tensor_size = torch.tensor(
-                [0], dtype=torch.long, device=torch.cuda.current_device()
-            )
-            dist.isend(tensor_size, dst=dst, group=group)
+            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
+            dist.send(tensor_size, dst=dst, group=group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
-            ).cuda(
-                device=torch.cuda.current_device()
-            )  # Move to GPU
-            tensor_size = torch.tensor(
-                [size], dtype=torch.long, device=torch.cuda.current_device()
-            )
+            ).to(
+                device=device
+            )  # Move to Device
+            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 
             dist.send(tensor_size, dst=dst, group=group)
             dist.send(tensor_data, dst=dst, group=group)
         return data
 
     elif rank == dst:
-        tensor_size = torch.tensor(
-            [0], dtype=torch.long, device=torch.cuda.current_device()
-        )
+        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
         dist.recv(tensor_size, src=src, group=group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
-        tensor_data = torch.empty(
-            size, dtype=torch.uint8, device=torch.cuda.current_device()
-        )
+        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
         dist.recv(tensor_data, src=src, group=group)
 
         serialized_data = bytes(
@@ -2798,38 +2792,99 @@ def lru_cache_frozenset(maxsize=128):
     return decorator
 
 
-def extract_numa_id(device_id):
-    return device_id.split(":")[0]
+def apply_module_patch(target_module, target_function, wrappers):
+    original_module, original_function = parse_module_path(
+        target_module, target_function, False
+    )
+
+    original_function_id = id(original_function)
+
+    candidate = original_function
+    for wrapper in wrappers:
+        candidate = wrapper(candidate)
+    if target_function is not None:
+        setattr(original_module, target_function, candidate)
+
+    for key, value in sys.modules.copy().items():
+        if (
+            target_function is not None
+            and hasattr(value, target_function)
+            and id(getattr(value, target_function)) == original_function_id
+        ):
+            setattr(value, target_function, candidate)
 
 
-def check_device_cross_numa_node(visible_device_idx=None) -> bool:
-    """Check if the GPU devices are on different NUMA nodes.
-    Assuming the device id format is like 00000001:8A:00.0
-    For example, for "00000001:8A:00.0", the NUMA node ID might be "01".
-    """
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=pci.bus_id", "--format=csv,noheader"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True,
-            text=True,
-        )
-        device_ids = result.stdout.strip().split("\n")
-        if visible_device_idx is not None:
-            valid_indices = [i for i in visible_device_idx if 0 <= i < len(device_ids)]
-            device_ids = [device_ids[i] for i in valid_indices]
+def parse_module_path(module_path, function_name, create_dummy):
+    from importlib.machinery import ModuleSpec
 
-        if len(device_ids) <= 1:
-            return False
+    def create_dummy_module(full_path, parent=None):
+        """Create and register a placeholder module"""
+        dummy = types.ModuleType(full_path)
+        dummy.__file__ = "vllm_ascend.dummy_module.py"
+        dummy.__spec__ = ModuleSpec(full_path, None)
+        sys.modules[full_path] = dummy
+        if parent:
+            setattr(parent, full_path.split(".")[-1], dummy)
+        return dummy
 
-        numa_ids = [extract_numa_id(device_id) for device_id in device_ids]
-        same_numa = all(numa == numa_ids[0] for numa in numa_ids)
+    def create_placeholder_function(func_name):
+        """Create dummy function that raises when called"""
 
-        return not same_numa
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to execute nvidia-smi: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}")
-        return False
+        def placeholder(*args, **kwargs):
+            raise NotImplementedError(f"Function {func_name} is a placeholder")
+
+        placeholder.__name__ = func_name
+        return placeholder
+
+    modules = module_path.split(".")
+    current_module = None
+    processed_path = []
+
+    for idx, part in enumerate(modules):
+        current_path = ".".join(modules[: idx + 1])
+        parent_path = ".".join(modules[:idx]) if idx > 0 else None
+
+        try:
+            current_module = importlib.import_module(current_path)
+        except ModuleNotFoundError:
+            # Handle missing module
+            parent = importlib.import_module(parent_path) if parent_path else None
+            if parent and hasattr(parent, part):
+                # Use existing attribute from parent
+                current_module = getattr(parent, part)
+                # Check for early function resolution
+                if function_name and hasattr(current_module, function_name):
+                    return current_module, getattr(current_module, function_name)
+                if function_name and create_dummy:
+                    ph_func = create_placeholder_function(function_name)
+                    setattr(current_module, function_name, ph_func)
+                    return current_module, ph_func
+                if function_name:
+                    raise AttributeError(
+                        f"Function {function_name} missing in {current_path}"
+                    )
+            else:
+                if not create_dummy:
+                    raise
+                # Create and register dummy module
+                current_module = create_dummy_module(
+                    current_path,
+                    parent=(
+                        importlib.import_module(parent_path) if parent_path else None
+                    ),
+                )
+
+        processed_path.append(part)
+
+    # Final function handling
+    final_module = sys.modules[module_path]
+    if function_name is not None:
+        if not hasattr(final_module, function_name):
+            if create_dummy:
+                ph_func = create_placeholder_function(function_name)
+                setattr(final_module, function_name, ph_func)
+            else:
+                setattr(final_module, function_name, None)
+        return final_module, getattr(final_module, function_name)
+
+    return final_module, None
