@@ -317,7 +317,7 @@ class ToolCall(BaseModel):
 
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool"]
-    content: Union[str, List[ChatCompletionMessageContentTextPart], None]
+    content: Optional[Union[str, List[ChatCompletionMessageContentTextPart]]] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
@@ -334,6 +334,25 @@ class ChatCompletionMessageGenericParam(BaseModel):
                 )
             return v_lower
         raise ValueError("'role' must be a string")
+    
+    @model_validator(mode="after")
+    def validate_content_or_tool_calls(self):
+        """Validate that content is required unless tool_calls is specified for assistant role."""
+        if self.role == "assistant":
+            # Check if tool_calls is empty or None
+            has_tool_calls = self.tool_calls is not None and len(self.tool_calls) > 0
+            
+            if not has_tool_calls and not self.content:
+                raise ValueError(
+                    "The contents of the assistant message is required unless tool_calls is specified."
+                )
+        elif self.role in ["system", "tool"]:
+            # For system and tool roles: content is always required
+            if not self.content:
+                raise ValueError(
+                    f"The content field is required for '{self.role}' role messages."
+                )
+        return self
 
 
 class ChatCompletionMessageUserParam(BaseModel):
