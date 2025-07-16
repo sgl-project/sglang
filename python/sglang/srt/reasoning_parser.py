@@ -228,10 +228,10 @@ if __name__ == "__main__":
     detector = Qwen3Detector(stream_reasoning=True)
     text = "<Direct answer without thinking."
     text_chunks = ["<", "Direct", " an", "swer", " without", " thinking."]
-    mormal_texts = []
+    normal_texts = []
     for chunk in text_chunks:
         result = detector.parse_streaming_increment(chunk)
-        mormal_texts.append(result.normal_text)
+        normal_texts.append(result.normal_text)
     assert (
-        "".join(mormal_texts) == text
+        "".join(normal_texts) == text
     ), "Streaming parsing failed to reconstruct the text"
