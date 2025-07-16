@@ -148,8 +148,8 @@ async def eval_mmmu(args) -> None:
         semaphore = asyncio.Semaphore(args.concurrency)
         tasks = [
             process_sample_with_semaphore(
-            semaphore, client, sample, sampling_params, lora_path
-        )
+                semaphore, client, sample, sampling_params, lora_path
+            )
             for sample in samples
         ]
 

@@ -22,13 +22,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+from sglang.srt.managers.mm_utils import TensorTransportMode, TransportableTensor
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
-
-from sglang.srt.managers.mm_utils import TensorTransportMode, TransportableTensor
-from sglang.srt.mm_utils import has_valid_data
-from sglang.utils import info_once
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -532,38 +529,6 @@ class TokenizedGenerateReqInput:
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
-    def __getstate__(self):
-        """
-        Called before serializing
-        """
-        state = dict(self.__dict__)
-        global global_transport_mode
-        if global_transport_mode is None:
-            if "mm_inputs" in state and state["mm_inputs"] is not None:
-                transport_mode = self._determine_tensor_transport_mode(
-                    global_transport_mode
-                )
-                global_transport_mode = transport_mode
-                info_once(f"{global_transport_mode=}")
-
-        # turn feature into TransportableTensor
-        if global_transport_mode is not None:
-            original_mm_inputs = state["mm_inputs"]
-            # shallow-copy
-            new_mm_inputs = copy.copy(original_mm_inputs)
-            new_mm_items = []
-            for original_item in original_mm_inputs["mm_items"]:
-                new_item = copy.copy(original_item)
-                if not isinstance(new_item.feature, TransportableTensor):
-                    # modify in-place
-                    new_item.feature = TransportableTensor(
-                        transport_mode=global_transport_mode, feature=new_item.feature
-                    )
-                new_mm_items.append(new_item)
-            new_mm_inputs["mm_items"] = new_mm_items
-            state["mm_inputs"] = new_mm_inputs
-        return state
-
     def __setstate__(self, state):
         if "mm_inputs" in state and state["mm_inputs"] is not None:
             mm_inputs = state["mm_inputs"]
@@ -572,25 +537,6 @@ class TokenizedGenerateReqInput:
                     mm_item.feature = mm_item.feature.deserialize()
 
         self.__dict__.update(state)
-
-    def _determine_tensor_transport_mode(
-        self, tensor_transport_mode: Optional[TensorTransportMode]
-    ) -> TensorTransportMode:
-        if tensor_transport_mode is not None and tensor_transport_mode != "auto":
-            return tensor_transport_mode
-
-        # Fallback to cpu transport for multi-node deployments, as cuda_ipc is not applicable.
-        # We use bootstrap_host as an indicator for multi-node/disaggregated inference.
-        is_remote_bootstrap = (
-            self.bootstrap_host is not None
-            and self.bootstrap_host not in ["localhost", "127.0.0.1"]
-        )
-
-        if is_remote_bootstrap:
-            # Fallback to default CPU transport for multi-node
-            return "default"
-        else:
-            return "cuda_ipc"
 
 
 @dataclass

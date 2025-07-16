@@ -12,6 +12,7 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
+from sglang.srt.managers.mm_utils import TensorTransportMode, TransportableTensor
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import load_audio, load_image, load_video, logger
 
@@ -139,6 +140,7 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.arch = hf_config.architectures[0]
         self.server_args = server_args
+        self.transport_mode: Optional[TensorTransportMode] = None
 
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
@@ -209,10 +211,10 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        if "pixel_values" in result and isinstance(
-            result["pixel_values"], torch.Tensor
-        ):
-            result["pixel_values"] = result["pixel_values"].to("cpu")
+        # if "pixel_values" in result and isinstance(
+        #     result["pixel_values"], torch.Tensor
+        # ):
+        #     result["pixel_values"] = result["pixel_values"].to("cpu")
         return result
 
     @abstractmethod
@@ -515,6 +517,13 @@ class BaseMultimodalProcessor(ABC):
 
                 if attr_name in self.FEATURE_NAMES:
                     attr_name = "feature"
+                    print(f"{type(value)=}")
+                    print(f"{self.transport_mode=}")
+                    if isinstance(value, torch.Tensor):
+
+                        value = TransportableTensor(
+                            transport_mode=self.transport_mode, feature=value
+                        )
 
                 items[modality].set(attr_name, value)
 

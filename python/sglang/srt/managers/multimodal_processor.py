@@ -49,11 +49,14 @@ def import_processors():
 
 
 def get_mm_processor(
-    hf_config, server_args: ServerArgs, processor
+    hf_config, server_args: ServerArgs, processor, transport_mode
 ) -> BaseMultimodalProcessor:
     for model_cls, processor_cls in PROCESSOR_MAPPING.items():
         if model_cls.__name__ in hf_config.architectures:
-            return processor_cls(hf_config, server_args, processor)
+            instance = processor_cls(hf_config, server_args, processor)
+            instance.transport_mode = transport_mode
+            return instance
+
     raise ValueError(
         f"No processor registered for architecture: {hf_config.architectures}.\n"
         f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
