@@ -25,7 +25,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 @dataclass
 class ExpertLocationDispatchInfo:
-    ep_dispatch_algorithm: Literal["static", "random", "dynamic", "fake", "lp", "test"]
+    ep_dispatch_algorithm: Literal["static", "random", "dynamic", "fake", "lp"]
     # (num_logical_experts,)
     partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # (num_logical_experts, X)
@@ -44,6 +44,8 @@ class ExpertLocationDispatchInfo:
         expert_location_metadata = get_global_expert_location_metadata()
         if ep_dispatch_algorithm == "lp":
             lp_metadata = get_global_token_dispatch_metadata()
+        else:
+            lp_metadata = None
 
         if ep_dispatch_algorithm is None:
             return None
@@ -80,7 +82,7 @@ class ExpertLocationDispatchInfo:
                 "phy_replicated_expert_array": lp_metadata.phy_replicated_expert_array[layer_id],
                 "dims": lp_metadata.dims,
                 "ecos_opts": lp_metadata.ecos_opts,
-            } if ep_dispatch_algorithm == "lp" else None
+            } if lp_metadata is not None else None
         )
 
 
@@ -110,13 +112,7 @@ def topk_ids_logical_to_physical(
         return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
     if info.ep_dispatch_algorithm == "lp" and logical_expert_probabilities is not None:
         return _topk_ids_logical_to_physical_probability(topk_ids, info, logical_expert_probabilities)
-    if info.ep_dispatch_algorithm == "test":
-        # Generate random probabilities with same shape as logical_to_all_physical_map
-        logical_expert_probabilities = torch.rand_like(info.partial_logical_to_all_physical_map, dtype=torch.float32, device=topk_ids.device)
-        # Set probability to 0 where physical expert ID is -1
-        logical_expert_probabilities[info.partial_logical_to_all_physical_map == -1] = 0
-        
-        return _topk_ids_logical_to_physical_probability(topk_ids, info, logical_expert_probabilities)
+
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
 
 
@@ -184,6 +180,18 @@ def _topk_ids_logical_to_physical_probability(
     masked_probabilities = logical_expert_probabilities * valid_mask
 
     topk_probs = masked_probabilities[topk_ids]
+    
+    # Check for zero-sum probabilities and handle them
+    prob_sums = topk_probs.sum(dim=-1)
+    zero_sum_mask = prob_sums <= 0
+    
+    if zero_sum_mask.any():
+        # print(f"Warning: Found {zero_sum_mask.sum()} tokens with zero-sum probabilities. Assigning 1 to all values and reapplying mask.")
+        # For tokens with zero-sum probabilities, assign 1 to all values and reapply mask
+        topk_probs[zero_sum_mask] = 1.0
+        # Reapply the mask to zero out invalid experts
+        topk_probs = topk_probs * valid_mask[topk_ids]
+    
     chosen_dispatch_index = torch.multinomial(topk_probs, 1).flatten()
 
     topk_ids = log2phy_map[topk_ids, chosen_dispatch_index]

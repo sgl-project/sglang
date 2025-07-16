@@ -200,8 +200,10 @@ def grouped_topk_gpu(
     if lp_dispatch:
         num_logical_experts = gating_output.shape[1]  # Number of experts in gating output
         log2phy_prob = get_log2phy_prob(topk_ids, num_logical_experts, expert_location_dispatch_info)
+        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info, log2phy_prob)
+    else:
+        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
 
-    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
 
@@ -318,9 +320,9 @@ def _mask_topk_ids_padded_region(
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
-    topk_ids, expert_location_dispatch_info, num_token_non_padded
+    topk_ids, expert_location_dispatch_info, num_token_non_padded, log2phy_prob: Optional[torch.Tensor] = None
 ):
-    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info, log2phy_prob)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_ids
 
@@ -361,14 +363,14 @@ def biased_grouped_topk_gpu(
         )
         if lp_dispatch:
             num_logical_experts = gating_output.shape[1]  # Number of experts in gating output
-            logical_counts = get_log2phy_prob(topk_ids, num_logical_experts, expert_location_dispatch_info)
+            log2phy_prob = get_log2phy_prob(topk_ids, num_logical_experts, expert_location_dispatch_info)
 
         # TODO merge into kernel
         if (expert_location_dispatch_info is not None) or (
             num_token_non_padded is not None
         ):
             topk_ids = _biased_grouped_topk_postprocess(
-                topk_ids, expert_location_dispatch_info, num_token_non_padded
+                topk_ids, expert_location_dispatch_info, num_token_non_padded, log2phy_prob
             )
         return topk_weights, topk_ids
     elif _use_aiter:

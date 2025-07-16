@@ -159,5 +159,5 @@ def get_log2phy_prob(
 
     # Step 4: Broadcast to all ranks
     log2phy_prob = send_log2phy_prob_broadcast(log2phy_prob)
-    log2phy_prob = log2phy_prob.to(device, non_blocking=True)
+    log2phy_prob = log2phy_prob.to(device, dtype=torch.float32, non_blocking=True)
     return log2phy_prob
