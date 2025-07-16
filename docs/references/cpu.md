@@ -50,9 +50,51 @@ docker run \
 ```
 
 If you'd prefer to install SGLang in a bare metal environment,
-please take the command list in the Dockerfile as reference.
-Please note that the environment variable `SGLANG_USE_CPU_ENGINE=1`
+the command list is similar with the procedure in the Dockerfile.
+It is worth noting that the environment variable `SGLANG_USE_CPU_ENGINE=1`
 is required to be set to enable SGLang service with CPU engine.
+
+```bash
+# Create and activate a conda environment
+conda create -n sgl-cpu python=3.12 -y
+conda activate sgl-cpu
+
+# Optional: Set PyTorch CPU as primary pip install channel to avoid installing CUDA version
+pip config set global.index-url https://download.pytorch.org/whl/cpu
+pip config set global.extra-index-url https://pypi.org/simple
+
+# Check if some conda related environment variables have been set
+env | grep -i conda
+# The following environment variable settings are required
+# if they have not been set properly
+export CONDA_EXE=$(which conda)
+export CONDA_ROOT=${CONDA_EXE}/../..
+export CONDA_PREFIX=${CONDA_ROOT}/envs/sgl-cpu
+export PATH=${PATH}:${CONDA_ROOT}/bin:${CONDA_ROOT}/condabin
+
+# Clone the SGLang code
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+git checkout <YOUR-DESIRED-VERSION>
+
+# Install SGLang main package and its dependencies
+pip install --upgrade pip setuptools
+conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl
+pip install intel-openmp
+pip install -e "python[all_cpu]"
+
+# Build the CPU backend kernels
+cd sgl-kernel
+cp pyproject_cpu.toml pyproject.toml
+pip install -v .
+
+# Other required environment variables
+# Recommend to set these in ~/.bashrc in order not to set every time in a new terminal
+export SGLANG_USE_CPU_ENGINE=1
+export LD_PRELOAD=${LD_PRELOAD}:${CONDA_PREFIX}/lib/libiomp5.so:${CONDA_PREFIX}/lib/libtcmalloc.so:${CONDA_PREFIX}/lib/libtbbmalloc.so.2
+```
+
+
 
 ## Launch of the Serving Engine
 
