@@ -8,7 +8,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
-    ImageDataItem,
+    ImageDataInputItem,
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.vila import VILAForConditionalGeneration
@@ -42,7 +42,7 @@ class VILAMultimodalProcessor(BaseMultimodalProcessor):
 
     async def process_mm_data_async(
         self,
-        image_data: Optional[ImageDataItem | List[ImageDataItem]],
+        image_data: Optional[ImageDataInputItem | List[ImageDataInputItem]],
         input_text: str | List[int],
         request_obj: GenerateReqInput | EmbeddingReqInput,
         max_req_input_len: int,
@@ -57,7 +57,7 @@ class VILAMultimodalProcessor(BaseMultimodalProcessor):
             image_data=image_data,
         )
 
-        mm_items, input_ids = self.process_and_combine_mm_data(base_output)
+        mm_items, input_ids, _ = self.process_and_combine_mm_data(base_output)
 
         return {
             "input_ids": input_ids.tolist(),

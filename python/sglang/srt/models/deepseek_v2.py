@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
 
+import concurrent.futures
 import logging
 import os
 from enum import IntEnum, auto
@@ -77,6 +78,7 @@ from sglang.srt.layers.quantization.int8_utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope, get_rope_wrapper
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -100,6 +102,7 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cpu,
     is_cuda,
+    is_flashinfer_available,
     is_hip,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
@@ -131,6 +134,9 @@ if _is_hip:
     from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
         decode_attention_fwd_grouped_rope,
     )
+
+_is_flashinfer_available = is_flashinfer_available()
+_is_sm100_supported = is_cuda() and is_sm100_supported()
 
 
 logger = logging.getLogger(__name__)
@@ -195,13 +201,13 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, forward_batch=None):
+    def forward(self, x, forward_batch=None, can_fuse_mlp_allreduce=False):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, can_fuse_mlp_allreduce=can_fuse_mlp_allreduce)
         return x
 
 
@@ -409,7 +415,10 @@ class DeepseekV2MoE(nn.Module):
         ]
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        can_fuse_mlp_allreduce: bool = False,
     ) -> torch.Tensor:
         if not self._enable_deepep_moe:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
@@ -418,37 +427,43 @@ class DeepseekV2MoE(nn.Module):
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             ):
-                return self.forward_normal_dual_stream(hidden_states)
+                return self.forward_normal_dual_stream(
+                    hidden_states, can_fuse_mlp_allreduce
+                )
             else:
-                return self.forward_normal(hidden_states)
+                return self.forward_normal(hidden_states, can_fuse_mlp_allreduce)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
-    def forward_normal_dual_stream(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states)
+    def forward_normal_dual_stream(
+        self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False
+    ) -> torch.Tensor:
 
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states)
 
         with torch.cuda.stream(self.alt_stream):
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
-        final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1:
+        final_hidden_states += shared_output
+        if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
-    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_normal(
+        self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False
+    ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
-            return self.forward_cpu(hidden_states)
+            return self.forward_cpu(hidden_states, can_fuse_mlp_allreduce)
 
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
@@ -461,11 +476,13 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
-    def forward_cpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_cpu(
+        self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False
+    ) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         fused_experts_out = self.experts(
@@ -514,7 +531,7 @@ class DeepseekV2MoE(nn.Module):
             None,  # a2_scale
             True,  # is_vnni
         )
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
@@ -1818,6 +1835,29 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id % self.config.moe_layer_freq == 0
         )
 
+    def _should_fuse_mlp_allreduce_with_next_layer(self, forward_batch) -> bool:
+        """Check if MLP allreduce can be fused with next layer's add_rmsnorm"""
+
+        if (
+            self.layer_id == self.config.num_hidden_layers - 1
+            or get_tensor_model_parallel_world_size() <= 1
+        ):
+            return False
+
+        if not global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False):
+            return False
+
+        if not _is_sm100_supported or not _is_flashinfer_available:
+            return False
+
+        if hasattr(forward_batch, "input_ids") and (
+            forward_batch.input_ids.shape[0] == 0
+            or forward_batch.input_ids.shape[0] > 128
+        ):
+            return False
+
+        return True
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1842,11 +1882,21 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
+        can_fuse_mlp_allreduce = (
+            self._should_fuse_mlp_allreduce_with_next_layer(forward_batch)
+            and not (self.enable_dp_attention and self.speculative_algorithm.is_eagle())
+            and not self.is_nextn
         )
+
+        hidden_states = self.mlp(hidden_states, forward_batch, can_fuse_mlp_allreduce)
+
+        if can_fuse_mlp_allreduce:
+            hidden_states._sglang_needs_allreduce_fusion = True
+
+        if not can_fuse_mlp_allreduce:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
 
         return hidden_states, residual
 
@@ -1938,7 +1988,7 @@ class DeepseekV2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            use_attn_tp_group=True,
+            enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
@@ -2146,7 +2196,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             # This may affect the accuracy of fp8 model.
             # Fix deepseek v3 blockwise bmm by using deep_gemm
             use_deep_gemm_bmm = False
-            model_dtype = torch.get_default_dtype()
 
             if w.dtype in (
                 torch.float8_e4m3fn,
@@ -2172,7 +2221,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                         _is_cuda
                         and weight_block_size[0] == 128
                         and weight_block_size[1] == 128
-                        and model_dtype == torch.bfloat16
                     ):
                         if (
                             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -2186,7 +2234,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 weight,
                                 weight_scale,
                                 weight_block_size,
-                                model_dtype,
+                                torch.bfloat16,
                             )
                     else:
                         w, scale = block_quant_to_tensor_quant(
@@ -2363,6 +2411,12 @@ class DeepseekV2ForCausalLM(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
+        if self.quant_config and self.quant_config.get_name() == "w4afp8":
+            expert_params_mapping += (
+                get_moe_impl_class().make_expert_input_scale_params_mapping(
+                    num_experts=self.config.n_routed_experts
+                )
+            )
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
@@ -2383,154 +2437,174 @@ class DeepseekV2ForCausalLM(nn.Module):
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
-        params_dict = dict(self.named_parameters())
-        weight_names = []
-        for name, loaded_weight in weights:
-            if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
-                name = name.replace(
-                    "mlp.shared_experts",
-                    f"mlp.experts.{self.config.n_routed_experts}",
-                )
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = []
+            params_dict = dict(self.named_parameters())
+            weight_names = []
+            for name, loaded_weight in weights:
+                if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+                    name = name.replace(
+                        "mlp.shared_experts",
+                        f"mlp.experts.{self.config.n_routed_experts}",
+                    )
 
-            weight_names.append(name)
+                weight_names.append(name)
 
-            if not is_nextn:
-                if hasattr(self.config, "num_nextn_predict_layers"):
-                    num_nextn_layers = self.config.num_nextn_predict_layers
-                    if num_nextn_layers > 0 and name.startswith("model.layers"):
-                        name_list = name.split(".")
-                        if (
-                            len(name_list) >= 3
-                            and int(name_list[2]) >= self.config.num_hidden_layers
-                        ):
-                            continue
-            else:
-                if not name.startswith(nextn_layer_prefix):
-                    continue
+                if not is_nextn:
+                    if hasattr(self.config, "num_nextn_predict_layers"):
+                        num_nextn_layers = self.config.num_nextn_predict_layers
+                        if num_nextn_layers > 0 and name.startswith("model.layers"):
+                            name_list = name.split(".")
+                            if (
+                                len(name_list) >= 3
+                                and int(name_list[2]) >= self.config.num_hidden_layers
+                            ):
+                                continue
+                else:
+                    if not name.startswith(nextn_layer_prefix):
+                        continue
 
-                # Use shared head and embed weights from target model
-                if "shared_head.head" in name or "embed_tokens" in name:
-                    continue
+                    # Use shared head and embed weights from target model
+                    if "shared_head.head" in name or "embed_tokens" in name:
+                        continue
 
-                is_decoder = True
-                # For nextn specific weights
-                for weight_name in nextn_spec_weight_names:
-                    if weight_name in name:
-                        name = name.replace(nextn_layer_prefix, "model")
-                        is_decoder = False
-                        break
-                # For decoder layer weights
-                if is_decoder:
-                    name = name.replace(nextn_layer_prefix, "model.decoder")
+                    is_decoder = True
+                    # For nextn specific weights
+                    for weight_name in nextn_spec_weight_names:
+                        if weight_name in name:
+                            name = name.replace(nextn_layer_prefix, "model")
+                            is_decoder = False
+                            break
+                    # For decoder layer weights
+                    if is_decoder:
+                        name = name.replace(nextn_layer_prefix, "model.decoder")
 
-            if "rotary_emb.inv_freq" in name:
-                continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
-                if weight_name not in name:
+                if "rotary_emb.inv_freq" in name:
                     continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since we handle the experts below in expert_params_mapping,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below in expert_params_mapping
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if ("mlp.experts." in name) and name not in params_dict:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    # Skip non-stacked layers and experts (experts handled below).
                     if weight_name not in name:
                         continue
+                    # We have mlp.experts[0].gate_proj in the checkpoint.
+                    # Since we handle the experts below in expert_params_mapping,
+                    # we need to skip here BEFORE we update the name, otherwise
+                    # name will be updated to mlp.experts[0].gate_up_proj, which
+                    # will then be updated below in expert_params_mapping
+                    # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                    if ("mlp.experts." in name) and name not in params_dict:
+                        continue
                     name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
-                else:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-                    if fuse_qkv_a_proj and (
-                        "q_a_proj" in name or "kv_a_proj_with_mqa" in name
-                    ):
-                        cached_a_proj[name] = loaded_weight
-                        q_a_proj_name = (
-                            name
-                            if "q_a_proj" in name
-                            else name.replace("kv_a_proj_with_mqa", "q_a_proj")
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    futures.append(
+                        executor.submit(weight_loader, param, loaded_weight, shard_id)
+                    )
+                    break
+                else:
+                    for mapping in expert_params_mapping:
+                        param_name, weight_name, expert_id, shard_id = mapping
+                        if weight_name not in name:
+                            continue
+                        name = name.replace(weight_name, param_name)
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        futures.append(
+                            executor.submit(
+                                weight_loader,
+                                param,
+                                loaded_weight,
+                                name,
+                                shard_id=shard_id,
+                                expert_id=expert_id,
+                            )
                         )
-                        kv_a_proj_name = (
-                            name
-                            if "kv_a_proj_with_mqa" in name
-                            else name.replace("q_a_proj", "kv_a_proj_with_mqa")
-                        )
-
-                        # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
-                        if (
-                            q_a_proj_name in cached_a_proj
-                            and kv_a_proj_name in cached_a_proj
+                        break
+                    else:
+                        # Skip loading extra bias for GPTQ models.
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        if fuse_qkv_a_proj and (
+                            "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
-                            q_a_proj_weight = cached_a_proj[q_a_proj_name]
-                            kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                            cat_dim = 0
-                            if self.quant_config is not None and (
-                                self.quant_config.get_name() == "awq"
-                                or self.quant_config.get_name() == "moe_wna16"
-                            ):
-                                cat_dim = 1
-                            fused_weight = torch.cat(
-                                [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
-                            )
-                            param_name = (
-                                name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
+                            cached_a_proj[name] = loaded_weight
+                            q_a_proj_name = (
+                                name
                                 if "q_a_proj" in name
-                                else name.replace(
-                                    "kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"
-                                )
+                                else name.replace("kv_a_proj_with_mqa", "q_a_proj")
                             )
-                            param = params_dict[param_name]
+                            kv_a_proj_name = (
+                                name
+                                if "kv_a_proj_with_mqa" in name
+                                else name.replace("q_a_proj", "kv_a_proj_with_mqa")
+                            )
 
+                            # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
+                            if (
+                                q_a_proj_name in cached_a_proj
+                                and kv_a_proj_name in cached_a_proj
+                            ):
+                                q_a_proj_weight = cached_a_proj[q_a_proj_name]
+                                kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+                                cat_dim = 0
+                                if self.quant_config is not None and (
+                                    self.quant_config.get_name() == "awq"
+                                    or self.quant_config.get_name() == "moe_wna16"
+                                ):
+                                    cat_dim = 1
+                                fused_weight = torch.cat(
+                                    [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
+                                )
+                                param_name = (
+                                    name.replace(
+                                        "q_a_proj", "fused_qkv_a_proj_with_mqa"
+                                    )
+                                    if "q_a_proj" in name
+                                    else name.replace(
+                                        "kv_a_proj_with_mqa",
+                                        "fused_qkv_a_proj_with_mqa",
+                                    )
+                                )
+                                param = params_dict[param_name]
+
+                                weight_loader = getattr(
+                                    param, "weight_loader", default_weight_loader
+                                )
+                                futures.append(
+                                    executor.submit(weight_loader, param, fused_weight)
+                                )
+                                cached_a_proj.pop(q_a_proj_name)
+                                cached_a_proj.pop(kv_a_proj_name)
+                        else:
+                            if (
+                                "k_scale" in name or "v_scale" in name
+                            ) and name not in params_dict:
+                                # modelopt attn kv scale is named differently
+                                for scale in ["k_scale", "v_scale"]:
+                                    if scale in name:
+                                        name = name.replace(
+                                            f"{scale[0]}_proj", "attn_mqa"
+                                        )
+                                        break
+                            if name not in params_dict:
+                                # modelopt ckpt contains not needed weights for MTP module:
+                                # model.decoder.self_attn.attn_mqa.v_scale and
+                                # model.decoder.self_attn.attn_mqa.k_scale
+                                logger.warning(f"{name} not found in params_dict.")
+                                continue
+                            param = params_dict[name]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
-                            weight_loader(param, fused_weight)
-                            cached_a_proj.pop(q_a_proj_name)
-                            cached_a_proj.pop(kv_a_proj_name)
-                    else:
-                        if (
-                            "k_scale" in name or "v_scale" in name
-                        ) and name not in params_dict:
-                            # modelopt attn kv scale is named differently
-                            for scale in ["k_scale", "v_scale"]:
-                                if scale in name:
-                                    name = name.replace(f"{scale[0]}_proj", "attn_mqa")
-                                    break
-                        if name not in params_dict:
-                            # modelopt ckpt contains not needed weights for MTP module:
-                            # model.decoder.self_attn.attn_mqa.v_scale and
-                            # model.decoder.self_attn.attn_mqa.k_scale
-                            logger.warning(f"{name} not found in params_dict.")
-                            continue
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
+                            futures.append(
+                                executor.submit(weight_loader, param, loaded_weight)
+                            )
+
+            # Wait for all tasks to complete and raise any exceptions.
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 

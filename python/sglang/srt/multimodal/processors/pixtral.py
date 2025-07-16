@@ -106,7 +106,7 @@ class PixtralProcessor(BaseMultimodalProcessor):
                     pixel_values=processor_output["pixel_values"],
                     image_sizes=processor_output["image_sizes"],
                     modality=Modality.IMAGE,
-                    image_offsets=image_offsets,
+                    offsets=image_offsets,
                 )
             ]
 
