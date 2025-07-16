@@ -1,6 +1,8 @@
 import logging
 from typing import List, Optional
 
+from sglang.srt.utils import get_bool_env_var, get_free_port
+
 logger = logging.getLogger(__name__)
 
 
@@ -53,12 +55,21 @@ class MooncakeTransferEngine:
         device_name: Optional[str],
     ) -> None:
         """Initialize the mooncake instance."""
-        ret_value = self.engine.initialize(
-            hostname,
-            "P2PHANDSHAKE",
-            "rdma",
-            device_name if device_name is not None else "",
-        )
+        if get_bool_env_var("ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE", "false"):
+            hostname += f":{get_free_port()}:npu_{self.gpu_id}"
+            ret_value = self.engine.initialize(
+                hostname,
+                "P2PHANDSHAKE",
+                "ascend",
+                device_name if device_name is not None else "",
+            )
+        else:
+            ret_value = self.engine.initialize(
+                hostname,
+                "P2PHANDSHAKE",
+                "rdma",
+                device_name if device_name is not None else "",
+            )
         if ret_value != 0:
             logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
