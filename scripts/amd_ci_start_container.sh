@@ -64,12 +64,14 @@ FIND_IMAGE_CMD="find_latest_mi30x_image"
 FALLBACK_IMAGE="rocm/sgl-dev:v0.4.9.post2-rocm630-mi30x-20250715"
 FALLBACK_MSG="No mi30x image found in last 30 days, using fallback image"
 
-if [[ "${RUNNER_NAME}" == "linux-mi35x-gpu-x" ]]; then
+# Check for mi350/mi355 runners
+if [[ "${RUNNER_NAME}" =~ ^linux-mi350-gpu-[0-9]+$ ]] || [[ "${RUNNER_NAME}" =~ ^linux-mi355-gpu-[0-9]+$ ]]; then
   echo "Runner is ${RUNNER_NAME}, will find mi35x image."
   FIND_IMAGE_CMD="find_latest_mi35x_image"
   FALLBACK_IMAGE="rocm/sgl-dev:v0.4.9.post2-rocm700-mi35x-20250715"
   FALLBACK_MSG="No mi35x image found in last 30 days, using fallback image"
-elif [[ "${RUNNER_NAME}" == "linux-mi300-gpu-x" || "${RUNNER_NAME}" == "linux-mi325-gpu-x" ]]; then
+# Check for mi300/mi325 runners
+elif [[ "${RUNNER_NAME}" =~ ^linux-mi300-gpu-[0-9]+$ ]] || [[ "${RUNNER_NAME}" =~ ^linux-mi325-gpu-[0-9]+$ ]]; then
   echo "Runner is ${RUNNER_NAME}, will find mi30x image."
 else
   echo "RUNNER_NAME env is not set or not recognized: '${RUNNER_NAME}'"
