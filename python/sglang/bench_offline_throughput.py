@@ -420,8 +420,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # handling Modelscope model downloads
-    import os
-
     if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() in ("true", "1"):
         try:
             os.environ["TRANSFORMERS_OFFLINE"] = "1"
