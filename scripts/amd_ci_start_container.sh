@@ -8,34 +8,20 @@ else
   DEVICE_FLAG="--device /dev/dri"
 fi
 
-# Function to find latest available mi30x image
-find_latest_mi30x_image() {
-  local base_tag="v0.4.9.post2-rocm630-mi30x"
-  local days_back=0
+# Function to find latest available image for a given GPU architecture
+find_latest_image() {
+  local gpu_arch=$1
+  local base_tag
 
-  while [ $days_back -lt 30 ]; do
-    local check_date=$(date -d "$days_back days ago" +%Y%m%d)
-    local image_tag="${base_tag}-${check_date}"
+  if [ "$gpu_arch" == "mi30x" ]; then
+    base_tag="v0.4.9.post2-rocm630-mi30x"
+  elif [ "$gpu_arch" == "mi35x" ]; then
+    base_tag="v0.4.9.post2-rocm700-mi35x"
+  else
+    echo "Error: Unsupported GPU architecture '$gpu_arch'" >&2
+    return 1
+  fi
 
-echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
-
-    # Check if the image exists by trying to get its manifest
-    if docker manifest inspect "rocm/sgl-dev:${image_tag}" >/dev/null 2>&1; then
-echo "Found available image: rocm/sgl-dev:${image_tag}" >&2
-      echo "rocm/sgl-dev:${image_tag}"
-      return 0
-    fi
-
-    days_back=$((days_back + 1))
-  done
-
-  echo "Error: No mi30x image found in the last 30 days" >&2
-  return 1
-}
-
-# Function to find latest available mi35x image
-find_latest_mi35x_image() {
-  local base_tag="v0.4.9.post2-rocm700-mi35x"
   local days_back=0
 
   while [ $days_back -lt 30 ]; do
@@ -54,7 +40,7 @@ find_latest_mi35x_image() {
     days_back=$((days_back + 1))
   done
 
-  echo "Error: No mi35x image found in the last 30 days" >&2
+  echo "Error: No ${gpu_arch} image found in the last 30 days" >&2
   return 1
 }
 
@@ -72,14 +58,14 @@ else
 fi
 
 echo "The runner is: ${RUNNER_NAME}"
-FIND_IMAGE_CMD="find_latest_mi30x_image"
+GPU_ARCH="mi30x"
 FALLBACK_IMAGE="rocm/sgl-dev:v0.4.9.post2-rocm630-mi30x-20250715"
 FALLBACK_MSG="No mi30x image found in last 30 days, using fallback image"
 
 # Check for mi350/mi355 runners
 if [[ "${RUNNER_NAME}" =~ ^linux-mi350-gpu-[0-9]+$ ]] || [[ "${RUNNER_NAME}" =~ ^linux-mi355-gpu-[0-9]+$ ]]; then
   echo "Runner is ${RUNNER_NAME}, will find mi35x image."
-  FIND_IMAGE_CMD="find_latest_mi35x_image"
+  GPU_ARCH="mi35x"
   FALLBACK_IMAGE="rocm/sgl-dev:v0.4.9.post2-rocm700-mi35x-20250715"
   FALLBACK_MSG="No mi35x image found in last 30 days, using fallback image"
 # Check for mi300/mi325 runners
@@ -91,7 +77,7 @@ else
 fi
 
 # Find and pull the latest image
-IMAGE=$($FIND_IMAGE_CMD)
+IMAGE=$(find_latest_image "${GPU_ARCH}")
 if [ $? -eq 0 ]; then
   echo "Pulling Docker image: $IMAGE"
 else
