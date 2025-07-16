@@ -229,11 +229,7 @@ def get_linear_quant_method(
 
     if isinstance(layer, LinearBase) or parallel_lm_head_quantized:
         # False = skip module, None = no override, else = Positive match
-        if (
-            get_dynamic_override(
-                cloned_config, layer_name=prefix
-            ) is False
-        ):
+        if get_dynamic_override(cloned_config, layer_name=prefix) is False:
             if parallel_lm_head_quantized:
                 return UnquantizedEmbeddingMethod()
             return UnquantizedLinearMethod()
