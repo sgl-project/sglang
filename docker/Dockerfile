@@ -66,7 +66,7 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/sour
  && git clone https://github.com/deepseek-ai/DeepEP.git \
  && tar -xf nvshmem_src_3.2.5-1.txz && mv nvshmem_src nvshmem \
  && cd nvshmem \
- && git apply /sgl-workspace/DeepEP/third-party/nvshmem.patch \
+ && git apply /sgl-workspace/sglang/DeepEP/third-party/nvshmem.patch \
  && sed -i '1i#include <unistd.h>' examples/moe_shuffle.cu \
  && rm -f /sgl-workspace/nvshmem_src_3.2.5-1.txz \
  && NVSHMEM_SHMEM_SUPPORT=0 \
