@@ -66,4 +66,6 @@ class NPUGraphRunner(CudaGraphRunner):
 
     def _update_inputs(self, forward_batch: ForwardBatch):
         seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (self.bs - self.raw_bs)
-        self.graphs[self.bs].update(cpu_update_input=[{"actual_seq_lens_kv": seq_lens}])
+        self.graphs[self.bs].update(
+            cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
+        )
