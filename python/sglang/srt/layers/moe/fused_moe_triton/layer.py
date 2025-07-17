@@ -1,8 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
-import importlib
 import logging
-from abc import abstractmethod
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
@@ -196,7 +194,7 @@ class FusedMoE(torch.nn.Module):
         shard_dim: int,
         expert_data: torch.Tensor,
         shard_id: str,
-        loaded_weight: torch.tensor,
+        loaded_weight: torch.Tensor,
         tp_rank: int,
     ):
         # Load grouped weight scales for group quantization

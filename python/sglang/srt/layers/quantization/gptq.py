@@ -17,6 +17,7 @@ from sglang.srt.layers.parameter import (
     permute_param_layout_,
 )
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
@@ -54,8 +55,6 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import fused_marlin_moe
 
-
-FusedMoEMethodBase = QuantizeMethodBase
 
 logger = logging.getLogger(__name__)
 

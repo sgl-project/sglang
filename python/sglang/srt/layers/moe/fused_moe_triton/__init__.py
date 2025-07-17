@@ -33,7 +33,6 @@ __all__ = [
     "FusedMoeWeightScaleSupported",
     "override_config",
     "get_config",
-    "fused_moe",
     "fused_experts",
     "get_config_file_name",
     "moe_align_block_size",

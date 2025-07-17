@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
@@ -72,7 +72,7 @@ class QoQConfig(QuantizationConfig):
         return 80
 
     @classmethod
-    def get_name(self) -> str:
+    def get_name(cls) -> str:
         return "qoq"
 
     @classmethod
