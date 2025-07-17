@@ -901,21 +901,36 @@ def align_evict_mask_to_page_size(
     num_draft_tokens: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
+    """
+    Aligns eviction mask to ensure final sequence length is page-aligned.
+    
+    Strategy: Calculate target number of tokens to keep, then set eviction mask accordingly.
+    """
     t_range = tl.arange(0, BLOCK_SIZE)
-
+    
     bid = tl.program_id(axis=0)
     seq_len = tl.load(seq_lens + bid)
+    
+    # Load current eviction mask
     io_mask = t_range < num_draft_tokens
-    mask_row = tl.load(
-        evict_mask + bid * num_draft_tokens + t_range, mask=io_mask, other=0
-    )
-
-    num_trues = tl.sum(mask_row)
-    num_false = num_draft_tokens - num_trues
-
-    start = (seq_len + num_false - 1) // page_size * page_size - seq_len
-    for i in range(max(start, 0), min(start + page_size, num_draft_tokens)):
-        tl.store(evict_mask + bid * num_draft_tokens + i, False)
+    mask_row = tl.load(evict_mask + bid * num_draft_tokens + t_range, mask=io_mask, other=False)
+    
+    # Calculate current tokens we'd keep (False = keep, True = evict)
+    num_to_evict = tl.sum(mask_row.to(tl.int32))
+    current_keep = num_draft_tokens - num_to_evict
+    current_final_len = seq_len + current_keep
+    
+    # Find next page-aligned length >= current_final_len
+    target_final_len = ((current_final_len - 1) // page_size + 1) * page_size
+    target_keep = target_final_len - seq_len
+    
+    # Clamp target_keep to valid range
+    target_keep = tl.maximum(0, tl.minimum(target_keep, num_draft_tokens))
+    
+    # Simple strategy: keep the first target_keep tokens, evict the rest
+    for i in range(num_draft_tokens):
+        should_keep = i < target_keep
+        tl.store(evict_mask + bid * num_draft_tokens + i, not should_keep)
 
 
 @triton.jit
