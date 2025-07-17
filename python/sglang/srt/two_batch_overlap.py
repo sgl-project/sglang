@@ -341,18 +341,18 @@ class TboDPAttentionPreparer:
 
     @staticmethod
     def _compute_global_forward_mode(forward_modes):
-        no_idle_forward_modes = [
+        forward_modes_excluding_idle = [
             x for x in forward_modes if x != ForwardMode.IDLE.value
         ]
 
-        if not no_idle_forward_modes:
-            return ForwardMode.IDLE, True
+        if not forward_modes_excluding_idle:
+            return ForwardMode.IDLE, False
 
         forward_mode_agree = TboDPAttentionPreparer._is_all_same(
-            no_idle_forward_modes
+            forward_modes_excluding_idle
         )
         global_forward_mode = (
-            ForwardMode(no_idle_forward_modes[0]) if forward_mode_agree else None
+            ForwardMode(forward_modes_excluding_idle[0]) if forward_mode_agree else None
         )
         return global_forward_mode, forward_mode_agree
 
