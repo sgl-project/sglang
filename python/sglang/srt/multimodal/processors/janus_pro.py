@@ -33,26 +33,10 @@ class JanusProImageProcessor(BaseMultimodalProcessor):
             max_req_input_len=max_req_input_len,
         )
 
-        images = base_out.images
-        res = self.process_mm_data(
-            input_text=base_out.input_text,
-            prompt=base_out.input_text,
-            images=images,
-        )
+        mm_items, input_ids, _ = self.process_and_combine_mm_data(base_out)
 
-        input_ids = res["input_ids"].flatten()
-        image_offsets = self.get_mm_items_offset(
-            input_ids=input_ids, mm_token_id=processor.image_id
-        )
         return {
-            "mm_items": [
-                MultimodalDataItem(
-                    feature=res["pixel_values"],
-                    image_emb_mask=res["images_emb_mask"],
-                    offsets=image_offsets,
-                    modality=Modality.IMAGE,
-                )
-            ],
+            "mm_items": mm_items,
             "input_ids": input_ids.tolist(),
             "im_start_id": processor.image_start_id,
             "im_end_id": processor.image_end_id,

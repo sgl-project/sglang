@@ -37,7 +37,7 @@ import logging
 import threading
 from enum import Enum, auto
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -201,7 +201,7 @@ class MultimodalDataItem:
     For example, if there are 3 images and 1 audio inputs, there will be 2 MultimodalDataItem.
     One for images and one for audio.
 
-    We put the common fields first and the model-specific fields last.
+    We put the common fields first and the model-specific fields in model_specific_data.
     """
 
     modality: Modality
@@ -211,33 +211,22 @@ class MultimodalDataItem:
     # the raw features returned by processor, e.g. pixel_values or audio_features
     feature: Union[torch.Tensor, np.ndarray] = None
 
+    # Common fields used across multiple models
     image_sizes: Tuple[int, int] = None
 
-    audio_feature_lens: Optional[List[torch.Tensor]] = None
-    audio_offsets: Optional[List[Tuple[int, int]]] = None
     precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
-    # For qwen-vl
-    image_grid_thw: Union[torch.Tensor, np.ndarray] = None
-    second_per_grid_ts: Optional[List[torch.Tensor]] = None
-
-    # For deepseek-vl
-    image_emb_mask: Optional[torch.Tensor] = None
-    image_spatial_crop: Optional[torch.Tensor] = None
-
-    # For minicpmv
-    # [num_images, (n, w, h)]
-    tgt_size: Tuple[int, int] = None
-
-    # For mllama
-    aspect_ratio_id: Optional[List[torch.Tensor]] = None
-    aspect_ratio_mask: Optional[List[torch.Tensor]] = None
-
-    # For kimi-vl
-    image_grid_hws: Optional[List[torch.Tensor]] = None
-
-    # For gemma3n
-    input_features_mask: Optional[torch.Tensor] = None
+    # Model-specific data stored in a dictionary
+    # This should contains all the individual model-specific fields like:
+    # - image_grid_thw, second_per_grid_ts (qwen-vl)
+    # - image_emb_mask, image_spatial_crop (deepseek-vl)
+    # - tgt_size (minicpmv)
+    # - aspect_ratio_id, aspect_ratio_mask (mllama)
+    # - image_grid_hws (kimi-vl)
+    # - input_features_mask (gemma3n)
+    # - audio_feature_lens, audio_offsets (minicpmo)
+    # - ...
+    model_specific_data: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @staticmethod
     def is_empty_list(l):
@@ -303,7 +292,7 @@ class MultimodalDataItem:
     def merge(self, other):
         self.feature += other.feature
         self.image_sizes += other.image_sizes
-        self.image_offsets += other.image_offsets
+        self.offsets += other.offsets
         self.hash = hash((self.hash, other.hash))
         self.set_pad_value()
 
