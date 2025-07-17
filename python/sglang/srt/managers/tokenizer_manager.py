@@ -198,6 +198,7 @@ class TokenizerManager:
         # Read model args
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
+        self.allow_auto_truncate = server_args.allow_auto_truncate
         self.model_config = ModelConfig.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
         self.is_image_gen = self.model_config.is_image_gen
@@ -532,6 +533,15 @@ class TokenizerManager:
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
+        max_new_tokens = obj.sampling_params.get("max_new_tokens")
+
+        if self.allow_auto_truncate and input_ids is not None:
+            max_req_input_len = (
+                self.max_req_input_len - max_new_tokens
+                if max_new_tokens is not None
+                else self.max_req_input_len
+            )
+            input_ids = input_ids[:max_req_input_len]
 
         input_token_num = len(input_ids) if input_ids is not None else 0
         # Check if input alone exceeds context length
@@ -542,7 +552,6 @@ class TokenizerManager:
             )
 
         # Check total tokens (input + max_new_tokens)
-        max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
             max_new_tokens is not None
             and (max_new_tokens + input_token_num) >= self.context_len
