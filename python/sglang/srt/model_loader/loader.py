@@ -64,9 +64,12 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
+    is_npu,
     is_pin_memory_available,
     set_weight_attrs,
 )
+
+_is_npu = is_npu()
 
 
 @contextmanager
@@ -124,18 +127,22 @@ def _get_quantization_config(
         quant_config = get_quant_config(
             model_config, load_config, packed_modules_mapping
         )
-        major, minor = get_device_capability()
+        # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
+        if quant_config is None:
+            return None
+        if not _is_npu:
+            major, minor = get_device_capability()
 
-        if major is not None and minor is not None:
-            assert 0 <= minor < 10
-            capability = major * 10 + minor
-            if capability < quant_config.get_min_capability():
-                raise ValueError(
-                    f"The quantization method {model_config.quantization} "
-                    "is not supported for the current GPU. "
-                    f"Minimum capability: {quant_config.get_min_capability()}. "
-                    f"Current capability: {capability}."
-                )
+            if major is not None and minor is not None:
+                assert 0 <= minor < 10
+                capability = major * 10 + minor
+                if capability < quant_config.get_min_capability():
+                    raise ValueError(
+                        f"The quantization method {model_config.quantization} "
+                        "is not supported for the current GPU. "
+                        f"Minimum capability: {quant_config.get_min_capability()}. "
+                        f"Current capability: {capability}."
+                    )
         supported_dtypes = quant_config.get_supported_act_dtypes()
         if model_config.dtype not in supported_dtypes:
             raise ValueError(
@@ -154,6 +161,13 @@ def _initialize_model(
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
+    if _is_npu:
+        packed_modules_mapping["fused_qkv_a_proj_with_mqa"] = [
+            "q_a_proj",
+            "kv_a_proj_with_mqa",
+        ]
+        packed_modules_mapping["qkv_proj"] = ["q_proj", "k_proj", "v_proj"]
+        packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
     quant_config = _get_quantization_config(
         model_config, load_config, packed_modules_mapping
     )
@@ -534,6 +548,12 @@ class DummyModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
+
+        if get_bool_env_var("SGL_CPU_QUANTIZATION"):
+            return load_model_with_cpu_quantization(
+                self, model_config=model_config, device_config=device_config
+            )
+
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(
@@ -1462,6 +1482,38 @@ class RemoteModelLoader(BaseModelLoader):
         end = time.perf_counter()
         logger.info("Loaded weights from remote storage in %.2f seconds.", end - start)
         return model.eval()
+
+
+def load_model_with_cpu_quantization(
+    self,
+    *,
+    model_config: ModelConfig,
+    device_config: DeviceConfig,
+) -> nn.Module:
+    target_device = torch.device(device_config.device)
+    with set_default_torch_dtype(model_config.dtype):
+        model = _initialize_model(
+            model_config,
+            self.load_config,
+        )
+
+        if not isinstance(self, DummyModelLoader):
+            model.load_weights(self._get_all_weights(model_config, model))
+
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                # When quant methods need to process weights after loading
+                # (for repacking, quantizing, etc), they expect parameters
+                # to be on the global target device. This scope is for the
+                # case where cpu offloading is used, where we will move the
+                # parameters onto device for processing and back off after.
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+
+        model.to(target_device)
+
+    return model.eval()
 
 
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:

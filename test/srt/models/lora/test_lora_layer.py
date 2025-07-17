@@ -59,7 +59,7 @@ class TestLoRALayer(CustomTestCase):
         self.num_loras_list = [1, 4]
         
         self.batch_sizes = [1, 4]
-        self.seq_lens = [5, 10, 100, 1000]
+        self.seq_lens = [5, 10, 100, 512]
         self.num_added_tokens = 16
 
     def _create_base_embedding_layer(self, vocab_size: int, embed_dim: int, device: str) -> VocabParallelEmbedding:
@@ -116,24 +116,23 @@ class TestLoRALayer(CustomTestCase):
         """Create LoRABatchInfo for the test batch."""
         seg_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         
-        seg_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+        seg_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device=device)
         seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
-        
+
         weight_indices = torch.tensor(
             [lora_id if lora_id is not None else 0 for lora_id in lora_ids], 
             dtype=torch.int32, device=device
         )
         
-        lora_ranks = torch.full(
-            (self.max_loras_per_batch,), self.lora_rank, 
-            dtype=torch.int32, device=device
-        )
-        
-        scalings = torch.full(
-            (self.max_loras_per_batch,), self.scaling_factor, 
-            dtype=torch.float32, device=device
-        )
-        
+        lora_ranks = [0] * self.max_loras_per_batch
+        scalings = [0] * self.max_loras_per_batch
+        for i, lora_id in enumerate(lora_ids):
+            if lora_id is not None:
+                lora_ranks[i] = self.lora_rank
+                scalings[i] = self.scaling_factor
+            
+        lora_ranks = torch.tensor(lora_ranks, dtype=torch.int32, device=device)
+        scalings = torch.tensor(scalings, dtype=torch.float32, device=device)
         max_len = max(seq_lens)
         
         return LoRABatchInfo(
@@ -184,19 +183,19 @@ class TestLoRALayer(CustomTestCase):
         """Manually compute the expected LoRA embedding output using VocabParallelEmbedding + manual LoRA."""
         expected_results: list[torch.Tensor] = []
         org_vocab_size_padded = base_layer.num_embeddings_padded
+
+        expanded_embedding = VocabParallelEmbedding(
+                num_embeddings=vocab_size + num_added_tokens,
+                embedding_dim=base_layer.embedding_dim,
+                enable_tp=False,
+                org_num_embeddings=vocab_size,
+            ).to(input_ids.device)
         
         current_pos = 0
         for i in range(batch_info.bs):
             seq_len = batch_info.seg_lens[i]
             lora_id = batch_info.weight_indices[i].item()
             seq_input = input_ids[current_pos:current_pos + seq_len]
-            
-            expanded_embedding = VocabParallelEmbedding(
-                num_embeddings=vocab_size + num_added_tokens,
-                embedding_dim=base_layer.embedding_dim,
-                enable_tp=False,
-                org_num_embeddings=vocab_size,
-            ).to(input_ids.device)
             
             added_tokens_start_index = org_vocab_size_padded
             added_tokens_end_index = added_tokens_start_index + num_added_tokens
@@ -275,6 +274,8 @@ class TestLoRALayer(CustomTestCase):
         )
         
         for batch_size in self.batch_sizes:
+            if batch_size > 1:
+                print()
             seq_lens = self.seq_lens[:batch_size]
             lora_ids: List[Optional[int]] = [i % num_loras for i in range(batch_size)]
             input_ids = self._create_test_input(

@@ -19,6 +19,36 @@ from sglang.srt.utils import get_device_capability, set_weight_attrs
 logger = logging.getLogger(__name__)
 
 
+def get_weight_perm(num_bits: int):
+    perm_list: List[int] = []
+    for i in range(32):
+        perm1: List[int] = []
+        col = i // 4
+        for block in [0, 1]:
+            for row in [
+                2 * (i % 4),
+                2 * (i % 4) + 1,
+                2 * (i % 4 + 4),
+                2 * (i % 4 + 4) + 1,
+            ]:
+                perm1.append(16 * row + col + 8 * block)
+        for j in range(4):
+            perm_list.extend([p + 256 * j for p in perm1])
+
+    perm = np.array(perm_list)
+
+    if num_bits == 4:
+        interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
+    elif num_bits == 8:
+        interleave = np.array([0, 2, 1, 3])
+    else:
+        raise Exception("num_bits must be 4 or 8, got {}".format(num_bits))
+
+    perm = perm.reshape((-1, len(interleave)))[:, interleave].ravel()
+    perm = torch.from_numpy(perm)
+    return perm
+
+
 class MoeWNA16Config(QuantizationConfig):
     """Config class for MOE WNA16 (W8A16/W4A16) quantization."""
 
@@ -116,8 +146,7 @@ class MoeWNA16Config(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
-        can_convert = cls.is_moe_wna16_compatible(hf_quant_cfg)
-        if can_convert and user_quant == "moe_wna16":
+        if user_quant == "moe_wna16" and cls.is_moe_wna16_compatible(hf_quant_cfg):
             return cls.get_name()
         return None
 
@@ -131,7 +160,7 @@ class MoeWNA16Config(QuantizationConfig):
         capability_tuple = get_device_capability()
         device_capability = (
             -1
-            if capability_tuple is None
+            if all(capability is None for capability in capability_tuple)
             else capability_tuple[0] * 10 + capability_tuple[1]
         )
         # Avoid circular import

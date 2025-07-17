@@ -22,10 +22,6 @@ try:
     from vllm.model_executor.layers.quantization.experts_int8 import ExpertsInt8Config
     from vllm.model_executor.layers.quantization.fbgemm_fp8 import FBGEMMFp8Config
     from vllm.model_executor.layers.quantization.gguf import GGUFConfig
-    from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
-    from vllm.model_executor.layers.quantization.gptq_marlin import (
-        GPTQMarlinLinearMethod,
-    )
     from vllm.model_executor.layers.quantization.gptq_marlin_24 import (
         GPTQMarlin24Config,
     )
@@ -59,7 +55,9 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.gptq import (
     GPTQConfig,
+    GPTQLinearMethod,
     GPTQMarlinConfig,
+    GPTQMarlinLinearMethod,
     GPTQMarlinMoEMethod,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -68,6 +66,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 )
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
+from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
@@ -82,6 +81,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
     "qoq": QoQConfig,
+    "w4afp8": W4AFp8Config,
 }
 
 # VLLM-dependent quantization methods
