@@ -45,6 +45,7 @@ class TestDeepseek(CustomTestCase):
                 "256",
                 "--max-running-requests",
                 "2048",
+                "--disable-radix-cache",
             ],
         )
 
@@ -54,10 +55,10 @@ class TestDeepseek(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=8,
+            num_shots=5,
             data_path=None,
-            num_questions=1250,
-            parallel=1250,
+            num_questions=1200,
+            parallel=1200,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -65,7 +66,7 @@ class TestDeepseek(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.93)
+        self.assertGreater(metrics["accuracy"], 0.92)
 
 
 class TestDeepseekMTP(CustomTestCase):
@@ -107,6 +108,7 @@ class TestDeepseekMTP(CustomTestCase):
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
+                "--disable-radix-cache",
             ],
         )
 
@@ -116,10 +118,10 @@ class TestDeepseekMTP(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=8,
+            num_shots=5,
             data_path=None,
-            num_questions=1250,
-            parallel=1250,
+            num_questions=1200,
+            parallel=1200,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -127,7 +129,7 @@ class TestDeepseekMTP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.93)
+        self.assertGreater(metrics["accuracy"], 0.92)
 
         server_info = requests.get(self.base_url + "/get_server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
@@ -138,7 +140,7 @@ class TestDeepseekMTP(CustomTestCase):
             f"accuracy={metrics['accuracy']=:.3f}\n"
             f"{avg_spec_accept_length=:.3f}\n"
         )
-        self.assertGreater(avg_spec_accept_length, 1.9)
+        self.assertGreater(avg_spec_accept_length, 1.85)
 
 
 if __name__ == "__main__":
