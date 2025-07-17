@@ -745,6 +745,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
         # Delay the import to avoid circular dependency
         from sglang.srt.layers.moe.topk import select_experts
 
+        # Note: quantization should be compatible with EPLB
         if enable_eplb:
             raise NotImplementedError("EPLB not supported for `AWQMoEMethod` yet.")
 
