@@ -102,7 +102,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
         M = x.shape[0]
         N = layer.weight.shape[0]
 
-        print(f"x: {x.shape} layer.weight: {layer.weight.shape} layer.weight_scale: {layer.weight_scale.shape}", flush=True)
+        #print(f"x: {x.shape} layer.weight: {layer.weight.shape} layer.weight_scale: {layer.weight_scale.shape}", flush=True)
 
         quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
         x, x_scales_shuffle = quant_func(x, shuffle=True)
@@ -113,6 +113,6 @@ class QuarkW4A4MXFP4(QuarkScheme):
 
         y = torch.zeros((M + 255) // 256 * 256, N, device=x.device, dtype=self.out_dtype)
 
-        print(f"x: {x} wshuffle: {wshuffle} w_scales_shuffle: {w_scales_shuffle} x_scales_shuffle: {x_scales_shuffle} y: {y}", flush=True)
+        #print(f"x: {x} wshuffle: {wshuffle} w_scales_shuffle: {w_scales_shuffle} x_scales_shuffle: {x_scales_shuffle} y: {y}", flush=True)
 
         return gemm_a4w4(x, wshuffle, x_scales_shuffle, w_scales_shuffle, y)
