@@ -24,7 +24,7 @@ class MllamaImageProcessor(BaseMultimodalProcessor):
         image_inputs["input_ids"] = image_inputs["input_ids"].tolist()[0]
         image_inputs["mm_items"] = [
             MultimodalDataItem(
-                pixel_values=image_inputs["pixel_values"],
+                feature=image_inputs["pixel_values"],
                 aspect_ratio_id=image_inputs["aspect_ratio_ids"],
                 aspect_ratio_mask=image_inputs["aspect_ratio_mask"],
                 modality=Modality.IMAGE,
