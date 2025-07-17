@@ -1,7 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
 
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 from torch.nn.parameter import Parameter
@@ -30,7 +30,7 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import is_cuda, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
 
 if is_cuda():
     from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
@@ -40,6 +40,19 @@ try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
 except ImportError:
     flashinfer_cutlass_fused_moe = None
+
+ENABLE_TRTLMM_GEN_MOE = get_bool_env_var("SGLANG_ENABLE_TRTLLM_GEN_MOE", "false")
+
+if ENABLE_TRTLMM_GEN_MOE:
+    # import tensorrt_llm to register ops
+    import tensorrt_llm  # noqa
+    from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
+    from tensorrt_llm.quantization.utils.fp4_utils import (
+        float4_sf_dtype,
+        get_reorder_rows_for_gated_act_gemm_row_indices,
+        get_shuffle_matrix_a_row_indices,
+        get_shuffle_matrix_sf_a_row_indices,
+    )
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
@@ -596,6 +609,13 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
 
+        if ENABLE_TRTLMM_GEN_MOE:
+            self.kernel = torch.ops.trtllm.nvfp4_gemm
+            self.sf_view_dtype = float4_sf_dtype
+        else:
+            self.kernel = cutlass_scaled_fp4_mm
+            self.sf_view_dtype = torch.float8_e4m3fn
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -727,11 +747,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         assert layer.weight_scale_interleaved.dtype == torch.float8_e4m3fn
         assert layer.alpha.dtype == torch.float32
 
-        out = cutlass_scaled_fp4_mm(
+        out = self.kernel(
             x_fp4,
             layer.weight,
-            x_scale_interleaved,
-            layer.weight_scale_interleaved,
+            x_scale_interleaved.view(self.sf_view_dtype),
+            layer.weight_scale_interleaved.view(self.sf_view_dtype),
             layer.alpha,
             output_dtype,
         )
@@ -746,6 +766,10 @@ class ModelOptNvFp4FusedMoEMethod:
     Args:
         quant_config: NVFP4 Quant Config
     """
+
+    _cache_permute_indices = {}
+    weight_dtype = torch.uint8
+    weight_scale_dtype = torch.float8_e4m3fn
 
     def __new__(cls, *args, **kwargs):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
@@ -778,7 +802,7 @@ class ModelOptNvFp4FusedMoEMethod:
     def create_weights(
         self,
         layer: torch.nn.Module,
-        num_experts: int,
+        num_experts: int,  # exactly num_experts_per_partition or local_num_experts
         hidden_size: int,
         intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
@@ -790,20 +814,19 @@ class ModelOptNvFp4FusedMoEMethod:
                 " dynamic quantization is not supported."
             )
 
-        layer.num_experts = num_experts
+        layer.local_num_experts = num_experts
+        layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.params_dtype = params_dtype
         layer.quant_config = self.quant_config
-        weight_dtype = torch.uint8
-        weight_scale_dtype = torch.float8_e4m3fn
         weight_loader = extra_weight_attrs.get("weight_loader")
         # GEMM 1
         w13_weight = ModelWeightParameter(
             data=torch.empty(
-                num_experts,
+                layer.local_num_experts,
                 2 * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,
-                dtype=weight_dtype,
+                dtype=self.weight_dtype,
             ),
             input_dim=1,
             output_dim=2,
@@ -814,11 +837,11 @@ class ModelOptNvFp4FusedMoEMethod:
         # GEMM 2
         w2_weight = ModelWeightParameter(
             data=torch.empty(
-                num_experts,
+                layer.local_num_experts,
                 hidden_size,
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // 2,
-                dtype=weight_dtype,
+                dtype=self.weight_dtype,
             ),
             input_dim=1,
             output_dim=2,
@@ -826,13 +849,17 @@ class ModelOptNvFp4FusedMoEMethod:
         )
         layer.register_parameter("w2_weight", w2_weight)
 
+        assert (
+            self.quant_config.group_size == 16
+        ), f"NVFP4 MoE only supports group_size=16, but got {self.quant_config.group_size}"
+
         w13_weight_scale = ModelWeightParameter(
             data=torch.empty(
-                num_experts,
+                layer.local_num_experts,
                 2 * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // self.quant_config.group_size,
-                dtype=weight_scale_dtype,
+                dtype=self.weight_scale_dtype,
             ),
             input_dim=1,
             output_dim=2,
@@ -842,11 +869,11 @@ class ModelOptNvFp4FusedMoEMethod:
 
         w2_weight_scale = ModelWeightParameter(
             data=torch.empty(
-                num_experts,
+                layer.local_num_experts,
                 hidden_size,
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // self.quant_config.group_size,
-                dtype=weight_scale_dtype,
+                dtype=self.weight_scale_dtype,
             ),
             input_dim=1,
             output_dim=2,
@@ -861,13 +888,13 @@ class ModelOptNvFp4FusedMoEMethod:
         )
 
         w13_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(num_experts, 2, dtype=torch.float32),
+            data=torch.empty(layer.local_num_experts, 2, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
 
         w2_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(num_experts, dtype=torch.float32),
+            data=torch.empty(layer.local_num_experts, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
@@ -877,13 +904,13 @@ class ModelOptNvFp4FusedMoEMethod:
         )
 
         w13_input_scale = PerTensorScaleParameter(
-            data=torch.empty(num_experts, 2, dtype=torch.float32),
+            data=torch.empty(layer.local_num_experts, 2, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w13_input_scale", w13_input_scale)
 
         w2_input_scale = PerTensorScaleParameter(
-            data=torch.empty(num_experts, dtype=torch.float32),
+            data=torch.empty(layer.local_num_experts, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
@@ -913,8 +940,183 @@ class ModelOptNvFp4FusedMoEMethod:
             else swizzled_scale.reshape(B, M, K)
         )
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc0/tensorrt_llm/_torch/modules/fused_moe/quantization.py#L1094
+    def trtllm_gen_maybe_get_cached_w3_w1_permute_indices(
+        self,
+        dst_w3_w1_weight: torch.Tensor,
+        epilogue_tile_m: int,
+        num_elts_per_sf: Union[None, int] = None,
+    ) -> torch.Tensor:
+        if dst_w3_w1_weight.shape not in self._cache_permute_indices:
+            # Get permute indices and chain them together
+            permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(dst_w3_w1_weight)
+            if num_elts_per_sf is None:
+                permute1 = get_shuffle_matrix_a_row_indices(
+                    dst_w3_w1_weight, epilogue_tile_m=epilogue_tile_m
+                )
+            else:
+                permute1 = get_shuffle_matrix_sf_a_row_indices(
+                    dst_w3_w1_weight,
+                    epilogue_tile_m=epilogue_tile_m,
+                    num_elts_per_sf=num_elts_per_sf,
+                )
+            # Memoize permute indices as recompute is **very** costly
+            self._cache_permute_indices[dst_w3_w1_weight.shape] = permute0[permute1].to(
+                dst_w3_w1_weight.device
+            )
+        permute_indices = self._cache_permute_indices[dst_w3_w1_weight.shape]
+        return permute_indices
 
+    # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc0/tensorrt_llm/_torch/modules/fused_moe/quantization.py#L1094
+    def trtllm_gen_maybe_get_cached_w2_permute_indices(
+        self,
+        dst_w2_weight: torch.Tensor,
+        epilogue_tile_m: int,
+        num_elts_per_sf: Union[None, int] = None,
+    ) -> torch.Tensor:
+        if dst_w2_weight.shape not in self._cache_permute_indices:
+            if num_elts_per_sf is None:
+                permute_indices = get_shuffle_matrix_a_row_indices(
+                    dst_w2_weight, epilogue_tile_m
+                ).to(dst_w2_weight.device)
+            else:
+                permute_indices = get_shuffle_matrix_sf_a_row_indices(
+                    dst_w2_weight,
+                    epilogue_tile_m=epilogue_tile_m,
+                    num_elts_per_sf=num_elts_per_sf,
+                ).to(dst_w2_weight.device)
+            # Memoize permute indices as recompute is **very** costly
+            self._cache_permute_indices[dst_w2_weight.shape] = permute_indices
+        permute_indices = self._cache_permute_indices[dst_w2_weight.shape]
+        return permute_indices
+
+    # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc0/tensorrt_llm/_torch/modules/fused_moe/quantization.py#L1094
+    def trtllm_gen_process_expert_w3_w1_weight(self, layer: torch.nn.Module):
+        for expert_idx in range(layer.local_num_experts):
+            dst_w3_w1_weight = layer.w13_weight.data[expert_idx]  # (E, imm * 2, hidden)
+
+            # FIXME: this depends on the kernel internals
+            epilogue_tile_m = 128
+
+            # Get permute indices
+            permute_indices = self.trtllm_gen_maybe_get_cached_w3_w1_permute_indices(
+                dst_w3_w1_weight, epilogue_tile_m
+            )
+
+            # Shuffle the weight according to permute indices
+            processed_w31_weight_shard = torch.ops.trtllm.shuffle_matrix(
+                dst_w3_w1_weight, permute_indices.to(dst_w3_w1_weight.device)
+            )
+
+            # Copy the result into device buffer
+            dst_w3_w1_weight.copy_(
+                processed_w31_weight_shard.view(dst_w3_w1_weight.dtype)
+            )
+
+    # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc0/tensorrt_llm/_torch/modules/fused_moe/quantization.py#L1094
+    def trtllm_gen_process_expert_w2_weight(self, layer: torch.nn.Module):
+        for expert_idx in range(layer.local_num_experts):
+            dst_w2_weight = layer.w2_weight.data[expert_idx]  # (E, hidden, imm)
+
+            # FIXME: this depends on the kernel internals
+            epilogue_tile_m = 128
+
+            # Get permuted indices
+            permute_indices = self.trtllm_gen_maybe_get_cached_w2_permute_indices(
+                dst_w2_weight, epilogue_tile_m
+            )
+
+            # Shuffle the weight according to permute indices
+            processed_w2_weight = torch.ops.trtllm.shuffle_matrix(
+                dst_w2_weight, permute_indices.to(dst_w2_weight.device)
+            )
+
+            # Copy the result into device buffer
+            dst_w2_weight.copy_(processed_w2_weight.view(dst_w2_weight.dtype))
+
+    # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc0/tensorrt_llm/_torch/modules/fused_moe/quantization.py#L1094
+    def trtllm_gen_process_expert_w3_w1_weight_scale_nvfp4(
+        self, layer: torch.nn.Module
+    ):
+        for expert_idx in range(layer.local_num_experts):
+            dst_w3_w1_weight_scale = layer.w13_weight_scale.data[expert_idx]  # (E, ...)
+            orig_shape = dst_w3_w1_weight_scale.shape
+
+            # trtllm-gen specific block scales preprocessing logics
+            epilogue_tile_m = 128  # FIXME
+
+            # Get permute indices
+            permute_indices = self.trtllm_gen_maybe_get_cached_w3_w1_permute_indices(
+                dst_w3_w1_weight_scale.view(float4_sf_dtype),
+                epilogue_tile_m,
+                num_elts_per_sf=16,
+            )
+
+            # Shuffle the weight according to permute indices
+            w3_w1_weight_scale = torch.ops.trtllm.shuffle_matrix(
+                dst_w3_w1_weight_scale.view(float4_sf_dtype), permute_indices
+            )
+
+            # Assert should only be removed during debugging
+            assert (
+                w3_w1_weight_scale.is_cuda
+            ), "w3_w1_weight_scale.is_cuda should be true or suffer from slow speed"
+            # Interleave the weight.
+            # TODO: use torch.ops.trllm.nvfp4_block_scale_interleave after trtllm 1.0.0
+            processed_w3_w1_weight_scale = (
+                torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+                    w3_w1_weight_scale.view(float4_sf_dtype).reshape(orig_shape)
+                )
+            )
+            # Copy the result into device buffer
+            dst_w3_w1_weight_scale.copy_(
+                processed_w3_w1_weight_scale.view(self.weight_scale_dtype).reshape(
+                    orig_shape
+                )
+            )
+
+    # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc0/tensorrt_llm/_torch/modules/fused_moe/quantization.py#L1094
+    def trtllm_gen_process_expert_w2_weight_scale_nvfp4(
+        self,
+        layer: torch.nn.Module,
+    ):
+        for expert_idx in range(layer.local_num_experts):
+            dst_w2_weight_scale = layer.w2_weight_scale.data[expert_idx]  # (E, ...)
+
+            orig_shape = dst_w2_weight_scale.shape
+
+            # trtllm-gen specific block scales preprocessing logics
+            epilogue_tile_m = 128  # FIXME: read from kernel
+
+            # Assert should only be removed during debugging
+            assert (
+                dst_w2_weight_scale.is_cuda
+            ), "dst_w2_weight_scale.is_cuda should be true or suffer from slow speed"
+
+            # Get permute indices
+            permute_indices = self.trtllm_gen_maybe_get_cached_w2_permute_indices(
+                dst_w2_weight_scale.view(float4_sf_dtype),
+                epilogue_tile_m,
+                num_elts_per_sf=16,
+            )
+
+            # Shuffle the weight according to permute indices
+            w_shuffled = torch.ops.trtllm.shuffle_matrix(
+                dst_w2_weight_scale.view(dtype=float4_sf_dtype), permute_indices
+            )
+            # Interleave the weight.
+            # TODO: use torch.ops.trllm.nvfp4_block_scale_interleave after trtllm 1.0.0
+            processed_w2_weight_scale = (
+                torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(w_shuffled)
+            )
+            # Copy the result into device buffer
+            dst_w2_weight_scale.copy_(
+                processed_w2_weight_scale.view(self.weight_scale_dtype).reshape(
+                    orig_shape
+                )
+            )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # GEMM 1
         if not torch.allclose(
             layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
@@ -923,11 +1125,10 @@ class ModelOptNvFp4FusedMoEMethod:
                 "w1_weight_scale_2 must match w3_weight_scale_2. "
                 "Accuracy may be affected."
             )
-
+        # W13 input scale and global scales
         w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
         layer.w13_weight_scale_2 = Parameter(w13_weight_scale_2, requires_grad=False)
-
-        if self.enable_flashinfer_moe:
+        if self.enable_flashinfer_moe or ENABLE_TRTLMM_GEN_MOE:
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
         else:
             w13_input_scale = layer.w13_input_scale.max(dim=1).values.to(torch.float32)
@@ -935,60 +1136,79 @@ class ModelOptNvFp4FusedMoEMethod:
             (w13_input_scale * w13_weight_scale_2).to(torch.float32),
             requires_grad=False,
         )
+        # This is for quantization, so we need to invert it.
+        layer.w13_input_scale_quant = Parameter(
+            (1 / w13_input_scale).to(torch.float32), requires_grad=False
+        )
 
+        # W13 weight and weight scales
         assert (
             layer.w13_weight_scale.shape[2] % 16 == 0
         ), "Expected weight_scale.dim(1) to be divisible by 16"
         assert (
             layer.w13_weight_scale.dtype == torch.float8_e4m3fn
         ), "Weight Blockscale must be represented as FP8-E4M3"
-        w13_blockscale_swizzled = self.swizzle_blockscale(layer.w13_weight_scale)
-
-        layer.w13_blockscale_swizzled = Parameter(
-            w13_blockscale_swizzled, requires_grad=False
-        )
-
-        # This is for quantization, so we need to invert it.
-        layer.w13_input_scale_quant = Parameter(
-            (1 / w13_input_scale).to(torch.float32), requires_grad=False
-        )
-
         layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
+        if not ENABLE_TRTLMM_GEN_MOE:
+            w13_blockscale_swizzled = self.swizzle_blockscale(layer.w13_weight_scale)
+            layer.w13_weight_scale = Parameter(
+                w13_blockscale_swizzled, requires_grad=False
+            )
+        else:
+            layer.w13_weight_scale = Parameter(
+                layer.w13_weight_scale.data, requires_grad=False
+            )
+            self.trtllm_gen_process_expert_w3_w1_weight(layer)
+            self.trtllm_gen_process_expert_w3_w1_weight_scale_nvfp4(layer)
 
         # GEMM 2
-        if self.enable_flashinfer_moe:
+        # W2 input scale and global scales
+        if self.enable_flashinfer_moe or ENABLE_TRTLMM_GEN_MOE:
             w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
         else:
             w2_input_scale = layer.w2_input_scale
-
         layer.g2_alphas = Parameter(
             (w2_input_scale * layer.w2_weight_scale_2).to(torch.float32),
             requires_grad=False,
         )
-
         # This is for quantization, so we need to invert it.
         layer.w2_input_scale_quant = Parameter(
             (1 / w2_input_scale).to(torch.float32), requires_grad=False
         )
 
+        # W2 weight and weight scales
         assert (
             layer.w2_weight_scale.shape[2] % 16 == 0
         ), "Expected weight_scale.dim(1) to be divisible by 16"
         assert (
             layer.w2_weight_scale.dtype == torch.float8_e4m3fn
         ), "Weight Blockscale must be represented as FP8-E4M3"
-        w2_blockscale_swizzled = self.swizzle_blockscale(layer.w2_weight_scale)
-
-        layer.w2_blockscale_swizzled = Parameter(
-            w2_blockscale_swizzled, requires_grad=False
-        )
         layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
+        if not ENABLE_TRTLMM_GEN_MOE:
+            w2_blockscale_swizzled = self.swizzle_blockscale(layer.w2_weight_scale)
+            layer.w2_weight_scale = Parameter(
+                w2_blockscale_swizzled, requires_grad=False
+            )
+        else:
+            layer.w2_weight_scale = Parameter(
+                layer.w2_weight_scale.data, requires_grad=False
+            )
+            self.trtllm_gen_process_expert_w2_weight(layer)
+            self.trtllm_gen_process_expert_w2_weight_scale_nvfp4(layer)
 
+        # trtllm gen moe param
+        if ENABLE_TRTLMM_GEN_MOE:
+            layer.g1_scale_c = Parameter(
+                (layer.w2_input_scale_quant * layer.g1_alphas).to(torch.float32),
+                requires_grad=False,
+            )
+
+        # cutlass moe param struct
         device = layer.w13_weight.device
         layer.cutlass_moe_params = CutlassMoEParams(
             CutlassMoEType.BlockscaledFP4,
             device,
-            num_experts=layer.num_experts,  # global num experts
+            num_experts=layer.local_num_experts,  # local num experts
             intermediate_size_per_partition=layer.w2_weight.shape[2] * 2,  # n
             hidden_size=layer.w13_weight.shape[2] * 2,
         )  # k
@@ -1023,6 +1243,67 @@ class ModelOptNvFp4FusedMoEMethod:
     ) -> torch.Tensor:
 
         assert activation == "silu", "Only SiLU activation is supported."
+
+        if ENABLE_TRTLMM_GEN_MOE:
+            assert (
+                self.enable_flashinfer_moe
+            ), "must enable flashinfer moe for POC convenience"
+            assert use_grouped_topk, "must be true for deepseek_v3"
+            assert correction_bias is not None, "must appear for deepseek_v3"
+            assert topk_group is not None, "must appear for deepseek_v3"
+            assert routed_scaling_factor is not None, "must appear for deepseek_v3"
+            assert num_expert_group is not None, "must appear for deepseek_v3"
+            assert not apply_router_weight_on_input, "unsupported"
+            assert custom_routing_function is None, "unsupported"
+            assert (
+                num_fused_shared_experts is None or num_fused_shared_experts == 0
+            ), "unsupported"
+            do_finalize = True
+            scale_factor_use_ue8m0 = False
+            is_scale_factor_swizzled = False  # use linear layout here
+            hidden_states_fp4, hidden_states_scale_linear_fp4 = (
+                torch.ops.trtllm.fp4_quantize(
+                    x,
+                    layer.w13_input_scale_quant,
+                    16,
+                    scale_factor_use_ue8m0,
+                    is_scale_factor_swizzled,
+                )
+            )
+
+            # FIXME: tile_tokens_dim is hardcoded for now
+            tile_tokens_dim = 8
+
+            # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc1/tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py#L195
+            outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
+                # NOTE: router out_dtype should be float32!
+                # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc1/tensorrt_llm/_torch/models/modeling_deepseekv3.py#L378
+                router_logits.to(torch.float32),
+                correction_bias,
+                hidden_states_fp4,
+                hidden_states_scale_linear_fp4.view(torch.float8_e4m3fn),
+                layer.w13_weight,
+                layer.w13_weight_scale.view(torch.float8_e4m3fn),
+                layer.w2_weight,
+                layer.w2_weight_scale.view(torch.float8_e4m3fn),
+                layer.g1_scale_c.data,
+                layer.g1_alphas.data,
+                layer.g2_alphas.data,
+                layer.local_num_experts * ep_size,
+                top_k,
+                num_expert_group,
+                topk_group,
+                layer.intermediate_size_per_partition,
+                layer.local_num_experts
+                * ep_rank,  # self.slot_start # local_expert_start;  use ep_rank if stride!=1
+                layer.local_num_experts,  # local_expert_size
+                routed_scaling_factor,
+                tile_tokens_dim,
+                RoutingMethodType.DeepSeekV3,
+                do_finalize=do_finalize,
+            )
+            return outputs[0]
+
         from sglang.srt.layers.moe.topk import select_experts
 
         topk_weights, topk_ids = select_experts(
@@ -1054,10 +1335,10 @@ class ModelOptNvFp4FusedMoEMethod:
                 x.dtype,
                 quant_scales=[
                     layer.w13_input_scale_quant,
-                    layer.w13_blockscale_swizzled.view(torch.int32),
+                    layer.w13_weight_scale.view(torch.int32),
                     layer.g1_alphas,
                     layer.w2_input_scale_quant,
-                    layer.w2_blockscale_swizzled.view(torch.int32),
+                    layer.w2_weight_scale.view(torch.int32),
                     layer.g2_alphas,
                 ],
                 ep_size=ep_size,
@@ -1074,11 +1355,11 @@ class ModelOptNvFp4FusedMoEMethod:
             a=x,
             a1_gscale=layer.w13_input_scale_quant,
             w1_fp4=layer.w13_weight,
-            w1_blockscale=layer.w13_blockscale_swizzled,
+            w1_blockscale=layer.w13_weight_scale,
             w1_alphas=layer.g1_alphas,
             a2_gscale=layer.w2_input_scale_quant,
             w2_fp4=layer.w2_weight,
-            w2_blockscale=layer.w2_blockscale_swizzled,
+            w2_blockscale=layer.w2_weight_scale,
             w2_alphas=layer.g2_alphas,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
