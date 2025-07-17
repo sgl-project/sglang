@@ -115,4 +115,4 @@ class QuarkW4A4MXFP4(QuarkScheme):
 
         #print(f"x: {x} wshuffle: {wshuffle} w_scales_shuffle: {w_scales_shuffle} x_scales_shuffle: {x_scales_shuffle} y: {y}", flush=True)
 
-        return gemm_a4w4(x, wshuffle, x_scales_shuffle, w_scales_shuffle, y)
+        return gemm_a4w4(x, wshuffle, x_scales_shuffle, w_scales_shuffle, y, bias=bias)
