@@ -2552,6 +2552,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 cat_dim = 0
                                 if self.quant_config is not None and (
                                     self.quant_config.get_name() == "awq"
+                                    or self.quant_config.get_name() == "awq_marlin"
                                     or self.quant_config.get_name() == "moe_wna16"
                                 ):
                                     cat_dim = 1
