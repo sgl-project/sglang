@@ -20,12 +20,14 @@ import inspect
 import logging
 import os
 from contextlib import contextmanager
+from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
@@ -40,10 +42,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    get_bool_env_var,
     get_device_memory_capacity,
     rank0_log,
     require_attn_tp_gather,
@@ -586,8 +590,17 @@ class CudaGraphRunner:
 
             run_once()
 
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=self.model_runner.server_args.enable_memory_saver and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+        )
+        graph_fn = (
+            partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
+            if memory_saver_adapter.enabled
+            else torch.cuda.graph
+        )
+
         global global_graph_memory_pool
-        with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=stream):
+        with graph_fn(cuda_graph=graph, pool=global_graph_memory_pool, stream=stream):
             out = run_once()
 
         global_graph_memory_pool = graph.pool()

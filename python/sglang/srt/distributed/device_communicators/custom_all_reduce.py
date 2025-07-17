@@ -18,7 +18,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     gpu_p2p_access_check,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -482,7 +482,8 @@ class CustomAllreduce:
                 if _is_hip:
                     return self.all_reduce_reg(input)
                 else:
-                    return self.all_reduce(input, registered=True)
+                    registered = not get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+                    return self.all_reduce(input, registered=registered)
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
