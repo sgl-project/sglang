@@ -5,7 +5,6 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
-from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -155,6 +154,10 @@ class BaseMultimodalProcessor(ABC):
             # Generic attributes that could apply to multiple modalities
             # "precomputed_features" - handled specially as it can be any modality
         }
+
+        # name of the feature filed
+        # TODO: pass from processors
+        self.FEATURE_NAMES = ["pixel_values", "pixel_values_videos", "audio_features"]
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -523,6 +526,9 @@ class BaseMultimodalProcessor(ABC):
                 # Create item if needed
                 if modality not in items:
                     items[modality] = MultimodalDataItem(modality=modality)
+
+                if attr_name in self.FEATURE_NAMES:
+                    attr_name = "feature"
 
                 # Set attribute
                 setattr(items[modality], attr_name, value)

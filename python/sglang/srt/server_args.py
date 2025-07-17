@@ -105,6 +105,7 @@ class ServerArgs:
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
+    enable_metrics_for_all_schedulers: bool = False
     bucket_time_to_first_token: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
@@ -1001,6 +1002,13 @@ class ServerArgs:
             "--enable-metrics",
             action="store_true",
             help="Enable log prometheus metrics.",
+        )
+        parser.add_argument(
+            "--enable-metrics-for-all-schedulers",
+            action="store_true",
+            help="Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) "
+            "to record request metrics separately. This is especially useful when dp_attention is enabled, as "
+            "otherwise all metrics appear to come from TP 0.",
         )
         parser.add_argument(
             "--bucket-time-to-first-token",

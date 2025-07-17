@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.linear import LinearMethodBase
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
+    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -64,7 +67,7 @@ class W8A8Fp8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "W8A8Fp8Config":
+    def from_config(cls, config: Dict[str, Any]) -> W8A8Fp8Config:
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp8_serialized = (
             "compressed-tensors" in quant_method or "w8a8_fp8" in quant_method
@@ -75,7 +78,7 @@ class W8A8Fp8Config(QuantizationConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
@@ -183,7 +186,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         )
 
 
-class W8A8FP8MoEMethod:
+class W8A8FP8MoEMethod(FusedMoEMethodBase):
     """MoE method for FP8.
     Supports loading FP8 checkpoints with static weight scale and
     dynamic/static activation scale.
@@ -194,25 +197,7 @@ class W8A8FP8MoEMethod:
         quant_config: The quantization config.
     """
 
-    def __new__(cls, *args, **kwargs):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
-
-        if not hasattr(cls, "_initialized"):
-            original_init = cls.__init__
-            new_cls = type(
-                cls.__name__,
-                (FusedMoEMethodBase,),
-                {
-                    "__init__": original_init,
-                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
-                },
-            )
-            obj = super(new_cls, new_cls).__new__(new_cls)
-            obj.__init__(*args, **kwargs)
-            return obj
-        return super().__new__(cls)
-
-    def __init__(self, quant_config):
+    def __init__(self, quant_config: W8A8Fp8Config):
         self.quant_config = quant_config
 
     def create_weights(

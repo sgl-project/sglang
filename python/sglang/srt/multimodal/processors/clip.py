@@ -26,7 +26,7 @@ class ClipImageProcessor(BaseMultimodalProcessor):
         image_inputs["input_ids"] = image_inputs["input_ids"].tolist()[0]
         image_inputs["mm_items"] = [
             MultimodalDataItem(
-                pixel_values=image_inputs["pixel_values"], modality=Modality.IMAGE
+                feature=image_inputs["pixel_values"], modality=Modality.IMAGE
             )
         ]
 

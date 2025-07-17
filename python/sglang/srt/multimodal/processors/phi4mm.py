@@ -62,7 +62,7 @@ class Phi4MMImageProcessor(BaseMultimodalProcessor):
 
         items = [
             MultimodalDataItem(
-                pixel_values=res["input_image_embeds"],
+                feature=res["input_image_embeds"],
                 image_sizes=res["image_sizes"],
                 image_emb_mask=res["image_attention_mask"],
                 offsets=image_offsets,

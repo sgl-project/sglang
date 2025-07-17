@@ -114,7 +114,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
 
         if len(pixel_values) != 0:
             item = MultimodalDataItem(
-                pixel_values=pixel_values,
+                feature=pixel_values,
                 offsets=image_offsets,
                 tgt_size=tgt_sizes_flat,
                 modality=Modality.IMAGE,
@@ -135,7 +135,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             else:
                 audio_offsets = None
             item = MultimodalDataItem(
-                audio_features=[res["audio_features"]],
+                feature=[res["audio_features"]],
                 audio_feature_lens=res["audio_feature_lens"],
                 offsets=audio_offsets,
                 modality=Modality.AUDIO,

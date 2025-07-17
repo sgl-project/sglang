@@ -147,7 +147,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             raise ValueError("Vision model not available for text-only checkpoint")
 
         pixel_values = (
-            torch.concat([item.pixel_values for item in items])
+            torch.concat([item.feature for item in items])
             .to(next(self.vision_model.parameters()).device)
             .type(next(self.vision_model.parameters()).dtype)
         )

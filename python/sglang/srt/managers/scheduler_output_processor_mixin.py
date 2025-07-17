@@ -290,7 +290,7 @@ class SchedulerOutputProcessorMixin:
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         if (
-            self.attn_tp_rank == 0
+            self.current_scheduler_metrics_enabled()
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
             self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
