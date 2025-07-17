@@ -958,7 +958,7 @@ class Scheduler(
                 # can't overlap
                 # because the pp_size <= 2, the send and recv has same cuda stream
                 if self.pp_size <= 2:
-                    self._send_pp_state_data()
+                    self._send_pp_stage_data(mb_id, result, pp_outputs, recv_reqs, bids)
 
                 pp_outputs = next_pp_outputs
 
