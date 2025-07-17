@@ -142,7 +142,7 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         # Add metadata for image processing
         processor_output["mm_items"] = [
             MultimodalDataItem(
-                pixel_values=processor_output["pixel_values"],
+                feature=processor_output["pixel_values"],
                 modality=Modality.IMAGE,
                 offsets=image_offsets,
             )
