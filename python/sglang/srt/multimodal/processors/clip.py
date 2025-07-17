@@ -9,8 +9,8 @@ from sglang.srt.utils import load_image
 class ClipImageProcessor(BaseMultimodalProcessor):
     models = [CLIPModel]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args):
+        super().__init__(hf_config, server_args, _processor, *args)
 
     async def process_mm_data_async(
         self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs
