@@ -2,8 +2,8 @@
 Multi-modality utils
 """
 
-import dataclasses
 import hashlib
+import pickle
 from abc import abstractmethod
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
@@ -30,123 +30,127 @@ from sglang.utils import logger
 
 # TODO(mick): nccl
 # cuda_ipc: for intranode tensor sharing
-# default: default tensor transport (e.g., pickle)
 TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
 
 
-@dataclasses.dataclass
-class TransportableTensor:
+class TransportableTensor(torch.Tensor):
     """
-    A wrapper for torch.Tensor to facilitate efficient inter-process communication.
-
-    When serialized with `cuda_ipc`, it stores the CUDA IPC handle and metadata,
-    allowing the tensor to be reconstructed in another process without copying the
-    underlying data.
-
-    Attributes:
-        transport_mode: The method to use for transport (e.g., "cuda_ipc").
-        feature: The torch.Tensor to be transported. Becomes None after serialization
-                 if using `cuda_ipc`.
-        extra: A dictionary to store metadata required for deserialization,
-               such as the tensor's shape, dtype, and IPC handle.
+    A torch.Tensor subclass that carries extra metadata and supports
+    efficient inter-process communications
     """
 
-    transport_mode: TensorTransportMode
-    feature: torch.tensor
-    extra: Dict[str, Any] = None
+    @staticmethod
+    def __new__(
+        cls,
+        data: torch.Tensor,
+        name: Optional[str] = None,
+        fields: Optional[Dict[str, Any]] = None,
+        transport_mode: TensorTransportMode = "default",
+        *args,
+        **kwargs,
+    ):
 
-    def __post_init__(self):
-        self.serialize()
-
-    def serialize(self):
-        if isinstance(self.feature, torch.Tensor) and self.feature.is_cuda:
-            if self.transport_mode == "cuda_ipc":
-                try:
-                    storage = self.feature.untyped_storage()
-                    handle = storage._share_cuda_()
-                    self.extra = {
-                        "handle": handle,
-                        "shape": self.feature.shape,
-                        "dtype": self.feature.dtype,
-                        "stride": self.feature.stride(),
-                        "index": self.feature.device.index,
-                    }
-                    # make sure to empty to prevent tensor from pickling
-                    self.feature = None
-                except Exception as e:
-                    if isinstance(
-                        e, RuntimeError
-                    ) and "Attempted to send CUDA tensor received from another process" in str(
-                        e
-                    ):
-                        print_warning_once(
-                            "Attempted to re-share a CUDA tensor received via IPC. "
-                            "Cloning the tensor to continue. This may have a performance impact."
-                        )
-                        cloned_data = self.feature.clone()
-                        storage = cloned_data.untyped_storage()
-                        handle = storage._share_cuda_()
-                        self.extra = {
-                            "handle": handle,
-                            "shape": self.feature.shape,
-                            "dtype": self.feature.dtype,
-                            "stride": self.feature.stride(),
-                            "index": self.feature.device.index,
-                        }
-                        self.feature = None
-                        return
-
-                    logger.error(
-                        f"Failed to get CUDA IPC handle for tensor: {e}. Falling back to copy.",
-                        exc_info=True,
-                    )
-                    self.feature = self.feature.cuda()
-                    self.transport_mode = "default"
-
-    def deserialize(self) -> torch.Tensor:
-        if self.transport_mode == "cuda_ipc":
-            handle, shape, dtype, stride, source_device_index = (
-                self.extra["handle"],
-                self.extra["shape"],
-                self.extra["dtype"],
-                self.extra["stride"],
-                self.extra["index"],
+        if not isinstance(data, torch.Tensor):
+            raise TypeError(
+                f"Input 'data' must be a torch.Tensor, but got {type(data)}"
             )
+
+        instance = data.as_subclass(cls)
+
+        instance._metadata = {
+            "name": name,
+            "fields": fields if fields is not None else {},
+            "transport_mode": transport_mode,
+        }
+
+        return instance
+
+    def __getstate__(self):
+        """
+        Called during pickling. Implements the serialization logic.
+        """
+        # acquire all serialize metadata from _metadata
+        state = {
+            "metadata": self._metadata,
+            "tensor_data": None,
+            "ipc_extra": None,
+        }
+
+        transport_mode = self._metadata.get("transport_mode", "default")
+
+        if transport_mode == "cuda_ipc" and self.is_cuda:
             try:
-                current_device_index = torch.cuda.current_device()
-                if source_device_index != current_device_index:
-                    # Check for peer-to-peer access capability before attempting to map.
-                    # A segfault can occur if P2P is not supported and this check is omitted.
-                    if not torch.cuda.can_device_access_peer(
-                        current_device_index, source_device_index
-                    ):
-                        raise RuntimeError(
-                            f"CUDA IPC Error: Attempting to access tensor on device {source_device_index} from "
-                            f"device {current_device_index}, but peer-to-peer access is not available. "
-                            "Please ensure your GPUs are on the same node, connected via a high-speed "
-                            "interconnect (e.g., NVLink), and that P2P is enabled."
-                        )
+                storage = self.untyped_storage()
+                handle = storage._share_cuda_()
 
-                # Ensure the current process is on the correct device context to open the handle
+                state["ipc_extra"] = {
+                    "handle": handle,
+                    "shape": self.shape,
+                    "dtype": self.dtype,
+                    "stride": self.stride(),
+                    "device_index": self.device.index,
+                }
+                state["tensor_data"] = None
+            except Exception as e:
+                print(
+                    f"Warning: Failed to get CUDA IPC handle ({e}). Falling back to default transport."
+                )
+                state["metadata"]["transport_mode"] = "default"
+                state["tensor_data"] = self
+        else:
+            state["metadata"]["transport_mode"] = "default"
+            state["tensor_data"] = self
+
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]):
+        """
+        Called during unpickling. Implements the deserialization logic.
+        """
+        self._metadata = state["metadata"]
+
+        transport_mode = self._metadata.get("transport_mode", "default")
+
+        if transport_mode == "cuda_ipc" and state["ipc_extra"] is not None:
+            ipc_extra = state["ipc_extra"]
+            handle, shape, dtype, stride, source_device_index = (
+                ipc_extra["handle"],
+                ipc_extra["shape"],
+                ipc_extra["dtype"],
+                ipc_extra["stride"],
+                ipc_extra["device_index"],
+            )
+
+            try:
                 target_device = torch.device(f"cuda:{source_device_index}")
-
                 with torch.cuda.device(target_device):
                     storage = torch.UntypedStorage._new_shared_cuda(*handle)
-                    tensor = torch.empty(0, dtype=dtype, device=target_device).set_(
-                        storage, storage_offset=0, size=shape, stride=stride
-                    )
-                    expected_numel = torch.Size(shape).numel()
-                    if tensor.numel() != expected_numel:
-                        # Potentially raise error or return None depending on strictness needed
-                        return self.feature
-
-                    return tensor
+                    reconstructed_tensor = torch.empty(
+                        0, dtype=dtype, device=target_device
+                    ).set_(storage, storage_offset=0, size=shape, stride=stride)
+                    self.set_(reconstructed_tensor)
             except Exception as e:
-                logger.error(
-                    f"Failed to deserialize CUDA IPC tensor: {e}", exc_info=True
-                )
+                print(f"Error: Failed to deserialize from CUDA IPC handle ({e}).")
                 raise e
-        return self.feature
+
+        elif state["tensor_data"] is not None:
+            self.set_(state["tensor_data"])
+        else:
+            raise pickle.UnpicklingError(
+                "Invalid state for MetaDataTensor: no tensor data found."
+            )
+
+    @property
+    def name(self) -> Optional[str]:
+        return self._metadata.get("name")
+
+    @property
+    def fields(self) -> Dict[str, Any]:
+        return self._metadata.get("fields", {})
+
+    @property
+    def transport_mode(self) -> TensorTransportMode:
+        return self._metadata.get("transport_mode", "default")
 
 
 class MultiModalityDataPaddingPattern:
