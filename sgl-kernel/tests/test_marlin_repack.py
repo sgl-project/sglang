@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 import torch
-from sgl_kernel import awq_marlin_repack
+from sgl_kernel import awq_marlin_repack, gptq_marlin_repack
 
 from sglang.srt.layers.quantization.scalar_type import scalar_types
 from sglang.srt.layers.quantization.utils import (
@@ -128,6 +128,54 @@ def test_awq_marlin_repack_correct(num_bits, k_tiles, n_tiles, group_size):
     torch.cuda.synchronize()
 
     torch.testing.assert_close(out_gpu, q_w_marlin)
+
+
+@pytest.mark.parametrize("num_bits", [4])
+@pytest.mark.parametrize("k_tiles,n_tiles", [(1, 1), (2, 2)])
+@pytest.mark.parametrize("group_size", [-1, 32])
+@pytest.mark.parametrize("has_perm", [True, False])
+def test_gptq_marlin_repack(num_bits, k_tiles, n_tiles, group_size, has_perm):
+    tile_k, tile_n = 16, 64
+    size_k = k_tiles * tile_k
+    size_n = n_tiles * tile_n
+    pack_factor = 32 // num_bits
+
+    if group_size == -1:
+        group_size = size_k
+
+    if size_k % group_size != 0:
+        pytest.skip("size_k must be divisible by group_size")
+
+    b_weight = torch.randn((size_k, size_n), dtype=torch.float16, device="cuda")
+
+    _, q_w, _, _ = quantize_weights(
+        b_weight, scalar_types.uint4, group_size, zero_points=False
+    )
+
+    q_w_gptq = pack_cols(q_w, num_bits, size_k, size_n)
+
+    q_w_permuted = q_w
+    if has_perm:
+        act_order_perm = torch.randperm(size_k, device="cuda").to(torch.int32)
+        q_w_permuted = q_w[act_order_perm]
+    else:
+        act_order_perm = torch.empty((0,), dtype=torch.int32, device="cuda")
+
+    marlin_layout_perm = get_weight_perm(num_bits).cuda()
+    q_w_marlin_ref = marlin_weights(
+        q_w_permuted, size_k, size_n, num_bits, marlin_layout_perm
+    )
+
+    out_gpu = gptq_marlin_repack(q_w_gptq, act_order_perm, size_k, size_n, num_bits)
+
+    assert out_gpu.is_cuda and out_gpu.dtype == torch.int32
+
+    expected_cols = size_n * tile_k // pack_factor
+    assert list(out_gpu.shape) == [size_k // tile_k, expected_cols]
+
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out_gpu, q_w_marlin_ref)
 
 
 if __name__ == "__main__":
