@@ -15,6 +15,20 @@ use std::time::Instant;
 use tokio;
 use tracing::{debug, error, info, warn};
 
+use crate::{
+    openai_api_types::GenerationRequest,
+    policies::{
+        cache_aware::{CacheAwarePolicy, CacheAwarePolicyConfig},
+        power_of_two::PowerOfTwoPolicy,
+        random::RandomPolicy,
+        round_robin::RoundRobinPolicy,
+        RoutingPolicy,
+    },
+    worker::Worker, // todo(Yingyi): placeholder, replace to core::Worker after pulling task 1 freeze
+};
+
+use super::config::types::{PolicyConfig, RouterConfig};
+
 pub fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
     req.headers()
         .iter()
@@ -25,6 +39,60 @@ pub fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
                 .map(|v| (name.to_string(), v.to_string()))
         })
         .collect()
+}
+
+pub struct Router {
+    policy: Arc<dyn RoutingPolicy>,
+    workers: Arc<RwLock<Vec<Arc<dyn Worker>>>>,
+}
+
+impl Router {
+    pub fn new(config: &RouterConfig, workers: Vec<Arc<dyn Worker>>) -> Self {
+        let policy: Arc<dyn RoutingPolicy> = match &config.policy {
+            PolicyConfig::Random => Arc::new(RandomPolicy::new()),
+            PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
+            PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
+            PolicyConfig::CacheAware {
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+                eviction_interval_secs,
+                max_tree_size,
+            } => {
+                let cache_config = CacheAwarePolicyConfig {
+                    cache_threshold: *cache_threshold,
+                    balance_abs_threshold: *balance_abs_threshold,
+                    balance_rel_threshold: *balance_rel_threshold,
+                    eviction_interval_secs: *eviction_interval_secs,
+                    max_tree_size: *max_tree_size,
+                };
+                Arc::new(CacheAwarePolicy::new(cache_config, &workers))
+            }
+        };
+        Self {
+            policy,
+            workers: Arc::new(RwLock::new(workers)),
+        }
+    }
+
+    pub async fn route_request<T: GenerationRequest + serde::Serialize + Clone>(
+        &self,
+        client: &reqwest::Client,
+        req: &HttpRequest,
+        typed_req: &T,
+        route: &str,
+    ) -> HttpResponse {
+        let workers = self.workers.read().unwrap();
+        let request_json = serde_json::to_value(typed_req).unwrap();
+
+        match self.policy.select_single(&workers, &request_json).await {
+            Ok(worker) => {
+                // TODO: Replace with actual request sending logic
+                HttpResponse::Ok().finish()
+            }
+            Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+        }
+    }
 }
 
 #[derive(Debug)]
