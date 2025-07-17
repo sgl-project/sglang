@@ -2777,8 +2777,10 @@ class Scheduler(
 
             # reinitialize the disaggregation resources for decode
             self.disaggregation_mode = DisaggregationMode.DECODE
+            self.policy.tree_cache = None
             del self.tree_cache
             self.init_memory_pool_and_cache()
+            self.policy.tree_cache = self.tree_cache
             self.init_disaggregation()
             gc.collect()
             torch.cuda.empty_cache()
@@ -2842,8 +2844,10 @@ class Scheduler(
             # reinitialize the tree cache for prefill, as prefill may use radix_cache or hiradix_cache
             # TODO find all ref of tree cache and set them to None
             if not self.server_args.disable_radix_cache:
+                self.policy.tree_cache = None
                 del self.tree_cache
                 self.init_memory_pool_and_cache()
+                self.policy.tree_cache = self.tree_cache
             self.init_disaggregation()
             gc.collect()
             torch.cuda.empty_cache()
