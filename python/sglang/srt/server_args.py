@@ -105,6 +105,7 @@ class ServerArgs:
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
+    enable_metrics_for_all_schedulers: bool = False
     bucket_time_to_first_token: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
@@ -250,6 +251,10 @@ class ServerArgs:
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
+
+    # For PD-Multiplexing
+    enable_pdmux: bool = False
+    sm_group_num: int = 3
 
     def __post_init__(self):
         # Expert parallelism
@@ -999,6 +1004,13 @@ class ServerArgs:
             help="Enable log prometheus metrics.",
         )
         parser.add_argument(
+            "--enable-metrics-for-all-schedulers",
+            action="store_true",
+            help="Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) "
+            "to record request metrics separately. This is especially useful when dp_attention is enabled, as "
+            "otherwise all metrics appear to come from TP 0.",
+        )
+        parser.add_argument(
             "--bucket-time-to-first-token",
             type=float,
             nargs="+",
@@ -1720,6 +1732,17 @@ class ServerArgs:
             nargs="*",
             default=None,
             help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
+        )
+        parser.add_argument(
+            "--enable-pdmux",
+            action="store_true",
+            help="Enable PD-Multiplexing, PD running on greenctx stream.",
+        )
+        parser.add_argument(
+            "--sm-group-num",
+            type=int,
+            default=ServerArgs.sm_group_num,
+            help="Number of sm partition groups.",
         )
         parser.add_argument(
             "--weight-loader-disable-mmap",
