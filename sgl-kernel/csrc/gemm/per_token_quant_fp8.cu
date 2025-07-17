@@ -21,8 +21,6 @@ __global__ void per_token_quant_fp8_kernel(
 
   const int tid = threadIdx.x;
 
-  float max_value = 0.f;
-
   // input[token, hidden_dim]
   auto gmem_in = make_tensor(const_cast<T*>(input) + token_idx * hidden_dim, make_shape(hidden_dim));
   auto gmem_out = make_tensor(output_q + token_idx * hidden_dim, make_shape(hidden_dim));
@@ -31,22 +29,44 @@ __global__ void per_token_quant_fp8_kernel(
   // Load is already vectorized, so 16 elements work for T.
   const uint32_t BLOCK_SIZE = 256;
   const uint32_t VEC_SIZE = 16;
+  const uint32_t TILE_BYTES = 8192;
+
+  // SMEM tile
+  extern __shared__ char smem_buf[];
+  T* Smem = reinterpret_cast<T*>(smem_buf);
+  constexpr int TILE_ELEMS = TILE_BYTES / sizeof(T);
+
+  //
+  // Pass-1: compute max across whole token
+  //
+  float max_value = 0.f;
   using vec_t = flashinfer::vec_t<T, VEC_SIZE>;
-  const int32_t num_vec_elems = hidden_dim / VEC_SIZE;
 
-  for (int32_t i = tid; i < num_vec_elems; i += BLOCK_SIZE) {
-    vec_t input_vec;
-    input_vec.cast_load(gmem_in.data() + i * VEC_SIZE);
+  for (int64_t g = 0; g < hidden_dim; g += TILE_ELEMS) {
+    int chunk = min<int64_t>(TILE_ELEMS, hidden_dim - g);
 
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      float val = static_cast<float>(input_vec[j]);
-      max_value = fmaxf(max_value, fabsf(val));
+    // Step A: global -> shared: vectorised 128-bit copy
+    for (int32_t idx = tid * VEC_SIZE; idx < chunk; idx += BLOCK_SIZE * VEC_SIZE) {
+      vec_t input_vec;
+      input_vec.cast_load(gmem_in.data() + g + idx);
+      input_vec.cast_store(Smem + idx);
     }
+    __syncthreads();
+
+    // Step B: scan shared to update max
+    for (int32_t idx = tid * VEC_SIZE; idx < chunk; idx += BLOCK_SIZE * VEC_SIZE) {
+      vec_t input_vec;
+      input_vec.cast_load(Smem + idx);
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j)
+        max_value = fmaxf(max_value, fabsf(static_cast<float>(input_vec[j])));
+    }
+    __syncthreads();  // reuse Smem for next tile
   }
 
   max_value = blockReduceMax(max_value);
 
+  // Broadcast scale
   __shared__ float scale;
   if (tid == 0) {
     scale = max_value / FP8_E4M3_MAX;
@@ -56,25 +76,39 @@ __global__ void per_token_quant_fp8_kernel(
 
   const float scale_inv = (scale == 0.f) ? 0.f : 1.0f / scale;
 
-  // Quantize using vectorized loads
-  for (int32_t i = tid; i < num_vec_elems; i += BLOCK_SIZE) {
-    vec_t input_vec;
-    input_vec.cast_load(gmem_in.data() + i * VEC_SIZE);
+  //
+  // Pass-2: quantise per tile
+  //
+  for (int64_t g = 0; g < hidden_dim; g += TILE_ELEMS) {
+    int chunk = min<int64_t>(TILE_ELEMS, hidden_dim - g);
 
-    FP8_TYPE output_arr[VEC_SIZE];
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      float val = fmaxf(fminf(static_cast<float>(input_vec[j]) * scale_inv, FP8_E4M3_MAX), -FP8_E4M3_MAX);
-#ifndef USE_ROCM
-      output_arr[j] = static_cast<FP8_TYPE>(val);
-#else
-      output_arr[j] = c10::Float8_e4m3fnuz(
-          __hip_cvt_float_to_fp8(val, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
-          c10::Float8_e4m3fnuz::from_bits());
-#endif
+    // Step A: global -> shared again
+    for (int32_t idx = tid * VEC_SIZE; idx < chunk; idx += BLOCK_SIZE * VEC_SIZE) {
+      vec_t input_vec;
+      input_vec.cast_load(gmem_in.data() + g + idx);
+      input_vec.cast_store(Smem + idx);
     }
+    __syncthreads();
 
-    *(uint4*)(gmem_out.data() + i * VEC_SIZE) = *(uint4*)output_arr;
+    // Step B: quantise and write back
+    for (int32_t idx = tid * VEC_SIZE; idx < chunk; idx += BLOCK_SIZE * VEC_SIZE) {
+      vec_t input_vec;
+      input_vec.cast_load(Smem + idx);
+      FP8_TYPE output_arr[VEC_SIZE];
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        float val = fmaxf(fminf(static_cast<float>(input_vec[j]) * scale_inv, FP8_E4M3_MAX), -FP8_E4M3_MAX);
+#ifndef USE_ROCM
+        output_arr[j] = static_cast<FP8_TYPE>(val);
+#else
+        output_arr[j] = c10::Float8_e4m3fnuz(
+            __hip_cvt_float_to_fp8(val, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
+            c10::Float8_e4m3fnuz::from_bits());
+#endif
+      }
+      *(uint4*)(gmem_out.data() + g + idx) = *(uint4*)output_arr;
+    }
+    __syncthreads();
   }
 }
 
@@ -89,8 +123,9 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
 
   TORCH_CHECK(hidden_dim % 16 == 0, "Hidden dimension must be divisible by 16, but got ", hidden_dim);
 
-  const int block_size = 256;
+  constexpr int block_size = 256;
   const int num_blocks = num_tokens;
+  constexpr int TILE_BYTES = 8192;
 
   dim3 grid(num_blocks);
   dim3 block(block_size);
@@ -98,7 +133,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
-    per_token_quant_fp8_kernel<scalar_t><<<grid, block, 0, stream>>>(
+    per_token_quant_fp8_kernel<scalar_t><<<grid, block, TILE_BYTES, stream>>>(
         static_cast<scalar_t*>(input.data_ptr()),
         static_cast<FP8_TYPE*>(output_q.data_ptr()),
         static_cast<float*>(output_s.data_ptr()),
