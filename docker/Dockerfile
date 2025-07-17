@@ -79,7 +79,7 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/sour
     NVSHMEM_USE_GDRCOPY=1 \
     cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=90 \
  && cmake --build build --target install -j \
- && cd /sgl-workspace/DeepEP \
+ && cd /sgl-workspace/sglang/DeepEP \
  && NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
 
 # Python tools
