@@ -1494,6 +1494,8 @@ class ModelRunner:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
+        if self.is_multimodal_embedding:
+            kwargs["get_multimodal_embedding"] = True
         return self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,

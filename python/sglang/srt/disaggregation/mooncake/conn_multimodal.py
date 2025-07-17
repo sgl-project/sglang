@@ -824,18 +824,10 @@ class MooncakeEmbeddingReceiver(BaseKVReceiver):
     def _get_embedding_parallel_info_from_server(self) -> Tuple[int, int]:
         """Fetch the embedding parallel info from the bootstrap server."""
         try:
-            print(
-                f"Fetching embedding parallel info from bootstrap: {self.bootstrap_addr};",
-                flush=True,
-            )
             url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}"
             response = requests.get(url)
             if response.status_code == 200:
                 embedding_parallel_info = response.json()
-                print(
-                    f"Fetched embedding parallel info: {embedding_parallel_info}",
-                    flush=True,
-                )
                 return int(embedding_parallel_info["embedding_tp_size"]), int(
                     embedding_parallel_info["embedding_dp_size"]
                 )
@@ -976,17 +968,12 @@ class MooncakeEmbeddingBootstrapServer(BaseKVBootstrapServer):
 
     async def _handle_route_put(self, request: web.Request):
         data = await request.json()
-        print(f"Register embedding bootstrap: {data}", flush=True)
         role = data["role"]
         tp_size = data["tp_size"]
         dp_size = data["dp_size"]
         rank_ip = data["rank_ip"]
         rank_port = int(data["rank_port"])
         engine_rank = int(data["engine_rank"])
-        print(
-            f"Register embedding bootstrap: {engine_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}",
-            flush=True,
-        )
 
         if self.tp_size is None:
             self.tp_size = tp_size

@@ -144,6 +144,7 @@ class ModelConfig:
         )
         self.is_multimodal_embedding = (
             enable_multimodal
+            and is_embedding
             and is_multimodal_embedding_model(self.hf_config.architectures)
         )
         self.is_audio_model = enable_multimodal and is_audio_model(
@@ -634,13 +635,15 @@ multimodal_model_archs = [
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
-    "Qwen2_5_VLForConditionalEmbedding",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
 ]
 
+multimodal_embedding_model_archs = [
+    "Qwen2_5_VLForConditionalGeneration",
+]
 
 def is_multimodal_model(model_architectures: List[str]):
     if any(
@@ -657,8 +660,9 @@ def is_multimodal_gen_model(model_architectures: List[str]):
 
 
 def is_multimodal_embedding_model(model_architectures: List[str]):
-    if is_multimodal_model(model_architectures) and any(
-        "Embedding" in arch for arch in model_architectures
+    if any(
+        multi_model_arch in model_architectures
+        for multi_model_arch in multimodal_embedding_model_archs
     ):
         return True
     else:
