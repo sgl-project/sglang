@@ -212,8 +212,6 @@ class MultimodalDataItem:
     feature: Union[torch.Tensor, np.ndarray] = None
 
     # the precomputed embeddings for the modality, e.g. image_emb for image, audio_emb for audio
-
-
     precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     # Model-specific data stored in a dictionary

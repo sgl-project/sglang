@@ -173,13 +173,6 @@ def _determine_tensor_transport_mode(
         return tensor_transport_mode
 
     is_cross_node = server_args.dist_init_addr
-    # --nccl-init-addr
-    # Fallback to cpu transport for multi-node deployments, as cuda_ipc is not applicable.
-    # We use bootstrap_host as an indicator for multi-node/disaggregated inference.
-    # is_remote_bootstrap = (
-    #     self.bootstrap_host is not None
-    #     and self.bootstrap_host not in ["localhost", "127.0.0.1"]
-    # )
 
     if is_cross_node:
         # Fallback to default CPU transport for multi-node
@@ -479,18 +472,6 @@ class TokenizerManager:
                 f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
             )
 
-        def get_obj_send_size(obj):
-            if isinstance(obj, torch.Tensor):
-                # GPU tensor 也要考虑搬到 CPU 再发
-                return obj.element_size() * obj.nelement()
-            elif isinstance(obj, np.ndarray):
-                return obj.nbytes
-            else:
-                try:
-                    return len(pickle.dumps(obj))
-                except Exception:
-                    return 0
-
         async with self.model_update_lock.reader_lock:
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
@@ -746,7 +727,6 @@ class TokenizerManager:
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
-        current_device_index = torch.cuda.current_device()
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
