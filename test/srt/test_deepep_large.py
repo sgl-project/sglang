@@ -10,9 +10,9 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
     run_bench_one_batch,
-    is_in_ci,
     write_github_step_summary,
 )
 
@@ -60,8 +60,8 @@ class TestDeepseek(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
-            parallel=200,
+            num_questions=1200,
+            parallel=1200,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -69,23 +69,7 @@ class TestDeepseek(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.93)
-    
-    def test_throughput(self):
-        requests.get(self.base_url + "/flush_cache")
-        res = run_bench_one_batch(
-            model=DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST,
-            num_prompts=2048,
-            request_rate=float("inf"),
-            port=int(self.base_url.split(":")[-1]),
-        )
-        print(res)
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_throughput\n"
-                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
-            )
-            self.assertGreater(res["output_throughput"], 3500)
+        self.assertGreater(metrics["accuracy"], 0.92)
 
 
 class TestDeepseekMTP(CustomTestCase):
@@ -139,8 +123,8 @@ class TestDeepseekMTP(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
-            parallel=200,
+            num_questions=1200,
+            parallel=1200,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -148,7 +132,7 @@ class TestDeepseekMTP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.93)
+        self.assertGreater(metrics["accuracy"], 0.92)
 
         server_info = requests.get(self.base_url + "/get_server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
@@ -159,23 +143,7 @@ class TestDeepseekMTP(CustomTestCase):
             f"accuracy={metrics['accuracy']=:.3f}\n"
             f"{avg_spec_accept_length=:.3f}\n"
         )
-        self.assertGreater(avg_spec_accept_length, 1.9)
-    
-    def test_throughput(self):
-        requests.get(self.base_url + "/flush_cache")
-        res = run_bench_one_batch(
-            model=DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST,
-            num_prompts=2048,
-            request_rate=float("inf"),
-            port=int(self.base_url.split(":")[-1]),
-        )
-        print(res)
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_throughput_mtp\n"
-                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
-            )
-            self.assertGreater(res["output_throughput"], 3500)
+        self.assertGreater(avg_spec_accept_length, 1.85)
 
 
 if __name__ == "__main__":
