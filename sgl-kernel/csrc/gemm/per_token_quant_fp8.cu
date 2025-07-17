@@ -18,14 +18,6 @@ using namespace cute;
 
 static constexpr int kWarpSize = 32;
 
-__device__ __forceinline__ float warp_max_all(float v) {
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-      v = fmaxf(v, __shfl_down_sync(0xffffffff, v, off));
-    // Broadcast to the whole warp
-    return __shfl_sync(0xffffffff, v, 0);
-  }
-
 // ---------------------------------------------------------------------------
 // 1. SmallWarp kernel — warp‑local, no shared memory
 //    • One warp handles one token.
@@ -65,13 +57,15 @@ __global__ void per_token_quant_fp8_small_kernel(
     }
   }
 
-  float warp_max = warp_max_all(max_value);
+  float warp_max = warpReduceMax(max_value);
 
+  __shared__ float scale;
+  scale = warp_max / FP8_E4M3_MAX;
   // Broadcast scale
   if (lane_id == 0) {
-    gmem_s(0) = warp_max / FP8_E4M3_MAX;
+    gmem_s(0) = scale;
   }
-  const float scale_inv = (warp_max == 0.f) ? 0.f : 1.0f / (warp_max / FP8_E4M3_MAX);
+  float scale_inv = (scale == 0.f) ? 0.f : 1.0f / scale;
 
   //
   // Pass-2: quantise and write back
@@ -84,7 +78,6 @@ __global__ void per_token_quant_fp8_small_kernel(
     for (uint32_t j = 0; j < kVecSize; ++j) {
       float val = static_cast<float>(input_vec[j]) * scale_inv;
       val = fmaxf(fminf(val, FP8_E4M3_MAX), -FP8_E4M3_MAX);
-      val = nearbyintf(val);
 
 #ifndef USE_ROCM
       output_arr[j] = static_cast<FP8_TYPE>(val);
@@ -94,9 +87,7 @@ __global__ void per_token_quant_fp8_small_kernel(
           c10::Float8_e4m3fnuz::from_bits());
 #endif
     }
-    uint4 packed;
-    memcpy(&packed, output_arr, 16);
-    *reinterpret_cast<uint4*>(gmem_out.data() + i * kVecSize) = packed;
+    *(uint4*)(gmem_out.data() + i * kVecSize) = *(uint4*)output_arr;
   }
 }
 
