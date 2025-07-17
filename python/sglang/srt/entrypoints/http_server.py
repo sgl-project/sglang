@@ -85,7 +85,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
-    VertexGenerateReqInput,
+    VertexGenerateReqInput, ReportHealthInput,
 )
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -245,7 +245,7 @@ async def health_update(obj: ReportHealthInput, request: Request) -> Response:
             )
     except Exception as e:
         logger.error(e)
-        return Response(status_code=HTTPStatus.OK.value)
+        return Response(status_code=HTTPStatus.SERVICE_UNAVAILABLE.value)
 
 
 @app.get("/health_generate")
