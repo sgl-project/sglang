@@ -34,8 +34,15 @@ from sglang.srt.utils import (
     _process_weight_after_loading,
     cpu_has_amx_support,
     is_cpu,
+    is_npu,
     set_weight_attrs,
 )
+
+_is_npu = is_npu()
+if _is_npu:
+    import torch_npu
+
+    torch.npu.config.allow_internal_format = True
 
 logger = logging.getLogger(__name__)
 
@@ -172,9 +179,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
+        self.enable_weight_nz = _is_npu
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_cpu and _is_cpu_amx_available:
+        if self.enable_weight_nz:
+            layer.weight.data = torch_npu.npu_format_cast(
+                layer.weight.data.transpose(-1, -2).contiguous(), 29
+            )  # 29: NZ format
+            layer.weight.input_dim = 0
+            layer.weight.output_dim = 1
+        elif _is_cpu and _is_cpu_amx_available:
             _process_weight_after_loading(layer, ["weight"])
 
     def apply(
@@ -185,11 +199,18 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
 
         if getattr(layer, "use_intel_amx_backend", False):
-            return torch.ops.sgl_kernel.weight_packed_linear(
+            out = torch.ops.sgl_kernel.weight_packed_linear(
                 x, layer.weight, bias, True  # is_vnni
             )
-
-        return F.linear(x, layer.weight, bias)
+        elif _is_npu and self.enable_weight_nz:
+            origin_shape = x.size()
+            out = torch.matmul(x.view(-1, origin_shape[-1]), layer.weight.data)
+            if bias is not None:
+                out = out + bias
+            out = out.view((*origin_shape[:-1], -1))
+        else:
+            out = F.linear(x, layer.weight, bias)
+        return out
 
 
 class LinearBase(torch.nn.Module):

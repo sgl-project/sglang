@@ -86,6 +86,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             self.quantization_config = W8A8Int8Config()
         else:
             self.quantization_config = quantization_config
+        self.enable_weight_nz = _is_npu
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu:
@@ -97,6 +98,10 @@ class W8A8Int8LinearMethod(LinearMethodBase):
 
         layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
+        if self.enable_weight_nz:
+            layer.weight.data = torch_npu.npu_format_cast(
+                layer.weight.data.contiguous(), 29
+            )  # 29: NZ format
 
     def create_weights(
         self,
@@ -144,7 +149,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 x.dtype,
                 True,  # is_vnni
             )
-        
+
         if _is_npu:
             x_q, x_scale = torch_npu.npu_dynamic_quant(x)
             out = torch_npu.npu_quant_matmul(
@@ -199,6 +204,7 @@ class W8A8Int8MoEMethod:
 
     def __init__(self, quant_config):
         self.quant_config = quant_config
+        self.enable_weight_nz = _is_npu
 
     def create_weights(
         self,
@@ -262,14 +268,19 @@ class W8A8Int8MoEMethod:
             _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             return
 
-        layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
-        layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
         layer.w13_weight_scale = Parameter(
             layer.w13_weight_scale.data, requires_grad=False
         )
         layer.w2_weight_scale = Parameter(
             layer.w2_weight_scale.data, requires_grad=False
         )
+        if self.enable_weight_nz:
+            layer.w13_weight = layer.w13_weight.npu()
+            layer.w2_weight = layer.w2_weight.npu()
+            layer.w13_weight.data = torch_npu.npu_format_cast(
+                layer.w13_weight.data, 29
+            )  # 29: NZ format
+            layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, 29)
 
     def apply(
         self,
