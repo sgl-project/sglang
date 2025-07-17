@@ -529,9 +529,9 @@ class BaseMultimodalProcessor(ABC):
 
                 if attr_name in self.FEATURE_NAMES:
                     attr_name = "feature"
-
-                # Set attribute
-                setattr(items[modality], attr_name, value)
+                    setattr(items[modality], attr_name, value)
+                else:
+                    items[modality].model_specific_data[attr_name] = value
 
         return list(items.values())
 

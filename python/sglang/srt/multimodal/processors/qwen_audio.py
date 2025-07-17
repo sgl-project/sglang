@@ -1,9 +1,6 @@
 import re
-from typing import List, Union
 
-import torch
-
-from sglang.srt.managers.multimodal_processors.base_processor import (
+from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
@@ -23,16 +20,11 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
 
     async def process_mm_data_async(
         self,
-        image_data: List[Union[str, bytes]],
+        audio_data,
         input_text,
-        request_obj,
         max_req_input_len,
         **kwargs,
     ):
-        audio_data = request_obj.audio_data
-        if not isinstance(audio_data, list):
-            audio_data = [audio_data]
-
         base_output = self.load_mm_data(
             prompt=input_text,
             max_req_input_len=max_req_input_len,
@@ -65,13 +57,13 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
             and len(res["input_features"]) != 0
         ):
             if audio_start_id is not None and audio_end_id is not None:
-                audio_offsets = self.get_mm_items_offset_by_pair(
+                offsets = self.get_mm_items_offset_by_pair(
                     input_ids=input_ids,
                     mm_start_id=audio_start_id,
                     mm_end_id=audio_end_id,
                 )
             else:
-                audio_offsets = None
+                offsets = None
 
             input_lengths = res["feature_attention_mask"].sum(dim=-1)
             input_lengths = (input_lengths - 1) // 2 + 1
@@ -79,8 +71,8 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
 
             item = MultimodalDataItem(
                 feature=res["input_features"],
-                audio_feature_lens=output_lengths,
-                audio_offsets=audio_offsets,
+                model_specific_data={"audio_feature_lens": output_lengths},
+                offsets=offsets,
                 modality=Modality.AUDIO,
             )
             items += [item]
