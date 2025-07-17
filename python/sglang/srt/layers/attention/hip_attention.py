@@ -111,7 +111,8 @@ class HiPAttentionBackend(AttentionBackend):
             dim=0, index=forward_batch.req_pool_indices
         )
 
-        self.flashattention_backend.init_forward_metadata(forward_batch=forward_batch)
+        if forward_batch.forward_mode.is_decode():
+            self.flashattention_backend.init_forward_metadata(forward_batch=forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int):
         self.flashattention_backend.init_cuda_graph_state(
@@ -498,6 +499,7 @@ class HiPAttentionBackend(AttentionBackend):
                             batch_size=forward_batch.batch_size,
                             metadata=metadata,
                             block_size_q=self.hip_config.block_sparse_block_size_q,
+                            cached_stages=forward_batch.hip_metadata_cached_stages,
                         )
 
                         if self.is_kv_cache_offload_enabled:
@@ -783,6 +785,7 @@ class HiPAttentionBackend(AttentionBackend):
                     batch_size=forward_batch.batch_size,
                     metadata=metadata,
                     block_size_q=self.hip_config.block_sparse_block_size_q,
+                    cached_stages=forward_batch.hip_metadata_cached_stages,
                 )
 
                 if self.is_kv_cache_offload_enabled:
