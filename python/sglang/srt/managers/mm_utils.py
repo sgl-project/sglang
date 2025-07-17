@@ -21,7 +21,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import flatten_nested_list, print_warning_once
-from sglang.utils import info_once, logger
+from sglang.utils import logger
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
@@ -139,7 +139,6 @@ class TransportableTensor:
                     if tensor.numel() != expected_numel:
                         # Potentially raise error or return None depending on strictness needed
                         return self.feature
-                    info_once("succeed")
 
                     return tensor
             except Exception as e:
@@ -221,7 +220,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
             return input_ids
 
         for start_idx, end_idx in zip(start_indices, end_indices):
-            padded_ids.extend(input_ids[last_idx : start_idx + 1])
+            padded_ids.extend(input_ids[last_idx: start_idx + 1])
 
             if input_ids[start_idx] in self.data_start_token_ids:
                 data_idx += 1
@@ -375,7 +374,7 @@ def _get_chunked_prefill_embedding(
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
             continue
-        embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
+        embedding_items_per_req = embedding_items[items_size[i]: items_size[i + 1]]
         items_offset = items_offset_list[i]
         assert items_offset is not None, items_offset
         embedding_items_hash = get_embedding_hash(embedding_items_per_req)
