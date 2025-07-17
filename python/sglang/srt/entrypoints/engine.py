@@ -663,7 +663,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     def sigchld_handler(signum, frame):
         pid, exitcode = os.waitpid(0, os.WNOHANG)
         if exitcode != 0:
-            report_health(ServerStatus.Crashed, server_args.host, ServerArgs.port)
+            report_health(ServerStatus.Crashed, server_args.host, server_args.port)
             logger.warning(
                 f"Child process unexpectedly failed with {exitcode=}. {pid=}"
             )
@@ -677,7 +677,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         logger.error(
             "Received sigquit from a child process. It usually means the child failed."
         )
-        report_health(ServerStatus.Crashed, server_args.host, ServerArgs.port)
+        report_health(ServerStatus.Crashed, server_args.host, server_args.port)
         kill_process_tree(os.getpid())
 
     signal.signal(signal.SIGQUIT, sigquit_handler)
