@@ -314,10 +314,19 @@ class ToolCall(BaseModel):
     type: Literal["function"] = "function"
     function: FunctionResponse
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Remove all None fields
+        for field_name in self.__class__.model_fields:
+            if getattr(self, field_name) is None:
+                data.pop(field_name, None)
+        return data
+
 
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool"]
-    content: Union[str, List[ChatCompletionMessageContentTextPart], None]
+    content: Union[str, List[ChatCompletionMessageContentTextPart], None] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
@@ -470,6 +479,15 @@ class ChatMessage(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Remove all None fields
+        for field_name in self.__class__.model_fields:
+            if getattr(self, field_name) is None:
+                data.pop(field_name, None)
+        return data
+
 
 class ChatCompletionResponseChoice(BaseModel):
     index: int
@@ -510,8 +528,10 @@ class DeltaMessage(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
-        if self.hidden_states is None:
-            data.pop("hidden_states", None)
+        # Remove all None fields
+        for field_name in self.__class__.model_fields:
+            if getattr(self, field_name) is None:
+                data.pop(field_name, None)
         return data
 
 
