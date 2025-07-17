@@ -254,7 +254,9 @@ class HiCacheController:
                 # todo: threshold policy for prefetching
                 self.prefetch_threshold = prefetch_threshold
             elif storage_backend == "hf3fs":
-                rank = os.getpid()
+                from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+                rank = get_tensor_model_parallel_rank()
                 bytes_per_page = (
                     mem_pool_host.get_size_per_token() * mem_pool_host.page_size
                 )
@@ -522,6 +524,11 @@ class HiCacheController:
         self.ongoing_prefetch[request_id] = operation
         self.prefetch_queue.put(operation)
 
+    def prefetch_done(self, request_id: str):
+        return self.ongoing_prefetch[request_id].completed_tokens == len(
+            self.ongoing_prefetch[request_id].token_ids
+        )
+
     def terminate_prefetch(self, request_id: str):
         operation = self.ongoing_prefetch.pop(request_id, None)
         if operation is None:
@@ -538,8 +545,8 @@ class HiCacheController:
         while not self.stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
-                for h in operation.hash_value:
-                    page_data = self.storage_backend.get(h)
+                page_datas = self.storage_backend.batch_get(operation.hash_value)
+                for h, page_data in zip(operation.hash_value, page_datas):
                     if page_data is None:
                         logger.warning(
                             f"Prefetch operation {operation.request_id} failed to retrieve page {h}."
@@ -594,9 +601,18 @@ class HiCacheController:
 
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
-                    self.prefetch_revoke_queue.put(operation.request_id)
+                    self.prefetch_revoke_queue.put(operation)
+                    logger.debug(
+                        f"Prefetching revoke for request {operation.request_id}."
+                    )
                 else:
                     operation.hash_value = hash_value
+                    self.mem_pool_host.free(
+                        operation.host_indices[len(hash_value) * self.page_size :]
+                    )
+                    operation.host_indices = operation.host_indices[
+                        : len(hash_value) * self.page_size
+                    ]
                     logger.debug(
                         f"Prefetching {len(hash_value)} pages for request {operation.request_id}."
                     )
@@ -631,19 +647,21 @@ class HiCacheController:
                 last_hash = operation.last_hash
                 tokens_to_backup = operation.token_ids
 
+                last_hashes, data_pages = [], []
                 for i in range(0, len(tokens_to_backup), self.page_size):
                     last_hash = get_hash_str(
                         tokens_to_backup[i : i + self.page_size], last_hash
                     )
-                    # todo, handle failures in storage backend
-                    self.storage_backend.set(
-                        last_hash,
-                        self.mem_pool_host.get_flat_data_page(
-                            operation.host_indices[i]
-                        ),
+                    data_page = self.mem_pool_host.get_flat_data_page(
+                        operation.host_indices[i]
                     )
-                    operation.completed_tokens += self.page_size
-                    operation.hash_value.append(last_hash)
+                    last_hashes.append(last_hash)
+                    data_pages.append(data_page)
+
+                # todo, handle failures in storage backend
+                self.storage_backend.batch_set(last_hashes, data_pages)
+                operation.completed_tokens += len(tokens_to_backup)
+                operation.hash_value.extend(last_hashes)
 
                 self.ack_backup_queue.put((operation.id, operation.hash_value))
 

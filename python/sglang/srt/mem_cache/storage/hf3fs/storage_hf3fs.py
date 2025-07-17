@@ -171,6 +171,8 @@ class HiCacheHF3FS(HiCacheStorage):
         ):
             if read_result == self.bytes_per_page:
                 results[batch_index] = file_result
+            else:
+                logger.error(f"HiCacheHF3FS get {keys[batch_index]} failed")
 
         return results
 
@@ -209,6 +211,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 self.key_to_index[key] = index
                 self.key_to_index.move_to_end(key)
             else:
+                logger.error(f"HiCacheHF3FS set {key} failed")
                 self.free_pages.append(index)
             results[batch_index] = write_result
         return results
