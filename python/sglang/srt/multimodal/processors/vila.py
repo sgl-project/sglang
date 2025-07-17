@@ -35,7 +35,7 @@ class VILAMultimodalProcessor(BaseMultimodalProcessor):
         server_args: ServerArgs,
         _processor: VILAProcessor,
     ) -> None:
-        super().__init__(hf_config, server_args, _processor)
+        super().__init__(hf_config, server_args, _processor, *args)
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self._processor.tokenizer.image_token,
             image_token_id=hf_config.image_token_id,

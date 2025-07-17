@@ -166,12 +166,7 @@ class ReqState:
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
 
 
-def _determine_tensor_transport_mode(
-    tensor_transport_mode: Optional[TensorTransportMode], server_args: ServerArgs
-) -> TensorTransportMode:
-    if tensor_transport_mode is not None and tensor_transport_mode != "auto":
-        return tensor_transport_mode
-
+def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
     is_cross_node = server_args.dist_init_addr
 
     if is_cross_node:
@@ -231,7 +226,7 @@ class TokenizerManager:
                 revision=server_args.revision,
                 use_fast=not server_args.disable_fast_image_processor,
             )
-            transport_mode = _determine_tensor_transport_mode(None, self.server_args)
+            transport_mode = _determine_tensor_transport_mode(self.server_args)
 
             # We want to parallelize the image pre-processing so we create an executor for it
             # We create mm_processor for any skip_tokenizer_init to make sure we still encode

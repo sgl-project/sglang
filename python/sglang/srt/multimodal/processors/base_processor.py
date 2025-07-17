@@ -135,12 +135,12 @@ class MultimodalSpecialTokens:
 class BaseMultimodalProcessor(ABC):
     models = []
 
-    def __init__(self, hf_config, server_args, _processor):
+    def __init__(self, hf_config, server_args, _processor, transport_mode):
         self.hf_config = hf_config
         self._processor = _processor
         self.arch = hf_config.architectures[0]
         self.server_args = server_args
-        self.transport_mode: Optional[TensorTransportMode] = None
+        self.transport_mode = transport_mode
 
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
@@ -513,6 +513,7 @@ class BaseMultimodalProcessor(ABC):
 
                 if attr_name in self.FEATURE_NAMES:
                     attr_name = "feature"
+                    # replace the feature tensor with TransportableTensor
                     if isinstance(value, torch.Tensor):
                         value = TransportableTensor(
                             transport_mode=self.transport_mode, feature=value
