@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass
 from fractions import Fraction
@@ -5,7 +7,6 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 
-from sglang.srt.layers.linear import LinearBase, LinearMethodBase, set_weight_attrs
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     ChannelQuantScaleParameter,
@@ -16,6 +17,8 @@ from sglang.srt.layers.parameter import (
     permute_param_layout_,
 )
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
+    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -34,7 +37,11 @@ from sglang.srt.layers.quantization.marlin_utils import (
     verify_marlin_supported,
 )
 from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
-from sglang.srt.layers.quantization.utils import replace_parameter, unpack_cols
+from sglang.srt.layers.quantization.utils import (
+    get_linear_quant_method,
+    replace_parameter,
+    unpack_cols,
+)
 
 try:
     from vllm import _custom_ops as ops
@@ -48,8 +55,6 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import fused_marlin_moe
 
-
-FusedMoEMethodBase = QuantizeMethodBase
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +184,7 @@ class GPTQConfig(QuantizationConfig):
         return ["quantize_config.json"]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "GPTQConfig":
+    def from_config(cls, config: Dict[str, Any]) -> GPTQConfig:
         dynamic = cls.get_from_keys_or(config, ["dynamic"], default={})
         dynamic = {} if dynamic is None else dynamic
 
@@ -191,10 +196,10 @@ class GPTQConfig(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["LinearMethodBase"]:
+    ) -> Optional[LinearMethodBase]:
         # Delay the import to avoid circular dependency
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        from sglang.srt.layers.quantization import get_linear_quant_method
 
         if isinstance(layer, LinearBase):
             return get_linear_quant_method(self, layer, prefix, GPTQLinearMethod)
@@ -303,7 +308,7 @@ class GPTQMarlinConfig(QuantizationConfig):
         return ["quantize_config.json"]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "GPTQMarlinConfig":
+    def from_config(cls, config: Dict[str, Any]) -> GPTQMarlinConfig:
         dynamic = cls.get_from_keys_or(config, ["dynamic"], default={})
         dynamic = {} if dynamic is None else dynamic
 
@@ -354,7 +359,6 @@ class GPTQMarlinConfig(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         # Delay the import to avoid circular dependency
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        from sglang.srt.layers.quantization import get_linear_quant_method
 
         if isinstance(layer, FusedMoE):
             return GPTQMarlinMoEMethod(self)
@@ -832,6 +836,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         # Delay the import to avoid circular dependency
+        from sglang.srt.layers.linear import set_weight_attrs
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         intermediate_size = extra_weight_attrs.pop("intermediate_size")
