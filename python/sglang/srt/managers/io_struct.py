@@ -478,10 +478,6 @@ class GenerateReqInput:
         )
 
 
-# applied for tensor sent from TokenizerManager -> Scheduler
-global_transport_mode: Optional[TensorTransportMode] = None
-
-
 @dataclass
 class TokenizedGenerateReqInput:
     # The request id
