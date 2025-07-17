@@ -639,7 +639,17 @@ impl Router {
                     let is_stream = typed_req.is_stream();
 
                     // Select worker based on text
-                    let worker_url = self.select_generate_worker_from_text(&text);
+                    let worker_url = match self.select_generate_worker_from_text(&text) {
+                        Ok(url) => url,
+                        Err(e) => {
+                            // If there are no workers, we can't continue. Return 503 Service Unavailable.
+                            error!("Failed to select worker from `select_generate_worker_from_text` with error:{e}");
+                            return HttpResponse::ServiceUnavailable().body(
+                                "Failed to select best available worker for routing request",
+                            );
+                        }
+                    };
+
                     let mut request_retries = 0;
 
                     // Try the same worker multiple times
@@ -723,31 +733,14 @@ impl Router {
     }
 
     // Helper method to select worker from text (returns index for RoundRobin/Random, URL for CacheAware)
-    fn select_generate_worker_from_text(&self, text: &str) -> String {
+    fn select_generate_worker_from_text(&self, text: &str) -> Result<String, String> {
         match self {
             Router::RoundRobin {
                 workers,
                 current_index,
                 ..
-            } => {
-                let workers_guard = workers.read().unwrap();
-                let idx = current_index
-                    .fetch_update(
-                        std::sync::atomic::Ordering::SeqCst,
-                        std::sync::atomic::Ordering::SeqCst,
-                        |x| Some((x + 1) % workers_guard.len()),
-                    )
-                    .unwrap();
-                workers_guard[idx].url().to_string()
-            }
-
-            Router::Random { workers, .. } => {
-                let workers_guard = workers.read().unwrap();
-                workers_guard[rand::random::<usize>() % workers_guard.len()]
-                    .url()
-                    .to_string()
-            }
-
+            } => Ok(Self::select_worker_round_robin(workers, current_index)),
+            Router::Random { workers, .. } => Ok(Self::select_worker_random(workers)),
             Router::CacheAware {
                 workers,
                 tree,
@@ -755,76 +748,94 @@ impl Router {
                 balance_abs_threshold,
                 balance_rel_threshold,
                 ..
-            } => {
-                let tree = tree.lock().unwrap();
-                let workers_guard = workers.read().unwrap();
-
-                // Get current load statistics from workers
-                let loads: Vec<usize> = workers_guard.iter().map(|w| w.load()).collect();
-                let max_load = *loads.iter().max().unwrap_or(&0);
-                let min_load = *loads.iter().min().unwrap_or(&0);
-
-                // Load is considered imbalanced if:
-                // 1. (max - min) > abs_threshold AND
-                // 2. max > rel_threshold * min
-                let is_imbalanced = max_load.saturating_sub(min_load) > *balance_abs_threshold
-                    && (max_load as f32) > (min_load as f32 * balance_rel_threshold);
-
-                let selected_url = if is_imbalanced {
-                    // Log load balancing trigger and current queue state
-                    let worker_loads: Vec<(String, usize)> = workers_guard
-                        .iter()
-                        .map(|w| (w.url().to_string(), w.load()))
-                        .collect();
-
-                    info!(
-                        "Load balancing triggered due to workload imbalance:\n\
-                        Max load: {}, Min load: {}\n\
-                        Current worker loads: {:?}",
-                        max_load, min_load, worker_loads
-                    );
-
-                    counter!("sgl_router_load_balancing_events_total").increment(1);
-                    gauge!("sgl_router_max_load").set(max_load as f64);
-                    gauge!("sgl_router_min_load").set(min_load as f64);
-
-                    // Use shortest queue routing when load is imbalanced
-                    workers_guard
-                        .iter()
-                        .min_by_key(|w| w.load())
-                        .map(|w| w.url().to_string())
-                        .unwrap_or_else(|| workers_guard[0].url().to_string())
-                } else {
-                    // Use cache-aware routing when load is balanced
-                    let (matched_text, matched_worker) = tree.prefix_match(&text);
-                    let matched_rate =
-                        matched_text.chars().count() as f32 / text.chars().count() as f32;
-
-                    if matched_rate > *cache_threshold {
-                        counter!("sgl_router_cache_hits_total").increment(1);
-                        matched_worker.to_string()
-                    } else {
-                        counter!("sgl_router_cache_misses_total").increment(1);
-                        tree.get_smallest_tenant()
-                    }
-                };
-
-                // Find the selected worker and increment processed counter only
-                if let Some(worker) = workers_guard.iter().find(|w| w.url() == &selected_url) {
-                    worker.increment_processed();
-                    counter!("sgl_router_processed_requests_total", "worker" => selected_url.to_string())
-                        .increment(1);
-                }
-
-                tree.insert(&text, &selected_url);
-
-                selected_url
-            }
+            } => Self::cache_aware_select_worker(
+                workers,
+                tree,
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+                text,
+            ),
             Router::PrefillDecode { .. } => {
                 // For PD mode, we don't use this method
-                return "PD_MODE_ERROR".to_string();
+                return Err("PD_MODE_ERROR".to_string());
             }
         }
+    }
+
+    fn select_worker_round_robin(
+        workers: &Arc<RwLock<Vec<Box<dyn Worker>>>>,
+        current_index: &AtomicUsize,
+    ) -> String {
+        let workers_guard = workers.read().unwrap();
+        let idx = current_index
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |x| Some((x + 1) % workers_guard.len()),
+            )
+            .unwrap();
+        workers_guard[idx].url().to_string()
+    }
+
+    fn select_worker_random(workers: &Arc<RwLock<Vec<Box<dyn Worker>>>>) -> String {
+        let workers_guard = workers.read().unwrap();
+        workers_guard[rand::random::<usize>() % workers_guard.len()]
+            .url()
+            .to_string()
+    }
+
+    fn cache_aware_select_worker(
+        workers: &Arc<RwLock<Vec<Box<dyn Worker>>>>,
+        tree: &Arc<Mutex<Tree>>,
+        cache_threshold: &f32,
+        balance_abs_threshold: &usize,
+        balance_rel_threshold: &f32,
+        text: &str,
+    ) -> Result<String, String> {
+        let processed_text = cache_aware_router_utils::ProcessedText::new(text.to_string());
+
+        let load_stats = match workers.read() {
+            Ok(workers_guard) => {
+                cache_aware_router_utils::LoadStatistics::calculate(&workers_guard)
+            }
+            Err(e) => {
+                tracing::error!("Failed to acquire workers lock for load balancing: {e}");
+                return Err(format!(
+                    "Failed to acquire workers lock for load balancing: {e}"
+                ));
+            }
+        };
+
+        let strategy = cache_aware_router_utils::determine_routing_strategy(
+            &load_stats,
+            balance_abs_threshold,
+            balance_rel_threshold,
+        );
+
+        let selected_url = match strategy {
+            cache_aware_router_utils::RoutingStrategy::CacheAware => {
+                cache_aware_router_utils::select_cache_aware_worker(
+                    tree,
+                    cache_threshold,
+                    &processed_text,
+                )?
+            }
+            cache_aware_router_utils::RoutingStrategy::LoadBalancing => {
+                cache_aware_router_utils::log_load_balancing_trigger(&load_stats);
+                cache_aware_router_utils::select_least_loaded_worker(workers)
+            }
+        };
+
+        cache_aware_router_utils::update_worker_metrics(workers, &selected_url)?;
+        cache_aware_router_utils::insert_into_tree(
+            tree.clone(),
+            text.to_string(),
+            selected_url.clone(),
+        );
+        cache_aware_router_utils::record_selection_metrics(workers, &selected_url);
+
+        Ok(selected_url)
     }
 
     // Send typed request directly without conversion
@@ -1266,6 +1277,198 @@ impl Router {
             }
             _ => HttpResponse::InternalServerError().body("Not in PrefillDecode mode"),
         }
+    }
+}
+
+mod cache_aware_router_utils {
+    use std::sync::{Arc, Mutex, RwLock};
+
+    use metrics::{counter, gauge};
+
+    use crate::{core::Worker, tree::Tree};
+
+    pub struct LoadStatistics {
+        max_load: usize,
+        min_load: usize,
+        worker_loads: Vec<(String, usize)>,
+    }
+
+    impl LoadStatistics {
+        pub fn calculate(workers: &Vec<Box<dyn Worker>>) -> Self {
+            let loads: Vec<usize> = workers.iter().map(|w| w.load()).collect();
+            let max_load = *loads.iter().max().unwrap_or(&0);
+            let min_load = *loads.iter().min().unwrap_or(&0);
+            Self {
+                max_load,
+                min_load,
+                worker_loads: workers
+                    .iter()
+                    .map(|w| (w.url().to_string(), w.load()))
+                    .collect(),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub enum RoutingStrategy {
+        LoadBalancing,
+        CacheAware,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ProcessedText {
+        text: String,
+        char_count: usize,
+    }
+
+    impl ProcessedText {
+        pub fn new(text: String) -> Self {
+            let char_count = text.chars().count();
+            Self { text, char_count }
+        }
+    }
+
+    pub fn determine_routing_strategy(
+        load_stats: &LoadStatistics,
+        balance_abs_threshold: &usize,
+        balance_rel_threshold: &f32,
+    ) -> RoutingStrategy {
+        let is_imbalanced = load_stats.max_load.saturating_sub(load_stats.min_load)
+            > *balance_abs_threshold
+            && (load_stats.max_load as f32) > (load_stats.min_load as f32 * *balance_rel_threshold);
+
+        if is_imbalanced {
+            RoutingStrategy::LoadBalancing
+        } else {
+            RoutingStrategy::CacheAware
+        }
+    }
+
+    pub fn select_least_loaded_worker(workers: &Arc<RwLock<Vec<Box<dyn Worker>>>>) -> String {
+        match workers.read() {
+            Ok(workers_guard) => {
+                if workers_guard.is_empty() {
+                    tracing::warn!("No workers available for load balancing");
+                    return "empty".to_string();
+                }
+
+                workers_guard
+                    .iter()
+                    .min_by_key(|w| w.load())
+                    .map(|w| w.url().to_string())
+                    .unwrap_or_else(|| {
+                        // Fallback to first worker
+                        workers_guard[0].url().to_string()
+                    })
+            }
+            Err(e) => {
+                tracing::error!("Failed to acquire workers lock for load balancing: {}", e);
+                "empty".to_string()
+            }
+        }
+    }
+
+    pub fn select_cache_aware_worker(
+        tree: &Arc<Mutex<Tree>>,
+        cache_threshold: &f32,
+        processed_text: &ProcessedText,
+    ) -> Result<String, String> {
+        let (matched_text, matched_worker) = match tree.lock() {
+            Ok(tree_guard) => tree_guard.prefix_match(&processed_text.text),
+            Err(e) => {
+                tracing::error!("Failed to acquire tree lock for prefix matching: {}", e);
+                return Err("Failed to acquire tree lock for prefix matching".to_string());
+            }
+        };
+
+        let match_rate = if processed_text.char_count > 0 {
+            matched_text.chars().count() as f32 / processed_text.char_count as f32
+        } else {
+            0.0
+        };
+
+        if match_rate > *cache_threshold {
+            counter!("sgl_router_cache_hits_total").increment(1);
+            Ok(matched_worker)
+        } else {
+            counter!("sgl_router_cache_misses_total").increment(1);
+            match tree.lock() {
+                Ok(tree_guard) => Ok(tree_guard.get_smallest_tenant()),
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to acquire tree lock for getting smallest tenant: {}",
+                        e
+                    );
+                    Err("Failed to acquire tree lock for getting smallest tenant".to_string())
+                }
+            }
+        }
+    }
+
+    pub fn update_worker_metrics(
+        workers: &Arc<RwLock<Vec<Box<dyn Worker>>>>,
+        selected_url: &str,
+    ) -> Result<(), String> {
+        if let Ok(workers_guard) = workers.read() {
+            if let Some(worker) = workers_guard.iter().find(|w| w.url() == selected_url) {
+                worker.increment_processed();
+                counter!("sgl_router_processed_requests_total", "worker" => selected_url.to_string())
+                    .increment(1);
+                return Ok(());
+            }
+        }
+        Err("Worker not found".to_string())
+    }
+
+    pub fn insert_into_tree(tree: Arc<Mutex<Tree>>, text: String, worker_url: String) {
+        match tree.lock() {
+            Ok(tree_guard) => {
+                tree_guard.insert(&text, &worker_url);
+                tracing::debug!(
+                    "Successfully inserted text into tree for worker: {}",
+                    worker_url
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to acquire tree lock for async insertion: {}", e);
+            }
+        }
+    }
+
+    pub fn record_selection_metrics(
+        workers: &Arc<RwLock<Vec<Box<dyn Worker>>>>,
+        selected_url: &str,
+    ) {
+        match workers.read() {
+            Ok(workers_guard) => {
+                // Find the selected worker and increment processed counter only
+                if let Some(worker) = workers_guard.iter().find(|w| w.url() == selected_url) {
+                    worker.increment_processed();
+                    counter!("sgl_router_processed_requests_total", "worker" => selected_url.to_string())
+                    .increment(1);
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to acquire workers lock for recording selection metrics: {e}"
+                );
+            }
+        }
+    }
+
+    pub fn log_load_balancing_trigger(stats: &LoadStatistics) {
+        tracing::info!(
+            "Load balancing triggered due to workload imbalance:\n\
+            Max load: {}, Min load: {}\n\
+            Current worker loads: {:?}",
+            stats.max_load,
+            stats.min_load,
+            stats.worker_loads
+        );
+
+        counter!("sgl_router_load_balancing_events_total").increment(1);
+        gauge!("sgl_router_max_load").set(stats.max_load as f64);
+        gauge!("sgl_router_min_load").set(stats.min_load as f64);
     }
 }
 
