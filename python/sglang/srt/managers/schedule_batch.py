@@ -213,7 +213,6 @@ class MultimodalDataItem:
 
     image_sizes: Tuple[int, int] = None
 
-
     audio_feature_lens: Optional[List[torch.Tensor]] = None
     audio_offsets: Optional[List[Tuple[int, int]]] = None
     precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
