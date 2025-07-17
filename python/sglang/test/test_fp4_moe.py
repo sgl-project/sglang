@@ -115,9 +115,10 @@ def torch_moe(a, w1, w2, score, topk, expert_map):
 @pytest.mark.parametrize("e", [40, 64, 256])
 @pytest.mark.parametrize("topk", [1, 6, 8])
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_tanh"])
 @torch.inference_mode()
 def test_cutlass_fp4_moe_no_graph(
-    m: int, n: int, k: int, e: int, topk: int, dtype: torch.dtype
+    m: int, n: int, k: int, e: int, topk: int, dtype: torch.dtype, activation: str
 ):
 
     torch.manual_seed(7)
@@ -200,6 +201,7 @@ def test_cutlass_fp4_moe_no_graph(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         params=params,
+        activation=activation,
         apply_router_weight_on_input=False,
     )
 
