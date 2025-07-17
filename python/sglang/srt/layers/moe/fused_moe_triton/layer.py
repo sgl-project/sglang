@@ -4,8 +4,16 @@ import importlib
 from abc import abstractmethod
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
+import logging
 
 import torch
+import torch.distributed as dist
+
+from sglang.srt.utils import is_flashinfer_available
+
+_is_flashinfer_available = is_flashinfer_available()
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
@@ -42,8 +50,6 @@ if torch.cuda.is_available():
         )
 else:
     fused_experts = None  # type: ignore
-
-import logging
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -952,7 +958,16 @@ class FusedMoE(torch.nn.Module):
             ),
         )
 
-        if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
+        if (
+            _is_flashinfer_available
+            and global_server_args_dict["enable_flashinfer_allreduce"]
+            and hidden_states.shape[0] <= 128
+            ):
+            from sglang.srt.layers.flashinfer_comm import (
+                flashinfer_allreduce,
+            )
+            final_hidden_states = flashinfer_allreduce(final_hidden_states)
+        elif self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
