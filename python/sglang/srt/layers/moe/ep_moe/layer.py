@@ -1272,6 +1272,12 @@ class DeepEPMoE(EPMoE):
             routed_scaling_factor=routed_scaling_factor,
         )
         self.deepep_mode = deepep_mode
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            assert self.use_fp8_w8a8, (
+                "DeepGEMM requires an fp8_w8a8 model; "
+                "alternatively, you can disable DeepGEMM by turning off the ENABLE_JIT_DEEPGEMM environment variable."
+            )
+
         if self.deepep_mode.enable_low_latency():
             assert (
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
