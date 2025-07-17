@@ -84,14 +84,10 @@ __global__ void per_token_quant_fp8_small_kernel(
     for (uint32_t j = 0; j < kVecSize; ++j) {
       float val = static_cast<float>(input_vec[j]) * scale_inv;
       val = fmaxf(fminf(val, FP8_E4M3_MAX), -FP8_E4M3_MAX);
-      // val = nearbyintf(val);
+      val = nearbyintf(val);
 
 #ifndef USE_ROCM
-      // output_arr[j] = static_cast<FP8_TYPE>(val);
-      output_arr[j] = __nv_cvt_float_to_fp8(
-        val,
-        __NV_E4M3,
-        __NV_SATFINITE);
+      output_arr[j] = static_cast<FP8_TYPE>(val);
 #else
       output_arr[j] = c10::Float8_e4m3fnuz(
           __hip_cvt_float_to_fp8(val, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
