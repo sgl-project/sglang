@@ -53,8 +53,8 @@ struct KernelTraits<float> {
   using MmaTileShape = Shape<_128, _128, _256>;
   using ClusterShape = Shape<int, int, _1>;
   using EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto;
-  using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized1Sm;
-  using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100;
+  using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized2Sm;
+  using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100;
 };
 
 template <typename T>
