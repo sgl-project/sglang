@@ -9,10 +9,6 @@ import torch
 
 try:
     from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
-    from vllm.model_executor.layers.quantization.awq_marlin import (
-        AWQMarlinConfig,
-        AWQMoEMethod,
-    )
     from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
         CompressedTensorsW8A8Fp8MoEMethod,
@@ -46,7 +42,11 @@ except ImportError:
 
 
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
-from sglang.srt.layers.quantization.awq import AWQConfig
+from sglang.srt.layers.quantization.awq import (
+    AWQConfig,
+    AWQMarlinConfig,
+    AWQMoEMethod, 
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
