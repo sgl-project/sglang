@@ -217,8 +217,6 @@ class MultimodalDataItem:
     audio_offsets: Optional[List[Tuple[int, int]]] = None
     precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
-    # the real data, pixel_values or audio_features
-    # data: Union[List[torch.Tensor], List[np.ndarray]]
     image_grid_thw: Union[torch.Tensor, np.ndarray] = None
     second_per_grid_ts: Optional[List[torch.Tensor]] = None
 
