@@ -237,7 +237,7 @@ class LoRAMemoryPool:
                     )
 
                     if temp_A_buffer[weight_name] is None:
-                        # Skip if the weight is not present in the adapter
+                        # Skip weight slicing if the weight is not present in the adapter
                         continue
 
                     if "qkv_proj" in module_name:
@@ -252,8 +252,8 @@ class LoRAMemoryPool:
                         )
                     else:
                         # TODO (lifuhuang): Ideally, we should call `get_weight_name` separately for both A and B.
-                        # Currently, we're reusing A's weight name as a workaround, relying on the fact that A and 
-                        # B share the same name except for `qkv_proj`. We should clean this up once we deprecate the 
+                        # Currently, we're reusing A's weight name as a workaround, relying on the fact that A and
+                        # B share the same name except for `qkv_proj`. We should clean this up once we deprecate the
                         # FlashInfer LoRA backend.
                         temp_A_buffer[weight_name] = module.slice_lora_a_weights(
                             temp_A_buffer[weight_name], self.tp_rank

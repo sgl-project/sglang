@@ -41,10 +41,10 @@ BASE_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
 class TestLoRAEviction(CustomTestCase):
     def test_lora_eviction_with_different_target_modules(self):
-        """ 
+        """
         Test LoRA eviction with different target modules.
 
-        This test runs inference against two LoRA adapters in different orders to force eviction behavior, and ensures 
+        This test runs inference against two LoRA adapters in different orders to force eviction behavior, and ensures
         that the outputs of the same (adapter, prompt) pair are consistent across runs.
         """
         output_history = {}
@@ -58,7 +58,7 @@ class TestLoRAEviction(CustomTestCase):
         reversed: bool,
         repeat: int = 2,
     ):
-        max_new_tokens = 256 
+        max_new_tokens = 256
         backend = "triton"
         torch_dtype = torch.float16
         base_path = BASE_MODEL
