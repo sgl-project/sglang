@@ -20,7 +20,7 @@ apt install -y curl wget git sudo libibverbs-dev rdma-core infiniband-diags open
 
 # Install GDRCopy
 rm -rf /opt/gdrcopy && mkdir -p /opt/gdrcopy
-mkdir -p /opt/nvshmem
+rm -rf /opt/nvshmem && mkdir -p /opt/nvshmem
 cd /opt/gdrcopy
 git clone https://github.com/NVIDIA/gdrcopy.git .
 git checkout v2.4.4
@@ -47,9 +47,7 @@ rm -rf /root/.cache/deepep && git clone https://github.com/deepseek-ai/DeepEP.gi
 cd /opt/nvshmem
 wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
 tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz
-rm -rf nvshmem && mv nvshmem_src nvshmem
-cd nvshmem
-git apply /root/.cache/deepep/third-party/nvshmem.patch
+mv nvshmem_src nvshmem && cd nvshmem && git apply /root/.cache/deepep/third-party/nvshmem.patch
 NVSHMEM_SHMEM_SUPPORT=0 \
 NVSHMEM_UCX_SUPPORT=0 \
 NVSHMEM_USE_NCCL=0 \
