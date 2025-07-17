@@ -48,14 +48,14 @@ class TestLoRAEviction(CustomTestCase):
         that the outputs of the same (adapter, prompt) pair are consistent across runs.
         """
         output_history = {}
-        self._run_test(ADAPTERS, output_history, reversed=False)
-        self._run_test(ADAPTERS, output_history, reversed=True)
+        self._run_test(ADAPTERS, output_history, reverse=False)
+        self._run_test(ADAPTERS, output_history, reverse=True)
 
     def _run_test(
         self,
         lora_paths: List[str],
         output_history: Dict[Tuple[str, str], str],
-        reversed: bool,
+        reverse: bool,
         repeat: int = 2,
     ):
         max_new_tokens = 256
@@ -74,12 +74,12 @@ class TestLoRAEviction(CustomTestCase):
             lora_backend=backend,
             disable_radix_cache=True,
         ) as srt_runner:
-            adapter_sequence = lora_paths if not reversed else lora_paths[::-1]
+            adapter_sequence = lora_paths if not reverse else lora_paths[::-1]
 
             for i in range(repeat):
                 for j, adapter in enumerate(adapter_sequence):
                     print(
-                        f"\n========== Testing LoRA eviction with adapter '{adapter}' (#{j+1}/{len(adapter_sequence)}), reversed: {reversed}, repeat: {i+1}/{repeat} ---"
+                        f"\n========== Testing LoRA eviction with adapter '{adapter}' (#{j+1}/{len(adapter_sequence)}), reversed: {reverse}, repeat: {i+1}/{repeat} ---"
                     )
                     for prompt in PROMPTS:
                         print("\nprompt:\n", prompt)

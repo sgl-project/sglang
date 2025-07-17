@@ -211,10 +211,10 @@ class LoRAMemoryPool:
         lora_rank = lora_adapter.config.hf_config["r"]
         for layer_id in range(self.num_layer):
             layer_weights = lora_adapter.layers[layer_id].weights
-            temp_A_buffer: Dict[str, torch.Tensor] = {
+            temp_A_buffer: Dict[str, Optional[torch.Tensor]] = {
                 weight_name: None for weight_name in self.A_buffer
             }
-            temp_B_buffer: Dict[str, torch.Tensor] = {
+            temp_B_buffer: Dict[str, Optional[torch.Tensor]] = {
                 weight_name: None for weight_name in self.B_buffer
             }
             for name, weights in layer_weights.items():
