@@ -5,7 +5,6 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
-from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -156,6 +155,10 @@ class BaseMultimodalProcessor(ABC):
             # "precomputed_features" - handled specially as it can be any modality
         }
 
+        # name of the feature filed
+        # TODO: pass from processors
+        self.FEATURE_NAMES = ["pixel_values", "pixel_values_videos", "audio_features"]
+
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
     ):
@@ -206,7 +209,7 @@ class BaseMultimodalProcessor(ABC):
         estimate the total frame count from all visual input
         """
         # Lazy import because decord is not available on some arm platforms.
-        from video_reader import PyVideoReader, cpu
+        from decord import VideoReader, cpu
 
         # Before processing inputs
         if not image_data or len(image_data) == 0:
@@ -216,7 +219,7 @@ class BaseMultimodalProcessor(ABC):
             if isinstance(image, str) and image.startswith("video:"):
                 path = image[len("video:") :]
                 # Estimate frames for the video
-                vr = PyVideoReader(path, threads=0)
+                vr = VideoReader(path, ctx=cpu(0))
                 num_frames = len(vr)
             else:
                 # For images, each contributes one frame
@@ -523,6 +526,9 @@ class BaseMultimodalProcessor(ABC):
                 # Create item if needed
                 if modality not in items:
                     items[modality] = MultimodalDataItem(modality=modality)
+
+                if attr_name in self.FEATURE_NAMES:
+                    attr_name = "feature"
 
                 # Set attribute
                 setattr(items[modality], attr_name, value)

@@ -84,7 +84,6 @@ from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager
-from video_reader import PyVideoReader
 
 logger = logging.getLogger(__name__)
 
@@ -758,9 +757,16 @@ def load_image(
 
 def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
     # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
-    from video_reader import PyVideoReader
+    from decord import VideoReader, cpu, gpu
 
-    device = "cuda" if use_gpu and torch.cuda.is_available() else None
+    try:
+        from decord.bridge import decord_bridge
+
+        ctx = gpu(0)
+        _ = decord_bridge.get_ctx_device(ctx)
+    except Exception:
+        ctx = cpu(0)
+
     tmp_file = None
     vr = None
     try:
@@ -768,7 +774,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
             tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
             tmp_file.write(video_file)
             tmp_file.close()
-            vr = PyVideoReader(tmp_file.name, device=device, threads=0)
+            vr = VideoReader(tmp_file.name, ctx=ctx)
         elif isinstance(video_file, str):
             if video_file.startswith(("http://", "https://")):
                 timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
@@ -778,22 +784,22 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 for chunk in response.iter_content(chunk_size=8192):
                     tmp_file.write(chunk)
                 tmp_file.close()
-                vr = PyVideoReader(tmp_file.name, device=device, threads=0)
+                vr = VideoReader(tmp_file.name, ctx=ctx)
             elif video_file.startswith("data:"):
                 _, encoded = video_file.split(",", 1)
                 video_bytes = base64.b64decode(encoded)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()
-                vr = PyVideoReader(tmp_file.name, device=device, threads=0)
+                vr = VideoReader(tmp_file.name, ctx=ctx)
             elif os.path.isfile(video_file):
-                vr = PyVideoReader(video_file, device=device, threads=0)
+                vr = VideoReader(video_file, ctx=ctx)
             else:
                 video_bytes = base64.b64decode(video_file)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()
-                vr = PyVideoReader(tmp_file.name, device=device, threads=0)
+                vr = VideoReader(tmp_file.name, ctx=ctx)
         else:
             raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
@@ -1094,15 +1100,15 @@ def broadcast_pyobj(
     rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
-    force_cpu_device: bool = True,
+    device: Optional[str] = None,
 ):
     """Broadcast inputs from src rank to all other ranks with torch.dist backend.
     The `rank` here refer to the source rank on global process group (regardless
     of dist_group argument).
     """
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
-    )
+
+    if device is None:
+        device = get_device()
 
     if rank == src:
         if len(data) == 0:
@@ -1142,44 +1148,38 @@ def point_to_point_pyobj(
     group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
     dst: int = 1,
+    device: Optional[str] = None,
 ):
     """Send data from src to dst in group using DeviceToDevice communication."""
-
+    if device is None:
+        device = get_device()
     if rank == src:
         if len(data) == 0:
-            tensor_size = torch.tensor(
-                [0], dtype=torch.long, device=torch.cuda.current_device()
-            )
+            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.send(tensor_size, dst=dst, group=group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
-            ).cuda(
-                device=torch.cuda.current_device()
-            )  # Move to GPU
-            tensor_size = torch.tensor(
-                [size], dtype=torch.long, device=torch.cuda.current_device()
-            )
+            ).to(
+                device=device
+            )  # Move to Device
+            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 
             dist.send(tensor_size, dst=dst, group=group)
             dist.send(tensor_data, dst=dst, group=group)
         return data
 
     elif rank == dst:
-        tensor_size = torch.tensor(
-            [0], dtype=torch.long, device=torch.cuda.current_device()
-        )
+        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
         dist.recv(tensor_size, src=src, group=group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
-        tensor_data = torch.empty(
-            size, dtype=torch.uint8, device=torch.cuda.current_device()
-        )
+        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
         dist.recv(tensor_data, src=src, group=group)
 
         serialized_data = bytes(
