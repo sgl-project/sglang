@@ -22,6 +22,8 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.lightning_attn import (
+    LightningAttentionMetadata,
+    LightningAttnBackend,
     lightning_attention,
     linear_decode_forward_triton,
 )
@@ -38,6 +40,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -45,6 +48,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.minimax_cache import MinimaxCacheManager, MinimaxCacheParams
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.utils import make_layers
@@ -245,392 +249,6 @@ class MiniMaxText01MoE(nn.Module):
         return final_hidden
 
 
-class MiniMaxText01LinearKernel:
-    """
-    Linear kernel for MiniMaxText01 model.
-    Optimizes the forward pass of the linear attention layer.
-    """
-
-    @staticmethod
-    def jit_linear_forward_prefix(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        kv_caches: torch.Tensor,
-        slope_rate: torch.Tensor,
-        block_size: int,
-        layer_idx: int = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        slope_rate = slope_rate.to(torch.float32)
-        should_pad_dim = q.dim() == 3
-        if should_pad_dim:
-            q = q.unsqueeze(0)
-            k = k.unsqueeze(0)
-            v = v.unsqueeze(0)
-        b, h, n, d = q.shape
-        e = d
-        kv_history = kv_caches.reshape(1, h, d, e).contiguous()
-        output, kv_history = lightning_attention(
-            q, k, v, slope_rate, block_size=block_size, kv_history=kv_history
-        )
-        kv_caches.copy_(kv_history[:, :, -1, :, :].reshape(h, d, e))
-        assert output.shape[0] == 1, "batch size must be 1"
-        return rearrange(output.squeeze(0), "h n d -> n (h d)")
-
-
-@dataclass
-class AttentionMetadata:
-    """
-    Attention metadata for prefill and decode batched together.
-    """
-
-    num_prefills: int
-    num_prefill_tokens: int
-    num_decode_tokens: int
-    query_start_loc: Optional[torch.Tensor] = None
-    context_lens_tensor: Optional[torch.Tensor] = None
-    rotary_emb: Optional[Any] = None
-
-    @property
-    def prefill_metadata(self) -> Optional["AttentionMetadata"]:
-        return self
-
-    @property
-    def decode_metadata(self) -> Optional["AttentionMetadata"]:
-        return self
-
-    def asdict_zerocopy(self, skip_fields: Optional[Set[str]] = None) -> Dict[str, Any]:
-        """Similar to dataclasses.asdict, but avoids deepcopying."""
-        if skip_fields is None:
-            skip_fields = set()
-        # Note that if we add dataclasses as fields, they will need
-        # similar handling.
-        return {
-            field.name: getattr(self, field.name)
-            for field in fields(self)
-            if field.name not in skip_fields
-        }
-
-
-class AttentionMetadataManager:
-    """Manager for creating and updating AttentionMetadata for MiniMaxText01 model."""
-
-    def __init__(self, config=None):
-        self.config = config
-
-    def create_metadata_from_batch_info(
-        self,
-        batch_size: int,
-        seq_lens: torch.Tensor,
-        extend_seq_lens: Optional[torch.Tensor] = None,
-        context_lens: Optional[torch.Tensor] = None,
-        is_prefill_batch: bool = False,
-        device: Optional[torch.device] = None,
-    ) -> AttentionMetadata:
-        """
-        Create AttentionMetadata from batch information.
-
-        Args:
-            batch_size: Number of sequences in the batch
-            seq_lens: Current sequence lengths [batch_size]
-            extend_seq_lens: New tokens being added in this step [batch_size]
-            context_lens: Context lengths for each sequence [batch_size]
-            is_prefill_batch: Whether this is a prefill batch
-            device: Device to place tensors on
-
-        Returns:
-            AttentionMetadata: Initialized metadata
-        """
-        if device is None:
-            device = seq_lens.device
-
-        metadata = AttentionMetadata(
-            num_prefills=0,
-            num_prefill_tokens=0,
-            num_decode_tokens=0,
-            query_start_loc=None,
-            context_lens_tensor=None,
-            rotary_emb=None,
-        )
-
-        if is_prefill_batch or (
-            extend_seq_lens is not None and extend_seq_lens.sum() > batch_size
-        ):
-            # Prefill/Extend mode - processing new sequences or extending existing ones
-            if extend_seq_lens is not None:
-                actual_extend_lens = extend_seq_lens
-            else:
-                # Assume single token decode if no extend_seq_lens provided
-                actual_extend_lens = torch.ones(
-                    batch_size, dtype=torch.int32, device=device
-                )
-
-            metadata.num_prefills = batch_size
-            metadata.num_prefill_tokens = actual_extend_lens.sum().item()
-            metadata.num_decode_tokens = 0
-
-            # Create cumulative sequence lengths for query start locations
-            metadata.query_start_loc = torch.nn.functional.pad(
-                torch.cumsum(actual_extend_lens, dim=0, dtype=torch.int32), (1, 0)
-            )
-        else:
-            # Pure decode mode - single token generation
-            metadata.num_prefills = 0
-            metadata.num_prefill_tokens = 0
-            metadata.num_decode_tokens = batch_size
-
-            # For decode, each sequence contributes 1 token
-            metadata.query_start_loc = torch.arange(
-                0, batch_size + 1, dtype=torch.int32, device=device
-            )
-
-        # Set context lengths
-        if context_lens is not None:
-            metadata.context_lens_tensor = context_lens.to(torch.int32)
-        else:
-            metadata.context_lens_tensor = seq_lens.to(torch.int32)
-
-        return metadata
-
-    def create_mixed_metadata(
-        self,
-        prefill_seq_lens: List[int],
-        decode_seq_count: int,
-        device: torch.device,
-        context_lens: Optional[torch.Tensor] = None,
-    ) -> AttentionMetadata:
-        """
-        Create metadata for mixed prefill and decode batch.
-
-        Args:
-            prefill_seq_lens: List of sequence lengths for prefill requests
-            decode_seq_count: Number of decode requests
-            device: Device to place tensors on
-            context_lens: Context lengths for all sequences
-
-        Returns:
-            AttentionMetadata: Metadata for mixed batch
-        """
-        num_prefills = len(prefill_seq_lens)
-        num_prefill_tokens = sum(prefill_seq_lens)
-        num_decode_tokens = decode_seq_count
-
-        # Build query start locations
-        query_starts = [0]
-
-        # Add prefill sequences
-        for seq_len in prefill_seq_lens:
-            query_starts.append(query_starts[-1] + seq_len)
-
-        # Add decode sequences (1 token each)
-        for _ in range(decode_seq_count):
-            query_starts.append(query_starts[-1] + 1)
-
-        metadata = AttentionMetadata(
-            num_prefills=num_prefills,
-            num_prefill_tokens=num_prefill_tokens,
-            num_decode_tokens=num_decode_tokens,
-            query_start_loc=torch.tensor(
-                query_starts, dtype=torch.int32, device=device
-            ),
-            context_lens_tensor=(
-                context_lens.to(torch.int32) if context_lens is not None else None
-            ),
-            rotary_emb=None,
-        )
-
-        return metadata
-
-    def update_for_next_step(
-        self,
-        metadata: AttentionMetadata,
-        new_tokens_per_seq: Optional[torch.Tensor] = None,
-    ) -> AttentionMetadata:
-        """
-        Update metadata for the next generation step.
-
-        Args:
-            metadata: Current metadata
-            new_tokens_per_seq: Number of new tokens added per sequence
-
-        Returns:
-            Updated metadata (creates new instance)
-        """
-        if new_tokens_per_seq is None:
-            # Default: add 1 token per sequence
-            total_seqs = metadata.num_prefills + metadata.num_decode_tokens
-            new_tokens_per_seq = torch.ones(
-                total_seqs,
-                dtype=torch.int32,
-                device=metadata.context_lens_tensor.device,
-            )
-
-        # Update context lengths
-        updated_context_lens = metadata.context_lens_tensor + new_tokens_per_seq
-
-        # For next step, everything becomes decode (single token generation)
-        total_batch_size = len(updated_context_lens)
-
-        updated_metadata = AttentionMetadata(
-            num_prefills=0,
-            num_prefill_tokens=0,
-            num_decode_tokens=total_batch_size,
-            query_start_loc=torch.arange(
-                0,
-                total_batch_size + 1,
-                dtype=torch.int32,
-                device=updated_context_lens.device,
-            ),
-            context_lens_tensor=updated_context_lens,
-            rotary_emb=metadata.rotary_emb,  # Preserve rotary embedding
-        )
-
-        return updated_metadata
-
-
-def init_attention_metadata_from_forward_batch(forward_batch) -> AttentionMetadata:
-    """
-    Initialize AttentionMetadata from a forward batch.
-    This function serves as the main entry point for creating metadata.
-    """
-    manager = AttentionMetadataManager()
-
-    # Determine batch properties
-    batch_size = getattr(forward_batch, "batch_size", len(forward_batch.seq_lens))
-    seq_lens = forward_batch.seq_lens
-    device = seq_lens.device
-
-    # Check if we have extend information
-    extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
-
-    # Determine if this is a prefill batch
-    is_prefill = False
-    if hasattr(forward_batch, "forward_mode"):
-        is_prefill = forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-    elif extend_seq_lens is not None:
-        # If extend_seq_lens has values > 1, it's likely prefill
-        is_prefill = (extend_seq_lens > 1).any().item()
-
-    # Create metadata
-    metadata = manager.create_metadata_from_batch_info(
-        batch_size=batch_size,
-        seq_lens=seq_lens,
-        extend_seq_lens=extend_seq_lens,
-        context_lens=seq_lens,  # Use seq_lens as context_lens by default
-        is_prefill_batch=is_prefill,
-        device=device,
-    )
-
-    return metadata
-
-
-def set_forward_context_metadata(metadata: AttentionMetadata) -> None:
-    """
-    Set the attention metadata in the global forward context.
-    """
-    global _forward_context
-    if _forward_context is None:
-        _forward_context = ForwardContext(attn_metadata=metadata)
-    else:
-        _forward_context.attn_metadata = metadata
-
-
-def clear_forward_context() -> None:
-    """Clear the global forward context."""
-    global _forward_context
-    _forward_context = None
-
-
-class Attention(nn.Module):
-
-    def __init__(
-        self,
-        num_heads: int,
-        head_size: int,
-        scale: float,
-        num_kv_heads: Optional[int] = None,
-        alibi_slopes: Optional[List[float]] = None,
-        cache_config: Any = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        blocksparse_params: Optional[Dict[str, Any]] = None,
-        logits_soft_cap: Optional[float] = None,
-        per_layer_sliding_window: Optional[int] = None,
-        use_mla: bool = False,
-        prefix: str = "",
-        attn_type: str = "decoder",
-        kv_sharing_target_layer_name: Optional[str] = None,
-        **extra_impl_args,
-    ) -> None:
-        super().__init__()
-        if per_layer_sliding_window is not None:
-            # per-layer sliding window
-            sliding_window = per_layer_sliding_window
-        elif cache_config is not None:
-            # model-level sliding window
-            sliding_window = cache_config.sliding_window
-        else:
-            sliding_window = None
-
-        if cache_config is not None:
-            kv_cache_dtype = cache_config.cache_dtype
-            calculate_kv_scales = cache_config.calculate_kv_scales
-        else:
-            kv_cache_dtype = "auto"
-            calculate_kv_scales = False
-        if num_kv_heads is None:
-            num_kv_heads = num_heads
-        assert num_heads % num_kv_heads == 0, (
-            f"num_heads ({num_heads}) is not "
-            f"divisible by num_kv_heads ({num_kv_heads})"
-        )
-
-        self.kv_cache_dtype = kv_cache_dtype
-        self.calculate_kv_scales = calculate_kv_scales
-        self._k_scale = torch.tensor(1.0, dtype=torch.float32)
-        self._v_scale = torch.tensor(1.0, dtype=torch.float32)
-
-        self._q_scale = torch.tensor(1.0, dtype=torch.float32)
-        self._prob_scale = torch.tensor(1.0, dtype=torch.float32)
-
-        self._k_scale_float = 1.0
-        self._v_scale_float = 1.0
-
-        self.use_mla = use_mla
-        self.num_heads = num_heads
-        self.head_size = head_size
-        self.num_kv_heads = num_kv_heads
-        self.sliding_window = sliding_window
-
-        quant_method = (
-            quant_config.get_quant_method(self, prefix=prefix) if quant_config else None
-        )
-        if quant_method is not None and not isinstance(
-            quant_method, UnquantizedLinearMethod
-        ):
-            assert isinstance(quant_method, BaseKVCacheMethod)
-
-
-@dataclass
-class ForwardContext:
-    """
-    Forward context for MiniMaxText01 model.
-    """
-
-    attn_metadata: Union[AttentionMetadata, dict[str, AttentionMetadata]]
-
-
-_forward_context: Optional[ForwardContext] = None
-
-
-def get_forward_context() -> ForwardContext:
-    """Get the current forward context."""
-    global _forward_context
-    if _forward_context is None:
-        return None
-    return _forward_context
-
-
 class MiniMaxText01LinearAttention(nn.Module):
     """
     Implements a transformer block using linear attention.
@@ -734,70 +352,12 @@ class MiniMaxText01LinearAttention(nn.Module):
         ).reshape(n_attention_heads, 1, 1)
         return slopes
 
-    def _prefill_and_mix_infer(
-        self, q, k, v, kv_cache, state_indices_tensor, attn_metadata
-    ):
-        hidden = []
-        for _prefill_idx in range(getattr(attn_metadata, "num_prefills", 0)):
-            if _prefill_idx >= len(attn_metadata.query_start_loc):
-                break
-            if _prefill_idx >= len(state_indices_tensor):
-                break
-            _start = attn_metadata.query_start_loc[_prefill_idx]
-            _end = attn_metadata.query_start_loc[_prefill_idx + 1]
-            slot_id = state_indices_tensor[_prefill_idx]
-            qs = q[_start:_end].transpose(0, 1).contiguous()
-            ks = k[_start:_end].transpose(0, 1).contiguous()
-            vs = v[_start:_end].transpose(0, 1).contiguous()
-            slot_id = state_indices_tensor[_prefill_idx]
-            slice_layer_cache = kv_cache[slot_id, ...]
-
-            out_slice = MiniMaxText01LinearKernel.jit_linear_forward_prefix(
-                qs,
-                ks,
-                vs,
-                slice_layer_cache,
-                self.tp_slope,
-                self.BLOCK,
-                layer_idx=self.layer_idx,
-            )
-            hidden.append(out_slice.contiguous())
-        if attn_metadata.num_decode_tokens > 0:
-            hidden.append(
-                self._decode_infer(
-                    q, k, v, kv_cache, state_indices_tensor, attn_metadata
-                )
-            )
-
-        if not hidden:
-            return torch.empty((0, self.tp_hidden), device=q.device, dtype=q.dtype)
-
-        hidden = torch.concat(hidden, dim=0).contiguous()
-        return hidden
-
-    def _decode_infer(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        kv_cache: torch.Tensor,
-        state_indices_tensor: torch.Tensor,
-        attn_metadata,
-    ) -> torch.Tensor:
-        q = q[attn_metadata.num_prefill_tokens :].unsqueeze(2).contiguous()
-        k = k[attn_metadata.num_prefill_tokens :].unsqueeze(2).contiguous()
-        v = v[attn_metadata.num_prefill_tokens :].unsqueeze(2).contiguous()
-        slot_id = state_indices_tensor[getattr(attn_metadata, "num_prefills", 0) :]
-        hidden = linear_decode_forward_triton(
-            q, k, v, kv_cache, self.tp_slope, slot_id, 32
-        )
-        return hidden
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         kv_caches: MinimaxCacheParams,
+        attn_backend: LightningAttnBackend,
         **kwargs,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
@@ -805,19 +365,70 @@ class MiniMaxText01LinearAttention(nn.Module):
         qkvact = torch.nn.functional.silu(qkv32)
         qkvact = qkvact.view((qkv.shape[0], self.tp_heads, -1))
         q, k, v = torch.split(qkvact, [self.head_dim] * 3, dim=-1)
-        forward_context = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
-        kv_cache = kv_caches.minimax_cache
-        state_indices_tensor = kv_caches.state_indices_tensor
 
-        decode_only = getattr(attn_metadata, "num_prefills", 0) == 0
+        # Use the lightning attention backend
+        if attn_backend.forward_metadata is None:
+            # Create a proper forward batch for metadata initialization
+            class DummyForwardBatch:
+                def __init__(self):
+                    self.batch_size = q.shape[0]
+                    self.seq_lens = torch.ones(
+                        self.batch_size, dtype=torch.int32, device=q.device
+                    )
+                    self.forward_mode = None  # Will be treated as decode mode
+                    self.extend_seq_lens = None
+                    # Add missing attributes for the backend
+                    self.kv_caches = kv_caches.minimax_cache
+                    self.state_indices_tensor = kv_caches.state_indices_tensor
+
+            dummy_batch = DummyForwardBatch()
+            attn_backend.init_forward_metadata(dummy_batch)
+
+        # Get metadata and ensure proper field assignment
+        metadata = attn_backend.forward_metadata
+
+        # Create updated metadata with correct fields
+        updated_metadata = LightningAttentionMetadata(
+            num_prefills=getattr(metadata, "num_prefills", 0),
+            num_prefill_tokens=getattr(metadata, "num_prefill_tokens", 0),
+            num_decode_tokens=getattr(metadata, "num_decode_tokens", q.shape[0]),
+            query_start_loc=getattr(
+                metadata,
+                "query_start_loc",
+                torch.arange(0, q.shape[0] + 1, dtype=torch.int32, device=q.device),
+            ),
+            context_lens_tensor=getattr(
+                metadata,
+                "context_lens_tensor",
+                torch.ones(q.shape[0], dtype=torch.int32, device=q.device),
+            ),
+            rotary_emb=getattr(metadata, "rotary_emb", None),
+            kv_caches=kv_caches.minimax_cache,
+            state_indices_tensor=kv_caches.state_indices_tensor,
+            slope_rates=self.tp_slope,
+        )
+
+        # Update backend metadata
+        attn_backend.forward_metadata = updated_metadata
+
+        decode_only = updated_metadata.num_prefills == 0
         if not decode_only:
-            hidden = self._prefill_and_mix_infer(
-                q, k, v, kv_cache, state_indices_tensor, attn_metadata
+            hidden = attn_backend._prefill_and_mix_infer(
+                q,
+                k,
+                v,
+                updated_metadata.kv_caches,
+                updated_metadata.state_indices_tensor,
+                updated_metadata,
             )
         else:
-            hidden = self._decode_infer(
-                q, k, v, kv_cache, state_indices_tensor, attn_metadata
+            hidden = attn_backend._decode_infer(
+                q,
+                k,
+                v,
+                updated_metadata.kv_caches,
+                updated_metadata.state_indices_tensor,
+                updated_metadata,
             )
 
         hidden = self.norm._forward(hidden)
@@ -883,26 +494,33 @@ class MiniMaxText01Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        self.attn = Attention(
+        self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
-            cache_config=cache_config,
+            layer_id=layer_idx,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
         return
 
     def forward(
-        self, hidden_states: torch.Tensor, positions: torch.Tensor, **kwargs
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        **kwargs,
     ) -> torch.Tensor:
-        forward_context = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
+        # Get attn_metadata from kwargs, which should be passed by the layer
+        attn_metadata = kwargs.get("attn_metadata")
+        if attn_metadata is None:
+            raise ValueError("attn_metadata must be provided in kwargs")
+
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = attn_metadata.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+        attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1050,23 +668,33 @@ class MiniMaxText01DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         kv_caches: Union[list[dict], Optional[torch.Tensor]],
-        attn_metadata: AttentionMetadata,
-        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        attn_metadata: LightningAttentionMetadata = None,
+        residual: Optional[torch.Tensor] = None,
         is_warmup: bool = False,
+        attn_backend: Optional[LightningAttnBackend] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
-        forward_context = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
         layernorm_input = hidden_states
         layernorm_output = self.input_layernorm(layernorm_input)
         residual = layernorm_output if self.postnorm else layernorm_input
-        self_attention_output = self.self_attn(
-            hidden_states=layernorm_output,
-            positions=positions,
-            kv_caches=kv_caches,
-            attn_metadata=attn_metadata,
-        )
+
+        # Pass the attention backend to linear attention layers
+        if isinstance(self.self_attn, MiniMaxText01LinearAttention):
+            self_attention_output = self.self_attn(
+                hidden_states=layernorm_output,
+                positions=positions,
+                kv_caches=kv_caches,
+                attn_backend=attn_backend,
+            )
+        else:
+            self_attention_output = self.self_attn(
+                hidden_states=layernorm_output,
+                positions=positions,
+                forward_batch=forward_batch,
+                attn_metadata=attn_metadata,
+                **kwargs,
+            )
 
         residual = residual * self.layernorm_attention_alpha
         self_attention_output = self_attention_output * self.layernorm_attention_beta
@@ -1268,7 +896,7 @@ class MiniMaxText01Model(nn.Module):
             dtype=torch.float32, cache_shape=self.cache_shape
         )
 
-        rope_theta = getattr(config, "rope_theta", 10000)
+        # Initialize lightning attention backend
         head_dim = getattr(config, "head_dim", None)
         if head_dim is None:
             head_dim = config.hidden_size // config.num_attention_heads
@@ -1277,6 +905,8 @@ class MiniMaxText01Model(nn.Module):
             max_position_embeddings = min(
                 config.max_position_embeddings, config.max_model_len
             )
+
+        rope_theta = getattr(config, "rope_theta", 10000)
         self.rotary_emb = RotaryEmbedding(
             head_dim,
             rotary_dim=config.rotary_dim if hasattr(config, "rotary_dim") else head_dim,
@@ -1331,46 +961,51 @@ class MiniMaxText01Model(nn.Module):
         self,
         input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
+        forward_batch: ForwardBatch,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        attn_backend: Optional[LightningAttnBackend] = None,
         **kwargs,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        forward_context = get_forward_context()
-        attn_metadata = forward_context.attn_metadata if forward_context else None
+        # Initialize attention backend if not provided
+        if attn_backend is None:
+            # Create a simple model runner stub for the backend
+            class DummyModelRunner:
+                def __init__(self, device):
+                    self.device = device
+
+            dummy_model_runner = DummyModelRunner(
+                input_ids.device if input_ids is not None else inputs_embeds.device
+            )
+            attn_backend = LightningAttnBackend(
+                model_runner=dummy_model_runner,
+                num_heads=(
+                    self.config.num_attention_heads if hasattr(self, "config") else 32
+                ),
+                head_dim=64,  # Default value
+                max_context_len=4096,  # Default value
+            )
 
         # Auto-initialize AttentionMetadata if not provided
-        if attn_metadata is None:
-            # Try to create metadata from available information
-            if "forward_batch" in kwargs:
-                attn_metadata = init_attention_metadata_from_forward_batch(
-                    kwargs["forward_batch"]
-                )
-            else:
-                # Fallback: create simple decode metadata
-                batch_size = (
-                    input_ids.shape[0]
-                    if input_ids is not None
-                    else inputs_embeds.shape[0]
-                )
-                device = (
-                    input_ids.device if input_ids is not None else inputs_embeds.device
-                )
+        batch_size = (
+            input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
+        )
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
 
-                manager = AttentionMetadataManager()
-                # Create dummy seq_lens for fallback
-                seq_lens = torch.ones(batch_size, dtype=torch.int32, device=device)
-                attn_metadata = manager.create_metadata_from_batch_info(
-                    batch_size=batch_size,
-                    seq_lens=seq_lens,
-                    is_prefill_batch=False,
-                    device=device,
-                )
+        # Create metadata for lightning attention
+        attn_metadata = LightningAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decode_tokens=batch_size,
+            query_start_loc=torch.arange(
+                0, batch_size + 1, dtype=torch.int32, device=device
+            ),
+            context_lens_tensor=torch.ones(
+                batch_size, dtype=torch.int32, device=device
+            ),
+            rotary_emb=self.rotary_emb,
+        )
 
-            # Set the metadata in forward context
-            set_forward_context_metadata(attn_metadata)
-
-        if attn_metadata is None:
-            return None
         if "request_ids_to_seq_ids" not in kwargs:
             kwargs["request_ids_to_seq_ids"] = {}
         if "finished_requests_ids" not in kwargs:
@@ -1398,7 +1033,6 @@ class MiniMaxText01Model(nn.Module):
             residual = intermediate_tensors["residual"]
 
         minimax_cache_index = 0
-        attn_metadata.rotary_emb = self.rotary_emb
         for i in range(len(self.layers)):
             layer = self.layers[i]
             _caches = None
@@ -1410,8 +1044,10 @@ class MiniMaxText01Model(nn.Module):
                 hidden_states=hidden_states,
                 positions=positions,
                 kv_caches=_caches,
+                forward_batch=forward_batch,
                 attn_metadata=attn_metadata,
                 residual=residual,
+                attn_backend=attn_backend,
             )
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -1493,12 +1129,18 @@ class MiniMaxText01ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        forward_batch: ForwardBatch,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
+            input_ids,
+            positions,
+            forward_batch,
+            intermediate_tensors,
+            inputs_embeds,
+            **kwargs,
         )
 
         return hidden_states
