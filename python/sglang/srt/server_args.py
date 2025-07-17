@@ -726,6 +726,7 @@ class ServerArgs:
                 "moe_wna16",
                 "qoq",
                 "w4afp8",
+                "rtn",
             ],
             help="The quantization method.",
         )
