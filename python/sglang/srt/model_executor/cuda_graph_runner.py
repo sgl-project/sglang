@@ -459,7 +459,7 @@ class CudaGraphRunner:
             logger.info(log_message)
 
     def _create_graph(self):
-        return torch.cuda.CUDAGraph
+        return torch.cuda.CUDAGraph()
 
     def _capture_init(self, run_once_fn):
         for _ in range(2):
@@ -470,7 +470,7 @@ class CudaGraphRunner:
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         with torch.cuda.graph(graph, pool=pool, stream=stream):
             out = run_once_fn()
-            return out
+        return out
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
         graph = self._create_graph()

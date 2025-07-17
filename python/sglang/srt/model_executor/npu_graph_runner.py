@@ -46,7 +46,7 @@ class NPUGraphRunner(CudaGraphRunner):
         super().__init__(model_runner)
 
     def _create_graph(self):
-        return torch.npu.NPUGraph
+        return torch.npu.NPUGraph()
 
     def _capture_init(self, run_once_fn):
         for _ in range(2):
@@ -62,7 +62,7 @@ class NPUGraphRunner(CudaGraphRunner):
             auto_dispatch_capture=True,
         ):
             out = run_once_fn()
-            return out
+        return out
 
     def _update_inputs(self, forward_batch: ForwardBatch):
         seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (self.bs - self.raw_bs)
