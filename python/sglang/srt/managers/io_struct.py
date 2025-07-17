@@ -525,15 +525,6 @@ class TokenizedGenerateReqInput:
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
-    def __setstate__(self, state):
-        if "mm_inputs" in state and state["mm_inputs"] is not None:
-            mm_inputs = state["mm_inputs"]
-            for mm_item in mm_inputs["mm_items"]:
-                if isinstance(mm_item.feature, TransportableTensor):
-                    mm_item.feature = mm_item.feature.deserialize()
-
-        self.__dict__.update(state)
-
 
 @dataclass
 class EmbeddingReqInput:
