@@ -218,11 +218,11 @@ def get_head_dim(config):
 
 
 def check_head_dim(config):
-    # Some model may leak of head_dim, but use another key.
-    # check the this attr, because this attr also used by flashinfer_backend.py
-    # so here we can only raise an error.
-    # althrough we can let hunyuan model use this `attention_head_dim` key
-    # but seems flash_infer code use head_dim key.
+    # Some models may lack `head_dim` and use `attention_head_dim` instead.
+    # This attribute is also used by flashinfer_backend.py, so we check for
+    # consistency and raise an error if it's not met to avoid silent failures.
+    # Although we could adapt the HunYuan model to use `attention_head_dim`,
+    # flashinfer expects `head_dim`, so we enforce its presence for correctness.
     calc_head_dim = config.hidden_size // config.num_attention_heads
 
     if hasattr(config, "attention_head_dim"):
