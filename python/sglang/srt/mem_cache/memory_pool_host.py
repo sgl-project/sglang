@@ -71,11 +71,12 @@ class HostKVCache(abc.ABC):
         requested_bytes = self.size * self.size_per_token
         # preserve at least 10GB for other usage
         ten_gb = 10 * (1024**3)
-        if requested_bytes > host_mem.available - ten_gb:
+        available_bytes = host_mem.available - ten_gb
+        if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
                 f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{host_mem.available / 1e9:.2f} GB free. Please reduce the "
+                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
                 f"size of the hierarchical cache."
             )
         else:
