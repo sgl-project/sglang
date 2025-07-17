@@ -18,10 +18,10 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         super().__init__(hf_config, server_args, _processor)
         self.IM_START_TOKEN_ID = hf_config.boi_token_index
         self.IM_END_TOKEN_ID = hf_config.eoi_token_index
-        self.IM_TOKEN_ID = hf_config.image_token_index
         self.mm_tokens = MultimodalSpecialTokens(
             # The single, pre-expanded image token.
             image_token="<start_of_image>",
+            image_token_id=hf_config.image_token_index,
             # The regex that matches expanded image tokens.
             image_token_regex=re.compile(
                 r"<start_of_image>(?:(?:<image_soft_token>)*<end_of_image>)?"
