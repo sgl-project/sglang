@@ -276,7 +276,7 @@ class HunYuanAttention(nn.Module):
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         # MistralConfig has an optional head_dim introduced by Mistral-Nemo
-        # Hunyuan's config use attention_head_dim key first.
+        # Prioritize `head_dim` but fall back to `attention_head_dim` for Hunyuan models.
         self.head_dim = get_head_dim(config)
 
         check_head_dim(config)
