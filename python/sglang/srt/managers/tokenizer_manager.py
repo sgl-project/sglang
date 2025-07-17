@@ -536,11 +536,9 @@ class TokenizerManager:
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
 
         if self.allow_auto_truncate and input_ids is not None:
-            max_req_input_len = (
-                self.max_req_input_len - max_new_tokens
-                if max_new_tokens is not None
-                else self.max_req_input_len
-            )
+            max_req_input_len = self.context_len
+            if max_new_tokens is not None:
+                max_req_input_len -= max_new_tokens
             input_ids = input_ids[:max_req_input_len]
 
         input_token_num = len(input_ids) if input_ids is not None else 0
