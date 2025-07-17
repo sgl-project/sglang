@@ -1306,7 +1306,13 @@ class ModelRunner:
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
-        if self.server_args.enable_two_batch_overlap and not self.is_draft_worker:
+        if self.server_args.enable_pdmux:
+            self.attn_backend = self._get_attention_backend()
+            self.decode_attn_backend_group = []
+            for _ in range(self.server_args.sm_group_num):
+                self.decode_attn_backend_group.append(self._get_attention_backend())
+            self.decode_attn_backend = self.decode_attn_backend_group[0]
+        elif self.server_args.enable_two_batch_overlap and not self.is_draft_worker:
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
         else:
             self.attn_backend = self._get_attention_backend()
@@ -1465,10 +1471,17 @@ class ModelRunner:
         device_mesh = torch.distributed.init_device_mesh(self.device, (self.tp_size,))
         tensor_parallel(self.model, device_mesh)
 
+    def update_decode_attn_backend(self, stream_idx: int):
+        self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
+
     def forward_decode(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> LogitsProcessorOutput:
-        self.attn_backend.init_forward_metadata(forward_batch)
+        if self.server_args.enable_pdmux:
+            self.decode_attn_backend.init_forward_metadata(forward_batch)
+            forward_batch.attn_backend = self.decode_attn_backend
+        else:
+            self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
