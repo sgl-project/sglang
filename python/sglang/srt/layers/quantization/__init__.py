@@ -22,10 +22,6 @@ try:
     from vllm.model_executor.layers.quantization.experts_int8 import ExpertsInt8Config
     from vllm.model_executor.layers.quantization.fbgemm_fp8 import FBGEMMFp8Config
     from vllm.model_executor.layers.quantization.gguf import GGUFConfig
-    from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
-    from vllm.model_executor.layers.quantization.gptq_marlin import (
-        GPTQMarlinLinearMethod,
-    )
     from vllm.model_executor.layers.quantization.gptq_marlin_24 import (
         GPTQMarlin24Config,
     )
@@ -59,7 +55,9 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.gptq import (
     GPTQConfig,
+    GPTQLinearMethod,
     GPTQMarlinConfig,
+    GPTQMarlinLinearMethod,
     GPTQMarlinMoEMethod,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
