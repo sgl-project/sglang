@@ -6,11 +6,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
-from sglang.srt.layers.linear import (
-    LinearBase,
-    set_weight_attrs,
-)
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
@@ -32,6 +28,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     verify_marlin_supports_shape,
 )
 from sglang.srt.layers.quantization.scalar_type import scalar_types
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import replace_parameter
 
 try:
@@ -689,7 +686,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
         )
         replace_parameter(layer, "w2_qweight", marlin_w2_qweight)
 
-        # Why does this take the intermediate size for size_k?
+        # hidden_size->intermediate_size
         marlin_w13_scales = marlin_moe_permute_scales(
             s=layer.w13_scales,
             size_k=layer.intermediate_size_per_partition,
@@ -756,7 +753,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
             scoring_func == "softmax"
         ), "Only softmax score func is supported for now."
 
-        # The input must currently be float16
+        # Note: bfloat16 should be supported
         orig_dtype = x.dtype
         x = x.half()
 
