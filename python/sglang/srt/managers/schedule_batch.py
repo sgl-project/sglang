@@ -217,6 +217,7 @@ class MultimodalDataItem:
     audio_offsets: Optional[List[Tuple[int, int]]] = None
     precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
+    # For qwen-vl
     image_grid_thw: Union[torch.Tensor, np.ndarray] = None
     second_per_grid_ts: Optional[List[torch.Tensor]] = None
 
