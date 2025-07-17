@@ -308,10 +308,24 @@ class PDRegistryRequest:
 @dataclasses.dataclass
 class PDConvertRequest:
     """A request to convert identity of a PD server"""
+    # the server url to convert
     server_url: str
-    # if convert decode to prefill,these two parameters are required
-    prefill_tp_size:Optional[int] = None
-    prefill_dp_size:Optional[int] = None
+
+    # if convert decode to prefill,these parameters are required
+    disaggregation_decode_tp:Optional[int] = None
+    disaggregation_decode_dp:Optional[int] = None
+    disaggregation_prefill_pp:Optional[int] = None
+    disable_radix_cache: Optional[bool] = False
+    enable_hierarchical_cache: Optional[bool] = False
+    hicache_ratio: float = 2.0
+    hicache_size: int = 0
+    hicache_write_policy: str = "write_through_selective"
+    hicache_io_backend: str = ""
+
+    # if convert prefill to decode,these parameters are required
+    disable_cuda_graph: Optional[bool] = False
+    
+
     def __post_init__(self):
         if not self.server_url:
             raise ValueError("URL must be provided for PDConvertRequest.")

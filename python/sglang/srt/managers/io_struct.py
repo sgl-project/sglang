@@ -803,7 +803,21 @@ class UpdateWeightsFromDistributedReqOutput:
 
 @dataclass
 class ConvertDisaggregationRoleReqInput:
+    # for convert decode to prefill
     bootstrap_port:Optional[int] = None
+    disaggregation_decode_tp:Optional[int] = None
+    disaggregation_decode_dp:Optional[int] = None
+    disaggregation_prefill_pp:Optional[int] = None
+    disable_radix_cache: Optional[bool] = False
+    enable_hierarchical_cache: Optional[bool] = False
+    hicache_ratio: float = 2.0
+    hicache_size: int = 0
+    hicache_write_policy: str = "write_through_selective"
+    hicache_io_backend: str = ""
+    
+    # for convert prefill to decode
+    disable_cuda_graph: Optional[bool] = False
+    
 
 @dataclass
 class ConvertDisaggregationRoleReqOutput:

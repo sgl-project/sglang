@@ -1152,7 +1152,7 @@ class TokenizerManager:
         )
         return [res.internal_state for res in responses]
 
-    async def convert_pd_role(self) -> Tuple[bool, str]:
+    async def convert_pd_role(self, obj:ConvertDisaggregationRoleReqInput) -> Tuple[bool, str]:
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # start a bootstarp server first
             kv_bootstrap_server_class = get_kv_class(
@@ -1169,9 +1169,10 @@ class TokenizerManager:
                 bootstrap_port,
             )
             self.server_args.disaggregation_bootstrap_port = bootstrap_port
-            req = ConvertDisaggregationRoleReqInput(bootstrap_port=bootstrap_port)
+            obj.bootstrap_port=bootstrap_port
+            req = obj
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            req = ConvertDisaggregationRoleReqInput()
+            req = obj
         else:
             return False, "Not support converting disaggregation of 'null'", None
 

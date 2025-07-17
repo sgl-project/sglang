@@ -86,6 +86,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
     VertexGenerateReqInput,
+    ConvertDisaggregationRoleReqInput,
 )
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -546,10 +547,10 @@ async def update_weights_from_distributed(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 @app.post("/convert_pd_role")
-async def convert_pd_role():
+async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
     """Update model parameter from distributed online."""
     success, message, bootstrap_port = (
-        await _global_state.tokenizer_manager.convert_pd_role()
+        await _global_state.tokenizer_manager.convert_pd_role(obj)
     )
     logger.info(f"{message}")
     content = {"success": success, "message": message, "bootstrap_port": bootstrap_port}

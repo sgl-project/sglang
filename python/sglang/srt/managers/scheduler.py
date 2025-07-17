@@ -2686,15 +2686,35 @@ class Scheduler(
         """Convert the disaggregation role of the scheduler."""
         self.flush_cache()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.server_args.disaggregation_bootstrap_port = None
+            self.server_args.disaggregation_decode_dp = None
+            self.server_args.disaggregation_decode_tp = None
+            self.server_args.disaggregation_prefill_pp = 1
+            self.server_args.disable_radix_cache = False
+            self.server_args.enable_hierarchical_cache = False
+            self.server_args.disable_cuda_graph = recv_req.disable_cuda_graph
             #stop prefill event loop
             self.stop_prefill_event.set()
             return ConvertDisaggregationRoleReqOutput(
                 success=True,
                 message="The role of this server is now DECODE.",
-            )
-            
+            )   
         else:
+            # set parameters to PREFILL mode
             self.server_args.disaggregation_bootstrap_port = recv_req.bootstrap_port
+            self.server_args.disaggregation_decode_dp = recv_req.disaggregation_decode_dp
+            self.server_args.disaggregation_decode_tp = recv_req.disaggregation_decode_tp
+            self.server_args.disaggregation_prefill_pp = recv_req.disaggregation_prefill_pp
+            self.server_args.disable_radix_cache = recv_req.disable_radix_cache
+            self.server_args.enable_hierarchical_cache = recv_req.enable_hierarchical_cache
+            self.server_args.disable_cuda_graph = True 
+            if self.server_args.enable_hierarchical_cache:
+                self.server_args.hicache_ratio = recv_req.hicache_ratio
+                self.server_args.hicache_size = recv_req.hicache_size
+                self.server_args.hicache_write_policy = recv_req.hicache_write_policy
+                self.server_args.hicache_io_backend = recv_req.hicache_io_backend
+                self.server_args.hicache_write_policy = recv_req.hicache_write_policy
+
             # stop decode event loop
             self.stop_decode_event.set()
             return ConvertDisaggregationRoleReqOutput(
@@ -2749,8 +2769,7 @@ class Scheduler(
                 pre_alloc_size=pre_alloc_size,
             )
             model_runner.init_attention_backend()
-            self.server_args.disable_cuda_graph = False
-            model_runner.server_args.disable_cuda_graph = False
+            model_runner.server_args.disable_cuda_graph = self.server_args.disable_cuda_graph
             model_runner.init_cuda_graphs()
             self.req_to_token_pool = model_runner.req_to_token_pool
             self.tree_cache.req_to_token_pool = self.req_to_token_pool
@@ -2758,6 +2777,8 @@ class Scheduler(
 
             # reinitialize the disaggregation resources for decode
             self.disaggregation_mode = DisaggregationMode.DECODE
+            del self.tree_cache
+            self.init_memory_pool_and_cache()
             self.init_disaggregation()
             gc.collect()
             torch.cuda.empty_cache()
@@ -2799,17 +2820,30 @@ class Scheduler(
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
             model_runner.init_attention_backend()
-            self.server_args.disable_cuda_graph = True
-            model_runner.server_args.disable_cuda_graph = True
+            model_runner.server_args.disable_cuda_graph = self.server_args.disable_cuda_graph
             model_runner.init_cuda_graphs()
             self.req_to_token_pool = model_runner.req_to_token_pool
             self.tree_cache.req_to_token_pool = self.req_to_token_pool
             self.running_batch.req_to_token_pool = self.req_to_token_pool
-            self.server_args.disaggregation_decode_dp = self.dp_size
-            self.server_args.disaggregation_decode_tp = self.tp_size
+            # follow the code in ServerArgs
+            if self.server_args.disaggregation_decode_dp is None:
+                self.server_args.disaggregation_decode_dp = self.dp_size
+            if self.server_args.disaggregation_decode_tp is None:
+                self.server_args.disaggregation_decode_tp = self.tp_size
+            
+            self.server_args.validate_disagg_tp_size(self.tp_size, self.server_args.disaggregation_decode_tp)
 
+            if self.server_args.disaggregation_prefill_pp is None:
+                self.server_args.disaggregation_prefill_pp = self.pp_size
+            
             # reinitialize the disaggregation resources for prefill
             self.disaggregation_mode = DisaggregationMode.PREFILL
+
+            # reinitialize the tree cache for prefill, as prefill may use radix_cache or hiradix_cache
+            # TODO find all ref of tree cache and set them to None
+            if not self.server_args.disable_radix_cache:
+                del self.tree_cache
+                self.init_memory_pool_and_cache()
             self.init_disaggregation()
             gc.collect()
             torch.cuda.empty_cache()
