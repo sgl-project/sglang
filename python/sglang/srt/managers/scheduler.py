@@ -165,6 +165,8 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+import gc
+from sglang.srt.model_executor.cuda_graph_runner import set_global_graph_memory_pool
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
@@ -2704,8 +2706,6 @@ class Scheduler(
         logger.info("Flushing disaggregation resources...")
         print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
         print(f"Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
-        import gc
-
         del self.req_to_metadata_buffer_idx_allocator
         del self.disagg_metadata_buffers
 
@@ -2729,6 +2729,7 @@ class Scheduler(
             # set all ref to req-to-token-pool to None to release Cuda memory
             self.req_to_token_pool = None
             self.tree_cache.req_to_token_pool = None
+            model_runner.attn_backend.model_runner= None
             model_runner.attn_backend = None
             self.running_batch.req_to_token_pool = None
             gc.collect()
@@ -2748,6 +2749,9 @@ class Scheduler(
                 pre_alloc_size=pre_alloc_size,
             )
             model_runner.init_attention_backend()
+            self.server_args.disable_cuda_graph = False
+            model_runner.server_args.disable_cuda_graph = False
+            model_runner.init_cuda_graphs()
             self.req_to_token_pool = model_runner.req_to_token_pool
             self.tree_cache.req_to_token_pool = self.req_to_token_pool
             self.running_batch.req_to_token_pool = self.req_to_token_pool
@@ -2770,10 +2774,17 @@ class Scheduler(
             # three place ref reqtotokenpool, all set None to release Cuda memory
             self.req_to_token_pool = None
             self.tree_cache.req_to_token_pool = None
+            model_runner.attn_backend.model_runner= None
             model_runner.attn_backend = None
             self.running_batch.req_to_token_pool = None
+            if model_runner.cuda_graph_runner is not None:
+                model_runner.cuda_graph_runner.model_runner = None
+                set_global_graph_memory_pool(None)
+                del model_runner.cuda_graph_runner
             gc.collect()
             torch.cuda.empty_cache()
+            print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            print(f"Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
             del model_runner.req_to_token_pool
             gc.collect()
             torch.cuda.empty_cache()
@@ -2788,9 +2799,10 @@ class Scheduler(
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
             model_runner.init_attention_backend()
+            self.server_args.disable_cuda_graph = True
+            model_runner.server_args.disable_cuda_graph = True
+            model_runner.init_cuda_graphs()
             self.req_to_token_pool = model_runner.req_to_token_pool
-            gc.collect()
-            torch.cuda.empty_cache() 
             self.tree_cache.req_to_token_pool = self.req_to_token_pool
             self.running_batch.req_to_token_pool = self.req_to_token_pool
             self.server_args.disaggregation_decode_dp = self.dp_size
@@ -2801,6 +2813,8 @@ class Scheduler(
             self.init_disaggregation()
             gc.collect()
             torch.cuda.empty_cache()
+        print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+        print(f"Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
 
 
     def get_print_prefix(self):
