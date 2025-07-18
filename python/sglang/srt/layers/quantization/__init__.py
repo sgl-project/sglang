@@ -230,7 +230,6 @@ def monkey_patch_quant_configs():
     setattr(GPTQMarlinConfig, "get_quant_method", gptq_get_quant_method)
     setattr(GPTQConfig, "get_quant_method", gptq_get_quant_method)
 
-    monkey_patch_moe_apply(AWQMoEMethod)
     monkey_patch_moe_apply(GPTQMarlinMoEMethod)
     monkey_patch_moe_apply(CompressedTensorsW8A8Fp8MoEMethod)
     monkey_patch_moe_apply(CompressedTensorsWNA16MoEMethod)

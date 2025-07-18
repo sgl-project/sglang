@@ -9,6 +9,7 @@ import torch
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
@@ -41,8 +42,6 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import awq_dequantize, fused_marlin_moe
-
-FusedMoEMethodBase = QuantizeMethodBase
 
 logger = logging.getLogger(__name__)
 
@@ -730,24 +729,16 @@ class AWQMoEMethod(FusedMoEMethodBase):
         use_grouped_topk: bool = False,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
-        global_num_experts: int = -1,
-        expert_map: Optional[torch.Tensor] = None,
+        num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None,
+        correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
-        enable_eplb: bool = False,
-        expert_load_view: Optional[torch.Tensor] = None,
-        logical_to_physical_map: Optional[torch.Tensor] = None,
-        logical_replica_count: Optional[torch.Tensor] = None,
+        routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         # Delay the import to avoid circular dependency
         from sglang.srt.layers.moe.topk import select_experts
-
-        # Note: quantization should be compatible with EPLB
-        if enable_eplb:
-            raise NotImplementedError("EPLB not supported for `AWQMoEMethod` yet.")
 
         assert activation == "silu", "Only SiLU activation is supported."
         assert (
@@ -761,13 +752,15 @@ class AWQMoEMethod(FusedMoEMethodBase):
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
             top_k=top_k,
+            use_grouped_topk=use_grouped_topk,
             renormalize=renormalize,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
+            num_fused_shared_experts=num_fused_shared_experts,
             custom_routing_function=custom_routing_function,
-            correction_bias=e_score_correction_bias,
+            correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         return fused_marlin_moe(
