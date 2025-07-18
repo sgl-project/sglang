@@ -4,6 +4,7 @@ import fnmatch
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
+import torch.nn.functional as F
 from torch.nn import Module
 
 import logging
@@ -18,13 +19,16 @@ from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 
 from sglang.srt.layers.radix_attention import RadixAttention
 
-from sglang.srt.layers.quantization.quark.quark_moe import QuarkMoEMethod
-
 from typing import List
 
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 
+from sglang.srt.layers.parameter import (
+    ModelWeightParameter,
+)
+
+import aiter
 from aiter import dtypes
 from aiter.ops.quant import get_torch_quant
 from aiter import ActivationType, QuantType
@@ -33,13 +37,17 @@ from aiter.fused_moe_bf16_asm import asm_moe, ck_moe_2stages
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.utility.fp4_utils import e8m0_shuffle
+from aiter.ops.gemm_op_a4w4 import gemm_a4w4
+
+from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+from aiter.ops.triton.mxfp import upcast_from_mxfp
 
 #__all__ = ["QuarkLinearMethod"]
 __all__ = ["Fp4MoEMethod", "W4A4MXFp4MoEDynamicMethod", "W4A4MXFp4MoEStaticMethod"]
 
 logger = logging.getLogger(__name__)
 
-use_aiter_moe = use_aiter_moe = get_bool_env_var("SGLANG_USE_AITER")
+use_aiter_moe = get_bool_env_var("SGLANG_USE_AITER")
 
 OCP_MX_BLOCK_SIZE = 32
 
@@ -70,9 +78,6 @@ class Fp4Config(QuantizationConfig):
         self.is_checkpoint_fp8_serialized = False
         self.weight_block_size = None
 
-    #def get_linear_method(self) -> "QuarkLinearMethod":
-    #    return QuarkLinearMethod(self)
-
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
         return [torch.float16, torch.bfloat16]
 
@@ -93,10 +98,12 @@ class Fp4Config(QuantizationConfig):
             return UnquantizedLinearMethod()
         
         if isinstance(layer, LinearBase):
-            #scheme = self.get_scheme(layer=layer, layer_name=prefix)
-            #layer.scheme = scheme
-            #return QuarkLinearMethod(self)
-            return Fp8LinearMethod(self)
+            ##scheme = self.get_scheme(layer=layer, layer_name=prefix)
+            ##layer.scheme = scheme
+            ##return QuarkLinearMethod(self)
+            #return Fp8LinearMethod(self)
+
+            return Fp4LinearMethod(self)
         
         if isinstance(layer, RadixAttention):
             return Fp4KVCacheMethod(self)
@@ -113,8 +120,6 @@ class Fp4Config(QuantizationConfig):
     def from_config(cls, config: dict[str, Any]) -> "Fp4Config":
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp4_serialized = "quark" in quant_method
-
-        print(f"kkkkk is_checkpoint_fp4_serialized: {is_checkpoint_fp4_serialized}", flush=True)
 
         kv_cache_group=[]
         pack_method=None
@@ -333,48 +338,128 @@ class Fp4Config(QuantizationConfig):
         return []
 
 
-#class QuarkLinearMethod(LinearMethodBase):
-#
-#    def __init__(self, quantization_config: QuarkConfig):
-#        self.quantization_config = quantization_config
-#
-#    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-#        layer.scheme.process_weights_after_loading(layer)
-#
-#    def create_weights(self, layer: torch.nn.Module,
-#                       input_size_per_partition: int,
-#                       output_partition_sizes: list[int], input_size: int,
-#                       output_size: int, params_dtype: torch.dtype,
-#                       **extra_weight_attrs):
-#        """
-#        Use the CompressedTensorsScheme associated with each layer to create
-#        the necessary parameters for the layer. See LinearMethodBase for param
-#        details
-#        """
-#        weight_loader = extra_weight_attrs.get("weight_loader")
-#        layer.scheme.create_weights(
-#            layer=layer,
-#            input_size=input_size,
-#            input_size_per_partition=input_size_per_partition,
-#            output_partition_sizes=output_partition_sizes,
-#            output_size=output_size,
-#            params_dtype=params_dtype,
-#            weight_loader=weight_loader)
-#
-#    def apply(self,
-#              layer: torch.nn.Module,
-#              x: torch.Tensor,
-#              bias: Optional[torch.Tensor] = None):
-#        """
-#        Use the output of create_weights and the CompressedTensorsScheme
-#        associated with the layer to apply the forward pass with the
-#        layer input.  See LinearMethodBase for param details
-#
-#        """
-#        scheme = layer.scheme
-#        if scheme is None:
-#            raise ValueError("A scheme must be defined for each layer")
-#        return scheme.apply_weights(layer, x, bias=bias)
+class Fp4LinearMethod(LinearMethodBase):
+
+    def __init__(self, quantization_config: Fp4Config):
+        self.quantization_config = quantization_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        #return 
+        if self.quantization_config.is_checkpoint_fp4_serialized:
+            layer.scheme.process_weights_after_loading(layer)
+        else:
+            #w, w_scales = dynamic_mxfp4_quant(layer.weight.data)
+            ##log_info_on_rank0(logger, f"w.shape: {w.shape}")
+
+            #wshuffle = w#shuffle_weight(w, layout=(16, 16))
+            #w_scales_shuffle = w_scales#e8m0_shuffle(w_scales).view(dtypes.fp8_e8m0)
+
+            quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+
+            w, w_scales_shuffle = quant_func(layer.weight.data, shuffle=True)
+
+            wshuffle = shuffle_weight(w, layout=(16, 16))
+
+            layer.weight = torch.nn.Parameter(wshuffle,
+                                              requires_grad=False)
+            layer.weight_scale = torch.nn.Parameter(w_scales_shuffle,
+                                                    requires_grad=False)
+
+    def create_weights(self, layer: torch.nn.Module,
+                       input_size_per_partition: int,
+                       output_partition_sizes: list[int], input_size: int,
+                       output_size: int, params_dtype: torch.dtype,
+                       **extra_weight_attrs):
+        """
+        Use the CompressedTensorsScheme associated with each layer to create
+        the necessary parameters for the layer. See LinearMethodBase for param
+        details
+        """
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        if self.quantization_config.is_checkpoint_fp4_serialized:
+            layer.scheme.create_weights(
+                layer=layer,
+                input_size=input_size,
+                input_size_per_partition=input_size_per_partition,
+                output_partition_sizes=output_partition_sizes,
+                output_size=output_size,
+                params_dtype=params_dtype,
+                weight_loader=weight_loader)
+        else:
+            output_size_per_partition = sum(output_partition_sizes)
+            layer.logical_widths = output_partition_sizes
+            layer.input_size_per_partition = input_size_per_partition
+            layer.output_size_per_partition = output_size_per_partition
+            layer.orig_dtype = params_dtype
+
+            weight_dtype = params_dtype
+
+            weight = ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition, input_size_per_partition, dtype=weight_dtype
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+
+            layer.register_parameter("weight", weight)
+            layer.register_parameter("weight_scale", None)
+
+    def apply(self,
+              layer: torch.nn.Module,
+              x: torch.Tensor,
+              bias: Optional[torch.Tensor] = None):
+        """
+        Use the output of create_weights and the CompressedTensorsScheme
+        associated with the layer to apply the forward pass with the
+        layer input.  See LinearMethodBase for param details
+
+        """
+        if self.quantization_config.is_checkpoint_fp4_serialized:
+            scheme = layer.scheme
+            if scheme is None:
+                raise ValueError("A scheme must be defined for each layer")
+            return scheme.apply_weights(layer, x, bias=bias)
+        else:
+
+            #dq_w = upcast_from_mxfp(layer.weight, layer.weight_scale, x.dtype, axis=1, swizzle_axis=None)
+            #out = F.linear(x, dq_w, bias)
+
+            #out = F.linear(x, layer.weight.data, bias) 
+
+            out_dtype = x.dtype
+
+            # ck or asm implement
+            M = x.shape[0]
+            N = layer.weight.shape[0]
+
+
+            quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+
+            x, x_scales_shuffle = quant_func(x, shuffle=True)
+
+            #log_info_on_rank0(logger, f"x.shape: {x.shape} x_scales_shuffle.shape: {x_scales_shuffle.shape} layer.weight.data: {layer.weight.data.shape} layer.weight_scale.data: {layer.weight_scale.data.shape}")
+
+            y = torch.zeros((M + 255) // 256 * 256, N, device=x.device, dtype=out_dtype)
+
+            out = gemm_a4w4(x, layer.weight.data, x_scales_shuffle, layer.weight_scale.data, y, bias=bias)
+
+            return out[:M]
+
+            # triton implement
+            #x_q, x_s = dynamic_mxfp4_quant(x)
+            #y = torch.empty(x_q.shape[0],
+            #                    layer.weight.shape[0],
+            #                    device=x_q.device,
+            #                    dtype=out_dtype)
+
+            #out = gemm_afp4wfp4(x_q, layer.weight, x_s, layer.weight_scale, out_dtype, y)
+
+            #log_info_on_rank0(logger, f"out.dtype: {out.dtype} out.shape: {out.shape} out_dtype: {out_dtype}")
+
+            #return out
 
 class Fp4MoEMethod():
     def __new__(cls, *args, **kwargs):
@@ -477,15 +562,15 @@ class W4A4MXFp4MoEDynamicMethod(Fp4MoEMethod):
             w_last_dim_size = w_shape[-1]
             w = w.view(-1, w_last_dim_size)
 
-        log_info_on_rank0(logger, f"[Pre-quant] w.shape: {w.shape}")
+        #log_info_on_rank0(logger, f"[Pre-quant] w.shape: {w.shape}")
         w, mx_scales = dynamic_mxfp4_quant(w)
-        log_info_on_rank0(logger, f"[Post-quant] w.shape: {w.shape} mx_scales.shape: {mx_scales.shape}")
+        #log_info_on_rank0(logger, f"[Post-quant] w.shape: {w.shape} mx_scales.shape: {mx_scales.shape}")
 
         if w_need_reshape:
             w_new_shape = w_shape[:-1] + (w.shape[-1],)
             w = w.view(w_new_shape)
 
-        log_info_on_rank0(logger, f"[re-shape] w.shape: {w.shape} mx_scales.shape: {mx_scales.shape}")
+        #log_info_on_rank0(logger, f"[re-shape] w.shape: {w.shape} mx_scales.shape: {mx_scales.shape}")
 
         mx_scales = e8m0_shuffle(mx_scales)
 
