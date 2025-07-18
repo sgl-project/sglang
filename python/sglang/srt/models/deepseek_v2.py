@@ -2070,6 +2070,7 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module):
+    packed_modules_mapping = {}
 
     def __init__(
         self,
@@ -2078,6 +2079,12 @@ class DeepseekV2ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+
+        # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
+        self.fuse_qkv_a_proj = hasattr(config, "q_lora_rank") and config.q_lora_rank is not None
+        if self.fuse_qkv_a_proj:
+            self.packed_modules_mapping["fused_qkv_a_proj_with_mqa"] = ["q_a_proj", "kv_a_proj_with_mqa"]
+
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
@@ -2424,11 +2431,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             )
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
-        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
-            self.config.q_lora_rank is not None
-        )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
-
+        cached_a_proj = {} if self.fuse_qkv_a_proj else None
+    
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
             nextn_spec_weight_names = [
@@ -2531,7 +2535,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         # Skip loading extra bias for GPTQ models.
                         if name.endswith(".bias") and name not in params_dict:
                             continue
-                        if fuse_qkv_a_proj and (
+                        if self.fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
                             cached_a_proj[name] = loaded_weight

@@ -34,7 +34,9 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import add_prefix
-
+from sglang.srt.model_loader.weight_utils import (
+    maybe_remap_kv_scale_name,
+)
 logger = logging.getLogger(__name__)
 
 
@@ -251,6 +253,12 @@ class Llama4ForConditionalGeneration(nn.Module):
                 name, loaded_weight = self.permute_qk_weight_for_rotary(
                     name, loaded_weight
                 )
+
+            # Handle FP8 kv-scale remapping
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             if self._handle_scale_remapping(name, params_dict):
                 continue

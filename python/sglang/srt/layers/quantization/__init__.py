@@ -53,6 +53,7 @@ from sglang.srt.layers.quantization.gptq import (
     GPTQMarlinLinearMethod,
     GPTQMarlinMoEMethod,
 )
+from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
@@ -76,6 +77,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "compressed-tensors": CompressedTensorsConfig,
     "qoq": QoQConfig,
     "w4afp8": W4AFp8Config,
+    "quark": QuarkConfig
 }
 
 # VLLM-dependent quantization methods

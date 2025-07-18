@@ -33,7 +33,11 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     next_power_of_2,
+    supports_mx,
 )
+
+from sglang.srt.layers.quantization.mxfp4_utils import (dequant_mxfp4, quant_dequant_mxfp4)
+
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -811,6 +815,7 @@ def invoke_fused_moe_kernel(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_mxfp4_w4a4: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
@@ -861,6 +866,15 @@ def invoke_fused_moe_kernel(
     elif use_int8_w8a16 or use_int4_w4a16:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
+    elif use_mxfp4_w4a4:
+        assert block_shape is None
+        if not supports_mx():
+            # OCP MX quantization simulation on hardware that does not support it natively, as AMD Instinct MI300.
+            A = quant_dequant_mxfp4(A)
+        else:
+            # TODO: the eventual fused moe kernel call should support mxfp4
+            # inputs on hardware that support mxfp4 math natively (as AMD Instinct MI350, MI355).
+            A = quant_dequant_mxfp4(A)
     else:
         assert A_scale is None
         assert B_scale is None
@@ -1157,6 +1171,7 @@ def get_config_dtype_str(
         # avoiding cases where kernel fails when float32 MoE
         # use fp16/bfloat16 configs
         return "float32"
+    # TODO: Once OCP MX is natively supported in the fused MOE kernel, we should return add it here.
     return None
 
 
@@ -1172,6 +1187,7 @@ def inplace_fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp4_w4a4: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -1195,6 +1211,7 @@ def inplace_fused_experts(
         use_int8_w8a8,
         use_int8_w8a16,
         use_int4_w4a16,
+        use_mxfp4_w4a4,
         per_channel_quant,
         w1_scale,
         w2_scale,
@@ -1220,6 +1237,7 @@ def inplace_fused_experts_fake(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp4_w4a4: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -1253,6 +1271,7 @@ def outplace_fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp4_w4a4: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -1277,6 +1296,7 @@ def outplace_fused_experts(
         use_int8_w8a8,
         use_int8_w8a16,
         use_int4_w4a16,
+        use_mxfp4_w4a4,
         per_channel_quant,
         w1_scale,
         w2_scale,
@@ -1302,6 +1322,7 @@ def outplace_fused_experts_fake(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp4_w4a4: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -1337,6 +1358,7 @@ def fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp4_w4a4: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -1363,6 +1385,7 @@ def fused_experts(
             use_int8_w8a8,
             use_int8_w8a16,
             use_int4_w4a16,
+            use_mxfp4_w4a4,
             per_channel_quant,
             w1_scale,
             w2_scale,
@@ -1387,6 +1410,7 @@ def fused_experts(
             use_int8_w8a8,
             use_int8_w8a16,
             use_int4_w4a16,
+            use_mxfp4_w4a4,
             per_channel_quant,
             w1_scale,
             w2_scale,
@@ -1505,6 +1529,7 @@ def fused_experts_impl(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp4_w4a4: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -1527,6 +1552,9 @@ def fused_experts_impl(
     # Check constraints.
     if use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
+    elif use_mxfp4_w4a4:
+        # 2 fp4 weights packed on one byte for the weight.
+        assert hidden_states.shape[1] == w1.shape[2] * 2, "hidden size mismatch"
     else:
         assert (
             hidden_states.shape[1] == w1.shape[2] - padded_size
@@ -1593,6 +1621,16 @@ def fused_experts_impl(
     else:
         out_hidden_states = torch.empty_like(hidden_states)
 
+    if use_mxfp4_w4a4:
+        # TODO: the eventual fused moe kernel call should support mxfp4
+        # inputs on hardware that support mxfp4 math natively (as AMD Instinct MI350, MI355).
+
+        # Weight has to be dequantized for mxfp4 emulation.
+        w1 = dequant_mxfp4(w1, w1_scale, hidden_states.dtype)
+        w1_scale = None
+        w2 = dequant_mxfp4(w2, w2_scale, hidden_states.dtype)
+        w2_scale = None
+
     for chunk in range((num_tokens // CHUNK_SIZE) + 1):
         begin_chunk_idx, end_chunk_idx = (
             chunk * CHUNK_SIZE,
@@ -1643,6 +1681,7 @@ def fused_experts_impl(
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
+            use_mxfp4_w4a4=use_mxfp4_w4a4,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
         )
@@ -1687,6 +1726,7 @@ def fused_experts_impl(
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
+            use_mxfp4_w4a4=use_mxfp4_w4a4,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
         )
@@ -1747,6 +1787,7 @@ def fused_moe(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp4_w4a4: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -1828,6 +1869,7 @@ def fused_moe(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_mxfp4_w4a4=use_mxfp4_w4a4,
         per_channel_quant=per_channel_quant,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
