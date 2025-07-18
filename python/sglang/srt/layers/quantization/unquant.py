@@ -346,7 +346,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         if use_intel_amx_backend(layer):
 
-            from sglang.srt.layers.moe.topk import select_experts, apply_topk_weights_cpu
+            from sglang.srt.layers.moe.topk import (
+                select_experts,
+                apply_topk_weights_cpu,
+            )
 
             topk_weights, topk_ids = select_experts(
                 hidden_states=x,
@@ -365,7 +368,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 apply_router_weight_on_input, topk_weights, x
             )
 
-            # TODO: support apply_router_weight_on_input in the fused_experts_cpu kernel
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,
