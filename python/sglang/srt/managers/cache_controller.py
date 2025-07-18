@@ -732,15 +732,18 @@ class HiCacheController:
                 if self.storage_batchedio:
                     exist_result = self.storage_backend.exists(hash_value)
                     storage_hit_count = sum(1 for v in exist_result.values() if v != 0) * self.page_size
+                    hit_hash = [k for k, v in exist_result.items() if v != 0]
+                    logger.info(f"storage hit count: {storage_hit_count}")
+                    logger.info(f"len(hithash): {len(hit_hash)}")
 
                 if storage_hit_count < self.prefetch_threshold:
                     logger.info("not enough for prefetching")
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                 else:
-                    operation.hash_value = hash_value
+                    operation.hash_value = hit_hash
                     logger.info(
-                        f"Prefetching {len(hash_value)} pages for request {operation.request_id}."
+                        f"Prefetching {len(hit_hash)} pages for request {operation.request_id}."
                     )
                     self.prefetch_buffer.put(operation)
 
@@ -775,6 +778,7 @@ class HiCacheController:
 
                 backup_hit_count = 0
                 remaining_tokens = len(tokens_to_backup)
+                logger.info(f"tokens to backup: {len(tokens_to_backup)}")
                 hash_value = []
                 while remaining_tokens >= self.page_size:
                     if isinstance(self.storage_backend, HiCacheFile):

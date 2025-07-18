@@ -214,7 +214,7 @@ class MooncakeStore(HiCacheStorage):
 			self.config = MooncakeStoreConfig.load_from_env()
 			logger.info("Mooncake Configuration loaded successfully.")
 
-			self.store.setup(
+			setup_code = self.store.setup(
 				self.config.local_hostname,
 				self.config.metadata_server,
 				self.config.global_segment_size,
@@ -223,6 +223,7 @@ class MooncakeStore(HiCacheStorage):
 				self.config.device_name,
 				self.config.master_server_address,
 			)
+			assert setup_code == 0
 			logger.info("Connect to Mooncake store successfully.")
 			self.warmup()
 			logger.info("Mooncake store warmup successfully.")

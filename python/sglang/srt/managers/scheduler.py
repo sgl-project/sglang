@@ -1213,7 +1213,7 @@ class Scheduler(
             self._add_request_to_queue(req)
 
     def _add_request_to_queue(self, req: Req):
-        logger.info("add request to queue")
+
         req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.disagg_prefill_bootstrap_queue.add(
@@ -1227,8 +1227,6 @@ class Scheduler(
                 last_hash = req.last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 if (matched_len > 0 and last_hash is not None) or matched_len == 0:
-                    logger.info("do prefetch")
-                    logger.info(f"matched len:{matched_len}")
                     new_input_tokens = req.fill_ids[matched_len:]
                     self.tree_cache.prefetch_from_storage(
                         req.rid, req.last_host_node, new_input_tokens, last_hash
@@ -2049,30 +2047,6 @@ class Scheduler(
                 self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
 
-    def prefetch_l3(self):
-        # torch.cuda.set_stream(self.current_stream)
-        # while True:
-        #     if len(self.waiting_queue) > 0:
-        #         for req in self.waiting_queue:
-        #             if req.waiting_status != WaitingStatus.UNREADY:
-        #                 continue
-
-        #             req.init_next_round_input(
-        #                 self.tree_cache
-        #             )
-        #             if req.l3_hit_length == 0:
-        #                 req.waiting_status = WaitingStatus.READY
-        #                 continue
-        #             req.waiting_status = WaitingStatus.LOADING
-        #             self.tree_cache.mooncake_load_back(req, req.last_l3_node)
-        #     time.sleep(0.001)
-        while True:
-            req = self.prefetch_queue.get(block=True)
-            key = req.input_ids
-            print("prefetch begin")
-            _, _ = self.tree_cache.match_prefix(key, True)
-            print("prefetch end")
-            self.prefetch_ack_queue.put(req)
             
 
     def watchdog_thread(self):
