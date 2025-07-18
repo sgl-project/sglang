@@ -19,15 +19,11 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.eplb import expert_location_dispatch
-from sglang.srt.eplb.expert_distribution import (
-    ExpertDistributionRecorder,
-    get_global_expert_distribution_recorder,
-)
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -95,6 +91,19 @@ def fused_topk_cpu(
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
+
+
+def apply_topk_weights_cpu(need_apply, topk_weights, inputs):
+    if not need_apply:
+        return inputs, topk_weights
+
+    # TODO: fuse below processing in fused_experts_cpu kernel
+    inputs = inputs * topk_weights.to(inputs.dtype)
+    topk_weights = torch.ones_like(
+        topk_weights, dtype=torch.float32
+    )  # clear topk_weights as already applied
+
+    return inputs, topk_weights
 
 
 def fused_topk(
