@@ -24,6 +24,8 @@ it means the model is verified.
 
 ## Installation
 
+### Install Using Docker
+
 It is recommended to use Docker for setting up the SGLang environment.
 A [Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/Dockerfile.xeon) is provided to facilitate the installation.
 Replace `<secret>` below with your [HuggingFace access token](https://huggingface.co/docs/hub/en/security-tokens).
@@ -48,6 +50,8 @@ docker run \
     -e "HF_TOKEN=<secret>" \
     sglang-cpu:main /bin/bash
 ```
+
+### Install From Source
 
 If you'd prefer to install SGLang in a bare metal environment,
 the command list is similar with the procedure in the Dockerfile.
@@ -93,8 +97,6 @@ pip install -v .
 export SGLANG_USE_CPU_ENGINE=1
 export LD_PRELOAD=${LD_PRELOAD}:${CONDA_PREFIX}/lib/libiomp5.so:${CONDA_PREFIX}/lib/libtcmalloc.so:${CONDA_PREFIX}/lib/libtbbmalloc.so.2
 ```
-
-
 
 ## Launch of the Serving Engine
 
