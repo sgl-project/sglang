@@ -18,14 +18,18 @@ This file implements HTTP APIs for the inference engine via fastapi.
 """
 
 import asyncio
+import ctypes
 import dataclasses
 import json
 import logging
 import multiprocessing as multiprocessing
 import os
+import sys
+import tempfile
 import threading
 import time
 from http import HTTPStatus
+from multiprocessing import Lock, Manager, Value, shared_memory
 from typing import AsyncIterator, Callable, Dict, Optional
 
 # Fix a bug of Python threading
@@ -91,7 +95,7 @@ from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.reasoning_parser import ReasoningParser
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
     add_prometheus_middleware,
@@ -124,38 +128,269 @@ def set_global_state(global_state: _GlobalState):
     _global_state = global_state
 
 
+def serialize_port_args(port_args: PortArgs) -> dict:
+    """Serialize PortArgs into a shareable dictionary"""
+    return {
+        "tokenizer_ipc_name": port_args.tokenizer_ipc_name,
+        "scheduler_input_ipc_name": port_args.scheduler_input_ipc_name,
+        "detokenizer_ipc_name": port_args.detokenizer_ipc_name,
+        "nccl_port": port_args.nccl_port,
+        "rpc_ipc_name": port_args.rpc_ipc_name,
+        "metrics_ipc_name": port_args.metrics_ipc_name,
+        "tokenizer_worker_ipc_name": port_args.tokenizer_worker_ipc_name,
+    }
+
+
+def deserialize_port_args(data: dict) -> PortArgs:
+    """Deserialize PortArgs from a shared dictionary"""
+    return PortArgs(**data)
+
+
+def serialize_server_args(server_args: ServerArgs) -> dict:
+    """Serialize ServerArgs into a shareable dictionary"""
+    return dataclasses.asdict(server_args)
+
+
+def deserialize_server_args(data: dict) -> ServerArgs:
+    """Deserialize ServerArgs from a shared dictionary"""
+    return ServerArgs(**data)
+
+
+def serialize_scheduler_info(scheduler_info: Dict) -> dict:
+    """Serialize scheduler_info into a shareable dictionary"""
+    return scheduler_info
+
+
+def deserialize_scheduler_info(data: dict) -> Dict:
+    """Deserialize scheduler_info from a shared dictionary"""
+    return data
+
+
+def write_to_shared_memory(data: dict, name: str) -> shared_memory.SharedMemory:
+    """Write data to shared memory"""
+    serialized = json.dumps(data).encode("utf-8")
+    size = len(serialized)
+    try:
+        # Try to open existing shared memory
+        shm = shared_memory.SharedMemory(name=name)
+        # If size is insufficient, close and recreate
+        if shm.size < size:
+            shm.close()
+            shm.unlink()
+            shm = shared_memory.SharedMemory(create=True, size=size, name=name)
+    except FileNotFoundError:
+        # If not present, create new shared memory
+        shm = shared_memory.SharedMemory(create=True, size=size, name=name)
+
+    shm.buf[:size] = serialized
+    return shm
+
+
+def read_from_shared_memory(name: str) -> dict:
+    """Read data from shared memory"""
+    try:
+        shm = shared_memory.SharedMemory(name=name)
+        data = json.loads(bytes(shm.buf).decode("utf-8"))
+        shm.close()
+        return data
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Shared memory {name} not found")
+
+
+def get_main_process_id() -> int:
+    """Get the main process ID"""
+    return multiprocessing.current_process()._parent_pid
+
+
+def serialize_tokenizer_mapping(mapping: Dict[int, str]) -> dict:
+    """Serialize tokenizer_ipc_name mapping into a shareable dictionary"""
+    return mapping
+
+
+def deserialize_tokenizer_mapping(data: dict) -> Dict[int, str]:
+    """Deserialize tokenizer_ipc_name mapping from a shared dictionary"""
+    return data
+
+
+def create_shared_lock() -> Lock:
+    """Create a shared lock"""
+    return Lock()
+
+
+def update_tokenizer_mapping(
+    worker_id: int, ipc_name: str, shm_name: str, lock_value: Value
+) -> tuple[shared_memory.SharedMemory, int]:
+    """Update or create the tokenizer_ipc_name mapping"""
+    with lock_value.get_lock():  # Use a shared lock to ensure inter-process synchronization
+        try:
+            # Try to read the existing mapping
+            existing_data = read_from_shared_memory(shm_name)
+            mapping = deserialize_tokenizer_mapping(existing_data)
+        except FileNotFoundError:
+            # If not present, create a new mapping
+            mapping = {}
+
+        # Update the mapping
+        mapping[worker_id] = ipc_name
+        logger.info(f"worker_id:{worker_id}, mapping:{mapping}")
+
+        # Write to shared memory
+        shm = write_to_shared_memory(
+            serialize_tokenizer_mapping(mapping),
+            shm_name,
+        )
+        return shm, len(mapping)
+
+
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
-    # Initialize OpenAI serving handlers
-    fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
-        _global_state.tokenizer_manager, _global_state.template_manager
-    )
-    fast_api_app.state.openai_serving_chat = OpenAIServingChat(
-        _global_state.tokenizer_manager, _global_state.template_manager
-    )
-    fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
-        _global_state.tokenizer_manager, _global_state.template_manager
-    )
-    fast_api_app.state.openai_serving_score = OpenAIServingScore(
-        _global_state.tokenizer_manager
-    )
-    fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
-        _global_state.tokenizer_manager
-    )
-
-    server_args: ServerArgs = fast_api_app.server_args
-    if server_args.warmups is not None:
-        await execute_warmups(
-            server_args.disaggregation_mode,
-            server_args.warmups.split(","),
-            _global_state.tokenizer_manager,
+    server_args = getattr(fast_api_app, "server_args", None)
+    if server_args is not None:
+        # Initialize OpenAI serving handlers
+        fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
+            _global_state.tokenizer_manager, _global_state.template_manager
         )
-        logger.info("Warmup ended")
+        fast_api_app.state.openai_serving_chat = OpenAIServingChat(
+            _global_state.tokenizer_manager, _global_state.template_manager
+        )
+        fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
+            _global_state.tokenizer_manager, _global_state.template_manager
+        )
+        fast_api_app.state.openai_serving_score = OpenAIServingScore(
+            _global_state.tokenizer_manager
+        )
+        fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
+            _global_state.tokenizer_manager
+        )
 
-    warmup_thread = getattr(fast_api_app, "warmup_thread", None)
-    if warmup_thread is not None:
+        if server_args.warmups is not None:
+            await execute_warmups(
+                server_args.disaggregation_mode,
+                server_args.warmups.split(","),
+                _global_state.tokenizer_manager,
+            )
+            logger.info("Warmup ended")
+
+        warmup_thread = getattr(fast_api_app, "warmup_thread", None)
+        if warmup_thread is not None:
+            warmup_thread.start()
+    else:
+        pid = os.getpid()
+        main_pid = get_main_process_id()
+        logger.info(f"current worker_id: {pid}, main processID: {main_pid}")
+
+        # Read port_args, server_args, and scheduler_info from shared memory
+        port_args_data = read_from_shared_memory(f"port_args_{main_pid}")
+        server_args_data = read_from_shared_memory(f"server_args_{main_pid}")
+        scheduler_info_data = read_from_shared_memory(
+            f"scheduler_info_{main_pid}"
+        )
+        lock_data = read_from_shared_memory(f"mapping_lock_{main_pid}")
+        lock_value = Value(ctypes.c_int, lock_data["lock_value"])
+
+        port_args = deserialize_port_args(port_args_data)
+        server_args = deserialize_server_args(server_args_data)
+        scheduler_info = deserialize_scheduler_info(scheduler_info_data)
+
+        port_args.tokenizer_ipc_name = (
+            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        )
+
+        # Use a shared lock to update the tokenizer_ipc_name mapping
+        tokenizer_mapping_shm, mapping_len = update_tokenizer_mapping(
+            pid,
+            port_args.tokenizer_ipc_name,
+            f"tokenizer_mapping_{main_pid}",
+            lock_value,
+        )
+
+        # Launch tokenizer process
+        tokenizer_manager = TokenizerManager(server_args, port_args, False)
+        template_manager = TemplateManager()
+        template_manager.initialize_templates(
+            tokenizer_manager=tokenizer_manager,
+            model_path=server_args.model_path,
+            chat_template=server_args.chat_template,
+            completion_template=server_args.completion_template,
+        )
+
+        tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+        set_global_state(
+            _GlobalState(
+                tokenizer_manager=tokenizer_manager,
+                template_manager=template_manager,
+                scheduler_info=scheduler_info,
+            )
+        )
+        # Initialize OpenAI serving handlers
+        fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
+            _global_state.tokenizer_manager, _global_state.template_manager
+        )
+        fast_api_app.state.openai_serving_chat = OpenAIServingChat(
+            _global_state.tokenizer_manager, _global_state.template_manager
+        )
+        fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
+            _global_state.tokenizer_manager, _global_state.template_manager
+        )
+        fast_api_app.state.openai_serving_score = OpenAIServingScore(
+            _global_state.tokenizer_manager
+        )
+        fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
+            _global_state.tokenizer_manager
+        )
+
+        logger.info(f"mapping_length={mapping_len},tokenizer_worker_num={server_args.tokenizer_worker_num}")
+        # Check if all workers have registered
+
+        if server_args.warmups is not None:
+            logger.info("Warmup started")
+            await execute_warmups(
+                server_args.disaggregation_mode,
+                server_args.warmups.split(","),
+                _global_state.tokenizer_manager,
+            )
+            logger.info("Warmup ended")
+        # wait for detokenizer manager to register zmq
+        time.sleep(12)
+        logger.info("warmup_thread start")
+
+        # Create a warmup thread for each worker
+        warmup_thread = threading.Thread(
+            target=_wait_and_warmup,
+            args=(
+                server_args,
+                None,  # pipe_finish_writer not needed in worker
+                _global_state.tokenizer_manager.image_token_id,
+                None,  # launch_callback not needed in worker
+            ),
+        )
+        logger.info(f"warmup_thread start warmup_thread={warmup_thread}")
         warmup_thread.start()
-    yield
+
+        logger.info(f"worker {pid} started")
+    try:
+        yield
+    finally:
+        if server_args.tokenizer_worker_num > 1:
+            logger.info(f"worker {pid} ending")
+            # Clean up shared memory
+            try:
+                if "warmup_thread" in locals() and warmup_thread.is_alive():
+                    warmup_thread.join()
+                with lock_value.get_lock():  # Use a shared lock to ensure inter-process synchronization during cleanup
+                    tokenizer_mapping_shm.close()
+                    # Check if other workers are still using this mapping
+                    try:
+                        mapping = deserialize_tokenizer_mapping(
+                            read_from_shared_memory(f"tokenizer_mapping_{main_pid}")
+                        )
+                        if len(mapping) <= 1:  # If only the current worker is using it
+                            tokenizer_mapping_shm.unlink()
+                    except FileNotFoundError:
+                        pass
+            except Exception as e:
+                logger.error(f"Error when cleaning up shared memory: {e}")
+            logger.info(f"worker {pid} ended")
 
 
 # Fast API
@@ -170,6 +405,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Function to setup all middlewares for multi-process compatibility
+def setup_middlewares():
+    """Setup all middlewares for both single and multi-process modes"""
+    worker_pid = os.getpid()
+
+    # Setup API key middleware
+    api_key = os.environ.get("SGLANG_API_KEY", "")
+    if api_key:
+        add_api_key_middleware(app, api_key)
+        logger.info(f"Worker {worker_pid} added API key middleware")
+
+    # Setup prometheus middleware
+    # Check if metrics are enabled via environment variable
+    enable_metrics = get_bool_env_var("SGLANG_ENABLE_METRICS", "false")
+    if enable_metrics:
+        add_prometheus_middleware(app)
+        enable_func_timer()
+        logger.info(f"Worker {worker_pid} added prometheus middleware")
+
+# Call setup function at module level for multi-process compatibility
+setup_middlewares()
 
 
 # Custom exception handlers to change validation error status codes
@@ -896,8 +1153,9 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
+    port_args = PortArgs.init_new(server_args)
     tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
-        server_args=server_args
+        server_args=server_args, port_args=port_args
     )
     set_global_state(
         _GlobalState(
@@ -906,53 +1164,101 @@ def launch_server(
             scheduler_info=scheduler_info,
         )
     )
+    if server_args.tokenizer_worker_num > 1:
+        # get main process ID
+        main_pid = get_main_process_id()
+        current_pid = os.getpid()
+        logger.info(f"main process ID: {main_pid}, current process ID: {current_pid}")
 
-    # Add api key authorization
-    if server_args.api_key:
-        add_api_key_middleware(app, server_args.api_key)
+        # Create a shared lock value
+        lock_value = Value(ctypes.c_int, 0)
 
-    # Add prometheus middleware
-    if server_args.enable_metrics:
-        add_prometheus_middleware(app)
-        enable_func_timer()
-
-    image_token_text = None
-    if (
-        tokenizer_manager.image_token_id is not None
-        and not server_args.skip_tokenizer_init
-    ):
-        image_token_text = tokenizer_manager.tokenizer.decode(
-            [tokenizer_manager.image_token_id]
+        # Write port_args to shared memory
+        port_args_shm = write_to_shared_memory(
+            serialize_port_args(port_args), f"port_args_{os.getpid()}"
+        )
+        # Write server_args to shared memory
+        server_args_shm = write_to_shared_memory(
+            serialize_server_args(server_args), f"server_args_{os.getpid()}"
+        )
+        # Write lock value address to shared memory
+        lock_shm = write_to_shared_memory(
+            {"lock_value": lock_value.value}, f"mapping_lock_{os.getpid()}"
         )
 
-    # Send a warmup request - we will create the thread launch it
-    # in the lifespan after all other warmups have fired.
-    warmup_thread = threading.Thread(
-        target=_wait_and_warmup,
-        args=(
-            server_args,
-            pipe_finish_writer,
-            image_token_text,
-            launch_callback,
-        ),
-    )
-    app.warmup_thread = warmup_thread
+        # Write scheduler_info to shared memory
+        scheduler_info_shm = write_to_shared_memory(
+            serialize_scheduler_info(scheduler_info), f"scheduler_info_{os.getpid()}"
+        )
+
+        port_args_shm.close()
+        server_args_shm.close()
+        scheduler_info_shm.close()
+        lock_shm.close()
+        # template_manager_shm.close()
+    else:
+        # Send a warmup request - we will create the thread launch it
+        # in the lifespan after all other warmups have fired.
+        warmup_thread = threading.Thread(
+            target=_wait_and_warmup,
+            args=(
+                server_args,
+                pipe_finish_writer,
+                _global_state.tokenizer_manager.image_token_id,
+                launch_callback,
+            ),
+        )
+        app.warmup_thread = warmup_thread
+
+    if server_args.tokenizer_worker_num > 1:
+        # Set environment variables for middlewares in main process
+        if server_args.api_key:
+            os.environ["SGLANG_API_KEY"] = server_args.api_key
+            logger.info("Main process set SGLANG_API_KEY")
+
+        if server_args.enable_metrics:
+            os.environ["SGLANG_ENABLE_METRICS"] = "true"
+            logger.info("Main process set SGLANG_ENABLE_METRICS=true")
+    else:
+        if server_args.api_key:
+            add_api_key_middleware(app,server_args.api_key)
+
+        if server_args.enable_metrics:
+            add_prometheus_middleware(app)
+            enable_func_timer()
 
     try:
         # Update logging configs
         set_uvicorn_logging_configs()
         app.server_args = server_args
         # Listen for HTTP requests
-        uvicorn.run(
-            app,
-            host=server_args.host,
-            port=server_args.port,
-            log_level=server_args.log_level_http or server_args.log_level,
-            timeout_keep_alive=5,
-            loop="uvloop",
-        )
+        if server_args.tokenizer_worker_num > 1:
+            uvicorn.run(
+                "sglang.srt.entrypoints.http_server:app",
+                host=server_args.host,
+                port=server_args.port,
+                log_level=server_args.log_level_http or server_args.log_level,
+                timeout_keep_alive=5,
+                loop="uvloop",
+                workers=server_args.tokenizer_worker_num,
+            )
+        else:
+            uvicorn.run(
+                app,
+                host=server_args.host,
+                port=server_args.port,
+                log_level=server_args.log_level_http or server_args.log_level,
+                timeout_keep_alive=5,
+                loop="uvloop",
+            )
     finally:
-        warmup_thread.join()
+        if server_args.tokenizer_worker_num > 1:
+            port_args_shm.unlink()
+            server_args_shm.unlink()
+            scheduler_info_shm.unlink()
+            lock_shm.unlink()
+        else:
+            warmup_thread.join()
 
 
 def _execute_server_warmup(
