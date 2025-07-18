@@ -32,14 +32,14 @@ except ImportError:
         def override_quantization_method(self, *args, **kwargs):
             return None
 
-    AQLMConfig = AWQMarlinConfig = BitsAndBytesConfig = CompressedTensorsConfig = (
+    AQLMConfig = BitsAndBytesConfig = CompressedTensorsConfig = (
         DeepSpeedFPConfig
     ) = ExpertsInt8Config = FBGEMMFp8Config = GGUFConfig = GPTQMarlin24Config = (
         MarlinConfig
     ) = QQQConfig = Int8TpuConfig = DummyConfig
 
 
-from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig, AWQMoEMethod
+from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (

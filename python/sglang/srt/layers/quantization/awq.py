@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Optional
-
+import warnings
 import torch
+from typing import Any, Callable, Dict, List, Optional
 
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
@@ -34,6 +34,10 @@ from sglang.srt.layers.quantization.utils import replace_parameter
 
 try:
     from vllm import _custom_ops as ops
+    warnings.warn(
+        f"Using kernels directly from vllm. This might lead to performance degradation or "
+        f"missing functionalities as certain kernels may not be optimized. "
+    )
 except ImportError:
     ops = None
 
