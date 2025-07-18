@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import importlib
 import sys
 from types import MappingProxyType
@@ -11,21 +13,19 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.linear import (
-    LinearMethodBase,
-    RowParallelLinear,
-    UnquantizedLinearMethod,
-)
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
+    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
     apply_module_patch,
     cpu_has_amx_support,
@@ -229,14 +229,14 @@ class W8A8Int8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "W8A8Int8Config":
+    def from_config(cls, config: Dict[str, Any]) -> W8A8Int8Config:
         return cls(config)
 
     def get_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
@@ -374,7 +374,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         )
 
 
-class W8A8Int8MoEMethod:
+class W8A8Int8MoEMethod(FusedMoEMethodBase):
     """MoE method for INT8.
     Supports loading INT8 checkpoints with static weight scale and
     dynamic/static activation scale.
@@ -385,25 +385,7 @@ class W8A8Int8MoEMethod:
         quant_config: The quantization config.
     """
 
-    def __new__(cls, *args, **kwargs):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
-
-        if not hasattr(cls, "_initialized"):
-            original_init = cls.__init__
-            new_cls = type(
-                cls.__name__,
-                (FusedMoEMethodBase,),
-                {
-                    "__init__": original_init,
-                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
-                },
-            )
-            obj = super(new_cls, new_cls).__new__(new_cls)
-            obj.__init__(*args, **kwargs)
-            return obj
-        return super().__new__(cls)
-
-    def __init__(self, quant_config):
+    def __init__(self, quant_config: W8A8Int8Config):
         self.quant_config = quant_config
 
     def create_weights(
@@ -885,13 +867,15 @@ class NPU_W8A8DynamicLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        from sglang.srt.layers.linear import RowParallelLinear
+
         if isinstance(layer, RowParallelLinear):
             tp_rank = get_tensor_model_parallel_rank()
             return self.quant_method.apply(layer, x, bias, tp_rank)
         return self.quant_method.apply(layer, x, bias)
 
 
-class NPU_W8A8MoEMethod:
+class NPU_W8A8MoEMethod(FusedMoEMethodBase):
     """MoE method for NPU quantization.
 
     This class search for specific quantization
