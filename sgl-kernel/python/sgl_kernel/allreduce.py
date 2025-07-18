@@ -77,8 +77,8 @@ if torch.version.hip is not None:
     def qr_destroy(fa: int) -> None:
         torch.ops.sgl_kernel.qr_destroy.default(fa)
 
-    def qr_max_size() -> None:
-        torch.ops.sgl_kernel.qr_max_size.default()
+    def qr_max_size() -> int:
+        return torch.ops.sgl_kernel.qr_max_size.default()
 
     # mscclpp
     def mscclpp_generate_unique_id() -> bytes:

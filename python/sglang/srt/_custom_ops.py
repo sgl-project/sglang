@@ -114,7 +114,7 @@ else:
     def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
         return sgl_kernel.allreduce.get_meta_buffer_ipc_handle(inp)
 
-    # ROCM quick allreduce
+    # ROCM custom quick allreduce
 
     def init_custom_qr(
         rank: int, world_size: int, qr_max_size: Optional[int] = None
@@ -139,8 +139,8 @@ else:
     def qr_destroy(fa: int) -> None:
         sgl_kernel.allreduce.qr_destroy(fa)
 
-    def qr_max_size() -> None:
-        sgl_kernel.allreduce.qr_max_size()
+    def qr_max_size() -> int:
+        return sgl_kernel.allreduce.qr_max_size()
 
 
 def mscclpp_generate_unique_id() -> bytes:
