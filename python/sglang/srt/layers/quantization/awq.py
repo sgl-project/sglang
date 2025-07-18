@@ -11,8 +11,6 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
 )
-from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import is_cuda, is_hip
 
