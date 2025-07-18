@@ -885,6 +885,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For split prefill
     split_index: int = 0
     split_prefill_finished: bool = False
+    split_forward_count: int = 1
     split_forward_batch: ForwardBatch = None
 
     # Stream

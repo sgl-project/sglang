@@ -258,7 +258,7 @@ class TpModelWorker:
             batch.split_forward_batch = forward_batch
 
         logits_output, can_run_cuda_graph = self.model_runner.forward(
-            batch.split_forward_batch
+            batch.split_forward_batch, split_forward_count=batch.split_forward_count
         )
         if logits_output:
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)

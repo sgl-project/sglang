@@ -142,22 +142,37 @@ class SchedulerMultiplexMixin:
                         self.max_prefill_tokens
                         // self.split_prefill_batch.extend_num_tokens,
                     )
+                    next_split_index = min(
+                        self.split_prefill_batch.split_index + forward_count,
+                        self.model_config.num_hidden_layers,
+                    )
+                    forward_count = (
+                        next_split_index - self.split_prefill_batch.split_index
+                    )
+
                     logger.debug(
                         f"Running split prefill batch {self.split_prefill_batch.split_index} with forward count: {forward_count}..."
                     )
-                    for _ in range(forward_count):
-                        # logger.debug(f"Running split prefill batch {self.split_prefill_batch.split_index}...")
-                        prefill_result = self.run_batch(self.split_prefill_batch)
-                        self.split_prefill_batch.split_index = (
-                            self.split_prefill_batch.split_index + 1
-                        )
-                        if (
-                            self.split_prefill_batch.split_index
-                            == self.model_config.num_hidden_layers
-                        ):
-                            self.split_prefill_batch.split_prefill_finished = True
-                            prefill_exe_done = prefill_stream.record_event()
-                            break
+                    self.split_prefill_batch.split_forward_count = forward_count
+                    prefill_result = self.run_batch(self.split_prefill_batch)
+                    if next_split_index == self.model_config.num_hidden_layers:
+                        self.split_prefill_batch.split_prefill_finished = True
+                        prefill_exe_done = prefill_stream.record_event()
+                    self.split_prefill_batch.split_index = next_split_index
+
+                    # for _ in range(forward_count):
+                    #     # logger.debug(f"Running split prefill batch {self.split_prefill_batch.split_index}...")
+                    #     prefill_result = self.run_batch(self.split_prefill_batch)
+                    #     self.split_prefill_batch.split_index = (
+                    #         self.split_prefill_batch.split_index + 1
+                    #     )
+                    #     if (
+                    #         self.split_prefill_batch.split_index
+                    #         == self.model_config.num_hidden_layers
+                    #     ):
+                    #         self.split_prefill_batch.split_prefill_finished = True
+                    #         prefill_exe_done = prefill_stream.record_event()
+                    #         break
                 elif wait_prefill_kernel_done:
                     prefill_done = True
                 else:
