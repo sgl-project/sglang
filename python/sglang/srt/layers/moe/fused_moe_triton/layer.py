@@ -1175,7 +1175,7 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight = loaded_weight.t().contiguous() # Oai model weight: [:, input channel, output channel]
             if shard_id == "w13":
                 # Handle full gate_up_proj weight (w13)
-                weight_param = getattr(self, "w13_weight", None)
+                weight_param = param
                 if weight_param is not None:
                     # Apply TP sharding to the full weight based on shard_dim
                     tp_size = get_tensor_model_parallel_world_size()
@@ -1207,7 +1207,7 @@ class FusedMoE(torch.nn.Module):
         if is_bias:
             if shard_id == "w13":
                 # Handle full gate_up_proj bias (w13)
-                bias_param = getattr(self, "w13_bias", None)
+                bias_param = param
                 if bias_param is not None:
                     # Apply TP sharding to the full bias (bias is 1D, always shard along dim 0)
                     tp_size = get_tensor_model_parallel_world_size()
@@ -1227,7 +1227,7 @@ class FusedMoE(torch.nn.Module):
                     bias_param.data[expert_id].copy_(loaded_weight)
             elif shard_id in ("w1", "w3"):
                 # For w1 and w3, we need to load bias into w13_bias
-                bias_param = getattr(self, "w13_bias", None)
+                bias_param = param
                 if bias_param is not None:
                     # Apply TP sharding to individual w1/w3 bias
                     tp_size = get_tensor_model_parallel_world_size()
@@ -1246,7 +1246,7 @@ class FusedMoE(torch.nn.Module):
                         bias_param.data[expert_id][bias_param.data[expert_id].shape[0]//2:] = loaded_weight
             elif shard_id == "w2":
                 # For w2, load bias into w2_bias (no TP sharding needed for w2 bias)
-                bias_param = getattr(self, "w2_bias", None)
+                bias_param = param
                 if bias_param is not None:
                     # w2 bias is not sharded in TP (it's the output bias)
                     bias_param.data[expert_id] = loaded_weight
