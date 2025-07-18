@@ -271,12 +271,13 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             batch,
             dp_size=model_runner.server_args.dp_size,
             attn_tp_size=1,
-            tp_cpu_group=model_runner.tp_group.cpu_group,
+            tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             speculative_num_draft_tokens=None,
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
+            disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
         )
 
 

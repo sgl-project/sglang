@@ -203,16 +203,9 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        # The single, pre-expanded image token.
-        self.IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
         # The regex that matches expanded image tokens.
-        self.IMAGE_TOKEN_REGEX = re.compile(
-            r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
-        )
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
-        self.IM_TOKEN_ID = hf_config.image_token_id
-        self.VIDEO_TOKEN_ID = hf_config.video_token_id
         self.vision_start_token_id = hf_config.vision_start_token_id
         self.vision_end_token_id = hf_config.vision_end_token_id
         self.NUM_TOKEN_PER_FRAME = 770
@@ -220,12 +213,14 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         self.MIN_PIXELS = 4 * 28 * 28
         self.MAX_PIXELS = 16384 * 28 * 28
         self.MAX_RATIO = 200
-        # TODO(mick): move all MultimodalSpecialTokens initializations into processor init
-        self.mm_special_tokens = MultimodalSpecialTokens(
-            image_token=self.IMAGE_TOKEN,
-            image_token_regex=self.IMAGE_TOKEN_REGEX,
-            video_token=self.VIDEO_TOKEN_ID,
-        )
+        self.mm_tokens = MultimodalSpecialTokens(
+            image_token="<|vision_start|><|image_pad|><|vision_end|>",
+            image_token_id=hf_config.image_token_id,
+            image_token_regex=re.compile(
+                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
+            ),
+            video_token_id=hf_config.video_token_id,
+        ).build(_processor)
 
     async def process_mm_data_async(
         self,
@@ -241,7 +236,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             prompt=input_text,
             image_data=image_data,
             video_data=request_obj.video_data,
-            multimodal_tokens=self.mm_special_tokens,
+            multimodal_tokens=self.mm_tokens,
             max_req_input_len=max_req_input_len,
         )
 
@@ -255,13 +250,15 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
                 await preprocess_video(video) for video in base_output.videos
             ]
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(base_output)
+        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+            base_output, self.mm_tokens
+        )
 
         input_ids = input_ids.flatten()
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
-            image_token_id=self.IM_TOKEN_ID,
-            video_token_id=self.VIDEO_TOKEN_ID,
+            image_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
             vision_start_token_id=self.vision_start_token_id,
             model_type=self.hf_config.model_type,
             tokens_per_second=getattr(
@@ -279,8 +276,8 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             "mm_items": mm_items,
             "im_start_id": self.IM_START_TOKEN_ID,
             "im_end_id": self.IM_END_TOKEN_ID,
-            "im_token_id": self.IM_TOKEN_ID,
-            "video_token_id": self.VIDEO_TOKEN_ID,
+            "im_token_id": self.mm_tokens.image_token_id,
+            "video_token_id": self.mm_tokens.video_token_id,
             "mrope_positions": mrope_positions,
             "mrope_position_delta": mrope_position_delta,
         }

@@ -268,9 +268,9 @@ class DeepseekVL2ForCausalLM(nn.Module):
         # TODO: can it be batched ?
         images_in_this_batch = []
         for item in items:
-            assert item.pixel_values.dim() == 4
+            assert item.feature.dim() == 4
             image_feature = self.vision.forward_features(
-                item.pixel_values.type(next(self.vision.parameters()).dtype).to(
+                item.feature.type(next(self.vision.parameters()).dtype).to(
                     device=next(self.vision.parameters()).device
                 )
             )

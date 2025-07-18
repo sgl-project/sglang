@@ -78,7 +78,7 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
             output_lengths = (input_lengths - 2) // 2 + 1
 
             item = MultimodalDataItem(
-                audio_features=res["input_features"],
+                feature=res["input_features"],
                 audio_feature_lens=output_lengths,
                 audio_offsets=audio_offsets,
                 modality=Modality.AUDIO,

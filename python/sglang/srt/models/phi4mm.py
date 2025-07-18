@@ -422,9 +422,7 @@ class Phi4MMForCausalLM(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         dtype = next(self.vision_encoder.parameters()).dtype
-        pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
-            dtype
-        )
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(dtype)
         image_attention_mask = torch.cat([item.image_emb_mask for item in items], dim=0)
         image_sizes = torch.cat([item.image_sizes for item in items], dim=0)
         image_embeds = self.vision_encoder(

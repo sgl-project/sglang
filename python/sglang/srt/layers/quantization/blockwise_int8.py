@@ -1,5 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
 
+from __future__ import annotations
+
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
@@ -7,17 +9,15 @@ import torch
 from torch.nn import Module
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.linear import (
-    LinearBase,
-    LinearMethodBase,
-    UnquantizedLinearMethod,
-)
 from sglang.srt.layers.parameter import BlockQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
+    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
 
@@ -78,7 +78,7 @@ class BlockInt8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "BlockInt8Config":
+    def from_config(cls, config: Dict[str, Any]) -> BlockInt8Config:
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_int8_serialized = "int8" in quant_method
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
@@ -93,7 +93,8 @@ class BlockInt8Config(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
@@ -230,7 +231,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
         )
 
 
-class BlockInt8MoEMethod:
+class BlockInt8MoEMethod(FusedMoEMethodBase):
     """MoE method for INT8.
     Supports loading INT8 checkpoints with static weight scale and
     dynamic activation scale.
@@ -242,25 +243,7 @@ class BlockInt8MoEMethod:
         quant_config: The quantization config.
     """
 
-    def __new__(cls, *args, **kwargs):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
-
-        if not hasattr(cls, "_initialized"):
-            original_init = cls.__init__
-            new_cls = type(
-                cls.__name__,
-                (FusedMoEMethodBase,),
-                {
-                    "__init__": original_init,
-                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
-                },
-            )
-            obj = super(new_cls, new_cls).__new__(new_cls)
-            obj.__init__(*args, **kwargs)
-            return obj
-        return super().__new__(cls)
-
-    def __init__(self, quant_config):
+    def __init__(self, quant_config: BlockInt8Config):
         self.quant_config = quant_config
         assert self.quant_config.weight_block_size is not None
         assert self.quant_config.is_checkpoint_int8_serialized
