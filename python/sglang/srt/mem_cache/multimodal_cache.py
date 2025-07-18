@@ -8,7 +8,6 @@ class MultimodalCache(abc.ABC):
     @abc.abstractmethod
     def __init__(
         self,
-
     ):
         pass
         # self.hidden_size = hidden_size
@@ -35,10 +34,7 @@ class MultimodalCache(abc.ABC):
 
     @abc.abstractmethod
     def set_mm_embedding(
-        self,
-        mm_hash: int,
-        embedding: torch.Tensor,
-        loc: Optional[torch.Tensor] = None
+        self, mm_hash: int, embedding: torch.Tensor, loc: Optional[torch.Tensor] = None
     ) -> bool:
         raise NotImplementedError()
 
@@ -57,7 +53,7 @@ class MultimodalCache(abc.ABC):
 
 class MultiModalStaticCache(MultimodalCache):
     """MultiModalStaticCache is used to store precomputed multimodal embeddings.
-        Embeddings will be computed prior, and this cache does not really pre-alloc
+    Embeddings will be computed prior, and this cache does not really pre-alloc
     """
 
     def __init__(
@@ -73,10 +69,7 @@ class MultiModalStaticCache(MultimodalCache):
         return self.mm_cache.get(mm_hash)
 
     def set_mm_embedding(
-        self,
-        mm_hash: int,
-        embedding: torch.Tensor,
-        loc: Optional[torch.Tensor] = None
+        self, mm_hash: int, embedding: torch.Tensor, loc: Optional[torch.Tensor] = None
     ) -> bool:
         if mm_hash in self.mm_cache:
             return True
@@ -163,10 +156,7 @@ class PagedMultiModalCache(MultimodalCache):
         return embedding
 
     def set_mm_embedding(
-        self,
-        mm_hash: int,
-        embedding: torch.Tensor,
-        loc: Optional[torch.Tensor] = None
+        self, mm_hash: int, embedding: torch.Tensor, loc: Optional[torch.Tensor] = None
     ) -> bool:
         if mm_hash in self.mm_hash_to_indices:
             return True

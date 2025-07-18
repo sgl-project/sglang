@@ -18,8 +18,11 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache, PagedMultiModalCache, \
-    MultimodalCache
+from sglang.srt.mem_cache.multimodal_cache import (
+    MultimodalCache,
+    MultiModalStaticCache,
+    PagedMultiModalCache,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import flatten_nested_list, print_warning_once
 from sglang.utils import logger
@@ -101,7 +104,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
             return input_ids
 
         for start_idx, end_idx in zip(start_indices, end_indices):
-            padded_ids.extend(input_ids[last_idx: start_idx + 1])
+            padded_ids.extend(input_ids[last_idx : start_idx + 1])
 
             if input_ids[start_idx] in self.data_start_token_ids:
                 data_idx += 1
@@ -174,7 +177,9 @@ def init_embedding_cache(max_size: int):
         page_size = 1
         dtype = torch.bfloat16
         device = "cuda:0"
-        embedding_cache = PagedMultiModalCache(size, hidden_size, page_size, dtype, device)
+        embedding_cache = PagedMultiModalCache(
+            size, hidden_size, page_size, dtype, device
+        )
     else:
         embedding_cache = MultiModalStaticCache(max_size)
 
@@ -263,7 +268,7 @@ def _get_chunked_prefill_embedding(
     for i in range(len(items_size) - 1):
         if items_size[i] == items_size[i + 1]:
             continue
-        embedding_items_per_req = embedding_items[items_size[i]: items_size[i + 1]]
+        embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
         items_offset = items_offset_list[i]
         embedding_items_hash = get_embedding_hash(embedding_items_per_req)
         # if all items has been prefixed, we do not need to calculate embedding
@@ -274,13 +279,21 @@ def _get_chunked_prefill_embedding(
             embedding_per_req = data_embedding_func(embedding_items_per_req)
             print(f"{embedding_per_req.shape=}")
             if is_epd:
-                allocator = TokenToKVPoolAllocator(size=2000, dtype=torch.bfloat16, device='cuda:0',
-                                                   kvcache=embedding_cache)
+                allocator = TokenToKVPoolAllocator(
+                    size=2000,
+                    dtype=torch.bfloat16,
+                    device="cuda:0",
+                    kvcache=embedding_cache,
+                )
                 locs = allocator.alloc(embedding_per_req.shape[0])
-                embedding_cache.set_mm_embedding(embedding_items_hash, embedding_per_req, loc=locs)
+                embedding_cache.set_mm_embedding(
+                    embedding_items_hash, embedding_per_req, loc=locs
+                )
                 # pass
             else:
-                if not embedding_cache.set_mm_embedding(embedding_items_hash, embedding_per_req):
+                if not embedding_cache.set_mm_embedding(
+                    embedding_items_hash, embedding_per_req
+                ):
                     print_warning_once(
                         "Multimodal embedding cache is full. Consider increasing the "
                         "`SGLANG_VLM_CACHE_SIZE_MB` environment variable."
