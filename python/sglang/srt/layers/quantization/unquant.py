@@ -347,8 +347,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         if use_intel_amx_backend(layer):
 
             from sglang.srt.layers.moe.topk import (
-                select_experts,
                 apply_topk_weights_cpu,
+                select_experts,
             )
 
             topk_weights, topk_ids = select_experts(
