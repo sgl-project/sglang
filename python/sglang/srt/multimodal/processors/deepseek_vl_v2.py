@@ -33,7 +33,9 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        self.IMAGE_TOKEN = "<image>"
+        self.mm_tokens = MultimodalSpecialTokens(image_token="<image>").build(
+            _processor
+        )
 
     async def process_mm_data_async(
         self,
@@ -47,7 +49,7 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
         base_output = self.load_mm_data(
             input_text,
             image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(image_token=self.IMAGE_TOKEN),
+            multimodal_tokens=self.mm_tokens,
             max_req_input_len=max_req_input_len,
         )
         res = self.process_mm_data(
