@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import importlib
 import sys
 from types import MappingProxyType
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
 from torch.nn.parameter import Parameter
@@ -11,21 +13,20 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.linear import (
-    LinearMethodBase,
-    RowParallelLinear,
-    UnquantizedLinearMethod,
-)
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
+    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
     apply_module_patch,
     cpu_has_amx_support,
@@ -178,20 +179,21 @@ class W8A8Int8Config(QuantizationConfig):
     - Activation: dynamic, per-token, symmetric
     """
 
-    def __init__(self, quant_config: Dict[str, Any] = None):
+    def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
         if quant_config is None:
             pass
         else:
             self.quant_description = quant_config
             self.is_dynamic = quant_config.get("is_dynamic", False)
-            if _is_npu:
-                if (
-                    "packed_modules_mapping" in quant_config
-                    and quant_config["packed_modules_mapping"] is not None
-                ):
-                    self.packed_modules_mapping = quant_config["packed_modules_mapping"]
+            ignore = cast(List[str], quant_config.get("ignore", []))
+            self.ignore = ignore if ignore is not None else []
+            packed_modules_mapping = quant_config.get("packed_modules_mapping", {})
+            self.packed_modules_mapping = (
+                packed_modules_mapping if packed_modules_mapping is not None else {}
+            )
 
+            if _is_npu:
                 # Ascend w8a8_int8 quantization with bias, use wrappers to isolate the effects between models
                 for name in self.quant_description.keys():
                     if "norm.bias" in name:
@@ -232,15 +234,15 @@ class W8A8Int8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "W8A8Int8Config":
+    def from_config(cls, config: Dict[str, Any]) -> W8A8Int8Config:
         return cls(config)
 
     def get_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional["QuantizeMethodBase"]:
-        from sglang.srt.layers.linear import LinearBase
+    ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if _is_npu:
@@ -265,12 +267,16 @@ class W8A8Int8Config(QuantizationConfig):
             elif isinstance(layer, FusedMoE):
                 return NPU_W8A8MoEMethod(self)
             return None
-        else:
-            if isinstance(layer, LinearBase):
-                return W8A8Int8LinearMethod(self)
-            elif isinstance(layer, FusedMoE):
-                return W8A8Int8MoEMethod(self)
-            return None
+
+        if should_ignore_layer(
+            prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+        ):
+            return UnquantizedLinearMethod()
+        if isinstance(layer, LinearBase):
+            return W8A8Int8LinearMethod(self)
+        elif isinstance(layer, FusedMoE):
+            return W8A8Int8MoEMethod(self)
+        return None
 
     def is_layer_skipped(
         self, prefix: str, fused_mapping: Mapping[str, List[str]] = MappingProxyType({})
@@ -377,7 +383,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         )
 
 
-class W8A8Int8MoEMethod:
+class W8A8Int8MoEMethod(FusedMoEMethodBase):
     """MoE method for INT8.
     Supports loading INT8 checkpoints with static weight scale and
     dynamic/static activation scale.
@@ -388,25 +394,7 @@ class W8A8Int8MoEMethod:
         quant_config: The quantization config.
     """
 
-    def __new__(cls, *args, **kwargs):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
-
-        if not hasattr(cls, "_initialized"):
-            original_init = cls.__init__
-            new_cls = type(
-                cls.__name__,
-                (FusedMoEMethodBase,),
-                {
-                    "__init__": original_init,
-                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
-                },
-            )
-            obj = super(new_cls, new_cls).__new__(new_cls)
-            obj.__init__(*args, **kwargs)
-            return obj
-        return super().__new__(cls)
-
-    def __init__(self, quant_config):
+    def __init__(self, quant_config: W8A8Int8Config):
         self.quant_config = quant_config
 
     def create_weights(
@@ -518,6 +506,11 @@ class W8A8Int8MoEMethod:
         )
 
         if use_intel_amx_backend(layer):
+            from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+
+            x, topk_weights = apply_topk_weights_cpu(
+                apply_router_weight_on_input, topk_weights, x
+            )
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,
@@ -888,13 +881,15 @@ class NPU_W8A8DynamicLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        from sglang.srt.layers.linear import RowParallelLinear
+
         if isinstance(layer, RowParallelLinear):
             tp_rank = get_tensor_model_parallel_rank()
             return self.quant_method.apply(layer, x, bias, tp_rank)
         return self.quant_method.apply(layer, x, bias)
 
 
-class NPU_W8A8MoEMethod:
+class NPU_W8A8MoEMethod(FusedMoEMethodBase):
     """MoE method for NPU quantization.
 
     This class search for specific quantization
