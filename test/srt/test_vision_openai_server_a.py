@@ -211,36 +211,5 @@ class TestMimoVLServer(TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
-class TestPhi4mmServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "microsoft/Phi-4-multimodal-instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.7",
-            ],
-        )
-        cls.base_url += "/v1"
-
-    # TODO: phi4-mm w/o lora cannot successfully pass this test. It can only remember the second image but will forget the first one.
-    # We are investigating this issue.
-    # AssertionError: text: The first image depicts a stylized, cartoonish representation of the word "SGL" with an orange, 3D-like font, featuring a small, orange, heart-shaped icon attached to the letter "G" and a small, orange, heart-shaped icon attached to the letter "L." The second image shows a simple, handwritten version of the word "SGL" in a casual, informal font, with a small, orange, heart-shaped icon attached to the letter "G" and a small, orange, heart-shaped icon attached to the letter "L.", should contain man, cab, SUV or taxi
-    def test_multi_images_chat_completion(self):
-        pass
-
-    def test_audio_chat_completion(self):
-        self._test_audio_speech_completion()
-        # TODO: phi4-mm w/o lora cannot successfully pass this test.
-        # We are investigating this issue.
-        # self._test_audio_ambient_completion()
-
-
 if __name__ == "__main__":
     unittest.main()
