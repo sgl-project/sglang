@@ -193,7 +193,7 @@ Alternatively, you can use `--quantization awq_marlin` as follows:
 python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --quantization awq_marlin --dtype float16
 ```
 
-Note that awq_marlin only supports `float16`, which may lead to some precision loss.
+Note that `awq_marlin` only supports `float16` now, which may lead to some precision loss.
 
 ### Example: Serving with 16 A100/A800 with int8 Quantization
 
