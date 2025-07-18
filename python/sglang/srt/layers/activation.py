@@ -103,8 +103,9 @@ class GeluAndMul(CustomOp):
         y_npu, gelu_npu = torch_npu.geglu(
             x,
             dim=-1,
-            approximate=1 if self.approximate == 'tanh' else 0,
-            activate_left=True)
+            approximate=1 if self.approximate == "tanh" else 0,
+            activate_left=True,
+        )
         return y_npu
 
 

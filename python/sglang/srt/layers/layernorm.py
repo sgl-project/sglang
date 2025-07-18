@@ -238,7 +238,7 @@ class GemmaRMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
-    )-> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         orig_dtype = x.dtype
         if residual is not None:
             x = x + residual
@@ -250,6 +250,7 @@ class GemmaRMSNorm(CustomOp):
         x = x * (1.0 + self.weight.float())
         x = x.to(orig_dtype)
         return x if residual is None else (x, residual)
+
 
 class Gemma3RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
