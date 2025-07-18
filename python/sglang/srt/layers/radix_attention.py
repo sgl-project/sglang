@@ -92,7 +92,7 @@ class RadixAttention(nn.Module):
             # For cross-layer sharing, kv can be None
             assert v is not None
             if forward_batch.kv_cache_dtype_is_fp8_e4m3:
-                MAX_FP8_E4M3_SCALE = 240.0
+                MAX_FP8_E4M3_SCALE = 448.0
                 k_max = k.abs().max()
                 v_max = v.abs().max()
                 k_scale = k_max / MAX_FP8_E4M3_SCALE if k_max > 1e-6 else 1.0
