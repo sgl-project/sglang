@@ -28,14 +28,13 @@ typedef CUresult(CUDAAPI* PFN_cuGreenCtxStreamCreate)(CUstream*, CUgreenCtx, uns
 
 static std::vector<int64_t> create_greenctx_stream_direct_dynamic(CUgreenCtx gctx[2]) {
   static PFN_cuGreenCtxStreamCreate pfn = nullptr;
-  static bool probed = false;
+  static std::once_flag pfn_probed_flag;
 
   // detect compatibility in runtime
-  if (!probed) {
-    CUresult st = cuGetProcAddress("cuGreenCtxStreamCreate", reinterpret_cast<void**>(&pfn), 0, 0, nullptr);
-    if (st != CUDA_SUCCESS) pfn = nullptr;
-    probed = true;
-  }
+  std::call_once(pfn_probed_flag, []() {
+    cuGetProcAddress("cuGreenCtxStreamCreate", reinterpret_cast<void**>(&pfn), 0, 0, nullptr);
+  });
+
   if (!pfn) {  // fallback if not compatible
     return create_greenctx_stream_fallback(gctx);
   }
@@ -58,6 +57,9 @@ std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, i
   CUdevResourceDesc desc[3];
   CUdevResource input;
   CUdevResource resources[4];
+  if (smA <= 0 || smB <= 0) {
+    TORCH_CHECK(false, "SM counts must be positive");
+  }
 
   CUDA_DRV(cuDeviceGetDevResource((CUdevice)device, &input, CU_DEV_RESOURCE_TYPE_SM));
 
