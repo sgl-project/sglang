@@ -32,7 +32,7 @@ static std::vector<int64_t> create_greenctx_stream_direct_dynamic(CUgreenCtx gct
 
   // detect compatibility in runtime
   if (!probed) {
-    CUresult st = cuGetProcAddress("cuGreenCtxStreamCreate", reinterpret_cast<void**>(&pfn), 0, 0);
+    CUresult st = cuGetProcAddress("cuGreenCtxStreamCreate", reinterpret_cast<void**>(&pfn), 0, 0, nullptr);
     if (st != CUDA_SUCCESS) pfn = nullptr;
     probed = true;
   }
@@ -85,8 +85,8 @@ std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, i
   CUDA_DRV(cuGreenCtxDestroy(gctx[2]));
 
   std::vector<int64_t> vec = {
-      stream_handles[0],  // streamA
-      stream_handles[1],  // streamB
+      streams[0],  // streamA
+      streams[1],  // streamB
       (int64_t)smCountA,
       (int64_t)smCountB};
 
