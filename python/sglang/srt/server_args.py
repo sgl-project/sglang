@@ -105,6 +105,7 @@ class ServerArgs:
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
+    enable_metrics_for_all_schedulers: bool = False
     bucket_time_to_first_token: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
@@ -221,6 +222,7 @@ class ServerArgs:
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
     hicache_io_backend: str = ""
+    hicache_storage_backend: Optional[str] = None
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
@@ -1003,6 +1005,13 @@ class ServerArgs:
             help="Enable log prometheus metrics.",
         )
         parser.add_argument(
+            "--enable-metrics-for-all-schedulers",
+            action="store_true",
+            help="Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) "
+            "to record request metrics separately. This is especially useful when dp_attention is enabled, as "
+            "otherwise all metrics appear to come from TP 0.",
+        )
+        parser.add_argument(
             "--bucket-time-to-first-token",
             type=float,
             nargs="+",
@@ -1595,6 +1604,13 @@ class ServerArgs:
             choices=["direct", "kernel"],
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
+        )
+        parser.add_argument(
+            "--hicache-storage-backend",
+            type=str,
+            choices=["file"],  # todo, mooncacke
+            default=ServerArgs.hicache_storage_backend,
+            help="The storage backend for hierarchical KV cache.",
         )
         parser.add_argument(
             "--flashinfer-mla-disable-ragged",
