@@ -279,6 +279,7 @@ def _get_chunked_prefill_embedding(
             embedding_per_req = data_embedding_func(embedding_items_per_req)
             print(f"{embedding_per_req.shape=}")
             if is_epd:
+                # TODO: mock the pre-alloc
                 allocator = TokenToKVPoolAllocator(
                     size=2000,
                     dtype=torch.bfloat16,
@@ -286,6 +287,7 @@ def _get_chunked_prefill_embedding(
                     kvcache=embedding_cache,
                 )
                 locs = allocator.alloc(embedding_per_req.shape[0])
+                # TODO: mocking the `set` op here, in practice, this will done in `EmbeddingReceiver`
                 embedding_cache.set_mm_embedding(
                     embedding_items_hash, embedding_per_req, loc=locs
                 )
