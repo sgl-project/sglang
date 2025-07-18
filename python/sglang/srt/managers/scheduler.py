@@ -262,6 +262,7 @@ class Scheduler(
         )
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.page_size = server_args.page_size
         self.dp_size = server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -614,6 +615,7 @@ class Scheduler(
                         == "fa3"  # hot fix for incompatibility
                         else server_args.hicache_io_backend
                     ),
+                    hicache_storage_backend=server_args.hicache_storage_backend,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -1258,6 +1260,15 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
+            if self.enable_hicache_storage:
+                req.init_next_round_input(self.tree_cache)
+                last_hash = req.last_host_node.get_last_hash_value()
+                matched_len = len(req.prefix_indices) + req.host_hit_length
+                if (matched_len > 0 and last_hash is not None) or matched_len == 0:
+                    new_input_tokens = req.fill_ids[matched_len:]
+                    self.tree_cache.prefetch_from_storage(
+                        req.rid, req.last_host_node, new_input_tokens, last_hash
+                    )
             self.waiting_queue.append(req)
 
     def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
@@ -1730,6 +1741,9 @@ class Scheduler(
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     self.running_batch.batch_is_full = True
                     break
+
+            if self.enable_hicache_storage:
+                self.tree_cache.check_prefetch_progress(req.rid)
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
