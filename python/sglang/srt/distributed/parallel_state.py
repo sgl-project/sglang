@@ -127,14 +127,18 @@ if supports_custom_op():
         fake_impl=inplace_all_reduce_fake,
     )
 
-    def outplace_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    def outplace_all_reduce(
+        tensor: torch.Tensor, group_name: str, outplace_all_reduce_method: str
+    ) -> torch.Tensor:
         assert group_name in _groups, f"Group {group_name} is not found."
         group = _groups[group_name]()
         if group is None:
             raise ValueError(f"Group {group_name} is destroyed.")
-        return group._all_reduce_out_place(tensor)
+        return group._all_reduce_out_place(tensor, outplace_all_reduce_method)
 
-    def outplace_all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    def outplace_all_reduce_fake(
+        tensor: torch.Tensor, group_name: str, outplace_all_reduce_method: str
+    ) -> torch.Tensor:
         return torch.empty_like(tensor)
 
     direct_register_custom_op(
@@ -264,9 +268,12 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.pynccl import (
             PyNcclCommunicator,
         )
-        from sglang.srt.distributed.device_communicators.quick_all_reduce import (
-            QuickAllReduce,
-        )
+
+        if is_hip():
+            from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+                QuickAllReduce,
+                qr_rocm_arch_available,
+            )
 
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
         if use_pynccl and self.world_size > 1:
@@ -301,13 +308,17 @@ class GroupCoordinator:
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
             if is_hip():
-                # TODO-lhy: check this comment.
-                # Initialize a custom quick all-reduce implementation for AMD.
-                # Quick reduce is designed as a complement to custom allreduce.
-                # Based on quickreduce (https://github.com/mk1-project/quickreduce).
-                # If it's a rocm, 'use_custom_allreduce==True' means it must
-                # currently be an MI300 series.
-                self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+                try:
+                    # Initialize a custom quick all-reduce implementation for AMD
+                    # when rocm >= gfx942. Quick reduce is designed as a
+                    # complement to custom allreduce.
+                    # Based on quickreduce (https://github.com/mk1-project/quickreduce).
+                    if qr_rocm_arch_available():
+                        self.qr_comm = QuickAllReduce(
+                            group=self.cpu_group, device=self.device
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to initialize QuickAllReduce: {e}")
 
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
             HpuCommunicator,
@@ -408,18 +419,18 @@ class GroupCoordinator:
             # PyMscclpp              | disabled| enabled |
             # torch.distributed      | enabled | disabled|
             #
+            # Note: When custom quick allreduce is enabled, a runtime check
+            #  will be performed. If the tensor size is too small, it will
+            #  automatically fall back to the next available option.
             # Note that custom allreduce will have a runtime check, if the
             #  tensor size is too large, it will fallback to the next
             #  available option.
             # Note that the PyMsccl needs to register the tensor in ahead,
             #  which will introduce large overhead in the eager case,
             #  therefore it is only supported in the graph case.
-            # In summary: When using CUDA graph, we use
-            #  either custom all-reduce kernel or pynccl. When not using
-            #  CUDA graph, we use either custom all-reduce kernel or
-            #  PyTorch NCCL. We always prioritize using custom all-reduce
-            #  kernel but fall back to PyTorch or pynccl if it is
-            #  disabled or not supported.
+            # In summary: We select the appropriate allreduce method for
+            #  each mode based on the algorithm order in the table and
+            #  their usage conditions.
             pynccl_comm = self.pynccl_comm
             maybe_pynccl_context: Any
             if not pynccl_comm:
@@ -479,27 +490,48 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
+        outplace_all_reduce_method = None
         if (
+            self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and self.qr_comm.should_quick_allreduce(input_)
+        ):
+            outplace_all_reduce_method = "qr"
+        elif (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
-        ) or (
+        ):
+            outplace_all_reduce_method = "ca"
+        elif (
             self.pymscclpp_comm is not None
             and not self.pymscclpp_comm.disabled
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         ):
-            return torch.ops.sglang.outplace_all_reduce(
-                input_, group_name=self.unique_name
+            outplace_all_reduce_method = "pymscclpp"
+        outplace_all_reduce_method = "ca"
+        if outplace_all_reduce_method is not None:
+            torch.ops.sglang.outplace_all_reduce(
+                input_,
+                group_name=self.unique_name,
+                outplace_all_reduce_method=outplace_all_reduce_method,
             )
         else:
             torch.ops.sglang.inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
-    def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
+    def _all_reduce_out_place(
+        self, input_: torch.Tensor, outplace_all_reduce_method: str
+    ) -> torch.Tensor:
+        qr_comm = self.qr_comm
         ca_comm = self.ca_comm
         pymscclpp_comm = self.pymscclpp_comm
-        assert ca_comm is not None or pymscclpp_comm is not None
-        if ca_comm is not None and not ca_comm.disabled:
+        assert any([qr_comm, ca_comm, pymscclpp_comm])
+        if outplace_all_reduce_method == "qr":
+            assert not qr_comm.disabled
+            out = qr_comm.quick_all_reduce(input_)
+        elif outplace_all_reduce_method == "ca":
+            assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
         else:
             assert not pymscclpp_comm.disabled
