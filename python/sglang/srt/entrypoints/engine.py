@@ -387,6 +387,18 @@ class Engine(EngineBase):
             self.tokenizer_manager.dump_expert_distribution_record()
         )
 
+    def dump_latest_expert_distribution(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            self.tokenizer_manager.dump_latest_expert_distribution()
+        )
+    
+    def dump_sum_expert_distribution(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            self.tokenizer_manager.dump_sum_expert_distribution()
+        )
+        
     def get_server_info(self):
         loop = asyncio.get_event_loop()
         internal_states = loop.run_until_complete(

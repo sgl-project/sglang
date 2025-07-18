@@ -95,6 +95,12 @@ class ExpertDistributionRecorder(ABC):
     def dump_record(self, output_mode: _OutputMode = "file"):
         self._on_not_implemented()
 
+    def dump_latest(self, output_mode: _OutputMode = "file"):
+        self._on_not_implemented()
+
+    def dump_sum(self, output_mode: _OutputMode = "file"):
+        self._on_not_implemented()
+
     @property
     def recording(self):
         return False
@@ -248,6 +254,16 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._reset()
         return output
 
+    def dump_latest(self, output_mode: _OutputMode = "file"):
+        """Dump the latest expert distribution without resetting."""
+        output = self._accumulator.dump(output_mode=output_mode, dump_mode="latest")
+        return output
+    
+    def dump_sum(self, output_mode: _OutputMode = "file"):
+        """Dump the sum expert distribution and without resetting."""
+        output = self._accumulator.dump(output_mode=output_mode, dump_mode="sum")
+        return output
+    
     @property
     def recording(self):
         return self._recording
@@ -597,7 +613,7 @@ class _Accumulator(ABC):
     def reset(self):
         pass
 
-    def dump(self, output_mode: _OutputMode):
+    def dump(self, output_mode: _OutputMode, dump_mode: "all"):
         pass
 
 
@@ -719,7 +735,7 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         super().reset()
         self._records.clear()
 
-    def dump(self, output_mode: _OutputMode):
+    def dump(self, output_mode: _OutputMode, dump_mode: "all"):
         assert output_mode == "file"
         output = dict(
             records=self._records,
@@ -762,9 +778,16 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         super().reset()
         self._global_physical_count_of_buffered_step.reset()
 
-    def dump(self, output_mode: _OutputMode):
+    def dump(self, output_mode: _OutputMode, dump_mode: "all"):
+        if dump_mode=="latest":
+            global_physical_count = self._global_physical_count_of_buffered_step.get_latest()
+        elif dump_mode=="sum":
+            global_physical_count = self._global_physical_count_of_buffered_step.get_sum()
+        else:
+            global_physical_count = self._global_physical_count_of_buffered_step.get_all()
+
         logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
-            self._global_physical_count_of_buffered_step.get_all(),
+            global_physical_count=global_physical_count,
             num_layers=self._expert_location_metadata.num_layers,
             num_logical_experts=self._expert_location_metadata.num_logical_experts,
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
@@ -781,11 +804,13 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         output = dict(
             rank=self._rank,
             logical_count=logical_count_of_buffered_step,
+            physical_count = global_physical_count,
+            last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map
         )
 
         if output_mode == "file":
             if self._rank == 0:
-                _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
+                _dump_to_file(f"expert_{dump_mode}_distribution_recorder_{time.time()}.pt", output)
         elif output_mode == "object":
             return output
         else:
@@ -833,6 +858,12 @@ class _CircularBuffer(_Buffer):
     def get_all(self) -> torch.Tensor:
         return self._buffer
 
+    def get_latest(self) -> torch.Tensor:
+        return self._buffer[self._curr_index - 1] if self._curr_index > 0 else self._buffer[-1]
+    
+    def get_sum(self) -> torch.Tensor:
+        return torch.sum(self._buffer, dim=0)
+    
     def reset(self):
         self._buffer[...] = 0
 

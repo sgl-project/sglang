@@ -470,6 +470,23 @@ async def dump_expert_distribution_record_async():
         status_code=200,
     )
 
+@app.api_route("/dump_latest_expert_distribution", methods=["GET", "POST"])
+async def dump_latest_expert_distribution_async():
+    """Dump the latest expert distribution."""
+    await _global_state.tokenizer_manager.dump_latest_expert_distribution()
+    return Response(
+        content="Dump latest expert distribution.\n",
+        status_code=200,
+    )
+
+@app.api_route("/dump_sum_expert_distribution", methods=["GET", "POST"])
+async def dump_sum_expert_distribution_async():
+    """Dump the sum expert distribution."""
+    await _global_state.tokenizer_manager.dump_sum_expert_distribution()
+    return Response(
+        content="Dump sum expert distribution.\n",
+        status_code=200,
+    )
 
 @app.post("/update_weights_from_disk")
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
