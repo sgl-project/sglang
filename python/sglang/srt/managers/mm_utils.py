@@ -96,10 +96,10 @@ class TransportProxyTensor(torch.Tensor):
                     f"Warning: Failed to get CUDA IPC handle ({e}). Falling back to default transport."
                 )
                 state["metadata"]["transport_mode"] = "default"
-                state["tensor_data"] = self
+                state["tensor_data"] = self.as_subclass(torch.Tensor)
         else:
             state["metadata"]["transport_mode"] = "default"
-            state["tensor_data"] = self
+            state["tensor_data"] = self.as_subclass(torch.Tensor)
 
         return state
 
