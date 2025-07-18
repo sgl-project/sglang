@@ -9,7 +9,6 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
-    FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
 )
 
@@ -31,11 +30,9 @@ def get_config() -> Optional[Dict[str, Any]]:
 
 __all__ = [
     "FusedMoE",
-    "FusedMoEMethodBase",
     "FusedMoeWeightScaleSupported",
     "override_config",
     "get_config",
-    "fused_moe",
     "fused_experts",
     "get_config_file_name",
     "moe_align_block_size",
