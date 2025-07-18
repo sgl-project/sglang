@@ -1690,13 +1690,16 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     return major, minor
 
 
-def get_npu_compiler_config():
-    config = {
+npu_compile_config = {
+    "experimental_config": {
         "frozen_parameter": True,
         "tiling_schedule_optimize": True,
         "topology_sorting_strategy": "StableRDFS",
-    }
-    return config
+    },
+    "inference_config": {"dynamic_gears_merge_policy": "zip"},
+    "mode": os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune"),
+}
+npu_backend = None
 
 
 def get_compiler_backend() -> str:
@@ -1713,11 +1716,27 @@ def get_compiler_backend() -> str:
                 "NPU detected, but torchair package is not installed. "
                 "Please install torchair for torch.compile support on NPU."
             )
+        global npu_backend
+        if npu_backend is not None:
+            logger.info("npu_backend is already registered, return it.")
+            return npu_backend
         compiler_config = CompilerConfig()
-        predefined_config = get_npu_compiler_config()
-        for k, v in predefined_config.items():
-            setattr(compiler_config.experimental_config, k, v)
+        for config_group, config_value in npu_compile_config.items():
+            config_obj = getattr(compiler_config, config_group, None)
+            if config_obj is None:
+                raise ValueError(
+                    f"Invalid config group for torch.compile with npu: {config_group}"
+                )
 
+            if isinstance(config_value, dict):
+                for key, value in config_value.items():
+                    setattr(config_obj, key, value)
+            elif isinstance(config_value, (set, str, bool, int)):
+                setattr(config_obj, config_group, config_value)
+            else:
+                raise TypeError(
+                    f"Unsupported config type for {config_group}: {type(config_value)}"
+                )
         npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
         return npu_backend
 
