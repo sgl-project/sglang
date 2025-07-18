@@ -814,9 +814,15 @@ class ConvertDisaggregationRoleReqInput:
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
     hicache_io_backend: str = ""
-    
+    SGLANG_DISAGGREGATION_THREAD_POOL_SIZE: Optional[int] = None
+    SGLANG_DISAGGREGATION_QUEUE_SIZE: Optional[int] = None
+    SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT: Optional[int] = None
+
     # for convert prefill to decode
     disable_cuda_graph: Optional[bool] = False
+    SGLANG_DISAGGREGATION_WAITING_TIMEOUT: Optional[int] = None
+    SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES: Optional[int] = None
+    SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL: Optional[float] = None
     
 
 @dataclass

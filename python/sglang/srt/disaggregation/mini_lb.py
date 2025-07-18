@@ -412,20 +412,20 @@ async def convert_pd_role(obj: PDConvertRequest):
     """ Convert identity of a PD server """
     server_url = obj.server_url
     if server_url in load_balancer.prefill_servers:
-        if len(load_balancer.prefill_servers) <= 1:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot convert {server_url} to decode, at least one prefill server is required.",
-            )
+        # if len(load_balancer.prefill_servers) <= 1:
+        #     raise HTTPException(
+        #         status_code=400,
+        #         detail=f"Cannot convert {server_url} to decode, at least one prefill server is required.",
+        #     )
         current_role = "prefill"
         load_balancer.remove_prefill_server(server_url)
         logger.info(f"Stop sending req to {server_url}.Waiting for prefill to finish all reqs.")
     elif server_url in load_balancer.decode_servers:
-        if len(load_balancer.decode_servers) <= 1:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Cannot convert {server_url} to prefill, at least one decode server is required.",
-            )
+        # if len(load_balancer.decode_servers) <= 1:
+        #     raise HTTPException(
+        #         status_code=500,
+        #         detail=f"Cannot convert {server_url} to prefill, at least one decode server is required.",
+        #     )
         current_role = "decode"
         load_balancer.remove_decode_server(server_url)
         logger.info(f"Stop sending req to {server_url}.Waiting for decode to finish all reqs.")
@@ -454,14 +454,16 @@ async def convert_pd_role(obj: PDConvertRequest):
             raise HTTPException(
                 status_code=500,
                 detail=f"Wait 10s for server: {server_url} to finish all reqs. "
-                f"May be caused by: 1. Server is not stuck, 2. 10s is not enough for server to finish all reqs.",
+                f"May be caused by: 1. Server is stuck or shut down, 2. 10s is not enough for server to finish all reqs.",
             )
     logger.info(f"All requests to {server_url} have been done, now converting role...")
 
     async with aiohttp.ClientSession() as session:
         while True:
-            response = await session.post(f"{server_url}/convert_pd_role")
+            # response = await session.post(f"{server_url}/convert_pd_role")
+            response = await session.post(f"{server_url}/convert_pd_role",json=dataclasses.asdict(obj))
             content = await response.json()
+
             if content["message"] != "bootstrap":
                 break
             else:

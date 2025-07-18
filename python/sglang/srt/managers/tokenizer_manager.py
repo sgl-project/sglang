@@ -1171,8 +1171,14 @@ class TokenizerManager:
             self.server_args.disaggregation_bootstrap_port = bootstrap_port
             obj.bootstrap_port=bootstrap_port
             req = obj
+            os.environ["SGLANG_DISAGGREGATION_THREAD_POOL_SIZE"] = obj.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE
+            os.environ["SGLANG_DISAGGREGATION_QUEUE_SIZE"] = obj.SGLANG_DISAGGREGATION_QUEUE_SIZE
+            os.environ["SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT"] = obj.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             req = obj
+            os.environ["SGLANG_DISAGGREGATION_WAITING_TIMEOUT"] = obj.SGLANG_DISAGGREGATION_WAITING_TIMEOUT
+            os.environ["SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES"] = obj.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES
+            os.environ["SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL"] = obj.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL
         else:
             return False, "Not support converting disaggregation of 'null'", None
 

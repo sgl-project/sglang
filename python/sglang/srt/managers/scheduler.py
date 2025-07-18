@@ -2747,11 +2747,11 @@ class Scheduler(
             pre_alloc_size = pool_size * 2 if pool_size <= 32 else 0
             
             # set all ref to req-to-token-pool to None to release Cuda memory
+            self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
             self.req_to_token_pool = None
             self.tree_cache.req_to_token_pool = None
             model_runner.attn_backend.model_runner= None
             model_runner.attn_backend = None
-            self.running_batch.req_to_token_pool = None
             gc.collect()
             torch.cuda.empty_cache()
             del model_runner.req_to_token_pool
@@ -2773,7 +2773,6 @@ class Scheduler(
             model_runner.init_cuda_graphs()
             self.req_to_token_pool = model_runner.req_to_token_pool
             self.tree_cache.req_to_token_pool = self.req_to_token_pool
-            self.running_batch.req_to_token_pool = self.req_to_token_pool
 
             # reinitialize the disaggregation resources for decode
             self.disaggregation_mode = DisaggregationMode.DECODE
@@ -2795,11 +2794,12 @@ class Scheduler(
             pool_device=self.req_to_token_pool.device
 
             # three place ref reqtotokenpool, all set None to release Cuda memory
+            self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
             self.req_to_token_pool = None
             self.tree_cache.req_to_token_pool = None
             model_runner.attn_backend.model_runner= None
             model_runner.attn_backend = None
-            self.running_batch.req_to_token_pool = None
+
             if model_runner.cuda_graph_runner is not None:
                 model_runner.cuda_graph_runner.model_runner = None
                 set_global_graph_memory_pool(None)
@@ -2826,7 +2826,7 @@ class Scheduler(
             model_runner.init_cuda_graphs()
             self.req_to_token_pool = model_runner.req_to_token_pool
             self.tree_cache.req_to_token_pool = self.req_to_token_pool
-            self.running_batch.req_to_token_pool = self.req_to_token_pool
+
             # follow the code in ServerArgs
             if self.server_args.disaggregation_decode_dp is None:
                 self.server_args.disaggregation_decode_dp = self.dp_size
@@ -2842,7 +2842,7 @@ class Scheduler(
             self.disaggregation_mode = DisaggregationMode.PREFILL
 
             # reinitialize the tree cache for prefill, as prefill may use radix_cache or hiradix_cache
-            # TODO find all ref of tree cache and set them to None
+
             if not self.server_args.disable_radix_cache:
                 self.policy.tree_cache = None
                 del self.tree_cache
