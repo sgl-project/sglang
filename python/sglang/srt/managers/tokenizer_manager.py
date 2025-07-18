@@ -277,10 +277,14 @@ class TokenizerManager:
             self.server_args.disaggregation_transfer_backend
         )
         # Start kv boostrap server on prefill
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # only start bootstrap server on prefill tm
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            or self.disaggregation_mode == DisaggregationMode.EMBEDDING
+        ):
+            # only start bootstrap server on prefill/embedding tm
+            is_multimodal = self.disaggregation_mode == DisaggregationMode.EMBEDDING
             kv_bootstrap_server_class = get_kv_class(
-                self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER
+                self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER, is_multimodal
             )
             self.bootstrap_server = kv_bootstrap_server_class(
                 self.server_args.disaggregation_bootstrap_port
@@ -431,30 +435,6 @@ class TokenizerManager:
             ]
         )
 
-        # For pd disaggregtion
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
-        self.transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
-        )
-        # Start kv boostrap server on prefill
-        if (
-            self.disaggregation_mode == DisaggregationMode.PREFILL
-            or self.disaggregation_mode == DisaggregationMode.EMBEDDING
-        ):
-            is_multimodal = self.disaggregation_mode == DisaggregationMode.EMBEDDING
-            # only start bootstrap server on prefill tm
-            kv_bootstrap_server_class = get_kv_class(
-                self.transfer_backend, KVClassType.BOOTSTRAP_SERVER, is_multimodal
-            )
-            self.bootstrap_server = kv_bootstrap_server_class(
-                self.server_args.disaggregation_bootstrap_port
-            )
-
-        self.current_load = 0
-        self.current_load_lock = asyncio.Lock()
-
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -524,14 +504,11 @@ class TokenizerManager:
             encoded = self.tokenizer(
                 input_text, return_token_type_ids=is_cross_encoder_request
             )
-            input_ids = self.tokenizer.encode(input_text)
+            input_ids = encoded["input_ids"]
             if is_cross_encoder_request:
                 input_ids = encoded["input_ids"][0]
                 token_type_ids = encoded.get("token_type_ids", [None])[0]
 
-        logger.debug(
-            f"obj.contains_mm_input(): {obj.contains_mm_input()}; self.mm_processor: {self.mm_processor}"
-        )
         if self.mm_processor and obj.contains_mm_input():
             if not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]

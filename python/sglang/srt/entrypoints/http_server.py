@@ -56,7 +56,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ModelCard,
     ModelList,
     ScoringRequest,
-    TokenizeRequest,
     V1RerankReqInput,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -398,13 +397,6 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         return ret
     except ValueError as e:
         return _create_error_response(e)
-
-
-@app.post("/tokenize")
-async def v1_tokenization_request(request: TokenizeRequest, raw_request: Request):
-    return await raw_request.app.state.openai_serving_tokenization.handle_request(
-        request, raw_request
-    )
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])

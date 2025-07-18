@@ -170,14 +170,6 @@ class MiniLoadBalancer:
                 total=3600
             )  # Add timeout for request reliability
         ) as session:
-            print(
-                f"vision_modified_request: {vision_modified_request} with {vision_server}/{vision_endpoint}",
-                flush=True,
-            )
-            print(
-                f"prefill_modified_request: {prefill_modified_request} with {prefill_server}/{prefill_endpoint}",
-                flush=True,
-            )
             tasks = [
                 session.post(
                     f"{vision_server}/{vision_endpoint}", json=vision_modified_request

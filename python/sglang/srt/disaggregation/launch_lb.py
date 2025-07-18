@@ -76,7 +76,6 @@ class LBArgs:
         parser.add_argument(
             "--prefill-bootstrap-ports",
             type=int,
-            default=[8998],
             nargs="+",
             help="Bootstrap ports for prefill servers",
         )

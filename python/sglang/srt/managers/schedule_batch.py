@@ -1186,15 +1186,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req, pre_len, self.model_config.attention_chunk_size
                     )
 
-            # If input_embeds are available, store them, support chunked prefill
+            # If input_embeds are available, store them
             if req.input_embeds is not None:
-                logger.debug(f"input_embeds: {req.input_embeds.shape}")
+                # for multimoldal embedding, tolist op is heavy, keep tensor format
                 if isinstance(req.input_embeds, list):
                     input_embeds.extend(
                         req.input_embeds[len(req.prefix_indices) : len(req.fill_ids)]
                     )  # Use extend to avoid nesting
                 else:
-                    logger.debug(f"{len(req.prefix_indices)=}, {len(req.fill_ids)=}")
                     chunk_embeds = req.input_embeds[
                         len(req.prefix_indices) : len(req.fill_ids)
                     ]

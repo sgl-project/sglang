@@ -199,8 +199,7 @@ async def preprocess_video(
 
 # Compatible with Qwen2VL and Qwen2_5VL
 class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
-    models = [Qwen2VLForConditionalGeneration,
-Qwen2_5_VLForConditionalGeneration]
+    models = [Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)

@@ -84,7 +84,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 # Handle multimodal embedding inputs
                 texts = []
                 images = []
-                for idx, item in enumerate(prompt):
+                for item in prompt:
                     # Use padding for text if None - this could be improved
                     texts.append(item.text if item.text is not None else "padding")
                     images.append(item.image if item.image is not None else None)
