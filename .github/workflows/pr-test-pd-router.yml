@@ -69,13 +69,6 @@ jobs:
     - name: Validate environment
       run: |
         echo "=== System Validation ==="
-        bash scripts/killall_sglang.sh
-        sudo kill -9 361081
-        sudo kill -9 361082
-        sudo kill -9 361083
-        sudo kill -9 4135879
-        sudo kill -9 4129509
-        sudo kill -9 4129851
         nvidia-smi
         echo "GPU count: $(nvidia-smi -L | wc -l)"
         if [ $(nvidia-smi -L | wc -l) -lt 8 ]; then
