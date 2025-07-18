@@ -500,7 +500,7 @@ class TestOpenAIVisionServer(CustomTestCase):
         self.assertIsNotNone(audio_response)
         self.assertGreater(len(audio_response), 0)
 
-        return audio_response
+        return audio_response.lower()
 
     def _test_audio_speech_completion(self):
         # a fragment of Trump's speech
