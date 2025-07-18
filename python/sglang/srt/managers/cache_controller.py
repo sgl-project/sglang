@@ -220,6 +220,7 @@ class HiCacheController:
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         mem_pool_host: HostKVCache,
+        tp_cache_group: torch.distributed.ProcessGroup,
         page_size: int,
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through_selective",
@@ -230,6 +231,8 @@ class HiCacheController:
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         self.mem_pool_host = mem_pool_host
+        group_ranks = torch.distributed.get_process_group_ranks(tp_cache_group)
+        self.tp_group = torch.distributed.new_group(group_ranks, backend="gloo")
         self.write_policy = write_policy
         self.page_size = page_size
         # using kernel for small page KV cache transfer and DMA for large pages
@@ -564,6 +567,16 @@ class HiCacheController:
         aux_thread.start()
         while (not self.stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
+                queue_size = torch.tensor(self.prefetch_queue.qsize(), dtype=torch.int)
+                if torch.distributed.get_world_size(group=self.tp_group) > 1:
+                    torch.distributed.all_reduce(
+                        queue_size,
+                        op=torch.distributed.ReduceOp.MIN,
+                        group=self.tp_group,
+                    )
+                if queue_size.item() == 0:
+                    continue
+
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
@@ -587,6 +600,18 @@ class HiCacheController:
                         remaining_tokens -= self.page_size
                     else:
                         break
+
+                storage_hit_count_tensor = torch.tensor(
+                    storage_hit_count, dtype=torch.int
+                )
+                if torch.distributed.get_world_size(group=self.tp_group) > 1:
+                    torch.distributed.all_reduce(
+                        storage_hit_count_tensor,
+                        op=torch.distributed.ReduceOp.MIN,
+                        group=self.tp_group,
+                    )
+                storage_hit_count = storage_hit_count_tensor.item()
+                hash_value = hash_value[: (storage_hit_count // self.page_size)]
 
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits

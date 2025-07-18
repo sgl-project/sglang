@@ -58,6 +58,7 @@ class HiRadixCache(RadixCache):
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator,
             self.token_to_kv_pool_host,
+            tp_cache_group,
             page_size,
             load_cache_event=self.load_cache_event,
             write_policy=hicache_write_policy,

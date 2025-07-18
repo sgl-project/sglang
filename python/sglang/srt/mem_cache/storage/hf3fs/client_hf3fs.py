@@ -18,8 +18,8 @@ try:
         make_iovec,
         register_fd,
     )
-except ImportError:
-    logger.warning("hf3fs_fuse.io is not available")
+except ImportError as e:
+    logger.warning(f"hf3fs_fuse.io is not available: {e}")
 
 
 def rsynchronized():
