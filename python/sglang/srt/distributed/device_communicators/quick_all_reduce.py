@@ -182,7 +182,9 @@ class QuickAllReduce:
         # On RocM, bfloat16 kernels are slower than fp16
         # due to slower match operations
         # If environment variable is set to 1, we convert input to fp16
-        self.use_fp16_kernels = os.environ.get("ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", 1)
+        self.use_fp16_kernels = int(
+            os.environ.get("ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", 1)
+        )
         regime_str = os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE")
         if regime_str not in QuickReduceRegime.__members__:
             logger.warning(
@@ -201,12 +203,13 @@ class QuickAllReduce:
             )
             return
         self.qr_quant_level = QuickReduceRegime[regime_str]
+
         # TODO: If the dtype is not bfloat16 or then float16,
         # quickallreduce should not be created.
 
         # ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB is specified in MB
-        qr_max_size = os.environ.get("ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", None)
-        if qr_max_size is not None:
+        qr_max_size = int(os.environ.get("ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", 0))
+        if qr_max_size > 0:
             if qr_max_size < 1:
                 logger.info(
                     "You should not set a max_size smaller than 1MB, which can "
@@ -215,7 +218,7 @@ class QuickAllReduce:
             qr_max_size = qr_max_size * MB
         # If qr_max_size is None, then 2GB is used by default.
         self._ptr = ops.init_custom_qr(self.rank, self.world_size, qr_max_size)
-        self.qr_max_size = qr_max_size if qr_max_size is not None else ops.qr_max_size()
+        self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
         self.create_shared_buffer()
         self.disabled = False
 
