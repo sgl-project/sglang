@@ -99,6 +99,14 @@ class GeluAndMul(CustomOp):
             raise RuntimeError("GeluAndMul only support tanh or none")
         return out
 
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        y_npu, gelu_npu = torch_npu.geglu(
+            x,
+            dim=-1,
+            approximate=1 if self.approximate == 'tanh' else 0,
+            activate_left=True)
+        return y_npu
+
 
 class NewGELU(CustomOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
@@ -117,6 +125,9 @@ class QuickGELU(CustomOp):
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         # TODO(zhyncs): Implement the CUDA kernel for QuickGELU in sgl-kernel
         return self.forward_native(x)
+
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        return torch_npu.npu_fast_gelu(x)
 
 
 class ScaledActivation(nn.Module):
