@@ -93,6 +93,19 @@ def fused_topk_cpu(
     return topk_weights, topk_ids
 
 
+def apply_topk_weights_cpu(need_apply, topk_weights, inputs):
+    if not need_apply:
+        return inputs, topk_weights
+
+    # TODO: fuse below processing in fused_experts_cpu kernel
+    inputs = inputs * topk_weights.to(inputs.dtype)
+    topk_weights = torch.ones_like(
+        topk_weights, dtype=torch.float32
+    )  # clear topk_weights as already applied
+
+    return inputs, topk_weights
+
+
 def fused_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
