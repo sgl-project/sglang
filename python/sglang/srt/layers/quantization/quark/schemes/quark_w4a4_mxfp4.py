@@ -13,6 +13,7 @@ from sglang.srt.utils import get_bool_env_var, supports_mx
 
 from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
+from aiter.ops.triton.mxfp import upcast_from_mxfp
 from aiter.ops.gemm_op_a4w4 import gemm_a4w4
 from aiter.ops.shuffle import shuffle_weight
 
@@ -43,20 +44,13 @@ class QuarkW4A4MXFP4(QuarkScheme):
         return 70
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.weight = torch.nn.Parameter(layer.weight.data,
+        wshuffle = shuffle_weight(layer.weight.data, layout=(16, 16))
+        w_scales_shuffle = e8m0_shuffle(layer.weight_scale.data).view(dtypes.fp8_e8m0)
+
+        layer.weight = torch.nn.Parameter(wshuffle,
                                           requires_grad=False)
-        layer.weight_scale = torch.nn.Parameter(layer.weight_scale.data,
+        layer.weight_scale = torch.nn.Parameter(w_scales_shuffle,
                                                 requires_grad=False)
-
-        if self.emulate and not self.emulate_memory:
-            layer.weight = torch.nn.Parameter(
-                dequant_mxfp4(layer.weight.data, layer.weight_scale.data, self.out_dtype),
-                requires_grad=False,
-            )
-            layer.weight_scale = None
-
-            # This call is necessary to release the scales memory.
-            torch.cuda.empty_cache()
 
     def create_weights(self, layer: torch.nn.Module,
                        output_partition_sizes: list[int],
@@ -102,17 +96,11 @@ class QuarkW4A4MXFP4(QuarkScheme):
         M = x.shape[0]
         N = layer.weight.shape[0]
 
-        #print(f"x: {x.shape} layer.weight: {layer.weight.shape} layer.weight_scale: {layer.weight_scale.shape}", flush=True)
-
         quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
         x, x_scales_shuffle = quant_func(x, shuffle=True)
 
-        wshuffle = shuffle_weight(layer.weight.data, layout=(16, 16))
-
-        w_scales_shuffle = e8m0_shuffle(layer.weight_scale.data).view(dtypes.fp8_e8m0)
-
         y = torch.zeros((M + 255) // 256 * 256, N, device=x.device, dtype=self.out_dtype)
 
-        #print(f"x: {x} wshuffle: {wshuffle} w_scales_shuffle: {w_scales_shuffle} x_scales_shuffle: {x_scales_shuffle} y: {y}", flush=True)
+        out = gemm_a4w4(x, layer.weight.data, x_scales_shuffle, layer.weight_scale.data, y, bias=bias)
 
-        return gemm_a4w4(x, wshuffle, x_scales_shuffle, w_scales_shuffle, y, bias=bias)
+        return out[:M]
