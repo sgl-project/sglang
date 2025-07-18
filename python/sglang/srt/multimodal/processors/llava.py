@@ -196,7 +196,7 @@ class LlavaMultimodalProcessor(BaseMultimodalProcessor):
 
         if vision_type := getattr(self.vision_config, "model_type"):
             self.inner = self._get_sgl_processor_cls(vision_type)(
-                hf_config, server_args, _processor
+                hf_config, server_args, _processor, *args
             )
         else:
             raise ValueError(
