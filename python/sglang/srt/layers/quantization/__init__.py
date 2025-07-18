@@ -36,13 +36,15 @@ except ImportError:
         def override_quantization_method(self, *args, **kwargs):
             return None
 
-    AQLMConfig = AWQMarlinConfig = BitsAndBytesConfig = CompressedTensorsConfig = (
-        DeepSpeedFPConfig
-    ) = ExpertsInt8Config = FBGEMMFp8Config = GGUFConfig = GPTQMarlin24Config = (
-        MarlinConfig
-    ) = QQQConfig = Int8TpuConfig = DummyConfig
+    AQLMConfig = AWQMarlinConfig = AutoRoundConfig = BitsAndBytesConfig = (
+        CompressedTensorsConfig
+    ) = DeepSpeedFPConfig = ExpertsInt8Config = FBGEMMFp8Config = GGUFConfig = (
+        GPTQMarlin24Config
+    ) = MarlinConfig = QQQConfig = Int8TpuConfig = DummyConfig
 
 
+from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
+from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
 from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
@@ -101,6 +103,7 @@ VLLM_QUANTIZATION_METHODS = {
     "experts_int8": ExpertsInt8Config,
     "gptq_marlin": GPTQMarlinConfig,
     "gptq": GPTQConfig,
+    "auto-round": AutoRoundConfig,
 }
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS, **VLLM_QUANTIZATION_METHODS}
