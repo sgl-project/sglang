@@ -39,7 +39,9 @@ __device__ inline bool cmp_eq(const T& a, const T& b) {
 // Fixed constants common to both dynamic and static template versions:
 static constexpr int WARP_SIZE = 32;
 static constexpr int WARPS_PER_CTA = 6;
-static constexpr int MAX_VPT = 32;  // maximum VPT we support, > params.VPT = num_expert / num_expert_group
+// DeepSeek V3/R1: num_experts = 256, n_group = 8
+// Kimi K2:        num_experts = 384, n_group =1
+static constexpr int MAX_VPT = 384;  // maximum VPT we support, > params.VPT = num_expert / num_expert_group
 
 // Create an alias for Array using AlignedArray
 template <typename T, int N>
@@ -417,6 +419,17 @@ std::vector<at::Tensor> moe_fused_gate(
   //   Case 3: other cases, require 8 <= num_experts / num_expert_group <= 32
   bool dispatched = false;
   switch (num_experts) {
+    case 384:
+      if (num_expert_group == 1)
+        // For Kimi K2 case. VPT = 384/1 = 384, THREADS_PER_ROW=1, ROWS_PER_WARP=32/1=32, ROWS_PER_CTA=6*32=192.
+        if (input.scalar_type() == at::kBFloat16) {
+          LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 384, 1);
+        } else if (input.scalar_type() == at::kHalf) {
+          LAUNCH_MOE_GATE_CONFIG(float16_t, 384, 1);
+        } else if (input.scalar_type() == at::kFloat) {
+          LAUNCH_MOE_GATE_CONFIG(float32_t, 384, 1);
+        }
+      break;
     case 256:
       if (num_expert_group == 8)
         // This is deepseek v3 case. Here VPT = 256/8 = 32, ROWS_PER_WARP = 32/8 = 4, ROWS_PER_CTA = 6 * 4 = 24.
