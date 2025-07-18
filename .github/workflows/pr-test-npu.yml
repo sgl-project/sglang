@@ -1,0 +1,50 @@
+name: PR Test (Ascend NPU)
+
+on:
+  pull_request:
+    types: [ labeled ]
+
+# Bash shells do not use ~/.profile or ~/.bashrc so these shells need to be explicitly
+# declared as "shell: bash -el {0}" on steps that need to be properly activated.
+# It's used to activate ascend-toolkit environment variables.
+defaults:
+  run:
+    shell: bash -el {0}
+
+# only 1 job can runs on static-8-cards
+concurrency:
+  group: static-8-cards
+  cancel-in-progress: false
+
+jobs:
+  basic-test-8-npu:
+    # pr-test will be triggered when tag 'npu-test'
+    if: ${{ contains(github.event.pull_request.labels.*.name, 'npu-test') }}
+    name: Basic 8 cards test
+    runs-on: npu
+
+    container:
+      image: m.daocloud.io/quay.io/ascend/cann:8.1.rc1-910b-ubuntu22.04-py3.10
+      volumes:
+        - /usr/local/dcmi:/usr/local/dcmi
+        - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi
+        - /usr/local/Ascend/driver/:/usr/local/Ascend/driver/
+        # Use self-host cache speed up pip and model download
+        - /home/action/.cache:/github/home/.cache/
+      options: >-
+        --device /dev/davinci0
+        --device /dev/davinci1
+        --device /dev/davinci2
+        --device /dev/davinci3
+        --device /dev/davinci4
+        --device /dev/davinci5
+        --device /dev/davinci6
+        --device /dev/davinci7
+        --device /dev/davinci_manager
+        --device /dev/devmm_svm
+        --device /dev/hisi_hdc
+    steps:
+      - name: Check npu and CANN info
+        run: |
+          npu-smi info
+          cat /usr/local/Ascend/ascend-toolkit/latest/"$(uname -i)"-linux/ascend_toolkit_install.info
