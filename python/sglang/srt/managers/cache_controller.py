@@ -249,8 +249,6 @@ class HiCacheController:
             if storage_backend == "file":
                 self.storage_backend = HiCacheFile()
                 self.enable_storage = True
-                # tracking prefetch operation progress
-                self.ongoing_prefetch: dict[int, PrefetchOperation] = {}
                 # todo: threshold policy for prefetching
                 self.prefetch_threshold = prefetch_threshold
             elif storage_backend == "hf3fs":
@@ -265,8 +263,6 @@ class HiCacheController:
                     rank, bytes_per_page, dtype
                 )
                 self.enable_storage = True
-                # tracking prefetch operation progress
-                self.ongoing_prefetch: dict[int, PrefetchOperation] = {}
                 # todo: threshold policy for prefetching
                 self.prefetch_threshold = prefetch_threshold
             else:
@@ -521,20 +517,13 @@ class HiCacheController:
         operation = PrefetchOperation(
             request_id, host_indices, new_input_tokens, last_hash
         )
-        self.ongoing_prefetch[request_id] = operation
         self.prefetch_queue.put(operation)
+        return operation
 
-    def prefetch_done(self, request_id: str):
-        return self.ongoing_prefetch[request_id].completed_tokens == len(
-            self.ongoing_prefetch[request_id].token_ids
-        )
+    def prefetch_done(self, operation):
+        return operation.completed_tokens == len(operation.token_ids)
 
-    def terminate_prefetch(self, request_id: str):
-        operation = self.ongoing_prefetch.pop(request_id, None)
-        if operation is None:
-            raise ValueError(
-                f"Request ID {request_id} not found in ongoing prefetches."
-            )
+    def terminate_prefetch(self, operation):
         operation.mark_done()
         return operation.completed_tokens, operation.hash_value
 
