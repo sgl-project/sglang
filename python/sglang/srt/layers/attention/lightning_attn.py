@@ -388,18 +388,12 @@ class LightningAttnBackend(AttentionBackend):
             decode_batch_size = q.shape[0]
             slot_id = torch.arange(decode_batch_size, dtype=torch.long, device=q.device)
 
-        # Ensure slot_id has the right shape
-        if len(slot_id) != q.shape[0]:
-            # Adjust slot_id to match the decode batch size
-            decode_batch_size = q.shape[0]
-            if len(slot_id) > decode_batch_size:
-                slot_id = slot_id[:decode_batch_size]
-            else:
-                # Extend with additional indices if needed
-                additional_slots = torch.arange(
-                    len(slot_id), decode_batch_size, dtype=torch.long, device=q.device
-                )
-                slot_id = torch.cat([slot_id, additional_slots])
+        # Assert that slot_id length matches the expected decode batch size
+        # This helps catch bugs in the upstream logic rather than silently fixing them
+        assert len(slot_id) == q.shape[0], (
+            f"slot_id length {len(slot_id)} does not match decode batch size {q.shape[0]}. "
+            "This indicates a bug in the upstream logic that should be investigated."
+        )
 
         hidden = linear_decode_forward_triton(
             q, k, v, kv_cache, attn_metadata.slope_rates, slot_id, 32
@@ -1121,17 +1115,12 @@ def linear_decode_forward_triton(
     if B == 0 or H == 0 or D == 0:
         return torch.empty((B, D * H), device=q.device, dtype=q.dtype)
 
-    # Ensure slot_idx has the right length
-    if len(slot_idx) != B:
-        # Adjust slot_idx to match batch size
-        if len(slot_idx) > B:
-            slot_idx = slot_idx[:B]
-        else:
-            # Extend with safe indices
-            additional_slots = torch.arange(
-                len(slot_idx), B, dtype=slot_idx.dtype, device=slot_idx.device
-            )
-            slot_idx = torch.cat([slot_idx, additional_slots])
+    # Assert that slot_idx length matches the batch size
+    # This helps catch bugs in the upstream logic rather than silently fixing them
+    assert len(slot_idx) == B, (
+        f"slot_idx length {len(slot_idx)} does not match batch size {B}. "
+        "This indicates a bug in the upstream logic that should be investigated."
+    )
 
     # Initialize output tensor
     output = torch.empty_like(q)
@@ -1179,9 +1168,11 @@ def linear_decode_forward_triton(
             BLOCK_SIZE=actual_block_size,
         )
     except Exception as e:
-        # Fallback to a simple implementation if kernel fails
-        print(f"Warning: Triton kernel failed with error: {e}, using fallback")
-        return torch.zeros((B, D * H), device=q.device, dtype=q.dtype)
+        # Log the error and re-raise to make the failure explicit
+        import logging
+
+        logging.error(f"Triton kernel failed in linear_decode_forward_triton: {e}")
+        raise RuntimeError(f"Triton kernel execution failed: {e}") from e
 
     # Reshape output and return
     output = rearrange(output, "b h n d -> b n (h d)")

@@ -102,6 +102,11 @@ class ConstantSizeCache(ABC):
             # set as pad, do not allocate destination index
             return PAD_SLOT_ID
         elif cur_rid not in self.cache_indices_mapping:
+            if not self.free_cache_indices:
+                raise RuntimeError(
+                    f"No free cache indices available for request {cur_rid}. "
+                    f"Cache capacity may be exceeded or not properly managed."
+                )
             destination_index = self.free_cache_indices.pop()
             self.cache_indices_mapping[cur_rid] = {seq_id: destination_index}
             return destination_index
@@ -111,6 +116,11 @@ class ConstantSizeCache(ABC):
             # existing cache into the siblings seq_ids caches
             index_exists = next(iter(seq_ids2indices.values()))
             # case of decoding n>1, copy prefill cache to decoding indices
+            if not self.free_cache_indices:
+                raise RuntimeError(
+                    f"No free cache indices available for parallel sampling of request {cur_rid}, seq_id {seq_id}. "
+                    f"Cache capacity may be exceeded or not properly managed."
+                )
             destination_index = self.free_cache_indices.pop()
             self._copy_cache(from_index=index_exists, to_index=destination_index)
             self.cache_indices_mapping[cur_rid][seq_id] = destination_index

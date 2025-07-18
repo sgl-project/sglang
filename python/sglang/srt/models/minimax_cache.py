@@ -30,5 +30,4 @@ class MinimaxCacheManager(ConstantSizeCache):
 
     def _copy_cache(self, from_index: int, to_index: int):
         assert len(self.cache) > 0
-        for cache_t in self.cache:
-            cache_t[:, to_index].copy_(cache_t[:, from_index], non_blocking=True)
+        self.cache[:, to_index].copy_(self.cache[:, from_index], non_blocking=True)

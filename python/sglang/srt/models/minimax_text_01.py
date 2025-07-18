@@ -590,9 +590,7 @@ class MiniMaxText01DecoderLayer(nn.Module):
                 prefix=prefix,
             )
         else:
-            raise ValueError(
-                f"Unsupported attention type: {self.config.attention_type}"
-            )
+            raise ValueError(f"Unsupported attention type: {config.attention_type}")
 
         if expert_num == 1:
             self.mlp = MiniMaxText01MLP(
@@ -896,7 +894,10 @@ class MiniMaxText01Model(nn.Module):
             dtype=torch.float32, cache_shape=self.cache_shape
         )
 
-        # Initialize lightning attention backend
+        # Initialize lightning attention backend with proper configuration
+        self.attn_backend = self._initialize_attention_backend(config, scheduler_config)
+
+        # Initialize rotary embedding
         head_dim = getattr(config, "head_dim", None)
         if head_dim is None:
             head_dim = config.hidden_size // config.num_attention_heads
@@ -925,6 +926,40 @@ class MiniMaxText01Model(nn.Module):
             self.norm = PPMissingLayer()
         self.embed_scale = 1.0
         return
+
+    def _initialize_attention_backend(self, config, scheduler_config):
+        """Initialize the lightning attention backend with proper configuration."""
+
+        # Create a proper model runner stub for the backend
+        class ModelRunnerStub:
+            def __init__(self, device, config):
+                self.device = device
+                self.config = config
+
+        # Use the actual device from the model (fallback to CPU if not available)
+        device = (
+            next(self.parameters()).device
+            if list(self.parameters())
+            else torch.device("cpu")
+        )
+        model_runner_stub = ModelRunnerStub(device, config)
+
+        # Calculate proper head_dim
+        head_dim = getattr(config, "head_dim", None)
+        if head_dim is None:
+            head_dim = config.hidden_size // config.num_attention_heads
+
+        # Get proper max_context_len
+        max_context_len = config.max_position_embeddings
+        if hasattr(config, "max_model_len") and isinstance(config.max_model_len, int):
+            max_context_len = min(config.max_position_embeddings, config.max_model_len)
+
+        return LightningAttnBackend(
+            model_runner=model_runner_stub,
+            num_heads=config.num_attention_heads,
+            head_dim=head_dim,
+            max_context_len=max_context_len,
+        )
 
     def _clear_prefill_cache(
         self, attn_metadata, minimax_cache_tensors: torch.Tensor, **kwargs
@@ -967,24 +1002,9 @@ class MiniMaxText01Model(nn.Module):
         attn_backend: Optional[LightningAttnBackend] = None,
         **kwargs,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        # Initialize attention backend if not provided
+        # Use provided backend or fall back to the model's initialized backend
         if attn_backend is None:
-            # Create a simple model runner stub for the backend
-            class DummyModelRunner:
-                def __init__(self, device):
-                    self.device = device
-
-            dummy_model_runner = DummyModelRunner(
-                input_ids.device if input_ids is not None else inputs_embeds.device
-            )
-            attn_backend = LightningAttnBackend(
-                model_runner=dummy_model_runner,
-                num_heads=(
-                    self.config.num_attention_heads if hasattr(self, "config") else 32
-                ),
-                head_dim=64,  # Default value
-                max_context_len=4096,  # Default value
-            )
+            attn_backend = self.attn_backend
 
         # Auto-initialize AttentionMetadata if not provided
         batch_size = (
@@ -1207,6 +1227,7 @@ class MiniMaxText01ForCausalLM(nn.Module):
                         "w13_weight" if weight_name in ["w1", "w3"] else "w2_weight",
                         f"experts.{expert_id}.{weight_name}.weight",
                         expert_id,
+                        weight_name,
                     )
                     for expert_id in range(max(self.config.num_local_experts))
                     for weight_name in ["w1", "w2", "w3"]
