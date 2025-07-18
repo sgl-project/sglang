@@ -373,11 +373,11 @@ class UnquantizedFusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
             layer.register_parameter("w2_bias", None)
     
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight.data = torch.transpose(layer.w13_weight.data, 1, 2).contiguous()
+        layer.w13_weight.data = torch.transpose(layer.w13_weight.data, 1, 2)
         if self.shuffle_weight:
             layer.w13_weight.data = shuffle_for_activation_kernel(layer.w13_weight.data)
             torch.cuda.empty_cache()
-        layer.w2_weight.data = torch.transpose(layer.w2_weight.data, 1, 2).contiguous()
+        layer.w2_weight.data = torch.transpose(layer.w2_weight.data, 1, 2)
         torch.cuda.empty_cache()
         if self.bias:
             layer.w13_bias.data = layer.w13_bias.data.to(torch.float32)
