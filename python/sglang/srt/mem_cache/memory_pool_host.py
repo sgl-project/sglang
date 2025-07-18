@@ -235,6 +235,10 @@ class MHATokenToKVPoolHost(HostKVCache):
     def v_buffer(self):
         return self.kv_buffer[1]
 
+    @property
+    def layout_dim(self):
+        return self.size * self.head_num * self.head_dim
+
 
 class MLATokenToKVPoolHost(HostKVCache):
     device_pool: MLATokenToKVPool
@@ -276,3 +280,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
         )
+
+    @property
+    def layout_dim(self):
+        return self.size * (self.kv_lora_rank + self.qk_rope_head_dim)
