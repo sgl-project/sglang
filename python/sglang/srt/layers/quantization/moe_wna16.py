@@ -1,4 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/moe_wna16.py
+from __future__ import annotations
 
 import logging
 from typing import Any, Callable, Dict, List, Optional
@@ -7,13 +8,14 @@ import torch
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import get_tp_group
-from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import get_device_capability, set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -118,7 +120,7 @@ class MoeWNA16Config(QuantizationConfig):
         raise NotImplementedError
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "MoeWNA16Config":
+    def from_config(cls, config: Dict[str, Any]) -> MoeWNA16Config:
         quant_method = cls.get_from_keys(config, ["quant_method"])
         weight_bits = cls.get_from_keys(config, ["bits"])
         group_size = cls.get_from_keys(config, ["group_size"])
@@ -177,8 +179,9 @@ class MoeWNA16Config(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
         # avoid circular import
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         if is_layer_skipped_quant(prefix, self.modules_to_not_convert):
@@ -209,31 +212,12 @@ def is_layer_skipped_quant(prefix: str, modules_to_not_convert: List[str]):
     return any(module_name in prefix for module_name in modules_to_not_convert)
 
 
-class MoeWNA16Method:
+class MoeWNA16Method(FusedMoEMethodBase):
     """Linear method for MOE WNA16 (W8A16/W4A16) quantization.
 
     Args:
         quant_config: The MOE WNA16 (W8A16/W4A16) quantization config.
     """
-
-    def __new__(cls, *args, **kwargs):
-        # avoid circular import
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
-
-        if not hasattr(cls, "_initialized"):
-            original_init = cls.__init__
-            new_cls = type(
-                cls.__name__,
-                (FusedMoEMethodBase,),
-                {
-                    "__init__": original_init,
-                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
-                },
-            )
-            obj = super(new_cls, new_cls).__new__(new_cls)
-            obj.__init__(*args, **kwargs)
-            return obj
-        return super().__new__(cls)
 
     def __init__(self, quant_config: MoeWNA16Config):
         self.quant_config = quant_config

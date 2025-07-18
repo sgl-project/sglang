@@ -64,6 +64,7 @@ suites = {
         TestFile("test_fused_moe.py", 30),
         TestFile("test_hicache.py", 116),
         TestFile("test_hicache_mla.py", 127),
+        TestFile("test_hicache_storage.py", 127),
         TestFile("test_hidden_states.py", 55),
         TestFile("test_int8_kernel.py", 8),
         TestFile("test_input_embeddings.py", 38),
@@ -146,6 +147,7 @@ suites = {
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_rope_rocm.py", 3),
+        TestFile("test_awq_dequant.py", 2),
     ],
     "per-commit-npu": [
         TestFile("test_ascend_attention_backend.py", 400),
