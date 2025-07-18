@@ -222,6 +222,7 @@ class ServerArgs:
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
     hicache_io_backend: str = ""
+    hicache_storage_backend: Optional[str] = None
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
@@ -1603,6 +1604,13 @@ class ServerArgs:
             choices=["direct", "kernel"],
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
+        )
+        parser.add_argument(
+            "--hicache-storage-backend",
+            type=str,
+            choices=["file"],  # todo, mooncacke
+            default=ServerArgs.hicache_storage_backend,
+            help="The storage backend for hierarchical KV cache.",
         )
         parser.add_argument(
             "--flashinfer-mla-disable-ragged",
