@@ -182,10 +182,8 @@ class QuickAllReduce:
         # On RocM, bfloat16 kernels are slower than fp16
         # due to slower match operations
         # If environment variable is set to 1, we convert input to fp16
-        self.use_fp16_kernels = os.environ.get(
-            "VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", 1
-        )
-        regime_str = os.environ.get("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION", "NONE")
+        self.use_fp16_kernels = os.environ.get("ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", 1)
+        regime_str = os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE")
         if regime_str not in QuickReduceRegime.__members__:
             logger.warning(
                 "Custom quick allreduce:",
@@ -199,15 +197,15 @@ class QuickAllReduce:
             logger.debug(
                 "Custom quick allreduce is disabled based "
                 "on env variable "
-                "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION='NONE'"
+                "ROCM_QUICK_REDUCE_QUANTIZATION='NONE'"
             )
             return
         self.qr_quant_level = QuickReduceRegime[regime_str]
         # TODO: If the dtype is not bfloat16 or then float16,
         # quickallreduce should not be created.
 
-        # VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB is specified in MB
-        qr_max_size = os.environ.get("VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", None)
+        # ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB is specified in MB
+        qr_max_size = os.environ.get("ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", None)
         if qr_max_size is not None:
             if qr_max_size < 1:
                 logger.info(
