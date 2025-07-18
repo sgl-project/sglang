@@ -37,6 +37,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8EPMoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
+    per_token_group_quant_fp8,
     sglang_per_token_group_quant_fp8,
     sglang_per_token_quant_fp8,
 )
@@ -51,12 +52,16 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_hip,
     is_npu,
+    next_power_of_2,
 )
 
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_flashinfer_blockscale_fp8_moe = get_bool_env_var(
+    "SGLANG_USE_FLASHINFER_BLOCKSCALE_FP8_MOE"
+)
 
 if not _is_npu:
     from sgl_kernel import silu_and_mul
@@ -70,6 +75,13 @@ if _use_aiter:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
+
+if _use_flashinfer_blockscale_fp8_moe:
+    try:
+        import flashinfer.fused_moe as fi_fused_moe
+    except ImportError:
+        fi_fused_moe = None
+        _use_flashinfer_blockscale_fp8_moe = False
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +157,16 @@ class GroupedGemmRunner(torch.nn.Module):
                 use_per_token_if_dynamic=self.use_per_token_if_dynamic,
             )
         return c
+
+
+def _get_tile_tokens_dim(num_tokens, top_k, num_experts):
+    # Guess tokens per expert assuming perfect expert distribution first.
+    num_tokens_per_expert = (num_tokens * top_k) // num_experts
+    # And pad the number to the next power of 2.
+    tile_tokens_dim = next_power_of_2(num_tokens_per_expert)
+    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
+    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
+    return tile_tokens_dim
 
 
 class EPMoE(torch.nn.Module):
@@ -474,13 +496,53 @@ class EPMoE(torch.nn.Module):
         hidden_states_shape = hidden_states.shape
         hidden_states_dtype = hidden_states.dtype
         hidden_states_device = hidden_states.device
+
+        if _use_flashinfer_blockscale_fp8_moe:
+            assert (
+                self.activation == "silu"
+            ), "Only silu is supported for flashinfer blockscale fp8 moe"
+            assert (
+                self.custom_routing_function is None
+            ), "Custom routing function is not supported for flashinfer blockscale fp8 moe"
+            assert (
+                self.renormalize
+            ), "Renormalize is required for flashinfer blockscale fp8 moe"
+            assert (
+                self.num_fused_shared_experts == 0
+            ), "Fused shared experts are not supported for flashinfer blockscale fp8 moe"
+            a_q, a_sf = per_token_group_quant_fp8(hidden_states, self.block_shape[1])
+            # NOTE: scales of hidden states have to be transposed!
+            a_sf_t = a_sf.t().contiguous()
+            assert fi_fused_moe is not None
+            return fi_fused_moe.trtllm_fp8_block_scale_moe(
+                routing_logits=router_logits.to(torch.float32),
+                routing_bias=self.correction_bias,
+                hidden_states=a_q,
+                hidden_states_scale=a_sf_t,
+                gemm1_weights=self.w13_weight,
+                gemm1_weights_scale=self.w13_weight_scale_inv,
+                gemm2_weights=self.w2_weight,
+                gemm2_weights_scale=self.w2_weight_scale_inv,
+                num_experts=self.num_experts,
+                top_k=self.top_k,
+                n_group=self.num_expert_group,
+                topk_group=self.topk_group,
+                intermediate_size=self.w2_weight.shape[2],
+                local_expert_offset=self.start_expert_id,
+                local_num_experts=self.num_experts_per_partition,
+                routed_scaling_factor=self.routed_scaling_factor,
+                tile_tokens_dim=_get_tile_tokens_dim(
+                    hidden_states.shape[0], self.top_k, self.num_experts
+                ),
+                routing_method_type=2,  # DeepSeek-styled routing method
+            )
+
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device,
                 use_flashinfer=False,  # TODO: use flashinfer
                 use_per_token_if_dynamic=self.use_per_token_if_dynamic,
             )
-
         topk_weights, topk_ids = select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -826,14 +888,23 @@ class EPMoE(torch.nn.Module):
             )
             return
 
-        if shard_id == "w2":
+        # Effectively, flashinfer assumes w31 format for w13_weight. Same for
+        # the scales.
+        if _use_flashinfer_blockscale_fp8_moe:
+            effective_shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
+        else:
+            effective_shard_id = shard_id
+
+        if effective_shard_id == "w2":
             param.data[expert_id] = loaded_weight
-        elif shard_id == "w1":
+        elif effective_shard_id == "w1":
             param.data[expert_id][: self.intermediate_size, :] = loaded_weight
-        elif shard_id == "w3":
+        elif effective_shard_id == "w3":
             param.data[expert_id][self.intermediate_size :, :] = loaded_weight
         else:
-            raise ValueError(f"Expected shard_id w1,w2 or w3 but got {shard_id}")
+            raise ValueError(
+                f"Expected shard_id w1,w2 or w3 but got {effective_shard_id}"
+            )
 
     def _load_fp8_scale(
         self,
@@ -870,12 +941,18 @@ class EPMoE(torch.nn.Module):
         # Weight scales
         elif "weight_scale" in weight_name:
             if self.use_block_quant:
+                if _use_flashinfer_blockscale_fp8_moe:
+                    effective_shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
+                else:
+                    effective_shard_id = shard_id
+
                 block_n, block_k = self.block_shape[0], self.block_shape[1]
-                if shard_id == "w1":
+
+                if effective_shard_id == "w1":
                     param_data[expert_id][
                         : (self.intermediate_size + block_n - 1) // block_n, :
                     ] = loaded_weight
-                elif shard_id == "w3":
+                elif effective_shard_id == "w3":
                     param_data[expert_id][
                         (self.intermediate_size + block_n - 1) // block_n :, :
                     ] = loaded_weight
