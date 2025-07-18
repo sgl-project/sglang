@@ -204,7 +204,7 @@ async fn v1_completions(
         let pd_request = body.into_inner().to_pd_request();
 
         Ok(router
-            .route_pd_generate_typed(&client, &req, pd_request, "/v1/completions")
+            .route_pd_generate_typed(&client, &req, pd_request, "/generate")
             .await)
     } else {
         // For regular mode, use typed request directly
