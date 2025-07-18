@@ -37,7 +37,7 @@ import logging
 import threading
 from enum import Enum, auto
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -226,7 +226,7 @@ class MultimodalDataItem:
     # - input_features_mask (gemma3n)
     # - audio_feature_lens, audio_offsets (minicpmo)
     # - ...
-    model_specific_data: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @staticmethod
     def is_empty_list(l):

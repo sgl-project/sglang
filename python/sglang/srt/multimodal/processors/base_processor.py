@@ -522,7 +522,7 @@ class BaseMultimodalProcessor(ABC):
         self, data_dict: dict
     ) -> List[MultimodalDataItem]:
         """Create mm_items directly from processor output."""
-        items = {}  # modality -> MultimodalDataItem
+        items: dict[Modality, MultimodalDataItem] = {}
 
         for attr_name, value in data_dict.items():
             if attr_name == "input_ids":
