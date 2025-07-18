@@ -213,11 +213,11 @@ suites = {
         TestFile("test_nightly_gsm8k_eval_amd.py"),
     ],
     "vllm_dependency_test": [
-        TestFile("test_awq.py"),
-        TestFile("test_bnb.py"),
-        TestFile("test_gguf.py", 78),
-        TestFile("test_gptqmodel_dynamic.py", 72),
-        TestFile("test_vllm_dependency.py"),
+        TestFile("test_awq.py", 163),
+        TestFile("test_bnb.py", 5),
+        TestFile("test_gguf.py", 96),
+        TestFile("test_gptqmodel_dynamic.py", 102),
+        TestFile("test_vllm_dependency.py", 185),
     ],
 }
 
