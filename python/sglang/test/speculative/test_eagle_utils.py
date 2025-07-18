@@ -12,10 +12,7 @@ from sglang.srt.utils import next_power_of_2
 class TestEagleUtils(unittest.TestCase):
 
     def setUp(self):
-        if os.environ.get("TRITON_INTERPRET") == "1":
-            self.device = "cpu"
-        else:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.data_ptrs = torch.zeros(2, 1, dtype=torch.uint64, device=self.device)
         self.k_cache = [
             torch.zeros((100, 1, 1), dtype=torch.float32, device=self.device)
@@ -48,7 +45,7 @@ class TestEagleUtils(unittest.TestCase):
     def test_assign_draft_cache_locs_single_seq(self):
         # Testing Setup: req_to_token starting from 4
         # 4,5,6,7,{8,9,10}, 8,9,10 is the last partial page, 3 tokens < page_size=4
-        # next kv cache will be stored starting 10,11,12...
+        # next kv cache will be stored starting 11,12,13...
         device = self.device
         num_seqs = 1
         page_size = 4
@@ -203,7 +200,6 @@ class TestEagleUtils(unittest.TestCase):
            115, 121, 122, 123, 129, 130, 131, 147, 155, 163, 171, 179, 187, 195
         ], device=device, dtype=torch.int32)
         # fmt: on
-
         assert torch.allclose(out_cache_loc, expected_out_cache_loc)
         assert torch.allclose(source_cache_loc, expected_source_cache_loc)
         assert torch.allclose(target_cache_loc, expected_target_cache_loc)
@@ -231,6 +227,50 @@ class TestEagleUtils(unittest.TestCase):
                 device=device,
             ),
         )
+
+    def test_assign_draft_cache_locs_page_size_1(self):
+        # Test to make sure page_size=1 not affected
+        device = self.device
+        num_seqs = 1
+        page_size = 1
+        speculative_num_steps = 5
+        topk = 8
+        seq_lens_num = 7
+        extend_lens_num = topk * speculative_num_steps
+        req_pool_indices = torch.arange(num_seqs, dtype=torch.int32, device=device)
+        req_to_token = torch.zeros((num_seqs, 100), dtype=torch.int32, device=device)
+        req_to_token[0, :seq_lens_num] = torch.tensor(
+            [4, 5, 6, 7, 8, 9, 10], device=device
+        )
+        seq_lens = torch.tensor([seq_lens_num], dtype=torch.int32, device=device)
+        extend_lens = torch.tensor([extend_lens_num], dtype=torch.int32, device=device)
+        num_new_pages_per_topk = torch.tensor([2], dtype=torch.int32, device=device)
+        out_cache_loc = torch.arange(11, 11 + extend_lens_num, device=device)
+        last_page_lens = torch.tensor([3], dtype=torch.int32, device=device)
+        duplicate_cache_len = 0
+        target_cache_loc = None
+        source_cache_loc = None
+        last_page_lens_cumsum = None
+        assign_draft_cache_locs[(num_seqs,)](
+            req_pool_indices,
+            req_to_token,
+            seq_lens,
+            extend_lens,
+            num_new_pages_per_topk,
+            out_cache_loc,
+            source_cache_loc,
+            target_cache_loc,
+            last_page_lens_cumsum,
+            req_to_token.shape[1],
+            topk,
+            speculative_num_steps,
+            page_size,
+            next_power_of_2(num_seqs),
+            next_power_of_2(speculative_num_steps),
+        )
+        out_cache_loc = out_cache_loc[: num_seqs * topk * speculative_num_steps]
+        expected_out_cache_loc = torch.arange(11, 11 + extend_lens_num, device=device)
+        assert torch.allclose(out_cache_loc, expected_out_cache_loc)
 
 
 if __name__ == "__main__":

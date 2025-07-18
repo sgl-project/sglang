@@ -28,7 +28,6 @@ from sglang.srt.layers.quantization.utils import (
     is_layer_skipped,
     requantize_with_max_scale,
 )
-from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import is_cuda, next_power_of_2
 
 if is_cuda():
@@ -109,6 +108,9 @@ class ModelOptFp8Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
+        # Import here to avoid circular import
+        from sglang.srt.layers.radix_attention import RadixAttention
+
         if self.exclude_modules and any(
             module in prefix for module in self.exclude_modules
         ):
@@ -318,6 +320,7 @@ class ModelOptFp4Config(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.radix_attention import RadixAttention
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.exclude_modules) or self.is_layer_excluded(

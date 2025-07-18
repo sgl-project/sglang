@@ -456,7 +456,7 @@ class EAGLEWorker(TpModelWorker):
             )
         if self.page_size > 1 and self.topk > 1:
             last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
-            duplicate_cache_len = torch.sum(last_page_lens) * (self.topk - 1)
+            duplicate_cache_len = torch.sum(last_page_lens).item() * (self.topk - 1)
             # TODO: Remove device sync here
             target_cache_loc = torch.zeros(
                 duplicate_cache_len, dtype=torch.int32, device=self.device
@@ -467,8 +467,7 @@ class EAGLEWorker(TpModelWorker):
         else:
             # When source_cache_loc is not needed, simply skip
             duplicate_cache_len = 0
-            source_cache_loc = torch.zeros(0, dtype=torch.int32, device=self.device)
-            target_cache_loc = torch.zeros(0, dtype=torch.int32, device=self.device)
+            source_cache_loc, target_cache_loc, last_page_lens_cumsum = None, None, None
 
         assign_draft_cache_locs[(num_seqs,)](
             batch.req_pool_indices,
@@ -497,7 +496,7 @@ class EAGLEWorker(TpModelWorker):
             out_cache_loc = out_cache_loc[
                 : num_seqs * self.topk * self.speculative_num_steps
             ]
-
+        torch.distributed.breakpoint()
         batch.out_cache_loc = out_cache_loc
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         batch.return_hidden_states = False
@@ -545,9 +544,6 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             # Run forward steps
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
-
-        # Should this line be here?
-        # self.token_to_kv_pool_allocator.restore_state(self.token_to_kv_pool_state_backup)
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
