@@ -82,12 +82,12 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "compressed-tensors": CompressedTensorsConfig,
     "qoq": QoQConfig,
     "w4afp8": W4AFp8Config,
+    "awq": AWQConfig,
 }
 
 # VLLM-dependent quantization methods
 VLLM_QUANTIZATION_METHODS = {
     "aqlm": AQLMConfig,
-    "awq": AWQConfig,
     "deepspeedfp": DeepSpeedFPConfig,
     "tpu_int8": Int8TpuConfig,
     "fbgemm_fp8": FBGEMMFp8Config,

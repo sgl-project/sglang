@@ -29,7 +29,7 @@ def dim_is_supported(weight):
     IC = weight.size(2) if ndim == 3 else weight.size(1)
     return OC % TILE_N == 0 and IC % TILE_K == 0
 
-def _autoawq_to_int4pack(qweight: Tensor, qzeros: Tensor, scales: Tensor):
+def _autoawq_to_int4pack(qweight: torch.Tensor, qzeros: torch.Tensor, scales: torch.Tensor):
     """Convert AutoAWQ weight format to sgl-kernel's CPU int4
 
     Args:
@@ -178,6 +178,7 @@ def _amx_process_packed_qweight_after_loading(
                 qweight_tensor.data, qzeros_tensor.data, scales_tensor.data
             )
             compensation = torch.nn.Parameter(compensation, requires_grad=False)
+            setattr(module, "compensation", compensation)
         else:
             qweight, qzeros, scales = _autoawq_to_int4pack(
                 qweight_tensor.data, qzeros_tensor.data, scales_tensor.data

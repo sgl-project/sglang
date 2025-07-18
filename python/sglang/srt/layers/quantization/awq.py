@@ -195,7 +195,7 @@ class AWQLinearMethod(LinearMethodBase):
             assert (
                 _is_cpu_amx_available
             ), "AWQLinearMethod on CPU requires that CPU has AMX support"
-            _amx_process_packed_qweight_after_loading(layer, ["qweight", "qzeros", "scales"])
+            _amx_process_packed_qweight_after_loading(layer, ["qweight", "qzeros", "scales"], "awq")
         else:
             layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
             layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)

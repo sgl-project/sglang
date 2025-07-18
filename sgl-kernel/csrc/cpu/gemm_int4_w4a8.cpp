@@ -25,7 +25,7 @@ template<bool sym_quant_a>
 struct ActDtype;
 template<>
 struct ActDtype<true> {
-  using type = int8_t;
+  using type = uint8_t;
 };
 
 template<>
@@ -617,9 +617,9 @@ void _da8w4_linear_impl(
     } else if (M < 64) {
       return 32;
     } else if (M < 96) {
-      return 48;
-    } else {
       return 64;
+    } else {
+      return 128;
     }
   }();
   int64_t Mc = (M + block_m - 1) / block_m;
@@ -791,55 +791,6 @@ da8w4_linear_prepack_cpu(
   return std::make_tuple(std::move(blocked_weight), std::move(blocked_scales), std::move(blocked_qzeros), std::move(compensation));
 }
 
-at::Tensor da8w4_linear_cpu(
-  const at::Tensor& input,
-  const at::Tensor& input_scales,
-  const at::Tensor& input_qzeros,
-  const at::Tensor& weight,
-  const at::Tensor& weight_scales,
-  const at::Tensor& weight_qzeros,
-  const at::Tensor& compensation,
-  const std::optional<at::Tensor>& bias,
-  at::ScalarType output_dtype) {
-    RECORD_FUNCTION(
-      "sgl-kernel::da8w4_linear_cpu", std::vector<c10::IValue>({input, weight}));
-static bool cpublas_can_pack = cpublas_could_pack();
-bool sym_quant_a = input.scalar_type() == c10::kChar;
-auto out_sizes = input.sizes().vec();
-int64_t N = weight.size(0) * weight.size(-1) * 2;
-out_sizes.back() = N;
-auto output = at::empty(out_sizes, input.options().dtype(output_dtype));
-
-#define call__da8w4_linear_impl(cpublas_can_pack, sym_quant_act) \
-  AT_DISPATCH_FLOATING_TYPES_AND2( \
-      at::ScalarType::BFloat16, at::ScalarType::Half, output_dtype, "da8w4_linear_cpu", [&] { \
-        _da8w4_linear_impl<scalar_t, cpublas_can_pack, sym_quant_act>( \
-            input, \
-            input_scales, \
-            input_qzeros, \
-            weight, \
-            weight_scales, \
-            weight_qzeros, \
-            compensation, \
-            bias, \
-            output); \
-      });
-
-if (cpublas_can_pack) {
-  if (sym_quant_a) {
-    call__da8w4_linear_impl(true, true);
-  } else {
-    call__da8w4_linear_impl(true, false);
-  }
-} else {
-  if (sym_quant_a) {
-    call__da8w4_linear_impl(false, true);
-  } else {
-    call__da8w4_linear_impl(false, false);
-  }
-}
-return output;
-}
 
 at::Tensor da8w4_linear_cpu_with_quant(
   const at::Tensor& input,
@@ -860,11 +811,13 @@ const auto st = input.scalar_type();
 TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf,
     "per_token_quant_int8: expect A to be bfloat16 or half.");
 
-auto Aq = at::empty({M_a, K_a}, input.options().dtype(c10::kChar));
+auto Aq = at::empty({M_a, K_a}, input.options().dtype(c10::kByte));
 auto As = at::empty({M_a}, input.options().dtype(at::kFloat));
-auto dummy_Azp = at::empty({M_a}, input.options().dtype(at::kInt));
+auto Azp = at::ones({M_a}, input.options().dtype(at::kInt));
+Azp = Azp.mul(128);
+// auto dummy_Azp = at::empty({M_a}, input.options().dtype(at::kInt));
 static bool cpublas_can_pack = cpublas_could_pack();
-bool sym_quant_a = true;
+bool sym_quant_a = false;
 auto out_sizes = input.sizes().vec();
 int64_t N = weight.size(0) * weight.size(-1) * 2;
 out_sizes.back() = N;
@@ -873,12 +826,13 @@ auto output = at::empty(out_sizes, input.options().dtype(output_dtype));
 #define call__da8w4_linear_with_quant_impl(cpublas_can_pack, sym_quant_act) \
   AT_DISPATCH_FLOATING_TYPES_AND2( \
       at::ScalarType::BFloat16, at::ScalarType::Half, output_dtype, "da8w4_linear_cpu_with_quant", [&] { \
-        int8_t* __restrict__ Aq_data = Aq.data_ptr<int8_t>(); \
+        uint8_t* __restrict__ Aq_data = Aq.data_ptr<uint8_t>(); \
         float* __restrict__ As_data = As.data_ptr<float>();\
+        int32_t* __restrict__ Azp_data = Azp.data_ptr<int32_t>();\
         const scalar_t* __restrict__ A_data = input.data_ptr<scalar_t>();\
         at::parallel_for(0, M_a, 0, [&] (int64_t begin, int64_t end) {\
           for (int64_t m = begin; m < end; ++m) {\
-            quantize_row_int8_sym<scalar_t>(\
+            quantize_row_int8<scalar_t>(\
                 Aq_data + m * K_a,\
                 As_data[m],\
                 A_data + m * lda,\
@@ -888,7 +842,7 @@ auto output = at::empty(out_sizes, input.options().dtype(output_dtype));
         _da8w4_linear_impl<scalar_t, cpublas_can_pack, sym_quant_act>( \
             Aq, \
             As, \
-            dummy_Azp, \
+            Azp, \
             weight, \
             weight_scales, \
             weight_qzeros, \

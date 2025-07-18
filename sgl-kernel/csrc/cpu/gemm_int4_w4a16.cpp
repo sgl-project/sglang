@@ -580,7 +580,7 @@ at::Tensor int4_w4a16_linear(
     at::Tensor& w,
     at::Tensor& w_zeros,
     at::Tensor& w_scales,
-    std::optional<at::Tensor>& bias) {
+    std::optional<at::Tensor> bias) {
   RECORD_FUNCTION(
     "sgl-kernel::int4_w4a16_linear", std::vector<c10::IValue>({x, w, w_zeros, w_scales, bias}));
 
