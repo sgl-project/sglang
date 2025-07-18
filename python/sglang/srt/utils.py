@@ -1149,14 +1149,18 @@ def point_to_point_pyobj(
     src: int = 0,
     dst: int = 1,
     device: Optional[str] = None,
+    async_send: bool = False,
 ):
     """Send data from src to dst in group using DeviceToDevice communication."""
     if device is None:
         device = get_device()
     if rank == src:
+        send_func = dist.send
+        if async_send:
+            send_func = dist.isend
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-            dist.send(tensor_size, dst=dst, group=group)
+            send_func(tensor_size, dst=dst, group=group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
@@ -1167,8 +1171,8 @@ def point_to_point_pyobj(
             )  # Move to Device
             tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 
-            dist.send(tensor_size, dst=dst, group=group)
-            dist.send(tensor_data, dst=dst, group=group)
+            send_func(tensor_size, dst=dst, group=group)
+            send_func(tensor_data, dst=dst, group=group)
         return data
 
     elif rank == dst:
