@@ -147,21 +147,107 @@ class FlattenedTensorMetadata:
 
 
 class FlattenedTensorBucket:
-    """Helper class to reconstruct tensors from flattened bucket data"""
+    """
+    A bucket that flattens multiple tensors into a single tensor for efficient processing
+    while preserving all metadata needed for reconstruction.
+    """
 
-    def __init__(
-        self, flattened_tensor: torch.Tensor, metadata: List[FlattenedTensorMetadata]
-    ):
-        self.flattened_tensor = flattened_tensor
-        self.metadata = metadata
-        self.total_elements = flattened_tensor.numel()
+    def __init__(self, named_tensors: List[Tuple[str, torch.Tensor]] = None,
+                 flattened_tensor: torch.Tensor = None, 
+                 metadata: List[FlattenedTensorMetadata] = None):
+        """
+        Initialize a tensor bucket from a list of named tensors OR from pre-flattened data.
 
-    def reconstruct_tensors(self) -> List[Tuple[str, torch.Tensor]]:
-        """Reconstruct original tensors from flattened tensor"""
+        Args:
+            named_tensors: List of (name, tensor) tuples (for creating new bucket)
+            flattened_tensor: Pre-flattened tensor (for reconstruction)
+            metadata: Pre-computed metadata (for reconstruction)
+        """
+        if named_tensors is not None:
+            # Create bucket from named tensors
+            self.metadata: List[FlattenedTensorMetadata] = []
+            self.flattened_tensor: torch.Tensor = None
+            self.device = None
+            self.total_elements = 0
+
+            if not named_tensors:
+                raise ValueError("Cannot create empty tensor bucket")
+
+            # Collect metadata and flatten tensors
+            flattened_tensors = []
+            current_idx = 0
+
+            for name, tensor in named_tensors:
+                # Store device info from first tensor
+                if self.device is None:
+                    self.device = tensor.device
+
+                # Ensure all tensors are on the same device
+                if tensor.device != self.device:
+                    tensor = tensor.to(self.device)
+
+                flattened = tensor.flatten()
+                flattened_tensors.append(flattened)
+
+                # Store metadata
+
+                numel = flattened.numel()
+                metadata_obj = FlattenedTensorMetadata(
+                    name=name,
+                    shape=tensor.shape,
+                    dtype=tensor.dtype,
+                    start_idx=current_idx,
+                    end_idx=current_idx + numel,
+                    numel=numel,
+                )
+                self.metadata.append(metadata_obj)
+                current_idx += numel
+
+            # Concatenate all flattened tensors
+            self.flattened_tensor = torch.cat(flattened_tensors, dim=0)
+            self.total_elements = self.flattened_tensor.numel()
+        else:
+            # Initialize from pre-flattened data
+            if flattened_tensor is None or metadata is None:
+                raise ValueError("Must provide either named_tensors or both flattened_tensor and metadata")
+            self.flattened_tensor = flattened_tensor
+            self.metadata = metadata
+            self.total_elements = flattened_tensor.numel()
+
+    def get_flattened_tensor(self) -> torch.Tensor:
+        """Get the flattened tensor containing all bucket tensors"""
+        return self.flattened_tensor
+
+    def get_metadata(self) -> List[FlattenedTensorMetadata]:
+        """Get metadata for all tensors in the bucket"""
+        return self.metadata
+
+    def reconstruct_tensors(
+        self, flattened_tensor: torch.Tensor = None
+    ) -> List[Tuple[str, torch.Tensor]]:
+        """
+        Reconstruct original tensors from flattened tensor.
+
+        Args:
+            flattened_tensor: Optional flattened tensor to reconstruct from.
+                            If None, uses the bucket's own flattened tensor.
+
+        Returns:
+            List of (name, tensor) tuples with original shapes
+        """
+        if flattened_tensor is None:
+            flattened_tensor = self.flattened_tensor
+
+        if flattened_tensor.numel() != self.total_elements:
+            raise ValueError(
+                f"Flattened tensor has {flattened_tensor.numel()} elements, "
+                f"expected {self.total_elements}"
+            )
+
         reconstructed = []
         for meta in self.metadata:
             # Extract the slice for this tensor
-            tensor_slice = self.flattened_tensor[meta.start_idx : meta.end_idx]
+            tensor_slice = flattened_tensor[meta.start_idx : meta.end_idx]
 
             # Reshape to original shape
             tensor = tensor_slice.reshape(meta.shape)
@@ -173,6 +259,21 @@ class FlattenedTensorBucket:
             reconstructed.append((meta.name, tensor))
 
         return reconstructed
+
+    def size_bytes(self) -> int:
+        """Get the total size of the bucket in bytes"""
+        return self.flattened_tensor.element_size() * self.total_elements
+
+    def __len__(self) -> int:
+        """Number of tensors in the bucket"""
+        return len(self.metadata)
+
+    def __repr__(self) -> str:
+        return (
+            f"FlattenedTensorBucket(num_tensors={len(self.metadata)}, "
+            f"num_elements={self.total_elements:,}, "
+            f"size={self.size_bytes() / 1024**2:.2f}MB)"
+        )
 
 
 class RankZeroFilter(logging.Filter):
@@ -966,7 +1067,7 @@ class ModelRunner:
             converted_metadata.append(converted_meta)
 
         # Create bucket and reconstruct tensors
-        bucket = FlattenedTensorBucket(rank_flattened_tensor, converted_metadata)
+        bucket = FlattenedTensorBucket(flattened_tensor=rank_flattened_tensor, metadata=converted_metadata)
         reconstructed_tensors = bucket.reconstruct_tensors()
 
         # Load the reconstructed tensors using the standard method

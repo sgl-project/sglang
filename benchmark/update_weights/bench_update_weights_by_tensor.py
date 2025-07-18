@@ -13,7 +13,7 @@ from loguru import logger
 from transformers import AutoModelForCausalLM
 from verl.workers.rollout.sglang_rollout.sglang_rollout import AsyncEngine
 
-from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+from sglang.srt.model_executor.model_runner import LocalSerializedTensor, FlattenedTensorBucket, FlattenedTensorMetadata
 from sglang.srt.utils import MultiprocessingSerializer
 
 parser = argparse.ArgumentParser()
@@ -36,131 +36,7 @@ parser.add_argument(
 args = parser.parse_args()
 
 
-@dataclass
-class TensorMetadata:
-    """Metadata for a tensor in a flattened bucket"""
 
-    name: str
-    shape: torch.Size
-    dtype: torch.dtype
-    start_idx: int
-    end_idx: int
-    numel: int
-
-
-class TensorBucket:
-    """
-    A bucket that flattens multiple tensors into a single tensor for efficient processing
-    while preserving all metadata needed for reconstruction.
-    """
-
-    def __init__(self, named_tensors: List[Tuple[str, torch.Tensor]]):
-        """
-        Initialize a tensor bucket from a list of named tensors.
-
-        Args:
-            named_tensors: List of (name, tensor) tuples
-        """
-        self.metadata: List[TensorMetadata] = []
-        self.flattened_tensor: torch.Tensor = None
-        self.device = None
-        self.total_elements = 0
-
-        if not named_tensors:
-            raise ValueError("Cannot create empty tensor bucket")
-
-        # Collect metadata and flatten tensors
-        flattened_tensors = []
-        current_idx = 0
-
-        for name, tensor in named_tensors:
-            # Store device info from first tensor
-            if self.device is None:
-                self.device = tensor.device
-
-            # Ensure all tensors are on the same device
-            if tensor.device != self.device:
-                tensor = tensor.to(self.device)
-
-            flattened = tensor.flatten()
-            flattened_tensors.append(flattened)
-
-            # Store metadata
-            metadata = TensorMetadata(
-                name=name,
-                shape=tensor.shape,
-                dtype=tensor.dtype,
-                start_idx=current_idx,
-                end_idx=current_idx + flattened.numel(),
-                numel=flattened.numel(),
-            )
-            self.metadata.append(metadata)
-            current_idx += flattened.numel()
-
-        # Concatenate all flattened tensors
-        self.flattened_tensor = torch.cat(flattened_tensors, dim=0)
-        self.total_elements = self.flattened_tensor.numel()
-
-    def get_flattened_tensor(self) -> torch.Tensor:
-        """Get the flattened tensor containing all bucket tensors"""
-        return self.flattened_tensor
-
-    def get_metadata(self) -> List[TensorMetadata]:
-        """Get metadata for all tensors in the bucket"""
-        return self.metadata
-
-    def reconstruct_tensors(
-        self, flattened_tensor: torch.Tensor = None
-    ) -> List[Tuple[str, torch.Tensor]]:
-        """
-        Reconstruct original tensors from flattened tensor.
-
-        Args:
-            flattened_tensor: Optional flattened tensor to reconstruct from.
-                            If None, uses the bucket's own flattened tensor.
-
-        Returns:
-            List of (name, tensor) tuples with original shapes
-        """
-        if flattened_tensor is None:
-            flattened_tensor = self.flattened_tensor
-
-        if flattened_tensor.numel() != self.total_elements:
-            raise ValueError(
-                f"Flattened tensor has {flattened_tensor.numel()} elements, "
-                f"expected {self.total_elements}"
-            )
-
-        reconstructed = []
-        for meta in self.metadata:
-            # Extract the slice for this tensor
-            tensor_slice = flattened_tensor[meta.start_idx : meta.end_idx]
-
-            # Reshape to original shape
-            tensor = tensor_slice.reshape(meta.shape)
-
-            # Ensure correct dtype
-            if tensor.dtype != meta.dtype:
-                tensor = tensor.to(meta.dtype)
-
-            reconstructed.append((meta.name, tensor))
-
-        return reconstructed
-
-    def size_bytes(self) -> int:
-        """Get the total size of the bucket in bytes"""
-        return self.flattened_tensor.element_size() * self.total_elements
-
-    def __len__(self) -> int:
-        """Number of tensors in the bucket"""
-        return len(self.metadata)
-
-    def __repr__(self) -> str:
-        return (
-            f"TensorBucket(tensors={len(self.metadata)}, "
-            f"elements={self.total_elements:,}, "
-            f"size={self.size_bytes() / 1024**2:.2f}MB)"
-        )
 
 
 def get_named_tensor_buckets(
@@ -201,7 +77,7 @@ def get_named_tensor_buckets(
 
 def get_flattened_tensor_buckets(
     iterable: Iterator[tuple[str, torch.Tensor]], bucket_bytes: int
-) -> Iterator[TensorBucket]:
+) -> Iterator[FlattenedTensorBucket]:
     """
     Group tensors into flattened buckets based on a specified size in bytes.
 
@@ -210,13 +86,13 @@ def get_flattened_tensor_buckets(
         bucket_bytes: The maximum size of each bucket in bytes.
 
     Yields:
-        TensorBucket objects containing flattened tensors with metadata.
+        FlattenedTensorBucket objects containing flattened tensors with metadata.
 
     Example:
         >>> tensors = [('tensor1', torch.randn(1000, 1000)), ('tensor2', torch.randn(2000, 2000))]
         >>> for bucket in get_flattened_tensor_buckets(tensors, bucket_bytes=10*1024*1024):
         ...     print(bucket)
-        TensorBucket(tensors=2, elements=5000000, size=20.00MB)
+        FlattenedTensorBucket(num_tensors=2, num_elements=5000000, size=20.00MB)
     """
     if bucket_bytes <= 0:
         raise ValueError(f"bucket_bytes must be greater than 0, got {bucket_bytes}")
@@ -228,7 +104,7 @@ def get_flattened_tensor_buckets(
         tensor_size = tensor.element_size() * tensor.numel()
         if current_size + tensor_size > bucket_bytes:
             if current_bucket:
-                yield TensorBucket(current_bucket)
+                yield FlattenedTensorBucket(named_tensors=current_bucket)
             current_bucket = [(name, tensor)]
             current_size = tensor_size
         else:
@@ -236,7 +112,7 @@ def get_flattened_tensor_buckets(
             current_size += tensor_size
 
     if current_bucket:
-        yield TensorBucket(current_bucket)
+        yield FlattenedTensorBucket(named_tensors=current_bucket)
 
 
 def batched(iterable, n):
@@ -474,9 +350,9 @@ def main():
             }
 
             # Monitor memory after serialization
-            post_serialize_memory = torch.cuda.memory_allocated(rank) / 1024**3
-            bucket_memory_increase = post_serialize_memory - pre_bucket_memory
-            max_bucket_memory = max(max_bucket_memory, bucket_memory_increase)
+            # post_serialize_memory = torch.cuda.memory_allocated(rank) / 1024**3
+            # bucket_memory_increase = post_serialize_memory - pre_bucket_memory
+            # max_bucket_memory = max(max_bucket_memory, bucket_memory_increase)
 
             if rank == 0:
                 gathered_serialized_data = [None for _ in range(world_size)]
@@ -534,32 +410,32 @@ def main():
         peak_memory = torch.cuda.max_memory_allocated(rank) / 1024**3
         final_memory = torch.cuda.memory_allocated(rank) / 1024**3
 
-        logger.info(f"Rank {rank} processed {total_buckets} flattened buckets")
-        logger.info(
-            f"Rank {rank} total flattened elements: {total_flattened_elements:,}"
-        )
-        logger.info(
-            f"Rank {rank} max single bucket memory increase: {max_bucket_memory:.2f} GB"
-        )
-        logger.info(
-            f"Rank {rank} peak memory: {peak_memory:.2f} GB (increase: {peak_memory - initial_memory:.2f} GB)"
-        )
-        logger.info(f"Rank {rank} final memory: {final_memory:.2f} GB")
+        # logger.info(f"Rank {rank} processed {total_buckets} flattened buckets")
+        # logger.info(
+        #     f"Rank {rank} total flattened elements: {total_flattened_elements:,}"
+        # )
+        # # logger.info(
+        # #     f"Rank {rank} max single bucket memory increase: {max_bucket_memory:.2f} GB"
+        # # )
+        # logger.info(
+        #     f"Rank {rank} peak memory: {peak_memory:.2f} GB (increase: {peak_memory - initial_memory:.2f} GB)"
+        # )
+        # logger.info(f"Rank {rank} final memory: {final_memory:.2f} GB")
         dist.barrier()
 
     async def benchmark_different_bucket_sizes():
         """Benchmark different bucket sizes with memory monitoring"""
         bucket_sizes = [
-            (0, "per-tensor"),
-            (512 * 1024 * 1024, "512MB"),  # 512MB
-            (1024 * 1024 * 1024, "1GB"),  # 1GB
+            # (0, "per-tensor"),
+            # (512 * 1024 * 1024, "512MB"),  # 512MB
+            #(1024 * 1024 * 1024, "1GB"),  # 1GB
         ]
 
         # Add flattened bucket variants
         flattened_bucket_sizes = [
-            (512 * 1024 * 1024, "512MB-flat"),  # 512MB flattened
+            # (512 * 1024 * 1024, "512MB-flat"),  # 512MB flattened
             (1024 * 1024 * 1024, "1GB-flat"),  # 1GB flattened
-            (2 * 1024 * 1024 * 1024, "2GB-flat"),  # 2GB flattened
+            #(2 * 1024 * 1024 * 1024, "2GB-flat"),  # 2GB flattened
         ]
         bucket_sizes.extend(flattened_bucket_sizes)
 
@@ -590,18 +466,27 @@ def main():
             initial_memory = torch.cuda.memory_allocated(rank) / 1024**3
 
             start_time = time.time()
-
-            named_tensors = per_tensor_generator(model)
-            if bucket_bytes == 0:
-                await update_weights(named_tensors)
-            else:
-                # Check if this is a flattened bucket variant
-                if size_name.endswith("-flat"):
-                    await update_weights_by_flattened_bucket(
-                        named_tensors, bucket_bytes
-                    )
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(args.profile_dir),
+                profile_memory=True,
+                with_stack=True,
+                record_shapes=True,
+            ):
+                named_tensors = per_tensor_generator(model)
+                if bucket_bytes == 0:
+                    await update_weights(named_tensors)
                 else:
-                    await update_weights_by_bucket(named_tensors, bucket_bytes)
+                    # Check if this is a flattened bucket variant
+                    if size_name.endswith("-flat"):
+                        await update_weights_by_flattened_bucket(
+                            named_tensors, bucket_bytes
+                        )
+                    else:
+                        await update_weights_by_bucket(named_tensors, bucket_bytes)
 
             end_time = time.time()
             elapsed = end_time - start_time
