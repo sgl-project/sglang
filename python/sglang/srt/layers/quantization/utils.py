@@ -246,16 +246,19 @@ def get_pack_factor(num_bits):
     assert 32 % num_bits == 0, f"Unsupported num_bits = {num_bits}"
     return 32 // num_bits
 
-def permute_rows(q_w: torch.Tensor,
-                 w_ref: torch.Tensor,
-                 group_size: int,
-                 test_perm: Optional[torch.Tensor] = None):
+
+def permute_rows(
+    q_w: torch.Tensor,
+    w_ref: torch.Tensor,
+    group_size: int,
+    test_perm: Optional[torch.Tensor] = None,
+):
     assert q_w.shape == w_ref.shape
 
     orig_device = q_w.device
     k_size, _ = q_w.shape
 
-    g_idx = torch.zeros((k_size, ), dtype=torch.int32)
+    g_idx = torch.zeros((k_size,), dtype=torch.int32)
     for i in range(k_size):
         g_idx[i] = i // group_size
 
@@ -272,7 +275,8 @@ def permute_rows(q_w: torch.Tensor,
         g_idx.to(device=orig_device),
         rand_perm.to(device=orig_device),
     )
-    
+
+
 def pack_cols(
     q_w: torch.Tensor,
     num_bits: int,
@@ -431,16 +435,19 @@ SUPPORTED_GPTQ_QUANT_TYPES = [scalar_types.uint4b8, scalar_types.uint8b128]
 SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
 
 
-def gptq_quantize_weights(w: torch.Tensor,
-                          quant_type: ScalarType,
-                          group_size: int,
-                          act_order: bool,
-                          test_perm: Optional[torch.Tensor] = None):
+def gptq_quantize_weights(
+    w: torch.Tensor,
+    quant_type: ScalarType,
+    group_size: int,
+    act_order: bool,
+    test_perm: Optional[torch.Tensor] = None,
+):
     size_k, _ = w.shape
 
     assert w.is_floating_point(), "w must be float"
-    assert quant_type in SUPPORTED_GPTQ_QUANT_TYPES, \
-        f"Unsupported gptq type = {quant_type}"
+    assert (
+        quant_type in SUPPORTED_GPTQ_QUANT_TYPES
+    ), f"Unsupported gptq type = {quant_type}"
     assert group_size in SUPPORTED_GROUP_SIZES + [
         size_k
     ], f"Unsupported groupsize = {group_size}"
@@ -454,10 +461,10 @@ def gptq_quantize_weights(w: torch.Tensor,
         assert (
             group_size < size_k
         ), "For act_order, groupsize = {} must be less than size_k = {}".format(
-            group_size, size_k)
+            group_size, size_k
+        )
 
-        w_ref, w_q, g_idx, rand_perm = permute_rows(w_q, w_ref, group_size,
-                                                    test_perm)
+        w_ref, w_q, g_idx, rand_perm = permute_rows(w_q, w_ref, group_size, test_perm)
 
     return w_ref, w_q, w_s, g_idx, rand_perm
 
@@ -465,8 +472,7 @@ def gptq_quantize_weights(w: torch.Tensor,
 def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
     orig_device = q_w.device
 
-    sort_indices = torch.argsort(g_idx).to(
-        dtype=torch.int32)  # Sort based on g_idx
+    sort_indices = torch.argsort(g_idx).to(dtype=torch.int32)  # Sort based on g_idx
 
     g_idx = g_idx[sort_indices].contiguous()
     q_w = q_w[sort_indices, :].contiguous()
