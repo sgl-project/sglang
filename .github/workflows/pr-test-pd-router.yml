@@ -70,6 +70,8 @@ jobs:
       run: |
         echo "=== System Validation ==="
         bash scripts/killall_sglang.sh
+        kill -9 361080
+        kill -9 4135878
         nvidia-smi
         echo "GPU count: $(nvidia-smi -L | wc -l)"
         if [ $(nvidia-smi -L | wc -l) -lt 8 ]; then
