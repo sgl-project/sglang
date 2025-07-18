@@ -1,6 +1,38 @@
 #!/bin/bash
 set -euo pipefail
 
+# Default base tags (can be overridden by command line arguments)
+DEFAULT_MI30X_BASE_TAG="v0.4.9.post2-rocm630-mi30x"
+DEFAULT_MI35X_BASE_TAG="v0.4.9.post2-rocm700-mi35x"
+
+# Parse command line arguments
+MI30X_BASE_TAG="$DEFAULT_MI30X_BASE_TAG"
+MI35X_BASE_TAG="$DEFAULT_MI35X_BASE_TAG"
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --mi30x-base-tag)
+      MI30X_BASE_TAG="$2"
+      shift 2
+      ;;
+    --mi35x-base-tag)
+      MI35X_BASE_TAG="$2"
+      shift 2
+      ;;
+    -h|--help)
+      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG]"
+      echo "  --mi30x-base-tag TAG    Base tag for mi30x images (default: $DEFAULT_MI30X_BASE_TAG)"
+      echo "  --mi35x-base-tag TAG    Base tag for mi35x images (default: $DEFAULT_MI35X_BASE_TAG)"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option $1"
+      echo "Use --help for usage information"
+      exit 1
+      ;;
+  esac
+done
+
 # Set up DEVICE_FLAG based on Kubernetes pod info
 if [ -f "/etc/podinfo/gha-render-devices" ]; then
   DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
@@ -14,9 +46,9 @@ find_latest_image() {
   local base_tag
 
   if [ "$gpu_arch" == "mi30x" ]; then
-    base_tag="v0.4.9.post2-rocm630-mi30x"
+    base_tag="$MI30X_BASE_TAG"
   elif [ "$gpu_arch" == "mi35x" ]; then
-    base_tag="v0.4.9.post2-rocm700-mi35x"
+    base_tag="$MI35X_BASE_TAG"
   else
     echo "Error: Unsupported GPU architecture '$gpu_arch'" >&2
     return 1
@@ -59,14 +91,14 @@ fi
 
 echo "The runner is: ${RUNNER_NAME}"
 GPU_ARCH="mi30x"
-FALLBACK_IMAGE="rocm/sgl-dev:v0.4.9.post2-rocm630-mi30x-20250715"
+FALLBACK_IMAGE="rocm/sgl-dev:${MI30X_BASE_TAG}-20250715"
 FALLBACK_MSG="No mi30x image found in last 30 days, using fallback image"
 
 # Check for mi350/mi355 runners
 if [[ "${RUNNER_NAME}" =~ ^linux-mi350-gpu-[0-9]+$ ]] || [[ "${RUNNER_NAME}" =~ ^linux-mi355-gpu-[0-9]+$ ]]; then
   echo "Runner is ${RUNNER_NAME}, will find mi35x image."
   GPU_ARCH="mi35x"
-  FALLBACK_IMAGE="rocm/sgl-dev:v0.4.9.post2-rocm700-mi35x-20250715"
+  FALLBACK_IMAGE="rocm/sgl-dev:${MI35X_BASE_TAG}-20250715"
   FALLBACK_MSG="No mi35x image found in last 30 days, using fallback image"
 # Check for mi300/mi325 runners
 elif [[ "${RUNNER_NAME}" =~ ^linux-mi300-gpu-[0-9]+$ ]] || [[ "${RUNNER_NAME}" =~ ^linux-mi325-gpu-[0-9]+$ ]]; then
