@@ -14,6 +14,8 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import is_cuda, is_hip
 
+logger = logging.getLogger(__name__)
+
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 if _is_cuda:
@@ -23,9 +25,7 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 else:
-    raise RuntimeError("Only CUDA and HIP support AWQ currently.")
-
-logger = logging.getLogger(__name__)
+    raise logger.warning("Only CUDA and HIP support AWQ currently.")
 
 
 def is_layer_skipped_awq(prefix: str, modules_to_not_convert: List[str]):
