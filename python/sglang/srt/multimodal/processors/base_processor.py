@@ -12,7 +12,7 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
-from sglang.srt.managers.mm_utils import TransportableTensor
+from sglang.srt.managers.mm_utils import TransportProxyTensor
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import load_audio, load_image, load_video, logger
 
@@ -513,9 +513,9 @@ class BaseMultimodalProcessor(ABC):
 
                 if attr_name in self.FEATURE_NAMES:
                     attr_name = "feature"
-                    # replace the feature tensor with TransportableTensor
+                    # replace the feature tensor with a proxy
                     if isinstance(value, torch.Tensor):
-                        value = TransportableTensor(
+                        value = TransportProxyTensor(
                             transport_mode=self.transport_mode, data=value
                         )
 

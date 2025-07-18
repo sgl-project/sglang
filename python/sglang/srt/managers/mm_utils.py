@@ -33,7 +33,7 @@ from sglang.utils import logger
 TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
 
 
-class TransportableTensor(torch.Tensor):
+class TransportProxyTensor(torch.Tensor):
     """
     A torch.Tensor subclass that carries extra metadata and supports
     efficient inter-process communications
@@ -92,7 +92,7 @@ class TransportableTensor(torch.Tensor):
                 }
                 state["tensor_data"] = None
             except Exception as e:
-                print(
+                print_warning_once(
                     f"Warning: Failed to get CUDA IPC handle ({e}). Falling back to default transport."
                 )
                 state["metadata"]["transport_mode"] = "default"
@@ -137,7 +137,7 @@ class TransportableTensor(torch.Tensor):
             self.set_(state["tensor_data"])
         else:
             raise pickle.UnpicklingError(
-                "Invalid state for MetaDataTensor: no tensor data found."
+                "Invalid state for TransportProxyTensor: no tensor data found."
             )
 
     @property
