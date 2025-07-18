@@ -7,7 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
     NVSHMEM_DIR=/sgl-workspace/nvshmem/install \
     BUILD_TYPE=${BUILD_TYPE} \
-    TORCH_CUDA_ARCH_LIST=10.0
+    TORCH_CUDA_ARCH_LIST="10.0 12.0"
 
 # Set timezone and install all packages
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
@@ -94,10 +94,10 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/sour
     NVSHMEM_PMIX_SUPPORT=0 \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
     NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=100 \
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES="100;120" \
  && cmake --build build --target install -j \
  && cd /sgl-workspace/DeepEP \
- && NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST=10.0 pip install .
+ && NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
@@ -140,8 +140,8 @@ RUN apt-get update && apt-get install -y \
 
 RUN apt update -y \
     && apt install -y --no-install-recommends gnupg \
-    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
-    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
+    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2204/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
+    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/$(if [ "$(uname -m)" = "aarch64" ]; then echo "sbsa"; else echo "x86_64"; fi)/3bf863cc.pub \
     && apt update -y \
     && apt install nsight-systems-cli -y
 
