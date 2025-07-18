@@ -5,7 +5,10 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.two_batch_overlap import compute_split_seq_index, compute_split_token_index
+from sglang.srt.two_batch_overlap import (
+    compute_split_seq_index,
+    compute_split_token_index,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -82,7 +85,7 @@ class TestTwoBatchOverlapUnitTest(unittest.TestCase):
                 forward_mode=ForwardMode.DECODE,
                 num_tokens=num_tokens,
                 extend_lens=None,
-                token_num_per_seq=1
+                token_num_per_seq=1,
             )
             self.assertEqual(actual, expect)
 

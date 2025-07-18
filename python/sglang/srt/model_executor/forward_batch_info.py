@@ -695,6 +695,7 @@ class PPProxyTensors:
     def __repr__(self) -> str:
         return f"PPProxyTensors(tensors={self.tensors})"
 
+
 def compute_position(
     attn_backend: str,
     extend_prefix_lens: torch.Tensor,
