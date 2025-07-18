@@ -197,6 +197,8 @@ class EagleVerifyOutput:
     accept_length_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
     accepted_indices: torch.Tensor
+    # Tracking the contents if they are in thinking mode.
+    thinking_states: Optional[List[bool]]
 
 
 @dataclass
@@ -389,7 +391,10 @@ class EagleVerifyInput:
             self.grammar.apply_vocab_mask(
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
-
+        relaxed_thinking = global_server_args_dict.get(
+            "speculative_relaxed_thinking", False
+        )
+        thinking_states = None
         # Sample tokens
         if batch.sampling_info.is_all_greedy:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
@@ -438,6 +443,25 @@ class EagleVerifyInput:
             coins_for_final_sampling = torch.rand(
                 (bs,), dtype=torch.float32, device="cuda"
             )
+
+            threshold_singles = torch.ones_like(
+                coins_for_final_sampling, dtype=torch.float32, device="cuda"
+            )
+            threshold_accs = torch.ones_like(
+                coins_for_final_sampling, dtype=torch.float32, device="cuda"
+            )
+            if relaxed_thinking:
+                thinking_states = batch.thinking_states()
+                thinking_states_ts = torch.tensor(thinking_states, device="cuda")
+            else:
+                thinking_states_ts = torch.ones(bs, dtype=torch.bool, device="cuda")
+            threshold_singles[thinking_states_ts] = global_server_args_dict[
+                "speculative_accept_threshold_single"
+            ]
+            threshold_accs[thinking_states_ts] = global_server_args_dict[
+                "speculative_accept_threshold_acc"
+            ]
+
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
@@ -450,12 +474,8 @@ class EagleVerifyInput:
                 uniform_samples_for_final_sampling=coins_for_final_sampling,
                 target_probs=target_probs,
                 draft_probs=draft_probs,
-                threshold_single=global_server_args_dict[
-                    "speculative_accept_threshold_single"
-                ],
-                threshold_acc=global_server_args_dict[
-                    "speculative_accept_threshold_acc"
-                ],
+                threshold_singles=threshold_singles,
+                threshold_accs=threshold_accs,
                 deterministic=True,
             )
 
@@ -484,6 +504,13 @@ class EagleVerifyInput:
                     break
                 id = predict_cpu[idx]
                 req.output_ids.append(id)
+
+                if relaxed_thinking and thinking_states:
+                    if id == req.think_start_token_id:
+                        thinking_states[i] = True
+                    elif id == req.think_end_token_id:
+                        thinking_states[i] = False
+
                 req.check_finished()
                 if req.finished():
                     has_finished = True
@@ -607,6 +634,7 @@ class EagleVerifyInput:
                 verified_id=verified_id,
                 accept_length_per_req_cpu=draft_input.accept_length_cpu,
                 accepted_indices=accept_index,
+                thinking_states=thinking_states,
             )
         else:
             if page_size == 1 or self.topk == 1:
@@ -672,6 +700,7 @@ class EagleVerifyInput:
                 verified_id=verified_id,
                 accept_length_per_req_cpu=accept_length_cpu,
                 accepted_indices=accept_index,
+                thinking_states=thinking_states,
             )
 
 
