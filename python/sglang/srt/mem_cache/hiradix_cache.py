@@ -398,13 +398,26 @@ class HiRadixCache(RadixCache):
         if req_id not in self.outstanding_prefetch:
             return True
 
-        # retry if prefetch has not been done
-        if (not self.cache_controller.prefetch_done(req_id)) and (
-            self.outstanding_prefetch[req_id][3] > 0
-        ):
-            self.outstanding_prefetch[req_id][3] = (
-                self.outstanding_prefetch[req_id][3] - 1
+        prefetch_done = torch.tensor(
+            self.cache_controller.prefetch_done(req_id), dtype=torch.int
+        )
+        retries = torch.tensor(self.outstanding_prefetch[req_id][3], dtype=torch.int)
+        if torch.distributed.get_world_size(group=self.tp_group) > 1:
+            torch.distributed.all_reduce(
+                prefetch_done,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
             )
+            torch.distributed.all_reduce(
+                retries,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.tp_group,
+            )
+        prefetch_done = prefetch_done.item()
+        retries = retries.item()
+        # retry if prefetch has not been done
+        if (prefetch_done == 0) and (retries > 0):
+            self.outstanding_prefetch[req_id][3] = retries - 1
             return False
 
         # todo: more policies for prefetch progress such as timeout
