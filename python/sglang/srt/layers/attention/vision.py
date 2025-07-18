@@ -349,6 +349,7 @@ class VisionAttention(nn.Module):
         flatten_batch: bool = False,
         prefix: str = "",
         proj_bias: bool = True,
+        num_dummy_heads: int = 0,
         **kwargs,
     ):
         super().__init__()
@@ -359,14 +360,17 @@ class VisionAttention(nn.Module):
             projection_size, num_heads
         )
         self.num_attention_heads_per_partition = dist_utils.divide(
-            num_heads, world_size
+            num_dummy_heads + num_heads, world_size
         )
         self.num_attention_kv_heads_per_partition = dist_utils.divide(
-            num_heads, world_size
+            num_dummy_heads + num_heads, world_size
         )
 
         self.q_size = self.num_attention_heads_per_partition * self.head_size
         self.kv_size = self.num_attention_kv_heads_per_partition * self.head_size
+
+        # Additional dummy heads are used to enable TP for common GPU counts.
+        self.dummy_dim = (num_dummy_heads + num_heads) * self.head_size
 
         if global_server_args_dict["mm_attention_backend"] is None:
             if qkv_backend is None:
@@ -391,20 +395,20 @@ class VisionAttention(nn.Module):
             self.qkv_proj = QKVParallelLinear(
                 hidden_size=embed_dim,
                 head_size=self.head_size,
-                total_num_heads=num_heads,
-                total_num_kv_heads=num_heads,
+                total_num_heads=num_dummy_heads + num_heads,
+                total_num_kv_heads=num_dummy_heads + num_heads,
                 quant_config=quant_config,
                 prefix=add_prefix("qkv_proj", prefix),
             )
         else:
             self.qkv_proj = ColumnParallelLinear(
                 input_size=embed_dim,
-                output_size=3 * projection_size,
+                output_size=3 * self.dummy_dim,
                 quant_config=quant_config,
                 prefix=add_prefix("qkv_proj", prefix),
             )
         self.proj = RowParallelLinear(
-            input_size=embed_dim,
+            input_size=self.dummy_dim,
             output_size=embed_dim,
             bias=proj_bias,
             quant_config=quant_config,

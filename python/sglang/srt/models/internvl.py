@@ -34,11 +34,13 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_janus_pro import DropPath
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 from sglang.utils import logger
 
 
@@ -47,12 +49,15 @@ class InternAttention(nn.Module):
         self,
         config,
         quant_config: QuantizationConfig = None,
+        num_dummy_heads: int = 0,
     ):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
+        # self.num_dummy_heads = num_dummy_heads
+        num_dummy_heads = 7  # FIXME, hard-coded now
 
         self.scale = self.head_dim**-0.5
 
@@ -66,6 +71,7 @@ class InternAttention(nn.Module):
             dropout=getattr(config, "dropout", 0.0),
             proj_bias=getattr(config, "qkv_bias", True),
             flatten_batch=False,
+            num_dummy_heads=num_dummy_heads
         )
 
         self.proj_drop = nn.Dropout(config.dropout)
@@ -194,12 +200,15 @@ class InternVisionEncoderLayer(nn.Module):
         config: PretrainedConfig,
         drop_path_rate: float,
         quant_config: QuantizationConfig = None,
+        num_dummy_heads: int = 0,
     ):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.norm_type = config.norm_type
-        self.attn = InternAttention(config)
+        self.attn = InternAttention(config=config,
+                                    quant_config=quant_config,
+                                    num_dummy_heads=num_dummy_heads)
         self.mlp = InternMLP(config)
         self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
         self.norm2 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
@@ -255,6 +264,7 @@ class InternVisionEncoder(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        num_dummy_heads: int = 0,
     ):
         super().__init__()
         self.config = config
@@ -265,7 +275,7 @@ class InternVisionEncoder(nn.Module):
         ]
         self.layers = nn.ModuleList(
             [
-                InternVisionEncoderLayer(config, dpr[idx], quant_config)
+                InternVisionEncoderLayer(config, dpr[idx], quant_config, num_dummy_heads)
                 for idx in range(config.num_hidden_layers)
             ]
         )
@@ -326,6 +336,7 @@ class InternVisionModel(PreTrainedModel):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        num_dummy_heads: int = 0,
     ):
         super().__init__(config)
         self.config = config
@@ -333,7 +344,7 @@ class InternVisionModel(PreTrainedModel):
         self.embeddings = InternVisionEmbeddings(
             config,
         )
-        self.encoder = InternVisionEncoder(config, quant_config)
+        self.encoder = InternVisionEncoder(config, quant_config, num_dummy_heads)
 
     def resize_pos_embeddings(self, old_size, new_size, patch_size):
         pos_emb = self.embeddings.position_embedding
@@ -446,6 +457,10 @@ class InternVLChatModel(nn.Module):
             self.language_model = InternLM2ForCausalLM(
                 config=config.llm_config, quant_config=quant_config
             )
+        elif config.llm_config.architectures[0] == "Qwen3MoeForCausalLM":
+            self.language_model = Qwen3MoeForCausalLM(
+                config=config.llm_config, quant_config=quant_config
+            )
         else:
             raise NotImplementedError(
                 f"{config.llm_config.architectures[0]} is not implemented."
@@ -545,6 +560,164 @@ class InternVLChatModel(nn.Module):
 
         return helper.pad_input_tokens(input_ids, mm_inputs)
 
+    # def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    #     if "InternLM2ForCausalLM" in self.config.llm_config.architectures:
+    #         stacked_params_mapping = [
+    #             # (param_name, shard_name, shard_id)
+    #             ("gate_up_proj", "w1", 0),
+    #             ("gate_up_proj", "w3", 1),
+    #         ]
+    #     elif "Qwen2ForCausalLM" in self.config.llm_config.architectures:
+    #         stacked_params_mapping = [
+    #             # (param_name, shard_name, shard_id)
+    #             ("qkv_proj", "q_proj", "q"),
+    #             ("qkv_proj", "k_proj", "k"),
+    #             ("qkv_proj", "v_proj", "v"),
+    #             ("gate_up_proj", "gate_proj", 0),
+    #             ("gate_up_proj", "up_proj", 1),
+    #         ]
+    #     elif "Qwen3MoeForCausalLM" in self.config.llm_config.architectures:
+    #         from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+    #         stacked_params_mapping = [
+    #             # (param_name, shard_name, shard_id)
+    #             ("qkv_proj", "q_proj", "q"),
+    #             ("qkv_proj", "k_proj", "k"),
+    #             ("qkv_proj", "v_proj", "v"),
+    #             ("gate_up_proj", "gate_proj", 0),
+    #             ("gate_up_proj", "up_proj", 1),
+    #         ]
+
+    #         expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+    #             ckpt_gate_proj_name="gate_proj",
+    #             ckpt_down_proj_name="down_proj",
+    #             ckpt_up_proj_name="up_proj",
+    #             num_experts=self.config.num_experts,
+    #         )
+
+    #     params_dict = dict(self.named_parameters())
+    #     loaded_params: Set[str] = set()
+
+    #     for name, loaded_weight in weights:
+    #         if "rotary_emb.inv_freq" in name:
+    #             continue
+    #         for param_name, weight_name, shard_id in stacked_params_mapping:
+    #             if weight_name not in name:
+    #                 continue
+    #             # We have mlp.experts[0].gate_proj in the checkpoint.
+    #             # Since we handle the experts below in expert_params_mapping,
+    #             # we need to skip here BEFORE we update the name, otherwise
+    #             # name will be updated to mlp.experts[0].gate_up_proj, which
+    #             # will then be updated below in expert_params_mapping
+    #             # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+    #             if "mlp.experts" in name:
+    #                 continue
+    #             name = name.replace(weight_name, param_name)
+    #             # Skip loading extra bias for GPTQ models.
+    #             if name.endswith(".bias") and name not in params_dict:
+    #                 continue
+    #             param = params_dict[name]
+    #             weight_loader = param.weight_loader
+    #             weight_loader(param, loaded_weight, shard_id)
+    #             break
+    #         else:
+    #             if "vision_model" in name:
+    #                 # adapt to VisionAttention
+    #                 if "attn.qkv" in name or "attn.proj" in name:
+    #                     name = name.replace(r"attn.", r"attn.attn.")
+    #                 name = name.replace(r"qkv.", r"qkv_proj.")
+
+    #             # # Skip loading extra bias for GPTQ models.
+    #             # if name.endswith(".bias") and name not in params_dict:
+    #             #     continue
+    #             # param = params_dict[name]
+    #             # if "wqkv" in name:
+    #             #     config = self.config
+    #             #     kv_groups = config.num_attention_heads // config.num_key_value_heads
+    #             #     head_dim = config.hidden_size // config.num_attention_heads
+    #             #     loaded_weight = loaded_weight.view(
+    #             #         -1, 2 + kv_groups, head_dim, loaded_weight.shape[-1]
+    #             #     )
+    #             #     wq, wk, wv = torch.split(loaded_weight, [kv_groups, 1, 1], dim=1)
+    #             #     wq = wq.reshape(-1, wq.shape[-1])
+    #             #     wk = wk.reshape(-1, wk.shape[-1])
+    #             #     wv = wv.reshape(-1, wv.shape[-1])
+    #             #     weight_loader = param.weight_loader
+    #             #     weight_loader(param, wq, "q")
+    #             #     weight_loader(param, wk, "k")
+    #             #     weight_loader(param, wv, "v")
+    #             # else:
+    #             #     weight_loader = getattr(
+    #             #         param, "weight_loader", default_weight_loader
+    #             #     )
+    #             #     weight_loader(param, loaded_weight)
+
+    #             for mapping in expert_params_mapping:
+    #                 param_name, weight_name, expert_id, shard_id = mapping
+    #                 if weight_name not in name:
+    #                     continue
+    #                 name = name.replace(weight_name, param_name)
+    #                 param = params_dict[name]
+    #                 weight_loader = param.weight_loader
+    #                 weight_loader(
+    #                     param,
+    #                     loaded_weight,
+    #                     name,
+    #                     shard_id=shard_id,
+    #                     expert_id=expert_id,
+    #                 )
+    #                 break
+    #             else:
+    #                 # # Skip loading extra bias for GPTQ models.
+    #                 # if name.endswith(".bias") and name not in params_dict:
+    #                 #     continue
+    #                 # if name not in params_dict:
+    #                 #     continue
+
+    #                 # if name in params_dict.keys():
+    #                 #     param = params_dict[name]
+    #                 #     weight_loader = getattr(
+    #                 #         param, "weight_loader", default_weight_loader
+    #                 #     )
+    #                 #     weight_loader(param, loaded_weight)
+    #                 # else:
+    #                 #     logger.warning(f"Parameter {name} not found in params_dict")
+
+
+
+    #                 # Skip loading extra bias for GPTQ models.
+    #                 if name.endswith(".bias") and name not in params_dict:
+    #                     continue
+    #                 param = params_dict[name]
+    #                 if "wqkv" in name:
+    #                     config = self.config
+    #                     kv_groups = config.num_attention_heads // config.num_key_value_heads
+    #                     head_dim = config.hidden_size // config.num_attention_heads
+    #                     loaded_weight = loaded_weight.view(
+    #                         -1, 2 + kv_groups, head_dim, loaded_weight.shape[-1]
+    #                     )
+    #                     wq, wk, wv = torch.split(loaded_weight, [kv_groups, 1, 1], dim=1)
+    #                     wq = wq.reshape(-1, wq.shape[-1])
+    #                     wk = wk.reshape(-1, wk.shape[-1])
+    #                     wv = wv.reshape(-1, wv.shape[-1])
+    #                     weight_loader = param.weight_loader
+    #                     weight_loader(param, wq, "q")
+    #                     weight_loader(param, wk, "k")
+    #                     weight_loader(param, wv, "v")
+    #                 else:
+    #                     weight_loader = getattr(
+    #                         param, "weight_loader", default_weight_loader
+    #                     )
+    #                     weight_loader(param, loaded_weight)
+
+    #         loaded_params.add(name)
+    #     unloaded_params = params_dict.keys() - loaded_params
+    #     if unloaded_params:
+    #         raise RuntimeError(
+    #             f"Some weights are not initialized from checkpoints: {unloaded_params}"
+    #         )
+    #     return loaded_params
+
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         if "InternLM2ForCausalLM" in self.config.llm_config.architectures:
             stacked_params_mapping = [
@@ -561,6 +734,23 @@ class InternVLChatModel(nn.Module):
                 ("gate_up_proj", "gate_proj", 0),
                 ("gate_up_proj", "up_proj", 1),
             ]
+        elif "Qwen3MoeForCausalLM" in self.config.llm_config.architectures:
+            stacked_params_mapping = [
+                # (param_name, shard_name, shard_id)
+                ("qkv_proj", "q_proj", "q"),
+                ("qkv_proj", "k_proj", "k"),
+                ("qkv_proj", "v_proj", "v"),
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            ]
+
+            expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=self.config.num_experts,
+            )
+
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -569,6 +759,14 @@ class InternVLChatModel(nn.Module):
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
+                    continue
+                # We have mlp.experts[0].gate_proj in the checkpoint.
+                # Since we handle the experts below in expert_params_mapping,
+                # we need to skip here BEFORE we update the name, otherwise
+                # name will be updated to mlp.experts[0].gate_up_proj, which
+                # will then be updated below in expert_params_mapping
+                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                if "mlp.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
@@ -581,33 +779,93 @@ class InternVLChatModel(nn.Module):
             else:
                 if "vision_model" in name:
                     # adapt to VisionAttention
-                    name = name.replace(r"attn.", r"attn.attn.")
+                    if "attn.qkv" in name or "attn.proj" in name:
+                        name = name.replace(r"attn.", r"attn.attn.")
                     name = name.replace(r"qkv.", r"qkv_proj.")
 
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                if "wqkv" in name:
-                    config = self.config
-                    kv_groups = config.num_attention_heads // config.num_key_value_heads
-                    head_dim = config.hidden_size // config.num_attention_heads
-                    loaded_weight = loaded_weight.view(
-                        -1, 2 + kv_groups, head_dim, loaded_weight.shape[-1]
-                    )
-                    wq, wk, wv = torch.split(loaded_weight, [kv_groups, 1, 1], dim=1)
-                    wq = wq.reshape(-1, wq.shape[-1])
-                    wk = wk.reshape(-1, wk.shape[-1])
-                    wv = wv.reshape(-1, wv.shape[-1])
+                # # Skip loading extra bias for GPTQ models.
+                # if name.endswith(".bias") and name not in params_dict:
+                #     continue
+                # param = params_dict[name]
+                # if "wqkv" in name:
+                #     config = self.config
+                #     kv_groups = config.num_attention_heads // config.num_key_value_heads
+                #     head_dim = config.hidden_size // config.num_attention_heads
+                #     loaded_weight = loaded_weight.view(
+                #         -1, 2 + kv_groups, head_dim, loaded_weight.shape[-1]
+                #     )
+                #     wq, wk, wv = torch.split(loaded_weight, [kv_groups, 1, 1], dim=1)
+                #     wq = wq.reshape(-1, wq.shape[-1])
+                #     wk = wk.reshape(-1, wk.shape[-1])
+                #     wv = wv.reshape(-1, wv.shape[-1])
+                #     weight_loader = param.weight_loader
+                #     weight_loader(param, wq, "q")
+                #     weight_loader(param, wk, "k")
+                #     weight_loader(param, wv, "v")
+                # else:
+                #     weight_loader = getattr(
+                #         param, "weight_loader", default_weight_loader
+                #     )
+                #     weight_loader(param, loaded_weight)
+
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    param = params_dict[name]
                     weight_loader = param.weight_loader
-                    weight_loader(param, wq, "q")
-                    weight_loader(param, wk, "k")
-                    weight_loader(param, wv, "v")
-                else:
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
                     )
-                    weight_loader(param, loaded_weight)
+                    break
+                else:
+                    # # Skip loading extra bias for GPTQ models.
+                    # if name.endswith(".bias") and name not in params_dict:
+                    #     continue
+                    # if name not in params_dict:
+                    #     continue
+
+                    # if name in params_dict.keys():
+                    #     param = params_dict[name]
+                    #     weight_loader = getattr(
+                    #         param, "weight_loader", default_weight_loader
+                    #     )
+                    #     weight_loader(param, loaded_weight)
+                    # else:
+                    #     logger.warning(f"Parameter {name} not found in params_dict")
+
+
+
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    if "wqkv" in name:
+                        config = self.config
+                        kv_groups = config.num_attention_heads // config.num_key_value_heads
+                        head_dim = config.hidden_size // config.num_attention_heads
+                        loaded_weight = loaded_weight.view(
+                            -1, 2 + kv_groups, head_dim, loaded_weight.shape[-1]
+                        )
+                        wq, wk, wv = torch.split(loaded_weight, [kv_groups, 1, 1], dim=1)
+                        wq = wq.reshape(-1, wq.shape[-1])
+                        wk = wk.reshape(-1, wk.shape[-1])
+                        wv = wv.reshape(-1, wv.shape[-1])
+                        weight_loader = param.weight_loader
+                        weight_loader(param, wq, "q")
+                        weight_loader(param, wk, "k")
+                        weight_loader(param, wv, "v")
+                    else:
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+
             loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
