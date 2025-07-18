@@ -13,8 +13,8 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_MODEL_NAME_FOR_TEST_DSR1_NEXTN,
     DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
-    DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
     DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8,
     DEFAULT_MODEL_NAME_FOR_TEST_W8A8,
     DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
@@ -73,7 +73,7 @@ class TestIntelAMXAttnBackend(CustomTestCase):
 
     def test_latency_dsr1_proxy_model(self):
         prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
-            DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
+            DEFAULT_MODEL_NAME_FOR_TEST_DSR1_NEXTN,
             [
                 "--attention-backend",
                 "intel_amx",
