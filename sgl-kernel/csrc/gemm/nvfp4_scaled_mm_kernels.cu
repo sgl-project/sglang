@@ -53,8 +53,8 @@ struct KernelTraits<float> {
   using MmaTileShape = Shape<_128, _128, _256>;
   using ClusterShape = Shape<int, int, _1>;
   using EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto;
-  using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized2Sm;
-  using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100;
+  using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized1Sm;
+  using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100;
 };
 
 template <typename T>
@@ -188,8 +188,13 @@ typename T::Gemm::Arguments args_from_options(
        stride_D}};
   auto& fusion_args = arguments.epilogue.thread;
   fusion_args.alpha_ptr = static_cast<ElementCompute const*>(alpha.data_ptr());
-  arguments.hw_info.cluster_shape = dim3(4, 4, 1);
-  arguments.hw_info.cluster_shape_fallback = dim3(2, 1, 1);
+  if constexpr (std::is_same_v<T, float>) {
+    arguments.hw_info.cluster_shape = dim3(1, 4, 1);
+    arguments.hw_info.cluster_shape_fallback = dim3(1, 1, 1);
+  } else {
+    arguments.hw_info.cluster_shape = dim3(4, 4, 1);
+    arguments.hw_info.cluster_shape_fallback = dim3(2, 1, 1);
+  }
   return arguments;
 }
 
