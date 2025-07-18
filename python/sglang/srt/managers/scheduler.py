@@ -675,6 +675,7 @@ class Scheduler(
         self.spec_num_total_forward_ct = 0
         self.cum_spec_accept_length = 0
         self.cum_spec_accept_count = 0
+        self.total_retracted_reqs = 0
         self.stats = SchedulerStats()
         if self.enable_metrics:
             engine_type = "unified"
@@ -1477,6 +1478,7 @@ class Scheduler(
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.spec_accept_length = spec_accept_length
+            self.stats.total_retracted_reqs = self.total_retracted_reqs
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
@@ -1824,14 +1826,17 @@ class Scheduler(
             old_ratio = self.new_token_ratio
 
             retracted_reqs, new_token_ratio = batch.retract_decode(self.server_args)
+            num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
 
             logger.info(
                 "KV cache pool is full. Retract requests. "
-                f"#retracted_reqs: {len(retracted_reqs)}, "
+                f"#retracted_reqs: {num_retracted_reqs}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
+
             self._extend_requests_to_queue(retracted_reqs, is_retracted=True)
+            self.total_retracted_reqs += num_retracted_reqs
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
