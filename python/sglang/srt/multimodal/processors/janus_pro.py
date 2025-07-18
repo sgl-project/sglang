@@ -11,8 +11,8 @@ from sglang.srt.multimodal.processors.base_processor import (
 class JanusProImageProcessor(BaseMultimodalProcessor):
     models = [MultiModalityCausalLM]
 
-    def __init__(self, hf_config, server_args, processor):
-        super().__init__(hf_config, server_args, processor)
+    def __init__(self, hf_config, server_args, processor, *args):
+        super().__init__(hf_config, server_args, processor, *args)
 
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=processor.image_token
