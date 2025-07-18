@@ -1,7 +1,36 @@
 from typing import Optional
 
 import torch
-from petit_kernel import mul_nvfp4_a16, process_nvfp4_scales, repack_nvfp4
+
+try:
+    from petit_kernel import mul_nvfp4_a16, process_nvfp4_scales, repack_nvfp4
+except ImportError:
+
+    def _check_petit_nvfp4_supported(
+        quant_method: str, group_size: Optional[int]
+    ) -> tuple[bool, Optional[str]]:
+        return (
+            False,
+            "Petit is not installed. Please install it with `pip install petit-kernel`.",
+        )
+
+    def prepare_nvfp4_layer_for_petit(layer: torch.nn.Module) -> None:
+        raise ValueError(
+            "Petit is not installed. Please install it with `pip install petit-kernel`."
+        )
+
+    def apply_petit_nvfp4_linear(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        weight_scale_2: torch.Tensor,
+        size_n: int,
+        size_k: int,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        raise ValueError(
+            "Petit is not installed. Please install it with `pip install petit-kernel`."
+        )
 
 
 def _check_petit_nvfp4_supported(
