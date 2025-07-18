@@ -689,11 +689,6 @@ void _da8w4_linear_impl(
 
 } // anonymous namespace
 
-TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
-  m.def("per_token_quant_int8_cpu_sym(Tensor act) -> (Tensor,Tensor)");
-  m.impl("per_token_quant_int8_cpu_sym", torch::kCPU, &per_token_quant_int8_cpu_sym); 
-}
-
 /*
 return: packed_weight, packed_scales, packed_qzeros, compensation
 */
@@ -741,7 +736,7 @@ da8w4_linear_prepack_cpu(
   weight_sub_qzero = weight_sub_qzero.view({Nc, block_n, Kc, block_k});
   at::Tensor compensation = weight_sub_qzero.sum(-1);
   compensation = compensation.permute({0, 2, 1}).contiguous().to(at::kInt);
-
+#if defined(CPU_CAPABILITY_AVX512)
   if (cpublas_could_pack()) {
     blocked_weight = at::empty({Nc, Kc, block_k, block_n / 2}, weight.options());
     auto weight_ptr = weight_reordered.data_ptr<uint8_t>();
@@ -777,7 +772,9 @@ da8w4_linear_prepack_cpu(
         }
       }
     });
-  } else {
+  } else
+  #endif
+  {
     // Pack weight: two int4 -> one int8
     using namespace at::indexing;
     at::Tensor even_columns =
@@ -800,7 +797,7 @@ at::Tensor da8w4_linear_cpu_with_quant(
   const at::Tensor& compensation,
   const std::optional<at::Tensor>& bias,
   at::ScalarType output_dtype) {
-    RECORD_FUNCTION(
+  RECORD_FUNCTION(
       "sgl-kernel::da8w4_linear_cpu_with_quant", std::vector<c10::IValue>({input, weight}));
 
 int64_t M_a = input.size(0);
@@ -815,7 +812,6 @@ auto Aq = at::empty({M_a, K_a}, input.options().dtype(c10::kByte));
 auto As = at::empty({M_a}, input.options().dtype(at::kFloat));
 auto Azp = at::ones({M_a}, input.options().dtype(at::kInt));
 Azp = Azp.mul(128);
-// auto dummy_Azp = at::empty({M_a}, input.options().dtype(at::kInt));
 static bool cpublas_can_pack = cpublas_could_pack();
 bool sym_quant_a = false;
 auto out_sizes = input.sizes().vec();
@@ -852,17 +848,9 @@ auto output = at::empty(out_sizes, input.options().dtype(output_dtype));
       });
 
 if (cpublas_can_pack) {
-  if (sym_quant_a) {
-    call__da8w4_linear_with_quant_impl(true, true);
-  } else {
     call__da8w4_linear_with_quant_impl(true, false);
-  }
 } else {
-  if (sym_quant_a) {
-    call__da8w4_linear_with_quant_impl(false, true);
-  } else {
     call__da8w4_linear_with_quant_impl(false, false);
-  }
 }
 return output;
 }
