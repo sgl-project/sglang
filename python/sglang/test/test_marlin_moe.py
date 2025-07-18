@@ -3,7 +3,7 @@ from typing import Optional
 
 import pytest
 import torch
-from marlin_utils_test import awq_marlin_quantize, marlin_quantize
+from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
 from sgl_kernel import fused_marlin_moe
 
 from sglang.srt.layers.activation import SiluAndMul
