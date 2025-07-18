@@ -25,7 +25,7 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 else:
-    raise logger.warning("Only CUDA and HIP support AWQ currently.")
+    logger.warning("Only CUDA and HIP support AWQ currently.")
 
 
 def is_layer_skipped_awq(prefix: str, modules_to_not_convert: List[str]):
