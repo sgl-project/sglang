@@ -155,11 +155,11 @@ suites = {
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
         TestFile("test_data_parallelism.py", 73),
-        TestFile("test_dp_attention.py", 137),
+        TestFile("test_dp_attention.py", 277),
         TestFile("test_mla_tp.py", 170),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_update_weights_from_distributed.py", 103),
-        TestFile("test_release_memory_occupation.py", 44),
+        TestFile("test_release_memory_occupation.py", 127),
     ],
     "per-commit-2-gpu-amd": [
         TestFile("models/lora/test_lora_tp.py", 116),
@@ -170,7 +170,7 @@ suites = {
     ],
     "per-commit-4-gpu": [
         TestFile("test_local_attn.py", 250),
-        TestFile("test_pp_single_node.py", 150),
+        TestFile("test_pp_single_node.py", 372),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
     ],
     "per-commit-4-gpu-deepep": [
@@ -182,12 +182,12 @@ suites = {
     "per-commit-8-gpu": [
         # Disabled because it hangs on the CI.
         # TestFile("test_moe_ep.py", 181),
-        TestFile("test_disaggregation.py", 270),
+        TestFile("test_disaggregation.py", 499),
         TestFile("test_disaggregation_different_tp.py", 155),
-        TestFile("test_full_deepseek_v3.py", 463),
+        TestFile("test_full_deepseek_v3.py", 333),
     ],
     "per-commit-8-gpu-deepep": [
-        TestFile("test_deepep_large.py", 485),
+        TestFile("test_deepep_large.py", 338),
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
@@ -214,11 +214,11 @@ suites = {
         TestFile("test_nightly_gsm8k_eval_amd.py"),
     ],
     "vllm_dependency_test": [
-        TestFile("test_awq.py"),
-        TestFile("test_bnb.py"),
-        TestFile("test_gguf.py", 78),
-        TestFile("test_gptqmodel_dynamic.py", 72),
-        TestFile("test_vllm_dependency.py"),
+        TestFile("test_awq.py", 163),
+        TestFile("test_bnb.py", 5),
+        TestFile("test_gguf.py", 96),
+        TestFile("test_gptqmodel_dynamic.py", 102),
+        TestFile("test_vllm_dependency.py", 185),
     ],
 }
 
