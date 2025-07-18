@@ -509,9 +509,8 @@ class GroupCoordinator:
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         ):
             outplace_all_reduce_method = "pymscclpp"
-        outplace_all_reduce_method = "ca"
         if outplace_all_reduce_method is not None:
-            torch.ops.sglang.outplace_all_reduce(
+            return torch.ops.sglang.outplace_all_reduce(
                 input_,
                 group_name=self.unique_name,
                 outplace_all_reduce_method=outplace_all_reduce_method,
