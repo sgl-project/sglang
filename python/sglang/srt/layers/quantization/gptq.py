@@ -1078,7 +1078,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             scoring_func == "softmax"
         ), "Only softmax score func is supported for now."
 
-        # Note:bfloat16 should be supported
+        # The input must currently be float16
         orig_dtype = x.dtype
         x = x.half()
 
