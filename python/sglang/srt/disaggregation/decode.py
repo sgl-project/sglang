@@ -44,7 +44,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch, get_last_loc
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
@@ -413,7 +413,11 @@ class DecodePreallocQueue:
             page_indices = kv_to_page_indices(
                 kv_indices, self.token_to_kv_pool_allocator.page_size
             )
-            decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
+            decode_req.kv_receiver.init(
+                page_indices,
+                decode_req.metadata_buffer_index,
+                len(decode_req.req.prefix_indices),
+            )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
 
@@ -489,15 +493,15 @@ class DecodePreallocQueue:
 
         req.req_pool_idx = req_pool_indices[0]
 
+        req.init_next_round_input(self.tree_cache)
+        num_tokens = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+
         if self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(
-                len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-            )
+            kv_loc = self.token_to_kv_pool_allocator.alloc(num_tokens)
         else:
-            num_tokens = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
             kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
                 prefix_lens=torch.tensor(
-                    [0],
+                    [len(req.prefix_indices)],
                     dtype=torch.int64,
                     device=self.token_to_kv_pool_allocator.device,
                 ),
@@ -507,22 +511,24 @@ class DecodePreallocQueue:
                     device=self.token_to_kv_pool_allocator.device,
                 ),
                 last_loc=torch.tensor(
-                    [-1],
+                    [len(req.prefix_indices) - 1],
                     dtype=torch.int64,
-                    device=self.token_to_kv_pool_allocator.device,
+                    device=self.token_to_kv_pool.device,
                 ),
-                extend_num_tokens=num_tokens,
+                extend_num_tokens=num_tokens - len(req.prefix_indices),
             )
 
         assert (
             kv_loc is not None
         ), "KV cache is full! There is a bug in memory estimation."
 
-        self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
-
-        # populate metadata
-        req.fill_ids = req.origin_input_ids + req.output_ids
-        req.extend_input_len = len(req.origin_input_ids)
+        self.req_to_token_pool.write(
+            (
+                req.req_pool_idx,
+                slice(len(req.prefix_indices), num_tokens),
+            ),
+            kv_loc,
+        )
 
         return kv_loc
 
@@ -628,7 +634,6 @@ class DecodeTransferQueue:
                     self.scheduler.stream_output(
                         [decode_req.req], decode_req.req.return_logprob
                     )
-                    self.tree_cache.cache_finished_req(decode_req.req)
                 else:
                     transferred_reqs.append(decode_req.req)
 

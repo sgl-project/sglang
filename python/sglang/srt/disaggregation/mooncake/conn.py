@@ -1020,7 +1020,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
-        prefix_cache_len: Optional[int] = None,
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
@@ -1030,7 +1029,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.conclude_state = None
         self.init_time = None
         self.data_parallel_rank = data_parallel_rank
-        self.prefix_cache_len = 0 if prefix_cache_len is None else prefix_cache_len
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
             self.prefill_tp_size, self.prefill_dp_size = (
@@ -1245,7 +1243,12 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
-    def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
+    def init(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int] = None,
+        prefix_cache_len: int = 0,
+    ):
         for bootstrap_info in self.bootstrap_infos:
             self.prefill_server_url = (
                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
@@ -1263,7 +1266,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                         kv_indices.tobytes() if not is_dummy else b"",
                         str(aux_index).encode("ascii") if not is_dummy else b"",
                         str(self.required_dst_info_num).encode("ascii"),
-                        str(self.prefix_cache_len).encode("ascii"),
+                        str(prefix_cache_len).encode("ascii"),
                     ]
                 )
         self.init_time = time.time()

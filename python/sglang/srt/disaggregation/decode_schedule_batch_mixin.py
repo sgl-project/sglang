@@ -42,7 +42,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             req_pool_indices.append(req.req_pool_idx)
 
             chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                : req.extend_input_len
+                len(req.prefix_indices) : len(req.fill_ids)
             ]
             assert (
                 offset + req.extend_input_len <= total_size
@@ -62,9 +62,38 @@ class ScheduleBatchDisaggregationDecodeMixin:
             req.already_computed = seq_len
             req.is_retracted = False
             pre_lens.append(pre_len)
-            req.extend_logprob_start_len = 0
+            if req.logprob_start_len >= pre_len:
+                req.extend_logprob_start_len = min(
+                    req.logprob_start_len - pre_len,
+                    req.extend_input_len,
+                    req.seqlen - 1,
+                )
+                global_start_idx, global_end_idx = (
+                    len(req.prefix_indices),
+                    len(req.fill_ids),
+                )
 
-        extend_input_logprob_token_ids = None
+                # Apply logprob_start_len
+                if global_start_idx < req.logprob_start_len:
+                    global_start_idx = req.logprob_start_len
+
+                logprob_token_ids = req.origin_input_ids[
+                    global_start_idx + 1 : global_end_idx + 1
+                ]
+                extend_input_logprob_token_ids.extend(logprob_token_ids)
+
+                extend_input_logprob_token_ids.extend(
+                    [0]
+                    * (
+                        req.extend_input_len
+                        - req.extend_logprob_start_len
+                        - len(logprob_token_ids)
+                    )
+                )
+
+            else:
+                req.extend_logprob_start_len = 0
+                extend_input_logprob_token_ids = None
 
         # Set fields
         self.input_ids = torch.tensor(

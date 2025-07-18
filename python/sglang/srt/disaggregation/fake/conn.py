@@ -63,7 +63,6 @@ class FakeKVReceiver(BaseKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
-        prefix_cache_len: Optional[int] = None,
     ):
         self.has_init = False
 
@@ -76,10 +75,15 @@ class FakeKVReceiver(BaseKVReceiver):
             logger.debug("FakeKVReceiver poll success")
             return KVPoll.Success
 
-    def init(self, kv_indices: list[int], aux_index: Optional[int] = None):
+    def init(
+        self,
+        kv_indices: list[int],
+        aux_index: Optional[int] = None,
+        prefix_cache_len: int = 0,
+    ):
         self.has_init = True
         logger.debug(
-            f"FakeKVReceiver init with kv_indices: {kv_indices}, aux_index: {aux_index}"
+            f"FakeKVReceiver init with kv_indices: {kv_indices}, aux_index: {aux_index} prefix_cache_len: {prefix_cache_len}"
         )
 
     def failure_exception(self):

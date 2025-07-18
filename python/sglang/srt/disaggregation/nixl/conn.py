@@ -445,13 +445,17 @@ class NixlKVReceiver(CommonKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
-        prefix_cache_len: Optional[int] = None,
     ):
         self.started_transfer = False
         self.conclude_state = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room, data_parallel_rank)
 
-    def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
+    def init(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int] = None,
+        prefix_cache_len: int = 0,
+    ):
         for bootstrap_info in self.bootstrap_infos:
             self.prefill_server_url = (
                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
