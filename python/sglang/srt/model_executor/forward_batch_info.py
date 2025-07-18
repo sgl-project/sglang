@@ -167,6 +167,9 @@ class ForwardBatch:
     # The sum of all sequence lengths
     seq_lens_sum: int
 
+    # Whether the kv cache is fp8 e4m3
+    kv_cache_dtype_is_fp8_e4m3: bool = False
+
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
 
@@ -316,6 +319,10 @@ class ForwardBatch:
             tbo_split_seq_index=batch.tbo_split_seq_index,
         )
         device = model_runner.device
+        ret.kv_cache_dtype_is_fp8_e4m3 = model_runner.kv_cache_dtype in [
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        ]
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (

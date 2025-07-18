@@ -91,6 +91,17 @@ class RadixAttention(nn.Module):
         if k is not None:
             # For cross-layer sharing, kv can be None
             assert v is not None
+            if forward_batch.kv_cache_dtype_is_fp8_e4m3:
+                MAX_FP8_E4M3_SCALE = 240.0
+                k_max = k.abs().max()
+                v_max = v.abs().max()
+                k_scale = k_max / MAX_FP8_E4M3_SCALE if k_max > 1e-6 else 1.0
+                v_scale = v_max / MAX_FP8_E4M3_SCALE if v_max > 1e-6 else 1.0
+                self.k_scale = k_scale
+                self.v_scale = v_scale
+                self.k_scale_float = float(k_scale)
+                self.v_scale_float = float(v_scale)
+
             if "k_rope" not in kwargs:
                 k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
                 v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
