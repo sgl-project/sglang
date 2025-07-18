@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import ctypes
 import logging
 import os
@@ -15,6 +17,8 @@ from sglang.srt import _custom_ops as ops
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     gpu_p2p_access_check,
+    is_full_nvlink,
+    is_weak_contiguous,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.utils import is_cuda, is_hip
@@ -33,11 +37,17 @@ except Exception:
     quick_ar = False
 
 
-def is_weak_contiguous(inp: torch.Tensor):
-    return inp.is_contiguous() or (
-        inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
-        == inp.numel() * inp.element_size()
-    )
+def qr_rocm_arch_available():
+    if not is_hip():
+        return False
+    try:
+        props = torch.cuda.get_device_properties(0)
+        gcn_arch = getattr(props, "gcnArchName", "")
+        supported_archs = ["gfx94", "gfx95"]
+        return any(gfx in gcn_arch for gfx in supported_archs)
+    except Exception as e:
+        logger.warning("Failed to determine ROCm for quick allreduce: %s", e)
+        return False
 
 
 class QuickReduceRegime(Enum):
@@ -89,7 +99,7 @@ class QuickAllReduce:
         are in the same node.
         """
         self.disabled = True
-        if not self._rocm_arch_available():
+        if not qr_rocm_arch_available():
             logger.debug(
                 "Custom quick allreduce is only supported on ROCm MI300 series."
             )
@@ -140,11 +150,11 @@ class QuickAllReduce:
         assert isinstance(device, torch.device)
         self.device = device
 
-        cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
+        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
         if cuda_visible_devices:
             device_ids = list(map(int, cuda_visible_devices.split(",")))
         else:
-            device_ids = list(range(cuda_device_count_stateless()))
+            device_ids = list(range(torch.cuda.device_count()))
         physical_device_id = device_ids[device.index]
         tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
         gather_list = [
@@ -157,8 +167,8 @@ class QuickAllReduce:
         # test nvlink first, this will filter out most of the cases
         # where custom quick allreduce is not supported
         # this checks hardware and driver support for NVLink
-        assert current_platform.is_cuda_alike()
-        self.fully_connected = current_platform.is_fully_connected(physical_device_ids)
+        if _is_cuda or _is_hip:
+            self.fully_connected = is_full_nvlink(physical_device_ids, self.world_size)
         if self.world_size > 2 and not self.fully_connected:
             logger.debug(
                 "Custom quick allreduce is disabled because it's not supported "
@@ -172,8 +182,10 @@ class QuickAllReduce:
         # On RocM, bfloat16 kernels are slower than fp16
         # due to slower match operations
         # If environment variable is set to 1, we convert input to fp16
-        self.use_fp16_kernels = envs.VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16
-        regime_str = envs.VLLM_ROCM_QUICK_REDUCE_QUANTIZATION
+        self.use_fp16_kernels = os.environ.get(
+            "VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", 1
+        )
+        regime_str = os.environ.get("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION", "NONE")
         if regime_str not in QuickReduceRegime.__members__:
             logger.warning(
                 "Custom quick allreduce:",
@@ -191,31 +203,11 @@ class QuickAllReduce:
             )
             return
         self.qr_quant_level = QuickReduceRegime[regime_str]
-        vllm_config = get_current_vllm_config()
-        if (
-            vllm_config is not None
-            and hasattr(vllm_config, "model_config")
-            and hasattr(vllm_config.model_config, "dtype")
-        ):
-            dtype = vllm_config.model_config.dtype
-            if dtype not in [torch.float16, torch.bfloat16]:
-                logger.debug(
-                    "Custom quick allreduce disabled: only supports "
-                    "float16 and float16, but get %s.",
-                    dtype,
-                )
-                return
-
-            if dtype == torch.bfloat16 and self.use_fp16_kernels:
-                logger.info(
-                    "Custom quick allreduce: BF16 inputs will be converted "
-                    "to FP16 to improve performance. set "
-                    "envs.VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16=0 "
-                    "to turn off."
-                )
+        # TODO: If the dtype is not bfloat16 or then float16,
+        # quickallreduce should not be created.
 
         # VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB is specified in MB
-        qr_max_size = envs.VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB
+        qr_max_size = os.environ.get("VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", None)
         if qr_max_size is not None:
             if qr_max_size < 1:
                 logger.info(
@@ -223,22 +215,11 @@ class QuickAllReduce:
                     "lead to error or degradation to custom allreduce or rccl."
                 )
             qr_max_size = qr_max_size * MB
+        # If qr_max_size is None, then 2GB is used by default.
         self._ptr = ops.init_custom_qr(self.rank, self.world_size, qr_max_size)
         self.qr_max_size = qr_max_size if qr_max_size is not None else ops.qr_max_size()
         self.create_shared_buffer()
         self.disabled = False
-
-    def _rocm_arch_available(self):
-        if not current_platform.is_rocm():
-            return False
-        try:
-            props = torch.cuda.get_device_properties(0)
-            gcn_arch = getattr(props, "gcnArchName", "")
-            supported_archs = ["gfx94", "gfx95"]
-            return any(gfx in gcn_arch for gfx in supported_archs)
-        except Exception as e:
-            logger.warning("Failed to determine ROCm for quick allreduce: %s", e)
-            return False
 
     def create_shared_buffer(self):
         """
