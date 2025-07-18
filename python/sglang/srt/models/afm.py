@@ -89,7 +89,7 @@ class AFMMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. "
                 "Only relu2 is supported for now."
             )
-        self.act_fn = lambda x: torch.pow(torch.relu(x), 2)
+        self.act_fn = lambda x: torch.nn.functional.relu(x) ** 2
 
     def forward(self, x, forward_batch=None):
         x, _ = self.up_proj(x)
@@ -382,7 +382,6 @@ class ArceeForCausalLM(nn.Module):
         ".q_proj": (".qkv_proj", 0),
         ".k_proj": (".qkv_proj", 1),
         ".v_proj": (".qkv_proj", 2),
-        ".up_proj": (".up_proj", 0),
     }
 
     def __init__(
@@ -396,22 +395,19 @@ class ArceeForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.model = self._init_model(config, quant_config, add_prefix("model", prefix))
-        # Assume tie_word_embeddings is False for AFM
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
-        )
+        # Handle tie_word_embeddings dynamically
+        if self.config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+            )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        self.stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-        ]
         self.capture_aux_hidden_states = False
 
     def _init_model(
