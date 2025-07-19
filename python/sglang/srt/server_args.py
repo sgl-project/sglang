@@ -156,6 +156,7 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
+    requests_all_greedy: Optional[bool] = True
 
     # Expert parallelism
     ep_size: int = 1
@@ -518,8 +519,11 @@ class ServerArgs:
             # NEXTN shares the same implementation of EAGLE
             self.speculative_algorithm = "EAGLE"
 
-        if self.speculative_algorithm in ("EAGLE", "EAGLE3"):
-            if self.max_running_requests is None:
+        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "SIMPLE_EAGLE"):
+            if (
+                self.max_running_requests is None
+                and self.speculative_algorithm != "SIMPLE_EAGLE"
+            ):
                 self.max_running_requests = 48
             self.disable_overlap_schedule = True
             logger.warning(
@@ -576,6 +580,17 @@ class ServerArgs:
             # The token generated from the verify step is counted.
             # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
             # assert self.speculative_num_steps < self.speculative_num_draft_tokens
+
+            # Set parameters for SIMPLE_EAGLE
+            if self.speculative_algorithm == "SIMPLE_EAGLE":
+                self.speculative_num_steps = 1
+                self.speculative_eagle_topk = 1
+                self.speculative_num_draft_tokens = 2
+                self.attention_backend = "flashinfer"
+                logger.warning(
+                    "SIMPLE_EAGLE only supports using flashinfer attention backend currently. "
+                    "Attention backend is automatically set to flashinfer."
+                )
 
         # GGUF
         if (
@@ -1269,7 +1284,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "SIMPLE_EAGLE"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -1312,6 +1327,13 @@ class ServerArgs:
             type=str,
             help="The path of the draft model's small vocab table.",
             default=ServerArgs.speculative_token_map,
+        )
+
+        parser.add_argument(
+            "--requests-all-greedy",
+            type=bool,
+            help="Determine which type of cuda graph builds, all-greedy or all-sampling.",
+            default=ServerArgs.requests_all_greedy,
         )
         parser.add_argument(
             "--mm-attention-backend",
