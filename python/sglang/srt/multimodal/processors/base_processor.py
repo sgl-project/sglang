@@ -5,7 +5,7 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -277,7 +277,7 @@ class BaseMultimodalProcessor(ABC):
         self,
         text_parts: List[str],
         multimodal_tokens: MultimodalSpecialTokens,
-        data_iterators: dict,
+        data_iterators: dict[Modality, Iterator[Any]],
         discard_alpha_channel: bool = True,
         image_estimated_frames_iter: Optional[iter] = None,
         image_scaling_factor: float = 1.0,
@@ -608,7 +608,7 @@ class BaseMultimodalProcessor(ABC):
             else:
                 raise ValueError(f"Unknown multimodal item type: {type(item)}")
         # Process items and get input_ids
-        all_collected_items = []
+        all_collected_items: list[MultimodalDataItem] = []
         input_ids = None
 
         # Handle dict items (already processed)
