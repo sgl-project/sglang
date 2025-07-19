@@ -4,13 +4,13 @@
 use super::pd_types::{api_path, Bootstrap, ChatReqInput, GenerateReqInput, PDRouterError};
 use super::request_adapter::ToPdRequest;
 use crate::core::{HealthChecker, Worker, WorkerFactory, WorkerLoadGuard};
+use crate::metrics::RouterMetrics;
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::policies::LoadBalancingPolicy;
 use crate::tree::Tree;
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
 use futures_util::{StreamExt, TryStreamExt};
-use metrics::{counter, histogram};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -296,7 +296,7 @@ impl PDRouter {
             Ok(pair) => pair,
             Err(e) => {
                 error!("Failed to select PD pair: {}", e);
-                counter!("sgl_router_pd_errors_total", "error" => "server_selection").increment(1);
+                RouterMetrics::record_pd_error("server_selection");
                 return HttpResponse::ServiceUnavailable()
                     .body(format!("No available servers: {}", e));
             }
@@ -313,7 +313,7 @@ impl PDRouter {
         // Add bootstrap info using the trait method
         if let Err(e) = typed_req.add_bootstrap_info(prefill.as_ref()) {
             error!("Failed to add bootstrap info: {}", e);
-            counter!("sgl_router_pd_errors_total", "error" => "bootstrap_injection").increment(1);
+            RouterMetrics::record_pd_error("bootstrap_injection");
             return HttpResponse::InternalServerError()
                 .body(format!("Bootstrap injection failed: {}", e));
         }
@@ -374,7 +374,7 @@ impl PDRouter {
             Ok(pair) => pair,
             Err(e) => {
                 error!("Failed to select PD pair: {}", e);
-                counter!("sgl_router_pd_errors_total", "error" => "server_selection").increment(1);
+                RouterMetrics::record_pd_error("server_selection");
                 return HttpResponse::ServiceUnavailable()
                     .body(format!("No available servers: {}", e));
             }
@@ -391,7 +391,7 @@ impl PDRouter {
         // Add bootstrap info using the trait method
         if let Err(e) = typed_req.add_bootstrap_info(prefill.as_ref()) {
             error!("Failed to add bootstrap info: {}", e);
-            counter!("sgl_router_pd_errors_total", "error" => "bootstrap_injection").increment(1);
+            RouterMetrics::record_pd_error("bootstrap_injection");
             return HttpResponse::InternalServerError()
                 .body(format!("Bootstrap injection failed: {}", e));
         }
@@ -460,13 +460,10 @@ impl PDRouter {
 
         // Update metrics
         let duration = start_time.elapsed();
-        histogram!("sgl_router_pd_request_duration_seconds", "route" => route.to_string())
-            .record(duration.as_secs_f64());
-        counter!("sgl_router_pd_requests_total", "route" => route.to_string()).increment(1);
-        counter!("sgl_router_pd_prefill_requests_total", "worker" => prefill.url().to_string())
-            .increment(1);
-        counter!("sgl_router_pd_decode_requests_total", "worker" => decode.url().to_string())
-            .increment(1);
+        RouterMetrics::record_pd_request_duration(route, duration);
+        RouterMetrics::record_pd_request(route);
+        RouterMetrics::record_pd_prefill_request(prefill.url());
+        RouterMetrics::record_pd_decode_request(decode.url());
 
         // Process decode response
         match decode_result {
@@ -475,7 +472,7 @@ impl PDRouter {
                     .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
 
                 if !status.is_success() {
-                    counter!("sgl_router_pd_decode_errors_total", "worker" => decode.url().to_string()).increment(1);
+                    RouterMetrics::record_pd_decode_error(decode.url());
                     error!(
                         "Decode server {} returned error status: {}",
                         decode.url(),
@@ -501,7 +498,7 @@ impl PDRouter {
                         prefill.url(),
                         e
                     );
-                    counter!("sgl_router_pd_prefill_errors_total", "worker" => prefill.url().to_string()).increment(1);
+                    RouterMetrics::record_pd_prefill_error(prefill.url());
                 }
 
                 if is_stream {
@@ -548,13 +545,19 @@ impl PDRouter {
                     } else {
                         // No logprob merging needed
                         HttpResponse::build(status)
-                            .insert_header((CONTENT_TYPE, HeaderValue::from_static("text/event-stream")))
+                            .insert_header((
+                                CONTENT_TYPE,
+                                HeaderValue::from_static("text/event-stream"),
+                            ))
                             .streaming({
                                 let decode_url = decode.url().to_string();
                                 res.bytes_stream().map_err(move |e| {
                                     error!("Stream error from decode server {}: {}", decode_url, e);
-                                    counter!("sgl_router_pd_stream_errors_total", "worker" => decode_url.to_string()).increment(1);
-                                    actix_web::error::ErrorInternalServerError(format!("Stream error: {}", e))
+                                    RouterMetrics::record_pd_stream_error(&decode_url);
+                                    actix_web::error::ErrorInternalServerError(format!(
+                                        "Stream error: {}",
+                                        e
+                                    ))
                                 })
                             })
                     }
@@ -578,8 +581,7 @@ impl PDRouter {
             }
             Err(e) => {
                 error!("Decode request failed: {}", e);
-                counter!("sgl_router_pd_decode_errors_total", "worker" => decode.url().to_string())
-                    .increment(1);
+                RouterMetrics::record_pd_decode_error(decode.url());
                 HttpResponse::BadGateway().body(format!("Decode server error: {}", e))
             }
         }
