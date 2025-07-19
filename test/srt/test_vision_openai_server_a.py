@@ -115,6 +115,7 @@ class TestVLMContextLengthIssue(CustomTestCase):
             or "is longer than the model's context length" in str(cm.exception)
         )
 
+
 # Note(Xinyuan): mllama is not stable for now, skip for CI
 # class TestMllamaServer(TestOpenAIVisionServer):
 #     @classmethod
