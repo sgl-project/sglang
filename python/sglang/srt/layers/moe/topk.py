@@ -12,8 +12,10 @@
 # limitations under the License.
 # ==============================================================================
 
+from __future__ import annotations
+
 import math
-from typing import Callable, NamedTuple, Optional
+from typing import TYPE_CHECKING, Callable, NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -34,6 +36,9 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import TopKOutput
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -78,6 +83,8 @@ class TopK(CustomOp):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
         super().__init__()
+        if self.use_grouped_topk:
+            assert num_expert_group is not None and topk_group is not None
         self.top_k = top_k
         self.use_grouped_topk = use_grouped_topk
         self.renormalize = renormalize
@@ -95,7 +102,7 @@ class TopK(CustomOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-    ):
+    ) -> TopKOutput:
         torch_native = True
         return select_experts(
             hidden_states=hidden_states,
@@ -121,7 +128,7 @@ class TopK(CustomOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-    ):
+    ) -> TopKOutput:
         torch_native = False
         return select_experts(
             hidden_states=hidden_states,
@@ -147,7 +154,7 @@ class TopK(CustomOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-    ):
+    ) -> TopKOutput:
         return select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -171,7 +178,7 @@ class TopK(CustomOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-    ):
+    ) -> TopKOutput:
         global_num_experts = router_logits.shape[-1]
 
         # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
@@ -609,7 +616,7 @@ def select_experts(
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-):
+) -> TopKOutput:
     router_logits, correction_bias = (
         expert_location_dispatch.transform_select_experts_inputs(
             router_logits=router_logits,

@@ -1,17 +1,13 @@
 import logging
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
-import einops
 import torch
-from torch.nn import Module
 
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
