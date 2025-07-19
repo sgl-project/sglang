@@ -1813,7 +1813,7 @@ class ServerArgs:
         ), "compatibility of lora and radix attention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
-        
+
         assert self.moe_dense_tp_size in {
             1,
             None,
