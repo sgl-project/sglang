@@ -1005,6 +1005,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
 
         if use_intel_amx_backend(layer):
+            from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+
+            x, topk_weights = apply_topk_weights_cpu(
+                apply_router_weight_on_input, topk_weights, x
+            )
+
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,

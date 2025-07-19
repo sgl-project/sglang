@@ -21,7 +21,7 @@ class Phi4MMImageProcessor(BaseMultimodalProcessor):
         super().__init__(hf_config, server_args, _processor)
         self.multimodal_tokens = MultimodalSpecialTokens(
             image_token=_IMAGE_SPECIAL_TOKEN,
-        )
+        ).build(_processor)
 
     async def process_mm_data_async(
         self,
