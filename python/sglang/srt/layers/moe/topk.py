@@ -37,9 +37,6 @@ from sglang.srt.utils import (
     is_npu,
 )
 
-if TYPE_CHECKING:
-    from sglang.srt.layers.moe.topk import TopKOutput
-
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -60,6 +57,12 @@ if _use_aiter:
 
 if _is_npu:
     import torch_npu
+
+
+class TopKOutput(NamedTuple):
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+    router_logits: torch.Tensor
 
 
 class TopK(CustomOp):
@@ -83,7 +86,7 @@ class TopK(CustomOp):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
         super().__init__()
-        if self.use_grouped_topk:
+        if use_grouped_topk:
             assert num_expert_group is not None and topk_group is not None
         self.top_k = top_k
         self.use_grouped_topk = use_grouped_topk
@@ -213,12 +216,6 @@ class TopK(CustomOp):
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
             )
-
-
-class TopKOutput(NamedTuple):
-    topk_weights: torch.Tensor
-    topk_ids: torch.Tensor
-    router_logits: torch.Tensor
 
 
 def fused_topk_torch_native(

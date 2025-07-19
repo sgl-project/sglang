@@ -224,7 +224,7 @@ class PhiMoE(nn.Module):
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(router_logits)
+        topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
         return final_hidden_states.view(orig_shape)
 
