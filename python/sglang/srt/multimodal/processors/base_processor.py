@@ -155,7 +155,6 @@ class BaseMultimodalProcessor(ABC):
         self.ATTR_NAME_TO_MODALITY = {
             # Image-related attributes
             "pixel_values": Modality.IMAGE,
-            "pixel_values_videos": Modality.VIDEO,
             "image_sizes": Modality.IMAGE,
             "image_grid_thw": Modality.IMAGE,
             "image_attention_mask": Modality.IMAGE,
@@ -165,7 +164,6 @@ class BaseMultimodalProcessor(ABC):
             "image_grid_hws": Modality.IMAGE,
             "aspect_ratio_ids": Modality.IMAGE,
             "aspect_ratio_mask": Modality.IMAGE,
-            "second_per_grid_ts": Modality.IMAGE,
             # Audio-related attributes
             "audio_features": Modality.AUDIO,
             "audio_feature_lens": Modality.AUDIO,
@@ -173,6 +171,8 @@ class BaseMultimodalProcessor(ABC):
             "input_features_mask": Modality.AUDIO,
             "audio_attention_mask": Modality.AUDIO,
             # Video-related attributes
+            "pixel_values_videos": Modality.VIDEO,
+            "second_per_grid_ts": Modality.VIDEO,
             "video_grid_thw": Modality.VIDEO,
             # Generic attributes that could apply to multiple modalities
             # "precomputed_embeddings" - handled specially as it can be any modality
