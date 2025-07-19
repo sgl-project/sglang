@@ -1824,7 +1824,7 @@ class ServerArgs:
                     self.lora_paths[name] = path
                 else:
                     self.lora_paths[lora_path] = lora_path
-    
+
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
         larger_tp = max(decode_tp, prefill_tp)
         smaller_tp = min(decode_tp, prefill_tp)
@@ -1852,9 +1852,7 @@ class ServerArgs:
 
         # weight params count
         current_complexity_score = vit_num_layers * (vit_hidden_size**2)
-        baseline_complexity_score = baseline_vit_layers * (
-            baseline_vit_hidden_size**2
-        )
+        baseline_complexity_score = baseline_vit_layers * (baseline_vit_hidden_size**2)
         complexity_ratio = (
             current_complexity_score / baseline_complexity_score
             if baseline_complexity_score > 0
@@ -1863,12 +1861,8 @@ class ServerArgs:
 
         # every time the complexity grows 100%, adjust final factor for 10%
         sensitivity_scale = 0.1
-        dynamic_adjustment_factor = 1.0 - sensitivity_scale * (
-            complexity_ratio - 1.0
-        )
-        dynamic_adjustment_factor = max(
-            0.8, min(1.05, dynamic_adjustment_factor)
-        )
+        dynamic_adjustment_factor = 1.0 - sensitivity_scale * (complexity_ratio - 1.0)
+        dynamic_adjustment_factor = max(0.8, min(1.05, dynamic_adjustment_factor))
 
         final_overall_factor = (
             base_mem_fraction_reduction_ratio * dynamic_adjustment_factor
@@ -1880,6 +1874,7 @@ class ServerArgs:
             f"Multimodal model: Dynamically adjusted --mem-fraction-static "
             f"from: {original_server_arg_mem_fraction:.3f} to: {self.mem_fraction_static:.3f}."
         )
+
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
