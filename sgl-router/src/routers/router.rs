@@ -1,6 +1,6 @@
 use crate::core::{HealthChecker, Worker, WorkerFactory};
+use crate::metrics::RouterMetrics;
 use crate::policies::LoadBalancingPolicy;
-use ::metrics::{counter, gauge, histogram};
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
 use futures_util::{StreamExt, TryStreamExt};
@@ -43,7 +43,7 @@ impl Router {
         interval_secs: u64,
     ) -> Result<Self, String> {
         // Update active workers gauge
-        gauge!("sgl_router_active_workers").set(worker_urls.len() as f64);
+        RouterMetrics::set_active_workers(worker_urls.len());
 
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
         if !worker_urls.is_empty() {
@@ -215,13 +215,11 @@ impl Router {
         // Record request metrics
         if route != "/health" {
             let duration = start.elapsed();
-            counter!("sgl_router_requests_total", "route" => route.to_string()).increment(1);
-            histogram!("sgl_router_request_duration_seconds", "route" => route.to_string())
-                .record(duration.as_secs_f64());
+            RouterMetrics::record_request(route);
+            RouterMetrics::record_request_duration(route, duration);
 
             if !response.status().is_success() {
-                counter!("sgl_router_request_errors_total", "route" => route.to_string())
-                    .increment(1);
+                RouterMetrics::record_request_error(route, "request_failed");
             }
         }
         response
@@ -390,7 +388,7 @@ impl Router {
             while request_retries < MAX_REQUEST_RETRIES {
                 if total_retries >= 1 {
                     info!("Retrying request after {} failed attempts", total_retries);
-                    counter!("sgl_router_retries_total", "route" => route.to_string()).increment(1);
+                    RouterMetrics::record_retry(route);
                 }
 
                 // Increment load before request if using RAII load tracking
@@ -398,8 +396,7 @@ impl Router {
                     let workers_guard = self.workers.read().unwrap();
                     if let Some(worker) = workers_guard.iter().find(|w| w.url() == &worker_url) {
                         worker.increment_load();
-                        gauge!("sgl_router_running_requests", "worker" => worker_url.to_string())
-                            .set(worker.load() as f64);
+                        RouterMetrics::set_running_requests(&worker_url, worker.load());
                         true
                     } else {
                         false
@@ -423,16 +420,14 @@ impl Router {
 
                 if response.status().is_success() {
                     let duration = start.elapsed();
-                    histogram!("sgl_router_generate_duration_seconds", "route" => route.to_string())
-                        .record(duration.as_secs_f64());
+                    RouterMetrics::record_generate_duration(duration);
                     return response;
                 } else {
                     // if the worker is healthy, it means the request is bad, so return the error response
                     let health_response =
                         self.send_request(client, &worker_url, "/health", req).await;
                     if health_response.status().is_success() {
-                        counter!("sgl_router_request_errors_total", "route" => route.to_string())
-                            .increment(1);
+                        RouterMetrics::record_request_error(route, "request_failed");
                         return response;
                     }
                 }
@@ -455,7 +450,7 @@ impl Router {
             }
         }
 
-        counter!("sgl_router_request_errors_total", "route" => route.to_string()).increment(1);
+        RouterMetrics::record_request_error(route, "request_failed");
         HttpResponse::InternalServerError().body("All retry attempts failed")
     }
 
@@ -512,8 +507,7 @@ impl Router {
                     if let Ok(workers_guard) = self.workers.read() {
                         if let Some(worker) = workers_guard.iter().find(|w| w.url() == worker_url) {
                             worker.decrement_load();
-                            gauge!("sgl_router_running_requests", "worker" => worker_url.to_string())
-                                .set(worker.load() as f64);
+                            RouterMetrics::set_running_requests(&worker_url, worker.load());
                         }
                     }
                 }
@@ -540,17 +534,15 @@ impl Router {
                 if let Ok(workers_guard) = self.workers.read() {
                     if let Some(worker) = workers_guard.iter().find(|w| w.url() == worker_url) {
                         worker.decrement_load();
-                        gauge!("sgl_router_running_requests", "worker" => worker_url.to_string())
-                            .set(worker.load() as f64);
+                        RouterMetrics::set_running_requests(&worker_url, worker.load());
                     }
                 }
             }
 
             // Record metrics
             let duration = start.elapsed();
-            histogram!("sgl_router_generate_duration_seconds", "route" => route.to_string())
-                .record(duration.as_secs_f64());
-            counter!("sgl_router_requests_total", "route" => route.to_string()).increment(1);
+            RouterMetrics::record_generate_duration(duration);
+            RouterMetrics::record_request(route);
 
             response
         } else if load_incremented {
@@ -577,8 +569,10 @@ impl Router {
                                             workers_guard.iter().find(|w| w.url() == &worker_url)
                                         {
                                             worker.decrement_load();
-                                            gauge!("sgl_router_running_requests", "worker" => worker_url.to_string())
-                                                .set(worker.load() as f64);
+                                            RouterMetrics::set_running_requests(
+                                                &worker_url,
+                                                worker.load(),
+                                            );
                                             debug!("Streaming is done!!")
                                         }
                                     }
@@ -626,7 +620,7 @@ impl Router {
                         info!("Added worker: {}", worker_url);
                         let new_worker = WorkerFactory::create_regular(worker_url.to_string());
                         workers_guard.push(new_worker);
-                        gauge!("sgl_router_active_workers").set(workers_guard.len() as f64);
+                        RouterMetrics::set_active_workers(workers_guard.len());
 
                         // If cache aware policy, initialize the worker in the tree
                         if let Some(cache_aware) =
@@ -680,7 +674,7 @@ impl Router {
         if let Some(index) = workers_guard.iter().position(|w| w.url() == worker_url) {
             workers_guard.remove(index);
             info!("Removed worker: {}", worker_url);
-            gauge!("sgl_router_active_workers").set(workers_guard.len() as f64);
+            RouterMetrics::set_active_workers(workers_guard.len());
         } else {
             warn!("Worker {} not found, skipping removal", worker_url);
             return;
