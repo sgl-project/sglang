@@ -221,17 +221,17 @@ def _get_precomputed_embedding(
     items: List[MultimodalDataItem],
 ) -> Optional[torch.Tensor]:
     """
-    If all items have precomputed_features, return their concatenation.
-    If some but not all have precomputed_features, raise NotImplementedError.
-    If none have precomputed_features, return None.
+    If all items have precomputed_embeddings, return their concatenation.
+    If some but not all have precomputed_embeddings, raise NotImplementedError.
+    If none have precomputed_embeddings, return None.
     """
-    precomputed_features = [item.precomputed_features for item in items]
-    if any(feature is not None for feature in precomputed_features):
-        if not all(feature is not None for feature in precomputed_features):
+    precomputed_embeddings = [item.precomputed_embeddings for item in items]
+    if any(feature is not None for feature in precomputed_embeddings):
+        if not all(feature is not None for feature in precomputed_embeddings):
             raise NotImplementedError(
                 "MM inputs where only some items are precomputed."
             )
-        result = torch.concat(precomputed_features)
+        result = torch.concat(precomputed_embeddings)
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
         result = result.reshape(-1, result.shape[-1])
         return result
