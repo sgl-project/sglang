@@ -25,6 +25,10 @@
 #include "cuda_runtime.h"
 #include "utils.h"
 
+static constexpr int DEFAULT_NUM_EXPERTS = 256;
+static constexpr int KIMI_K2_NUM_EXPERTS = 384;
+static constexpr int DEFAULT_HIDDEN_DIM = 7168;
+
 // Custom FMA implementation using PTX assembly instructions
 __device__ __forceinline__ void fma(float2& d, float2 const& a, float2 const& b, float2 const& c) {
   asm volatile("fma.rn.f32x2 %0, %1, %2, %3;\n"
@@ -228,6 +232,55 @@ invokeRouterGemm<__nv_bfloat16, 15, 256, 7168>(float*, __nv_bfloat16 const*, __n
 template void
 invokeRouterGemm<__nv_bfloat16, 16, 256, 7168>(float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
+// Template instantiations for KIMI_K2_NUM_EXPERTS experts
+template void invokeRouterGemm<__nv_bfloat16, 1, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void invokeRouterGemm<__nv_bfloat16, 2, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void invokeRouterGemm<__nv_bfloat16, 3, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void invokeRouterGemm<__nv_bfloat16, 4, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void invokeRouterGemm<__nv_bfloat16, 5, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void invokeRouterGemm<__nv_bfloat16, 6, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void invokeRouterGemm<__nv_bfloat16, 7, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void invokeRouterGemm<__nv_bfloat16, 8, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void invokeRouterGemm<__nv_bfloat16, 9, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void invokeRouterGemm<__nv_bfloat16, 10, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void invokeRouterGemm<__nv_bfloat16, 11, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void invokeRouterGemm<__nv_bfloat16, 12, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void invokeRouterGemm<__nv_bfloat16, 13, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void invokeRouterGemm<__nv_bfloat16, 14, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void invokeRouterGemm<__nv_bfloat16, 15, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+template void invokeRouterGemm<__nv_bfloat16, 16, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>(
+    float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
 template <int kBegin, int kEnd, int kNumExperts, int kHiddenDim>
 struct LoopUnroller {
   static void
@@ -260,12 +313,24 @@ void dsv3_router_gemm(
   TORCH_CHECK(output.dim() == 2 && mat_a.dim() == 2 && mat_b.dim() == 2);
 
   const int num_tokens = mat_a.size(0);
-  constexpr int num_experts = 256;
-  constexpr int hidden_dim = 7168;
+  const int num_experts = mat_b.size(0);
+  const int hidden_dim = mat_a.size(1);
 
   TORCH_CHECK(mat_a.size(1) == mat_b.size(1), "mat_a and mat_b must have the same hidden_dim");
-  TORCH_CHECK(mat_a.size(1) == hidden_dim, "currently hidden_dim only supports 7168");
-  TORCH_CHECK(mat_b.size(0) == num_experts, "currently num_experts only supports 256");
+  TORCH_CHECK(
+      hidden_dim == DEFAULT_HIDDEN_DIM,
+      "Expected hidden_dim=",
+      DEFAULT_HIDDEN_DIM,
+      ", but got hidden_dim=",
+      hidden_dim);
+  TORCH_CHECK(
+      num_experts == DEFAULT_NUM_EXPERTS || num_experts == KIMI_K2_NUM_EXPERTS,
+      "Expected num_experts=",
+      DEFAULT_NUM_EXPERTS,
+      " or num_experts=",
+      KIMI_K2_NUM_EXPERTS,
+      ", but got num_experts=",
+      num_experts);
   TORCH_CHECK(
       num_tokens >= 1 && num_tokens <= 16, "currently num_tokens must be less than or equal to 16 for router_gemm");
   TORCH_CHECK(mat_a.dtype() == torch::kBFloat16, "mat_a must be bf16");
@@ -277,10 +342,32 @@ void dsv3_router_gemm(
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  LoopUnroller<1, 16, num_experts, hidden_dim>::unroll(
-      num_tokens,
-      reinterpret_cast<float*>(output.mutable_data_ptr()),
-      reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-      reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
-      stream);
+  switch (num_experts) {
+    case DEFAULT_NUM_EXPERTS:
+      LoopUnroller<1, 16, DEFAULT_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>::unroll(
+          num_tokens,
+          reinterpret_cast<float*>(output.mutable_data_ptr()),
+          reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
+          reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
+          stream);
+      break;
+    case KIMI_K2_NUM_EXPERTS:
+      LoopUnroller<1, 16, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>::unroll(
+          num_tokens,
+          reinterpret_cast<float*>(output.mutable_data_ptr()),
+          reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
+          reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
+          stream);
+      break;
+    default:
+      TORCH_CHECK(
+          false,
+          "Unsupported num_experts=",
+          num_experts,
+          ". Expected ",
+          DEFAULT_NUM_EXPERTS,
+          " or ",
+          KIMI_K2_NUM_EXPERTS);
+      break;
+  }
 }
