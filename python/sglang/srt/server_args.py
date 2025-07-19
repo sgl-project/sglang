@@ -411,6 +411,14 @@ class ServerArgs:
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
 
+        model_arch = get_model_arch(self)
+
+        if "Llama4" in model_arch:
+            # TODO: remove this after Llama4 supports page size > 1
+            assert (
+                self.page_size == 1
+            ), "Page size > 1 is not supported for Llama4 models. Please use --page-size 1."
+
         if self.attention_backend == "flashmla":
             logger.warning(
                 "FlashMLA only supports a page_size of 64, change page_size to 64."
@@ -532,8 +540,6 @@ class ServerArgs:
                     "Mixed chunked prefill is disabled because of using "
                     "eagle speculative decoding."
                 )
-
-            model_arch = get_model_arch(self)
 
             if model_arch == "DeepseekV3ForCausalLM":
                 # Auto set draft_model_path DeepSeek-V3/R1
