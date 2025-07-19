@@ -1023,7 +1023,8 @@ def _execute_server_warmup(
                 timeout=600,
             )
             assert res.status_code == 200, f"{res}"
-        else:
+        elif server_args.disaggregation_mode in ["prefill", "decode"]:
+            # TODO: support other disaggregation modes for vision
             logger.info(f"Start of prefill warmup ...")
             json_data = {
                 "sampling_params": {

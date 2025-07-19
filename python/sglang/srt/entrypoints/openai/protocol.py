@@ -558,6 +558,11 @@ class EmbeddingRequest(BaseModel):
     # The request id.
     rid: Optional[Union[List[str], str]] = None
 
+    # For disaggregation
+    bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
+    bootstrap_room: Optional[int] = None
+
 
 class EmbeddingObject(BaseModel):
     embedding: List[float]

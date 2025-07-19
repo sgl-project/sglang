@@ -30,6 +30,8 @@ class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
     DECODE = "decode"
+    EMBEDDING = "embedding"
+    LANGUAGE = "language"
 
 
 #########################
@@ -216,7 +218,11 @@ class KVClassType(Enum):
     BOOTSTRAP_SERVER = "bootstrap_server"
 
 
-def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
+def get_kv_class(
+    transfer_backend: TransferBackend,
+    class_type: KVClassType,
+    is_multimodal: bool = False,
+):
     from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
 
     if transfer_backend == TransferBackend.MOONCAKE:
@@ -227,13 +233,29 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
             MooncakeKVReceiver,
             MooncakeKVSender,
         )
+        from sglang.srt.disaggregation.mooncake.conn_multimodal import (
+            MooncakeEmbeddingBootstrapServer,
+            MooncakeEmbeddingManager,
+            MooncakeEmbeddingReceiver,
+            MooncakeEmbeddingSender,
+        )
 
         class_mapping = {
             KVClassType.KVARGS: KVArgs,
-            KVClassType.MANAGER: MooncakeKVManager,
-            KVClassType.SENDER: MooncakeKVSender,
-            KVClassType.RECEIVER: (MooncakeKVReceiver),
-            KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
+            KVClassType.MANAGER: (
+                MooncakeKVManager if not is_multimodal else MooncakeEmbeddingManager
+            ),
+            KVClassType.SENDER: (
+                MooncakeKVSender if not is_multimodal else MooncakeEmbeddingSender
+            ),
+            KVClassType.RECEIVER: (
+                (MooncakeKVReceiver) if not is_multimodal else MooncakeEmbeddingReceiver
+            ),
+            KVClassType.BOOTSTRAP_SERVER: (
+                MooncakeKVBootstrapServer
+                if not is_multimodal
+                else MooncakeEmbeddingBootstrapServer
+            ),
         }
         return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.ASCEND:
@@ -371,3 +393,47 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
         req.input_top_logprobs_idx = []
         req.input_token_ids_logprobs_val = []
         req.input_token_ids_logprobs_idx = []
+
+
+class MultimodalDataBuffers:
+    def __init__(
+        self, size: int, max_prefill_tokens: int, embedding_dim: int = 8192
+    ) -> None:
+        self.input_embeddings = torch.zeros(
+            (size, max_prefill_tokens * embedding_dim), dtype=torch.bfloat16, device="cpu"
+        )
+        self.fill_ids = torch.zeros((size, max_prefill_tokens), dtype=torch.int32, device="cpu")
+         # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
+        self.embedding_lengths = torch.zeros((size, 16), dtype=torch.int32, device="cpu")
+        self.max_prefill_tokens = max_prefill_tokens
+        self.embedding_dim = embedding_dim
+
+    def get_buf_chunk_info(self, req: Req):
+        # (offset, size)
+        return [
+            (0, len(req.fill_ids) * self.embedding_dim * self.input_embeddings.itemsize),
+            (0, len(req.fill_ids) * self.fill_ids.itemsize),
+            (0, self.embedding_lengths.shape[1] * self.embedding_lengths.itemsize)
+        ]
+
+    def get_buf_infos(self):
+        ptrs = [self.input_embeddings.data_ptr(), self.fill_ids.data_ptr(), self.embedding_lengths.data_ptr()]
+        data_lens = [self.input_embeddings.nbytes, self.fill_ids.nbytes, self.embedding_lengths.nbytes]
+        item_lens = [self.input_embeddings[0].nbytes, self.fill_ids[0].nbytes, self.embedding_lengths[0].nbytes]
+        return ptrs, data_lens, item_lens
+
+    def get_buf(self, idx: int):
+        input_embeddings = self.input_embeddings[idx].reshape(
+            self.max_prefill_tokens, self.embedding_dim
+        )
+        fill_ids = self.fill_ids[idx]
+        embedding_lengths = self.embedding_lengths[idx][0]
+        return input_embeddings, fill_ids, embedding_lengths
+
+    def set_buf(self, req: Req):
+        embed_length = req.embedding.shape[0]
+        self.fill_ids[req.metadata_buffer_index, :len(req.fill_ids)] = torch.tensor(req.fill_ids)
+        self.input_embeddings[req.metadata_buffer_index, :embed_length * self.embedding_dim] = (
+            req.embedding.flatten()
+        )
+        self.embedding_lengths[req.metadata_buffer_index][0] = embed_length
