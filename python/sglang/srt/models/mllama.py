@@ -836,10 +836,19 @@ class MllamaForConditionalGeneration(nn.Module):
             prefix="multi_modal_projector",
         )
         self.logits_processor = LogitsProcessor(config.text_config)
-        self.padding_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        return self.padding_pattern.pad_input_tokens(input_ids, mm_inputs)
+        pixel_values = torch.cat([item.feature for item in mm_inputs.mm_items], dim=0)
+        pad_values = [item.pad_value for item in mm_inputs.mm_items]
+
+        num_concurrent_media, num_tiles = pixel_values.shape[1:3]
+        num_patches = self.vision_model.num_patches
+        image_len = num_concurrent_media * num_tiles * num_patches
+        mm_inputs.num_image_tokens = image_len
+
+        pad_ids = pad_values * ((image_len + len(pad_values)) // len(pad_values))
+
+        return pad_ids[:image_len] + input_ids
 
     def _batch_image_inputs(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode() or all(forward_batch.encoder_cached):
