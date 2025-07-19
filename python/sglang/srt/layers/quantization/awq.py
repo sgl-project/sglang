@@ -743,7 +743,6 @@ class AWQMoEMethod(FusedMoEMethodBase):
         topk_output: TopKOutput,
         *,
         activation: str = "silu",
-        routed_scaling_factor: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
 

@@ -11,6 +11,7 @@ import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
+from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.utils import (
@@ -22,7 +23,6 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
     from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
@@ -294,7 +294,8 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             inplace=inplace,
             activation=activation,
             use_fp8_w8a8=True,
-            per_channel_quant=self.weight_quant.strategy == QuantizationStrategy.CHANNEL,
+            per_channel_quant=self.weight_quant.strategy
+            == QuantizationStrategy.CHANNEL,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             a1_scale=layer.w13_input_scale,
@@ -608,7 +609,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         topk_output: TopKOutput,
         *,
         activation: str = "silu",
-        routed_scaling_factor: Optional[float] = None,
+        **kwargs,
     ) -> torch.Tensor:
 
         assert activation == "silu", "Only SiLU activation is supported."

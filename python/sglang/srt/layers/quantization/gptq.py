@@ -1061,11 +1061,11 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        e_score_correction_bias: Optional[torch.Tensor] = None,
+        *,
         activation: str = "silu",
+        **kwargs,
     ) -> torch.Tensor:
         # Delay the import to avoid circular dependency
-        from sglang.srt.layers.moe.topk import select_experts
 
         assert activation == "silu", "Only SiLU activation is supported."
 

@@ -36,6 +36,7 @@ class CustomOp(nn.Module):
                 from sglang.srt.layers.moe.fused_moe_native import (
                     fused_moe_forward_native,
                 )
+
                 self._forward_method = fused_moe_forward_native
         elif "TopK" in self.__class__.__name__:
             if num_tokens == 1:
