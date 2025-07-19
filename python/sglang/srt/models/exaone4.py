@@ -29,6 +29,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader, maybe_remap_kv_scale_name
 from sglang.srt.utils import add_prefix, make_layers
@@ -84,7 +85,7 @@ class Exaone4Attention(nn.Module):
         rms_norm_eps: float = 1e-06,
         rope_theta: float = 10000,
         rope_scaling: Optional[dict[str, Any]] = None,
-        max_position_embeddings: int = 2048,
+        max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
         bias: bool = False,
         bias_o_proj: bool = False,
@@ -143,16 +144,14 @@ class Exaone4Attention(nn.Module):
         is_neox_style = True
         if quant_config is not None and quant_config.get_name() == "gguf":
             is_neox_style = False
-            
-        layer_has_sliding_window = (
-            getattr(config, "sliding_window_pattern", "LLLG")
-            and (layer_id + 1) % config.sliding_window_pattern.__len__() != 0)
 
-        interleaved_sliding_window = getattr(config,
-                                             "interleaved_sliding_window",
-                                             None)
-        self.sliding_window = (interleaved_sliding_window
-                               if layer_has_sliding_window else None)
+        interleaved_sliding_window = getattr(config, "interleaved_sliding_window", 4096)
+        self.sliding_window_pattern = getattr(config, "sliding_window_pattern", None)
+
+        self.is_sliding = False
+        if self.sliding_window_pattern:
+            if (layer_id + 1) % len(self.sliding_window_pattern) != 0:
+                self.is_sliding = True
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -168,6 +167,9 @@ class Exaone4Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            sliding_window_size=(
+                interleaved_sliding_window if self.is_sliding else None
+            ),
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -186,14 +188,17 @@ class Exaone4Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Add qk-norm
-        q = q.unflatten(-1, (self.num_heads, self.head_dim))
+        q_shape = q.shape
+        q = q.reshape(-1, self.head_dim)
         q = self.q_norm(q)
-        q = q.flatten(-2, -1)
-        k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+        q = q.reshape(q_shape)
+
+        k_shape = k.shape
+        k = k.reshape(-1, self.head_dim)
         k = self.k_norm(k)
-        k = k.flatten(-2, -1)
+        k = k.reshape(k_shape)
         
-        if self.sliding_window:
+        if not self.sliding_window_pattern or self.is_sliding:
             q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
@@ -256,6 +261,7 @@ class Exaone4DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         
@@ -266,6 +272,7 @@ class Exaone4DecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            forward_batch=forward_batch,
         )
         
         # Use post-LN
@@ -300,18 +307,22 @@ class Exaone4Model(nn.Module):
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
-        self.embed_tokens = VocabParallelEmbedding(
-                self.vocab_size,
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("embed_tokens", prefix),
             )
+        else:
+            self.embed_tokens = PPMissingLayer()
         
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
-            lambda prefix: Exaone4DecoderLayer(
+            lambda idx, prefix: Exaone4DecoderLayer(
                 config=config,
                 quant_config=quant_config,
+                layer_id=idx,
                 prefix=prefix,
             ),
             pp_rank=self.pp_group.rank_in_group,
@@ -330,22 +341,38 @@ class Exaone4Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors]:
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.get_input_embeddings(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
         else:
-            hidden_states = input_embeds
-        residual = None
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
         
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
+                forward_batch,
                 residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
     
     # def load_weights(self, weights: Iterable[tuple[str,
@@ -410,6 +437,29 @@ class Exaone4Model(nn.Module):
     #     return loaded_params
     
 class Exaone4ForCausalLM(nn.Module):
+    _tied_weights_keys = ["lm_head.weight"]
+    _tp_plan = {"lm_head": "colwise_rep"}
+    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    base_model_prefix = "language_model"
+
+    # BitandBytes specific attributes
+    default_bitsandbytes_target_modules = [
+        ".gate_proj.",
+        ".down_proj.",
+        ".up_proj.",
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+        ".o_proj.",
+    ]
+    bitsandbytes_stacked_params_mapping = {
+        ".q_proj": (".qkv_proj", 0),
+        ".k_proj": (".qkv_proj", 1),
+        ".v_proj": (".qkv_proj", 2),
+        ".gate_proj": (".gate_up_proj", 0),
+        ".up_proj": (".gate_up_proj", 1),
+    }
+    
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -427,40 +477,24 @@ class Exaone4ForCausalLM(nn.Module):
         config, 
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = ""):
-        super().__init__(config, quant_config, prefix)
+        super().__init__()
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
         
         self.model = self._init_model(config, quant_config, add_prefix("model", prefix))
-        # handle the lm head on different pp ranks
-        if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                )
+        # Exaone-4.0 32B set tie_word_embeddins to False
+        # Exaone-4.0 1.2B set tie_word_embeddins to True
+        if config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
         else:
-            # ranks other than the last rank will have a placeholder layer
-            self.lm_head = PPMissingLayer()
-            
-        # perform weight tying for PP
-        if self.pp_group.world_size > 1 and config.tie_word_embeddings:
-            if self.pp_group.is_first_rank:
-                self.pp_group.send(
-                    self.model.embed_tokens.weight, dst=self.pp_group.last_rank
-                )
-            else:
-                emb_token_weight = self.pp_group.recv(
-                    size=(config.vocab_size, config.hidden_size),
-                    dtype=next(self.model.parameters()).dtype,
-                    src=self.pp_group.first_rank,
-                )
-                self.lm_head.weight.copy_(emb_token_weight)
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+            )
                 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -491,8 +525,8 @@ class Exaone4ForCausalLM(nn.Module):
             positions,
             forward_batch,
             input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors
-            )
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
         
         if self.pp_group.is_last_rank:
             if not get_embedding:
@@ -725,3 +759,5 @@ class Exaone4ForCausalLM(nn.Module):
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
+
+EntryClass = Exaone4ForCausalLM
