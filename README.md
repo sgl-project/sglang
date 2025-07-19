@@ -59,7 +59,7 @@ The core features include:
 - [Contribution Guide](https://docs.sglang.ai/references/contribution_guide.html)
 
 ## Benchmark and Performance
-Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [EP](https://lmsys.org/blog/2025-05-05-large-scale-ep/).
+Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/).
 
 ## Roadmap
 [Development Roadmap (2025 H1)](https://github.com/sgl-project/sglang/issues/4042)
