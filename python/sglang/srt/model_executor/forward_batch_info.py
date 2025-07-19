@@ -418,7 +418,7 @@ class ForwardBatch:
             ret._compute_mrope_positions(model_runner, batch)
 
         # Init lora information
-        if model_runner.server_args.lora_paths is not None:
+        if model_runner.server_args.enable_lora:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         TboForwardBatchPreparer.prepare(
