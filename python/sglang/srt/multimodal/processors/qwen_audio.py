@@ -17,6 +17,17 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
         self.AUDIO_TOKEN_REGEX = re.compile(
             r"<\|audio_bos\|>(?:<\|AUDIO\|>)+<\|audio_eos\|>"
         )
+        # Collect special token ids
+        tokenizer = self._processor.tokenizer
+        self.audio_start_id = tokenizer.convert_tokens_to_ids("<|audio_bos|>")
+        self.audio_token_id = tokenizer.convert_tokens_to_ids("<|AUDIO|>")
+        self.audio_end_id = tokenizer.convert_tokens_to_ids("<|audio_eos|>")
+
+        self.mm_tokens = MultimodalSpecialTokens(
+            audio_token=self.AUDIO_TOKEN,
+            audio_token_regex=self.AUDIO_TOKEN_REGEX,
+            audio_token_id=self.audio_token_id,
+        ).build(_processor)
 
     async def process_mm_data_async(
         self,
@@ -27,58 +38,28 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
         base_output = self.load_mm_data(
             prompt=input_text,
             audio_data=audio_data,
-            multimodal_tokens=MultimodalSpecialTokens(
-                audio_token=self.AUDIO_TOKEN,
-                audio_token_regex=self.AUDIO_TOKEN_REGEX,
-            ),
+            multimodal_tokens=self.mm_tokens,
         )
         if base_output is None:
             return None
 
-        res = self.process_mm_data(
-            input_text=base_output.input_text,
-            audio=base_output.audios,
+        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+            base_output, self.mm_tokens
         )
 
-        # Collect special token ids
-        tokenizer = self._processor.tokenizer
-        audio_start_id = tokenizer.convert_tokens_to_ids("<|audio_bos|>")
-        audio_token_id = tokenizer.convert_tokens_to_ids("<|AUDIO|>")
-        audio_end_id = tokenizer.convert_tokens_to_ids("<|audio_eos|>")
+        assert (
+            "feature_attention_mask" in ret
+        ), "feature_attention_mask not found in processor output"
+        input_lengths = ret["feature_attention_mask"].sum(dim=-1)
+        input_lengths = (input_lengths - 1) // 2 + 1
+        output_lengths = (input_lengths - 2) // 2 + 1
 
-        items = []
-        input_ids = res["input_ids"].flatten()
-
-        if (
-            "input_features" in res
-            and res["input_features"] is not None
-            and len(res["input_features"]) != 0
-        ):
-            if audio_start_id is not None and audio_end_id is not None:
-                offsets = self.get_mm_items_offset_by_pair(
-                    input_ids=input_ids,
-                    mm_start_id=audio_start_id,
-                    mm_end_id=audio_end_id,
-                )
-            else:
-                offsets = None
-
-            input_lengths = res["feature_attention_mask"].sum(dim=-1)
-            input_lengths = (input_lengths - 1) // 2 + 1
-            output_lengths = (input_lengths - 2) // 2 + 1
-
-            item = MultimodalDataItem(
-                feature=res["input_features"],
-                model_specific_data={"audio_feature_lens": output_lengths},
-                offsets=offsets,
-                modality=Modality.AUDIO,
-            )
-            items += [item]
+        mm_items[0].model_specific_data["audio_feature_lens"] = output_lengths
 
         return {
-            "mm_items": items,
+            "mm_items": mm_items,
             "input_ids": input_ids.tolist(),
-            "audio_start_id": audio_start_id,
-            "audio_token_id": audio_token_id,
-            "audio_end_id": audio_end_id,
+            "audio_start_id": self.audio_start_id,
+            "audio_token_id": self.audio_token_id,
+            "audio_end_id": self.audio_end_id,
         }
