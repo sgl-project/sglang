@@ -77,6 +77,7 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
+    ReportHealthInput,
     ResumeMemoryOccupationReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
@@ -85,7 +86,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
-    VertexGenerateReqInput, ReportHealthInput,
+    VertexGenerateReqInput,
 )
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
