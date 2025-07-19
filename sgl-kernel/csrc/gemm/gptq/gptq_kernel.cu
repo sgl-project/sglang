@@ -1569,10 +1569,10 @@ void gemm_half_q_half_cuda(
     int size_n,
     int size_k,
     int groups,
-    bool use_exllama,
+    bool use_shuffle,
     int bit) {
   bool use_reconstruct;
-  if (use_exllama) {
+  if (use_shuffle) {
     use_reconstruct = ((bit == 8 && size_m > MAX_Q_GEMM_ROWS_8BIT) || (bit != 8 && size_m > MAX_Q_GEMM_ROWS));
   } else {
     // The 2/3-bit kernels are somehow slower than dequant + gemm baseline, so
@@ -1581,7 +1581,7 @@ void gemm_half_q_half_cuda(
   }
   if (use_reconstruct) {
     // Reconstruct FP16 matrix, then cuBLAS
-    if (use_exllama) {
+    if (use_shuffle) {
       reconstruct_exllama(b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, temp_dq, size_k, size_n, groups, bit);
     } else {
       reconstruct_gptq(b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, temp_dq, size_k, size_n, groups, bit);
@@ -1604,7 +1604,7 @@ void gemm_half_q_half_cuda(
         &beta,
         c,
         size_n);
-  } else if (use_exllama) {
+  } else if (use_shuffle) {
     // Quantized matmul
     int max_chunks = size_m / BLOCK_M_SIZE_MAX;
     int last_chunk = max_chunks * BLOCK_M_SIZE_MAX;
@@ -1914,7 +1914,7 @@ torch::Tensor gptq_gemm(
     torch::Tensor b_gptq_qzeros,
     torch::Tensor b_gptq_scales,
     torch::Tensor b_g_idx,
-    bool use_exllama,
+    bool use_shuffle,
     int64_t bit) {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   auto options = torch::TensorOptions().dtype(a.dtype()).device(a.device());
@@ -1934,7 +1934,7 @@ torch::Tensor gptq_gemm(
       c.size(1),              // n
       a.size(1),              // k
       b_gptq_qzeros.size(0),  // group number
-      use_exllama,
+      use_shuffle,
       bit);
   return c;
 }
