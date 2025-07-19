@@ -127,7 +127,7 @@ class TestTransformersFallbackEngine(CustomTestCase):
             tp_size=model_case.tp_size,
             torch_dtype=model_case.torch_dtype,
             model_type="generation",
-            impl="transformers",
+            model_impl="transformers",
             trust_remote_code=model_case.trust_remote_code,
             torchao_config=model_case.torchao_config,
         ) as srt_runner:
