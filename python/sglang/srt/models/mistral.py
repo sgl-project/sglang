@@ -56,7 +56,10 @@ class Mistral3ForConditionalGeneration:
         features = []
         for item in items:
             # in each item, we assume pixel_values is always batched
-            pixel_values, image_sizes = item.feature, item.image_sizes
+            pixel_values, image_sizes = (
+                item.feature,
+                item.model_specific_data["image_sizes"],
+            )
             image_outputs = self.vision_tower(
                 pixel_values, image_sizes, output_hidden_states=True
             )

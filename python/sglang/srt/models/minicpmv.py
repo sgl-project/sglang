@@ -726,7 +726,10 @@ class MiniCPMV2_6(MiniCPMBaseModel):
         # list of tensors
         pixel_values = flatten_nested_list([item.feature for item in items])
         tgt_sizes = torch.stack(
-            flatten_nested_list([item.tgt_size for item in items]), dim=0
+            flatten_nested_list(
+                [item.model_specific_data["tgt_size"] for item in items]
+            ),
+            dim=0,
         )
         assert len(pixel_values) == tgt_sizes.shape[0]
 

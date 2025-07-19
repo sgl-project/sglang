@@ -487,9 +487,15 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
-        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+        image_grid_thw = torch.concat(
+            [item.model_specific_data["image_grid_thw"] for item in items], dim=0
+        )
+        assert (
+            pixel_values.dim() == 2
+        ), f"Dimension of pixel_values must be 2, but got {pixel_values.dim()}"
+        assert (
+            image_grid_thw.dim() == 2
+        ), f"Dimension of image_grid_thw must be 2, but got {image_grid_thw.dim()}"
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
 
@@ -498,9 +504,15 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
-        video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert video_grid_thw.dim() == 2, video_grid_thw.dim()
+        video_grid_thw = torch.concat(
+            [item.model_specific_data["video_grid_thw"] for item in items], dim=0
+        )
+        assert (
+            pixel_values.dim() == 2
+        ), f"Dimension of pixel_values must be 2, but got {pixel_values.dim()}"
+        assert (
+            video_grid_thw.dim() == 2
+        ), f"Dimension of video_grid_thw must be 2, but got {video_grid_thw.dim()}"
         video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 

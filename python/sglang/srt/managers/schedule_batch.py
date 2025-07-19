@@ -217,15 +217,6 @@ class MultimodalDataItem:
     precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     # Model-specific data stored in a dictionary
-    # This should contains all the individual model-specific fields like:
-    # - image_grid_thw, second_per_grid_ts (qwen-vl)
-    # - image_emb_mask, image_spatial_crop (deepseek-vl)
-    # - tgt_size (minicpmv)
-    # - aspect_ratio_id, aspect_ratio_mask (mllama)
-    # - image_grid_hws (kimi-vl)
-    # - input_features_mask (gemma3n)
-    # - audio_feature_lens, audio_offsets (minicpmo)
-    # - ...
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @staticmethod

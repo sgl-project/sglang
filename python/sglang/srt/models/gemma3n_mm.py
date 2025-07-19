@@ -318,7 +318,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         # Extract audio features and masks from items
         all_input_features = flatten_nested_list([item.feature for item in items])
         all_input_features_mask = flatten_nested_list(
-            [~item.input_features_mask for item in items]
+            [~item.model_specific_data["input_features_mask"] for item in items]
         )  # Note(Xinyuan): reverse the mask according to the HF implementation
 
         # Process audio features one by one
