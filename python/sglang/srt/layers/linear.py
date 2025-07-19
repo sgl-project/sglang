@@ -53,6 +53,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "ModelOptFp8LinearMethod",
     "ModelOptFp4LinearMethod",
     "IPEXAWQLinearMethod",
+    "PetitNvFp4LinearMethod",
 ]
 
 _is_cpu = is_cpu()
@@ -755,7 +756,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         bias: bool = True,
         skip_bias_add: bool = False,
         params_dtype: Optional[torch.dtype] = None,
-        quant_config: Optional["QuantizationConfig"] = None,
+        quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,

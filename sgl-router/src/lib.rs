@@ -3,14 +3,14 @@ pub mod config;
 pub mod logging;
 use std::collections::HashMap;
 pub mod core;
+pub mod metrics;
 pub mod openai_api_types;
 pub mod policies;
-pub mod prometheus;
 pub mod routers;
 pub mod server;
 pub mod service_discovery;
 pub mod tree;
-use crate::prometheus::PrometheusConfig;
+use crate::metrics::PrometheusConfig;
 
 #[pyclass(eq)]
 #[derive(Clone, PartialEq, Debug)]

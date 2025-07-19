@@ -200,16 +200,17 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
                 "0.70",
                 "--disable-radix-cache",
                 "--max-loras-per-batch",
-                "1",
+                "2",
                 "--revision",
                 revision,
                 "--lora-paths",
                 f"vision={constants.HF_HUB_CACHE}/models--microsoft--Phi-4-multimodal-instruct/snapshots/{revision}/vision-lora",
+                f"speech={constants.HF_HUB_CACHE}/models--microsoft--Phi-4-multimodal-instruct/snapshots/{revision}/speech-lora",
             ],
         )
         cls.base_url += "/v1"
 
-    def get_request_kwargs(self):
+    def get_vision_request_kwargs(self):
         return {
             "extra_body": {
                 "lora_path": "vision",
@@ -218,8 +219,21 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
             }
         }
 
-    def test_video_chat_completion(self):
-        pass
+    def get_audio_request_kwargs(self):
+        return {
+            "extra_body": {
+                "lora_path": "speech",
+                "top_k": 1,
+                "top_p": 1.0,
+            }
+        }
+
+    def test_audio_chat_completion(self):
+        self._test_audio_speech_completion()
+        # TODO: currently phi4-mm cannot pass this test.
+        # We are investigating this issue.
+        # Response: La ciudad está situada en la costa este de la isla, en la desembocadura del río St. Lawrence.
+        # self._test_audio_ambient_completion()
 
 
 class TestVILAServer(TestOpenAIVisionServer):

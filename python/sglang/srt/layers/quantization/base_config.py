@@ -1,11 +1,15 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/base_config.py
+from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 import torch
 from torch import nn
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import TopKOutput
 
 
 class QuantizeMethodBase(ABC):
@@ -88,19 +92,22 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        raise NotImplementedError()
+        raise NotImplementedError
 
     @abstractmethod
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool,
+        topk_output: TopKOutput,
+        *,
+        activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
-        raise NotImplementedError()
+        raise NotImplementedError
 
 
 class QuantizationConfig(ABC):
