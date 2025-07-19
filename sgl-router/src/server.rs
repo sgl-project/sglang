@@ -1,7 +1,7 @@
 use crate::config::RouterConfig;
 use crate::logging::{self, LoggingConfig};
+use crate::metrics::{self, PrometheusConfig};
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
-use crate::prometheus::{self, PrometheusConfig};
 use crate::routers::{RouterFactory, RouterTrait};
 use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
 use actix_web::{
@@ -237,7 +237,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
             "🚧 Initializing Prometheus metrics on {}:{}",
             prometheus_config.host, prometheus_config.port
         );
-        prometheus::start_prometheus(prometheus_config);
+        metrics::start_prometheus(prometheus_config);
     } else {
         info!("🚧 Prometheus metrics disabled");
     }
