@@ -23,7 +23,6 @@ class JanusProImageProcessor(BaseMultimodalProcessor):
         image_data: List[Union[str, bytes]],
         input_text,
         request_obj,
-        max_req_input_len,
         **kwargs,
     ):
         processor = self._processor
@@ -32,7 +31,6 @@ class JanusProImageProcessor(BaseMultimodalProcessor):
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
-            max_req_input_len=max_req_input_len,
         )
 
         mm_items, input_ids, _ = self.process_and_combine_mm_data(

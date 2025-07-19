@@ -29,7 +29,6 @@ class Phi4MMImageProcessor(BaseMultimodalProcessor):
         audio_data,
         input_text,
         request_obj,
-        max_req_input_len,
         **kwargs,
     ):
         if audio_data:
@@ -40,7 +39,6 @@ class Phi4MMImageProcessor(BaseMultimodalProcessor):
 
         base_output = self.load_mm_data(
             prompt=input_text,
-            max_req_input_len=max_req_input_len,
             audio_data=audio_data,
             image_data=image_data,
             multimodal_tokens=self.multimodal_tokens,

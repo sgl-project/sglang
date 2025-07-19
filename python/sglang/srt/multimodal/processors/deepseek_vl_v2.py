@@ -35,18 +35,12 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
         )
 
     async def process_mm_data_async(
-        self,
-        image_data: List[Union[str, bytes]],
-        input_text,
-        max_req_input_len,
-        *args,
-        **kwargs
+        self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs
     ):
         base_output = self.load_mm_data(
             input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
-            max_req_input_len=max_req_input_len,
         )
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output, self.mm_tokens

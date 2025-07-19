@@ -220,7 +220,6 @@ class BaseMultimodalProcessor(ABC):
         audio_data,
         input_text,
         request_obj,
-        max_req_input_len,
         **kwargs,
     ) -> Optional[Dict[str, Any]]:
         pass
@@ -346,7 +345,6 @@ class BaseMultimodalProcessor(ABC):
         self,
         prompt: str,
         multimodal_tokens: MultimodalSpecialTokens,
-        max_req_input_len: int,
         image_data: Optional[list] = None,
         video_data: Optional[list] = None,
         audio_data: Optional[list] = None,

@@ -22,12 +22,10 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
         self,
         audio_data,
         input_text,
-        max_req_input_len,
         **kwargs,
     ):
         base_output = self.load_mm_data(
             prompt=input_text,
-            max_req_input_len=max_req_input_len,
             audio_data=audio_data,
             multimodal_tokens=MultimodalSpecialTokens(
                 audio_token=self.AUDIO_TOKEN,
