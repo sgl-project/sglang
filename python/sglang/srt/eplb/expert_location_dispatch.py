@@ -66,7 +66,7 @@ def transform_select_experts_inputs(
     info: Optional[ExpertLocationDispatchInfo],
 ):
     if (info is not None) and (info.ep_dispatch_algorithm == "fake"):
-        router_logits = torch.randn_like(router_logits)
+        router_logits.uniform_(5, 10)
         if correction_bias is not None:
             correction_bias = torch.zeros_like(correction_bias)
     return router_logits, correction_bias
