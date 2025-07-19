@@ -50,19 +50,10 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-cutlass)
 
-# DeepGEMM
-if("${CUDA_VERSION}" VERSION_EQUAL "12.8")
-  set(DeepGEMM_REPO "https://github.com/deepseek-ai/DeepGEMM")
-  set(DeepGEMM_TAG "6c9558ed04a6b64a84e27305294f5dc920e8ffb0")
-else()
-  set(DeepGEMM_REPO "https://github.com/deepseek-ai/DeepGEMM")
-  set(DeepGEMM_TAG "6c9558ed04a6b64a84e27305294f5dc920e8ffb0")
-endif()
-
 FetchContent_Declare(
     repo-deepgemm
-    GIT_REPOSITORY ${DeepGEMM_REPO}
-    GIT_TAG        ${DeepGEMM_TAG}
+    GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM.git
+    GIT_TAG        6c9558ed04a6b64a84e27305294f5dc920e8ffb0
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
