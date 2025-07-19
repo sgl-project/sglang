@@ -63,6 +63,7 @@ class ServerArgs:
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
     hybrid_kvcache_ratio: Optional[float] = None
+    swa_full_tokens_ratio: float = 0.8
     impl: str = "auto"
 
     # Port for the HTTP server
@@ -104,6 +105,7 @@ class ServerArgs:
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
+    enable_metrics_for_all_schedulers: bool = False
     bucket_time_to_first_token: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
@@ -133,6 +135,8 @@ class ServerArgs:
     preferred_sampling_params: Optional[str] = None
 
     # LoRA
+    max_lora_rank: Optional[int] = None
+    lora_target_modules: Optional[List[str]] = None
     lora_paths: Optional[Union[dict[str, str], List[str]]] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
@@ -218,6 +222,7 @@ class ServerArgs:
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
     hicache_io_backend: str = ""
+    hicache_storage_backend: Optional[str] = None
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
@@ -225,6 +230,7 @@ class ServerArgs:
     enable_return_hidden_states: bool = False
     enable_triton_kernel_moe: bool = False
     warmups: Optional[str] = None
+    disable_hybrid_swa_memory: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -246,6 +252,10 @@ class ServerArgs:
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
+
+    # For PD-Multiplexing
+    enable_pdmux: bool = False
+    sm_group_num: int = 3
 
     def __post_init__(self):
         # Expert parallelism
@@ -327,8 +337,52 @@ class ServerArgs:
 
             # Multimodal models need more memory for the image processor
             model_config = ModelConfig.from_server_args(self)
-            if model_config.is_multimodal:
-                self.mem_fraction_static *= 0.90
+
+            vision_config = getattr(model_config.hf_config, "vision_config", None)
+
+            if model_config.is_multimodal and vision_config:
+                # roughly reduce the mem_fraction_static base on params of Vit
+                original_server_arg_mem_fraction = self.mem_fraction_static
+                # a base mem_fraction_static factor for regular Vit
+                base_mem_fraction_reduction_ratio = 0.95
+
+                vit_num_layers = getattr(vision_config, "num_hidden_layers", 24)
+                vit_hidden_size = getattr(vision_config, "hidden_size", 1024)
+
+                # baseline ViT params (ViT-L/14)
+                baseline_vit_layers = 24
+                baseline_vit_hidden_size = 1024
+
+                # weight params count
+                current_complexity_score = vit_num_layers * (vit_hidden_size**2)
+                baseline_complexity_score = baseline_vit_layers * (
+                    baseline_vit_hidden_size**2
+                )
+                complexity_ratio = (
+                    current_complexity_score / baseline_complexity_score
+                    if baseline_complexity_score > 0
+                    else 1.0
+                )
+
+                # every time the complexity grows 100%, adjust final factor for 10%
+                sensitivity_scale = 0.1
+                dynamic_adjustment_factor = 1.0 - sensitivity_scale * (
+                    complexity_ratio - 1.0
+                )
+                dynamic_adjustment_factor = max(
+                    0.8, min(1.05, dynamic_adjustment_factor)
+                )
+
+                final_overall_factor = (
+                    base_mem_fraction_reduction_ratio * dynamic_adjustment_factor
+                )
+                self.mem_fraction_static = (
+                    original_server_arg_mem_fraction * final_overall_factor
+                )
+                logger.warning(
+                    f"Multimodal model: Dynamically adjusted --mem-fraction-static "
+                    f"from: {original_server_arg_mem_fraction:.3f} to: {self.mem_fraction_static:.3f}."
+                )
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
@@ -481,13 +535,21 @@ class ServerArgs:
 
             model_arch = get_model_arch(self)
 
-            # Auto set draft_model_path DeepSeek-V3/R1
             if model_arch == "DeepseekV3ForCausalLM":
+                # Auto set draft_model_path DeepSeek-V3/R1
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
                 else:
                     logger.warning(
                         "DeepSeek MTP does not require setting speculative_draft_model_path."
+                    )
+            elif "Llama4" in model_arch:
+                # TODO: remove this after Llama4 supports in other backends
+                if self.attention_backend != "fa3":
+                    self.attention_backend = "fa3"
+                    logger.warning(
+                        "Llama4 requires using fa3 attention backend. "
+                        "Attention backend is automatically set to fa3."
                     )
 
             # Auto choose parameters
@@ -704,6 +766,7 @@ class ServerArgs:
                 "gguf",
                 "modelopt",
                 "modelopt_fp4",
+                "petit_nvfp4",
                 "w8a8_int8",
                 "w8a8_fp8",
                 "moe_wna16",
@@ -852,6 +915,18 @@ class ServerArgs:
                 "(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length)"
             ),
         )
+        parser.add_argument(
+            "--swa-full-tokens-ratio",
+            type=float,
+            default=ServerArgs.swa_full_tokens_ratio,
+            help="The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. "
+            "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.",
+        )
+        parser.add_argument(
+            "--disable-hybrid-swa-memory",
+            action="store_true",
+            help="Disable the hybrid SWA memory.",
+        )
 
         # Other runtime options
         parser.add_argument(
@@ -973,6 +1048,13 @@ class ServerArgs:
             "--enable-metrics",
             action="store_true",
             help="Enable log prometheus metrics.",
+        )
+        parser.add_argument(
+            "--enable-metrics-for-all-schedulers",
+            action="store_true",
+            help="Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) "
+            "to record request metrics separately. This is especially useful when dp_attention is enabled, as "
+            "otherwise all metrics appear to come from TP 0.",
         )
         parser.add_argument(
             "--bucket-time-to-first-token",
@@ -1107,6 +1189,28 @@ class ServerArgs:
         )
 
         # LoRA
+        parser.add_argument(
+            "--max-lora-rank",
+            default=ServerArgs.max_lora_rank,
+            type=int,
+            help="The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+        )
+        parser.add_argument(
+            "--lora-target-modules",
+            type=str,
+            choices=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+            nargs="*",
+            default=None,
+            help="The union set of all target modules where LoRA should be applied. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+        )
         parser.add_argument(
             "--lora-paths",
             type=str,
@@ -1547,6 +1651,13 @@ class ServerArgs:
             help="The IO backend for KV cache transfer between CPU and GPU",
         )
         parser.add_argument(
+            "--hicache-storage-backend",
+            type=str,
+            choices=["file"],  # todo, mooncacke
+            default=ServerArgs.hicache_storage_backend,
+            help="The storage backend for hierarchical KV cache.",
+        )
+        parser.add_argument(
             "--flashinfer-mla-disable-ragged",
             action="store_true",
             help="Not using ragged prefill wrapper when running flashinfer mla",
@@ -1674,6 +1785,17 @@ class ServerArgs:
             nargs="*",
             default=None,
             help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
+        )
+        parser.add_argument(
+            "--enable-pdmux",
+            action="store_true",
+            help="Enable PD-Multiplexing, PD running on greenctx stream.",
+        )
+        parser.add_argument(
+            "--sm-group-num",
+            type=int,
+            default=ServerArgs.sm_group_num,
+            help="Number of sm partition groups.",
         )
         parser.add_argument(
             "--weight-loader-disable-mmap",

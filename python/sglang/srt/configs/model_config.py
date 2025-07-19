@@ -391,6 +391,7 @@ class ModelConfig:
             "compressed-tensors",
             "fbgemm_fp8",
             "w8a8_fp8",
+            "petit_nvfp4",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -408,9 +409,11 @@ class ModelConfig:
             "moe_wna16",
             "qoq",
             "w4afp8",
+            "petit_nvfp4",
         ]
         compatible_quantization_methods = {
             "modelopt_fp4": ["modelopt"],
+            "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
@@ -711,7 +714,6 @@ def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int)
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
     else:
-        raise ValueError(
-            "get_hybrid_layer_ids is only implemented for Llama4ForConditionalGeneration"
-        )
+        swa_attention_layer_ids = None
+        full_attention_layer_ids = None
     return swa_attention_layer_ids, full_attention_layer_ids
