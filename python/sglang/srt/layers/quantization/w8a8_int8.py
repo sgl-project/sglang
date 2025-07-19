@@ -3,18 +3,7 @@ from __future__ import annotations
 import importlib
 import sys
 from types import MappingProxyType
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Dict,
-    List,
-    Mapping,
-    Optional,
-    Tuple,
-    Union,
-    cast,
-)
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
 from torch.nn.parameter import Parameter
@@ -253,7 +242,7 @@ class W8A8Int8Config(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
-        from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if _is_npu:
@@ -483,7 +472,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        topk_output: "TopKOutput",
+        topk_output: TopKOutput,
         *,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
@@ -496,7 +485,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
-            topk_weights, topk_ids, _ = topk_outpu
+            topk_weights, topk_ids, _ = topk_output
             x, topk_weights = apply_topk_weights_cpu(
                 apply_router_weight_on_input, topk_weights, x
             )
@@ -898,7 +887,7 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         num_experts: int,
         hidden_size: int,
-        intermediate_size: List[int],
+        intermediate_size: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:

@@ -1,4 +1,6 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/__init__.py
+from __future__ import annotations
+
 import builtins
 import inspect
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Type, Union
@@ -187,7 +189,7 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        topk_output: "TopKOutput",
+        topk_output: TopKOutput,
         *,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,

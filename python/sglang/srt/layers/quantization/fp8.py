@@ -972,7 +972,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        topk_output: "TopKOutput",
+        topk_output: TopKOutput,
         *,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
@@ -1079,7 +1079,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        topk_output: "TopKOutput",
+        topk_output: TopKOutput,
         activation: str = "silu",
         no_combine: bool = False,
     ) -> Optional[torch.Tensor]:

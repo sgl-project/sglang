@@ -1060,7 +1060,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        topk_output: "TopKOutput",
+        topk_output: TopKOutput,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",

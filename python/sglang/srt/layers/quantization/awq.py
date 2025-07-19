@@ -745,6 +745,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
         scoring_func: str = "softmax",
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
+        **kwargs,
     ) -> torch.Tensor:
 
         assert activation == "silu", "Only SiLU activation is supported."

@@ -1,10 +1,11 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/v0.8.2/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
 
 import enum
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from compressed_tensors import CompressionFormat
@@ -22,6 +23,9 @@ from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -62,7 +66,7 @@ class CompressedTensorsMoEMethod:
 
     @staticmethod
     def get_moe_method(
-        quant_config: "CompressedTensorsConfig",  # type: ignore # noqa E501
+        quant_config: CompressedTensorsConfig,
     ) -> "CompressedTensorsMoEMethod":
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
@@ -85,9 +89,7 @@ class CompressedTensorsMoEMethod:
 
 class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
-    def __init__(
-        self, quant_config: "CompressedTensorsConfig"  # type: ignore # noqa E501
-    ):
+    def __init__(self, quant_config: CompressedTensorsConfig):
         self.quant_config = quant_config
         self.weight_quant = self.quant_config.target_scheme_map["Linear"].get("weights")
         self.input_quant = self.quant_config.target_scheme_map["Linear"].get(
@@ -273,7 +275,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        topk_output: "TopKOutput",
+        topk_output: TopKOutput,
         *,
         global_num_experts: int = -1,
         expert_map: Optional[torch.Tensor] = None,
@@ -307,9 +309,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
-    def __init__(
-        self, quant_config: "CompressedTensorsConfig"  # type: ignore # noqa E501
-    ):
+    def __init__(self, quant_config: CompressedTensorsConfig):
         self.quant_config = quant_config
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
@@ -608,7 +608,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        topk_output: "TopKOutput",
+        topk_output: TopKOutput,
         global_num_experts: int = -1,
         expert_map: Optional[torch.Tensor] = None,
         scoring_func: str = "softmax",

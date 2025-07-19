@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+import numpy as np
 import torch
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -351,7 +352,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        topk_output: "TopKOutput",
+        topk_output: TopKOutput,
         *,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
