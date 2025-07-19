@@ -513,11 +513,6 @@ class BaseMultimodalProcessor(ABC):
 
                 if attr_name in self.FEATURE_NAMES:
                     attr_name = "feature"
-                    # replace the feature tensor with a proxy
-                    if isinstance(value, torch.Tensor):
-                        value = TransportProxyTensor(
-                            transport_mode=self.transport_mode, data=value
-                        )
 
                 items[modality].set(attr_name, value)
 
@@ -619,5 +614,20 @@ class BaseMultimodalProcessor(ABC):
                     Modality.AUDIO: mm_tokens.audio_token_id,
                 }.get(mm_item.modality, None),
             )
+
+        # post-process
+        for item in all_collected_items:
+            # replace the feature tensor with a proxy
+            if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
+                item.feature = TransportProxyTensor(
+                    transport_mode=self.transport_mode, data=item.feature
+                )
+            elif (
+                isinstance(item.precomputed_features, torch.Tensor)
+                and item.feature.is_cuda
+            ):
+                item.precomputed_features = TransportProxyTensor(
+                    transport_mode=self.transport_mode, data=item.precomputed_features
+                )
 
         return all_collected_items, input_ids, ret

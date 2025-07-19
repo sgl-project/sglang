@@ -35,7 +35,7 @@ TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
 
 class TransportProxyTensor(torch.Tensor):
     """
-    A torch.Tensor subclass that carries extra metadata and supports
+    A convenient torch.Tensor subclass that carries extra metadata and supports
     efficient inter-process communications
     """
 

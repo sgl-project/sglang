@@ -208,10 +208,11 @@ class MultimodalDataItem:
     hash: int = None
     pad_value: int = None
     offsets: Optional[list] = None
+
     # the raw features returned by processor, e.g. pixel_values or audio_features
     feature: Union[torch.Tensor, np.ndarray] = None
-
-    # the precomputed embeddings for the modality, e.g. image_emb for image, audio_emb for audio
+    # the precomputed features, passed as final encoder embeddings
+    # Usually, one and only one of the feature and precomputed_features is empty
     precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     # Model-specific data stored in a dictionary
