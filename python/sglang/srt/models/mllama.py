@@ -901,7 +901,7 @@ class MllamaForConditionalGeneration(nn.Module):
                     img = pixel_values[0, j]
                     num_tiles = img.shape[0]
                     batched_images[i, j, :num_tiles] = img
-                    batched_ar_ids[i, j] = mm_input.mm_items[0].get("aspect_ratio_id")[
+                    batched_ar_ids[i, j] = mm_input.mm_items[0].get("aspect_ratio_ids")[
                         0, j
                     ]
 

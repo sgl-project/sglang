@@ -163,7 +163,7 @@ class BaseMultimodalProcessor(ABC):
             "images_spatial_crop": Modality.IMAGE,
             "tgt_size": Modality.IMAGE,
             "image_grid_hws": Modality.IMAGE,
-            "aspect_ratio_id": Modality.IMAGE,
+            "aspect_ratio_ids": Modality.IMAGE,
             "aspect_ratio_mask": Modality.IMAGE,
             "second_per_grid_ts": Modality.IMAGE,
             # Audio-related attributes
