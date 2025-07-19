@@ -275,6 +275,15 @@ class ModelRunner:
         self.sampler = Sampler()
         self.load_model()
 
+        if (
+            not self.server_args.disable_hybrid_swa_memory
+            and self.sliding_window_size is not None
+            and self.sliding_window_size > 0
+        ):
+            architectures = self.model_config.hf_config.architectures
+            if architectures and not any("Llama4" in arch for arch in architectures):
+                self.is_hybrid = self.model_config.is_hybrid = True
+
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(
             self.model, "end_layer", self.model_config.num_hidden_layers
@@ -402,7 +411,7 @@ class ModelRunner:
                 else:
                     server_args.attention_backend = "triton"
             logger.info(
-                f"Attention backend not set. Use {server_args.attention_backend} backend by default."
+                f"Attention backend not explicitly specified. Use {server_args.attention_backend} backend by default."
             )
         elif self.use_mla_backend:
             if server_args.device != "cpu":
@@ -454,7 +463,7 @@ class ModelRunner:
             if not self.is_multimodal_chunked_prefill_supported:
                 server_args.chunked_prefill_size = -1
                 logger.info(
-                    f"Automatically turn of --chunked-prefill-size as it is not supported for "
+                    f"Automatically turn off --chunked-prefill-size as it is not supported for "
                     f"{self.model_config.hf_config.model_type}"
                 )
 
@@ -470,10 +479,6 @@ class ModelRunner:
         if server_args.attention_backend == "aiter":
             if self.model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
-
-        if self.is_hybrid and not server_args.disable_radix_cache:
-            logger.info("Automatically disable radix cache for hybrid cache.")
-            server_args.disable_radix_cache = True
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -534,6 +539,7 @@ class ModelRunner:
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
+                duplicate_tp_group=self.server_args.enable_pdmux,
             )
             initialize_dp_attention(
                 enable_dp_attention=self.server_args.enable_dp_attention,
@@ -555,7 +561,7 @@ class ModelRunner:
 
         # Check memory for tensor parallelism
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not self.is_draft_worker:
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
                     logger.warning(
@@ -645,11 +651,15 @@ class ModelRunner:
                 )
 
         # Parse other args
-        self.sliding_window_size = (
-            self.model.get_attention_sliding_window_size()
-            if hasattr(self.model, "get_attention_sliding_window_size")
-            else None
-        )
+        self.sliding_window_size = None
+        if hasattr(self.model, "get_attention_sliding_window_size"):
+            self.sliding_window_size = self.model.get_attention_sliding_window_size()
+        elif self.model_config.attention_chunk_size is not None:
+            self.sliding_window_size = self.model_config.attention_chunk_size
+            print(
+                f"Setting sliding_window_size to be attention_chunk_size: {self.sliding_window_size}"
+            )
+
         self.dtype = self.model_config.dtype
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -882,6 +892,8 @@ class ModelRunner:
             lora_backend=self.server_args.lora_backend,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
+            max_lora_rank=self.server_args.max_lora_rank,
+            target_modules=self.server_args.lora_target_modules,
         )
         result = self.lora_manager.load_lora_adapters(self.server_args.lora_paths)
         if result.success:
@@ -992,8 +1004,53 @@ class ModelRunner:
             )
             self.max_total_num_tokens = self.full_max_total_num_tokens
         else:
-            raise ValueError(
-                f"Unsupported model for hybrid cache: {self.model_config.hf_config.architectures}."
+            assert self.sliding_window_size is not None and self.sliding_window_size > 0
+            full_attention_layer_ids = []
+            swa_attention_layer_ids = []
+
+            try:
+                layers = self.model.model.layers
+            except:
+                try:
+                    layers = self.model.language_model.model.layers
+                except:
+                    self.is_hybrid = False
+                    return
+
+            for layer in layers:
+                if (
+                    layer.self_attn.attn.sliding_window_size is None
+                    or layer.self_attn.attn.sliding_window_size == -1
+                ):
+                    full_attention_layer_ids.append(layer.layer_id)
+                else:
+                    swa_attention_layer_ids.append(layer.layer_id)
+            self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
+            self.model_config.full_attention_layer_ids = full_attention_layer_ids
+
+            # Algorithm:
+            # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
+            # - Find total # of tokens available across layers.
+            # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
+            total_tokens = (
+                self.max_total_num_tokens * self.model_config.num_hidden_layers
+            )
+            full_layers_num = len(full_attention_layer_ids)
+            swa_layers_num = len(swa_attention_layer_ids)
+            swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
+
+            # Solve the equations:
+            # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
+            # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
+            denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
+            self.full_max_total_num_tokens = int(total_tokens / denominator)
+            self.swa_max_total_num_tokens = int(
+                self.full_max_total_num_tokens * swa_full_tokens_ratio
+            )
+            self.max_total_num_tokens = self.full_max_total_num_tokens
+
+            logger.info(
+                f"Use Sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
             )
 
     def init_memory_pool(
@@ -1072,7 +1129,6 @@ class ModelRunner:
             // self.server_args.page_size
             * self.server_args.page_size
         )
-
         # create token size for hybrid cache
         if self.is_hybrid:
             self.set_num_token_hybrid()
@@ -1457,11 +1513,34 @@ class ModelRunner:
             **kwargs,
         )
 
+    def forward_split_prefill(
+        self,
+        forward_batch: ForwardBatch,
+        reinit_attn_backend: bool = False,
+        forward_count: int = 1,
+    ) -> LogitsProcessorOutput:
+        if forward_batch.split_index == 0 or reinit_attn_backend:
+            self.attn_backend.init_forward_metadata(forward_batch)
+        next_split_index = min(
+            forward_batch.split_index + forward_count,
+            self.model_config.num_hidden_layers,
+        )
+        ret = self.model.forward_split_prefill(
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            (forward_batch.split_index, next_split_index),
+        )
+        forward_batch.split_index = next_split_index
+        return ret
+
     def forward(
         self,
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        reinit_attn_backend: bool = False,
+        split_forward_count: int = 1,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         self.forward_pass_id += 1
 
@@ -1470,7 +1549,11 @@ class ModelRunner:
             forward_batch,
         ):
             output = self._forward_raw(
-                forward_batch, skip_attn_backend_init, pp_proxy_tensors
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
             )
 
         if self.eplb_manager is not None:
@@ -1483,6 +1566,8 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool,
         pp_proxy_tensors: Optional[PPProxyTensors],
+        reinit_attn_backend: bool = False,
+        split_forward_count: int = 1,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         can_run_cuda_graph = bool(
             forward_batch.forward_mode.is_cuda_graph()
@@ -1502,6 +1587,12 @@ class ModelRunner:
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
+            )
+        elif forward_batch.forward_mode.is_split_prefill():
+            ret = self.forward_split_prefill(
+                forward_batch,
+                reinit_attn_backend=reinit_attn_backend,
+                forward_count=split_forward_count,
             )
         elif forward_batch.forward_mode.is_idle():
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)

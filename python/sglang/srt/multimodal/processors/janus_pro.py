@@ -11,8 +11,12 @@ from sglang.srt.multimodal.processors.base_processor import (
 class JanusProImageProcessor(BaseMultimodalProcessor):
     models = [MultiModalityCausalLM]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, processor):
+        super().__init__(hf_config, server_args, processor)
+
+        self.mm_tokens = MultimodalSpecialTokens(
+            image_token=processor.image_token
+        ).build(processor)
 
     async def process_mm_data_async(
         self,
@@ -27,9 +31,7 @@ class JanusProImageProcessor(BaseMultimodalProcessor):
         base_out = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(
-                image_token=processor.image_token
-            ),
+            multimodal_tokens=self.mm_tokens,
             max_req_input_len=max_req_input_len,
         )
 
@@ -47,9 +49,9 @@ class JanusProImageProcessor(BaseMultimodalProcessor):
         return {
             "mm_items": [
                 MultimodalDataItem(
-                    pixel_values=res["pixel_values"],
+                    feature=res["pixel_values"],
                     image_emb_mask=res["images_emb_mask"],
-                    image_offsets=image_offsets,
+                    offsets=image_offsets,
                     modality=Modality.IMAGE,
                 )
             ],

@@ -490,6 +490,7 @@ class TboForwardBatchPreparer:
         output_dict["spec_info"] = output_spec_info
         for key in [
             "forward_mode",
+            "is_extend_in_batch",
             "return_logprob",
             "req_to_token_pool",
             "token_to_kv_pool",
@@ -499,6 +500,7 @@ class TboForwardBatchPreparer:
             "capture_hidden_mode",
             "padded_static_len",
             "mrope_positions",  # only used by qwen2-vl, thus not care
+            "split_index",  # for split prefill
         ]:
             output_dict[key] = getattr(batch, key)
         if not batch.forward_mode.is_target_verify():
