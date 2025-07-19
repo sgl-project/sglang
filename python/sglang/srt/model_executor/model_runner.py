@@ -396,7 +396,7 @@ class ModelRunner:
                 if is_hopper_with_cuda_12_3():
                     server_args.attention_backend = "fa3"
                 elif is_sm100_supported():
-                    server_args.attention_backend = "flashinfer"
+                    server_args.attention_backend = "trtllm_mla"
                 elif _is_hip:
                     head_num = self.model_config.get_num_kv_heads(self.tp_size)
                     # TODO current aiter only support head number 16 or 128 head number
@@ -422,6 +422,7 @@ class ModelRunner:
                     "triton",
                     "flashmla",
                     "cutlass_mla",
+                    "trtllm_mla",
                     "ascend",
                 ]:
                     logger.info(
@@ -1380,6 +1381,12 @@ class ModelRunner:
             )
 
             return CutlassMLABackend(self)
+        elif self.server_args.attention_backend == "trtllm_mla":
+            from sglang.srt.layers.attention.trtllm_gen_mla_backend import (
+                TRTLLMGENMLABackend,
+            )
+
+            return TRTLLMGENMLABackend(self)
         elif self.server_args.attention_backend == "intel_amx":
             from sglang.srt.layers.attention.intel_amx_backend import (
                 IntelAMXAttnBackend,
