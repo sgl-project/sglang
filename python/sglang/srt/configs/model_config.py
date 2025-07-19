@@ -53,7 +53,7 @@ class ModelConfig:
         trust_remote_code: bool = True,
         revision: Optional[str] = None,
         context_length: Optional[int] = None,
-        model_override_args: Optional[str] = None,
+        model_override_args: str = "{}",
         is_embedding: Optional[bool] = None,
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
@@ -61,13 +61,13 @@ class ModelConfig:
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
-        impl: Union[str, ModelImpl] = ModelImpl.AUTO,
+        model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
     ) -> None:
 
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
-        self.impl = impl
+        self.model_impl = model_impl
 
         # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
@@ -286,7 +286,7 @@ class ModelConfig:
             dtype=server_args.dtype,
             quantization=server_args.quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
-            impl=server_args.impl,
+            model_impl=server_args.model_impl,
             **kwargs,
         )
 
