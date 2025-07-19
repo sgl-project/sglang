@@ -22,7 +22,7 @@ class TestPixtralServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.73",
+                "0.70",
             ],
         )
         cls.base_url += "/v1"
@@ -44,7 +44,7 @@ class TestMistral3_1Server(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.8",
+                "0.75",
             ],
         )
         cls.base_url += "/v1"
@@ -88,7 +88,7 @@ class TestJanusProServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.4",
+                "0.35",
             ],
         )
         cls.base_url += "/v1"
@@ -197,7 +197,7 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.75",
+                "0.70",
                 "--disable-radix-cache",
                 "--max-loras-per-batch",
                 "1",
