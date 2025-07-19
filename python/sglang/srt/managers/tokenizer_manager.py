@@ -516,6 +516,7 @@ class TokenizerManager:
                 audio_data=obj.audio_data,
                 input_text=input_text or input_ids,
                 request_obj=obj,
+                max_req_input_len=self.max_req_input_len,
             )
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]

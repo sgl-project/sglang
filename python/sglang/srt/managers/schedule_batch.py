@@ -238,6 +238,9 @@ class MultimodalDataItem:
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
 
+    def is_modality(self, modality: Modality) -> bool:
+        return self.modality == modality
+
     def is_audio(self):
         return self.modality == Modality.AUDIO
 

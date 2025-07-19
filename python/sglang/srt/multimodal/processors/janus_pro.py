@@ -33,7 +33,7 @@ class JanusProImageProcessor(BaseMultimodalProcessor):
         )
 
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
-            base_out, self.mm_tokens
+            base_out, self.mm_tokens, prompt=base_out.input_text
         )
 
         return {

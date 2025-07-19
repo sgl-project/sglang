@@ -160,7 +160,7 @@ class BaseMultimodalProcessor(ABC):
             "image_grid_thw": Modality.IMAGE,
             "image_attention_mask": Modality.IMAGE,
             "image_emb_mask": Modality.IMAGE,
-            "image_spatial_crop": Modality.IMAGE,
+            "images_spatial_crop": Modality.IMAGE,
             "tgt_size": Modality.IMAGE,
             "image_grid_hws": Modality.IMAGE,
             "aspect_ratio_id": Modality.IMAGE,
@@ -584,6 +584,7 @@ class BaseMultimodalProcessor(ABC):
         self,
         base_output: BaseMultiModalProcessorOutput,
         mm_tokens: MultimodalSpecialTokens,
+        **kwargs,
     ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
         """
         Process multimodal data and return the combined multimodal items and input_ids.
@@ -632,6 +633,7 @@ class BaseMultimodalProcessor(ABC):
                 images=raw_images,
                 audios=raw_audios,
                 videos=raw_videos,
+                **kwargs,
             )
             all_collected_items.extend(collected_items)
         else:

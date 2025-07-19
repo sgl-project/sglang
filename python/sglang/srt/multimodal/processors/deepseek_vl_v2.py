@@ -18,6 +18,9 @@
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 from typing import List, Union
 
+import torch
+
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.deepseek_vl2 import DeepseekVL2ForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -35,7 +38,13 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
         ).build(_processor)
 
     async def process_mm_data_async(
-        self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs
+        self,
+        image_data: List[Union[str, bytes]],
+        input_text,
+        request_obj,
+        max_req_input_len,
+        *args,
+        **kwargs
     ):
         base_output = self.load_mm_data(
             input_text,
@@ -43,11 +52,14 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
             multimodal_tokens=self.mm_tokens,
         )
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
+            base_output,
+            self.mm_tokens,
+            max_req_input_len=max_req_input_len,
+            conversations=base_output.input_text,
         )
 
         return {
             "mm_items": mm_items,
             "input_ids": input_ids.tolist(),
-            "im_token_id": self.mm_tokens.image_token_id,
+            "im_token_id": self._processor.image_token_id,
         }
