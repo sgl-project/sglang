@@ -1422,6 +1422,13 @@ def get_nvgpu_memory_capacity():
         ]
 
         if not memory_values:
+            # Fallback to torch.cuda.mem_get_info() when failed to get memory capacity from nvidia-smi,
+            # typically in NVIDIA MIG mode.
+            if torch.cuda.is_available():
+                logger.warning(
+                    "Failed to get GPU memory capacity from nvidia-smi, falling back to torch.cuda.mem_get_info()."
+                )
+                return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MB
             raise ValueError("No GPU memory values found.")
 
         # Return the minimum memory value
