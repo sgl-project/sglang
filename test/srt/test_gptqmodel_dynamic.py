@@ -24,7 +24,7 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
         set_custom_all_reduce,
     )
     from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-    from sglang.srt.layers.quantization import get_dynamic_override
+    from sglang.srt.layers.quantization.utils import get_dynamic_override
     from sglang.srt.model_loader import get_model
     from sglang.srt.server_args import PortArgs, ServerArgs
 

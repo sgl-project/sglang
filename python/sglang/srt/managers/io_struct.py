@@ -13,7 +13,7 @@
 # ==============================================================================
 """
 The definition of objects transferred between different
-processes (TokenizerManager, DetokenizerManager, Controller).
+processes (TokenizerManager, DetokenizerManager, Scheduler).
 """
 
 import copy
@@ -545,7 +545,7 @@ class EmbeddingReqInput:
     # The request id.
     rid: Optional[Union[List[str], str]] = None
     # Dummy sampling params for compatibility
-    sampling_params: Union[List[Dict], Dict] = None
+    sampling_params: Optional[Union[List[Dict], Dict]] = None
     # Dummy input embeds for compatibility
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -953,17 +953,6 @@ class ProfileReqType(Enum):
     STOP_PROFILE = 2
 
 
-class ExpertDistributionReq(Enum):
-    START_RECORD = 1
-    STOP_RECORD = 2
-    DUMP_RECORD = 3
-
-
-@dataclass
-class ExpertDistributionReqOutput:
-    pass
-
-
 @dataclass
 class ProfileReq:
     type: ProfileReqType
@@ -1010,6 +999,17 @@ class OpenSessionReqOutput:
 
 @dataclass
 class HealthCheckOutput:
+    pass
+
+
+class ExpertDistributionReq(Enum):
+    START_RECORD = 1
+    STOP_RECORD = 2
+    DUMP_RECORD = 3
+
+
+@dataclass
+class ExpertDistributionReqOutput:
     pass
 
 

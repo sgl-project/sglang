@@ -4,11 +4,9 @@ pub mod logging;
 use std::collections::HashMap;
 pub mod core;
 pub mod openai_api_types;
-pub mod pd_router;
-pub mod pd_types;
+pub mod policies;
 pub mod prometheus;
-pub mod request_adapter;
-pub mod router;
+pub mod routers;
 pub mod server;
 pub mod service_discovery;
 pub mod tree;
@@ -241,11 +239,6 @@ impl Router {
             ))
         })?;
 
-        // Convert to internal policy config
-        let policy_config = router_config
-            .to_routing_policy_config()
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
         // Create service discovery config if enabled
         let service_discovery_config = if self.service_discovery {
             Some(service_discovery::ServiceDiscoveryConfig {
@@ -282,8 +275,7 @@ impl Router {
             server::startup(server::ServerConfig {
                 host: self.host.clone(),
                 port: self.port,
-                worker_urls: self.worker_urls.clone(),
-                policy_config,
+                router_config,
                 max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
                 log_level: self.log_level.clone(),
