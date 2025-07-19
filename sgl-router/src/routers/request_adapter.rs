@@ -1,9 +1,9 @@
 // Request adapter to bridge OpenAI API types with PD routing requirements
 
+use super::pd_types::{Bootstrap, ChatReqInput, GenerateReqInput, SingleOrBatch};
 use crate::openai_api_types::{
     ChatCompletionRequest, CompletionRequest, GenerateRequest, GenerationRequest, StringOrArray,
 };
-use crate::pd_types::{Bootstrap, ChatReqInput, GenerateReqInput, SingleOrBatch};
 use serde_json::Value;
 
 /// Adapter trait to convert OpenAI requests to PD-compatible requests
