@@ -604,6 +604,23 @@ class FusedMoE(torch.nn.Module):
             ]
         ]
 
+    @classmethod
+    def make_expert_input_scale_params_mapping(
+        cls,
+        num_experts: int,
+    ) -> List[Tuple[str, str, int, str]]:
+        # (param_name, weight_name, expert_id, shard_id)
+        return [
+            (
+                "experts.w13_" if shard_id in ["w1", "w3"] else "experts.w2_",
+                f"experts.{expert_id}.{shard_id}.",
+                expert_id,
+                shard_id,
+            )
+            for expert_id in range(num_experts)
+            for shard_id in ["w1", "w2", "w3"]
+        ]
+
     def _load_fp8_scale(
         self,
         param: torch.nn.Parameter,

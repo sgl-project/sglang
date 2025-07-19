@@ -184,7 +184,7 @@ void cutlass_w4a8_group_gemm_caller(
   TORCH_CHECK(b_tensors.size(0) == num_experts, "B tensor first dimension must match number of groups");
   TORCH_CHECK(b_scales.size(0) == num_experts, "Scale tensor first dimension must match number of groups");
   TORCH_CHECK(b_tensors.size(2) * 2 == a_tensors.size(1), "B tensor K/2 dimension must match A tensor K dimension");
-  TORCH_CHECK(b_scales.size(1) == a_tensors.size(1) / 512, "Scale tensor second dimension must be K//512");
+  TORCH_CHECK(b_scales.size(1) == (a_tensors.size(1) + 511) / 512, "Scale tensor second dimension must be K//512");
   TORCH_CHECK(b_scales.size(2) == 4 * b_tensors.size(1), "Scale tensor last dimension must be 4*N");
 
   // Check tensor types
