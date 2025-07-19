@@ -15,6 +15,7 @@ limitations under the License.
 
 import logging
 import math
+import os
 import threading
 from queue import Empty, Full, PriorityQueue, Queue
 from typing import TYPE_CHECKING, List, Optional
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
+from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import HiCacheHF3FS
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +220,7 @@ class HiCacheController:
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         mem_pool_host: HostKVCache,
+        tp_cache_group: torch.distributed.ProcessGroup,
         page_size: int,
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through_selective",
@@ -228,6 +231,8 @@ class HiCacheController:
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         self.mem_pool_host = mem_pool_host
+        group_ranks = torch.distributed.get_process_group_ranks(tp_cache_group)
+        self.tp_group = torch.distributed.new_group(group_ranks, backend="gloo")
         self.write_policy = write_policy
         self.page_size = page_size
         # using kernel for small page KV cache transfer and DMA for large pages
@@ -246,6 +251,20 @@ class HiCacheController:
         if storage_backend is not None:
             if storage_backend == "file":
                 self.storage_backend = HiCacheFile()
+                self.enable_storage = True
+                # todo: threshold policy for prefetching
+                self.prefetch_threshold = prefetch_threshold
+            elif storage_backend == "hf3fs":
+                from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+                rank = get_tensor_model_parallel_rank()
+                bytes_per_page = (
+                    mem_pool_host.get_size_per_token() * mem_pool_host.page_size
+                )
+                dtype = mem_pool_host.dtype
+                self.storage_backend = HiCacheHF3FS.from_env_config(
+                    rank, bytes_per_page, dtype
+                )
                 self.enable_storage = True
                 # todo: threshold policy for prefetching
                 self.prefetch_threshold = prefetch_threshold
@@ -358,6 +377,8 @@ class HiCacheController:
         if host_indices is None:
             return None
         self.mem_pool_host.protect_write(host_indices)
+        # to ensure the device indices are ready before accessed by another CUDA stream
+        torch.cuda.current_stream().synchronize()
         self.write_queue.put(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
@@ -502,6 +523,9 @@ class HiCacheController:
         self.prefetch_queue.put(operation)
         return operation
 
+    def prefetch_done(self, operation):
+        return operation.completed_tokens == len(operation.token_ids)
+
     def terminate_prefetch(self, operation):
         operation.mark_done()
         return operation.completed_tokens, operation.hash_value
@@ -513,8 +537,8 @@ class HiCacheController:
         while not self.stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
-                for h in operation.hash_value:
-                    page_data = self.storage_backend.get(h)
+                page_datas = self.storage_backend.batch_get(operation.hash_value)
+                for h, page_data in zip(operation.hash_value, page_datas):
                     if page_data is None:
                         logger.warning(
                             f"Prefetch operation {operation.request_id} failed to retrieve page {h}."
@@ -543,6 +567,16 @@ class HiCacheController:
         aux_thread.start()
         while (not self.stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
+                queue_size = torch.tensor(self.prefetch_queue.qsize(), dtype=torch.int)
+                if torch.distributed.get_world_size(group=self.tp_group) > 1:
+                    torch.distributed.all_reduce(
+                        queue_size,
+                        op=torch.distributed.ReduceOp.MIN,
+                        group=self.tp_group,
+                    )
+                if queue_size.item() == 0:
+                    continue
+
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
@@ -567,11 +601,32 @@ class HiCacheController:
                     else:
                         break
 
+                storage_hit_count_tensor = torch.tensor(
+                    storage_hit_count, dtype=torch.int
+                )
+                if torch.distributed.get_world_size(group=self.tp_group) > 1:
+                    torch.distributed.all_reduce(
+                        storage_hit_count_tensor,
+                        op=torch.distributed.ReduceOp.MIN,
+                        group=self.tp_group,
+                    )
+                storage_hit_count = storage_hit_count_tensor.item()
+                hash_value = hash_value[: (storage_hit_count // self.page_size)]
+
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
-                    self.prefetch_revoke_queue.put(operation.request_id)
+                    self.prefetch_revoke_queue.put(operation)
+                    logger.debug(
+                        f"Prefetching revoke for request {operation.request_id}."
+                    )
                 else:
                     operation.hash_value = hash_value
+                    self.mem_pool_host.free(
+                        operation.host_indices[len(hash_value) * self.page_size :]
+                    )
+                    operation.host_indices = operation.host_indices[
+                        : len(hash_value) * self.page_size
+                    ]
                     logger.debug(
                         f"Prefetching {len(hash_value)} pages for request {operation.request_id}."
                     )
@@ -606,19 +661,21 @@ class HiCacheController:
                 last_hash = operation.last_hash
                 tokens_to_backup = operation.token_ids
 
+                last_hashes, data_pages = [], []
                 for i in range(0, len(tokens_to_backup), self.page_size):
                     last_hash = get_hash_str(
                         tokens_to_backup[i : i + self.page_size], last_hash
                     )
-                    # todo, handle failures in storage backend
-                    self.storage_backend.set(
-                        last_hash,
-                        self.mem_pool_host.get_flat_data_page(
-                            operation.host_indices[i]
-                        ),
+                    data_page = self.mem_pool_host.get_flat_data_page(
+                        operation.host_indices[i]
                     )
-                    operation.completed_tokens += self.page_size
-                    operation.hash_value.append(last_hash)
+                    last_hashes.append(last_hash)
+                    data_pages.append(data_page)
+
+                # todo, handle failures in storage backend
+                self.storage_backend.batch_set(last_hashes, data_pages)
+                operation.completed_tokens += len(tokens_to_backup)
+                operation.hash_value.extend(last_hashes)
 
                 self.ack_backup_queue.put((operation.id, operation.hash_value))
 
