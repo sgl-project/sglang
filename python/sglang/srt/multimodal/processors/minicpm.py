@@ -15,8 +15,8 @@ from sglang.srt.multimodal.processors.base_processor import (
 class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
     models = [MiniCPMV, MiniCPMO]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args):
+        super().__init__(hf_config, server_args, _processor, *args)
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="(<image>./</image>)",
             audio_token="(<audio>./</audio>)",

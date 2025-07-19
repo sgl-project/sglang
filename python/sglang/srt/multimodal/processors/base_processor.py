@@ -12,6 +12,7 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
+from sglang.srt.managers.mm_utils import TransportProxyTensor
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import load_audio, load_image, load_video, logger
 
@@ -134,11 +135,12 @@ class MultimodalSpecialTokens:
 class BaseMultimodalProcessor(ABC):
     models = []
 
-    def __init__(self, hf_config, server_args, _processor):
+    def __init__(self, hf_config, server_args, _processor, transport_mode):
         self.hf_config = hf_config
         self._processor = _processor
         self.arch = hf_config.architectures[0]
         self.server_args = server_args
+        self.transport_mode = transport_mode
 
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
@@ -207,10 +209,6 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        if "pixel_values" in result and isinstance(
-            result["pixel_values"], torch.Tensor
-        ):
-            result["pixel_values"] = result["pixel_values"].to("cpu")
         return result
 
     @abstractmethod
@@ -648,5 +646,20 @@ class BaseMultimodalProcessor(ABC):
                     Modality.AUDIO: mm_tokens.audio_token_id,
                 }.get(mm_item.modality, None),
             )
+
+        # post-process
+        for item in all_collected_items:
+            # replace the feature tensor with a proxy
+            if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
+                item.feature = TransportProxyTensor(
+                    transport_mode=self.transport_mode, data=item.feature
+                )
+            elif (
+                isinstance(item.precomputed_features, torch.Tensor)
+                and item.feature.is_cuda
+            ):
+                item.precomputed_features = TransportProxyTensor(
+                    transport_mode=self.transport_mode, data=item.precomputed_features
+                )
 
         return all_collected_items, input_ids, ret

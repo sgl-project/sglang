@@ -17,8 +17,8 @@ _IMAGE_SPECIAL_TOKEN_ID = 200010
 class Phi4MMImageProcessor(BaseMultimodalProcessor):
     models = [Phi4MMForCausalLM]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args):
+        super().__init__(hf_config, server_args, _processor, *args)
         self.multimodal_tokens = MultimodalSpecialTokens(
             image_token=_IMAGE_SPECIAL_TOKEN,
         ).build(_processor)
