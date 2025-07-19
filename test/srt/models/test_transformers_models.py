@@ -27,7 +27,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--impl", "transformers"],
+            other_args=["--model-impl", "transformers"],
         )
         cls.mmlu_lower_bound = 0.65
         cls.gsm8k_lower_bound = 0.65
@@ -76,7 +76,7 @@ class TestTransformersFallbackTorchAO(TestTransformersFallbackEndpoint):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--impl",
+                "--model-impl",
                 "transformers",
                 "--torchao-config",
                 "int4wo-128",
