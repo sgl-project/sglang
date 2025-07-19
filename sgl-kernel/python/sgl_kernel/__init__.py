@@ -30,6 +30,10 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     silu_and_mul,
 )
+
+if torch.version.hip is not None:
+    from sgl_kernel.elementwise import gelu_quick
+
 from sgl_kernel.fused_moe import fused_marlin_moe
 from sgl_kernel.gemm import (
     awq_dequantize,
