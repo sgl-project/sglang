@@ -211,9 +211,7 @@ class MultimodalDataItem:
     # the raw features returned by processor, e.g. pixel_values or audio_features
     feature: Union[torch.Tensor, np.ndarray] = None
 
-    # Common fields used across multiple models
-    image_sizes: Tuple[int, int] = None
-
+    # the precomputed embeddings for the modality, e.g. image_emb for image, audio_emb for audio
     precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     # Model-specific data stored in a dictionary
@@ -268,7 +266,6 @@ class MultimodalDataItem:
 
     def merge(self, other):
         self.feature += other.feature
-        self.image_sizes += other.image_sizes
         self.offsets += other.offsets
         self.hash = hash((self.hash, other.hash))
         self.set_pad_value()
