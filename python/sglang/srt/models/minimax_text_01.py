@@ -1118,9 +1118,7 @@ class MiniMaxText01ForCausalLM(nn.Module):
                 padding_size=DEFAULT_VOCAB_PADDING_SIZE,
             )
 
-            self.logits_processor = LogitsProcessor(
-                self.unpadded_vocab_size, self.config.vocab_size
-            )
+            self.logits_processor = LogitsProcessor(config)
 
         else:
             self.lm_head = PPMissingLayer()
@@ -1162,17 +1160,25 @@ class MiniMaxText01ForCausalLM(nn.Module):
             inputs_embeds,
             **kwargs,
         )
+        if get_pp_group().is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            return hidden_states
 
-        return hidden_states
+    # def compute_logits(
+    #     self, hidden_states: torch.Tensor, sampling_metadata
+    # ) -> torch.Tensor:
+    #     logits_output = self.logits_processor(
+    #         None,  # input_ids can be None for generation
+    #         hidden_states.float(),
+    #         self.lm_head,
+    #         sampling_metadata
+    #     )
 
-    def compute_logits(
-        self, hidden_states: torch.Tensor, sampling_metadata
-    ) -> torch.Tensor:
-        logits = self.logits_processor(
-            self.lm_head, hidden_states.float(), sampling_metadata
-        )
-
-        return logits
+    #     # Extract logits from LogitsProcessorOutput
+    #     return logits_output.next_token_logits
 
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
