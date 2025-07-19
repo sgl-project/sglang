@@ -217,4 +217,22 @@ class KimiK2Detector(BaseFormatDetector):
         raise NotImplementedError()
 
     def build_ebnf(self, tools: List[Tool]):
-        raise NotImplementedError()
+        """
+        Build EBNF grammar for Kimi K2 tool call format.
+        Format: <|tool_calls_section_begin|><|tool_call_begin|>function.{tool_name}:{index}<|tool_call_argument_begin|>{json_args}<|tool_call_end|><|tool_calls_section_end|>
+        """
+        if not tools:
+            return None
+
+        # Use EBNFComposer with custom call rule format for Kimi K2
+        # The call rule format includes the tool ID pattern and argument structure
+        call_rule_fmt = '"<|tool_call_begin|>" "function.{name}:" [0-9]+ "<|tool_call_argument_begin|>" {arguments_rule} "<|tool_call_end|>"'
+
+        return EBNFComposer.build_ebnf(
+            tools,
+            function_format="json",
+            sequence_start_token=self.bot_token,
+            sequence_end_token=self.eot_token,
+            tool_call_separator="",  # No separator between tool calls
+            call_rule_fmt=call_rule_fmt,
+        )
