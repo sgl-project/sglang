@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import warnings
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import torch
 
@@ -32,6 +32,9 @@ from sglang.srt.layers.quantization.marlin_utils import (
 from sglang.srt.layers.quantization.scalar_type import scalar_types
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import replace_parameter
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import TopKOutput
 
 try:
     from vllm import _custom_ops as ops
@@ -737,45 +740,19 @@ class AWQMoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
-        custom_routing_function: Optional[Callable] = None,
-        scoring_func: str = "softmax",
-        correction_bias: Optional[torch.Tensor] = None,
-        apply_router_weight_on_input: bool = False,
+        topk_output: TopKOutput,
+        *,
         activation: str = "silu",
-        routed_scaling_factor: Optional[float] = None,
+        **kwargs,
     ) -> torch.Tensor:
-        # Delay the import to avoid circular dependency
-        from sglang.srt.layers.moe.topk import select_experts
 
         assert activation == "silu", "Only SiLU activation is supported."
-        assert (
-            scoring_func == "softmax"
-        ), "Only softmax score func is supported for now."
 
         # The input must currently be float16
         orig_dtype = x.dtype
         x = x.half()
 
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            top_k=top_k,
-            use_grouped_topk=use_grouped_topk,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
+        topk_weights, topk_ids, router_logits = topk_output
 
         return fused_marlin_moe(
             x,
