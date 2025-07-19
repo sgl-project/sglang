@@ -1,60 +1,29 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
-import importlib
-from abc import abstractmethod
+import logging
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
-from sglang.srt.utils import (
-    cpu_has_amx_support,
-    get_bool_env_var,
-    is_cpu,
-    is_hip,
-    set_weight_attrs,
-    use_intel_amx_backend,
-)
-
-has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
-
-if torch.cuda.is_available():
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-
-    if has_triton_kernels:
-        from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-            triton_kernel_moe_forward,
-        )
-else:
-    fused_experts = None  # type: ignore
-
-import logging
+from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var, is_cpu, is_hip
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
-if _use_aiter:
-    from aiter import ActivationType
-    from aiter.fused_moe import fused_moe
-    from aiter.fused_moe_bf16_asm import ck_moe_2stages
-    from aiter.ops.shuffle import shuffle_weight
 
 logger = logging.getLogger(__name__)
 
@@ -462,7 +431,7 @@ class FusedMoE(torch.nn.Module):
         shard_dim: int,
         expert_data: torch.Tensor,
         shard_id: str,
-        loaded_weight: torch.tensor,
+        loaded_weight: torch.Tensor,
         tp_rank: int,
     ):
         # Load grouped weight scales for group quantization
@@ -489,7 +458,7 @@ class FusedMoE(torch.nn.Module):
         expert_data: torch.Tensor,
         shard_dim: int,
         shard_id: str,
-        loaded_weight: torch.tensor,
+        loaded_weight: torch.Tensor,
         tp_rank: int,
     ):
         # for per channel weight quantization
@@ -509,7 +478,7 @@ class FusedMoE(torch.nn.Module):
         expert_data: torch.Tensor,
         shard_dim: int,
         shard_id: str,
-        loaded_weight: torch.tensor,
+        loaded_weight: torch.Tensor,
         tp_rank: int,
     ):
 
@@ -554,7 +523,7 @@ class FusedMoE(torch.nn.Module):
         expert_data: torch.Tensor,
         shard_dim: int,
         shard_id: str,
-        loaded_weight: torch.tensor,
+        loaded_weight: torch.Tensor,
         tp_rank: int,
     ):
         """Load w2 weights for down projection.
@@ -626,7 +595,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_data: torch.Tensor,
         shard_dim: int,
-        loaded_weight: torch.tensor,
+        loaded_weight: torch.Tensor,
         tp_rank: int,
     ):
 
