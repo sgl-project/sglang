@@ -742,16 +742,12 @@ class AWQMoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_output: TopKOutput,
         *,
-        scoring_func: str = "softmax",
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
 
         assert activation == "silu", "Only SiLU activation is supported."
-        assert (
-            scoring_func == "softmax"
-        ), "Only softmax score func is supported for now."
 
         # The input must currently be float16
         orig_dtype = x.dtype

@@ -22,6 +22,7 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
     from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
@@ -58,7 +59,7 @@ __all__ = [
 ]
 
 
-class CompressedTensorsMoEMethod:
+class CompressedTensorsMoEMethod(FusedMoEMethodBase):
     def __new__(cls, *args, **kwargs):
         if cls is CompressedTensorsMoEMethod:
             return super().__new__(cls)
@@ -277,13 +278,10 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         x: torch.Tensor,
         topk_output: TopKOutput,
         *,
-        global_num_experts: int = -1,
-        expert_map: Optional[torch.Tensor] = None,
-        scoring_func: str = "softmax",
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
-        apply_router_weight_on_input: bool = False,
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton import fused_experts
@@ -296,8 +294,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             inplace=inplace,
             activation=activation,
             use_fp8_w8a8=True,
-            per_channel_quant=self.weight_quant.strategy
-            == QuantizationStrategy.CHANNEL,
+            per_channel_quant=self.weight_quant.strategy == QuantizationStrategy.CHANNEL,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             a1_scale=layer.w13_input_scale,
@@ -609,18 +606,12 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        global_num_experts: int = -1,
-        expert_map: Optional[torch.Tensor] = None,
-        scoring_func: str = "softmax",
+        *,
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
 
         assert activation == "silu", "Only SiLU activation is supported."
-        if expert_map is not None:
-            raise NotImplementedError(
-                "Expert Parallelism is not supported for " "fused Marlin MoE method."
-            )
 
         topk_weights, topk_ids, router_logits = topk_output
 

@@ -71,9 +71,12 @@ class TopK(CustomOp):
         renormalize: bool = True,
         num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
         correction_bias: Optional[torch.Tensor] = None,
         routed_scaling_factor: Optional[float] = None,
     ):
+        # NOTE: scoring_func is not used for now, but we keep it for future use
+        # see https://github.com/sgl-project/sglang/pull/4505 for more details
         super().__init__()
         self.top_k = top_k
         self.use_grouped_topk = use_grouped_topk

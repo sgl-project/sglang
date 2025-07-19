@@ -1061,7 +1061,6 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
     ) -> torch.Tensor:
@@ -1069,9 +1068,6 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.topk import select_experts
 
         assert activation == "silu", "Only SiLU activation is supported."
-        assert (
-            scoring_func == "softmax"
-        ), "Only softmax score func is supported for now."
 
         # The input must currently be float16
         orig_dtype = x.dtype
