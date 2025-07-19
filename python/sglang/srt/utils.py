@@ -2880,3 +2880,17 @@ def parse_module_path(module_path, function_name, create_dummy):
         return final_module, getattr(final_module, function_name)
 
     return final_module, None
+
+
+# LoRA-related constants and utilities
+SUPPORTED_LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+LORA_TARGET_ALL_MODULES = "all"

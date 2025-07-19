@@ -25,6 +25,8 @@ from typing import List, Literal, Optional, Union
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
+    LORA_TARGET_ALL_MODULES,
+    SUPPORTED_LORA_TARGET_MODULES,
     configure_ipv6,
     get_device,
     get_device_memory_capacity,
@@ -37,18 +39,6 @@ from sglang.srt.utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-SUPPORTED_LORA_TARGET_MODULES = [
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-]
-
-LORA_TARGET_ALL_MODULES = "all"
 
 
 @dataclasses.dataclass
@@ -1152,7 +1142,7 @@ class ServerArgs:
             "--enable-lora",
             default=ServerArgs.enable_lora,
             action="store_true",
-            help="Enable LoRA support for the model. This argument is automatically set to True if any other LoRA argument is provided.",
+            help="Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility.",
         )
         parser.add_argument(
             "--max-lora-rank",

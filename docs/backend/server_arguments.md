@@ -164,6 +164,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
+| `--enable-lora` | Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility. | False |
 | `--lora-paths` | The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}. | None |
 | `--max-loras-per-batch` | Maximum number of adapters for a running batch, include base-only request. | 8 |
 | `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | triton |
