@@ -484,7 +484,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # Handle tool calls
                 if request.tool_choice != "none" and request.tools:
-                    async for chunk in self._process_tool_call_stream(
+                    async for (
+                        chunk,
+                        tool_call_finish_reason_type,
+                    ) in self._process_tool_call_stream(
                         index,
                         delta,
                         parser_dict,
@@ -492,7 +495,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         request,
                         finish_reason_type,
                     ):
-                        yield chunk
+                        if chunk:
+                            yield chunk
+                        finish_reason_type = tool_call_finish_reason_type
+
                 else:
                     # Regular content
                     if delta or not (
@@ -865,7 +871,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 choices=[choice_data],
                 model=request.model,
             )
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json()}\n\n", finish_reason_type
 
         # Yield tool calls
         for call_item in calls:
@@ -920,4 +926,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 choices=[choice_data],
                 model=request.model,
             )
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json()}\n\n", finish_reason_type
+
+        if finish_reason_type == "stop":
+            yield None, "tool_calls"
