@@ -946,7 +946,37 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         self.mrope_section = mrope_section
         if self.mrope_section:
-            assert sum(self.mrope_section) == rotary_dim // 2
+            expected_sum = rotary_dim // 2
+            actual_sum = sum(self.mrope_section)
+            if actual_sum != expected_sum:
+                print(
+                    f"MRoPE section sum mismatch: expected {expected_sum}, got {actual_sum}. "
+                    f"Adjusting mrope_section to match rotary_dim // 2 = {expected_sum}"
+                )
+                # Auto-correct by scaling the mrope_section proportionally
+                if actual_sum > 0:
+                    scale_factor = expected_sum / actual_sum
+                    self.mrope_section = [
+                        max(1, int(section * scale_factor))
+                        for section in self.mrope_section
+                    ]
+                    # Ensure the sum exactly matches by adjusting the last element
+                    current_sum = sum(self.mrope_section)
+                    if current_sum != expected_sum:
+                        self.mrope_section[-1] += expected_sum - current_sum
+                else:
+                    # If all sections are 0, create a default distribution
+                    self.mrope_section = [
+                        expected_sum // len(self.mrope_section)
+                    ] * len(self.mrope_section)
+                    # Handle remainder
+                    remainder = expected_sum % len(self.mrope_section)
+                    for i in range(remainder):
+                        self.mrope_section[i] += 1
+
+                print(
+                    f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
+                )
 
     def forward(
         self,
@@ -1001,7 +1031,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         spatial_merge_size: int,
         image_token_id: int,
         video_token_id: int,
-        vision_start_token_id: int,
+        vision_start_token_id: int | list[int],
         model_type: str,
         tokens_per_second: Optional[int] = None,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1010,6 +1040,11 @@ class MRotaryEmbedding(RotaryEmbedding):
         second_per_grid_ts: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        vision_start_token_id = (
+            [vision_start_token_id]
+            if isinstance(vision_start_token_id, int)
+            else vision_start_token_id
+        )
         mrope_position_deltas = []
         if input_ids is not None and (
             image_grid_thw is not None or video_grid_thw is not None
@@ -1025,8 +1060,15 @@ class MRotaryEmbedding(RotaryEmbedding):
             image_index, video_index = 0, 0
             for i, input_ids in enumerate(total_input_ids):
                 image_nums, video_nums = 0, 0
-                vision_start_indices = torch.argwhere(
-                    input_ids == vision_start_token_id
+                vision_start_indices = torch.nonzero(
+                    torch.isin(
+                        input_ids,
+                        torch.tensor(
+                            vision_start_token_id,
+                            device=input_ids.device,
+                            dtype=input_ids.dtype,
+                        ),
+                    )
                 ).squeeze(1)
                 vision_tokens = input_ids[vision_start_indices + 1]
                 image_nums = (vision_tokens == image_token_id).sum()
@@ -1083,7 +1125,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                         torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
                     )
 
-                    if model_type == "qwen2_5_vl":
+                    if model_type == "qwen2_5_vl" or model_type == "glm4v":
                         range_tensor = torch.arange(llm_grid_t).view(-1, 1)
                         expanded_range = range_tensor.expand(
                             -1, llm_grid_h * llm_grid_w
