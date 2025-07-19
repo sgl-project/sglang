@@ -53,6 +53,9 @@ if _use_aiter:
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 
+if _is_npu:
+    import torch_npu
+
 
 class TopK(CustomOp):
 
@@ -166,23 +169,40 @@ class TopK(CustomOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ):
-        torch_native = True
-        return select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            top_k=self.top_k,
-            use_grouped_topk=self.use_grouped_topk,
-            renormalize=self.renormalize,
-            topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            num_fused_shared_experts=self.num_fused_shared_experts,
-            custom_routing_function=self.custom_routing_function,
-            correction_bias=self.correction_bias,
-            torch_native=torch_native,
-            routed_scaling_factor=self.routed_scaling_factor,
-            num_token_non_padded=num_token_non_padded,
-            expert_location_dispatch_info=expert_location_dispatch_info,
-        )
+        global_num_experts = router_logits.shape[-1]
+
+        # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
+        if global_num_experts == 256:
+            return torch_npu.npu_moe_gating_top_k(
+                router_logits,
+                k=self.top_k,
+                bias=self.correction_bias,
+                k_group=self.topk_group,
+                group_count=self.num_expert_group,
+                group_select_mode=1,
+                renorm=0,
+                norm_type=1,
+                routed_scaling_factor=1,
+                eps=float(1e-20),
+            )
+        else:
+            torch_native = True
+            return select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                top_k=self.top_k,
+                use_grouped_topk=self.use_grouped_topk,
+                renormalize=self.renormalize,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                custom_routing_function=self.custom_routing_function,
+                correction_bias=self.correction_bias,
+                torch_native=torch_native,
+                routed_scaling_factor=self.routed_scaling_factor,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+            )
 
 
 class TopKOutput(NamedTuple):

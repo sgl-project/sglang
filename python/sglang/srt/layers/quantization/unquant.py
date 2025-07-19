@@ -259,7 +259,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     ),
                 )
             else:
-                from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+                from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+                    fused_experts,
+                )
+
                 return fused_experts(
                     hidden_states=x,
                     w1=layer.w13_weight,
@@ -311,6 +314,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             )
         else:
             from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
+
             return moe_forward_native(
                 layer,
                 x,
@@ -335,6 +339,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
+
         return moe_forward_native(
             layer,
             x,

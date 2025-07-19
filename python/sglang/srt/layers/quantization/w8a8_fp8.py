@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
@@ -269,7 +269,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        topk_output: "TopKOutput",
+        topk_output: TopKOutput,
         *,
         activation: str = "silu",
         inplace: bool = True,

@@ -43,7 +43,6 @@ from sglang.srt.layers.quantization.utils import (
     unpack_cols,
 )
 
-
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
 

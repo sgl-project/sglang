@@ -975,52 +975,11 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         self,
         layer,
         x,
-        router_logits,
-        top_k,
-        renormalize,
-        use_grouped_topk,
-        topk_group,
-        num_expert_group,
-        num_fused_shared_experts,
-        custom_routing_function,
-        correction_bias,
-        activation,
-        apply_router_weight_on_input,
-        routed_scaling_factor,
+        topk_output: TopKOutput,
         **kwargs,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.topk import select_experts
 
-        global_num_experts = router_logits.shape[-1]
-        # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
-        if global_num_experts == 256:
-            topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
-                router_logits,
-                k=top_k,
-                bias=correction_bias,
-                k_group=topk_group,
-                group_count=num_expert_group,
-                group_select_mode=1,
-                renorm=0,
-                norm_type=1,
-                routed_scaling_factor=1,
-                eps=float(1e-20),
-            )
-        else:
-            topk_weights, topk_ids = select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                use_grouped_topk=use_grouped_topk,
-                top_k=top_k,
-                renormalize=renormalize,
-                topk_group=topk_group,
-                num_expert_group=num_expert_group,
-                num_fused_shared_experts=num_fused_shared_experts,
-                custom_routing_function=custom_routing_function,
-                correction_bias=correction_bias,
-                torch_native=True,
-                routed_scaling_factor=routed_scaling_factor,
-            )
+        topk_weights, topk_ids, _ = topk_output
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
         return npu_fused_experts(
@@ -1031,5 +990,5 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            top_k=top_k,
+            top_k=topk_ids.shape[1],
         )

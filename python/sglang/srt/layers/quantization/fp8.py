@@ -984,6 +984,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+
             topk_weights, topk_ids, _ = topk_output
             x, topk_weights = apply_topk_weights_cpu(
                 apply_router_weight_on_input, topk_weights, x
@@ -1160,6 +1161,8 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.float8_e4m3fn
 
