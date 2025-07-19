@@ -411,7 +411,7 @@ class ModelRunner:
                 else:
                     server_args.attention_backend = "triton"
             logger.info(
-                f"Attention backend not set. Use {server_args.attention_backend} backend by default."
+                f"Attention backend not explicitly specified. Use {server_args.attention_backend} backend by default."
             )
         elif self.use_mla_backend:
             if server_args.device != "cpu":
@@ -463,7 +463,7 @@ class ModelRunner:
             if not self.is_multimodal_chunked_prefill_supported:
                 server_args.chunked_prefill_size = -1
                 logger.info(
-                    f"Automatically turn of --chunked-prefill-size as it is not supported for "
+                    f"Automatically turn off --chunked-prefill-size as it is not supported for "
                     f"{self.model_config.hf_config.model_type}"
                 )
 
