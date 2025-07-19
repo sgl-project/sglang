@@ -183,7 +183,7 @@ class ModelRunner:
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
-        self.is_multimodal_embedding = model_config.is_multimodal_embedding
+        self.multimodal_embedding_disaggregated = server_args.disaggregation_mode == "embedding"
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
             model_config.is_multimodal_chunked_prefill_supported
@@ -1419,6 +1419,9 @@ class ModelRunner:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
 
+        if self.multimodal_embedding_disaggregated:
+            return
+
         if self.server_args.disable_cuda_graph:
             return
 
@@ -1494,7 +1497,7 @@ class ModelRunner:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
-        if self.is_multimodal_embedding:
+        if self.multimodal_embedding_disaggregated:
             kwargs["get_multimodal_embedding"] = True
         return self.model.forward(
             forward_batch.input_ids,

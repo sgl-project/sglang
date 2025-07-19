@@ -286,11 +286,8 @@ class SchedulerDisaggregationMultimodalEmbeddingMixin:
                 )
                 done_reqs.append(req)
 
-        self.stream_output(
-            done_reqs,
-            any(req.return_logprob for req in done_reqs),
-            None,
-        )
+        # keep generation response format here
+        self.stream_output_generation(done_reqs, any(req.return_logprob for req in done_reqs), None)
 
         for req in done_reqs:
             self.req_to_metadata_buffer_idx_allocator.free(

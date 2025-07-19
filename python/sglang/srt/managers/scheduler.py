@@ -338,7 +338,7 @@ class Scheduler(
             )[0]
 
         # Check whether overlap can be enabled
-        if not self.is_generation:
+        if not self.is_generation or self.server_args.disaggregation_mode == "embedding":
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
 
@@ -557,8 +557,7 @@ class Scheduler(
         server_args = self.server_args
 
         self.model_config = ModelConfig.from_server_args(server_args)
-        self.is_generation = self.model_config.is_generation
-        self.is_multimodal_embedding = self.model_config.is_multimodal_embedding
+        self.is_generation = self.model_config.is_generation and self.server_args.disaggregation_mode != "embedding"
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None

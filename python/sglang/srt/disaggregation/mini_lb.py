@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import PDRegistryRequest
+import copy
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64
@@ -155,15 +156,11 @@ class MiniLoadBalancer:
         prefill_modified_request,
         vision_server,
         prefill_server,
-        vision_endpoint="embedding",
-        prefill_endpoint="generate",
+        endpoint="v1/chat/completions",
     ) -> ORJSONResponse:
         assert (
-            vision_endpoint[0] != "/"
-        ), f"Endpoint should not start with '/': {vision_endpoint}"
-        assert (
-            prefill_endpoint[0] != "/"
-        ), f"Endpoint should not start with '/': {prefill_endpoint}"
+            endpoint[0] != "/"
+        ), f"Endpoint should not start with '/': {endpoint}"
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
@@ -172,10 +169,10 @@ class MiniLoadBalancer:
         ) as session:
             tasks = [
                 session.post(
-                    f"{vision_server}/{vision_endpoint}", json=vision_modified_request
+                    f"{vision_server}/{endpoint}", json=vision_modified_request
                 ),
                 session.post(
-                    f"{prefill_server}/{prefill_endpoint}",
+                    f"{prefill_server}/{endpoint}",
                     json=prefill_modified_request,
                 ),
             ]
@@ -191,15 +188,11 @@ class MiniLoadBalancer:
         prefill_modified_request,
         vision_server,
         prefill_server,
-        vision_endpoint="v1/embeddings",
-        prefill_endpoint="generate",
+        endpoint="v1/chat/completions",
     ):
         assert (
-            vision_endpoint[0] != "/"
-        ), f"Endpoint should not start with '/': {vision_endpoint}"
-        assert (
-            prefill_endpoint[0] != "/"
-        ), f"Endpoint should not start with '/': {prefill_endpoint}"
+            endpoint[0] != "/"
+        ), f"Endpoint should not start with '/': {endpoint}"
 
         async def stream_results():
             async with aiohttp.ClientSession(
@@ -209,11 +202,11 @@ class MiniLoadBalancer:
             ) as session:
                 tasks = [
                     session.post(
-                        f"{vision_server}/{vision_endpoint}",
+                        f"{vision_server}/{endpoint}",
                         json=vision_modified_request,
                     ),
                     session.post(
-                        f"{prefill_server}/{prefill_endpoint}",
+                        f"{prefill_server}/{endpoint}",
                         json=prefill_modified_request,
                     ),
                 ]
@@ -475,51 +468,15 @@ async def _forward_to_backend_multimodal(request_data: dict, endpoint_name: str)
             status_code=400,
             detail=f"Endpoint name should be 'v1/chat/completions', but got {endpoint_name}"
         )
-    if len(request_data["messages"]) != 1:
-        raise HTTPException(
-            status_code=400,
-            detail="Currently only one message per request is supported"
-        )
 
     vision_server, bootstrap_port, prefill_server = load_balancer.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(vision_server)
     hostname = parsed_url.hostname
-    prefill_modified_request = request_data.copy()
-    image_data = [
-        _d["image_url"]["url"]
-        for _d in request_data["messages"][0]["content"]
-        if _d["type"] == "image_url"
-    ]
-    text_data = [
-        _d["text"]
-        for _d in request_data["messages"][0]["content"]
-        if _d["type"] == "text"
-    ]
-    if len(image_data) != 1 or len(text_data) != 1:
-        raise HTTPException(
-            status_code=400,
-            detail="Currently only one image and one text segment per request is supported"
-        )
+    vision_modified_request = copy.deepcopy(request_data)
+    language_modified_request = copy.deepcopy(request_data)
 
-    vision_endpoint = "v1/embeddings"
-    vision_modified_request = {
-        "model": request_data["model"],
-        "input": [
-            {
-                "text": text_data[0],
-                "image": image_data[0],
-            }
-        ],
-    }
-    # del image data for prefill request
-    prefill_modified_request["messages"][0]["content"] = [
-        {
-            "type": "text",
-            "text": text_data[0],
-        }
-    ]
 
     bootstrap_room = (
         _generate_bootstrap_room()
@@ -533,31 +490,37 @@ async def _forward_to_backend_multimodal(request_data: dict, endpoint_name: str)
             "bootstrap_room": bootstrap_room,
         }
     )
-    prefill_modified_request.update(
+    language_modified_request.update(
         {
             "bootstrap_host": hostname,
             "bootstrap_port": bootstrap_port,
             "bootstrap_room": bootstrap_room,
         }
     )
+    # only keep text input for language request
+    for message in language_modified_request["messages"]:
+        if isinstance(message["content"], list):
+            text_content = []
+            for content in message["content"]:
+                if content["type"] == "text":
+                    text_content.append(content)
+            message["content"] = text_content
 
     if request_data.get("stream", False):
         return await load_balancer.multimodal_generate_stream(
             vision_modified_request,
-            prefill_modified_request,
+            language_modified_request,
             vision_server,
             prefill_server,
-            vision_endpoint=vision_endpoint,
-            prefill_endpoint=endpoint_name,
+            endpoint=endpoint_name
         )
     else:
         return await load_balancer.multimodal_generate(
             vision_modified_request,
-            prefill_modified_request,
+            language_modified_request,
             vision_server,
             prefill_server,
-            vision_endpoint=vision_endpoint,
-            prefill_endpoint=endpoint_name,
+            endpoint=endpoint_name
         )
 
 
