@@ -15,6 +15,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -60,6 +61,11 @@ class GraniteMoeMoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
+        self.topk = TopK(
+            top_k=top_k,
+            renormalize=True,
+        )
+
         self.experts = FusedMoE(
             num_experts=num_experts,
             top_k=top_k,
@@ -67,7 +73,6 @@ class GraniteMoeMoE(nn.Module):
             intermediate_size=intermediate_size,
             params_dtype=params_dtype,
             reduce_results=True,
-            renormalize=True,
             quant_config=quant_config,
             tp_size=tp_size,
             prefix=f"{prefix}.experts",
@@ -78,7 +83,8 @@ class GraniteMoeMoE(nn.Module):
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states, router_logits)
+        topk_output = self.topk(hidden_states, router_logits)
+        final_hidden_states = self.experts(hidden_states, topk_output)
         return final_hidden_states.view(orig_shape)
 
 

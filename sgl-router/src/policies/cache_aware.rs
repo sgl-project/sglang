@@ -61,8 +61,8 @@
 
 use super::{get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy};
 use crate::core::Worker;
+use crate::metrics::RouterMetrics;
 use crate::tree::Tree;
-use metrics::{counter, gauge};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -171,9 +171,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 max_load, min_load, worker_loads
             );
 
-            counter!("sgl_router_load_balancing_events_total").increment(1);
-            gauge!("sgl_router_max_load").set(max_load as f64);
-            gauge!("sgl_router_min_load").set(min_load as f64);
+            RouterMetrics::record_load_balancing_event();
+            RouterMetrics::set_load_range(max_load, min_load);
 
             // Use shortest queue when imbalanced
             let min_load_idx = healthy_indices
@@ -183,8 +182,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
             // Increment processed counter
             workers[min_load_idx].increment_processed();
-            counter!("sgl_router_processed_requests_total", "worker" => workers[min_load_idx].url().to_string())
-                .increment(1);
+            RouterMetrics::record_processed_request(workers[min_load_idx].url());
 
             return Some(min_load_idx);
         }
@@ -201,10 +199,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             };
 
             let selected_url = if match_rate > self.config.cache_threshold {
-                counter!("sgl_router_cache_hits_total").increment(1);
+                RouterMetrics::record_cache_hit();
                 matched_worker.to_string()
             } else {
-                counter!("sgl_router_cache_misses_total").increment(1);
+                RouterMetrics::record_cache_miss();
                 tree.get_smallest_tenant()
             };
 
@@ -221,7 +219,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
             // Increment processed counter
             workers[selected_idx].increment_processed();
-            counter!("sgl_router_processed_requests_total", "worker" => selected_url).increment(1);
+            RouterMetrics::record_processed_request(&selected_url);
 
             return Some(selected_idx);
         }

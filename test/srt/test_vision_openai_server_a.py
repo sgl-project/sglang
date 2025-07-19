@@ -30,7 +30,7 @@ class TestQwen2VLServer(TestOpenAIVisionServer):
             api_key=cls.api_key,
             other_args=[
                 "--mem-fraction-static",
-                "0.4",
+                "0.35",
             ],
         )
         cls.base_url += "/v1"
@@ -52,7 +52,7 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
             api_key=cls.api_key,
             other_args=[
                 "--mem-fraction-static",
-                "0.4",
+                "0.35",
             ],
         )
         cls.base_url += "/v1"
@@ -75,7 +75,7 @@ class TestVLMContextLengthIssue(CustomTestCase):
             other_args=[
                 "--context-length",
                 "300",
-                "--mem-fraction-static=0.80",
+                "--mem-fraction-static=0.75",
             ],
         )
         cls.base_url += "/v1"
@@ -147,7 +147,7 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.4",
+                "0.35",
             ],
         )
         cls.base_url += "/v1"
@@ -181,7 +181,7 @@ class TestMinicpmoServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.7",
+                "0.65",
             ],
         )
         cls.base_url += "/v1"

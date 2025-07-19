@@ -151,13 +151,6 @@ impl GenerateReqInput {
             if texts.is_empty() {
                 return Err("Batch text array is empty".to_string());
             }
-            if texts.len() > 10000 {
-                // Reasonable limit for production
-                return Err(format!(
-                    "Batch size {} exceeds maximum allowed (10000)",
-                    texts.len()
-                ));
-            }
             return Ok(Some(texts.len()));
         }
 
@@ -165,13 +158,6 @@ impl GenerateReqInput {
         if let Some(InputIds::Batch(ids)) = &self.input_ids {
             if ids.is_empty() {
                 return Err("Batch input_ids array is empty".to_string());
-            }
-            if ids.len() > 10000 {
-                // Reasonable limit for production
-                return Err(format!(
-                    "Batch size {} exceeds maximum allowed (10000)",
-                    ids.len()
-                ));
             }
             // Validate each sequence is not empty
             for (i, seq) in ids.iter().enumerate() {

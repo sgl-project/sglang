@@ -691,11 +691,16 @@ def decode_video_base64(video_base64):
         )  # Return an empty array and size tuple if no frames were found
 
 
-def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarray:
+def load_audio(
+    audio_file: str, sr: Optional[int] = None, mono: bool = True
+) -> np.ndarray:
     # Use soundfile here, since librosa use it under the hood,
     # and librosa will not support audio loading in the future
     import soundfile as sf
     from scipy.signal import resample
+
+    if sr is None:
+        sr = 16000
 
     # Load audio data
     if isinstance(audio_file, bytes):
