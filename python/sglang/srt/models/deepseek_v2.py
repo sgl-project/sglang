@@ -127,6 +127,10 @@ if _is_cuda:
     )
 elif _is_cpu and _is_cpu_amx_available:
     pass
+elif _is_hip:
+    from sglang.srt.layers.quantization.awq_triton import (
+        awq_dequantize_triton as awq_dequantize,
+    )
 else:
     from vllm._custom_ops import awq_dequantize
 
@@ -355,6 +359,7 @@ class DeepseekV2MoE(nn.Module):
                 self.shared_experts.gate_up_proj.quant_method, "quant_config"
             ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
                 "awq",
+                "awq_marlin",
                 "moe_wna16",
             }
             self.shared_experts_is_int8 = (
@@ -929,7 +934,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             has_fused_proj
             and hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config")
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
-            in {"awq", "moe_wna16"}
+            in {"awq", "awq_marlin", "moe_wna16"}
         )
         self.use_min_latency_fused_a_gemm = (
             has_fused_proj
@@ -2175,7 +2180,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             )
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # AWQ compatible
-                if _is_cuda:
+                if _is_cuda or _is_hip:
                     w = awq_dequantize(
                         self_attn.kv_b_proj.qweight,
                         self_attn.kv_b_proj.scales,
@@ -2551,6 +2556,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 cat_dim = 0
                                 if self.quant_config is not None and (
                                     self.quant_config.get_name() == "awq"
+                                    or self.quant_config.get_name() == "awq_marlin"
                                     or self.quant_config.get_name() == "moe_wna16"
                                 ):
                                     cat_dim = 1
