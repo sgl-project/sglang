@@ -582,7 +582,7 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-        # Model, tokenizer, and chat templates
+        # Model and tokenizer
         parser.add_argument(
             "--model-path",
             "--model",
