@@ -110,9 +110,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         raise NotImplementedError
 
 
-
-
-
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
 
