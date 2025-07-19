@@ -1,7 +1,7 @@
 import logging
 from typing import Union
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
@@ -59,3 +59,9 @@ class OpenAIServingScore(OpenAIServingBase):
 
         except ValueError as e:
             return self.create_error_response(str(e))
+        except HTTPException as e:
+            return self.create_error_response(
+                e.detail,
+                err_type=str(e.status_code),
+                status_code=e.status_code,
+            )
