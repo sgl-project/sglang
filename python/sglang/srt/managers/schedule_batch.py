@@ -214,7 +214,7 @@ class MultimodalDataItem:
     # Common fields used across multiple models
     image_sizes: Tuple[int, int] = None
 
-    precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
+    precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     # Model-specific data stored in a dictionary
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -235,33 +235,19 @@ class MultimodalDataItem:
             if self.feature is not None:
                 hashed_feature = self.feature
             else:
-                hashed_feature = self.precomputed_features
+                hashed_feature = self.precomputed_embeddings
             self.hash = hash_feature(hashed_feature)
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
 
-    def is_modality(self, modality: Modality) -> bool:
-        return self.modality == modality
-
     def is_audio(self):
-        return (self.modality == Modality.AUDIO) and (
-            self.precomputed_features is not None
-            or not MultimodalDataItem.is_empty_list(self.feature)
-        )
+        return self.modality == Modality.AUDIO
 
     def is_image(self):
-        return (
-            self.is_modality(Modality.IMAGE) or self.is_modality(Modality.MULTI_IMAGES)
-        ) and (
-            self.precomputed_features is not None
-            or not MultimodalDataItem.is_empty_list(self.feature)
-        )
+        return self.modality in [Modality.IMAGE, Modality.MULTI_IMAGES]
 
     def is_video(self):
-        return (self.modality == Modality.VIDEO) and (
-            self.precomputed_features is not None
-            or not MultimodalDataItem.is_empty_list(self.feature)
-        )
+        return self.modality == Modality.VIDEO
 
     def is_valid(self) -> bool:
         return self.is_image() or self.is_video() or self.is_audio()

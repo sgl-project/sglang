@@ -175,7 +175,7 @@ class BaseMultimodalProcessor(ABC):
             # Video-related attributes
             "video_grid_thw": Modality.VIDEO,
             # Generic attributes that could apply to multiple modalities
-            # "precomputed_features" - handled specially as it can be any modality
+            # "precomputed_embeddings" - handled specially as it can be any modality
         }
 
         # name of the feature filed
@@ -539,7 +539,7 @@ class BaseMultimodalProcessor(ABC):
             # Get modality for this attribute
             modality = self.ATTR_NAME_TO_MODALITY.get(attr_name)
 
-            if not modality and attr_name == "precomputed_features":
+            if not modality and attr_name == "precomputed_embeddings":
                 modality_str = data_dict.get("modality")
                 try:
                     modality = (
