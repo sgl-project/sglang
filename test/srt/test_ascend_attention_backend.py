@@ -34,6 +34,21 @@ class TestAscendAttnBackend(CustomTestCase):
         print(f"{output_throughput=}")
 
         if is_in_ci():
+            self.assertGreater(output_throughput, 28)
+
+    def test_latency_no_graph(self):
+        output_throughput = run_bench_offline_throughput(
+            DEFAULT_MODEL_NAME_FOR_TEST,
+            [
+                "--attention-backend",
+                "ascend",
+                "--disable-cuda-graph",
+            ],
+        )
+
+        print(f"{output_throughput=}")
+
+        if is_in_ci():
             self.assertGreater(output_throughput, 18)
 
     def test_gsm8k(self):
