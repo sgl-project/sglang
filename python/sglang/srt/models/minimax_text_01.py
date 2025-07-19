@@ -41,7 +41,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
@@ -450,7 +450,7 @@ class MiniMaxText01Attention(nn.Module):
         head_dim: int,
         num_kv_heads: int,
         rotary_dim: int,
-        max_position: int = 4096 * 32,
+        max_position: int = 8192,
         rope_theta: float = 10000,
         sliding_window: Optional[int] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -460,7 +460,7 @@ class MiniMaxText01Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
-
+        self.max_position = max_position
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -496,6 +496,12 @@ class MiniMaxText01Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=max_position,
+            base=rope_theta,
+        )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -514,14 +520,9 @@ class MiniMaxText01Attention(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> torch.Tensor:
-        # Get attn_metadata from kwargs, which should be passed by the layer
-        attn_metadata = kwargs.get("attn_metadata")
-        if attn_metadata is None:
-            raise ValueError("attn_metadata must be provided in kwargs")
-
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = attn_metadata.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -1168,33 +1169,6 @@ class MiniMaxText01ForCausalLM(nn.Module):
             )
         else:
             return hidden_states
-
-    # def compute_logits(
-    #     self, hidden_states: torch.Tensor, sampling_metadata
-    # ) -> torch.Tensor:
-    #     logits_output = self.logits_processor(
-    #         None,  # input_ids can be None for generation
-    #         hidden_states.float(),
-    #         self.lm_head,
-    #         sampling_metadata
-    #     )
-
-    #     # Extract logits from LogitsProcessorOutput
-    #     return logits_output.next_token_logits
-
-    def make_empty_intermediate_tensors(
-        self, batch_size: int, dtype: torch.dtype, device: torch.device
-    ) -> IntermediateTensors:
-        return IntermediateTensors(
-            {
-                "hidden_states": torch.zeros(
-                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
-                ),
-                "residual": torch.zeros(
-                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
-                ),
-            }
-        )
 
     def load_weights(
         self,

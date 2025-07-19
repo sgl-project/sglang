@@ -187,7 +187,7 @@ class LightningAttnBackend(AttentionBackend):
             num_decode_tokens=num_decode_tokens,
             query_start_loc=query_start_loc,
             context_lens_tensor=context_lens_tensor,
-            rotary_emb=None,  # Will be set by model if needed
+            rotary_emb=None,
             kv_caches=kv_caches,
             state_indices_tensor=state_indices_tensor,
             slope_rates=self.slope_rates,  # Use pre-allocated slope_rates
@@ -213,12 +213,11 @@ class LightningAttnBackend(AttentionBackend):
     ):
         """Initialize metadata for CUDA graph capture."""
 
-        # Create a dummy ForwardBatch-like object for metadata creation
         class DummyForwardBatch:
             def __init__(self):
                 self.batch_size = bs
                 self.seq_lens = seq_lens
-                self.forward_mode = forward_mode  # Use the provided forward_mode
+                self.forward_mode = forward_mode
                 self.extend_seq_lens = None
 
         dummy_batch = DummyForwardBatch()
@@ -266,6 +265,12 @@ class LightningAttnBackend(AttentionBackend):
         if self.forward_metadata is None:
             self.init_forward_metadata(forward_batch)
 
+        # Save KV cache if requested
+        if save_kv_cache and k is not None and v is not None:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v
+            )
+
         metadata = self.forward_metadata
 
         # Use the prefill and mixed inference from original code
@@ -287,12 +292,22 @@ class LightningAttnBackend(AttentionBackend):
         if self.forward_metadata is None:
             self.init_forward_metadata(forward_batch)
 
+        # Save KV cache if requested
+        if save_kv_cache and k is not None and v is not None:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v
+            )
+
         metadata = self.forward_metadata
 
         # Use the decode inference from original code
         return self._decode_infer(
             q, k, v, metadata.kv_caches, metadata.state_indices_tensor, metadata
         )
+
+    def support_triton(self) -> bool:
+        """Check if the current backend supports triton."""
+        return True
 
     def _prefill_and_mix_infer(
         self, q, k, v, kv_cache, state_indices_tensor, attn_metadata
@@ -390,7 +405,6 @@ class LightningAttnBackend(AttentionBackend):
             slot_id = torch.arange(decode_batch_size, dtype=torch.long, device=q.device)
 
         # Assert that slot_id length matches the expected decode batch size
-        # This helps catch bugs in the upstream logic rather than silently fixing them
         assert len(slot_id) == q.shape[0], (
             f"slot_id length {len(slot_id)} does not match decode batch size {q.shape[0]}. "
             "This indicates a bug in the upstream logic that should be investigated."
@@ -1117,7 +1131,6 @@ def linear_decode_forward_triton(
         return torch.empty((B, D * H), device=q.device, dtype=q.dtype)
 
     # Assert that slot_idx length matches the batch size
-    # This helps catch bugs in the upstream logic rather than silently fixing them
     assert len(slot_idx) == B, (
         f"slot_idx length {len(slot_idx)} does not match batch size {B}. "
         "This indicates a bug in the upstream logic that should be investigated."
