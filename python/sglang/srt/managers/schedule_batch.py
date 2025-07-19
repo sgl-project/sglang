@@ -208,14 +208,17 @@ class MultimodalDataItem:
     hash: int = None
     pad_value: int = None
     offsets: Optional[list] = None
+
     # the raw features returned by processor, e.g. pixel_values or audio_features
     feature: Union[torch.Tensor, np.ndarray] = None
+    # the precomputed features, passed as final encoder embeddings
+    # Usually, one and only one of the feature and precomputed_features is empty
+    precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     image_sizes: Tuple[int, int] = None
 
     audio_feature_lens: Optional[List[torch.Tensor]] = None
     audio_offsets: Optional[List[Tuple[int, int]]] = None
-    precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     # For qwen-vl
     image_grid_thw: Union[torch.Tensor, np.ndarray] = None
