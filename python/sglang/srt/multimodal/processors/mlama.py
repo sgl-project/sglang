@@ -12,10 +12,9 @@ class MllamaImageProcessor(BaseMultimodalProcessor):
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        self.IM_TOKEN = self._processor.image_token
-        self.IM_TOKEN_ID = self._processor.image_token_id
         self.mm_tokens = MultimodalSpecialTokens(
-            image_token=self.IM_TOKEN, image_token_id=self.IM_TOKEN_ID
+            image_token=self._processor.image_token,
+            image_token_id=self._processor.image_token_id,
         ).build(_processor)
 
     async def process_mm_data_async(
@@ -34,5 +33,5 @@ class MllamaImageProcessor(BaseMultimodalProcessor):
         return {
             "mm_items": mm_items,
             "input_ids": input_ids.tolist(),
-            "im_token_id": self.IM_TOKEN_ID,
+            "im_token_id": self.mm_tokens.image_token_id,
         }
