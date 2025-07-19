@@ -79,6 +79,7 @@ blackwell = [
 srt_hip = [
     "sglang[runtime_common]",
     "torch",
+    "petit_kernel",
 ]
 
 # xpu is not enabled in public vllm and torch whl,
