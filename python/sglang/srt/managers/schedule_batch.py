@@ -207,13 +207,12 @@ class MultimodalDataItem:
     modality: Modality
     hash: int = None
     pad_value: int = None
-    image_sizes: Tuple[int, int] = None
     offsets: Optional[list] = None
+    # the raw features returned by processor, e.g. pixel_values or audio_features
+    feature: Union[torch.Tensor, np.ndarray] = None
 
-    # the real data, pixel_values or audio_features
-    # data: Union[List[torch.Tensor], List[np.ndarray]]
-    pixel_values: Union[torch.Tensor, np.ndarray, "PIL.Image"] = None
-    audio_features: Union[torch.Tensor, np.ndarray] = None
+    image_sizes: Tuple[int, int] = None
+
     audio_feature_lens: Optional[List[torch.Tensor]] = None
     audio_offsets: Optional[List[Tuple[int, int]]] = None
     precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
@@ -238,7 +237,6 @@ class MultimodalDataItem:
     image_grid_hws: Optional[List[torch.Tensor]] = None
 
     # For gemma3n
-    input_features: Optional[torch.Tensor] = None
     input_features_mask: Optional[torch.Tensor] = None
 
     @staticmethod
@@ -254,18 +252,11 @@ class MultimodalDataItem:
         from sglang.srt.managers.mm_utils import hash_feature
 
         if self.hash is None:
-            if self.precomputed_features is not None:
-                self.hash = hash_feature(self.precomputed_features)
-            elif self.is_audio():
-                if self.audio_features is not None:
-                    self.hash = hash_feature(self.audio_features)
-                elif self.input_features is not None:
-                    self.hash = hash_feature(self.input_features)
-            elif self.is_video():
-                self.hash = hash_feature(self.pixel_values_videos)
+            if self.feature is not None:
+                hashed_feature = self.feature
             else:
-                self.hash = hash_feature(self.pixel_values)
-
+                hashed_feature = self.precomputed_features
+            self.hash = hash_feature(hashed_feature)
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
 
@@ -275,8 +266,7 @@ class MultimodalDataItem:
     def is_audio(self):
         return (self.modality == Modality.AUDIO) and (
             self.precomputed_features is not None
-            or not MultimodalDataItem.is_empty_list(self.audio_features)
-            or not MultimodalDataItem.is_empty_list(self.input_features)
+            or not MultimodalDataItem.is_empty_list(self.feature)
         )
 
     def is_image(self):
@@ -284,13 +274,13 @@ class MultimodalDataItem:
             self.is_modality(Modality.IMAGE) or self.is_modality(Modality.MULTI_IMAGES)
         ) and (
             self.precomputed_features is not None
-            or not MultimodalDataItem.is_empty_list(self.pixel_values)
+            or not MultimodalDataItem.is_empty_list(self.feature)
         )
 
     def is_video(self):
         return (self.modality == Modality.VIDEO) and (
             self.precomputed_features is not None
-            or not MultimodalDataItem.is_empty_list(self.pixel_values_videos)
+            or not MultimodalDataItem.is_empty_list(self.feature)
         )
 
     def is_valid(self) -> bool:
@@ -311,7 +301,7 @@ class MultimodalDataItem:
         return ret
 
     def merge(self, other):
-        self.pixel_values += other.pixel_values
+        self.feature += other.feature
         self.image_sizes += other.image_sizes
         self.image_offsets += other.image_offsets
         self.hash = hash((self.hash, other.hash))
@@ -354,7 +344,6 @@ class MultimodalInputs:
 
         assert isinstance(ret.mm_items, list)
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
-
         for item in ret.mm_items:
             item.set_pad_value()
 
@@ -1278,11 +1267,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if mm_input is None:
                 continue
             for mm_item in mm_input.mm_items:
-                pixel_values = getattr(mm_item, "pixel_values", None)
+                pixel_values = getattr(mm_item, "feature", None)
                 if isinstance(pixel_values, torch.Tensor):
-                    mm_item.pixel_values = pixel_values.to(
-                        self.device, non_blocking=True
-                    )
+                    mm_item.feature = pixel_values.to(self.device, non_blocking=True)
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
