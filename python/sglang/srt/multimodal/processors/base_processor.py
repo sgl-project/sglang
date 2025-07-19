@@ -487,45 +487,6 @@ class BaseMultimodalProcessor(ABC):
 
         return list(zip(indices_start.tolist(), indices_end.tolist()))
 
-    @staticmethod
-    def _extract_processor_features(
-        items: List[dict], attr_name: str
-    ) -> Optional[torch.Tensor]:
-        """
-        Helper function to concat extracted attributes from processor output.
-        """
-        values = [value for item in items if (value := item.get(attr_name)) is not None]
-        return torch.cat(values) if values else None
-
-    # When we assume that all the items have the same attributes
-    def _extract_processor_features_from_all_attributes(
-        self, items: List[dict]
-    ) -> dict:
-        values = {}
-        # Verify all items have the same keys
-        first_keys = set(items[0].keys())
-        for item in items[1:]:
-            if set(item.keys()) != first_keys:
-                raise ValueError(
-                    f"All items must have the same attributes. "
-                    f"First item has {first_keys}, but found {set(item.keys())}"
-                )
-
-        # Process each attribute
-        for k, v in items[0].items():
-            if isinstance(v, list):
-                values[k] = self._extract_processor_features(items, k)
-            else:
-                # Verify all items have the same value for non-list attributes
-                for item in items[1:]:
-                    if item[k] != v:
-                        raise ValueError(
-                            f"All items must have the same value for attribute {k}. "
-                            f"First item has {v}, but found {item[k]}"
-                        )
-                values[k] = v
-        return values
-
     def collect_mm_items_from_processor_output(
         self, data_dict: dict
     ) -> List[MultimodalDataItem]:
@@ -539,16 +500,15 @@ class BaseMultimodalProcessor(ABC):
             # Get modality for this attribute
             modality = self.ATTR_NAME_TO_MODALITY.get(attr_name)
 
-            if not modality and attr_name == "precomputed_embeddings":
+            if attr_name == "precomputed_embeddings":
                 modality_str = data_dict.get("modality")
-                try:
-                    modality = (
-                        Modality.from_str(modality_str)
-                        if modality_str
-                        else Modality.IMAGE
-                    )
-                except ValueError:
-                    modality = Modality.IMAGE
+                modality = Modality.IMAGE
+                if modality_str:
+                    try:
+                        modality = Modality.from_str(modality_str)
+                    except ValueError:
+                        pass
+
             if modality:
                 # Create item if needed
                 if modality not in items:
@@ -556,9 +516,8 @@ class BaseMultimodalProcessor(ABC):
 
                 if attr_name in self.FEATURE_NAMES:
                     attr_name = "feature"
-                    setattr(items[modality], attr_name, value)
-                else:
-                    items[modality].model_specific_data[attr_name] = value
+
+                items[modality].set(attr_name, value)
 
         return list(items.values())
 

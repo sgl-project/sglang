@@ -58,7 +58,7 @@ class Mistral3ForConditionalGeneration:
             # in each item, we assume pixel_values is always batched
             pixel_values, image_sizes = (
                 item.feature,
-                item.model_specific_data.get("image_sizes"),
+                item.get("image_sizes"),
             )
             image_outputs = self.vision_tower(
                 pixel_values, image_sizes, output_hidden_states=True

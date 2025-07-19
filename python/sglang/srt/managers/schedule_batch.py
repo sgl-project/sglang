@@ -217,6 +217,29 @@ class MultimodalDataItem:
     # Model-specific data stored in a dictionary
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
 
+    def __getitem__(self, key: str):
+        if hasattr(self, key):
+            return getattr(self, key)
+        elif key in self.model_specific_data:
+            return self.model_specific_data[key]
+        else:
+            raise KeyError(f"Key '{key}' not found in MultimodalDataItem")
+
+    def get(self, key: str, default: Any = None):
+        try:
+            return self.__getitem__(key)
+        except KeyError:
+            return default
+
+    def __setitem__(self, key: str, value: Any):
+        if hasattr(self, key):
+            setattr(self, key, value)
+        else:
+            self.model_specific_data[key] = value
+
+    def set(self, key: str, value: Any):
+        self.__setitem__(key, value)
+
     @staticmethod
     def is_empty_list(l):
         if l is None:

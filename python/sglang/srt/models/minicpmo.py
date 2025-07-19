@@ -1556,9 +1556,9 @@ class MiniCPMO(MiniCPMBaseModel):
         # list, [[x1, x2], [y1], [z1]]
         audio_feature_lens_raw = flatten_nested_list(
             [
-                item.model_specific_data.get("audio_feature_lens")
+                item.get("audio_feature_lens")
                 for item in items
-                if item.model_specific_data.get("audio_feature_lens")
+                if item.get("audio_feature_lens")
             ]
         )
 
@@ -1665,9 +1665,9 @@ class MiniCPMO(MiniCPMBaseModel):
         # list, [[x1, x2], [y1], [z1]]
         audio_feature_lens_raw = flatten_nested_list(
             [
-                item.model_specific_data.get("audio_feature_lens")
+                item.get("audio_feature_lens")
                 for item in items
-                if item.model_specific_data.get("audio_feature_lens")
+                if item.get("audio_feature_lens")
             ]
         )
 
@@ -1784,9 +1784,7 @@ class MiniCPMO(MiniCPMBaseModel):
         # list of tensors
         pixel_values = flatten_nested_list([item.feature for item in items])
         tgt_sizes = torch.stack(
-            flatten_nested_list(
-                [item.model_specific_data.get("tgt_size") for item in items]
-            ),
+            flatten_nested_list([item.get("tgt_size") for item in items]),
             dim=0,
         )
         assert len(pixel_values) == tgt_sizes.shape[0]

@@ -501,7 +501,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             self.visual.dtype
         )
         image_grid_thw = torch.cat(
-            [item.model_specific_data.get("image_grid_thw") for item in items], dim=0
+            [item.get("image_grid_thw") for item in items], dim=0
         )
         assert (
             pixel_values.dim() == 2
@@ -518,7 +518,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             self.visual.dtype
         )
         video_grid_thw = torch.cat(
-            [item.model_specific_data.get("video_grid_thw") for item in items], dim=0
+            [item.get("video_grid_thw") for item in items], dim=0
         )
         assert (
             pixel_values.dim() == 2
