@@ -424,10 +424,10 @@ class Phi4MMForCausalLM(nn.Module):
         dtype = next(self.vision_encoder.parameters()).dtype
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(dtype)
         image_attention_mask = torch.cat(
-            [item.model_specific_data["image_emb_mask"] for item in items], dim=0
+            [item.model_specific_data.get("image_emb_mask") for item in items], dim=0
         )
         image_sizes = torch.cat(
-            [item.model_specific_data["image_sizes"] for item in items], dim=0
+            [item.model_specific_data.get("image_sizes") for item in items], dim=0
         )
         image_embeds = self.vision_encoder(
             pixel_values, image_sizes, image_attention_mask

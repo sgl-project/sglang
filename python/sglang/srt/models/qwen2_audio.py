@@ -126,7 +126,7 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         audio_embeds = self.multi_modal_projector(audio_embeds)
 
         audio_feature_lens = torch.cat(
-            [item.model_specific_data["audio_feature_lens"] for item in items]
+            [item.model_specific_data.get("audio_feature_lens") for item in items]
         )
         new_embeds = []
         for i, d in zip(audio_feature_lens, audio_embeds):
