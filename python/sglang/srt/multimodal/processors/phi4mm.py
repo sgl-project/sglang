@@ -58,7 +58,7 @@ class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
         self.AUDIO_TOKEN_ID = 200011
         self.AUDIO_SAMPLE_RATE = 16000
 
-        self.multimodal_tokens = MultimodalSpecialTokens(
+        self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.IMAGE_TOKEN,
             image_token_id=self.IM_TOKEN_ID,
             audio_token=self.AUDIO_TOKEN,
@@ -77,7 +77,7 @@ class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
             prompt=input_text,
             audio_data=audio_data,
             image_data=image_data,
-            multimodal_tokens=self.multimodal_tokens,
+            multimodal_tokens=self.mm_tokens,
             audio_sample_rate=self.AUDIO_SAMPLE_RATE,
         )
 
@@ -89,7 +89,7 @@ class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
             ]
 
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
-            base_output, self.multimodal_tokens
+            base_output, self.mm_tokens
         )
 
         return {

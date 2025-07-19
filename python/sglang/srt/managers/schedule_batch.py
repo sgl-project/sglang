@@ -219,10 +219,6 @@ class MultimodalDataItem:
     # Model-specific data stored in a dictionary
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
 
-    # For phi4-mm
-    image_attention_mask: Optional[torch.Tensor] = None
-    audio_attention_mask: Optional[torch.Tensor] = None
-
     @staticmethod
     def is_empty_list(l):
         if l is None:

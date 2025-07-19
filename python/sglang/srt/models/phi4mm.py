@@ -435,9 +435,12 @@ class Phi4MMForCausalLM(nn.Module):
         dtype = next(self.vision_encoder.parameters()).dtype
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(dtype)
         image_attention_mask = torch.cat(
-            [item.model_specific_data.get("image_emb_mask") for item in items], dim=0
+            [item.model_specific_data.get("image_attention_mask") for item in items],
+            dim=0,
         )
-        image_sizes = torch.cat([item.image_sizes for item in items], dim=0)
+        image_sizes = torch.cat(
+            [item.model_specific_data.get("image_sizes") for item in items], dim=0
+        )
         image_embeds = self.vision_encoder(
             pixel_values, image_sizes, image_attention_mask
         )
@@ -455,8 +458,8 @@ class Phi4MMForCausalLM(nn.Module):
                 # item.audio_attention_mask: (num_audios_in_a_sequence, T, D) BoolTensor or None
                 audio_features=item.feature.to(device).type(dtype),
                 audio_attention_mask=(
-                    item.audio_attention_mask.to(device)
-                    if item.audio_attention_mask is not None
+                    item.model_specific_data.get("audio_attention_mask").to(device)
+                    if item.model_specific_data.get("audio_attention_mask") is not None
                     else None
                 ),
             )

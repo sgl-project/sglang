@@ -57,7 +57,10 @@ from sglang.srt.utils import add_prefix, flatten_nested_list, logger
 class LlavaBaseForCausalLM(nn.Module):
     def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         image_sizes = flatten_nested_list(
-            [item.image_sizes for item in image_inputs.mm_items]
+            [
+                item.model_specific_data.get("image_sizes")
+                for item in image_inputs.mm_items
+            ]
         )
 
         pad_values = [item.pad_value for item in image_inputs.mm_items]
@@ -193,7 +196,10 @@ class LlavaBaseForCausalLM(nn.Module):
                 )
                 image_sizes = [
                     flatten_nested_list(
-                        [item.image_sizes for item in image_inputs[i].mm_items]
+                        [
+                            item.model_specific_data.get("image_sizes")
+                            for item in image_inputs[i].mm_items
+                        ]
                     )
                     for i in range(bs)
                     if need_vision[i]
@@ -753,7 +759,9 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         features = []
         for item in items:
             # in each item, we assume pixel_values is always batched
-            pixel_values, image_sizes = item.feature, item.image_sizes
+            pixel_values, image_sizes = item.feature, item.model_specific_data.get(
+                "image_sizes"
+            )
             image_outputs = self.vision_tower(
                 pixel_values, image_sizes, output_hidden_states=True
             )
