@@ -1117,6 +1117,7 @@ class ServerArgs:
             choices=[
                 "round_robin",
                 "shortest_queue",
+                "minimum_tokens",
             ],
         )
 

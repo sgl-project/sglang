@@ -741,6 +741,7 @@ def _launch_subprocesses(
                         pp_rank,
                         None,
                         writer,
+                        None,
                     ),
                 )
 
