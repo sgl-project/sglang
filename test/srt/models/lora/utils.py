@@ -136,7 +136,7 @@ def run_lora_test_one_by_one(
     max_new_tokens: int,
     backend: str,
     disable_cuda_graph: bool = False,
-    disable_radix_cache: bool = True,
+    disable_radix_cache: bool = False,
     mem_fraction_static: float = 0.88,
     test_tag: str = "",
 ):
@@ -156,7 +156,7 @@ def run_lora_test_one_by_one(
         max_new_tokens (int): The maximum number of new tokens to generate.
         backend (str): The lora backend to use.
         disable_cuda_graph (bool, optional): Whether to disable CUDA graph. Defaults to False.
-        disable_radix_cache (bool, optional): Whether to disable radix cache. Defaults to True.
+        disable_radix_cache (bool, optional): Whether to disable radix cache. Defaults to False.
         mem_fraction_static (float, optional): The fraction of memory to use. Defaults to 0.88.
         test_tag (str, optional): The tag to use for the test. Defaults to "".
     """
@@ -284,7 +284,7 @@ def run_lora_test_by_batch(
     max_new_tokens: int,
     backend: str,
     disable_cuda_graph: bool = False,
-    disable_radix_cache: bool = True,
+    disable_radix_cache: bool = False,
     mem_fraction_static: float = 0.88,
     test_tag: str = "",
 ):
@@ -303,7 +303,7 @@ def run_lora_test_by_batch(
         max_new_tokens (int): The maximum number of new tokens to generate.
         backend (str): The lora backend to use.
         disable_cuda_graph (bool, optional): Whether to disable CUDA graph. Defaults to False.
-        disable_radix_cache (bool, optional): Whether to disable radix cache. Defaults to True.
+        disable_radix_cache (bool, optional): Whether to disable radix cache. Defaults to False.
         mem_fraction_static (float, optional): The fraction of memory to use. Defaults to 0.88.
         test_tag (str, optional): The tag to use for the test. Defaults to "".
     """
