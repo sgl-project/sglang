@@ -95,6 +95,6 @@ class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
-            "im_token_id": self.IM_TOKEN_ID,
-            "audio_token_id": self.AUDIO_TOKEN_ID,
+            "im_token_id": self.mm_tokens.image_token_id,
+            "audio_token_id": self.mm_tokens.audio_token_id,
         }

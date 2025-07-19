@@ -53,7 +53,8 @@ class PixtralProcessor(BaseMultimodalProcessor):
         self.image_size = self.vision_config.image_size
         self.patch_size = self.vision_config.patch_size
         self.mm_tokens = MultimodalSpecialTokens(
-            image_token=_processor.image_token
+            image_token=_processor.image_token,
+            image_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
         _processor.tokenizer.add_special_tokens(
             {

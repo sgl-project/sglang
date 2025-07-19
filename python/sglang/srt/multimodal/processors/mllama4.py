@@ -27,6 +27,7 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         self.image_token_index = hf_config.image_token_index
         self.multimodal_tokens = MultimodalSpecialTokens(
             image_token=_processor.image_token,
+            image_token_id=self.image_token_index,
         ).build(_processor)
 
     async def process_mm_data_async(
