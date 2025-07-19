@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -1160,8 +1160,6 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.float8_e4m3fn
 
@@ -1374,14 +1372,8 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        custom_routing_function: Optional[Callable] = None,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
     ) -> torch.Tensor:
         raise NotImplementedError
 
