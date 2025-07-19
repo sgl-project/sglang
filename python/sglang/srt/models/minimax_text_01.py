@@ -122,7 +122,9 @@ class MiniMaxText01RMSNormTP(CustomOp):
         weight = self.weight
         if x.size(-1) != self.weight.size(0):
             if self.weight.size(0) < x.size(-1):
-                repeat_count = (x.size(-1) + self.weight.size(0)) // x.size(-1)
+                repeat_count = (
+                    x.size(-1) + self.weight.size(0) - 1
+                ) // self.weight.size(0)
                 full_weight = self.weight.repeat(repeat_count)
                 weight = full_weight[: x.size(-1)]
             else:
@@ -704,7 +706,7 @@ class MiniMaxText01DecoderLayer(nn.Module):
         if self.expert_num == 1:
             hidden_states = self.mlp(layernorm_output)
         else:
-            moe_hidden_states = self.block_sparse_moe(copy.deepcopy(layernorm_output))
+            moe_hidden_states = self.block_sparse_moe(layernorm_output.clone())
             if self.shared_moe:
                 before_moe_dtype = layernorm_output.dtype
                 moe_hidden_fp32 = moe_hidden_states.to(torch.float32)

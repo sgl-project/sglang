@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
@@ -1168,9 +1169,6 @@ def linear_decode_forward_triton(
             BLOCK_SIZE=actual_block_size,
         )
     except Exception as e:
-        # Log the error and re-raise to make the failure explicit
-        import logging
-
         logging.error(f"Triton kernel failed in linear_decode_forward_triton: {e}")
         raise RuntimeError(f"Triton kernel execution failed: {e}") from e
 
