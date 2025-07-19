@@ -250,22 +250,14 @@ class MultimodalLanguageTransferQueue:
                 continue
             elif poll == KVPoll.Success:
                 idx = language_req.metadata_buffer_index
-                embedding_data, embedding_length = self.metadata_buffers.get_buf(idx)
+                embedding_data, fill_ids, embedding_length = self.metadata_buffers.get_buf(idx)
                 language_req.req.input_embeds = embedding_data[:embedding_length, :]
-                language_req.req.origin_input_ids = [1] * embedding_length
+                language_req.req.origin_input_ids = fill_ids[:embedding_length].tolist()
                 logger.debug(f"Transferred embedding data: {language_req.req=}")
 
                 logger.debug(
                     f"Transferred embedding data: {idx=} {embedding_data.shape=} {embedding_length=} {language_req.req.input_embeds.shape=}"
                 )
-                # buffer = (ctypes.c_uint16 * 100).from_address(embedding_ptr)
-                # arr = np.ctypeslib.as_array(buffer)
-                # new_tensor = torch.frombuffer(arr.tobytes(), dtype=torch.bfloat16, count=100).flatten()
-                # logger.debug(f"Transferred embedding data: {idx=} {embedding_data}; {language_req.embedding_receiver.session_id=};{embedding_ptr=};{new_tensor[:100]}")
-
-                # logger.debug(f"Transferred embedding data for request {language_req.req.bootstrap_room} with embedding length: {embedding_length} {embedding_data.shape=}")
-                # show part data
-                # logger.debug(f"Transferred embedding data: {language_req.req.bootstrap_room}, {embedding_data.flatten()[:100]}")
                 transferred_reqs.append(language_req.req)
                 indices_to_remove.add(i)
             elif poll in [

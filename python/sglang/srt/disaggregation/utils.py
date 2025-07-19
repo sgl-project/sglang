@@ -402,6 +402,7 @@ class MultimodalDataBuffers:
         self.input_embeddings = torch.zeros(
             (size, max_prefill_tokens * embedding_dim), dtype=torch.bfloat16, device="cpu"
         )
+        self.fill_ids = torch.zeros((size, max_prefill_tokens), dtype=torch.int32, device="cpu")
          # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
         self.embedding_lengths = torch.zeros((size, 16), dtype=torch.int32, device="cpu")
         self.max_prefill_tokens = max_prefill_tokens
@@ -411,24 +412,27 @@ class MultimodalDataBuffers:
         # (offset, size)
         return [
             (0, len(req.fill_ids) * self.embedding_dim * self.input_embeddings.itemsize),
+            (0, len(req.fill_ids) * self.fill_ids.itemsize),
             (0, self.embedding_lengths.shape[1] * self.embedding_lengths.itemsize)
         ]
 
     def get_buf_infos(self):
-        ptrs = [self.input_embeddings.data_ptr(), self.embedding_lengths.data_ptr()]
-        data_lens = [self.input_embeddings.nbytes, self.embedding_lengths.nbytes]
-        item_lens = [self.input_embeddings[0].nbytes, self.embedding_lengths[0].nbytes]
+        ptrs = [self.input_embeddings.data_ptr(), self.fill_ids.data_ptr(), self.embedding_lengths.data_ptr()]
+        data_lens = [self.input_embeddings.nbytes, self.fill_ids.nbytes, self.embedding_lengths.nbytes]
+        item_lens = [self.input_embeddings[0].nbytes, self.fill_ids[0].nbytes, self.embedding_lengths[0].nbytes]
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
         input_embeddings = self.input_embeddings[idx].reshape(
             self.max_prefill_tokens, self.embedding_dim
         )
+        fill_ids = self.fill_ids[idx]
         embedding_lengths = self.embedding_lengths[idx][0]
-        return input_embeddings, embedding_lengths
+        return input_embeddings, fill_ids, embedding_lengths
 
     def set_buf(self, req: Req):
         embed_length = req.embedding.shape[0]
+        self.fill_ids[req.metadata_buffer_index, :len(req.fill_ids)] = torch.tensor(req.fill_ids)
         self.input_embeddings[req.metadata_buffer_index, :embed_length * self.embedding_dim] = (
             req.embedding.flatten()
         )
