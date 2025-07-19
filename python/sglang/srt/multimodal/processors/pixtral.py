@@ -52,7 +52,7 @@ class PixtralProcessor(BaseMultimodalProcessor):
         self.vision_config = hf_config.vision_config
         self.image_size = self.vision_config.image_size
         self.patch_size = self.vision_config.patch_size
-        self.multimodal_tokens = MultimodalSpecialTokens(
+        self.mm_tokens = MultimodalSpecialTokens(
             image_token=_processor.image_token
         ).build(_processor)
         _processor.tokenizer.add_special_tokens(
@@ -79,7 +79,7 @@ class PixtralProcessor(BaseMultimodalProcessor):
     ):
         mm_data = self.load_mm_data(
             prompt=input_text,
-            multimodal_tokens=self.multimodal_tokens,
+            multimodal_tokens=self.mm_tokens,
             max_req_input_len=kwargs.get("max_req_input_len", 4096),
             image_data=image_data,
             return_text=True,
@@ -88,7 +88,9 @@ class PixtralProcessor(BaseMultimodalProcessor):
             resize_tasks = [self._resize(image) for image in mm_data.images]
             mm_data.images = await asyncio.gather(*resize_tasks)
 
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(mm_data)
+        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+            mm_data, self.mm_tokens
+        )
 
         return {
             "mm_items": mm_items,
