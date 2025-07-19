@@ -1,17 +1,13 @@
 import logging
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
-import einops
 import torch
-from torch.nn import Module
 
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
@@ -28,7 +24,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -162,16 +158,9 @@ class EPMoE(torch.nn.Module):
         intermediate_size: int,
         layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
-        renormalize: bool = True,
-        use_grouped_topk: bool = False,
-        num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
-        topk_group: Optional[int] = None,
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
         prefix: str = "",
-        correction_bias: Optional[torch.Tensor] = None,
-        custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
         use_per_token_if_dynamic: bool = True,
@@ -189,24 +178,12 @@ class EPMoE(torch.nn.Module):
         self.layer_id = layer_id
         self.num_experts = num_experts
         assert self.num_experts % self.tp_size == 0
-        assert (
-            num_fused_shared_experts == 0
-        ), "num_fused_shared_experts is not supported in EP"
-        self.num_fused_shared_experts = num_fused_shared_experts
         self.num_experts_per_partition, self.expert_map = self.determine_expert_map()
         self.start_expert_id = self.tp_rank * self.num_experts_per_partition
         self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1
 
         self.top_k = top_k
         self.intermediate_size = intermediate_size
-        self.renormalize = renormalize
-        self.use_grouped_topk = use_grouped_topk
-        if self.use_grouped_topk:
-            assert num_expert_group is not None and topk_group is not None
-        self.num_expert_group = num_expert_group
-        self.topk_group = topk_group
-        self.correction_bias = correction_bias
-        self.custom_routing_function = custom_routing_function
         self.activation = activation
         self.routed_scaling_factor = routed_scaling_factor
         self.use_per_token_if_dynamic = use_per_token_if_dynamic
@@ -311,33 +288,24 @@ class EPMoE(torch.nn.Module):
             )
         return (local_num_experts, expert_map)
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
-            return self.forward_deepgemm(hidden_states, router_logits)
+            return self.forward_deepgemm(hidden_states, topk_output)
         else:
-            return self.forward_normal(hidden_states, router_logits)
+            return self.forward_normal(hidden_states, topk_output)
 
     def forward_deepgemm(
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
     ):
         assert self.quant_method is not None
         assert self.activation == "silu"
         hidden_states_shape = hidden_states.shape
         hidden_states_dtype = hidden_states.dtype
         hidden_states_device = hidden_states.device
-        topk_weights, topk_ids = select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            top_k=self.top_k,
-            use_grouped_topk=self.use_grouped_topk,
-            renormalize=self.renormalize,
-            topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            num_fused_shared_experts=self.num_fused_shared_experts,
-            correction_bias=self.correction_bias,
-            custom_routing_function=self.custom_routing_function,
-            routed_scaling_factor=self.routed_scaling_factor,
-        )
+
+        topk_weights, topk_ids, _ = topk_output
 
         if not self.use_block_quant:
             # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm
@@ -469,8 +437,10 @@ class EPMoE(torch.nn.Module):
         )
         return output
 
-    def forward_normal(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward_normal(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         assert self.quant_method is not None
+        topk_weights, topk_ids, _ = topk_output
+
         hidden_states_shape = hidden_states.shape
         hidden_states_dtype = hidden_states.dtype
         hidden_states_device = hidden_states.device
@@ -480,23 +450,6 @@ class EPMoE(torch.nn.Module):
                 use_flashinfer=False,  # TODO: use flashinfer
                 use_per_token_if_dynamic=self.use_per_token_if_dynamic,
             )
-
-        topk_weights, topk_ids = select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            top_k=self.top_k,
-            use_grouped_topk=self.use_grouped_topk,
-            renormalize=self.renormalize,
-            topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            num_fused_shared_experts=self.num_fused_shared_experts,
-            correction_bias=self.correction_bias,
-            custom_routing_function=self.custom_routing_function,
-            routed_scaling_factor=self.routed_scaling_factor,
-            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                layer_id=self.layer_id,
-            ),
-        )
 
         if self.use_w4afp8:
             local_topk_ids = topk_ids
@@ -916,16 +869,9 @@ class DeepEPMoE(EPMoE):
         intermediate_size: int,
         layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
-        renormalize: bool = True,
-        use_grouped_topk: bool = False,
-        num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
-        topk_group: Optional[int] = None,
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
         prefix: str = "",
-        correction_bias: Optional[torch.Tensor] = None,
-        custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
         deepep_mode: DeepEPMode = DeepEPMode.auto,
@@ -937,16 +883,9 @@ class DeepEPMoE(EPMoE):
             intermediate_size=intermediate_size,
             layer_id=layer_id,
             params_dtype=params_dtype,
-            renormalize=renormalize,
-            use_grouped_topk=use_grouped_topk,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            topk_group=topk_group,
             quant_config=quant_config,
             tp_size=tp_size,
             prefix=prefix,
-            correction_bias=correction_bias,
-            custom_routing_function=custom_routing_function,
             activation=activation,
             routed_scaling_factor=routed_scaling_factor,
         )
