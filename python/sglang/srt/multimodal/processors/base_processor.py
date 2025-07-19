@@ -158,6 +158,7 @@ class BaseMultimodalProcessor(ABC):
             "pixel_values_videos": Modality.VIDEO,
             "image_sizes": Modality.IMAGE,
             "image_grid_thw": Modality.IMAGE,
+            "image_attention_mask": Modality.IMAGE,
             "image_emb_mask": Modality.IMAGE,
             "image_spatial_crop": Modality.IMAGE,
             "tgt_size": Modality.IMAGE,
@@ -170,6 +171,7 @@ class BaseMultimodalProcessor(ABC):
             "audio_feature_lens": Modality.AUDIO,
             "input_features": Modality.AUDIO,
             "input_features_mask": Modality.AUDIO,
+            "audio_attention_mask": Modality.AUDIO,
             # Video-related attributes
             "video_grid_thw": Modality.VIDEO,
             # Generic attributes that could apply to multiple modalities
@@ -251,7 +253,11 @@ class BaseMultimodalProcessor(ABC):
 
     @staticmethod
     def _load_single_item(
-        data, modality: Modality, frame_count_limit=None, discard_alpha_channel=True
+        data,
+        modality: Modality,
+        frame_count_limit=None,
+        audio_sample_rate: Optional[int] = None,
+        discard_alpha_channel=True,
     ):
         """
         Load a single multimodal data.
@@ -268,7 +274,7 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
-                return load_audio(data)
+                return load_audio(data, audio_sample_rate)
 
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")
@@ -282,6 +288,7 @@ class BaseMultimodalProcessor(ABC):
         image_estimated_frames_iter: Optional[iter] = None,
         image_scaling_factor: float = 1.0,
         max_image_frames: int = 30,
+        audio_sample_rate: Optional[int] = None,
     ) -> Tuple[List, List]:
         """
         load multimodal data parallelly using iterators.
@@ -324,6 +331,7 @@ class BaseMultimodalProcessor(ABC):
                         data,
                         modality,
                         frame_count_limit,
+                        audio_sample_rate,
                         discard_alpha_channel,
                     )
                 )
@@ -352,6 +360,7 @@ class BaseMultimodalProcessor(ABC):
         audio_data: Optional[list] = None,
         return_text: Optional[bool] = True,
         discard_alpha_channel: bool = True,
+        audio_sample_rate: Optional[int] = None,
     ) -> BaseMultiModalProcessorOutput:
         """
         Each frame of video/image will be replaced by a single image token
@@ -390,6 +399,7 @@ class BaseMultimodalProcessor(ABC):
             multimodal_tokens=multimodal_tokens,
             data_iterators=data_iterators,
             discard_alpha_channel=discard_alpha_channel,
+            audio_sample_rate=audio_sample_rate,
         )
         task_info_iter = iter(task_info)
         futures_iter = iter(futures)
