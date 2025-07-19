@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class ServerArgs:
-    # Model, tokenizer, and chat templates
+    # Model and tokenizer
     model_path: str
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
