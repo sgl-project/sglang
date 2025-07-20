@@ -40,6 +40,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     sglang_per_token_quant_fp8,
 )
+from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
 from sglang.srt.layers.quantization.unquant import UnquantizedEPMoEMethod
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -51,16 +52,17 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_hip,
     is_npu,
+    is_cuda,
 )
 
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if not _is_npu:
     from sgl_kernel import silu_and_mul
-
     from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 
 if _is_hip:
@@ -70,6 +72,9 @@ if _use_aiter:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
+
+if _is_cuda:
+    from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp8
 
 logger = logging.getLogger(__name__)
 
@@ -991,6 +996,7 @@ class DeepEPMoE(EPMoE):
                     else self.w2_weight_scale
                 ),
             )
+        self.cutlass_moe_fp8_supported = cutlass_fp8_supported() and (torch.cuda.get_device_capability(torch.cuda.current_device())[0] == 9) and (torch.version.cuda >= "12.3")
 
     def forward(
         self,
@@ -1011,7 +1017,11 @@ class DeepEPMoE(EPMoE):
             forward_batch.is_extend_in_batch
         )
         if resolved_deepep_mode == DeepEPMode.normal:
-            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            if get_bool_env_var("SGLANG_CUTLASS_MOE") and self.cutlass_moe_fp8_supported:
+                return self.forward_cutlass_moe(
+                    hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
+                )
+            elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
                 return self.forward_deepgemm_contiguous(
                     hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
                 )
@@ -1171,6 +1181,117 @@ class DeepEPMoE(EPMoE):
             ),
             expert_mask=self.expert_mask,
         )
+        
+    def forward_cutlass_moe(self,
+        hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor],
+        topk_idx,
+        topk_weights,
+        num_recv_tokens_per_expert: List[int]
+    ):
+        hidden_states_fp8, hidden_states_scale = hidden_states_fp8
+        assert self.quant_method is not None
+        assert self.activation == "silu"
+        if num_recv_tokens_per_expert is None:
+            return hidden_states_fp8.bfloat16()
+        all_tokens = sum(num_recv_tokens_per_expert)
+        if all_tokens <= 0:
+            return hidden_states_fp8.bfloat16()
+        M, K = hidden_states_fp8.size()
+        N = self.w13_weight.size(1)
+        scale_block_size = 128
+        
+        hidden_states_fp8_shape = hidden_states_fp8.shape
+        hidden_states_fp8_device = hidden_states_fp8.device
+        hidden_states_fp8_dtype = hidden_states_fp8.dtype
+        
+        gateup_input_fp8 = torch.empty(
+            (all_tokens, K),
+            device=hidden_states_fp8_device,
+            dtype=hidden_states_fp8_dtype)
+        gateup_input_scale = torch.empty(
+            (all_tokens, K // 128),
+            device=hidden_states_fp8_device,
+            dtype=torch.float32)
+        m_indices = torch.empty(
+            all_tokens, device=hidden_states_fp8_device, dtype=torch.int32
+        )
+        output_index = torch.empty_like(topk_idx)
+
+        num_recv_tokens_per_expert_gpu = torch.tensor(
+            num_recv_tokens_per_expert,
+            dtype=torch.int32,
+            pin_memory=True,
+            device="cpu",
+        ).cuda(non_blocking=True)
+        expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
+
+        ep_scatter(
+            hidden_states_fp8,
+            hidden_states_scale,
+            topk_idx,
+            num_recv_tokens_per_expert_gpu,
+            expert_start_loc,
+            gateup_input_fp8,
+            gateup_input_scale,
+            m_indices,
+            output_index,
+            scale_ue8m0=False,
+        )
+        dispose_tensor(hidden_states_fp8)
+
+        gateup_output = torch.empty(
+            (all_tokens, N),
+            device=hidden_states_fp8_device,
+            dtype=torch.bfloat16,
+        )
+        gateup_input_scale = tma_align_input_scale(gateup_input_scale)
+
+        cutlass_moe_fp8(a=gateup_input_fp8, 
+                        a_scale=gateup_input_scale,
+                        w=self.w13_weight,
+                        w_scale=self.w13_weight_scale,
+                        c=gateup_output,
+                        m_indices=m_indices)
+        del gateup_input_fp8, gateup_input_scale
+        
+        down_input = torch.empty(
+            (
+                all_tokens,
+                N // 2,
+            ),
+            device=hidden_states_fp8_device,
+            dtype=torch.bfloat16,
+        )
+        silu_and_mul(gateup_output.view(-1, N), down_input)
+        del gateup_output
+        down_output = torch.empty(
+            (all_tokens, K),
+            device=hidden_states_fp8_device,
+            dtype=torch.bfloat16,
+        )
+        down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+            down_input,
+            scale_block_size,
+        )
+        del down_input
+        down_input_scale = tma_align_input_scale(down_input_scale)
+        cutlass_moe_fp8(a=down_input_fp8, 
+                        a_scale=down_input_scale,
+                        w=self.w2_weight,
+                        w_scale=self.w2_weight_scale,
+                        c=down_output,
+                        m_indices=m_indices)
+        del down_input_fp8, down_input_scale
+
+        gather_out = torch.empty(
+            hidden_states_fp8_shape,
+            device=hidden_states_fp8_device,
+            dtype=torch.bfloat16,
+        )
+        ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
+
+        return gather_out
+        
 
     def forward_deepgemm_contiguous(
         self,

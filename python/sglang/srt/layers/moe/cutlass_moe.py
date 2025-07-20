@@ -216,6 +216,57 @@ FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = 448.0
 
 
+def cutlass_moe_fp8(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    c: torch.Tensor,
+    m_indices: torch.Tensor,
+) -> None:
+    '''Performs EP MoE computation using CUTLASS-like kernels with per-block-fp8-quant weights and per-token-group-fp8-quant activations. 
+    '''
+    device = a.device
+    num_experts, k_g, n_g = w.shape
+    problem_sizes = torch.zeros((num_experts, 3), device=device, dtype=torch.int32)
+    layout_sfa = torch.zeros((num_experts, 5), device=device, dtype=torch.int32)
+    layout_sfb = torch.zeros((num_experts, 5), device=device, dtype=torch.int32)
+    a_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    b_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    out_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    a_scales_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    b_scales_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    workspace = torch.empty((1024 * 1024 * 1024), device=device, dtype=torch.uint8)
+    a_strides = torch.full((num_experts,), a.stride(0), device=device, dtype=torch.int64)
+    c_strides = torch.full((num_experts,), c.stride(0), device=device, dtype=torch.int64)
+    
+    for expert in range(num_experts):
+        m_g = m_indices[expert]
+        problem_sizes[expert][:] = torch.tensor([m_g, n_g, k_g], device=device)
+    w_scale = w_scale.transpose(1, 2).contiguous()
+    
+    fp8_blockwise_scaled_grouped_mm(
+        c,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        w,
+        a_scale,
+        w_scale,
+        a_strides,
+        a_strides,
+        c_strides,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        m_indices[:-1],
+        workspace,
+    )
+    
+
 def cutlass_moe_fp4(
     a: torch.Tensor,
     a1_gscale: torch.Tensor,
