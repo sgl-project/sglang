@@ -294,8 +294,10 @@ def _per_token_group_quant_8bit_raw(
 
     return x_q, x_s
 
+
 # backward compatibility
 per_token_group_quant_fp8 = _per_token_group_quant_8bit_raw
+
 
 def _per_token_group_quant_8bit_fuse_silu_and_mul(
     x: torch.Tensor,
@@ -320,9 +322,7 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
 
     from deep_gemm.utils.layout import transform_sf_into_required_layout
 
-    from sglang.srt.layers.moe.ep_moe.kernels import (
-        silu_and_mul_masked_post_quant_fwd,
-    )
+    from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
 
     assert column_major_scales
     assert scale_tma_aligned

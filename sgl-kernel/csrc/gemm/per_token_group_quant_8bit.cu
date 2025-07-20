@@ -404,60 +404,70 @@ void sgl_per_token_group_quant_8bit(
   const int scale_hidden_stride = static_cast<int>(output_s.stride(-1));
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, GROUP_SIZE, T, DST_DTYPE, output_s_dtype, ...)                                \
-  do {                                                                                                   \
-    int subwarps_per_block;                                                                              \
-    dim3 grid, block;                                                                                    \
-    SCHEDULER::compute_exec_config(                                                                      \
-        num_local_experts, hidden_dim_num_groups, num_groups, subwarps_per_block, grid, block);          \
-                                                                                                         \
+  do {                                                                                                               \
+    int subwarps_per_block;                                                                                          \
+    dim3 grid, block;                                                                                                \
+    SCHEDULER::compute_exec_config(                                                                                  \
+        num_local_experts, hidden_dim_num_groups, num_groups, subwarps_per_block, grid, block);                      \
+                                                                                                                     \
     per_token_group_quant_8bit_kernel<SCHEDULER, GROUP_SIZE, T, DST_DTYPE, __VA_ARGS__><<<grid, block, 0, stream>>>( \
-        static_cast<T*>(input.data_ptr()),                                                               \
-        static_cast<DST_DTYPE*>(output_q.data_ptr()),                                                    \
-        static_cast<output_s_dtype*>(output_s.data_ptr()),                                               \
-        static_cast<int32_t*>(masked_m.has_value() ? masked_m->data_ptr() : 0),                          \
-        group_size,                                                                                      \
-        subwarps_per_block,                                                                              \
-        hidden_dim_num_groups,                                                                           \
-        scale_expert_stride,                                                                             \
-        scale_hidden_stride,                                                                             \
-        num_tokens_per_expert);                                                                          \
+        static_cast<T*>(input.data_ptr()),                                                                           \
+        static_cast<DST_DTYPE*>(output_q.data_ptr()),                                                                \
+        static_cast<output_s_dtype*>(output_s.data_ptr()),                                                           \
+        static_cast<int32_t*>(masked_m.has_value() ? masked_m->data_ptr() : 0),                                      \
+        group_size,                                                                                                  \
+        subwarps_per_block,                                                                                          \
+        hidden_dim_num_groups,                                                                                       \
+        scale_expert_stride,                                                                                         \
+        scale_hidden_stride,                                                                                         \
+        num_tokens_per_expert);                                                                                      \
   } while (0)
 
 #define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                                               \
-  do {                                                                                            \
-    TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));      \
-                                                                                                  \
-    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                  \
-    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                      \
-    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                                                      \
-                                                                                                  \
-    if (is_column_major) {                                                                        \
-      if (scale_ue8m0) {                                                                          \
-        if (fuse_silu_and_mul) {                                                                  \
-          if (masked_layout) {                                                                    \
+  do {                                                                                                        \
+    TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));                  \
+                                                                                                              \
+    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                              \
+    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                                  \
+    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                                                                  \
+                                                                                                              \
+    if (is_column_major) {                                                                                    \
+      if (scale_ue8m0) {                                                                                      \
+        if (fuse_silu_and_mul) {                                                                              \
+          if (masked_layout) {                                                                                \
             LAUNCH_KERNEL_INNER(MaskedLayoutScheduler, GROUP_SIZE, T, DST_DTYPE, uint32_t, true, true, true); \
-          } else {                                                                                \
+          } else {                                                                                            \
             LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, T, DST_DTYPE, uint32_t, true, true, true);        \
-          }                                                                                       \
-        } else {                                                                                  \
+          }                                                                                                   \
+        } else {                                                                                              \
           LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, T, DST_DTYPE, uint32_t, true, true);                \
-        }                                                                                         \
-      } else {                                                                                    \
+        }                                                                                                     \
+      } else {                                                                                                \
         LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, T, DST_DTYPE, float, true);                           \
-      }                                                                                           \
-    } else {                                                                                      \
+      }                                                                                                       \
+    } else {                                                                                                  \
       LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, T, DST_DTYPE, float, false);                            \
-    }                                                                                             \
+    }                                                                                                         \
   } while (0)
 
-#define LAUNCH_KERNEL_OUTER(...) \
-    switch (group_size) { \
-        case 16: LAUNCH_KERNEL(16, __VA_ARGS__); break; \
-        case 32: LAUNCH_KERNEL(32, __VA_ARGS__); break; \
-        case 64: LAUNCH_KERNEL(64, __VA_ARGS__); break; \
-        case 128: LAUNCH_KERNEL(128, __VA_ARGS__); break; \
-        default: TORCH_CHECK(false, "Unsupported group_size"); \
-    } while (0)
+#define LAUNCH_KERNEL_OUTER(...)                    \
+  switch (group_size) {                             \
+    case 16:                                        \
+      LAUNCH_KERNEL(16, __VA_ARGS__);               \
+      break;                                        \
+    case 32:                                        \
+      LAUNCH_KERNEL(32, __VA_ARGS__);               \
+      break;                                        \
+    case 64:                                        \
+      LAUNCH_KERNEL(64, __VA_ARGS__);               \
+      break;                                        \
+    case 128:                                       \
+      LAUNCH_KERNEL(128, __VA_ARGS__);              \
+      break;                                        \
+    default:                                        \
+      TORCH_CHECK(false, "Unsupported group_size"); \
+  }                                                 \
+  while (0)
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), scalar_t, [&] {
     if (dst_type == at::ScalarType::Char) {

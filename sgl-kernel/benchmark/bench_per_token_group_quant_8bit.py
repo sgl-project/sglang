@@ -217,7 +217,9 @@ else:
 def benchmark(
     num_tokens, hidden_dim, group_size, num_ranks, dst_dtype, flags, provider
 ):
-    print(f"Testing: {num_tokens=} {hidden_dim=} {group_size=} {num_ranks=} {dst_dtype=} {flags=} {provider=}")
+    print(
+        f"Testing: {num_tokens=} {hidden_dim=} {group_size=} {num_ranks=} {dst_dtype=} {flags=} {provider=}"
+    )
 
     x, masked_m = create_per_token_group_quant_test_data(
         num_tokens=num_tokens, hidden_dim=hidden_dim, num_ranks=num_ranks, flags=flags
@@ -241,7 +243,9 @@ def benchmark(
         **{k: v for k, v in flags.items() if k not in ["masked_layout_mode"]},
     )
 
-    time_s = bench_kineto(bench_fn, kernel_names=kernel_names, num_tests=300 if mode_concentrated else 30)
+    time_s = bench_kineto(
+        bench_fn, kernel_names=kernel_names, num_tests=300 if mode_concentrated else 30
+    )
     return time_s * 1e6
 
 
