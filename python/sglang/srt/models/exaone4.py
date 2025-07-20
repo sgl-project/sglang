@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
     if getattr(config, "sliding_window", None) is not None:
-        return config.sliding_window - 1
+        return config.sliding_window
     else:
         return None
 
@@ -549,6 +549,9 @@ class Exaone4ForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
+    
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
