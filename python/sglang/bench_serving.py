@@ -814,9 +814,9 @@ def sample_mmmu_requests(
         List of tuples (prompt, prompt_token_len, output_token_len).
     """
     try:
-        import base64
         import io
 
+        import pybase64
         from datasets import load_dataset
     except ImportError:
         raise ImportError("Please install datasets: pip install datasets")
@@ -867,7 +867,7 @@ def sample_mmmu_requests(
                     # Encode image to base64
                     buffered = io.BytesIO()
                     image.save(buffered, format="JPEG")
-                    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                    img_str = pybase64.b64encode(buffered.getvalue()).decode("utf-8")
                     image_data = f"data:image/jpeg;base64,{img_str}"
                 else:
                     continue
@@ -1678,7 +1678,6 @@ def run_benchmark(args_: argparse.Namespace):
             if args.base_url
             else f"http://{args.host}:{args.port}/generate"
         )
-        args.apply_chat_template = True
     elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
         api_url = (
             f"{args.base_url}/v1/completions"

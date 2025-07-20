@@ -126,8 +126,6 @@ def set_global_state(global_state: _GlobalState):
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
-    server_args: ServerArgs = fast_api_app.server_args
-
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
         _global_state.tokenizer_manager, _global_state.template_manager
@@ -145,9 +143,12 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager
     )
 
+    server_args: ServerArgs = fast_api_app.server_args
     if server_args.warmups is not None:
         await execute_warmups(
-            server_args.warmups.split(","), _global_state.tokenizer_manager
+            server_args.disaggregation_mode,
+            server_args.warmups.split(","),
+            _global_state.tokenizer_manager,
         )
         logger.info("Warmup ended")
 
@@ -280,13 +281,17 @@ async def get_model_info():
         "model_path": _global_state.tokenizer_manager.model_path,
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
+        "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
     }
     return result
 
 
 @app.get("/get_server_info")
 async def get_server_info():
-    internal_states = await _global_state.tokenizer_manager.get_internal_state()
+    # Returns interna states per DP.
+    internal_states: List[Dict[Any, Any]] = (
+        await _global_state.tokenizer_manager.get_internal_state()
+    )
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
@@ -300,6 +305,8 @@ async def get_load():
     return await _global_state.tokenizer_manager.get_load()
 
 
+# example usage:
+# curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -d '{"server_args": {"max_micro_batch_size": 8}}'
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
@@ -411,6 +418,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
 
     await _global_state.tokenizer_manager.start_profile(
         output_dir=obj.output_dir,
+        start_step=obj.start_step,
         num_steps=obj.num_steps,
         activities=obj.activities,
         with_stack=obj.with_stack,
@@ -655,7 +663,9 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
 async def abort_request(obj: AbortReq, request: Request):
     """Abort a request."""
     try:
-        _global_state.tokenizer_manager.abort_request(rid=obj.rid)
+        _global_state.tokenizer_manager.abort_request(
+            rid=obj.rid, abort_all=obj.abort_all
+        )
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
@@ -701,6 +711,26 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     }
 
     return ORJSONResponse(content=response_data, status_code=200)
+
+
+@app.post("/pause_generation")
+async def pause_generation(request: Request):
+    """Pause generation."""
+    await _global_state.tokenizer_manager.pause_generation()
+    return ORJSONResponse(
+        content={"message": "Generation paused successfully.", "status": "ok"},
+        status_code=200,
+    )
+
+
+@app.post("/continue_generation")
+async def continue_generation(request: Request):
+    """Continue generation."""
+    await _global_state.tokenizer_manager.continue_generation()
+    return ORJSONResponse(
+        content={"message": "Generation continued successfully.", "status": "ok"},
+        status_code=200,
+    )
 
 
 ##### OpenAI-compatible API endpoints #####
@@ -886,6 +916,15 @@ def launch_server(
         add_prometheus_middleware(app)
         enable_func_timer()
 
+    image_token_text = None
+    if (
+        tokenizer_manager.image_token_id is not None
+        and not server_args.skip_tokenizer_init
+    ):
+        image_token_text = tokenizer_manager.tokenizer.decode(
+            [tokenizer_manager.image_token_id]
+        )
+
     # Send a warmup request - we will create the thread launch it
     # in the lifespan after all other warmups have fired.
     warmup_thread = threading.Thread(
@@ -893,7 +932,7 @@ def launch_server(
         args=(
             server_args,
             pipe_finish_writer,
-            _global_state.tokenizer_manager.image_token_id,
+            image_token_text,
             launch_callback,
         ),
     )
@@ -916,11 +955,9 @@ def launch_server(
         warmup_thread.join()
 
 
-def _wait_and_warmup(
+def _execute_server_warmup(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
-    image_token_text: str,
-    launch_callback: Optional[Callable[[], None]] = None,
 ):
     headers = {}
     url = server_args.url()
@@ -945,7 +982,7 @@ def _wait_and_warmup(
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_process_tree(os.getpid())
-        return
+        return success
 
     model_info = res.json()
 
@@ -1019,12 +1056,28 @@ def _wait_and_warmup(
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_process_tree(os.getpid())
-        return
+        return False
 
     # Debug print
-    # logger.info(f"{res.json()=}")
+    # logger.info(f"warmup request returns: {res.json()=}")
+    return success
+
+
+def _wait_and_warmup(
+    server_args: ServerArgs,
+    pipe_finish_writer: Optional[multiprocessing.connection.Connection],
+    image_token_text: str,
+    launch_callback: Optional[Callable[[], None]] = None,
+):
+    if not server_args.skip_server_warmup:
+        if not _execute_server_warmup(
+            server_args,
+            pipe_finish_writer,
+        ):
+            return
 
     logger.info("The server is fired up and ready to roll!")
+
     if pipe_finish_writer is not None:
         pipe_finish_writer.send("ready")
 

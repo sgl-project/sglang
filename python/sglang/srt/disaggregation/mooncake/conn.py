@@ -132,13 +132,9 @@ class MooncakeKVManager(BaseKVManager):
     ):
         self.kv_args = args
         self.local_ip = get_local_ip_auto()
-        self.engine = MooncakeTransferEngine(
-            hostname=self.local_ip,
-            gpu_id=self.kv_args.gpu_id,
-            ib_device=self.kv_args.ib_device,
-        )
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
+        self.init_engine()
         # for p/d multi node infer
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
@@ -185,9 +181,11 @@ class MooncakeKVManager(BaseKVManager):
                 threading.Thread(
                     target=self.transfer_worker, args=(queue, executor), daemon=True
                 ).start()
-
-            self.bootstrap_time_out = get_int_env_var(
-                "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 120
+            # If a timeout happens on the prefill side, it means prefill instances
+            # fail to receive the KV indices from the decode instance of this request.
+            # These timeout requests should be aborted to release the tree cache.
+            self.bootstrap_timeout = get_int_env_var(
+                "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 300
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.heartbeat_failures = {}
@@ -209,6 +207,12 @@ class MooncakeKVManager(BaseKVManager):
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
             self.prefill_tp_size_table: Dict[str, int] = {}
             self.prefill_dp_size_table: Dict[str, int] = {}
+            # If a timeout happens on the decode side, it means decode instances
+            # fail to receive the KV Cache transfer done signal after bootstrapping.
+            # These timeout requests should be aborted to release the tree cache.
+            self.waiting_timeout = get_int_env_var(
+                "SGLANG_DISAGGREGATION_WAITING_TIMEOUT", 300
+            )
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -216,6 +220,13 @@ class MooncakeKVManager(BaseKVManager):
 
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
+
+    def init_engine(self):
+        self.engine = MooncakeTransferEngine(
+            hostname=self.local_ip,
+            gpu_id=self.kv_args.gpu_id,
+            ib_device=self.kv_args.ib_device,
+        )
 
     def register_buffer_to_engine(self):
         for kv_data_ptr, kv_data_len in zip(
@@ -259,19 +270,17 @@ class MooncakeKVManager(BaseKVManager):
 
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            src_addr_list = []
-            dst_addr_list = []
-            length_list = []
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
-                src_addr_list.append(src_addr)
-                dst_addr_list.append(dst_addr)
-                length_list.append(length)
-            return self.engine.batch_transfer_sync(
-                mooncake_session_id, src_addr_list, dst_addr_list, length_list
-            )
+
+                status = self.engine.transfer_sync(
+                    mooncake_session_id, src_addr, dst_addr, length
+                )
+                if status != 0:
+                    return status
+            return 0
 
         futures = [
             executor.submit(
@@ -312,67 +321,60 @@ class MooncakeKVManager(BaseKVManager):
         This may introduce performance overhead (increased TTFT) for long sequences.
         """
         # Extract configuration
-        local_tp_rank = self.kv_args.engine_rank
         local_tp_size = self.tp_size // self.dp_size
+        local_tp_rank_in_group = self.kv_args.engine_rank % local_tp_size
+        src_kv_item_len = self.kv_args.kv_item_lens[0]
+        dst_tp_rank_in_group = dst_tp_rank % dst_tp_size
         num_kv_heads = self.kv_args.kv_head_num
         num_layers = len(self.kv_args.kv_data_ptrs)
         page_size = self.kv_args.page_size
 
         # Calculate head distribution
-        heads_per_decode_rank = num_kv_heads * local_tp_size // dst_tp_size
-        heads_per_prefill_rank = num_kv_heads
-        decode_global_head_start = dst_tp_rank * heads_per_decode_rank
-        prefill_global_head_start = local_tp_rank * heads_per_prefill_rank
-        bytes_per_head = dst_kv_item_len // heads_per_decode_rank // page_size
-
-        decode_rank_item_lens = [dst_kv_item_len for _ in range(num_layers)]
+        src_heads_per_rank = num_kv_heads
+        dst_heads_per_rank = num_kv_heads * local_tp_size // dst_tp_size
+        bytes_per_head_slice_to_send = (
+            dst_kv_item_len // page_size // dst_heads_per_rank
+        )
 
         # Determine slicing parameters based on TP configuration
         if local_tp_size > dst_tp_size:
-            src_head_offset = 0
-            num_heads_to_send = heads_per_prefill_rank
-            dst_head_offset = prefill_global_head_start - decode_global_head_start
+            # Send KVCache from multiple prefill instances to 1 decode instance
+            src_head_start_offset = 0
+            num_heads_to_send = src_heads_per_rank
+            dst_head_start_offset = local_tp_rank_in_group * src_heads_per_rank
         else:
-            src_head_offset = decode_global_head_start - prefill_global_head_start
-            num_heads_to_send = heads_per_decode_rank
-            dst_head_offset = 0
+            # Send KVCache from 1 prefill instance to multiple decode instances
+            src_head_start_offset = dst_tp_rank_in_group * dst_heads_per_rank
+            num_heads_to_send = dst_heads_per_rank
+            dst_head_start_offset = 0
 
-        layer_transfer_params = []
+        layers_params = []
         for layer_id in range(num_layers):
-            item_len_of_prefill_rank_page = self.kv_args.kv_item_lens[layer_id]
+            # Calculate precise byte offset and length for the sub-slice within the token
+            src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
+            dst_head_slice_offset = dst_head_start_offset * bytes_per_head_slice_to_send
+            heads_bytes_per_token_to_send = (
+                num_heads_to_send * bytes_per_head_slice_to_send
+            )
 
-            # Page stride on the target dst decode rank for its slice pages
-            item_len_of_decode_rank_page = decode_rank_item_lens[layer_id]
-
-            if item_len_of_prefill_rank_page == 0 or num_kv_heads == 0:
-                logger.error(
-                    f"Invalid item_len_of_prefill_rank_page or num_kv_heads for layer {layer_id}"
-                )
-                return -1
-
-            # Calculate precise byte offset and length for the sub-slice within the prefill page data
-            src_slice_offset = src_head_offset * bytes_per_head
-            dst_slice_offset = dst_head_offset * bytes_per_head
-            slice_lens_per_page = num_heads_to_send * bytes_per_head
-
-            # Sanity check: The data sub-slice to be sent should fit into the decode instance's page.
-            # This means slice_lens_per_page <= item_len_of_decode_rank_page
-            if slice_lens_per_page > item_len_of_decode_rank_page:
+            # Sanity check: The data sub-slice to be sent should fit into the dst buffer.
+            # This means heads_bytes_per_token_to_send <= (dst_kv_item_len // page_size)
+            if heads_bytes_per_token_to_send > (dst_kv_item_len // page_size):
                 logger.error(
                     f"[{mooncake_session_id}] Layer {layer_id}: "
-                    f"slice size ({slice_lens_per_page}) exceeds "
-                    f"target page size ({item_len_of_decode_rank_page})"
+                    f"slice size ({heads_bytes_per_token_to_send}) exceeds "
+                    f"target token slot size ({dst_kv_item_len // page_size})"
                 )
                 return -1
-            layer_transfer_params.append(
+            layers_params.append(
                 (
                     self.kv_args.kv_data_ptrs[layer_id],
                     dst_kv_ptrs[layer_id],
-                    item_len_of_prefill_rank_page,
-                    item_len_of_decode_rank_page,
-                    src_slice_offset,
-                    dst_slice_offset,
-                    slice_lens_per_page,
+                    src_kv_item_len,
+                    dst_kv_item_len,
+                    src_head_slice_offset,
+                    dst_head_slice_offset,
+                    heads_bytes_per_token_to_send,
                 )
             )
 
@@ -382,9 +384,9 @@ class MooncakeKVManager(BaseKVManager):
                 dst_ptr,
                 src_item_len,
                 dst_item_len,
-                src_offset,
-                dst_offset,
-                slice_lens_per_page,
+                src_head_slice_offset,
+                dst_head_slice_offset,
+                heads_bytes_per_token_to_send,
             ) = layer_params
             src_addr_list = []
             dst_addr_list = []
@@ -415,17 +417,12 @@ class MooncakeKVManager(BaseKVManager):
                     )
 
                     # Calculate final src and dst addresses by applying head-slice offsets
-                    src_slice_addr = src_token_slot_start_addr + src_offset
-                    dst_slice_addr = dst_token_slot_start_addr + dst_offset
+                    src_slice_addr = src_token_slot_start_addr + src_head_slice_offset
+                    dst_slice_addr = dst_token_slot_start_addr + dst_head_slice_offset
 
                     src_addr_list.append(src_slice_addr)
                     dst_addr_list.append(dst_slice_addr)
-                    length_list.append(slice_lens_per_page)
-
-                    logger.debug(
-                        f"SYNC: sid={mooncake_session_id}, "
-                        f"src={src_slice_addr}, dst={dst_slice_addr}, len={slice_lens_per_page}"
-                    )
+                    length_list.append(heads_bytes_per_token_to_send)
 
             return self.engine.batch_transfer_sync(
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
@@ -436,7 +433,7 @@ class MooncakeKVManager(BaseKVManager):
                 process_layer_tp_aware,
                 layer_params,
             )
-            for layer_params in layer_transfer_params
+            for layer_params in layers_params
         ]
 
         for future in concurrent.futures.as_completed(futures):
@@ -524,12 +521,12 @@ class MooncakeKVManager(BaseKVManager):
                         if len(chunked_dst_kv_indice) < len(
                             kv_chunk.prefill_kv_indices
                         ):
-                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
-                                : len(chunked_dst_kv_indice)
-                            ]
                             logger.warning(
                                 f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
                             )
+                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
+                                : len(chunked_dst_kv_indice)
+                            ]
 
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
@@ -938,7 +935,12 @@ class MooncakeKVSender(BaseKVSender):
                 if self.init_time is not None:
                     now = time.time()
                     elapsed = now - self.init_time
-                    if elapsed >= self.kv_mgr.bootstrap_time_out:
+                    if elapsed >= self.kv_mgr.bootstrap_timeout:
+                        logger.warning_once(
+                            "Some requests timed out when bootstrapping, "
+                            "which means prefill instances fail to receive the KV indices from the decode instance of this request. "
+                            "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
+                        )
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,
                             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.Bootstrapping",
@@ -987,6 +989,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.session_id = self.kv_mgr.get_session_id()
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
         self.conclude_state = None
+        self.init_time = None
         self.data_parallel_rank = data_parallel_rank
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
@@ -1222,14 +1225,31 @@ class MooncakeKVReceiver(BaseKVReceiver):
                         str(self.required_dst_info_num).encode("ascii"),
                     ]
                 )
+        self.init_time = time.time()
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
+            elif status == KVPoll.WaitingForInput:
+                if self.init_time is not None:
+                    now = time.time()
+                    elapsed = now - self.init_time
+                    if elapsed >= self.kv_mgr.waiting_timeout:
+                        logger.warning_once(
+                            "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
+                            "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
+                        )
+                        self.kv_mgr.record_failure(
+                            self.bootstrap_room,
+                            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.WaitingForInput",
+                        )
+                        self.conclude_state = KVPoll.Failed
+                        return KVPoll.Failed
 
             return status
+
         else:
             return self.conclude_state
 

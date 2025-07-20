@@ -259,6 +259,25 @@ def qserve_w4a8_per_group_gemm(
     return out_feats
 
 
+def dsv3_router_gemm(
+    hidden_states: torch.Tensor,
+    router_weights: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    output = torch.empty(
+        hidden_states.shape[0],
+        router_weights.shape[0],
+        device=hidden_states.device,
+        dtype=out_dtype,
+    )
+    torch.ops.sgl_kernel.dsv3_router_gemm(
+        output,
+        hidden_states,
+        router_weights,
+    )
+    return output
+
+
 def shuffle_rows(input_tensor, dst2src_map, output_tensor_shape):
     output_tensor = torch.empty(
         output_tensor_shape,
