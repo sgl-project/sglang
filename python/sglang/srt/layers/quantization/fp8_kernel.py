@@ -310,7 +310,7 @@ def per_token_group_quant_8bit(
     from sglang.srt.layers.quantization.int8_kernel import per_token_group_quant_int8
 
     if fuse_silu_and_mul:
-        # TODO temp
+        # Another way to implement (can be used in e.g. comparison tests)
         # from sgl_kernel import silu_and_mul
         # x_after_silu_and_mul = silu_and_mul(x)
         # return per_token_group_quant_fp8(
