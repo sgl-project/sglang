@@ -298,7 +298,6 @@ class SolarModel(nn.Module):
 
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-            deferred_norm = None
 
         # Depth up-scaling mechanism: caches hidden states and residuals from intermediate layers and interpolates them with the states of later layers.
         # `bskcn` stands for "backbone skip connection".
