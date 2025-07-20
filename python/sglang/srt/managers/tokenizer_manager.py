@@ -574,7 +574,7 @@ class TokenizerManager:
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logits-processor` to enable this feature."
                 )
-            if self.server_args.enable_lora and obj.lora_path:
+            if self.server_args.lora_paths and obj.lora_path:
                 self._validate_lora_adapters(obj)
 
     def _validate_input_ids_in_vocab(
@@ -1037,10 +1037,6 @@ class TokenizerManager:
         _: Optional[fastapi.Request] = None,
     ) -> LoadLoRAAdapterReqOutput:
         self.auto_create_handle_loop()
-        if not self.server_args.enable_lora:
-            raise ValueError(
-                "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
-            )
 
         # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
         # with dp_size > 1.
@@ -1064,10 +1060,6 @@ class TokenizerManager:
         _: Optional[fastapi.Request] = None,
     ) -> UnloadLoRAAdapterReqOutput:
         self.auto_create_handle_loop()
-        if not self.server_args.enable_lora:
-            raise ValueError(
-                "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
-            )
 
         # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
         # with dp_size > 1.
@@ -1367,7 +1359,7 @@ class TokenizerManager:
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
-            self.last_receive_tstamp = time.perf_counter()
+            self.last_receive_tstamp = time.time()
 
     def _handle_batch_output(
         self,
@@ -1701,6 +1693,29 @@ class TokenizerManager:
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
 
+    def _qwen3_rerank_customize_instruction(self, instruction, query, documents):
+        if instruction is None:
+            instruction = "Given a web search query, retrieve relevant passages that answer the query"
+
+        prefix = '<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n<|im_start|>user\n'
+        suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+        def format_instruction(instruction, query, doc):
+            output = (
+                prefix
+                + " "
+                + "<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {doc}".format(
+                    instruction=instruction, query=query, doc=doc
+                )
+                + " "
+                + suffix
+            )
+            return output
+
+        pairs = [format_instruction(instruction, query, doc) for doc in documents]
+        print(pairs, "...current...scoring candidates")
+        return pairs
+
     async def score_request(
         self,
         query: Optional[Union[str, List[int]]] = None,
@@ -1708,6 +1723,8 @@ class TokenizerManager:
         label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
+        instruction: str = None,
+        rerank_type: str = None,
         request: Optional[Any] = None,
     ) -> List[List[float]]:
         """
@@ -1723,7 +1740,6 @@ class TokenizerManager:
                     raise ValueError(
                         f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})"
                     )
-
         # Handle string or tokenized query/items
         if isinstance(query, str) and (
             isinstance(items, str)
@@ -1733,8 +1749,13 @@ class TokenizerManager:
             items_list = [items] if isinstance(items, str) else items
             if item_first:
                 prompts = [f"{item}{query}" for item in items_list]
+            elif rerank_type == "qwen3-rerank":
+                prompts = self._qwen3_rerank_customize_instruction(
+                    instruction, query, items_list
+                )
             else:
                 prompts = [f"{query}{item}" for item in items_list]
+
             batch_request = GenerateReqInput(
                 text=prompts,
                 return_logprob=True,
