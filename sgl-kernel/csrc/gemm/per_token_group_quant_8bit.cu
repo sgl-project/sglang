@@ -421,7 +421,6 @@ void sgl_per_token_group_quant_8bit(
         static_cast<DST_DTYPE*>(output_q.data_ptr()),                                                                \
         static_cast<output_s_dtype*>(output_s.data_ptr()),                                                           \
         static_cast<int32_t*>(masked_m.has_value() ? masked_m->data_ptr() : 0),                                      \
-        group_size,                                                                                                  \
         subwarps_per_block,                                                                                          \
         hidden_dim_num_groups,                                                                                       \
         scale_expert_stride,                                                                                         \
