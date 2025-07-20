@@ -354,7 +354,7 @@ class LoRAManager:
                     )
         # call set_lora_info for embeddings
         for module_name, module in self.lora_embeddings_modules.items():
-            if self.cur_max_extra_vocab_size > 0:
+            if self.max_extra_vocab_size > 0:
                 new_embeddings_buffer = self.memory_pool.get_embedding_tensor(module_name)
             module.set_lora_info(
                 new_embeddings_buffer,

@@ -131,7 +131,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         added_tokens_mask = torch.where(input_ > self.vocab_size - 1, 1, 0)
         base_output = self.base_layer.forward(input_ * (1-added_tokens_mask))
 
-        if added_tokens_mask.sum() > 0:
+        if added_tokens_mask.any():
             base_output = self._forward(input_, added_tokens_mask, batch_info, base_output)
         
         if self.set_lora:

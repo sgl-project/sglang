@@ -185,13 +185,13 @@ class LoRAMemoryPool:
 
         init_buffer(
             self.embedding_A_buffer,
-            lora_embeddings_weight_names[0],
+            self.lora_embeddings_weight_names[0],
             self.get_embedding_lora_A_shape,
         )
 
         init_buffer(
             self.embedding_B_buffer,
-            lora_embeddings_weight_names[1],
+            self.lora_embeddings_weight_names[1],
             self.get_embedding_lora_B_shape,
         )
 

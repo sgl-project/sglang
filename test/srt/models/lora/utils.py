@@ -77,7 +77,7 @@ CI_LORA_MODELS = [
 
 EMBEDDING_LORA_MODELS = [
     LoRAModelCase(
-        base="meta-llama/Llama-3.1-8B-Instruct",
+        base="meta-llama/Llama-2-7b-hf",
         adaptors=[LoRAAdaptor(name="yard1/llama-2-7b-sql-lora-test")],
         max_loras_per_batch=1,
     ),
