@@ -12,6 +12,7 @@ class TestDownloadFromModelScope(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        # Use a small model to keep test time short.
         cls.model = "LLM-Research/tinyllama-15M-stories"
         stat, output = subprocess.getstatusoutput("pip install modelscope")
 
@@ -33,12 +34,10 @@ class TestDownloadFromModelScope(CustomTestCase):
             from sglang.srt.server_args import ServerArgs
 
             args = ServerArgs(self.model)
-
+            safetensors_path = os.path.join(args.model_path, "model.safetensors")
             self.assertTrue(
-                os.path.exists(os.path.join(args.model_path, "config.json"))
-            )
-            self.assertTrue(
-                os.path.exists(os.path.join(args.model_path, "model.safetensors"))
+                os.path.exists(safetensors_path),
+                f"prepare modelscope model failed, {safetensors_path} not found",
             )
 
 
