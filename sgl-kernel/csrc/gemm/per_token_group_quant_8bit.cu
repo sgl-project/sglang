@@ -107,11 +107,11 @@ __device__ __forceinline__ int compute_input_group_start_offset(
 }
 
 constexpr float LOCAL_ABSMAX_ABS = 1e-10;
-constexpr int THREADS_PER_SUBWARP = 8;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 
 struct NaiveScheduler {
   static void compute_exec_config(
+      int threads_per_subwarp,
       int num_local_experts,
       int hidden_dim_num_groups,
       int num_groups,
@@ -131,14 +131,13 @@ struct NaiveScheduler {
       return 1;
     })();
     grid = dim3(num_groups / subwarps_per_block);
-    block = dim3(subwarps_per_block * THREADS_PER_SUBWARP);
+    block = dim3(subwarps_per_block * threads_per_subwarp);
   }
 
-  template <bool FUSE_SILU_AND_MUL, typename FUNC>
+  template <bool FUSE_SILU_AND_MUL, int GROUP_SIZE, int THREADS_PER_SUBWARP, typename FUNC>
   __device__ __forceinline__ static void execute(
       const int subwarps_per_block,
       const int hidden_dim_num_groups,
-      const int group_size,
       const int32_t* masked_m,
       const int num_tokens_per_expert,
       FUNC fn) {
@@ -152,7 +151,7 @@ struct NaiveScheduler {
 
     int64_t input_group_start_offset;
     if constexpr (!FUSE_SILU_AND_MUL) {
-      input_group_start_offset = group_id * group_size;
+      input_group_start_offset = group_id * GROUP_SIZE;
     }
 
     const int token_idx = group_id / hidden_dim_num_groups;
@@ -160,9 +159,9 @@ struct NaiveScheduler {
     const int hidden_dim_group_idx = group_id % hidden_dim_num_groups;
 
     if constexpr (FUSE_SILU_AND_MUL) {
-      const int hidden_size = hidden_dim_num_groups * group_size;
+      const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
       input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
-          expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, group_size);
+          expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, GROUP_SIZE);
     }
 
     fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
@@ -175,6 +174,7 @@ struct MaskedLayoutScheduler {
   static constexpr int SUBWARPS_PER_BLOCK = 16;
 
   static void compute_exec_config(
+      int threads_per_subwarp,
       int num_local_experts,
       int hidden_dim_num_groups,
       int num_groups,
@@ -187,11 +187,10 @@ struct MaskedLayoutScheduler {
     block = dim3(subwarps_per_block * THREADS_PER_SUBWARP);
   }
 
-  template <bool FUSE_SILU_AND_MUL, typename FUNC>
+  template <bool FUSE_SILU_AND_MUL, int GROUP_SIZE, int THREADS_PER_SUBWARP, typename FUNC>
   __device__ __forceinline__ static void execute(
       const int subwarps_per_block,
       const int hidden_dim_num_groups,
-      const int group_size,
       const int32_t* masked_m,
       const int num_tokens_per_expert,
       FUNC fn) {
@@ -207,9 +206,9 @@ struct MaskedLayoutScheduler {
 
     for (int token_idx = token_idx_start; token_idx < curr_expert_token_num;
          token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
-      const int hidden_size = hidden_dim_num_groups * group_size;
+      const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
       const int64_t input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
-          expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, group_size);
+          expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, GROUP_SIZE);
       fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
     }
   }
@@ -239,10 +238,9 @@ __global__ void per_token_group_quant_8bit_kernel(
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
-  SCHEDULER::execute<FUSE_SILU_AND_MUL>(
+  SCHEDULER::execute<FUSE_SILU_AND_MUL, GROUP_SIZE, THREADS_PER_SUBWARP>(
       subwarps_per_block,
       hidden_dim_num_groups,
-      GROUP_SIZE,
       masked_m,
       num_tokens_per_expert,
       [&](const int expert_idx,
@@ -408,7 +406,7 @@ void sgl_per_token_group_quant_8bit(
     int subwarps_per_block;                                                                                          \
     dim3 grid, block;                                                                                                \
     SCHEDULER::compute_exec_config(                                                                                  \
-        num_local_experts, hidden_dim_num_groups, num_groups, subwarps_per_block, grid, block);                      \
+        THREADS_PER_SUBWARP, num_local_experts, hidden_dim_num_groups, num_groups, subwarps_per_block, grid, block); \
                                                                                                                      \
     per_token_group_quant_8bit_kernel<SCHEDULER, GROUP_SIZE, T, DST_DTYPE, __VA_ARGS__><<<grid, block, 0, stream>>>( \
         static_cast<T*>(input.data_ptr()),                                                                           \
