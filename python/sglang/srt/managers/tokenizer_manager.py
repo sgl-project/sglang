@@ -1721,7 +1721,6 @@ class TokenizerManager:
             return output
 
         pairs = [format_instruction(instruction, query, doc) for doc in documents]
-        print(pairs, "...current...scoring candidates")
         return pairs
 
     async def score_request(
