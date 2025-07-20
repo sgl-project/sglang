@@ -46,9 +46,9 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
-    ImageDataItem,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
+    MultimodalDataInputFormat,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -65,6 +65,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    ServerStatus,
     assert_pkg_version,
     configure_logger,
     get_zmq_socket,
@@ -73,6 +74,7 @@ from sglang.srt.utils import (
     launch_dummy_health_check_server,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
+    report_health,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
@@ -148,13 +150,9 @@ class Engine(EngineBase):
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
         # See also python/sglang/srt/utils.py:load_image for more details.
-        image_data: Optional[
-            Union[
-                List[List[ImageDataItem]],
-                List[ImageDataItem],
-                ImageDataItem,
-            ]
-        ] = None,
+        image_data: Optional[MultimodalDataInputFormat] = None,
+        audio_data: Optional[MultimodalDataInputFormat] = None,
+        video_data: Optional[MultimodalDataInputFormat] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -187,6 +185,8 @@ class Engine(EngineBase):
             input_ids=input_ids,
             sampling_params=sampling_params,
             image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -231,13 +231,9 @@ class Engine(EngineBase):
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
         # See also python/sglang/srt/utils.py:load_image for more details.
-        image_data: Optional[
-            Union[
-                List[List[ImageDataItem]],
-                List[ImageDataItem],
-                ImageDataItem,
-            ]
-        ] = None,
+        image_data: Optional[MultimodalDataInputFormat] = None,
+        audio_data: Optional[MultimodalDataInputFormat] = None,
+        video_data: Optional[MultimodalDataInputFormat] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -272,6 +268,8 @@ class Engine(EngineBase):
             input_ids=input_ids,
             sampling_params=sampling_params,
             image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -295,19 +293,20 @@ class Engine(EngineBase):
     def encode(
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
-        image_data: Optional[
-            Union[
-                List[List[Union[Image, str]]],
-                List[Union[Image, str]],
-                Union[Image, str],
-            ]
-        ] = None,
+        image_data: Optional[MultimodalDataInputFormat] = None,
+        audio_data: Optional[MultimodalDataInputFormat] = None,
+        video_data: Optional[MultimodalDataInputFormat] = None,
     ) -> Dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
         Please refer to `EmbeddingReqInput` for the documentation.
         """
-        obj = EmbeddingReqInput(text=prompt, image_data=image_data)
+        obj = EmbeddingReqInput(
+            text=prompt,
+            image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
+        )
         loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
         ret = loop.run_until_complete(generator.__anext__())
@@ -316,7 +315,9 @@ class Engine(EngineBase):
     async def async_encode(
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
-        image_data: Optional[Union[List[str], str]] = None,
+        image_data: Optional[MultimodalDataInputFormat] = None,
+        audio_data: Optional[MultimodalDataInputFormat] = None,
+        video_data: Optional[MultimodalDataInputFormat] = None,
     ) -> Dict:
         """
         Asynchronous version of encode method.
@@ -324,7 +325,12 @@ class Engine(EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
         Please refer to `EmbeddingReqInput` for the documentation.
         """
-        obj = EmbeddingReqInput(text=prompt, image_data=image_data)
+        obj = EmbeddingReqInput(
+            text=prompt,
+            image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
+        )
         generator = self.tokenizer_manager.generate_request(obj, None)
         return await generator.__anext__()
 
@@ -418,12 +424,21 @@ class Engine(EngineBase):
             self.tokenizer_manager.init_weights_update_group(obj, None)
         )
 
-    def update_weights_from_distributed(self, name: str, dtype, shape):
+    def update_weights_from_distributed(
+        self,
+        names: list[str],
+        dtypes: list[str],
+        shapes: list[list[int]],
+        group_name: str = "weight_update_group",
+        flush_cache: bool = True,
+    ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
-            name=name,
-            dtype=dtype,
-            shape=shape,
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name=group_name,
+            flush_cache=flush_cache,
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
@@ -633,7 +648,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.6.post1",
+            "0.2.7.post1",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -641,13 +656,14 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda:
         assert_pkg_version(
             "sgl-kernel",
-            "0.1.9",
+            "0.2.6",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
     def sigchld_handler(signum, frame):
         pid, exitcode = os.waitpid(0, os.WNOHANG)
         if exitcode != 0:
+            report_health(ServerStatus.Crashed, server_args.host, server_args.port)
             logger.warning(
                 f"Child process unexpectedly failed with {exitcode=}. {pid=}"
             )
@@ -661,6 +677,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         logger.error(
             "Received sigquit from a child process. It usually means the child failed."
         )
+        report_health(ServerStatus.Crashed, server_args.host, server_args.port)
         kill_process_tree(os.getpid())
 
     signal.signal(signal.SIGQUIT, sigquit_handler)

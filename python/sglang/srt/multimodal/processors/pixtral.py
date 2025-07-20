@@ -55,7 +55,7 @@ class PixtralProcessor(BaseMultimodalProcessor):
         self.patch_size = self.vision_config.patch_size
         self.multimodal_tokens = MultimodalSpecialTokens(
             image_token=_processor.image_token
-        )
+        ).build(_processor)
         _processor.tokenizer.add_special_tokens(
             {
                 "pad_token": getattr(hf_config, "pad_token", self.PAD_TOKEN),
@@ -78,12 +78,6 @@ class PixtralProcessor(BaseMultimodalProcessor):
         *args,
         **kwargs,
     ):
-        if not image_data:
-            return None
-
-        if isinstance(image_data, str):
-            image_data = [image_data]
-
         mm_data = self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=self.multimodal_tokens,
@@ -109,10 +103,10 @@ class PixtralProcessor(BaseMultimodalProcessor):
             )
             mm_items = [
                 MultimodalDataItem(
-                    pixel_values=processor_output["pixel_values"],
+                    feature=processor_output["pixel_values"],
                     image_sizes=processor_output["image_sizes"],
                     modality=Modality.IMAGE,
-                    image_offsets=image_offsets,
+                    offsets=image_offsets,
                 )
             ]
 

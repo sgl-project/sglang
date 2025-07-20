@@ -69,18 +69,6 @@ jobs:
             sgl-router/target/criterion/
           retention-days: 30
 
-      - name: Post benchmark results as PR comment
-        if: github.event_name == 'pull_request'
-        run: |
-          cd sgl-router/
-          # Use Python script to post benchmark comment
-          python3 scripts/post_benchmark_comment.py \
-            --pr-number ${{ github.event.number }} \
-            --commit-sha ${{ github.sha }} \
-            --results-file benchmark_results.env
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   benchmark-integration-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest

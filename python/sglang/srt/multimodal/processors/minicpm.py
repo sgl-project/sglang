@@ -17,34 +17,27 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        self.image_token = "(<image>./</image>)"
-        self.audio_token = "(<audio>./</audio>)"
+        self.mm_tokens = MultimodalSpecialTokens(
+            image_token="(<image>./</image>)",
+            audio_token="(<audio>./</audio>)",
+            video_token="(<video>./</video>)",
+        ).build(_processor)
 
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
+        audio_data: List[Union[str, bytes]],
         input_text,
         request_obj,
         max_req_input_len,
         **kwargs,
     ):
-        audio_data = request_obj.audio_data
-        if not image_data and not audio_data:
-            return None
-        if not isinstance(image_data, list):
-            image_data = [image_data]
-        if not isinstance(audio_data, list):
-            audio_data = [audio_data]
-
         base_output = self.load_mm_data(
             prompt=input_text,
             max_req_input_len=max_req_input_len,
             audio_data=audio_data,
             image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(
-                image_token=self.image_token,
-                audio_token=self.audio_token,
-            ),
+            multimodal_tokens=self.mm_tokens,
         )
         if base_output is None:
             return None
@@ -119,8 +112,8 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
 
         if len(pixel_values) != 0:
             item = MultimodalDataItem(
-                pixel_values=pixel_values,
-                image_offsets=image_offsets,
+                feature=pixel_values,
+                offsets=image_offsets,
                 tgt_size=tgt_sizes_flat,
                 modality=Modality.IMAGE,
             )
@@ -140,13 +133,12 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             else:
                 audio_offsets = None
             item = MultimodalDataItem(
-                audio_features=[res["audio_features"]],
+                feature=[res["audio_features"]],
                 audio_feature_lens=res["audio_feature_lens"],
-                audio_offsets=audio_offsets,
+                offsets=audio_offsets,
                 modality=Modality.AUDIO,
             )
             items += [item]
-
         return {
             "mm_items": items,
             "input_ids": input_ids.tolist(),
