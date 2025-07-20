@@ -742,6 +742,7 @@ class HiCacheController:
                     self.prefetch_revoke_queue.put(operation.request_id)
                 else:
                     operation.hash_value = hit_hash
+                    operation.host_indices = operation.host_indices[:(storage_hit_count * self.page_size)]
                     logger.info(
                         f"Prefetching {len(hit_hash)} pages for request {operation.request_id}."
                     )
@@ -817,7 +818,7 @@ class HiCacheController:
                                                                                              non_exist_indices)
                             self.storage_backend.set(key_strs, target_location=buffer_ptrs, target_sizes=buffer_sizes)
 
-                        operation.comleted_tokens += len(hash_value) * self.page_size
+                        operation.completed_tokens += len(hash_value) * self.page_size
                     else:
                         #unimplemented
                         pass

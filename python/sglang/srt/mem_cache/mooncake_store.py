@@ -148,6 +148,7 @@ class MooncakeStore:
         buffer_ptrs: List[int],
         buffer_sizes: List[int]
     ) -> None:
+        logger.info("batch get called python")
         assert len(key_strs) == len(buffer_ptrs) == len(buffer_sizes)
         if len(key_strs) == 0:
             return
@@ -189,6 +190,7 @@ class MooncakeStore:
         buffer_sizes: List[int]
     ) -> None:
         try:
+            logger.info("batch get into called from python")
             self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
         except TypeError as err:
             logger.error("Failed to get value from Mooncake Store: %s", err)

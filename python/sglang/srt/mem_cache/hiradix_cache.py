@@ -84,7 +84,7 @@ class HiRadixCache(RadixCache):
         self.write_through_threshold = (
             1 if hicache_write_policy == "write_through" else 3
         )
-        self.write_through_threshold_storage = 1
+        self.write_through_threshold_storage = 2
         self.load_back_threshold = 10
         super().__init__(
             req_to_token_pool, token_to_kv_pool_allocator, page_size, disable=False
@@ -304,8 +304,7 @@ class HiRadixCache(RadixCache):
             for k, v in x.parent.children.items():
                 if v == x:
                     break
-            if len(x.parent.children[k].l3_keys) == 0:
-                del x.parent.children[k]
+            
 
             if len(x.parent.children) == 0 and x.parent.evicted:
                 heapq.heappush(leaves, x.parent)

@@ -474,13 +474,6 @@ class Scheduler(
         t.start()
         self.parent_process = psutil.Process().parent()
 
-        # self.enable_mooncake_store_l3_cache = server_args.enable_mooncake_store_l3_cache
-        # # Init loading l3 cache thread
-        # if self.enable_hierarchical_cache and self.enable_mooncake_store_l3_cache:
-        #     prefetch_thread = threading.Thread(
-        #         target=self.prefetch_l3, daemon=True
-        #     )
-        #     prefetch_thread.start()
 
         # Init memory saver
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
