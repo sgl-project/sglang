@@ -24,7 +24,6 @@ configs = list(
         [1, 4, 16, 64, 127, 128, 512, 1024, 4096, 8192],  # num_tokens
         [128, 256, 384, 512, 1024, 1536, 1664, 2048, 4096, 7168, 16384],  # hidden_dim
         [16, 32, 64, 128],  # group_size
-        [128],  # group_size
         [None],  # num_ranks
         [fp8_type_, torch.int8],  # dtype
         [
