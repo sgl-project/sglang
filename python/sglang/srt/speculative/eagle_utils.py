@@ -21,6 +21,7 @@ from sglang.srt.managers.schedule_batch import (
     get_last_loc,
     global_server_args_dict,
 )
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
