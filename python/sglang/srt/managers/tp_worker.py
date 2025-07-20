@@ -30,15 +30,17 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterReqInput,
+    UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 
@@ -58,7 +60,7 @@ class TpModelWorker:
         nccl_port: int,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
-        token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
+        token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
@@ -148,6 +150,15 @@ class TpModelWorker:
         # A reference make this class has the same member as TpModelWorkerClient
         self.worker = self
 
+        self.hicache_layer_transfer_counter = None
+
+    def register_hicache_layer_transfer_counter(self, counter):
+        self.hicache_layer_transfer_counter = counter
+
+    def set_hicache_consumer(self, consumer_index):
+        if self.hicache_layer_transfer_counter is not None:
+            self.hicache_layer_transfer_counter.set_consumer(consumer_index)
+
     def get_worker_info(self):
         return (
             self.max_total_num_tokens,
@@ -161,6 +172,20 @@ class TpModelWorker:
             self.model_runner.req_to_token_pool.size,
             self.model_runner.req_to_token_pool.max_context_len,
             self.model_runner.token_to_kv_pool.size,
+        )
+
+    @property
+    def sliding_window_size(self) -> Optional[int]:
+        return self.model_runner.sliding_window_size
+
+    @property
+    def is_hybrid(self) -> bool:
+        return self.model_runner.is_hybrid is not None
+
+    def get_tokens_per_layer_info(self):
+        return (
+            self.model_runner.full_max_total_num_tokens,
+            self.model_runner.swa_max_total_num_tokens,
         )
 
     def get_pad_input_ids_func(self):
@@ -253,7 +278,6 @@ class TpModelWorker:
         return success, message
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        monkey_patch_torch_reductions()
         success, message = self.model_runner.update_weights_from_tensor(
             named_tensors=MultiprocessingSerializer.deserialize(
                 recv_req.serialized_named_tensors[self.tp_rank]
@@ -267,3 +291,13 @@ class TpModelWorker:
             recv_req.name, recv_req.truncate_size
         )
         return parameter
+
+    def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
+        result = self.model_runner.load_lora_adapter(
+            recv_req.lora_name, recv_req.lora_path
+        )
+        return result
+
+    def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
+        result = self.model_runner.unload_lora_adapter(recv_req.lora_name)
+        return result

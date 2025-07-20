@@ -30,9 +30,9 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     dp_gather_replicate,
     dp_scatter,
+    get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_size,
-    get_local_attention_dp_rank,
     get_local_attention_dp_size,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -42,19 +42,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import dump_to_file
-
-logger = logging.getLogger(__name__)
-
-
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
-from sglang.srt.utils import dump_to_file
+from sglang.srt.utils import dump_to_file, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
@@ -183,7 +171,7 @@ class LogitsMetadata:
             return
 
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
-        dp_rank = get_local_attention_dp_rank()
+        dp_rank = get_attention_dp_rank()
         if dp_rank == 0:
             dp_local_start_pos = torch.zeros_like(
                 self.global_num_tokens_for_logprob_gpu[0]
@@ -448,17 +436,26 @@ class LogitsProcessor(nn.Module):
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits_metadata.compute_dp_attention_metadata(hidden_states)
             hidden_states, local_hidden_states = (
-                logits_metadata.gathered_buffer,
-                hidden_states.clone(),
+                torch.empty_like(logits_metadata.gathered_buffer),
+                hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
         if hasattr(lm_head, "weight"):
-            logits = torch.matmul(
-                hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-            )
+            if use_intel_amx_backend(lm_head):
+                logits = torch.ops.sgl_kernel.weight_packed_linear(
+                    hidden_states.to(lm_head.weight.dtype),
+                    lm_head.weight,
+                    None,  # bias
+                    True,  # is_vnni
+                )
+            else:
+                logits = torch.matmul(
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                )
         else:
             # GGUF models
+            # TODO: use weight_packed_linear for GGUF models
             logits = lm_head.quant_method.apply(lm_head, hidden_states, embedding_bias)
 
         if self.logit_scale is not None:
