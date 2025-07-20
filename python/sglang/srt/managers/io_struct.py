@@ -1083,9 +1083,3 @@ class LoRAUpdateResult:
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
-
-
-@dataclass
-class ReportHealthInput:
-    status: str
-    msg: Optional[str] = ""
