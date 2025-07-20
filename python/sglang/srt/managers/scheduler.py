@@ -143,6 +143,7 @@ from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils import (
     DeepEPMode,
     DynamicGradMode,
+    ServerStatus,
     broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
@@ -154,6 +155,7 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
+    report_health,
     require_mlp_sync,
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
@@ -262,6 +264,7 @@ class Scheduler(
         )
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.page_size = server_args.page_size
         self.dp_size = server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -614,6 +617,7 @@ class Scheduler(
                         == "fa3"  # hot fix for incompatibility
                         else server_args.hicache_io_backend
                     ),
+                    hicache_storage_backend=server_args.hicache_storage_backend,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -675,6 +679,7 @@ class Scheduler(
         self.spec_num_total_forward_ct = 0
         self.cum_spec_accept_length = 0
         self.cum_spec_accept_count = 0
+        self.total_retracted_reqs = 0
         self.stats = SchedulerStats()
         if self.enable_metrics:
             engine_type = "unified"
@@ -972,7 +977,6 @@ class Scheduler(
                             self.world_group.device_group,
                             self.pp_rank * self.tp_size + dp_offset,
                             (self.pp_rank + 1) * self.tp_size + dp_offset,
-                            device=self.device,
                         )
 
                     # send out proxy tensors to the next stage
@@ -1021,7 +1025,6 @@ class Scheduler(
                     self.world_group.device_group,
                     (self.pp_rank - 1) * self.tp_size + dp_offset,
                     self.pp_rank * self.tp_size + dp_offset,
-                    device=self.device,
                 )
             else:
                 recv_reqs = None
@@ -1052,7 +1055,6 @@ class Scheduler(
                     self.attn_tp_group.rank,
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
-                    device=self.device,
                 )
             if self.tp_size != 1:
                 control_reqs = broadcast_pyobj(
@@ -1060,7 +1062,6 @@ class Scheduler(
                     self.tp_group.rank,
                     self.tp_cpu_group,
                     src=self.tp_group.ranks[0],
-                    device=self.device,
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
@@ -1069,7 +1070,6 @@ class Scheduler(
                 self.tp_group.rank,
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
-                device=self.device,
             )
         return recv_reqs
 
@@ -1257,6 +1257,15 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
+            if self.enable_hicache_storage:
+                req.init_next_round_input(self.tree_cache)
+                last_hash = req.last_host_node.get_last_hash_value()
+                matched_len = len(req.prefix_indices) + req.host_hit_length
+                if (matched_len > 0 and last_hash is not None) or matched_len == 0:
+                    new_input_tokens = req.fill_ids[matched_len:]
+                    self.tree_cache.prefetch_from_storage(
+                        req.rid, req.last_host_node, new_input_tokens, last_hash
+                    )
             self.waiting_queue.append(req)
 
     def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
@@ -1382,8 +1391,6 @@ class Scheduler(
             f += f"#running-req: {running_bs}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
 
-        f += f"timestamp: {datetime.datetime.now().isoformat()}"
-
         logger.info(f)
 
         if self.enable_metrics:
@@ -1464,7 +1471,6 @@ class Scheduler(
             f"cuda graph: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
-            f"timestamp: {datetime.datetime.now().isoformat()}"
         )
 
         logger.info(msg)
@@ -1477,6 +1483,7 @@ class Scheduler(
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.spec_accept_length = spec_accept_length
+            self.stats.total_retracted_reqs = self.total_retracted_reqs
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
@@ -1729,6 +1736,9 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
                     break
 
+            if self.enable_hicache_storage:
+                self.tree_cache.check_prefetch_progress(req.rid)
+
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
 
@@ -1824,14 +1834,17 @@ class Scheduler(
             old_ratio = self.new_token_ratio
 
             retracted_reqs, new_token_ratio = batch.retract_decode(self.server_args)
+            num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
 
             logger.info(
                 "KV cache pool is full. Retract requests. "
-                f"#retracted_reqs: {len(retracted_reqs)}, "
+                f"#retracted_reqs: {num_retracted_reqs}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
+
             self._extend_requests_to_queue(retracted_reqs, is_retracted=True)
+            self.total_retracted_reqs += num_retracted_reqs
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
@@ -2953,4 +2966,5 @@ def run_scheduler_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
+        report_health(ServerStatus.Crashed, server_args.host, ServerArgs.port)
         parent_process.send_signal(signal.SIGQUIT)
