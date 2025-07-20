@@ -58,7 +58,7 @@ pub enum PDSelectionPolicy {
     },
 }
 // Bootstrap types from PDLB
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum SingleOrBatch<T> {
     Single(T),
