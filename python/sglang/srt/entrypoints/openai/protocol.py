@@ -585,8 +585,8 @@ class ScoringRequest(BaseModel):
     apply_softmax: bool = False
     item_first: bool = False
     model: str
-    instruction: str = None
-    rerank_type: str = None
+    instruction: Optional[str] = None
+    rerank_type: Optional[str] = None
 
 
 class ScoringResponse(BaseModel):
