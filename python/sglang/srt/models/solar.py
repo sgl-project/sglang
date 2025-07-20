@@ -300,6 +300,8 @@ class SolarModel(nn.Module):
             residual = pp_proxy_tensors["residual"]
             deferred_norm = None
 
+        # Depth up-scaling mechanism: caches hidden states and residuals from intermediate layers and interpolates them with the states of later layers.
+        # `bskcn` stands for "backbone skip connection".
         bskcn_h_1 = None
         bskcn_h_2 = None
         bskcn_r_1 = None
@@ -309,21 +311,17 @@ class SolarModel(nn.Module):
         for i in range(self.start_layer, self.end_layer):
             if i in self.config.bskcn_1:
                 bskcn_h_1 = hidden_states.clone()
-                bskcn_r_1 = (
-                    residual.clone() if residual is not None else None
-                )  # Modified line
+                bskcn_r_1 = residual.clone() if residual is not None else None
             if i in self.config.bskcn_2:
                 bskcn_h_2 = hidden_states.clone()
-                bskcn_r_2 = (
-                    residual.clone() if residual is not None else None
-                )  # Modified line
+                bskcn_r_2 = residual.clone() if residual is not None else None
             if i in self.config.bskcn_3:
                 hidden_states = bskcn_h_1 * bskcn_tv + hidden_states * (1 - bskcn_tv)
-                if bskcn_r_1 is not None and residual is not None:  # Modified line
+                if bskcn_r_1 is not None and residual is not None:
                     residual = bskcn_r_1 * bskcn_tv + residual * (1 - bskcn_tv)
             if i in self.config.bskcn_4:
                 hidden_states = bskcn_h_2 * bskcn_tv + hidden_states * (1 - bskcn_tv)
-                if bskcn_r_2 is not None and residual is not None:  # Modified line
+                if bskcn_r_2 is not None and residual is not None:
                     residual = bskcn_r_2 * bskcn_tv + residual * (1 - bskcn_tv)
             layer = self.layers[i]
             hidden_states, residual = layer(
