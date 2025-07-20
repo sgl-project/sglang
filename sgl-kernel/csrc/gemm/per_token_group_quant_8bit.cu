@@ -35,6 +35,17 @@ __device__ __forceinline__ float silu(const float& val) {
   return half * (1.0f + t);
 }
 
+__device__ float2 fmul2_rn(float2 a, float2 b) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  return __fmul2_rn(a, b);
+#else
+  float2 result;
+  result.x = a.x * b.x;
+  result.y = a.y * b.y;
+  return result;
+#endif
+}
+
 // Copied and modified from DeepEP
 __forceinline__ __device__ float fast_pow2(int x) {
   // We can ensure `-126 <= x and x <= 127`
@@ -352,7 +363,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 #pragma unroll
           for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
             float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
-            float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
+            float2 outputx2 = fmul2_rn(inputx2, y_scale_repeated);
             output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
           }
         } else {
