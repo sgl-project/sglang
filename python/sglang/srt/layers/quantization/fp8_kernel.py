@@ -188,7 +188,7 @@ def _per_token_group_quant_fp8_colmajor(
     tl.store(y_s_ptr, y_s)
 
 
-def per_token_group_quant_fp8(
+def _per_token_group_quant_8bit_raw(
     x: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
@@ -294,6 +294,9 @@ def per_token_group_quant_fp8(
 
     return x_q, x_s
 
+# backward compatibility
+per_token_group_quant_fp8 = _per_token_group_quant_8bit_raw
+
 def _per_token_group_quant_8bit_fuse_silu_and_mul(
     x: torch.Tensor,
     group_size: int,
@@ -392,7 +395,7 @@ def per_token_group_quant_8bit(
             masked_m=masked_m,
         )
     else:
-        return per_token_group_quant_fp8(
+        return _per_token_group_quant_8bit_raw(
             x=x,
             group_size=group_size,
             eps=eps,
