@@ -84,7 +84,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "disable_radix_cache",
     "enable_dp_attention",
     "enable_two_batch_overlap",
-    "two_batch_token_distribution_threshold",
+    "tbo_token_distribution_threshold",
     "enable_dp_lm_head",
     "enable_deepep_moe",
     "deepep_mode",

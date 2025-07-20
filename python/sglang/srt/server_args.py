@@ -220,7 +220,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
-    two_batch_token_distribution_threshold: float = 0.48
+    tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     torchao_config: str = ""
@@ -1556,9 +1556,9 @@ class ServerArgs:
             help="Enabling two micro batches to overlap.",
         )
         parser.add_argument(
-            "--two-batch-token-distribution-threshold",
+            "--tbo-token-distribution-threshold",
             type=float,
-            default=ServerArgs.two_batch_token_distribution_threshold,
+            default=ServerArgs.tbo_token_distribution_threshold,
             help="The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap.",
         )
         parser.add_argument(

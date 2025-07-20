@@ -56,7 +56,7 @@ def compute_split_seq_index(
 ) -> Optional[int]:
     if forward_mode == ForwardMode.EXTEND:
         assert extend_lens is not None
-        return _split_array_by_half_sum(extend_lens)
+        return _split_extend_seqs(extend_lens)
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
         return (num_tokens // token_num_per_seq) // 2
@@ -67,25 +67,26 @@ def compute_split_seq_index(
         raise NotImplementedError()
 
 
-def _is_enabled_two_chunk_split(left_sum, overall_sum):
-    threshold = global_server_args_dict["two_batch_token_distribution_threshold"]
+def _is_two_chunk_split_enabled(left_sum, overall_sum):
+    threshold = global_server_args_dict["tbo_token_distribution_threshold"]
+    assert threshold <= 0.5, f"{threshold=}"
     return left_sum < overall_sum * threshold or left_sum > overall_sum * (
         1 - threshold
     )
 
 
-def _split_array_by_half_sum(arr: Sequence[int]) -> int:
+def _split_extend_seqs(arr: Sequence[int]) -> int:
     split_seq_index = _split_array_by_sequence(arr)
 
     left_sum = sum(arr[:split_seq_index])
     overall_sum = sum(arr)
-    if _is_enabled_two_chunk_split(left_sum, overall_sum):
+    if _is_two_chunk_split_enabled(left_sum, overall_sum):
         return _split_array_by_token(arr)
 
     return split_seq_index
 
 
-def _split_array_by_token(arr):
+def _split_array_by_token(arr: Sequence[int]) -> int:
     left_sum = 0
     overall_sum = sum(arr)
     half_sum = overall_sum // 2
@@ -117,6 +118,34 @@ def _split_array_by_sequence(arr: Sequence[int]) -> int:
             break
 
     return best_index
+
+
+def _modify_some_fields(
+    batch: ForwardBatch, cpu_field: str, device_field: str, sum_field: str = None
+):
+    cpu_value = getattr(batch, cpu_field, None)
+    old_device_value = getattr(batch, device_field, None)
+    if (
+        cpu_value is None
+        or old_device_value is None
+        or not (isinstance(cpu_value, torch.Tensor) or isinstance(cpu_value, list))
+    ):
+        return
+
+    new_device_value = (
+        cpu_value
+        if isinstance(cpu_value, torch.Tensor)
+        else torch.tensor(cpu_value, dtype=old_device_value.dtype)
+    ).to(device=global_server_args_dict["device"], non_blocking=True)
+    setattr(batch, device_field, new_device_value)
+
+    if sum_field is not None:
+        sum_value = (
+            cpu_value.sum().item()
+            if isinstance(cpu_value, torch.Tensor)
+            else sum(cpu_value)
+        )
+        setattr(batch, sum_field, sum_value)
 
 
 def _compute_mask_offset(seq_index: int, spec_info: Optional[EagleVerifyInput]) -> int:
@@ -214,7 +243,7 @@ def compute_split_token_index(
         assert extend_seq_lens is not None
         split_token_index = sum(extend_seq_lens[:split_seq_index])
         overall_sum = sum(extend_seq_lens)
-        if _is_enabled_two_chunk_split(split_token_index, overall_sum):
+        if _is_two_chunk_split_enabled(split_token_index, overall_sum):
             return overall_sum // 2
         return split_token_index
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
@@ -469,7 +498,7 @@ class TboForwardBatchPreparer:
         )
 
         if is_enable_two_chunk:
-            cls.filter_batch_for_two_chunk(
+            cls.derive_some_fields_for_two_chunk(
                 batch,
                 child_a=child_a,
                 child_b=child_b,
@@ -480,7 +509,7 @@ class TboForwardBatchPreparer:
         batch.tbo_children = [child_a, child_b]
 
     @classmethod
-    def filter_batch_for_two_chunk(
+    def derive_some_fields_for_two_chunk(
         cls,
         batch: ForwardBatch,
         *,
@@ -491,21 +520,22 @@ class TboForwardBatchPreparer:
         extend_seq_lens_cpu = batch.extend_seq_lens_cpu
         overall_sum = sum(extend_seq_lens_cpu)
         half_sum = overall_sum // 2
-        left_token_num = half_sum - sum(extend_seq_lens_cpu[:tbo_split_seq_index])
-        right_token_num = extend_seq_lens_cpu[tbo_split_seq_index] - left_token_num
+        left_last_seq_token_num = half_sum - sum(
+            extend_seq_lens_cpu[:tbo_split_seq_index]
+        )
+        right_first_seq_token_num = (
+            extend_seq_lens_cpu[tbo_split_seq_index] - left_last_seq_token_num
+        )
 
-        child_a.extend_seq_lens_cpu[-1] = left_token_num
-        child_b.extend_seq_lens_cpu[0] = right_token_num
-
-        child_a.extend_seq_lens = torch.tensor(
-            child_a.extend_seq_lens_cpu, dtype=batch.extend_seq_lens.dtype
-        ).to(device=global_server_args_dict["device"], non_blocking=True)
-        child_b.extend_seq_lens = torch.tensor(
-            child_b.extend_seq_lens_cpu, dtype=batch.extend_seq_lens.dtype
-        ).to(device=global_server_args_dict["device"], non_blocking=True)
-
-        child_a.extend_num_tokens = sum(child_a.extend_seq_lens_cpu)
-        child_b.extend_num_tokens = sum(child_b.extend_seq_lens_cpu)
+        child_a.extend_seq_lens_cpu[-1] = left_last_seq_token_num
+        child_b.extend_seq_lens_cpu[0] = right_first_seq_token_num
+        for child in [child_a, child_b]:
+            _modify_some_fields(
+                batch=child,
+                cpu_field="extend_seq_lens_cpu",
+                device_field="extend_seq_lens",
+                sum_field="extend_num_tokens",
+            )
 
         assert (
             child_a.extend_num_tokens == half_sum
@@ -518,15 +548,20 @@ class TboForwardBatchPreparer:
             child_a.extend_seq_lens_cpu[-1] + child_a.extend_prefix_lens_cpu[-1]
         )
         child_a.seq_lens_cpu = seq_lens_cpu
-        child_a.seq_lens = seq_lens_cpu.to(
-            device=global_server_args_dict["device"], non_blocking=True
+        _modify_some_fields(
+            batch=child_a,
+            cpu_field="seq_lens_cpu",
+            device_field="seq_lens",
+            sum_field="seq_lens_sum",
         )
-        child_a.seq_lens_sum = child_a.seq_lens_cpu.sum().item()
 
-        child_b.extend_prefix_lens_cpu[0] += left_token_num
-        child_b.extend_prefix_lens = torch.tensor(
-            child_b.extend_prefix_lens_cpu, dtype=batch.extend_prefix_lens.dtype
-        ).to(device=global_server_args_dict["device"], non_blocking=True)
+        child_b.extend_prefix_lens_cpu[0] += left_last_seq_token_num
+        _modify_some_fields(
+            batch=child_b,
+            cpu_field="extend_prefix_lens_cpu",
+            device_field="extend_prefix_lens",
+            sum_field=None,
+        )
         _, child_b.extend_start_loc = compute_position(
             global_server_args_dict["attention_backend"],
             child_b.extend_prefix_lens,
