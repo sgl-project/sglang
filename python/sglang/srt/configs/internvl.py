@@ -6,10 +6,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import sentencepiece as spm
 from transformers import (
     TOKENIZER_MAPPING,
-    Qwen2Config,
     LlamaConfig,
     PretrainedConfig,
     PreTrainedTokenizer,
+    Qwen2Config,
 )
 
 from sglang.utils import logger
