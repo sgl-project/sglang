@@ -192,7 +192,7 @@ struct MaskedLayoutScheduler {
     subwarps_per_block = SUBWARPS_PER_BLOCK;
     TORCH_CHECK(hidden_dim_num_groups % subwarps_per_block == 0);
     grid = dim3(hidden_dim_num_groups / subwarps_per_block, TOKEN_DIM_BLOCK_NUM_PER_EXPERT, num_local_experts);
-    block = dim3(subwarps_per_block * THREADS_PER_SUBWARP);
+    block = dim3(subwarps_per_block * threads_per_subwarp);
   }
 
   template <bool FUSE_SILU_AND_MUL, int GROUP_SIZE, int THREADS_PER_SUBWARP, typename FUNC>
