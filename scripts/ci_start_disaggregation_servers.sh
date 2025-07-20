@@ -87,20 +87,8 @@ while true; do
     fi
 done
 
-# Launch the router
-echo "Launching router at 127.0.0.9:8000..."
-python3 -m sglang_router.launch_router \
-  --pd-disaggregation \
-  --policy power_of_two \
-  --prefill http://127.0.0.1:30001 9001 \
-  --prefill http://127.0.0.2:30002 9002 \
-  --prefill http://127.0.0.3:30003 9003 \
-  --prefill http://127.0.0.4:30004 9004 \
-  --decode http://127.0.0.5:30005 \
-  --decode http://127.0.0.6:30006 \
-  --decode http://127.0.0.7:30007 \
-  --decode http://127.0.0.8:30008 \
-  --host 127.0.0.9 \
-  --port 8000 &
+# Don't launch router here - just keep servers running
+echo "✅ All disaggregation servers are ready and waiting for router connections"
 
-wait  # Wait for all background jobs to finish
+# Keep the script running
+wait  # Wait for all background server jobs

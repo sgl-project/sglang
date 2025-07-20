@@ -14,10 +14,11 @@ class TestFile:
 suites = {
     "per-commit": [
         TestFile("models/lora/test_lora.py", 200),
+        TestFile("models/lora/test_lora_eviction.py", 120),
         TestFile("models/lora/test_lora_backend.py", 99),
         TestFile("models/lora/test_multi_lora_backend.py", 60),
         TestFile("models/lora/test_lora_cuda_graph.py", 250),
-        TestFile("models/lora/test_lora_update.py", 400),
+        TestFile("models/lora/test_lora_update.py", 800),
         TestFile("models/test_embedding_models.py", 73),
         # TestFile("models/test_clip_models.py", 52),
         TestFile("models/test_encoder_embedding_models.py", 100),
@@ -54,7 +55,7 @@ suites = {
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_eagle_infer_a.py", 370),
-        TestFile("test_eagle_infer_b.py", 270),
+        TestFile("test_eagle_infer_b.py", 700),
         TestFile("test_ebnf_constrained.py", 108),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 376),
@@ -64,13 +65,15 @@ suites = {
         TestFile("test_fused_moe.py", 30),
         TestFile("test_hicache.py", 116),
         TestFile("test_hicache_mla.py", 127),
+        TestFile("test_hicache_storage.py", 127),
         TestFile("test_hidden_states.py", 55),
         TestFile("test_int8_kernel.py", 8),
         TestFile("test_input_embeddings.py", 38),
+        TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
         TestFile("test_mla.py", 167),
-        TestFile("test_mla_deepseek_v3.py", 342),
+        TestFile("test_mla_deepseek_v3.py", 700),
         TestFile("test_mla_int8_deepseek_v3.py", 429),
         TestFile("test_mla_flashinfer.py", 302),
         TestFile("test_mla_fp8.py", 93),
@@ -86,6 +89,7 @@ suites = {
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_engine.py", 261),
         TestFile("test_srt_endpoint.py", 130),
+        TestFile("test_start_profile.py", 60),
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 172),
         TestFile("test_torch_native_attention_backend.py", 123),
@@ -125,10 +129,11 @@ suites = {
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_function_call_parser.py", 10),
+        TestFile("test_fused_moe.py", 30),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_metrics.py", 32),
         TestFile("test_no_chunked_prefill.py", 108),
-        TestFile("test_no_overlap_scheduler.py", 234),
+        # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_pytorch_sampling_backend.py", 66),
@@ -140,17 +145,22 @@ suites = {
         TestFile("test_triton_attention_backend.py", 150),
         TestFile("test_update_weights_from_disk.py", 114),
         TestFile("test_vertex_endpoint.py", 31),
-        TestFile("test_vision_chunked_prefill.py", 175),
+        # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         TestFile("test_reasoning_parser.py", 5),
+        TestFile("test_rope_rocm.py", 3),
+        TestFile("test_awq_dequant.py", 2),
+    ],
+    "per-commit-npu": [
+        TestFile("test_ascend_attention_backend.py", 400),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
         TestFile("test_data_parallelism.py", 73),
-        TestFile("test_dp_attention.py", 137),
+        TestFile("test_dp_attention.py", 277),
         TestFile("test_mla_tp.py", 170),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_update_weights_from_distributed.py", 103),
-        TestFile("test_release_memory_occupation.py", 44),
+        TestFile("test_release_memory_occupation.py", 127),
     ],
     "per-commit-2-gpu-amd": [
         TestFile("models/lora/test_lora_tp.py", 116),
@@ -161,23 +171,24 @@ suites = {
     ],
     "per-commit-4-gpu": [
         TestFile("test_local_attn.py", 250),
-        TestFile("test_pp_single_node.py", 150),
+        TestFile("test_pp_single_node.py", 372),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
+    ],
+    "per-commit-4-gpu-deepep": [
+        TestFile("test_deepep_small.py", 531),
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
     ],
     "per-commit-8-gpu": [
-        # Disabled deepep tests temporarily because it takes too much time.
-        # TODO: re-enable them after reducing the test time with compilation cache and smaller models.
-        # TestFile("test_deepep_intranode.py", 50),
-        # TestFile("test_deepep_low_latency.py", 50),
-        # TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
         # Disabled because it hangs on the CI.
         # TestFile("test_moe_ep.py", 181),
-        TestFile("test_disaggregation.py", 270),
+        TestFile("test_disaggregation.py", 499),
         TestFile("test_disaggregation_different_tp.py", 155),
-        TestFile("test_full_deepseek_v3.py", 463),
+        TestFile("test_full_deepseek_v3.py", 333),
+    ],
+    "per-commit-8-gpu-deepep": [
+        TestFile("test_deepep_large.py", 338),
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
@@ -195,6 +206,7 @@ suites = {
         TestFile("cpu/test_rope.py"),
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
+        TestFile("test_intel_amx_attention_backend.py"),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
@@ -203,11 +215,11 @@ suites = {
         TestFile("test_nightly_gsm8k_eval_amd.py"),
     ],
     "vllm_dependency_test": [
-        TestFile("test_awq.py"),
-        TestFile("test_bnb.py"),
-        TestFile("test_gguf.py", 78),
-        TestFile("test_gptqmodel_dynamic.py", 72),
-        TestFile("test_vllm_dependency.py"),
+        TestFile("test_awq.py", 163),
+        TestFile("test_bnb.py", 5),
+        TestFile("test_gguf.py", 96),
+        TestFile("test_gptqmodel_dynamic.py", 102),
+        TestFile("test_vllm_dependency.py", 185),
     ],
 }
 

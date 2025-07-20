@@ -144,13 +144,13 @@ struct NaiveScheduler {
       FUNC fn) {
     constexpr int expert_idx = 0;
 
-    const int subwarp_id = threadIdx.x / THREADS_PER_SUBWARP;
+    const int64_t subwarp_id = threadIdx.x / THREADS_PER_SUBWARP;
     const int lane_id = threadIdx.x % THREADS_PER_SUBWARP;
 
-    const int block_group_id = blockIdx.x * subwarps_per_block;
-    const int group_id = block_group_id + subwarp_id;
+    const int64_t block_group_id = blockIdx.x * subwarps_per_block;
+    const int64_t group_id = block_group_id + subwarp_id;
 
-    int input_group_start_offset;
+    int64_t input_group_start_offset;
     if constexpr (!FUSE_SILU_AND_MUL) {
       input_group_start_offset = group_id * group_size;
     }
@@ -195,20 +195,20 @@ struct MaskedLayoutScheduler {
       const int32_t* masked_m,
       const int num_tokens_per_expert,
       FUNC fn) {
-    const int subwarp_id = threadIdx.x / THREADS_PER_SUBWARP;
+    const int64_t subwarp_id = threadIdx.x / THREADS_PER_SUBWARP;
     const int lane_id = threadIdx.x % THREADS_PER_SUBWARP;
 
     const int expert_idx = blockIdx.z;
     const int token_idx_start = blockIdx.y;
 
-    const int hidden_dim_group_idx = blockIdx.x * SUBWARPS_PER_BLOCK + subwarp_id;
+    const int64_t hidden_dim_group_idx = blockIdx.x * SUBWARPS_PER_BLOCK + subwarp_id;
 
     const int curr_expert_token_num = masked_m[expert_idx];
 
     for (int token_idx = token_idx_start; token_idx < curr_expert_token_num;
          token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
       const int hidden_size = hidden_dim_num_groups * group_size;
-      const int input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
+      const int64_t input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
           expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, group_size);
       fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
     }
