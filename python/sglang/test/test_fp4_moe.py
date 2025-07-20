@@ -159,12 +159,10 @@ def test_cutlass_fp4_moe_no_graph(
 
     score = torch.randn((m, e), device="cuda", dtype=dtype)
 
-    topk_weights, topk_ids = select_experts(
+    topk_weights, topk_ids, _ = select_experts(
         hidden_states=a,
         router_logits=score,
         top_k=topk,
-        use_grouped_topk=False,
-        renormalize=False,
     )
 
     a1_gs = torch.ones((e,), device="cuda", dtype=torch.float32)
