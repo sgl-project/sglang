@@ -10,7 +10,6 @@ payload = {
     "model": "Qwen/Qwen3-Reranker-0.6B",
     "query": "what is panda?",
     "items": [
-        # "hi",
         "The giant panda (Ailuropoda melanoleuca), sometimes called a panda bear or simply panda, is a bear species endemic to China."
     ],
     "instruction": "Given a web search query, retrieve relevant passages that answer the query",
@@ -23,4 +22,3 @@ response_json = response.json()
 
 for item in response_json:
     print(item, response_json[item])
-    # print(f"Score: {item['score']:.2f} - Document: '{item['document']}'")
