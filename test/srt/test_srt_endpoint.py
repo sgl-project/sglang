@@ -364,7 +364,7 @@ class TestSRTEndpoint(CustomTestCase):
             )
 
     def run_stateful_custom_logit_processor(
-        self, first_token_id: int | None, delay: int = 2
+        self, first_token_id: Optional[int] = None, delay: int = 2
     ):
         """Test custom logit processor with custom params and state.
 
