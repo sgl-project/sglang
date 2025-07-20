@@ -65,6 +65,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    ServerStatus,
     assert_pkg_version,
     configure_logger,
     get_zmq_socket,
@@ -73,6 +74,7 @@ from sglang.srt.utils import (
     launch_dummy_health_check_server,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
+    report_health,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
@@ -654,13 +656,14 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda:
         assert_pkg_version(
             "sgl-kernel",
-            "0.2.5",
+            "0.2.6",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
     def sigchld_handler(signum, frame):
         pid, exitcode = os.waitpid(0, os.WNOHANG)
         if exitcode != 0:
+            report_health(ServerStatus.Crashed, server_args.host, server_args.port)
             logger.warning(
                 f"Child process unexpectedly failed with {exitcode=}. {pid=}"
             )
@@ -674,6 +677,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         logger.error(
             "Received sigquit from a child process. It usually means the child failed."
         )
+        report_health(ServerStatus.Crashed, server_args.host, server_args.port)
         kill_process_tree(os.getpid())
 
     signal.signal(signal.SIGQUIT, sigquit_handler)
