@@ -228,7 +228,7 @@ def benchmark(
     fn, kernel_names = {
         "triton": (
             triton_per_token_group_quant_8bit,
-            "_per_token_group_quant_fp8|_silu_and_mul_post_quant_kernel",
+            "_per_token_group_quant_8bit|_silu_and_mul_post_quant_kernel",
         ),
         "sglang": (
             sglang_per_token_group_quant_8bit,
