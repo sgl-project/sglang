@@ -431,6 +431,7 @@ void sgl_per_token_group_quant_8bit(
 
 #define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                                               \
   do {                                                                                                        \
+    constexpr int THREADS_PER_SUBWARP = GROUP_SIZE / 16;                  \
     TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));                  \
                                                                                                               \
     using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                              \
