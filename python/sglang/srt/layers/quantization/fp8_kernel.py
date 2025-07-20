@@ -307,8 +307,6 @@ def per_token_group_quant_8bit(
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    from sglang.srt.layers.quantization.int8_kernel import per_token_group_quant_int8
-
     if fuse_silu_and_mul:
         # Another way to implement (can be used in e.g. comparison tests)
         # from sgl_kernel import silu_and_mul
