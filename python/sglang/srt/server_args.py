@@ -18,6 +18,7 @@ import dataclasses
 import json
 import logging
 import os
+import socket
 import random
 import tempfile
 from token import OP
@@ -25,6 +26,7 @@ from typing import List, Literal, Optional, Union
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.reasoning_parser import ReasoningParser
+from sglang.srt.connector import ConnectorType
 from sglang.srt.utils import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -37,6 +39,7 @@ from sglang.srt.utils import (
     is_remote_url,
     is_valid_ipv6_address,
     nullable_str,
+    parse_connector_type,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,6 +49,9 @@ logger = logging.getLogger(__name__)
 class ServerArgs:
     # Model and tokenizer
     model_path: str
+    model_config_path: Optional[str] = None
+    seed_instance_url: Optional[str] = None
+    client_instance_id: Optional[str] = None
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
@@ -284,6 +290,15 @@ class ServerArgs:
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
+        
+        if self.model_config_path is None:
+            self.model_config_path = self.tokenizer_path
+
+        if self.seed_instance_url is None:
+            self.seed_instance_url = ""
+
+        if self.client_instance_id is None:
+            self.client_instance_id = socket.gethostbyname(socket.gethostname())
 
         if self.device is None:
             self.device = get_device()
@@ -542,7 +557,7 @@ class ServerArgs:
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
 
-        if is_remote_url(self.model_path):
+        if is_remote_url(self.model_path) and parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
             self.load_format = "remote"
 
         # AMD-specific Triton attention KV splits default number
@@ -594,6 +609,24 @@ class ServerArgs:
             required=True,
         )
         parser.add_argument(
+            "--model-config-path",
+            type=str,
+            default=ServerArgs.model_config_path,
+            help="The path of the model config.",
+        )
+        parser.add_argument(
+            "--seed-instance-url",
+            type=str,
+            default=ServerArgs.seed_instance_url,
+            help="The url of the seed instance for loading weights from remote instance.",
+        )
+        parser.add_argument(
+            "--client-instance-id",
+            type=str,
+            default=ServerArgs.client_instance_id,
+            help="The id of the client instance for loading weights from remote instance.",
+        )
+        parser.add_argument(
             "--tokenizer-path",
             type=str,
             default=ServerArgs.tokenizer_path,
@@ -628,6 +661,7 @@ class ServerArgs:
                 "bitsandbytes",
                 "layered",
                 "remote",
+                "remote_instance",
             ],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
