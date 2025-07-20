@@ -10,7 +10,9 @@ template <int THREADS_PER_SUBWARP>
 __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   unsigned mask = 0xffff;
 
-  static_assert((THREADS_PER_SUBWARP == 16) or (THREADS_PER_SUBWARP == 8) or (THREADS_PER_SUBWARP == 4) or (THREADS_PER_SUBWARP == 2) or (THREADS_PER_SUBWARP == 1));
+  static_assert((THREADS_PER_SUBWARP & (THREADS_PER_SUBWARP - 1)) == 0 &&
+                THREADS_PER_SUBWARP <= 16 && THREADS_PER_SUBWARP >= 1,
+                "THREADS_PER_SUBWARP must be 1, 2, 4, 8, or 16");
 
   if constexpr (THREADS_PER_SUBWARP >= 16) {
     val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
