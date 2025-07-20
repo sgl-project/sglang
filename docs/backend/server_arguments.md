@@ -51,7 +51,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 
 Please consult the documentation below and [server_args.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py) to learn more about the arguments you may provide when launching a server.
 
-## Model, processor and tokenizer
+## Model and tokenizer
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
@@ -61,20 +61,30 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--skip-tokenizer-init` | If set, skip init tokenizer and pass input_ids in generate request. | False |
 | `--load-format` | The format of the model weights to load. 'auto' will try to load the weights in the safetensors format and fall back to the pytorch bin format if safetensors format is not available. 'pt' will load the weights in the pytorch bin format. 'safetensors' will load the weights in the safetensors format. 'npcache' will load the weights in pytorch format and store a numpy cache to speed up the loading. 'dummy' will initialize the weights with random values, which is mainly for profiling. 'gguf' will load the weights in the gguf format. 'bitsandbytes' will load the weights using bitsandbytes quantization. 'layered' loads weights layer by layer so that one can quantize a layer before loading another to make the peak memory envelope smaller. | auto |
 | `--trust-remote-code` | Whether or not to allow for custom models defined on the Hub in their own modeling files. | False |
-| `--dtype` | Data type for model weights and activations. 'auto' will use FP16 precision for FP32 and FP16 models, and BF16 precision for BF16 models. 'half' for FP16. Recommended for AWQ quantization. 'float16' is the same as 'half'. 'bfloat16' for a balance between precision and range. 'float' is shorthand for FP32 precision. 'float32' for FP32 precision. | auto |
-| `--kv-cache-dtype` | Data type for kv cache storage. 'auto' will use model data type. 'fp8_e5m2' and 'fp8_e4m3' is supported for CUDA 11.8+. | auto |
-| `--quantization` | The quantization method. | None |
-| `--quantization-param-path` | Path to the JSON file containing the KV cache scaling factors. This should generally be supplied, when KV cache dtype is FP8. Otherwise, KV cache scaling factors default to 1.0, which may cause accuracy issues. | None |
 | `--context-length` | The model's maximum context length. Defaults to None (will use the value from the model's config.json instead). | None |
-| `--device` | The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified. | None |
-| `--served-model-name` | Override the model name returned by the v1/models endpoint in OpenAI API server. | None |
-| `--chat-template` | The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server. | None |
-| `--completion-template` | The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently. | None |
 | `--is-embedding` | Whether to use a CausalLM as an embedding model. | False |
 | `--enable-multimodal` | Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen. | None |
 | `--revision` | The specific model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version. | None |
-| `--impl` | Which implementation of the model to use. 'auto' will try to use the SGLang implementation if it exists and fall back to the Transformers implementation if no SGLang implementation is available. 'sglang' will use the SGLang model implementation. 'transformers' will use the Transformers model implementation. | auto |
+| `--model-impl` | Which implementation of the model to use. 'auto' will try to use the SGLang implementation if it exists and fall back to the Transformers implementation if no SGLang implementation is available. 'sglang' will use the SGLang model implementation. 'transformers' will use the Transformers model implementation. | auto |
 
+## HTTP server
+
+| Arguments | Description | Defaults |
+|-----------|-------------|----------|
+| `--host` | The host address for the server. | 127.0.0.1 |
+| `--port` | The port number for the server. | 30000 |
+| `--skip-server-warmup` | If set, skip the server warmup process. | False |
+| `--warmups` | Warmup configurations. | None |
+| `--nccl-port` | The port for NCCL initialization. | None |
+
+## Quantization and data type
+
+| Arguments | Description | Defaults |
+|-----------|-------------|----------|
+| `--dtype` | Data type for model weights and activations. 'auto' will use FP16 precision for FP32 and FP16 models, and BF16 precision for BF16 models. 'half' for FP16. Recommended for AWQ quantization. 'float16' is the same as 'half'. 'bfloat16' for a balance between precision and range. 'float' is shorthand for FP32 precision. 'float32' for FP32 precision. | auto |
+| `--quantization` | The quantization method. | None |
+| `--quantization-param-path` | Path to the JSON file containing the KV cache scaling factors. This should generally be supplied, when KV cache dtype is FP8. Otherwise, KV cache scaling factors default to 1.0, which may cause accuracy issues. | None |
+| `--kv-cache-dtype` | Data type for kv cache storage. 'auto' will use model data type. 'fp8_e5m2' and 'fp8_e4m3' is supported for CUDA 11.8+. | auto |
 
 ## Memory and scheduling
 
@@ -90,13 +100,13 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--cpu-offload-gb` | How many GBs of RAM to reserve for CPU offloading. | 0 |
 | `--page-size` | The number of tokens in a page. | 1 |
 
-
-## Other runtime options
+## Runtime options
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
-| `--tensor-parallel-size` or `--tp-size` | The tensor parallelism size. | 1 |
-| `--pipeline-parallel-size` or `--pp-size` | The pipeline parallelism size. | 1 |
+| `--device` | The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified. | None |
+| `--tp-size` | The tensor parallelism size. | 1 |
+| `--pp-size` | The pipeline parallelism size. | 1 |
 | `--max-micro-batch-size` | The maximum micro batch size in pipeline parallelism. | None |
 | `--stream-interval` | The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher. | 1 |
 | `--stream-output` | Whether to output as a sequence of disjoint segments. | False |
@@ -132,20 +142,22 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--api-key` | Set API key of the server. It is also used in the OpenAI API compatible server. | None |
+| `--served-model-name` | Override the model name returned by the v1/models endpoint in OpenAI API server. | None |
+| `--chat-template` | The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server. | None |
+| `--completion-template` | The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently. | None |
 | `--file-storage-path` | The path of the file storage in backend. | sglang_storage |
 | `--enable-cache-report` | Return number of cached tokens in usage.prompt_tokens_details for each openai request. | False |
 | `--reasoning-parser` | Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}. | None |
 | `--tool-call-parser` | Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', and 'kimi_k2'. | None |
 
-##  Data parallelism
+## Data parallelism
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
-| `--data-parallel-size` or `--dp-size` | The data parallelism size. | 1 |
+| `--dp-size` | The data parallelism size. | 1 |
 | `--load-balance-method` | The load balancing strategy for data parallelism. | round_robin |
 
-
-##  Multi-node distributed serving
+## Multi-node distributed serving
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
@@ -153,7 +165,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--nnodes` | The number of nodes. | 1 |
 | `--node-rank` | The node rank. | 0 |
 
-##  Model override args
+## Model override args in JSON
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
@@ -164,11 +176,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
+| `--enable-lora` | Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility. | False |
+| `--max-lora-rank` | The maximum LoRA rank that should be supported. If not specified, it will be automatically inferred from the adapters provided in `--lora-paths`. This argument is needed when you expect to dynamically load adapters of larger LoRA rank after server startup. | None |
+| `--lora-target-modules` | The union set of all target modules where LoRA should be applied (e.g., `q_proj`, `k_proj`, `gate_proj`). If not specified, it will be automatically inferred from the adapters provided in `--lora-paths`. This argument is needed when you expect to dynamically load adapters of different target modules after server startup. You can also set it to `all` to enable LoRA for all supported modules. However, enabling LoRA on additional modules introduces a minor performance overhead. If your application is performance-sensitive, we recommend only specifying the modules for which you plan to load adapters. | None |
 | `--lora-paths` | The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}. | None |
 | `--max-loras-per-batch` | Maximum number of adapters for a running batch, include base-only request. | 8 |
 | `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | triton |
-| `--max-lora-rank` | The maximum LoRA rank that should be supported. If not specified, it will be automatically inferred from the adapters provided in `--lora-paths`. This argument is needed when you expect to dynamically load adapters of larger LoRA rank after server startup. | None |
-| `--lora-target-modules` | The union set of all target modules where LoRA should be applied (e.g., `q_proj`, `k_proj`, `gate_proj`). If not specified, it will be automatically inferred from the adapters provided in `--lora-paths`. This argument is needed when you expect to dynamically load adapters of different target modules after server startup. | None |
 
 ## Kernel backend
 
@@ -179,7 +192,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--grammar-backend` | Choose the backend for grammar-guided decoding. | None |
 | `--mm-attention-backend` | Set multimodal attention backend. | None |
 
-##  Speculative decoding
+## Speculative decoding
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
@@ -192,13 +205,14 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-accept-threshold-acc` | The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc). | 1.0 |
 | `--speculative-token-map` | The path of the draft model's small vocab table. | None |
 
-##  Expert parallelism
+## Expert parallelism
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
-| `--expert-parallel-size` or `--ep-size` | The expert parallelism size. | 1 |
+| `--ep-size` | The expert parallelism size. | 1 |
 | `--enable-ep-moe` | Enabling expert parallelism for moe. The ep size is equal to the tp size. | False |
 | `--enable-deepep-moe` | Enabling DeepEP MoE implementation for EP MoE. | False |
+| `--enable-flashinfer-moe` | Enabling Flashinfer MoE implementation. | False |
 | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | auto |
 | `--ep-num-redundant-experts` | Allocate this number of redundant experts in expert parallel. | 0 |
 | `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in expert parallel. | None |
@@ -213,7 +227,18 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--deepep-config` | Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path. | None |
 | `--moe-dense-tp-size` | TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports. | None |
 
-##  Optimization/debug options
+## Hierarchical cache
+
+| Arguments | Description | Defaults |
+|-----------|-------------|----------|
+| `--enable-hierarchical-cache` | Enable hierarchical cache. | False |
+| `--hicache-ratio` | The ratio of the size of host KV cache memory pool to the size of device pool. | 2.0 |
+| `--hicache-size` | The size of the hierarchical cache. | 0 |
+| `--hicache-write-policy` | The write policy for hierarchical cache. | write_through_selective |
+| `--hicache-io-backend` | The IO backend for hierarchical cache. |  |
+| `--hicache-storage-backend` | The storage backend for hierarchical cache. | None |
+
+## Optimization/debug options
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
@@ -229,7 +254,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disable-custom-all-reduce` | Disable the custom all-reduce kernel and fall back to NCCL. | False |
 | `--enable-mscclpp` | Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL. | False |
 | `--disable-overlap-schedule` | Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker. | False |
-| `--disable-overlap-cg-plan` | Disable the overlap optimization for cudagraph preparation in eagle verify. | False |
 | `--enable-mixed-chunk` | Enabling mixing prefill and decode in a batch when using chunked prefill. | False |
 | `--enable-dp-attention` | Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported. | False |
 | `--enable-dp-lm-head` | Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention. | False |
@@ -246,24 +270,43 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-memory-saver` | Allow saving memory using release_memory_occupation and resume_memory_occupation. | False |
 | `--allow-auto-truncate` | Allow automatically truncating requests that exceed the maximum input length instead of returning an error. | False |
 | `--enable-custom-logit-processor` | Enable users to pass custom logit processors to the server (disabled by default for security). | False |
-| `--enable-hierarchical-cache` | Enable hierarchical cache. | False |
-| `--hicache-ratio` | The ratio of the size of host KV cache memory pool to the size of device pool. | 2.0 |
-| `--hicache-size` | The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set. | 0 |
-| `--hicache-write-policy` | The write policy of hierarchical cache. | write_through_selective |
-| `--flashinfer-mla-disable-ragged` | Not using ragged prefill wrapper when running flashinfer mla. | False |
-| `--disable-shared-experts-fusion` | Disable shared experts fusion optimization for deepseek v3/r1. | False |
-| `--disable-chunked-prefix-cache` | Disable chunked prefix cache feature for deepseek, which should save overhead for short sequences. | False |
-| `--disable-fast-image-processor` | Adopt base image processor instead of fast image processor. | False |
-| `--enable-return-hidden-states` | Enable returning hidden states with responses. | False |
-| `--warmups` | Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests. | None |
+| `--flashinfer-mla-disable-ragged` | Disable ragged processing in Flashinfer MLA. | False |
+| `--disable-shared-experts-fusion` | Disable shared experts fusion. | False |
+| `--disable-chunked-prefix-cache` | Disable chunked prefix cache. | False |
+| `--disable-fast-image-processor` | Disable fast image processor. | False |
+| `--enable-return-hidden-states` | Enable returning hidden states. | False |
+| `--enable-triton-kernel-moe` | Enable Triton kernel for MoE. | False |
 
-## Prefill decode disaggregation
+## Debug tensor dumps
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
-| `--disaggregation-mode` | Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated. | null |
-| `--disaggregation-transfer-backend` | The backend for disaggregation transfer. Default is mooncake. | mooncake |
-| `--disaggregation-bootstrap-port` | Bootstrap server port on the prefill server. Default is 8998. | 8998 |
-| `--disaggregation-ib-device` | The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when mooncake backend is enabled. | None |
-| `--num-reserved-decode-tokens` | Number of decode tokens that will have memory reserved when adding new request to the running batch. | 512 |
-| `--pdlb-url` | The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer. | None |
+| `--debug-tensor-dump-output-folder` | The output folder for debug tensor dumps. | None |
+| `--debug-tensor-dump-input-file` | The input file for debug tensor dumps. | None |
+| `--debug-tensor-dump-inject` | Enable injection of debug tensor dumps. | False |
+| `--debug-tensor-dump-prefill-only` | Enable prefill-only mode for debug tensor dumps. | False |
+
+## PD disaggregation
+
+| Arguments | Description | Defaults |
+|-----------|-------------|----------|
+| `--disaggregation-mode` | PD disaggregation mode: "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only). | null |
+| `--disaggregation-transfer-backend` | The transfer backend for PD disaggregation. | mooncake |
+| `--disaggregation-bootstrap-port` | The bootstrap port for PD disaggregation. | 8998 |
+| `--disaggregation-decode-tp` | The decode TP for PD disaggregation. | None |
+| `--disaggregation-decode-dp` | The decode DP for PD disaggregation. | None |
+| `--disaggregation-prefill-pp` | The prefill PP for PD disaggregation. | 1 |
+
+## Model weight update
+
+| Arguments | Description | Defaults |
+|-----------|-------------|----------|
+| `--custom-weight-loader` | Custom weight loader paths. | None |
+| `--weight-loader-disable-mmap` | Disable mmap for weight loader. | False |
+
+## PD-Multiplexing
+
+| Arguments | Description | Defaults |
+|-----------|-------------|----------|
+| `--enable-pdmux` | Enable PD-Multiplexing. | False |
+| `--sm-group-num` | Number of SM groups for PD-Multiplexing. | 3 |
