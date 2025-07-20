@@ -450,12 +450,21 @@ void sgl_per_token_group_quant_8bit(
     }                                                                                             \
   } while (0)
 
+#define LAUNCH_KERNEL_OUTER(...) \
+    switch (group_size) { \
+        case 16: LAUNCH_KERNEL(16, __VA_ARGS__); break; \
+        case 32: LAUNCH_KERNEL(32, __VA_ARGS__); break; \
+        case 64: LAUNCH_KERNEL(64, __VA_ARGS__); break; \
+        case 128: LAUNCH_KERNEL(128, __VA_ARGS__); break; \
+        default: TORCH_CHECK(false, "Unsupported group_size"); \
+    } while (0)
+
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), scalar_t, [&] {
     if (dst_type == at::ScalarType::Char) {
-      LAUNCH_KERNEL(scalar_t, int8_t);
+      LAUNCH_KERNEL_OUTER(scalar_t, int8_t);
       return true;
     } else if (dst_type == at::ScalarType::Float8_e4m3fn) {
-      LAUNCH_KERNEL(scalar_t, c10::Float8_e4m3fn);
+      LAUNCH_KERNEL_OUTER(scalar_t, c10::Float8_e4m3fn);
       return true;
     }
     return false;
