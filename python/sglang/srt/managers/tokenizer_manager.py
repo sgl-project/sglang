@@ -1710,15 +1710,7 @@ class TokenizerManager:
         suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
         def format_instruction(instruction, query, doc):
-            output = (
-                prefix
-                + " "
-                + "<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {doc}".format(
-                    instruction=instruction, query=query, doc=doc
-                )
-                + " "
-                + suffix
-            )
+            output = f"{prefix} <Instruct>: {instruction}\n<Query>: {query}\n<Document>: {doc} {suffix}"
             return output
 
         pairs = [format_instruction(instruction, query, doc) for doc in documents]
@@ -1748,7 +1740,7 @@ class TokenizerManager:
                     raise ValueError(
                         f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})"
                     )
-                    
+
         # Handle string or tokenized query/items
         if isinstance(query, str) and (
             isinstance(items, str)
