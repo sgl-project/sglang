@@ -1701,7 +1701,7 @@ class TokenizerManager:
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
 
-    def _qwen3_rerank_customize_instruction(self, instruction, query, documents):
+    def _qwen3_rerank_customize_instruction(self, instruction: Optional[str], query: str, documents: List[str]) -> List[str]:
         if instruction is None:
             instruction = "Given a web search query, retrieve relevant passages that answer the query"
 
