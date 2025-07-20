@@ -52,20 +52,21 @@ class ModelConfig:
         trust_remote_code: bool = True,
         revision: Optional[str] = None,
         context_length: Optional[int] = None,
-        model_override_args: Optional[str] = None,
+        model_override_args: str = "{}",
         is_embedding: Optional[bool] = None,
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
-        impl: Union[str, ModelImpl] = ModelImpl.AUTO,
+        hybrid_kvcache_ratio: Optional[float] = None,
+        model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
     ) -> None:
 
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
-        self.impl = impl
+        self.model_impl = model_impl
 
         # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
@@ -270,7 +271,8 @@ class ModelConfig:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
-            impl=server_args.impl,
+            hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
+            model_impl=server_args.model_impl,
             **kwargs,
         )
 
@@ -365,6 +367,7 @@ class ModelConfig:
             "compressed-tensors",
             "fbgemm_fp8",
             "w8a8_fp8",
+            "petit_nvfp4",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -381,9 +384,12 @@ class ModelConfig:
             "w8a8_fp8",
             "moe_wna16",
             "qoq",
+            "w4afp8",
+            "petit_nvfp4",
         ]
         compatible_quantization_methods = {
             "modelopt_fp4": ["modelopt"],
+            "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
