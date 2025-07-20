@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -9,8 +8,6 @@ from sglang.srt.two_batch_overlap import compute_split_seq_index
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST,
-    DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -107,7 +104,7 @@ class TestTwoBatchOverlapUnitTest(unittest.TestCase):
 class TestQwen3TwoBatchOverlap(TestTwoBatchOverlap):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST
+        cls.model = "Qwen/Qwen3-30B-A3B"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-1234"
         cls.process = popen_launch_server(
