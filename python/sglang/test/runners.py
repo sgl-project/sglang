@@ -481,7 +481,7 @@ class SRTRunner:
         torch_dtype: torch.dtype,
         model_type: str,
         tp_size: int = 1,
-        impl: str = "auto",
+        model_impl: str = "auto",
         port: int = DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
         lora_paths: List[str] = None,
         max_loras_per_batch: int = 4,
@@ -507,6 +507,7 @@ class SRTRunner:
         sleep_on_idle=False,
         max_lora_rank: Optional[int] = None,
         lora_target_modules: Optional[List[str]] = None,
+        enable_lora: Optional[bool] = None,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -525,7 +526,7 @@ class SRTRunner:
             tp_size=tp_size,
             dtype=get_dtype_str(torch_dtype),
             port=port,
-            impl=impl,
+            model_impl=model_impl,
             torchao_config=torchao_config,
             mem_fraction_static=mem_fraction_static,
             trust_remote_code=trust_remote_code,
@@ -547,6 +548,7 @@ class SRTRunner:
             sleep_on_idle=sleep_on_idle,
             max_lora_rank=max_lora_rank,
             lora_target_modules=lora_target_modules,
+            enable_lora=enable_lora,
             **spec_kwargs,
         )
 

@@ -143,6 +143,7 @@ from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils import (
     DeepEPMode,
     DynamicGradMode,
+    ServerStatus,
     broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
@@ -154,6 +155,7 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
+    report_health,
     require_mlp_sync,
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
@@ -1389,8 +1391,6 @@ class Scheduler(
             f += f"#running-req: {running_bs}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
 
-        f += f"timestamp: {datetime.datetime.now().isoformat()}"
-
         logger.info(f)
 
         if self.enable_metrics:
@@ -1471,7 +1471,6 @@ class Scheduler(
             f"cuda graph: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
-            f"timestamp: {datetime.datetime.now().isoformat()}"
         )
 
         logger.info(msg)
@@ -2967,4 +2966,5 @@ def run_scheduler_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
+        report_health(ServerStatus.Crashed, server_args.host, ServerArgs.port)
         parent_process.send_signal(signal.SIGQUIT)
