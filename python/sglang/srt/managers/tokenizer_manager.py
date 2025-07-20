@@ -121,6 +121,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_process_tree,
 )
+QWEN3_RERANK_TYPE = "qwen3-rerank"
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -1757,7 +1758,7 @@ class TokenizerManager:
             items_list = [items] if isinstance(items, str) else items
             if item_first:
                 prompts = [f"{item}{query}" for item in items_list]
-            elif rerank_type == "qwen3-rerank":
+            elif rerank_type == QWEN3_RERANK_TYPE:
                 prompts = self._qwen3_rerank_customize_instruction(
                     instruction, query, items_list
                 )
