@@ -186,7 +186,7 @@ class LlavaBaseForCausalLM(nn.Module):
                 bs = forward_batch.batch_size
                 pixel_values = flatten_nested_list(
                     [
-                        [item.pixel_values for item in image_inputs[i].mm_items]
+                        [item.feature for item in image_inputs[i].mm_items]
                         for i in range(bs)
                         if need_vision[i]
                     ]
@@ -753,7 +753,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         features = []
         for item in items:
             # in each item, we assume pixel_values is always batched
-            pixel_values, image_sizes = item.pixel_values, item.image_sizes
+            pixel_values, image_sizes = item.feature, item.image_sizes
             image_outputs = self.vision_tower(
                 pixel_values, image_sizes, output_hidden_states=True
             )
