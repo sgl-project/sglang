@@ -105,3 +105,18 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
 
 def get_architecture_class_name(model_config: ModelConfig) -> str:
     return get_model_architecture(model_config)[1]
+
+
+def check_gguf_version(version: str) -> None:
+    """Checks if the installed gguf version is sufficient."""
+    MIN_GGUF_VERSION = "0.10.0"
+
+    installed_version_str = getattr(version, "__version__")
+
+    if installed_version_str < MIN_GGUF_VERSION:
+        raise ImportError(
+            f"Installed gguf version {installed_version_str} is insufficient. "
+            f"SGLang requires gguf>={MIN_GGUF_VERSION}. "
+            f"Please upgrade gguf via `pip install --upgrade gguf`."
+            "You may see the following link to be useful: https://github.com/huggingface/transformers/blob/b6d65e40b256d98d9621707762b94bc8ad83b7a7/src/transformers/modeling_gguf_pytorch_utils.py#L286"
+        )
