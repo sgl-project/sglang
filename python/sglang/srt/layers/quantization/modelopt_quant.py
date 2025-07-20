@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.nn.parameter import Parameter
@@ -32,7 +32,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.topk import TopK, TopKOutput
 
 if is_cuda():
     from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
@@ -727,24 +727,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     weight_dtype = torch.uint8
     weight_scale_dtype = torch.float8_e4m3fn
 
-    def __new__(cls, *args, **kwargs):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
-
-        if not hasattr(cls, "_initialized"):
-            original_init = cls.__init__
-            new_cls = type(
-                cls.__name__,
-                (FusedMoEMethodBase,),
-                {
-                    "__init__": original_init,
-                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
-                },
-            )
-            obj = super(new_cls, new_cls).__new__(new_cls)
-            obj.__init__(*args, **kwargs)
-            return obj
-        return super().__new__(cls)
-
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
         if not is_sm100_supported():
@@ -1178,7 +1160,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        topk_output: TopKOutput,
+        topk_output: Union[TopKOutput, Tuple[TopK, torch.Tensor]],
         *,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
@@ -1194,19 +1176,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         assert activation == "silu", "Only SiLU activation is supported."
 
         if ENABLE_TRTLMM_GEN_MOE:
+            topk, router_logits = topk_output
+
             assert (
                 self.enable_flashinfer_moe
             ), "must enable flashinfer moe for POC convenience"
-            assert use_grouped_topk, "must be true for deepseek_v3"
-            assert correction_bias is not None, "must appear for deepseek_v3"
-            assert topk_group is not None, "must appear for deepseek_v3"
-            assert routed_scaling_factor is not None, "must appear for deepseek_v3"
-            assert num_expert_group is not None, "must appear for deepseek_v3"
+            assert topk.use_grouped_topk, "must be true for deepseek_v3"
+            assert topk.correction_bias is not None, "must appear for deepseek_v3"
+            assert topk.topk_group is not None, "must appear for deepseek_v3"
+            assert topk.routed_scaling_factor is not None, "must appear for deepseek_v3"
+            assert topk.num_expert_group is not None, "must appear for deepseek_v3"
             assert not apply_router_weight_on_input, "unsupported"
-            assert custom_routing_function is None, "unsupported"
+            assert topk.custom_routing_function is None, "unsupported"
             assert (
-                num_fused_shared_experts is None or num_fused_shared_experts == 0
+                topk.num_fused_shared_experts is None
+                or topk.num_fused_shared_experts == 0
             ), "unsupported"
+
             do_finalize = True
             scale_factor_use_ue8m0 = False
             is_scale_factor_swizzled = False  # use linear layout here
@@ -1228,7 +1214,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # NOTE: router out_dtype should be float32!
                 # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc1/tensorrt_llm/_torch/models/modeling_deepseekv3.py#L378
                 router_logits.to(torch.float32),
-                correction_bias,
+                topk.correction_bias,
                 hidden_states_fp4,
                 hidden_states_scale_linear_fp4.view(torch.float8_e4m3fn),
                 layer.w13_weight,
@@ -1239,35 +1225,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer.g1_alphas.data,
                 layer.g2_alphas.data,
                 layer.local_num_experts * ep_size,
-                top_k,
-                num_expert_group,
-                topk_group,
+                topk.top_k,
+                topk.num_expert_group,
+                topk.topk_group,
                 layer.intermediate_size_per_partition,
                 layer.local_num_experts
                 * ep_rank,  # self.slot_start # local_expert_start;  use ep_rank if stride!=1
                 layer.local_num_experts,  # local_expert_size
-                routed_scaling_factor,
+                topk.routed_scaling_factor,
                 tile_tokens_dim,
                 RoutingMethodType.DeepSeekV3,
                 do_finalize=do_finalize,
             )
             return outputs[0]
-
-        from sglang.srt.layers.moe.topk import select_experts
-
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
 
         if self.enable_flashinfer_moe:
             assert (

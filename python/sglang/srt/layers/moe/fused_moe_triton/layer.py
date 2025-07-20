@@ -25,29 +25,13 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cpu,
     is_hip,
-    set_weight_attrs,
-    use_intel_amx_backend,
 )
-
-has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
-
-if torch.cuda.is_available():
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-
-    if has_triton_kernels:
-        from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-            triton_kernel_moe_forward,
-        )
-else:
-    fused_experts = None  # type: ignore
-
-import logging
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
-TRTLMM_GEN_MOE_EP_SIZE = get_int_env_var("SGLANG_TRTLLM_GEN_MOE_EP_SIZE", "0")
+TRTLLM_GEN_MOE_EP_SIZE = get_int_env_var("SGLANG_TRTLLM_GEN_MOE_EP_SIZE", 0)
 
 logger = logging.getLogger(__name__)
 
@@ -127,8 +111,8 @@ class FusedMoE(torch.nn.Module):
                 self.enable_flashinfer_moe
             ), "FusedMoE only supports EP with --enable-flashinfer-moe"
             etp_ep_size = self.tp_size
-            if TRTLMM_GEN_MOE_EP_SIZE > 0:
-                etp_ep_size = TRTLMM_GEN_MOE_EP_SIZE
+            if TRTLLM_GEN_MOE_EP_SIZE > 0:
+                etp_ep_size = TRTLLM_GEN_MOE_EP_SIZE
             self.ep_size = etp_ep_size
             self.ep_rank = self.tp_rank % etp_ep_size
             self.tp_size = self.tp_size // etp_ep_size
