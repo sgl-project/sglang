@@ -90,7 +90,9 @@ class TestLaunchRouter(unittest.TestCase):
 
     def test_launch_router_with_empty_worker_urls(self):
         args = self.create_router_args(worker_urls=[])
-        self.run_router_process(args)  # Expected error
+        self.run_router_process(
+            args
+        )  # Should start successfully with empty worker list
 
     def test_launch_router_with_service_discovery(self):
         # Test router startup with service discovery enabled but no selectors
@@ -278,6 +280,25 @@ class TestLaunchRouter(unittest.TestCase):
         )
         self.assertEqual(router_args.prefill_selector, {})
         self.assertEqual(router_args.decode_selector, {})
+
+    def test_empty_worker_urls_args_parsing(self):
+        """Test that router accepts no worker URLs and defaults to empty list."""
+        import argparse
+
+        from sglang_router.launch_router import RouterArgs
+
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+
+        # Test with no --worker-urls argument at all
+        args = parser.parse_args(["--policy", "random", "--port", "30000"])
+        router_args = RouterArgs.from_cli_args(args)
+        self.assertEqual(router_args.worker_urls, [])
+
+        # Test with explicit empty --worker-urls
+        args = parser.parse_args(["--worker-urls", "--policy", "random"])
+        router_args = RouterArgs.from_cli_args(args)
+        self.assertEqual(router_args.worker_urls, [])
 
 
 if __name__ == "__main__":
