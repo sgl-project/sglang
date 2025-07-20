@@ -1156,45 +1156,7 @@ Returns:
 Raises:
     AssertionError: If input is not 2D or if static scale's numel != 1
 """
-if _is_cuda:
-
-    def scaled_fp8_quant(
-        input: torch.Tensor,
-        scale: Optional[torch.Tensor] = None,
-        num_token_padding: Optional[int] = None,
-        use_per_token_if_dynamic: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-
-        assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
-        shape = input.shape
-        if num_token_padding:
-            shape = (max(num_token_padding, input.shape[0]), shape[1])
-        output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
-
-        if scale is None:
-            # Dynamic scaling
-            if use_per_token_if_dynamic:
-                scale = torch.empty(
-                    (shape[0], 1), device=input.device, dtype=torch.float32
-                )
-                sgl_per_token_quant_fp8(input, output, scale)
-            else:
-                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-                sgl_per_tensor_quant_fp8(
-                    input, output, scale, is_static=False
-                )  # False for dynamic
-        else:
-            # Static scaling
-            assert (
-                scale.numel() == 1
-            ), f"Expected scalar scale, got numel={scale.numel()}"
-            sgl_per_tensor_quant_fp8(
-                input, output, scale, is_static=True
-            )  # True for static
-
-        return output, scale
-
-elif _is_hip:
+if _is_hip:
 
     def scaled_fp8_quant(
         input: torch.Tensor,
@@ -1235,6 +1197,44 @@ elif _is_hip:
                 static_per_tensor_quant(output, input, scale)
             else:
                 torch.ops._C.static_scaled_fp8_quant(output, input, scale)
+
+        return output, scale
+
+else:
+
+    def scaled_fp8_quant(
+        input: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        num_token_padding: Optional[int] = None,
+        use_per_token_if_dynamic: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
+        shape = input.shape
+        if num_token_padding:
+            shape = (max(num_token_padding, input.shape[0]), shape[1])
+        output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
+
+        if scale is None:
+            # Dynamic scaling
+            if use_per_token_if_dynamic:
+                scale = torch.empty(
+                    (shape[0], 1), device=input.device, dtype=torch.float32
+                )
+                sgl_per_token_quant_fp8(input, output, scale)
+            else:
+                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+                sgl_per_tensor_quant_fp8(
+                    input, output, scale, is_static=False
+                )  # False for dynamic
+        else:
+            # Static scaling
+            assert (
+                scale.numel() == 1
+            ), f"Expected scalar scale, got numel={scale.numel()}"
+            sgl_per_tensor_quant_fp8(
+                input, output, scale, is_static=True
+            )  # True for static
 
         return output, scale
 
