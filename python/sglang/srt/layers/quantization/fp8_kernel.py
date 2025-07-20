@@ -95,7 +95,7 @@ if supports_custom_op():
 
 
 @triton.jit
-def _per_token_group_quant_fp8(
+def _per_token_group_quant_8bit(
     # Pointers to inputs and output
     y_ptr,
     y_q_ptr,
@@ -138,7 +138,7 @@ def _per_token_group_quant_fp8(
 
 
 @triton.jit
-def _per_token_group_quant_fp8_colmajor(
+def _per_token_group_quant_8bit_colmajor(
     # Pointers to inputs and output
     y_ptr,
     y_q_ptr,
@@ -248,7 +248,7 @@ def _per_token_group_quant_8bit_raw(
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1
     if column_major_scales:
-        _per_token_group_quant_fp8_colmajor[(M,)](
+        _per_token_group_quant_8bit_colmajor[(M,)](
             x,
             x_q,
             x_s,
@@ -265,7 +265,7 @@ def _per_token_group_quant_8bit_raw(
         )
     else:
         assert not scale_ue8m0
-        _per_token_group_quant_fp8[(M,)](
+        _per_token_group_quant_8bit[(M,)](
             x,
             x_q,
             x_s,
