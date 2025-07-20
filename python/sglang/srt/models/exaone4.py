@@ -44,7 +44,10 @@ logger = logging.getLogger(__name__)
 # Aligned with HF's implementation, using sliding window inclusive with the last token
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
-    return config.sliding_window - 1
+    if getattr(config, "sliding_window", None) is not None:
+        return config.sliding_window - 1
+    else:
+        return None
 
 
 class Exaone4GatedMLP(nn.Module):
@@ -158,7 +161,7 @@ class Exaone4Attention(nn.Module):
         if quant_config is not None and quant_config.get_name() == "gguf":
             is_neox_style = False
 
-        interleaved_sliding_window = getattr(config, "sliding_window", 4096) - 1
+        interleaved_sliding_window = get_attention_sliding_window_size(config)
         self.sliding_window_pattern = getattr(config, "sliding_window_pattern", None)
 
         self.is_sliding = False
