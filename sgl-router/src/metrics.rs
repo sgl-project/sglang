@@ -132,7 +132,7 @@ pub fn start_prometheus(config: PrometheusConfig) {
     // Initialize metric descriptions
     init_metrics();
 
-    let duration_matcher = Matcher::Suffix(String::from("duration"));
+    let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
     let duration_bucket = [
         0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
         60.0, 90.0, 120.0, 180.0, 240.0,
