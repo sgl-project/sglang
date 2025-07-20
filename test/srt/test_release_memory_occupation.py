@@ -34,7 +34,11 @@ import torch
 from transformers import AutoModelForCausalLM
 
 import sglang as sgl
-from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.constants import (
+    GPU_MEMORY_TYPE_CUDA_GRAPH,
+    GPU_MEMORY_TYPE_KV_CACHE,
+    GPU_MEMORY_TYPE_WEIGHTS,
+)
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
@@ -52,6 +56,8 @@ def get_gpu_memory_gb():
 class TestReleaseMemoryOccupation(CustomTestCase):
     def _setup_engine(self, model_name, mem_fraction_static=0.8, tp_size=1):
         """Common setup for engine and HF model."""
+
+        os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "1"
         engine = sgl.Engine(
             model_path=model_name,
             random_seed=42,
@@ -155,6 +161,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
                 continue
 
             print(f"Testing tp_size={tp_size} for test_multi_stage_release_and_resume")
+            os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "1"
             engine = sgl.Engine(
                 model_path=model_name,
                 random_seed=42,
@@ -172,17 +179,17 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             )
 
             t = time.perf_counter()
-            gpu_memory_usage_before_release_kv_cache = get_gpu_memory_gb()
+            gpu_memory_usage_before_release = get_gpu_memory_gb()
             engine.release_memory_occupation(tags=[GPU_MEMORY_TYPE_KV_CACHE])
 
             gpu_memory_usage_after_release_kv_cache = get_gpu_memory_gb()
 
             self.assertLess(
                 gpu_memory_usage_after_release_kv_cache,
-                gpu_memory_usage_before_release_kv_cache,
+                gpu_memory_usage_before_release,
             )
-            engine.release_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
+            engine.release_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
             gpu_memory_usage_after_release_weights = get_gpu_memory_gb()
 
             self.assertLess(
@@ -190,32 +197,48 @@ class TestReleaseMemoryOccupation(CustomTestCase):
                 gpu_memory_usage_after_release_kv_cache,
             )
 
+            engine.release_memory_occupation(tags=[GPU_MEMORY_TYPE_CUDA_GRAPH])
+            gpu_memory_usage_after_release_cuda_graph = get_gpu_memory_gb()
+
+            self.assertLess(
+                gpu_memory_usage_after_release_cuda_graph,
+                gpu_memory_usage_after_release_weights,
+            )
+
             print(f"Release took {time.perf_counter() - t:.2f}s")
             print(
-                f"Memory: {gpu_memory_usage_before_release_kv_cache:.1f} → {gpu_memory_usage_after_release_kv_cache:.1f} → {gpu_memory_usage_after_release_weights:.1f} GB"
+                f"Memory: {gpu_memory_usage_before_release:.1f} → {gpu_memory_usage_after_release_kv_cache:.1f} → {gpu_memory_usage_after_release_weights:.1f} → {gpu_memory_usage_after_release_cuda_graph:.1f} GB"
             )
 
             if _DEBUG_EXTRA:
                 time.sleep(3)
 
             t = time.perf_counter()
-            gpu_memory_usage_before_resume_weights = get_gpu_memory_gb()
+            gpu_memory_usage_before_resume = get_gpu_memory_gb()
 
-            # gpu_memory_usage_after_release_weights and gpu_memory_usage_before_resume_weights should be close
+            # gpu_memory_usage_after_release_weights and gpu_memory_usage_before_resume should be close
 
             self.assertAlmostEqual(
                 gpu_memory_usage_after_release_weights,
-                gpu_memory_usage_before_resume_weights,
+                gpu_memory_usage_before_resume,
                 delta=3.0,
             )
             print(f"Resume weights took {time.perf_counter() - t:.2f}s")
+
+            engine.resume_memory_occupation(tags=[GPU_MEMORY_TYPE_CUDA_GRAPH])
+            gpu_memory_usage_after_resume_cuda_graph = get_gpu_memory_gb()
+
+            self.assertGreater(
+                gpu_memory_usage_after_resume_cuda_graph,
+                gpu_memory_usage_before_resume,
+            )
 
             engine.resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
             gpu_memory_usage_after_resume_weights = get_gpu_memory_gb()
 
             self.assertGreater(
                 gpu_memory_usage_after_resume_weights,
-                gpu_memory_usage_before_resume_weights,
+                gpu_memory_usage_after_resume_cuda_graph,
             )
 
             # Update weights from a trained model to serving engine, and then destroy the trained model
@@ -240,7 +263,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
 
             print(f"Resume + update took {time.perf_counter() - t:.2f}s")
             print(
-                f"Memory: {gpu_memory_usage_before_resume_weights:.1f} → {gpu_memory_usage_after_resume_weights:.1f} → {gpu_memory_usage_after_loaded_hf_model:.1f} → {gpu_memory_usage_after_resume_kv_cache:.1f} GB"
+                f"Memory: {gpu_memory_usage_before_resume:.1f} → {gpu_memory_usage_after_resume_cuda_graph:.1f} → {gpu_memory_usage_after_resume_weights:.1f} → {gpu_memory_usage_after_loaded_hf_model:.1f} → {gpu_memory_usage_after_resume_kv_cache:.1f} GB"
             )
 
             print("generate (#2)")
