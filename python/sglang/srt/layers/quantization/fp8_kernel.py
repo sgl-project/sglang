@@ -294,6 +294,81 @@ def per_token_group_quant_fp8(
 
     return x_q, x_s
 
+def _per_token_group_quant_8bit_fuse_silu_and_mul(
+    x: torch.Tensor,
+    group_size: int,
+    dst_dtype: torch.dtype,
+    column_major_scales: bool,
+    scale_tma_aligned: bool,
+    scale_ue8m0: bool,
+    masked_m: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Another way to implement (can be used in e.g. comparison tests)
+    # from sgl_kernel import silu_and_mul
+    # x_after_silu_and_mul = silu_and_mul(x)
+    # return per_token_group_quant_fp8(
+    #     x_after_silu_and_mul,
+    #     group_size=group_size,
+    #     eps=eps,
+    #     column_major_scales=column_major_scales,
+    #     scale_tma_aligned=scale_tma_aligned,
+    #     scale_ue8m0=scale_ue8m0,
+    # )
+
+    from deep_gemm.utils.layout import transform_sf_into_required_layout
+
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        silu_and_mul_masked_post_quant_fwd,
+    )
+
+    assert column_major_scales
+    assert scale_tma_aligned
+    assert scale_ue8m0
+
+    needs_unsqueeze = x.dim() == 2
+    if needs_unsqueeze:
+        num_tokens, _ = x.shape
+        x = x.unsqueeze(0)
+        assert masked_m is None
+        masked_m = torch.tensor([num_tokens], device=x.device, dtype=torch.int32)
+
+    # NOTE use `zeros` for easier testing
+    output = torch.zeros(
+        (*x.shape[:-1], x.shape[-1] // 2),
+        device=x.device,
+        dtype=dst_dtype,
+    )
+    # NOTE use `zeros` for easier testing
+    output_scale_for_kernel = torch.zeros(
+        (*x.shape[:-1], x.shape[-1] // 2 // group_size),
+        device=x.device,
+        dtype=torch.float32,
+    )
+    silu_and_mul_masked_post_quant_fwd(
+        input=x,
+        output=output,
+        output_scale=output_scale_for_kernel,
+        quant_group_size=group_size,
+        masked_m=masked_m,
+        scale_ue8m0=scale_ue8m0,
+    )
+
+    assert group_size == 128
+    output_scale = transform_sf_into_required_layout(
+        output_scale_for_kernel,
+        num_groups=output.shape[0],
+        mn=output.shape[-2],
+        k=output.shape[-1],
+        recipe=(1, group_size, group_size),
+        is_sfa=True,
+    )
+
+    if needs_unsqueeze:
+        output = output.squeeze(0)
+        output_scale = output_scale.squeeze(0)
+
+    return output, output_scale
+
 
 # TODO maybe unify int8 and fp8 code later
 def per_token_group_quant_8bit(
@@ -308,81 +383,25 @@ def per_token_group_quant_8bit(
     masked_m: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if fuse_silu_and_mul:
-        # Another way to implement (can be used in e.g. comparison tests)
-        # from sgl_kernel import silu_and_mul
-        # x_after_silu_and_mul = silu_and_mul(x)
-        # return per_token_group_quant_fp8(
-        #     x_after_silu_and_mul,
-        #     group_size=group_size,
-        #     eps=eps,
-        #     column_major_scales=column_major_scales,
-        #     scale_tma_aligned=scale_tma_aligned,
-        #     scale_ue8m0=scale_ue8m0,
-        # )
-
-        from deep_gemm.utils.layout import transform_sf_into_required_layout
-
-        from sglang.srt.layers.moe.ep_moe.kernels import (
-            silu_and_mul_masked_post_quant_fwd,
+        return _per_token_group_quant_8bit_fuse_silu_and_mul(
+            x=x,
+            group_size=group_size,
+            dst_dtype=dst_dtype,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=scale_ue8m0,
+            masked_m=masked_m,
         )
-
-        assert column_major_scales
-        assert scale_tma_aligned
-        assert scale_ue8m0
-
-        needs_unsqueeze = x.dim() == 2
-        if needs_unsqueeze:
-            num_tokens, _ = x.shape
-            x = x.unsqueeze(0)
-            assert masked_m is None
-            masked_m = torch.tensor([num_tokens], device=x.device, dtype=torch.int32)
-
-        # NOTE use `zeros` for easier testing
-        output = torch.zeros(
-            (*x.shape[:-1], x.shape[-1] // 2),
-            device=x.device,
+    else:
+        return per_token_group_quant_fp8(
+            x=x,
+            group_size=group_size,
+            eps=eps,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=scale_ue8m0,
             dtype=dst_dtype,
         )
-        # NOTE use `zeros` for easier testing
-        output_scale_for_kernel = torch.zeros(
-            (*x.shape[:-1], x.shape[-1] // 2 // group_size),
-            device=x.device,
-            dtype=torch.float32,
-        )
-        silu_and_mul_masked_post_quant_fwd(
-            input=x,
-            output=output,
-            output_scale=output_scale_for_kernel,
-            quant_group_size=group_size,
-            masked_m=masked_m,
-            scale_ue8m0=scale_ue8m0,
-        )
-
-        assert group_size == 128
-        output_scale = transform_sf_into_required_layout(
-            output_scale_for_kernel,
-            num_groups=output.shape[0],
-            mn=output.shape[-2],
-            k=output.shape[-1],
-            recipe=(1, group_size, group_size),
-            is_sfa=True,
-        )
-
-        if needs_unsqueeze:
-            output = output.squeeze(0)
-            output_scale = output_scale.squeeze(0)
-
-        return output, output_scale
-
-    return per_token_group_quant_fp8(
-        x=x,
-        group_size=group_size,
-        eps=eps,
-        column_major_scales=column_major_scales,
-        scale_tma_aligned=scale_tma_aligned,
-        scale_ue8m0=scale_ue8m0,
-        dtype=dst_dtype,
-    )
 
 
 def create_per_token_group_quant_fp8_output_scale(
