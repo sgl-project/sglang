@@ -31,6 +31,7 @@ class Phi4MMProcessorAdapter(ProcessorMixin):
         for hf_key, sglang_key in key_mapping.items():
             if hf_key in result:
                 result[sglang_key] = result[hf_key]
+                del result[hf_key]
 
         # Filter out None or empty tensors from the result.
         # This prevents the sglang function base_processor.collect_mm_items_from_processor_output()
