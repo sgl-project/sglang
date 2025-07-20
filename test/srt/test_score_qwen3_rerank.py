@@ -14,7 +14,7 @@ payload = {
     ],
     "instruction": "Given a web search query, retrieve relevant passages that answer the query",
     "rerank_type": "qwen3-rerank",
-    "label_token_ids": [9693, 2152],
+    "label_token_ids": [9693, 2152],  # Corresponds to "yes" and "no" tokens
 }
 
 response = requests.post(url, json=payload)
