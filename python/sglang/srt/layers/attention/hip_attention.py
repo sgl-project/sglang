@@ -79,7 +79,17 @@ class HiPAttentionBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         assert self.page_size == 1
 
-        self.forward_paged_hip = PagedHiPStateful()
+        self.forward_paged_hip = PagedHiPStateful(
+            max_batch_size=32,
+            num_layers=model_runner.model_config.num_hidden_layers,
+            num_heads=model_runner.model_config.num_attention_heads // model_runner.tp_size,
+            head_dim=(
+                model_runner.model_config.head_dim 
+                if not hasattr(model_runner.model_config, "v_head_dim") else 
+                model_runner.model_config.v_head_dim
+            ),
+            device=model_runner.device,
+        )
 
         self.hip_config: HiPAttentionConfig = (
             model_runner.server_args.hip_attention_config
