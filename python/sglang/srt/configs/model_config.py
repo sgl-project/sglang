@@ -64,12 +64,18 @@ class ModelConfig:
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
+        seed_instance_ip: Optional[str] = None,
+        seed_instance_service_port: Optional[int] = None,
+        send_weights_group_ports: Optional[List[int]] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
         self.model_impl = model_impl
+        self.seed_instance_ip = seed_instance_ip
+        self.seed_instance_service_port = seed_instance_service_port
+        self.send_weights_group_ports = send_weights_group_ports
 
         self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
@@ -315,6 +321,9 @@ class ModelConfig:
             quantization=server_args.quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
+            seed_instance_ip=server_args.seed_instance_ip,
+            seed_instance_service_port=server_args.seed_instance_service_port,
+            send_weights_group_ports=server_args.send_weights_group_ports,
             **kwargs,
         )
 
