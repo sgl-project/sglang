@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
 class TestTwoBatchOverlap(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.model = "lmsys/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
