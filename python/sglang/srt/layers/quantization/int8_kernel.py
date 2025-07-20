@@ -81,7 +81,7 @@ def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
         return x_q, scales
 
 
-# TODO remove
+# TODO remove and use the unified one in fp8_kernel.py
 @triton.jit
 def _per_token_group_quant_int8(
     # Pointers to inputs and output
@@ -124,7 +124,7 @@ def _per_token_group_quant_int8(
     tl.store(y_s_ptr, y_s)
 
 
-# TODO remove
+# TODO remove and use the unified one in fp8_kernel.py
 def per_token_group_quant_int8(
     x: torch.Tensor,
     group_size: int,
