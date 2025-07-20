@@ -34,6 +34,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8EPMoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     scaled_fp8_quant,
+    sglang_per_token_group_quant_8bit,
     sglang_per_token_group_quant_fp8,
     sglang_per_token_quant_fp8,
 )
