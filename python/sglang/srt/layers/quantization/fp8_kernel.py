@@ -40,21 +40,6 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-if _is_hip:
-    if _use_aiter:
-        try:
-            from aiter import (  # v0.1.3
-                dynamic_per_tensor_quant,
-                dynamic_per_token_scaled_quant,
-                static_per_tensor_quant,
-            )
-        except ImportError:
-            raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
-    else:
-        try:
-            import vllm._C
-        except ImportError:
-            raise ImportError("vllm is required when SGLANG_USE_AITER is set to False")
 
 if _is_cuda:
     from sgl_kernel import (
