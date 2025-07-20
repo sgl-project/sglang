@@ -332,13 +332,13 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
         assert masked_m is None
         masked_m = torch.tensor([num_tokens], device=x.device, dtype=torch.int32)
 
-    # NOTE use `zeros` for easier testing
+    # Use `zeros` for easier testing
     output = torch.zeros(
         (*x.shape[:-1], x.shape[-1] // 2),
         device=x.device,
         dtype=dst_dtype,
     )
-    # NOTE use `zeros` for easier testing
+    # Use `zeros` for easier testing
     output_scale_for_kernel = torch.zeros(
         (*x.shape[:-1], x.shape[-1] // 2 // group_size),
         device=x.device,
@@ -370,7 +370,6 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
     return output, output_scale
 
 
-# TODO maybe unify int8 and fp8 code later
 def per_token_group_quant_8bit(
     x: torch.Tensor,
     group_size: int,
