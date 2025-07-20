@@ -318,8 +318,6 @@ def fused_moe_kernel_gptq_awq(
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-
 
 @triton.jit
 def fused_moe_kernel(
