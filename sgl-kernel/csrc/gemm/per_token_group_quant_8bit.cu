@@ -10,9 +10,9 @@ template <int THREADS_PER_SUBWARP>
 __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   unsigned mask = 0xffff;
 
-  static_assert((THREADS_PER_SUBWARP & (THREADS_PER_SUBWARP - 1)) == 0 &&
-                THREADS_PER_SUBWARP <= 16 && THREADS_PER_SUBWARP >= 1,
-                "THREADS_PER_SUBWARP must be 1, 2, 4, 8, or 16");
+  static_assert(
+      (THREADS_PER_SUBWARP & (THREADS_PER_SUBWARP - 1)) == 0 && THREADS_PER_SUBWARP <= 16 && THREADS_PER_SUBWARP >= 1,
+      "THREADS_PER_SUBWARP must be 1, 2, 4, 8, or 16");
 
   if constexpr (THREADS_PER_SUBWARP >= 16) {
     val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
@@ -431,7 +431,7 @@ void sgl_per_token_group_quant_8bit(
 
 #define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                                               \
   do {                                                                                                        \
-    constexpr int THREADS_PER_SUBWARP = GROUP_SIZE / 16;                  \
+    constexpr int THREADS_PER_SUBWARP = GROUP_SIZE / 16;                                                      \
     TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));                  \
                                                                                                               \
     using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                              \
