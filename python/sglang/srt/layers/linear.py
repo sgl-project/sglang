@@ -756,7 +756,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         bias: bool = True,
         skip_bias_add: bool = False,
         params_dtype: Optional[torch.dtype] = None,
-        quant_config: Optional["QuantizationConfig"] = None,
+        quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
