@@ -93,22 +93,6 @@ time_infos = {}
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
 
-class ServerStatus(Enum):
-    Up = "Up"
-    Starting = "Starting"
-    UnHealthy = "UnHealthy"
-    Crashed = "Crashed"
-
-    def is_healthy(self) -> bool:
-        return self == ServerStatus.Up
-
-
-def report_health(status: ServerStatus, host: str, http_port: int, msg: str = ""):
-    requests.post(
-        f"http://{host}:{http_port}/health", json={"status": status.value, "msg": msg}
-    )
-
-
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 def is_hip() -> bool:
     return torch.version.hip is not None

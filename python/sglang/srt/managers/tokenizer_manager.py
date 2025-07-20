@@ -116,7 +116,6 @@ from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    ServerStatus,
     dataclass_to_string_truncated,
     get_bool_env_var,
     get_zmq_socket,
@@ -174,9 +173,6 @@ class TokenizerManager:
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
-        # Server Status
-        self.server_status = ServerStatus.Starting
-
         # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
@@ -255,6 +251,7 @@ class TokenizerManager:
         # Store states
         self.no_create_loop = False
         self.rid_to_state: Dict[str, ReqState] = {}
+        self.health_check_failed = False
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
         self.dump_requests_folder = ""  # By default do not dump
@@ -1335,7 +1332,7 @@ class TokenizerManager:
         while True:
             remain_num_req = len(self.rid_to_state)
 
-            if not self.server_status.is_healthy():
+            if self.health_check_failed:
                 # if health check failed, we should exit immediately
                 logger.error(
                     "Signal SIGTERM received while health check failed. Exiting... remaining number of requests: %d",
