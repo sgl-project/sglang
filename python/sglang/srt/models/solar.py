@@ -174,12 +174,12 @@ class SolarDecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
 
-        if rope_scaling is not None:
-            rope_scaling = rope_scaling.copy()
-            if getattr(config, "original_max_position_embeddings", None):
-                rope_scaling["original_max_position_embeddings"] = (
-                    config.original_max_position_embeddings
-                )
+        if rope_scaling is not None and getattr(
+            config, "original_max_position_embeddings", None
+        ):
+            rope_scaling["original_max_position_embeddings"] = (
+                config.original_max_position_embeddings
+            )
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
         attention_bias = getattr(config, "attention_bias", False) or getattr(
@@ -293,17 +293,17 @@ class SolarModel(nn.Module):
             else:
                 hidden_states = self.get_input_embeddings(input_ids)
             residual = None
-            bskcn_h_1, bskcn_h_2, bskcn_r_1, bskcn_r_2 = None, None, None, None
         else:
             assert pp_proxy_tensors is not None
 
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-            bskcn_h_1 = pp_proxy_tensors.tensors.get("bskcn_h_1")
-            bskcn_h_2 = pp_proxy_tensors.tensors.get("bskcn_h_2")
-            bskcn_r_1 = pp_proxy_tensors.tensors.get("bskcn_r_1")
-            bskcn_r_2 = pp_proxy_tensors.tensors.get("bskcn_r_2")
+            deferred_norm = None
 
+        bskcn_h_1 = None
+        bskcn_h_2 = None
+        bskcn_r_1 = None
+        bskcn_r_2 = None
         bskcn_tv = self.config.bskcn_tv[0] if self.training else self.config.bskcn_tv[1]
 
         for i in range(self.start_layer, self.end_layer):
@@ -314,17 +314,9 @@ class SolarModel(nn.Module):
                 bskcn_h_2 = hidden_states.clone()
                 bskcn_r_2 = residual.clone()
             if i in self.config.bskcn_3:
-                if bskcn_h_1 is None or bskcn_r_1 is None:
-                    raise RuntimeError(
-                        f"bskcn_h_1 or bskcn_r_1 is None at layer {i}, indicating missing skip connection data from previous PP stage."
-                    )
                 hidden_states = bskcn_h_1 * bskcn_tv + hidden_states * (1 - bskcn_tv)
                 residual = bskcn_r_1 * bskcn_tv + residual * (1 - bskcn_tv)
             if i in self.config.bskcn_4:
-                if bskcn_h_2 is None or bskcn_r_2 is None:
-                    raise RuntimeError(
-                        f"bskcn_h_2 or bskcn_r_2 is None at layer {i}, indicating missing skip connection data from previous PP stage."
-                    )
                 hidden_states = bskcn_h_2 * bskcn_tv + hidden_states * (1 - bskcn_tv)
                 residual = bskcn_r_2 * bskcn_tv + residual * (1 - bskcn_tv)
             layer = self.layers[i]
@@ -336,16 +328,9 @@ class SolarModel(nn.Module):
             )
 
         if not self.pp_group().is_last_rank:
-            proxy_tensors = {"hidden_states": hidden_states, "residual": residual}
-            if bskcn_h_1 is not None:
-                proxy_tensors["bskcn_h_1"] = bskcn_h_1
-            if bskcn_h_2 is not None:
-                proxy_tensors["bskcn_h_2"] = bskcn_h_2
-            if bskcn_r_1 is not None:
-                proxy_tensors["bskcn_r_1"] = bskcn_r_1
-            if bskcn_r_2 is not None:
-                proxy_tensors["bskcn_r_2"] = bskcn_r_2
-            return PPProxyTensors(proxy_tensors)
+            return PPProxyTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -457,8 +442,6 @@ class SolarForCausalLM(nn.Module):
             logits = self.logits_processor(self.lm_head, hidden_states, forward_batch)
             return logits
 
-        # If not the last rank, hidden_states will be a PPProxyTensors object
-        # which is handled by the model's forward method for PP communication.
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
