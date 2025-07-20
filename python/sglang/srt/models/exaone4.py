@@ -1,18 +1,18 @@
 import logging
 from collections.abc import Iterable
-from typing import Any, Optional, Union, Tuple, List
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import Exaone4Config
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     get_local_attention_dp_size,
 )
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -31,11 +31,21 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader, maybe_remap_kv_scale_name
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+# Aligned with HF's implementation, using sliding window inclusive with the last token
+# SGLang assumes exclusive
+def get_attention_sliding_window_size(config):
+    return config.sliding_window - 1
+
 
 class Exaone4GatedMLP(nn.Module):
     def __init__(
@@ -53,26 +63,29 @@ class Exaone4GatedMLP(nn.Module):
             [intermediate_size] * 2,
             bias=bias,
             quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj",prefix),
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=bias,
             quant_config=quant_config,
-            prefix=add_prefix("down_proj",prefix),
+            prefix=add_prefix("down_proj", prefix),
         )
-        if hidden_act != 'silu':
-            raise ValueError(f"Unsupported activation: {hidden_act}. "
-                             "Only silu is supported for now.")
+        if hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. "
+                "Only silu is supported for now."
+            )
         self.act_fn = SiluAndMul()
-    
+
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
-    
+
+
 class Exaone4Attention(nn.Module):
     def __init__(
         self,
@@ -94,10 +107,10 @@ class Exaone4Attention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
-        
+
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
-        
+
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -111,7 +124,7 @@ class Exaone4Attention(nn.Module):
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        
+
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -126,7 +139,7 @@ class Exaone4Attention(nn.Module):
             total_num_kv_heads=self.total_num_kv_heads,
             bias=bias,
             quant_config=quant_config,
-            prefix=add_prefix("qkv_proj",prefix),
+            prefix=add_prefix("qkv_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
         )
@@ -145,7 +158,7 @@ class Exaone4Attention(nn.Module):
         if quant_config is not None and quant_config.get_name() == "gguf":
             is_neox_style = False
 
-        interleaved_sliding_window = getattr(config, "interleaved_sliding_window", 4096)
+        interleaved_sliding_window = getattr(config, "sliding_window", 4096) - 1
         self.sliding_window_pattern = getattr(config, "sliding_window_pattern", None)
 
         self.is_sliding = False
@@ -173,10 +186,9 @@ class Exaone4Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
-        
+
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        
 
     def forward(
         self,
@@ -197,13 +209,14 @@ class Exaone4Attention(nn.Module):
         k = k.reshape(-1, self.head_dim)
         k = self.k_norm(k)
         k = k.reshape(k_shape)
-        
+
         if not self.sliding_window_pattern or self.is_sliding:
             q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
-    
+
+
 class Exaone4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -214,7 +227,7 @@ class Exaone4DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        
+
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(
@@ -223,32 +236,33 @@ class Exaone4DecoderLayer(nn.Module):
             rope_scaling["original_max_position_embeddings"] = (
                 config.original_max_position_embeddings
             )
-        
+
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        
+
         self.local_dp_size = get_local_attention_dp_size()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
-        
+
         self.self_attn = Exaone4Attention(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            num_kv_heads=getattr(config, "num_key_value_heads",
-                                 config.num_key_value_heads),
+            num_kv_heads=getattr(
+                config, "num_key_value_heads", config.num_key_value_heads
+            ),
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix)
+            prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = Exaone4GatedMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix)
+            prefix=add_prefix("mlp", prefix),
         )
         self.post_attention_layernorm = RMSNorm(
             self.hidden_size, eps=config.rms_norm_eps
@@ -256,7 +270,7 @@ class Exaone4DecoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(
             self.hidden_size, eps=config.rms_norm_eps
         )
-        
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -264,17 +278,17 @@ class Exaone4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        
+
         if residual is None:
             residual = hidden_states
-        
+
         # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        
+
         # Use post-LN
         hidden_states = self.post_attention_layernorm(hidden_states)
         orig_dtype = hidden_states.dtype
@@ -282,10 +296,10 @@ class Exaone4DecoderLayer(nn.Module):
         hidden_states = hidden_states + residual.to(torch.float32)
         hidden_states = hidden_states.to(orig_dtype)
         residual = hidden_states
-        
+
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
-        
+
         # Use post-LN
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         orig_dtype = hidden_states.dtype
@@ -293,15 +307,17 @@ class Exaone4DecoderLayer(nn.Module):
         hidden_states = hidden_states + residual.to(torch.float32)
         hidden_states = hidden_states.to(orig_dtype)
         residual = hidden_states
-        
+
         return hidden_states, residual
+
 
 class Exaone4Model(nn.Module):
     def __init__(
-        self, 
+        self,
         config,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""):
+        prefix: str = "",
+    ):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
@@ -316,7 +332,7 @@ class Exaone4Model(nn.Module):
             )
         else:
             self.embed_tokens = PPMissingLayer()
-        
+
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Exaone4DecoderLayer(
@@ -327,16 +343,16 @@ class Exaone4Model(nn.Module):
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
-            prefix=add_prefix("layers", prefix)
+            prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
-        
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
-    
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -355,7 +371,7 @@ class Exaone4Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-        
+
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
@@ -374,68 +390,8 @@ class Exaone4Model(nn.Module):
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
-    
-    # def load_weights(self, weights: Iterable[tuple[str,
-    #                                                torch.Tensor]]) -> set[str]:
-    #     stacked_params_mapping = [
-    #         # (param_name, shard_name, shard_id)
-    #         ("qkv_proj", "q_proj", "q"),
-    #         ("qkv_proj", "k_proj", "k"),
-    #         ("qkv_proj", "v_proj", "v"),
-    #         ("gate_up_proj", "gate_proj", 0),
-    #         ("gate_up_proj", "up_proj", 1),
-    #     ]
-    #     params_dict = dict(self.named_parameters())
-    #     loaded_params: set[str] = set()
-    #     for name, loaded_weight in weights:
-    #         if "rotary_emb.inv_freq" in name:
-    #             continue
-    #         if ("rotary_emb.cos_cached" in name
-    #                 or "rotary_emb.sin_cached" in name):
-    #             # Models trained using ColossalAI may include these tensors in
-    #             # the checkpoint. Skip them.
-    #             continue
-    #         if (self.quant_config is not None and
-    #             (scale_name := self.quant_config.get_cache_scale(name))):
-    #             # Loading kv cache quantization scales
-    #             param = params_dict[scale_name]
-    #             weight_loader = getattr(param, "weight_loader",
-    #                                     default_weight_loader)
-    #             loaded_weight = (loaded_weight if loaded_weight.dim() == 0 else
-    #                              loaded_weight[0])
-    #             weight_loader(param, loaded_weight)
-    #             loaded_params.add(scale_name)
-    #             continue
-    #         for (param_name, weight_name, shard_id) in stacked_params_mapping:
-    #             if weight_name not in name:
-    #                 continue
-    #             name = name.replace(weight_name, param_name)
-    #             # Skip loading extra bias for GPTQ models.
-    #             if name.endswith(".bias") and name not in params_dict:
-    #                 continue
-    #             if is_pp_missing_parameter(name, self):
-    #                 continue
-    #             param = params_dict[name]
-    #             weight_loader = param.weight_loader
-    #             weight_loader(param, loaded_weight, shard_id)
-    #             break
-    #         else:
-    #             # Skip loading extra bias for GPTQ models.
-    #             if name.endswith(".bias") and name not in params_dict:
-    #                 continue
-    #             # Remapping the name of FP8 kv-scale.
-    #             name = maybe_remap_kv_scale_name(name, params_dict)
-    #             if name is None:
-    #                 continue
-    #             if is_pp_missing_parameter(name, self):
-    #                 continue
-    #             param = params_dict[name]
-    #             weight_loader = getattr(param, "weight_loader",
-    #                                     default_weight_loader)
-    #             weight_loader(param, loaded_weight)
-    #         loaded_params.add(name)
-    #     return loaded_params
-    
+
+
 class Exaone4ForCausalLM(nn.Module):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
@@ -459,7 +415,7 @@ class Exaone4ForCausalLM(nn.Module):
         ".gate_proj": (".gate_up_proj", 0),
         ".up_proj": (".gate_up_proj", 1),
     }
-    
+
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -471,17 +427,18 @@ class Exaone4ForCausalLM(nn.Module):
             "up_proj",
         ],
     }
-    
+
     def __init__(
-        self, 
-        config, 
+        self,
+        config,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""):
+        prefix: str = "",
+    ):
         super().__init__()
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        
+
         self.model = self._init_model(config, quant_config, add_prefix("model", prefix))
         # Exaone-4.0 32B set tie_word_embeddins to False
         # Exaone-4.0 1.2B set tie_word_embeddins to True
@@ -495,10 +452,10 @@ class Exaone4ForCausalLM(nn.Module):
                 prefix=add_prefix("lm_head", prefix),
                 use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
             )
-                
+
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        
+
     def _init_model(
         self,
         config,
@@ -506,10 +463,10 @@ class Exaone4ForCausalLM(nn.Module):
         prefix: str = "",
     ):
         return Exaone4Model(config, quant_config=quant_config, prefix=prefix)
-        
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
-    
+
     @torch.no_grad()
     def forward(
         self,
@@ -521,13 +478,13 @@ class Exaone4ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> LogitsProcessorOutput:
         hidden_states = self.model(
-            input_ids, 
+            input_ids,
             positions,
             forward_batch,
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        
+
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(
@@ -540,7 +497,7 @@ class Exaone4ForCausalLM(nn.Module):
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
-        
+
     @torch.no_grad()
     def forward_split_prefill(
         self,
@@ -566,7 +523,7 @@ class Exaone4ForCausalLM(nn.Module):
                 forward_batch,
                 forward_batch.residual,
             )
-        
+
         if end == self.model.config.num_hidden_layers:
             # norm
             hidden_states, _ = self.model.norm(
@@ -585,7 +542,7 @@ class Exaone4ForCausalLM(nn.Module):
     @property
     def start_layer(self):
         return self.model.start_layer
-    
+
     @property
     def end_layer(self):
         return self.model.end_layer
@@ -759,5 +716,6 @@ class Exaone4ForCausalLM(nn.Module):
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
+
 
 EntryClass = Exaone4ForCausalLM
