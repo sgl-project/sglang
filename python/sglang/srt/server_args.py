@@ -285,6 +285,13 @@ class ServerArgs:
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
 
+        # If using model from www.modelscope.cn, first download the model.
+        from sglang.srt.utils import prepare_model_and_tokenizer
+
+        self.model_path, self.tokenizer_path = prepare_model_and_tokenizer(
+            self.model_path, self.tokenizer_path
+        )
+
         if self.device is None:
             self.device = get_device()
 
