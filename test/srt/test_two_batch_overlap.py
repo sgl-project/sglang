@@ -39,7 +39,6 @@ class TestTwoBatchOverlap(unittest.TestCase):
                 "--disable-cuda-graph",  # DeepEP normal does not support CUDA Graph
                 "--enable-two-batch-overlap",
             ],
-            env={"SGL_ENABLE_JIT_DEEPGEMM": "0", **os.environ},
         )
 
     @classmethod
@@ -128,7 +127,6 @@ class TestQwen3TwoBatchOverlap(TestTwoBatchOverlap):
                 "--disable-cuda-graph",  # DeepEP normal does not support CUDA Graph
                 "--enable-two-batch-overlap",
             ],
-            env={"SGL_ENABLE_JIT_DEEPGEMM": "0", **os.environ},
         )
 
 
