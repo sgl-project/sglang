@@ -69,7 +69,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
     esac \
  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
-      python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.5 --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps ; \
       python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.2.4/sgl_kernel-0.2.4+cu128-cp39-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
     fi
 
@@ -140,8 +140,8 @@ RUN apt-get update && apt-get install -y \
 
 RUN apt update -y \
     && apt install -y --no-install-recommends gnupg \
-    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2204/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
-    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/$(if [ "$(uname -m)" = "aarch64" ]; then echo "sbsa"; else echo "x86_64"; fi)/3bf863cc.pub \
+    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
+    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
     && apt update -y \
     && apt install nsight-systems-cli -y
 
