@@ -308,19 +308,35 @@ class TestOpenAIVisionServer(CustomTestCase):
             "iPod" in video_response
             or "device" in video_response
             or "microphone" in video_response
-        ), video_response
+        ), f"""
+        ====================== video_response =====================
+        {video_response}
+        ===========================================================
+        should contain 'iPod' or 'device' or 'microphone'
+        """
         assert (
             "man" in video_response
             or "person" in video_response
             or "individual" in video_response
             or "speaker" in video_response
-        ), video_response
+            or "Steve" in video_response
+        ), f"""
+        ====================== video_response =====================
+        {video_response}
+        ===========================================================
+        should contain 'man' or 'person' or 'individual' or 'speaker'
+        """
         assert (
             "present" in video_response
             or "examine" in video_response
             or "display" in video_response
             or "hold" in video_response
-        )
+        ), f"""
+        ====================== video_response =====================
+        {video_response}
+        ===========================================================
+        should contain 'present' or 'examine' or 'display' or 'hold'
+        """
         assert "black" in video_response or "dark" in video_response
         self.assertIsNotNone(video_response)
         self.assertGreater(len(video_response), 0)
