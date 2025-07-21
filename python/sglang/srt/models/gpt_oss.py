@@ -766,11 +766,11 @@ class OpenAIMoeDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        # Todo: remove this, simple WA for orangina
         # hidden_states, residual = self.layer_communicator.prepare_mlp(
         #     hidden_states, residual, forward_batch
         # )
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # TODO: Remove this, currently WA for got-oss
+        hidden_states, residual = self.post_attention_layernorm.forward_native(hidden_states, residual)
 
         hidden_states = self.mlp(hidden_states, forward_batch)
 
