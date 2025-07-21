@@ -46,6 +46,9 @@ _is_cpu = is_cpu()
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
+if is_npu():
+    import torch_npu
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,6 +72,10 @@ class SiluAndMul(CustomOp):
             return out
         else:
             return self.forward_native(x)
+
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch_npu.npu_swiglu(x)
+        return out
 
 
 class GeluAndMul(CustomOp):
@@ -157,6 +164,7 @@ class ScaledActivation(nn.Module):
 _ACTIVATION_REGISTRY = {
     "gelu": nn.GELU(),
     "gelu_pytorch_tanh": nn.GELU(approximate="tanh"),
+    "gelu_new": NewGELU(),
 }
 
 

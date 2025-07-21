@@ -468,10 +468,7 @@ class TestToolChoiceQwen25(TestToolChoiceLlama32):
 
     @classmethod
     def setUpClass(cls):
-        cls.flaky_tests = {
-            "test_multi_tool_scenario_auto",
-            "test_multi_tool_scenario_required",
-        }
+        cls.flaky_tests = {}
 
         cls.model = "Qwen/Qwen2.5-7B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST

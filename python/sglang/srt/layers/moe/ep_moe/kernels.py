@@ -4,9 +4,9 @@ from typing import List, Optional
 import torch
 import triton
 
-from sglang.math_utils import ceil_div
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.utils import dispose_tensor, is_cuda
+from sglang.srt.utils import ceil_div, dispose_tensor, is_cuda
+from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +147,7 @@ def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
 
 def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+
     seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
 
@@ -159,7 +160,64 @@ def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
     compute_src2dst_triton_kernel[grid](
         reorder_ids, src2dst, topk_ids.numel(), BLOCK_SIZE
     )
+
     return reorder_topk_ids, src2dst, seg_indptr
+
+
+def run_cutlass_moe_ep_preproess(local_topk_ids: torch.Tensor, local_num_experts: int):
+    reorder_topk_ids, reorder_ids = torch.sort(local_topk_ids.view(-1), stable=True)
+
+    seg_indptr = torch.zeros(
+        local_num_experts + 1, device=local_topk_ids.device, dtype=torch.int64
+    )
+    src2dst = torch.empty(
+        local_topk_ids.numel(), device=local_topk_ids.device, dtype=torch.int32
+    )
+
+    BLOCK_SIZE = 512
+    grid = (triton.cdiv(local_topk_ids.numel(), BLOCK_SIZE),)
+    compute_src2dst_triton_kernel[grid](
+        reorder_ids, src2dst, local_topk_ids.numel(), BLOCK_SIZE
+    )
+
+    return reorder_topk_ids, src2dst, seg_indptr
+
+
+@triton.jit
+def pre_reorder_triton_kernel_for_cutlass_moe(
+    input_ptr,
+    gateup_input_ptr,
+    src2dst_ptr,
+    topk_ids_ptr,
+    a1_scales_ptr,
+    num_experts,
+    topk,
+    hidden_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    OutDtype = gateup_input_ptr.dtype.element_ty
+
+    src_idx = tl.program_id(0)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+
+    src_ptr = input_ptr + src_idx * hidden_size
+    for idx in range(topk):
+        expert_id = tl.load(topk_ids_ptr + idx)
+        if expert_id != num_experts:
+            if a1_scales_ptr is not None:
+                scale = 1.0 / tl.load(a1_scales_ptr)
+            else:
+                scale = 1.0
+
+            dst_idx = tl.load(src2dst_ptr + idx)
+            dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+            for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+                offset = start_offset + tl.arange(0, BLOCK_SIZE)
+                mask = offset < hidden_size
+                in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
+                out_data = (in_data * scale).to(OutDtype)
+                tl.store(dst_ptr + offset, out_data, mask=mask)
 
 
 @triton.jit
@@ -178,7 +236,8 @@ def pre_reorder_triton_kernel(
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
 
-    src_idx = tl.program_id(0)
+    src_idx_int32 = tl.program_id(0)
+    src_idx = src_idx_int32.to(tl.int64)
     src2dst_ptr = src2dst_ptr + src_idx * topk
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
     src_ptr = input_ptr + src_idx * hidden_size
@@ -197,7 +256,8 @@ def pre_reorder_triton_kernel(
             else:
                 scale = 1.0
 
-            dst_idx = tl.load(src2dst_ptr + idx)
+            dst_idx_int32 = tl.load(src2dst_ptr + idx)
+            dst_idx = dst_idx_int32.to(tl.int64)
             dst_ptr = gateup_input_ptr + dst_idx * hidden_size
             for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
                 offset = start_offset + vec
@@ -814,14 +874,17 @@ def _fwd_kernel_ep_scatter_2(
     offset_in = tl.arange(0, HIDDEN_SIZE_PAD)
     mask = offset_in < HIDDEN_SIZE
 
-    offset_in_s = tl.arange(0, SCALE_HIDDEN_SIZE_PAD)
-    mask_s = offset_in_s < SCALE_HIDDEN_SIZE
+    index_in_s = tl.arange(0, SCALE_HIDDEN_SIZE_PAD)
+    mask_s = index_in_s < SCALE_HIDDEN_SIZE
 
     for token_id_int32 in range(start_token_id, total_token_num, grid_num):
         token_id = token_id_int32.to(tl.int64)
         to_copy = tl.load(recv_x + token_id * recv_x_stride0 + offset_in, mask=mask)
         to_copy_s = tl.load(
-            recv_x_scale + token_id * recv_x_scale_stride0 + offset_in_s, mask=mask_s
+            recv_x_scale
+            + token_id * recv_x_scale_stride0
+            + index_in_s * recv_x_scale_stride1,
+            mask=mask_s,
         )
 
         for topk_idx_int32 in tl.range(0, topk_num, 1, num_stages=4):
@@ -842,7 +905,11 @@ def _fwd_kernel_ep_scatter_2(
                     output_tensor_scale + dest_token_index * output_tensor_scale_stride0
                 )
                 tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
-                tl.store(output_tensor_scale_ptr + offset_in_s, to_copy_s, mask=mask_s)
+                tl.store(
+                    output_tensor_scale_ptr + index_in_s * output_tensor_scale_stride1,
+                    to_copy_s,
+                    mask=mask_s,
+                )
 
 
 # copy from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/deepep_scatter_gather.py
@@ -857,6 +924,7 @@ def ep_scatter(
     output_tensor_scale: torch.Tensor,
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
+    scale_ue8m0: bool = False,
 ):
     BLOCK_E = 128  # token num of per expert is aligned to 128
     BLOCK_D = 128  # block size of quantization
@@ -866,7 +934,15 @@ def ep_scatter(
     # grid = (triton.cdiv(hidden_size, BLOCK_D), num_experts)
     grid = num_experts
 
+    scale_hidden_size = hidden_size // BLOCK_D
+    if scale_ue8m0:
+        # ue8m0 scales are packed here (4 scales per int32),
+        # hence the effective size of this dimension is divided by 4.
+        scale_hidden_size = ceil_div(scale_hidden_size, 4)
+
     assert m_indices.shape[0] % BLOCK_E == 0
+    assert recv_x_scale.dtype == output_tensor_scale.dtype
+    assert recv_x_scale.shape[1] == output_tensor_scale.shape[1] == scale_hidden_size
 
     _fwd_kernel_ep_scatter_1[(grid,)](
         num_recv_tokens_per_expert,
@@ -905,8 +981,8 @@ def ep_scatter(
         num_warps=num_warps,
         HIDDEN_SIZE=hidden_size,
         HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
-        SCALE_HIDDEN_SIZE=hidden_size // BLOCK_D,
-        SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size // BLOCK_D),
+        SCALE_HIDDEN_SIZE=scale_hidden_size,
+        SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(scale_hidden_size),
     )
     return
 
@@ -985,7 +1061,7 @@ def ep_gather(
     input_index: torch.Tensor,
     output_tensor: torch.Tensor,
 ):
-    BLOCK_D = 1024  # block size of quantization
+    BLOCK_D = 1024 if not is_in_ci() else 128  # block size of quantization
     num_warps = 2
     num_tokens = output_tensor.shape[0]
     hidden_size = input_tensor.shape[1]

@@ -236,8 +236,7 @@ async fn add_worker(
 
 #[get("/list_workers")]
 async fn list_workers(data: web::Data<AppState>) -> impl Responder {
-    let workers = data.router.get_worker_urls();
-    let worker_list = workers.read().unwrap().clone();
+    let worker_list = data.router.get_worker_urls();
     HttpResponse::Ok().json(serde_json::json!({ "urls": worker_list }))
 }
 
@@ -278,7 +277,7 @@ pub struct ServerConfig {
     pub port: u16,
     pub worker_urls: Vec<String>,
     pub policy_config: PolicyConfig,
-    pub verbose: bool,
+    pub max_payload_size: usize,
     // FIXME: The dp_awareness is duplicated with the same filed inside
     // PolicyConfig.
     // It is introduced to let the server startup process can easily
@@ -286,8 +285,8 @@ pub struct ServerConfig {
     // removed after the dp_awareness feature in service_discovery is
     // fully supported.
     pub dp_awareness: bool,
-    pub max_payload_size: usize,
     pub log_dir: Option<String>,
+    pub log_level: Option<String>,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
@@ -299,11 +298,17 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
 
     let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
         Some(logging::init_logging(LoggingConfig {
-            level: if config.verbose {
-                Level::DEBUG
-            } else {
-                Level::INFO
-            },
+            level: config
+                .log_level
+                .as_deref()
+                .and_then(|s| match s.to_uppercase().parse::<Level>() {
+                    Ok(l) => Some(l),
+                    Err(_) => {
+                        warn!("Invalid log level string: '{}'. Defaulting to INFO.", s);
+                        None
+                    }
+                })
+                .unwrap_or(Level::INFO),
             json_format: false,
             log_dir: config.log_dir.clone(),
             colorize: true,
@@ -386,7 +391,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     info!("✅ Serving router on {}:{}", config.host, config.port);
     info!(
         "✅ Serving workers on {:?}",
-        app_state.router.get_worker_urls().read().unwrap()
+        app_state.router.get_worker_urls()
     );
 
     HttpServer::new(move || {

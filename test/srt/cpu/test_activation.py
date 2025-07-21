@@ -8,7 +8,7 @@ from utils import SiluAndMul, precision
 
 from sglang.test.test_utils import CustomTestCase
 
-torch.manual_seed(0)
+torch.manual_seed(1234)
 
 
 class TestActivation(CustomTestCase):

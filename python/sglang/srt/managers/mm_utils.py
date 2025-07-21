@@ -2,14 +2,15 @@
 Multi-modality utils
 """
 
-import dataclasses
-import logging
+import hashlib
 from abc import abstractmethod
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch import nn
 
+from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -124,80 +125,44 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
     e.g. <image><image>....<image>, or <audio><audio>...<audio>
     """
 
-    def __init__(self, token_ids: List[int]) -> None:
-        self.token_ids = token_ids
-
     def pad_input_tokens(
         self, input_ids: List[int], mm_inputs: MultimodalInputs
     ) -> List[int]:
         """
-        Finds contiguous regions of tokens matching `self.token_ids` in `input_ids`
-        and replaces each region with the corresponding `pad_value` from `mm_inputs.mm_items`.
+        Replaces multimodal tokens in input_ids with corresponding pad_values from mm_items.
+        Each modality (image, audio, video) is handled separately based on its token_id.
         """
-        pad_values = [item.pad_value for item in mm_inputs.mm_items]
-        if not pad_values:
-            # No multimodal items, return original input_ids
+        if not input_ids or not mm_inputs.mm_items:
             return input_ids
-        if not input_ids:
-            return []
 
         input_ids_tensor = torch.tensor(input_ids)
-        device = input_ids_tensor.device
-        token_ids_tensor = torch.tensor(self.token_ids, device=device)
-        mask = torch.isin(input_ids_tensor, token_ids_tensor)
 
-        if not mask.any():
-            # No tokens match token_ids, return original input_ids
-            return input_ids
+        # Create mapping of token_ids to pad_values for each modality
+        token_to_pad_mapping = {}
 
-        # Find contiguous regions
-        padded_mask = torch.cat(
-            (
-                torch.tensor([False], device=device),
-                mask,
-                torch.tensor([False], device=device),
-            )
-        )
-        # Find indices where the mask value changes
-        diff_indices = torch.where(padded_mask[1:] != padded_mask[:-1])[0]
-
-        # Start indices are where False changes to True
-        starts = diff_indices[::2]
-        # End indices are where True changes to False (exclusive index)
-        ends = diff_indices[1::2]
-
-        # Check if the number of regions matches the number of pad values
-        if len(starts) != len(pad_values):
-            # Maybe log a warning here?
-            num_regions = len(starts)
-            num_pad_values = len(pad_values)
-            if num_regions > 0 and num_pad_values > 0:
-                pad_values = (pad_values * (num_regions // num_pad_values + 1))[
-                    :num_regions
-                ]
-            else:  # If no regions or no pad_values, this loop won't run anyway.
-                pad_values = []  # Ensure pad_values is empty if starts is empty
-
-        # Create a copy to modify
-        output_ids_tensor = input_ids_tensor.clone()
-
-        # Replace tokens in each region with the corresponding pad value
-        # Ensure we don't iterate if pad_values became empty due to mismatch and num_regions=0
-        for i in range(min(len(starts), len(pad_values))):
-            start_idx = starts[i]
-            end_idx = ends[i]
-            pad_value = pad_values[i]
-            if pad_value is not None:  # Ensure pad_value is not None before assignment
-                output_ids_tensor[start_idx:end_idx] = pad_value
+        for item in mm_inputs.mm_items:
+            if item.is_image() and mm_inputs.im_token_id is not None:
+                token_to_pad_mapping[mm_inputs.im_token_id] = item.pad_value
+            elif item.is_audio() and mm_inputs.audio_token_id is not None:
+                token_to_pad_mapping[mm_inputs.audio_token_id] = item.pad_value
+            elif item.is_video() and mm_inputs.video_token_id is not None:
+                token_to_pad_mapping[mm_inputs.video_token_id] = item.pad_value
             else:
-                logger.warning(f"Skipping region {i} due to None pad_value.")
-        return output_ids_tensor.tolist()
+                raise ValueError(f"No multimodal token id provided for {item.modality}")
+
+        # Apply replacements for all tokens at once
+        for token_id, pad_value in token_to_pad_mapping.items():
+            input_ids_tensor[input_ids_tensor == token_id] = pad_value
+
+        ret_input_ids = input_ids_tensor.tolist()
+
+        return ret_input_ids
 
 
-embedding_cache = None
+embedding_cache: Optional[MultiModalCache] = None
 
 
-def init_embedding_cache(max_size: int):
+def init_embedding_cache(max_size: int = 0):
     global embedding_cache
     embedding_cache = MultiModalCache(max_size)
 
@@ -283,11 +248,14 @@ def _get_chunked_prefill_embedding(
 ) -> Optional[torch.Tensor]:
     # Calculate embedding for each request, try to get it from cache to avoid repeated calculation
     embedding_list = []
-    for i in range(len(items_size) - 1):
+    # FIXME(Xinyuan): temporary workaround for eagle3, which may have len(items_size) > len(prefix_length)
+    max_iterations = min(len(items_size) - 1, len(prefix_length))
+    for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
             continue
         embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
         items_offset = items_offset_list[i]
+        assert items_offset is not None, items_offset
         embedding_items_hash = get_embedding_hash(embedding_items_per_req)
         # if all items has been prefixed, we do not need to calculate embedding
         if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
@@ -304,7 +272,7 @@ def _get_chunked_prefill_embedding(
         embedding_per_req_chunk, _, end_index = get_embedding_chunk(
             embedding=embedding_per_req,
             extend_prefix_len=prefix_length[i],
-            extend_seq_len=extend_length[i],
+            extend_seq_len=extend_length[i] if i < len(extend_length) else 0,
             items_offset=items_offset,
         )
         # remove this item from cache if chunk reaches to the end
@@ -413,11 +381,9 @@ def embed_mm_inputs(
     extend_seq_lens: List[int],
     input_ids: torch.Tensor,
     input_embedding: nn.Embedding,
-    image_data_embedding_func: Callable[
-        [List[MultimodalDataItem]], torch.Tensor
-    ] = None,
-    audio_data_embedding_func: Callable[
-        [List[MultimodalDataItem]], torch.Tensor
+    multimodal_model: nn.Module = None,
+    data_embedding_func_mapping: Dict[
+        Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
     ] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
 ) -> Optional[torch.Tensor]:
@@ -430,8 +396,6 @@ def embed_mm_inputs(
         extend_seq_lens: Sequence lengths for each request
         input_ids: Input token IDs tensor
         input_embedding: Embedding layer for text tokens
-        image_data_embedding_func: Function to embed image data
-        audio_data_embedding_func: Function to embed audio data
         placeholder_tokens: Token IDs for multimodal placeholders (uses pad_values if None)
 
     Returns:
@@ -448,88 +412,53 @@ def embed_mm_inputs(
         item_flatten_list += [item for item in mm_inputs.mm_items if item is not None]
 
     embeddings, masks = [], []
-
     # 2. Get multimodal embedding separately
-    # TODO: make this more generic
-    # Try get image embedding if any
-    if (
-        any(True for item in item_flatten_list if item.is_image())
-        and image_data_embedding_func
-    ):
-        items = [item for item in item_flatten_list if item.is_image()]
-        placeholder_tensor = torch.tensor(
-            [item.pad_value for item in items],
-            device=input_ids.device,
+    # Try get mm embedding if any
+    for modality in Modality.all():
+        items = [
+            item for item in item_flatten_list if item.is_modality(modality=modality)
+        ]
+        embedder = (
+            None
+            if data_embedding_func_mapping is None
+            else data_embedding_func_mapping.get(modality, None)
         )
-        # calculate per request items length offset
-        items_size = torch.zeros(len(mm_inputs_list) + 1, dtype=int)
-        items_offsets = []
-        for i, mm_inputs in enumerate(mm_inputs_list):
-            image_items = [item for item in mm_inputs.mm_items if item.is_image()]
-            items_size[i + 1] = len(image_items)
-            items_offsets.append(
-                flatten_nested_list(
-                    [
-                        item.image_offsets
-                        for item in mm_inputs.mm_items
-                        if item.is_image()
-                    ]
-                )
+        if embedder is None:
+            # "image", "video", etc
+            modality_id = modality.name.lower()
+            embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
+        if len(items) != 0 and embedder is not None:
+            placeholder_tensor = torch.tensor(
+                [item.pad_value for item in items],
+                device=input_ids.device,
             )
-        items_size = torch.cumsum(items_size, dim=0).tolist()
-
-        embedding, mask = get_embedding_and_mask(
-            data_embedding_func=image_data_embedding_func,
-            embedding_items=items,
-            placeholder_tensor=placeholder_tensor,
-            input_ids=input_ids,
-            items_size=items_size,
-            prefix_length=extend_prefix_lens,
-            extend_length=extend_seq_lens,
-            items_offset_list=items_offsets,
-        )
-        embeddings += [embedding]
-        masks += [mask]
-
-    # Try get audio embedding if any
-    if (
-        any(True for item in item_flatten_list if item.is_audio())
-        and audio_data_embedding_func
-    ):
-        items = [item for item in item_flatten_list if item.is_audio()]
-        placeholder_tensor = torch.tensor(
-            [item.pad_value for item in items],
-            device=input_ids.device,
-        )
-        items_offsets = []
-        # calculate per request items length offset
-        items_size = torch.zeros(len(mm_inputs_list) + 1, dtype=int)
-        for i, mm_inputs in enumerate(mm_inputs_list):
-            audio_items = [item for item in mm_inputs.mm_items if item.is_audio()]
-            items_size[i + 1] = len(audio_items)
-            items_offsets.append(
-                flatten_nested_list(
-                    [
-                        item.audio_offsets
-                        for item in mm_inputs.mm_items
-                        if item.is_audio()
-                    ]
+            # calculate per request items length offset
+            items_size = torch.zeros(len(mm_inputs_list) + 1, dtype=int)
+            items_offsets = []
+            for i, mm_inputs in enumerate(mm_inputs_list):
+                mm_items = [
+                    item
+                    for item in mm_inputs.mm_items
+                    if item.is_modality(modality=modality)
+                ]
+                items_size[i + 1] = len(mm_items)
+                items_offsets.append(
+                    flatten_nested_list([item.offsets for item in mm_inputs.mm_items])
                 )
-            )
-        items_size = torch.cumsum(items_size, dim=0)
+            items_size = torch.cumsum(items_size, dim=0).tolist()
 
-        embedding, mask = get_embedding_and_mask(
-            data_embedding_func=audio_data_embedding_func,
-            embedding_items=items,
-            placeholder_tensor=placeholder_tensor,
-            input_ids=input_ids,
-            items_size=items_size,
-            prefix_length=extend_prefix_lens,
-            extend_length=extend_seq_lens,
-            items_offset_list=items_offsets,
-        )
-        embeddings += [embedding]
-        masks += [mask]
+            embedding, mask = get_embedding_and_mask(
+                data_embedding_func=embedder,
+                embedding_items=items,
+                placeholder_tensor=placeholder_tensor,
+                input_ids=input_ids,
+                items_size=items_size,
+                prefix_length=extend_prefix_lens,
+                extend_length=extend_seq_lens,
+                items_offset_list=items_offsets,
+            )
+            embeddings += [embedding]
+            masks += [mask]
 
     # 3. Get input embeddings
     vocab_size = input_embedding.num_embeddings
@@ -556,11 +485,9 @@ def general_mm_embed_routine(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
     language_model: nn.Module,
-    image_data_embedding_func: Optional[
-        Callable[[List[MultimodalDataItem]], torch.Tensor]
-    ] = None,
-    audio_data_embedding_func: Optional[
-        Callable[[List[MultimodalDataItem]], torch.Tensor]
+    multimodal_model: Optional[nn.Module] = None,
+    data_embedding_funcs: Dict[
+        Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
     ] = None,
     placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
     **kwargs,
@@ -605,8 +532,8 @@ def general_mm_embed_routine(
             extend_seq_lens=extend_seq_lens,
             input_ids=input_ids,
             input_embedding=embed_tokens,
-            image_data_embedding_func=image_data_embedding_func,
-            audio_data_embedding_func=audio_data_embedding_func,
+            multimodal_model=multimodal_model,
+            data_embedding_func_mapping=data_embedding_funcs,
             placeholder_tokens=placeholder_tokens,
         )
         # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
@@ -680,3 +607,52 @@ def get_multimodal_data_bounds(
     # Convert valid pairs to tensor
     valid_pairs_tensor = torch.tensor(valid_pairs, device=input_ids.device)
     return valid_pairs_tensor
+
+
+def data_hash(data) -> int:
+    hash_bytes = hashlib.sha256(data).digest()[:8]
+    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+
+
+def tensor_hash(tensor_list) -> int:
+    """
+    hash a tensor or a tensor list
+    """
+    tensor = tensor_list
+    if isinstance(tensor_list, list):
+        tensor_list = flatten_nested_list(tensor_list)
+        tensor_list = [
+            x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
+        ]
+        tensor = torch.concat(tensor_list)
+    if tensor.is_cuda:
+        return gpu_tensor_hash(tensor)
+    tensor = tensor.detach().contiguous()
+
+    if tensor.dtype == torch.bfloat16:
+        # memoryview() doesn't support PyTorch's BFloat16 dtype
+        tensor = tensor.float()
+
+    assert isinstance(tensor, torch.Tensor)
+    if tensor.is_cuda:
+        # TODO: improve this
+        tensor_cpu = tensor.cpu()
+    else:
+        tensor_cpu = tensor
+
+    mv = memoryview(tensor_cpu.numpy())
+    return data_hash(mv.tobytes())
+
+
+def hash_feature(f):
+    if isinstance(f, list):
+        if isinstance(f[0], torch.Tensor):
+            return tensor_hash(f)
+        return data_hash(tuple(flatten_nested_list(f)))
+    elif isinstance(f, np.ndarray):
+        arr = np.ascontiguousarray(f)
+        arr_bytes = arr.tobytes()
+        return data_hash(arr_bytes)
+    elif isinstance(f, torch.Tensor):
+        return tensor_hash([f])
+    return data_hash(f)
