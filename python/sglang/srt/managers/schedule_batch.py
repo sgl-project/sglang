@@ -212,7 +212,7 @@ class MultimodalDataItem:
     # the raw features returned by processor, e.g. pixel_values or audio_features
     feature: Union[torch.Tensor, np.ndarray] = None
     # the precomputed features, passed as final encoder embeddings
-    # Usually, one and only one of the feature and precomputed_features is empty
+    # One and only one of the feature and precomputed_features will be empty
     precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     # Model-specific data stored in a dictionary
