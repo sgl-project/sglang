@@ -36,7 +36,7 @@ class LBArgs:
             "--policy",
             type=str,
             default=LBArgs.policy,
-            choices=["random", "po2"],
+            choices=["random", "po2", "rr"],
             help=f"Policy to use for load balancing (default: {LBArgs.policy})",
         )
         parser.add_argument(
@@ -103,8 +103,8 @@ class LBArgs:
     def __post_init__(self):
         if not self.rust_lb:
             assert (
-                self.policy == "random"
-            ), "Only random policy is supported for Python load balancer"
+                self.policy == "random" or self.policy == "rr"
+            ), "Only random and Round Robin policy is supported for Python load balancer"
 
 
 def main():
@@ -133,7 +133,13 @@ def main():
         prefill_configs = [
             PrefillConfig(url, port) for url, port in lb_args.prefill_infos
         ]
-        run(prefill_configs, lb_args.decode_infos, lb_args.host, lb_args.port)
+        run(
+            prefill_configs,
+            lb_args.decode_infos,
+            lb_args.host,
+            lb_args.port,
+            lb_args.policy,
+        )
 
 
 if __name__ == "__main__":
