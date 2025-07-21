@@ -67,6 +67,7 @@ class TestDeepseekVL2Server(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--context-length",
                 "4096",
+                "--disable-cuda-graph",
             ],
         )
         cls.base_url += "/v1"
