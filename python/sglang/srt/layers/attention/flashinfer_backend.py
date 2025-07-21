@@ -608,13 +608,12 @@ class FlashInferAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
-        sink: Optional[torch.Tensor] = None,
     ):
         # Log input tensors
         log_tensor(f"forward_extend_layer{layer.layer_id}_q", q)
         log_tensor(f"forward_extend_layer{layer.layer_id}_k", k)
         log_tensor(f"forward_extend_layer{layer.layer_id}_v", v)
-        log_tensor(f"forward_extend_layer{layer.layer_id}_sink", sink)
+        log_tensor(f"forward_extend_layer{layer.layer_id}_sink", layer.attention_sinks)
         
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
@@ -645,13 +644,13 @@ class FlashInferAttnBackend(AttentionBackend):
             prefill_wrapper_paged._logits_soft_cap = logits_soft_cap
             prefill_wrapper_paged._window_left = window_left
 
-            if hasattr(layer, 'enable_attention_sink') and layer.enable_attention_sink and sink is not None:
+            if hasattr(layer, 'enable_attention_sink') and layer.enable_attention_sink and layer.attention_sinks is not None:
                 # For JIT kernels, sm_scale is passed as a kernel argument, so the one on the object is ignored.
                 prefill_wrapper_paged._sm_scale = None
                 o = prefill_wrapper_paged.run(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                    sink,
+                    layer.attention_sinks,
                     layer.scaling,
                     k_scale=layer.k_scale,
                     v_scale=layer.v_scale,
@@ -676,14 +675,14 @@ class FlashInferAttnBackend(AttentionBackend):
             if self.forward_metadata.extend_no_prefix:
                 self.prefill_wrapper_ragged._causal = True
 
-                if hasattr(layer, 'enable_attention_sink') and layer.enable_attention_sink and sink is not None:
+                if hasattr(layer, 'enable_attention_sink') and layer.enable_attention_sink and layer.attention_sinks is not None:
                     # For JIT kernels, sm_scale is passed as a kernel argument.
                     self.prefill_wrapper_ragged._sm_scale = None
                     o = self.prefill_wrapper_ragged.run(
                         q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k.view(-1, layer.tp_k_head_num, layer.head_dim),
                         v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                        sink,
+                        layer.attention_sinks,
                         layer.scaling,
                     )
                 else:
@@ -706,7 +705,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 prefill_wrapper_paged._k_scale = layer.k_scale
                 prefill_wrapper_paged._v_scale = layer.v_scale
 
-                if hasattr(layer, 'enable_attention_sink') and layer.enable_attention_sink and sink is not None:
+                if hasattr(layer, 'enable_attention_sink') and layer.enable_attention_sink and layer.attention_sinks is not None:
                     self.prefill_wrapper_ragged._sm_scale = None
                     prefill_wrapper_paged._sm_scale = None
 
@@ -714,14 +713,14 @@ class FlashInferAttnBackend(AttentionBackend):
                         q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k.view(-1, layer.tp_k_head_num, layer.head_dim),
                         v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                        sink,
+                        layer.attention_sinks,
                         layer.scaling,
                     )
 
                     o2, s2 = prefill_wrapper_paged.run_return_lse(
                         q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                        sink,
+                        layer.attention_sinks,
                         layer.scaling,
                     )
                 else:
@@ -763,13 +762,12 @@ class FlashInferAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
-        sink: Optional[torch.Tensor] = None,
     ):
         # Log input tensors
         log_tensor(f"forward_decode_layer{layer.layer_id}_q", q)
         log_tensor(f"forward_decode_layer{layer.layer_id}_k", k)
         log_tensor(f"forward_decode_layer{layer.layer_id}_v", v)
-        log_tensor(f"forward_decode_layer{layer.layer_id}_sink", sink)
+        log_tensor(f"forward_decode_layer{layer.layer_id}_sink", layer.attention_sinks)
         
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
@@ -796,13 +794,13 @@ class FlashInferAttnBackend(AttentionBackend):
         decode_wrapper._window_left = window_left
 
         # Call the wrapped function
-        if hasattr(layer, 'enable_attention_sink') and layer.enable_attention_sink and sink is not None:
+        if hasattr(layer, 'enable_attention_sink') and layer.enable_attention_sink and layer.attention_sinks is not None:
             # For JIT kernels, sm_scale is passed as a kernel argument, so the one on the object is ignored.
             decode_wrapper._sm_scale = None
             o = decode_wrapper.run(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                sink,
+                layer.attention_sinks,
                 layer.scaling,
                 k_scale=layer.k_scale,
                 v_scale=layer.v_scale,
