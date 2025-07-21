@@ -229,6 +229,7 @@ class Exaone4DecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.hidden_size = config.hidden_size
 
         rope_theta = getattr(config, "rope_theta", 1000000)
@@ -690,7 +691,7 @@ class Exaone4ForCausalLM(nn.Module):
 
         except Exception:
             logger.error(
-                f"Error getting weights by name {name} in LlamaForCausalLM: {get_exception_traceback()}"
+                f"Error getting weights by name {name} in Exaone4ForCausalLM: {get_exception_traceback()}"
             )
             return None
 
