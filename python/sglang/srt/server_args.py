@@ -1100,6 +1100,7 @@ class ServerArgs:
                 "pythonic",
                 "kimi_k2",
                 "qwen3",
+                "glm45",
             ],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', and 'kimi_k2'.",

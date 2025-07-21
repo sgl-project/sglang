@@ -20,21 +20,15 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
-
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     parallel_state,
-    get_tensor_model_parallel_rank,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.models.deepseek_v2 import (
-    DeepseekV2Model,
-    DeepseekV2MoE,
-    DeepseekV2ForCausalLM,
-    DeepseekV2DecoderLayer,
-)
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -64,20 +58,25 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_v2 import (
+    DeepseekV2DecoderLayer,
+    DeepseekV2ForCausalLM,
+    DeepseekV2Model,
+    DeepseekV2MoE,
+)
 from sglang.srt.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
     model_forward_maybe_tbo,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
@@ -425,8 +424,8 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
 
         self.experts = get_moe_impl_class()(
             num_experts=config.n_routed_experts
-                        + self.num_fused_shared_experts
-                        + global_server_args_dict["ep_num_redundant_experts"],
+            + self.num_fused_shared_experts
+            + global_server_args_dict["ep_num_redundant_experts"],
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -471,10 +470,10 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
             is_packed_weight = hasattr(
                 self.shared_experts.gate_up_proj.quant_method, "quant_config"
             ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
-                                   "awq",
-                                   "awq_marlin",
-                                   "moe_wna16",
-                               }
+                "awq",
+                "awq_marlin",
+                "moe_wna16",
+            }
             self.shared_experts_is_int8 = (
                 not is_packed_weight
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
