@@ -810,7 +810,7 @@ class UpdateWeightsFromTensorReqInput:
     - Data is structured in JSON for easy transmission over HTTP
     """
 
-    serialized_named_tensors: List[Union[str, bytes]]
+    serialized_named_tensors: List[Union[str, bytes, List[Union[str, bytes]]]]
     # Optional format specification for loading
     load_format: Optional[str] = None
     # Whether to flush the cache after updating weights
