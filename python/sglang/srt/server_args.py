@@ -494,7 +494,7 @@ class ServerArgs:
                 )
 
             model_arch = self.get_hf_config().architectures[0]
-            if model_arch == "DeepseekV3ForCausalLM":
+            if model_arch in ["DeepseekV3ForCausalLM", "Glm4MoeForCausalLM"]:
                 # Auto set draft_model_path DeepSeek-V3/R1
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
