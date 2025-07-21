@@ -28,10 +28,11 @@ class LoRAConfig:
         self.target_modules = self.hf_config["target_modules"]
 
         # TODO: Support more modules
-        # if any(module in self.target_modules for module in ["lm_head"]):
-        #     raise ValueError("Not supported yet")
-        if "lm_head" in self.target_modules:
-            self.target_modules.remove("lm_head")
+        if any(module in self.target_modules for module in ["lm_head"]):
+            raise ValueError("Not supported yet")
+        # For testing adapter: yard1/llama-2-7b-sql-lora-test
+        # if "lm_head" in self.target_modules:
+        #     self.target_modules.remove("lm_head")
 
         self.r = self.hf_config["r"]
         self.lora_alpha = self.hf_config["lora_alpha"]

@@ -486,7 +486,8 @@ class LoRAManager:
                 del self.loras[name]
 
         # Current max extra vocab size
-        self.max_extra_vocab_size: int = max([x.extra_vocab_size for x in self.loras.values()])
+        for name, lora in self.loras.items():
+            self.max_extra_vocab_size = max(self.max_extra_vocab_size, lora.extra_vocab_size)
 
         # Additional checks for flashinfer backend
         # FIXME remove the restrictions after supporting multi-rank for flashinfer backend

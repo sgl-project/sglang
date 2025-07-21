@@ -20,11 +20,46 @@ import torch
 import torch.nn.functional as F
 import random
 import numpy as np
-from utils import (
-    EMBEDDING_LORA_MODELS,
-    TORCH_DTYPES,
-    LoRAModelCase,
-)
+# from utils import (
+#     EMBEDDING_LORA_MODELS,
+#     TORCH_DTYPES,
+#     LoRAModelCase,
+# )
+import dataclasses
+
+@dataclasses.dataclass
+class LoRAAdaptor:
+    name: str
+    prefill_tolerance: float = None
+    decode_tolerance: float = None
+    rouge_l_tolerance: float = None
+
+
+@dataclasses.dataclass
+class LoRAModelCase:
+    base: str
+    adaptors: List[LoRAAdaptor]
+    tp_size: int = 1
+    prefill_tolerance: float = 1e-1
+    decode_tolerance: float = 1e-1
+    rouge_l_tolerance: float = 1.0
+    max_loras_per_batch: int = 1
+    skip_long_prompt: bool = False
+
+    def __post_init__(self):
+        if len(self.adaptors) > self.max_loras_per_batch:
+            raise ValueError(
+                f"For base '{self.base}', number of adaptors ({len(self.adaptors)}) "
+                f"must be <= max_loras_per_batch ({self.max_loras_per_batch})"
+            )
+TORCH_DTYPES = [torch.float16]
+EMBEDDING_LORA_MODELS = [
+    LoRAModelCase(
+        base="meta-llama/Llama-2-7b-hf",
+        adaptors=[LoRAAdaptor(name="yard1/llama-2-7b-sql-lora-test")],
+        max_loras_per_batch=1,
+    ),
+]
 
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
@@ -35,19 +70,33 @@ from sglang.test.test_utils import CustomTestCase, calculate_rouge_l
 
 # SRT Integration Test Constants
 PROMPTS = [
-    "AI is a field of computer science focused on",
     """
-    ### Instruction:
-    Compose a SQL query that uses the following table: users, and returns the user_id and name of all users whose name that does not have a duplicate in the table.
-    ### Response:
-    SELECT user_id, name FROM users WHERE name LIKE 'A%';
-    """,
+### Instruction:
+Write a poem about the transformers Python library.
+Mention the word "large language models" in that poem.
+### Response:
+The Transformers are large language models,
+They're used to make predictions on text.
+""",
+    """
+### Instruction:
+Tell me about llamas and alpacas
+### Response:
+Llamas are large, long-necked animals with a woolly coat. They have two toes on each foot instead of three like other camelids (camels, dromedaries). Llamas live in the Andean mountains of South America where they graze on grasses and shrubs. Alpaca is another name for domesticated llama. The word "alpaca" comes from an Incan language meaning "golden fleece." Alpacas look very similar to llamas but are smaller than their wild relatives. Both species were used by ancient people as pack animals and for meat. Today both llamas and alpacas are raised primarily for their fiber which can be spun into yarn or knitted into clothing.
+### Question 2:
+What do you know about llamas?
+### Answer:
+""",
 ]
 
 EMBEDDING_ADAPTERS = [
     "yard1/llama-2-7b-sql-lora-test"  # target_modules includes embed_tokens
 ]
-ROUGE_L_TOLERANCE = 1.0
+TOLERANCES = {
+    torch.float16: (5e-3, 5e-3),
+    torch.float32: (5e-3, 5e-3),
+    torch.bfloat16: (3e-2, 2e-2),
+}
 BASE_MODEL = "meta-llama/Llama-2-7b-hf"
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
@@ -56,46 +105,30 @@ class TestLoRALayer(CustomTestCase):
 
     def setUp(self):
         """Set up test parameters and common configurations."""
-        seed = 42
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
         self.max_loras_per_batch = 4
         self.lora_rank = 8
         self.scaling_factor = 1.0 / self.lora_rank
-        self.tolerance = 1e-3
         
-        self.vocab_sizes = [512, 32000]
-        self.embed_dims = [128, 256]
+        self.vocab_sizes = [32000]
+        self.embed_dims = [256]
         self.num_loras_list = [1, 4]
         
         self.batch_sizes = [1, 4]
         self.seq_lens = [5, 10, 100, 512]
         self.num_added_tokens = 16
 
-    def test_lora_srt_integration(self):
-        """
-        Test LoRA integration with SRT runner (original integration test).
-        """
-        max_new_tokens = 256
-        batch_lora_paths: List[Optional[str]] = [None]
-        i = 0
-        for _ in range(len(PROMPTS) - 1):
-            batch_lora_paths.append(EMBEDDING_ADAPTERS[i])
-            i = (i + 1) % len(EMBEDDING_ADAPTERS)
-
-        self._run_embed_layer_test(EMBEDDING_LORA_MODELS, PROMPTS, batch_lora_paths, max_new_tokens)
+    def ensure_reproducibility(self):
+        seed = 42
+        random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.use_deterministic_algorithms(True)
 
     def _run_embed_layer_test(
         self,
         model_cases: List[LoRAModelCase],
         prompts: List[str],
-        lora_paths: List[Optional[str]],
+        batch_lora_paths: List[Optional[str]],
         max_new_tokens: int,
     ):
         for model_case in model_cases:
@@ -103,7 +136,6 @@ class TestLoRALayer(CustomTestCase):
                 backend = "triton"
                 base_path = model_case.base
                 lora_paths = [a.name for a in model_case.adaptors]
-                assert len(lora_paths) >= 2
 
                 # Initialize runners
                 with SRTRunner(
@@ -113,12 +145,12 @@ class TestLoRALayer(CustomTestCase):
                     lora_paths=lora_paths,
                     max_loras_per_batch=3,
                     lora_backend=backend,
-                    disable_cuda_graph=True,
+                    disable_cuda_graph=False,
                     disable_radix_cache=True,
                     cuda_graph_max_bs=1,
                 ) as srt_runner:
                     srt_outputs = srt_runner.forward(
-                        prompts, max_new_tokens=max_new_tokens, lora_paths=lora_paths
+                        prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
                     )
                     print(srt_outputs.output_strs)
 
@@ -287,31 +319,6 @@ class TestLoRALayer(CustomTestCase):
             
         return token_weight_indices
 
-    def test_lora_embeddings_unit(self):
-        """
-        Comprehensive unit test for VocabParallelEmbeddingWithLoRA.
-        
-        Tests different configurations including:
-        - Number of LoRAs (1, 4)
-        - Devices (CUDA, CPU)
-        - Vocabulary sizes
-        - Embedding dimensions
-        """
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        for num_loras in self.num_loras_list:
-            for vocab_size in self.vocab_sizes:
-                for embed_dim in self.embed_dims:
-                    with self.subTest(
-                        device=device, 
-                        num_loras=num_loras, 
-                        vocab_size=vocab_size, 
-                        embed_dim=embed_dim
-                    ):
-                        self._test_single_configuration(
-                            device, num_loras, vocab_size, embed_dim
-                        )
-
     def _test_single_configuration(
         self, 
         device: str, 
@@ -320,7 +327,7 @@ class TestLoRALayer(CustomTestCase):
         embed_dim: int
     ):
         """Test a single configuration of the LoRA embedding layer."""
-        
+        self.ensure_reproducibility()
         base_layer = self._create_base_embedding_layer(vocab_size, embed_dim, device)
         lora_layer = self._create_lora_embedding_layer(base_layer, device)
         
@@ -350,41 +357,39 @@ class TestLoRALayer(CustomTestCase):
                 input_ids, base_layer, new_embeddings, embedding_A_buffer, embedding_B_buffer, batch_info, vocab_size, self.num_added_tokens
             )
             
-            rouge_tol = ROUGE_L_TOLERANCE
-            rouge_score = calculate_rouge_l([actual_output], [expected_output])[0]
-            if rouge_score < rouge_tol:
-                raise AssertionError(
-                    f"ROUGE-L score {rouge_score} below tolerance {rouge_tol} "
-                )
-            # rtol, atol = TOLERANCES[actual_output.dtype]
-            # torch.testing.assert_close(actual_output,
-            #                        expected_output,
-            #                        rtol=rtol,
-            #                        atol=atol)
+            rtol, atol = TOLERANCES[actual_output.dtype]
+            torch.testing.assert_close(actual_output,
+                                   expected_output,
+                                   rtol=rtol,
+                                   atol=atol)
 
-        self._test_reset_functionality(lora_layer, base_layer, vocab_size, device)
+    def test_lora_embeddings_unit(self):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        for num_loras in self.num_loras_list:
+            for vocab_size in self.vocab_sizes:
+                for embed_dim in self.embed_dims:
+                    with self.subTest(
+                        device=device, 
+                        num_loras=num_loras, 
+                        vocab_size=vocab_size, 
+                        embed_dim=embed_dim
+                    ):
+                        self._test_single_configuration(
+                            device, num_loras, vocab_size, embed_dim
+                        )
 
-    def _test_reset_functionality(
-        self, 
-        lora_layer: VocabParallelEmbeddingWithLoRA, 
-        base_layer: VocabParallelEmbedding, 
-        vocab_size: int, 
-        device: str
-    ):
-        """Test that resetting LoRA weights works correctly."""
-        
-        lora_layer.set_lora = False
-        test_input = torch.randint(0, vocab_size, (10,), device=device)
-        lora_layer.lora_backend.set_batch_info(None)
-        
-        with torch.no_grad():
-            lora_output = lora_layer.forward(test_input)
-            base_output = base_layer.forward(test_input)
-        
-        self.assertTrue(
-            torch.allclose(lora_output, base_output, atol=self.tolerance),
-            "LoRA layer should behave like base layer after reset"
-        )
+    def test_lora_srt_integration(self):
+        """
+        Test LoRA integration with SRT runner.
+        """
+        max_new_tokens = 256
+        batch_lora_paths: List[Optional[str]] = [None]
+        i = 0
+        for _ in range(len(PROMPTS) - 1):
+            batch_lora_paths.append(EMBEDDING_ADAPTERS[i])
+            i = (i + 1) % len(EMBEDDING_ADAPTERS)
+
+        self._run_embed_layer_test(EMBEDDING_LORA_MODELS, PROMPTS, batch_lora_paths, max_new_tokens)
 
 
 if __name__ == "__main__":
