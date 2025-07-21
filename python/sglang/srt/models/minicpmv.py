@@ -724,7 +724,7 @@ class MiniCPMV2_6(MiniCPMBaseModel):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # list of tensors
-        pixel_values = flatten_nested_list([item.pixel_values for item in items])
+        pixel_values = flatten_nested_list([item.feature for item in items])
         tgt_sizes = torch.stack(
             flatten_nested_list([item.tgt_size for item in items]), dim=0
         )
