@@ -653,12 +653,12 @@ class HiPAttentionBackend(AttentionBackend):
                         torch.float16,
                         torch.bfloat16,
                     ]:
-                        assert k_cache.dtype in (torch.float8_e5m2, )
+                        assert k_cache.dtype in (torch.float8_e5m2, torch.float8_e4m3fn), k_cache.dtype
                         if layer.k_scale is not None:
                             descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                             k_descale = layer.k_scale.expand(descale_shape)
                             v_descale = layer.v_scale.expand(descale_shape)
-                            q = q.to(k_cache.dtype)
+                            # q = q.to(k_cache.dtype)
                         # assert layer.k_scale is not None, "fp8 scale should be handled"
 
                 q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
@@ -709,7 +709,7 @@ class HiPAttentionBackend(AttentionBackend):
                         torch.float16,
                         torch.bfloat16,
                     ]:
-                        assert k_cache.dtype in (torch.float8_e5m2, )
+                        assert k_cache.dtype in (torch.float8_e5m2, torch.float8_e4m3fn)
                         assert layer.k_scale is not None, "fp8 scale should be handled"
                 # print(q.shape, k.shape, q_rope.shape, k_rope.shape)
                 # torch.Size([1, 16, 512]) torch.Size([1, 1, 512]) torch.Size([1, 16, 64]) torch.Size([1, 1, 64])
