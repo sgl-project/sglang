@@ -503,7 +503,7 @@ class ForwardBatch:
                 # NOTE: mrope_position_delta can be None on decode warmup, and
                 #       the 'or 0' here prevents None to be accessed by the function here.
                 if batch.decode_mrope_position_delta:
-                    mrope_position_deltas = batch.decode_mrope_position_delta
+                    mrope_position_deltas = [batch.decode_mrope_position_delta[batch_idx]]
                 else:
                     mrope_position_deltas = (
                         [0]
