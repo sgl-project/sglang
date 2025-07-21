@@ -30,9 +30,9 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
+    get_world_group,
     parallel_state,
     tensor_model_parallel_all_reduce,
-    get_world_group,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -572,8 +572,23 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             if self._lp_dispatch:
-                torch.distributed.reduce(torch.zeros(expert_location_dispatch_info.partial_logical_to_all_physical_map_num_valid.shape[0]), dst=0, group=get_world_group().cpu_group, op=torch.distributed.ReduceOp.SUM)
-                torch.distributed.broadcast(torch.zeros_like(expert_location_dispatch_info.partial_logical_to_valid_physical_map), src=0, group=get_world_group().cpu_group)
+                torch.distributed.reduce(
+                    torch.zeros(
+                        expert_location_dispatch_info.partial_logical_to_all_physical_map_num_valid.shape[
+                            0
+                        ]
+                    ),
+                    dst=0,
+                    group=get_world_group().cpu_group,
+                    op=torch.distributed.ReduceOp.SUM,
+                )
+                torch.distributed.broadcast(
+                    torch.zeros_like(
+                        expert_location_dispatch_info.partial_logical_to_valid_physical_map
+                    ),
+                    src=0,
+                    group=get_world_group().cpu_group,
+                )
             topk_idx = torch.full(
                 (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
             )
@@ -668,8 +683,23 @@ class DeepseekV2MoE(nn.Module):
                 )
         else:
             if self._lp_dispatch:
-                torch.distributed.reduce(torch.zeros(expert_location_dispatch_info.partial_logical_to_all_physical_map_num_valid.shape[0]), dst=0, group=get_world_group().cpu_group, op=torch.distributed.ReduceOp.SUM)
-                torch.distributed.broadcast(torch.zeros_like(expert_location_dispatch_info.partial_logical_to_valid_physical_map), src=0, group=get_world_group().cpu_group)
+                torch.distributed.reduce(
+                    torch.zeros(
+                        expert_location_dispatch_info.partial_logical_to_all_physical_map_num_valid.shape[
+                            0
+                        ]
+                    ),
+                    dst=0,
+                    group=get_world_group().cpu_group,
+                    op=torch.distributed.ReduceOp.SUM,
+                )
+                torch.distributed.broadcast(
+                    torch.zeros_like(
+                        expert_location_dispatch_info.partial_logical_to_valid_physical_map
+                    ),
+                    src=0,
+                    group=get_world_group().cpu_group,
+                )
             state.topk_idx_local = torch.full(
                 (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
             )

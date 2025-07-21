@@ -27,7 +27,6 @@ from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
-
 from sglang.srt.eplb.lp_token_dispatch import get_log2phy_prob
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
@@ -363,9 +362,15 @@ def grouped_topk_gpu(
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     if lp_dispatch:
-        num_logical_experts = gating_output.shape[1]  # Number of experts in gating output
-        log2phy_prob = get_log2phy_prob(topk_ids, num_logical_experts, expert_location_dispatch_info)
-        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info, log2phy_prob)
+        num_logical_experts = gating_output.shape[
+            1
+        ]  # Number of experts in gating output
+        log2phy_prob = get_log2phy_prob(
+            topk_ids, num_logical_experts, expert_location_dispatch_info
+        )
+        topk_ids = topk_ids_logical_to_physical(
+            topk_ids, expert_location_dispatch_info, log2phy_prob
+        )
     else:
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
 
@@ -461,8 +466,12 @@ def biased_grouped_topk_impl(
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
     if lp_dispatch:
-        num_logical_experts = gating_output.shape[1]  # Number of experts in gating output
-        log2phy_prob = get_log2phy_prob(topk_ids, num_logical_experts, expert_location_dispatch_info)
+        num_logical_experts = gating_output.shape[
+            1
+        ]  # Number of experts in gating output
+        log2phy_prob = get_log2phy_prob(
+            topk_ids, num_logical_experts, expert_location_dispatch_info
+        )
 
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
@@ -485,9 +494,14 @@ def _mask_topk_ids_padded_region(
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
-    topk_ids, expert_location_dispatch_info, num_token_non_padded, log2phy_prob: Optional[torch.Tensor] = None
+    topk_ids,
+    expert_location_dispatch_info,
+    num_token_non_padded,
+    log2phy_prob: Optional[torch.Tensor] = None,
 ):
-    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info, log2phy_prob)
+    topk_ids = topk_ids_logical_to_physical(
+        topk_ids, expert_location_dispatch_info, log2phy_prob
+    )
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_ids
 
@@ -527,15 +541,22 @@ def biased_grouped_topk_gpu(
             routed_scaling_factor,
         )
         if lp_dispatch:
-            num_logical_experts = gating_output.shape[1]  # Number of experts in gating output
-            log2phy_prob = get_log2phy_prob(topk_ids, num_logical_experts, expert_location_dispatch_info)
+            num_logical_experts = gating_output.shape[
+                1
+            ]  # Number of experts in gating output
+            log2phy_prob = get_log2phy_prob(
+                topk_ids, num_logical_experts, expert_location_dispatch_info
+            )
 
         # TODO merge into kernel
         if (expert_location_dispatch_info is not None) or (
             num_token_non_padded is not None
         ):
             topk_ids = _biased_grouped_topk_postprocess(
-                topk_ids, expert_location_dispatch_info, num_token_non_padded, log2phy_prob
+                topk_ids,
+                expert_location_dispatch_info,
+                num_token_non_padded,
+                log2phy_prob,
             )
         return topk_weights, topk_ids
     elif _use_aiter:
