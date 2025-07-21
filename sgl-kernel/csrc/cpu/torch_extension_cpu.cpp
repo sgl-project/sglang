@@ -133,21 +133,15 @@ at::Tensor int8_scaled_mm_with_quant(
     bool is_vnni);
 
 // int4 gemm
-at::Tensor int4_w4a16_linear(
-    at::Tensor& x,
-    at::Tensor& w,
-    at::Tensor& w_zeros,
-    at::Tensor& w_scales,
-    std::optional<at::Tensor> bias);
+at::Tensor int4_scaled_mm_cpu(
+    at::Tensor& x, at::Tensor& w, at::Tensor& w_zeros, at::Tensor& w_scales, std::optional<at::Tensor> bias);
 
-
+// weight prepack for int4 weights
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-da8w4_linear_prepack_cpu(
-    const at::Tensor& weight,
-    const at::Tensor& scales,
-    const at::Tensor& qzeros);
+convert_int4_weight_packed(const at::Tensor& weight, const at::Tensor& scales, const at::Tensor& qzeros);
 
-at::Tensor da8w4_linear_cpu_with_quant(
+// quant + igemm
+at::Tensor int4_scaled_mm_cpu_with_quant(
     const at::Tensor& input,
     const at::Tensor& weight,
     const at::Tensor& weight_scales,
@@ -329,20 +323,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("int8_scaled_mm_with_quant", torch::kCPU, &int8_scaled_mm_with_quant);
 
   // quant + igemm
+  m.def("int4_scaled_mm_cpu(Tensor x, Tensor w, Tensor w_zeros, Tensor w_scales, Tensor? bias) -> Tensor");
+  m.impl("int4_scaled_mm_cpu", torch::kCPU, &int4_scaled_mm_cpu);
+
+  // quant + igemm
+  m.def("convert_int4_weight_packed(Tensor weight, Tensor scales, Tensor qzeros) -> (Tensor, Tensor,Tensor,Tensor)");
+  m.impl("convert_int4_weight_packed", torch::kCPU, &convert_int4_weight_packed);
+
+  // quant + igemm
   m.def(
-    "int4_w4a16_linear(Tensor x, Tensor w, Tensor w_zeros, Tensor w_scales, Tensor? bias) -> Tensor");
-  m.impl("int4_w4a16_linear", torch::kCPU, &int4_w4a16_linear);
-
-    // quant + igemm
-    m.def(
-        "da8w4_linear_prepack_cpu(Tensor weight, Tensor scales, Tensor qzeros) -> (Tensor, Tensor,Tensor,Tensor)");
-      m.impl("da8w4_linear_prepack_cpu", torch::kCPU, &da8w4_linear_prepack_cpu);
-
-        // quant + igemm
-  m.def(
-    "da8w4_linear_cpu_with_quant(Tensor input, Tensor weight, Tensor weight_scales, Tensor weight_qzeros, Tensor compensation, Tensor? bias, ScalarType output_dtype) -> Tensor");
-  m.impl("da8w4_linear_cpu_with_quant", torch::kCPU, &da8w4_linear_cpu_with_quant);
-
+      "int4_scaled_mm_cpu_with_quant(Tensor input, Tensor weight, Tensor weight_scales, Tensor weight_qzeros, Tensor "
+      "compensation, Tensor? bias, ScalarType output_dtype) -> Tensor");
+  m.impl("int4_scaled_mm_cpu_with_quant", torch::kCPU, &int4_scaled_mm_cpu_with_quant);
 
   // bmm
   m.def("bmm_cpu(Tensor out, Tensor mat1, Tensor mat2, bool is_vnni, Tensor? scale) -> ()");

@@ -114,7 +114,6 @@ inline void parallel_for(int n, const func_t& f) {
 #endif
 }
 
-
 // for 1d parallel, use `actual_nth`
 // for 2d parallel, use even nths, e.g. 43->42
 int inline adjust_num_threads(int m) {
@@ -125,10 +124,8 @@ int inline adjust_num_threads(int m) {
   return std::max(1, (actual_nth >> 1) * 2);
 }
 
-
 template <typename func_t>
 inline void parallel_2d(int m, int n, const func_t& f) {
-
   // make sure we have even num_threads
   int nth = adjust_num_threads(m);
 
@@ -156,21 +153,21 @@ inline void parallel_2d(int m, int n, const func_t& f) {
 
 #if defined(_OPENMP)
 #pragma omp parallel num_threads(nth)
-{
-  int ith = omp_get_thread_num();
-  int ith_m = ith / nth_n;
-  int ith_n = ith % nth_n;
+  {
+    int ith = omp_get_thread_num();
+    int ith_m = ith / nth_n;
+    int ith_n = ith % nth_n;
 
-  int thread_block_m = div_up(m, nth_m);
-  int thread_block_n = div_up(n, nth_n);
+    int thread_block_m = div_up(m, nth_m);
+    int thread_block_n = div_up(n, nth_n);
 
-  int begin_m = ith_m * thread_block_m;
-  int end_m = std::min(m, begin_m + thread_block_m);
-  int begin_n = ith_n * thread_block_n;
-  int end_n = std::min(n, begin_n + thread_block_n);
+    int begin_m = ith_m * thread_block_m;
+    int end_m = std::min(m, begin_m + thread_block_m);
+    int begin_n = ith_n * thread_block_n;
+    int end_n = std::min(n, begin_n + thread_block_n);
 
-  f(begin_m, end_m, begin_n, end_n);
-}
+    f(begin_m, end_m, begin_n, end_n);
+  }
 #else
   f(0, m, 0, n);
 #endif

@@ -38,7 +38,10 @@ inline bool can_use_brgemm<at::Float8_e4m3fn>(int M) {
   return M > 4;
 }
 
-template <> inline bool can_use_brgemm<at::quint4x2>(int M) { return M > 4; }
+template <>
+inline bool can_use_brgemm<at::quint4x2>(int M) {
+  return M > 4;
+}
 
 // work around compiler internal error
 #define BLOCK_K 128  // 4 * TILE_K

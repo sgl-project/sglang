@@ -1,8 +1,9 @@
-#include "vec.h"
-#include <torch/all.h>
 #include <ATen/cpu/vec/vec.h>
 #include <ATen/native/CPUBlas.h>
 #include <c10/util/Unroll.h>
+#include <torch/all.h>
+
+#include "vec.h"
 
 namespace {
 
@@ -21,18 +22,17 @@ bool cpublas_could_pack() {
   return cpublas_can_pack;
 }
 
-template<bool sym_quant_a>
+template <bool sym_quant_a>
 struct ActDtype;
-template<>
+template <>
 struct ActDtype<true> {
   using type = uint8_t;
 };
 
-template<>
+template <>
 struct ActDtype<false> {
   using type = uint8_t;
 };
-
 
 #if defined(CPU_CAPABILITY_AVX512)
 inline std::array<__m256i, 2> load_zps_4vnni(const int8_t* __restrict__ zps) {
@@ -44,39 +44,8 @@ inline std::array<__m256i, 2> load_zps_4vnni(const int8_t* __restrict__ zps) {
   // 01234567012345670123456701234567
   // to
   // 00001111222233334444555566667777
-  __m256i shuffle_mask = _mm256_set_epi8(
-      7,
-      7,
-      7,
-      7,
-      6,
-      6,
-      6,
-      6,
-      5,
-      5,
-      5,
-      5,
-      4,
-      4,
-      4,
-      4,
-      3,
-      3,
-      3,
-      3,
-      2,
-      2,
-      2,
-      2,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0);
+  __m256i shuffle_mask =
+      _mm256_set_epi8(7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
   vzps_low = _mm256_shuffle_epi8(vzps_low, shuffle_mask);
   vzps_high = _mm256_shuffle_epi8(vzps_high, shuffle_mask);
   return {vzps_low, vzps_high};
@@ -92,11 +61,7 @@ inline std::array<__m256i, 2> load_uint4_as_int8(const uint8_t* __restrict__ qB)
 }
 
 template <int64_t N, int64_t ldb>
-void _dequant_weight_zp_only(
-    const uint8_t* __restrict__ B,
-    int8_t* dqB,
-    const int8_t* __restrict__ qzeros,
-    int64_t K) {
+void _dequant_weight_zp_only(const uint8_t* __restrict__ B, int8_t* dqB, const int8_t* __restrict__ qzeros, int64_t K) {
   // unpack weight int8 -> two int4
   // subtract zero point
   // B shape = [K, ldb] = [K, N / 2], actual shape = [K / 4, N / 2, 4]
@@ -160,8 +125,7 @@ void _dequant_and_store(
       if constexpr (sym_quant_a) {
         dq_val = (float)input[m * ldi + n] * a_scale * scale_b[n];
       } else {
-        dq_val =
-          (float)(input[m * ldi + n] - a_zp * comp_b[n]) * a_scale * scale_b[n];
+        dq_val = (float)(input[m * ldi + n] - a_zp * comp_b[n]) * a_scale * scale_b[n];
       }
       if constexpr (accum) {
         output[m * ldo + n] += dq_val;
@@ -173,12 +137,8 @@ void _dequant_and_store(
 }
 
 #else
-template<int64_t N, int64_t ldb>
-void _dequant_weight_zp_only(
-    const uint8_t* B,
-    int8_t* dqB,
-    const int8_t* qzeros,
-    int64_t K) {
+template <int64_t N, int64_t ldb>
+void _dequant_weight_zp_only(const uint8_t* B, int8_t* dqB, const int8_t* qzeros, int64_t K) {
   // B shape = [K, N / 2]
   // dqB shape = [K, N]
   for (int k = 0; k < K; ++k) {
@@ -225,7 +185,7 @@ void _dequant_gemm_accum_small_M(
   constexpr int COLS = N / 16;
   // Computing compensation is faster than loading it for small M
   // because it's memory bound.
-  __m512i ones = _mm512_set1_epi8(1); // used for computing compensation
+  __m512i ones = _mm512_set1_epi8(1);  // used for computing compensation
   __m512i va;
   __m512i vb[COLS];
   __m512i vc[M * COLS];
@@ -235,14 +195,13 @@ void _dequant_gemm_accum_small_M(
 
   // Load scales and zps
   c10::ForcedUnroll<COLS>{}([&](auto i) {
-      vscales[i] = _mm512_loadu_ps(scales_b + i * 16);
-      vzps[i] = combine_m256i(load_zps_4vnni(qzeros_b + i * 16));
-      if constexpr (!sym_quant_a) {
-        vcompensate[i] = _mm512_setzero_epi32();
-      }
-    });
-  c10::ForcedUnroll<M * COLS>{}(
-      [&](auto i) { vc[i] = _mm512_setzero_epi32(); });
+    vscales[i] = _mm512_loadu_ps(scales_b + i * 16);
+    vzps[i] = combine_m256i(load_zps_4vnni(qzeros_b + i * 16));
+    if constexpr (!sym_quant_a) {
+      vcompensate[i] = _mm512_setzero_epi32();
+    }
+  });
+  c10::ForcedUnroll<M * COLS>{}([&](auto i) { vc[i] = _mm512_setzero_epi32(); });
 
   auto compute = [&](auto i, int k) {
     constexpr const int row = i / COLS;
@@ -257,15 +216,14 @@ void _dequant_gemm_accum_small_M(
       vb[col] = combine_m256i(load_uint4_as_int8(B + B_offset));
       vb[col] = _mm512_sub_epi8(vb[col], vzps[col]);
       if constexpr (!sym_quant_a) {
-          vcompensate[col] =
-              _mm512_dpbusd_epi32(vcompensate[col], ones, vb[col]);
+        vcompensate[col] = _mm512_dpbusd_epi32(vcompensate[col], ones, vb[col]);
       }
       _mm_prefetch(B + B_offset + 128 * ldb, _MM_HINT_T0);
     }
     if constexpr (sym_quant_a) {
-        auto vsb = _mm512_sign_epi8(vb[col], va);
-        auto vabsa = _mm512_sign_epi8(va, va);
-        vc[i] = _mm512_dpbusds_epi32(vc[i], vabsa, vsb);
+      auto vsb = _mm512_sign_epi8(vb[col], va);
+      auto vabsa = _mm512_sign_epi8(va, va);
+      vc[i] = _mm512_dpbusds_epi32(vc[i], vabsa, vsb);
     } else {
       vc[i] = _mm512_dpbusd_epi32(vc[i], va, vb[col]);
     }
@@ -275,9 +233,7 @@ void _dequant_gemm_accum_small_M(
   constexpr const int unroll = 4;
   int k = 0;
   for (; k < K / 4 / unroll; k++) {
-    c10::ForcedUnroll<unroll>{}([&](auto i) {
-      c10::ForcedUnroll<M * COLS>{}(compute, 4 * (k * unroll + i));
-    });
+    c10::ForcedUnroll<unroll>{}([&](auto i) { c10::ForcedUnroll<M * COLS>{}(compute, 4 * (k * unroll + i)); });
   }
   k *= 4 * unroll;
   for (; k < K; k += 4) {
@@ -291,10 +247,7 @@ void _dequant_gemm_accum_small_M(
     // compute (qC - compensate * zp_a) * scale_a * scale_b
     __m512 vc_float;
     if constexpr (!sym_quant_a) {
-      vc[i] = _mm512_sub_epi32(
-          vc[i],
-          _mm512_mullo_epi32(
-              vcompensate[col], _mm512_set1_epi32(*(qzeros_a + row))));
+      vc[i] = _mm512_sub_epi32(vc[i], _mm512_mullo_epi32(vcompensate[col], _mm512_set1_epi32(*(qzeros_a + row))));
     }
     vc_float = _mm512_cvtepi32_ps(vc[i]);
     vc_float = _mm512_mul_ps(vc_float, _mm512_set1_ps(*(scales_a + row)));
@@ -305,21 +258,10 @@ void _dequant_gemm_accum_small_M(
     _mm512_storeu_ps(C + row * ldc + col * 16, vc_float);
   };
   c10::ForcedUnroll<M * COLS>{}(store);
-
 }
 
 #define call_dequant_gemm_accum_small_M(M) \
-  _dequant_gemm_accum_small_M<M, N, ldb, sym_quant_a>( \
-      C, \
-      A, \
-      scales_a, \
-      qzeros_a, \
-      B, \
-      scales_b, \
-      qzeros_b, \
-      K, \
-      lda, \
-      ldc);
+  _dequant_gemm_accum_small_M<M, N, ldb, sym_quant_a>(C, A, scales_a, qzeros_a, B, scales_b, qzeros_b, K, lda, ldc);
 #endif
 
 template <bool cpublas_can_pack, int64_t N, int64_t ldb, bool sym_quant_a>
@@ -365,30 +307,11 @@ void _dequant_gemm_accum(
   if constexpr (cpublas_can_pack) {
     int32_t C_i32[M * N];
     at::native::cpublas::brgemm(
-        M,
-        N,
-        K,
-        lda,
-        N /*ldb*/,
-        N /*ldc*/,
-        false /* add_C */,
-        A_ptr,
-        dqB,
-        C_i32,
-        true /* is_vnni */);
+        M, N, K, lda, N /*ldb*/, N /*ldc*/, false /* add_C */, A_ptr, dqB, C_i32, true /* is_vnni */);
     _mm_prefetch(B + N * K / 2, _MM_HINT_T0);
     _mm_prefetch(A + K, _MM_HINT_T0);
     _dequant_and_store<true, N, sym_quant_a>(
-        C,
-        C_i32,
-        scales_a,
-        qzeros_a,
-        scales_b,
-        compensation,
-        M,
-        N /*ldi*/,
-        ldc,
-        1 /*ldsa*/);
+        C, C_i32, scales_a, qzeros_a, scales_b, compensation, M, N /*ldi*/, ldc, 1 /*ldsa*/);
   } else
 #endif
   {
@@ -408,7 +331,7 @@ void _dequant_gemm_accum(
   }
 }
 
-template<int64_t N>
+template <int64_t N>
 inline void copy_bias(const float* bias_ptr, float* y_buf, int64_t m) {
   if (bias_ptr) {
     for (int i = 0; i < m; ++i) {
@@ -424,7 +347,7 @@ inline void copy_bias(const float* bias_ptr, float* y_buf, int64_t m) {
         y_buf[i * N + j] = bias_ptr[j];
       }
     }
-  } else { // initialize to zero
+  } else {  // initialize to zero
     for (int i = 0; i < m; ++i) {
       int j = 0;
 #if defined(CPU_CAPABILITY_AVX512)
@@ -441,7 +364,7 @@ inline void copy_bias(const float* bias_ptr, float* y_buf, int64_t m) {
   }
 }
 
-template<typename out_dtype, int64_t N>
+template <typename out_dtype, int64_t N>
 inline void store_out(const float* y_buf, out_dtype* c_ptr, int64_t m, /* int64_t n, */ int64_t lda) {
   for (int i = 0; i < m; ++i) {
     int j = 0;
@@ -486,13 +409,11 @@ inline void store_out(const float* y_buf, out_dtype* c_ptr, int64_t m, /* int64_
   }
 }
 
-
 // https://github.com/InternLM/lmdeploy/blob/086481ed84b59bee3b8e4274e5fc69620040c048/lmdeploy/pytorch/kernels/cuda/w8a8_triton_kernels.py#L282
 template <typename scalar_t>
-inline void quantize_row_int8_sym(int8_t* __restrict__ Aq, float& As,
-    const scalar_t* __restrict__ A, int64_t K, float eps = 1e-7) {
-
-  float amax = 0.f; // absolute max
+inline void
+quantize_row_int8_sym(int8_t* __restrict__ Aq, float& As, const scalar_t* __restrict__ A, int64_t K, float eps = 1e-7) {
+  float amax = 0.f;  // absolute max
   for (int64_t k = 0; k < K; ++k) {
     const float val = static_cast<float>(A[k]);
     amax = std::max(amax, std::abs(val));
@@ -511,9 +432,8 @@ inline void quantize_row_int8_sym(int8_t* __restrict__ Aq, float& As,
 
 #if defined(CPU_CAPABILITY_AVX512)
 template <>
-inline void quantize_row_int8_sym<at::BFloat16>(int8_t* __restrict__ Aq, float& As,
-    const at::BFloat16* __restrict__ A, int64_t K, float eps) {
-
+inline void quantize_row_int8_sym<at::BFloat16>(
+    int8_t* __restrict__ Aq, float& As, const at::BFloat16* __restrict__ A, int64_t K, float eps) {
   const __m512 signBit = _mm512_set1_ps(-0.0f);
   // K is 32x, no remainder
   float amax = 0.f;
@@ -556,8 +476,7 @@ std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu_sym(at::Tensor& A) {
   int64_t lda = A.stride(0);
 
   const auto st = A.scalar_type();
-  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf,
-      "per_token_quant_int8: expect A to be bfloat16 or half.");
+  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf, "per_token_quant_int8: expect A to be bfloat16 or half.");
 
   auto Aq = at::empty({M, K}, A.options().dtype(c10::kChar));
   auto As = at::empty({M}, A.options().dtype(at::kFloat));
@@ -567,20 +486,16 @@ std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu_sym(at::Tensor& A) {
     float* __restrict__ As_data = As.data_ptr<float>();
     const scalar_t* __restrict__ A_data = A.data_ptr<scalar_t>();
 
-    at::parallel_for(0, M, 0, [&] (int64_t begin, int64_t end) {
+    at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
       for (int64_t m = begin; m < end; ++m) {
-        quantize_row_int8_sym<scalar_t>(
-            Aq_data + m * K,
-            As_data[m],
-            A_data + m * lda,
-            K);
+        quantize_row_int8_sym<scalar_t>(Aq_data + m * K, As_data[m], A_data + m * lda, K);
       }
     });
   });
   return std::make_tuple(Aq, As);
 }
 
-template<typename out_dtype, bool cpublas_can_pack, bool sym_quant_a>
+template <typename out_dtype, bool cpublas_can_pack, bool sym_quant_a>
 void _da8w4_linear_impl(
     const at::Tensor& input,
     const at::Tensor& input_scales,
@@ -597,7 +512,7 @@ void _da8w4_linear_impl(
   auto input_view = input.view({-1, K});
   int64_t M = input_view.size(0);
   TORCH_CHECK(input_scales.numel() == M, "DA8W4: unexpected input scales shape");
-  if(not sym_quant_a){
+  if (not sym_quant_a) {
     TORCH_CHECK(input_scales.sizes() == input_qzeros.sizes(), "DA8W4: unexpected input qzeros shape");
   }
 
@@ -629,8 +544,7 @@ void _da8w4_linear_impl(
   // scales/qzeros shape = [Nc, G, block_n]
   int64_t num_groups = weight_scales.size(1);
   int64_t group_size = K / num_groups;
-  TORCH_CHECK(group_size % block_k == 0,
-              "DA8W4 CPU: group_size should be divisible by block_k");
+  TORCH_CHECK(group_size % block_k == 0, "DA8W4 CPU: group_size should be divisible by block_k");
   int64_t block_per_group = group_size / block_k;
 
   using Tin = typename ActDtype<sym_quant_a>::type;
@@ -658,25 +572,21 @@ void _da8w4_linear_impl(
         copy_bias<block_n>(bias_data, y_buf[0], m_size);
         for (int kci = 0; kci < Kc; ++kci) {
           _dequant_gemm_accum<cpublas_can_pack, block_n, block_n / 2, sym_quant_a>(
-            y_buf[0] /*C*/,
-            (uint8_t*)a_ptr + mci * block_m * K + kci * block_k /*A*/,
-            a_scales_ptr + mci * block_m /*scales_a*/,
-            a_qzeros_ptr + mci * block_m /*qzeros_a*/,
-            b_ptr + (nc * Kc + kci) * block_n * block_k / 2 /*B*/,
-            b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n /*scales_b*/,
-            b_qzeros_ptr + nc * block_n * num_groups + kci / block_per_group * block_n /*qzeros_b*/,
-            compensation_ptr + nc * block_n * Kc + kci * block_n /*compensation*/,
-            m_size /*M*/,
-            block_k /*K*/,
-            K /*lda*/,
-            block_n /*ldc*/);
+              y_buf[0] /*C*/,
+              (uint8_t*)a_ptr + mci * block_m * K + kci * block_k /*A*/,
+              a_scales_ptr + mci * block_m /*scales_a*/,
+              a_qzeros_ptr + mci * block_m /*qzeros_a*/,
+              b_ptr + (nc * Kc + kci) * block_n * block_k / 2 /*B*/,
+              b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n /*scales_b*/,
+              b_qzeros_ptr + nc * block_n * num_groups + kci / block_per_group * block_n /*qzeros_b*/,
+              compensation_ptr + nc * block_n * Kc + kci * block_n /*compensation*/,
+              m_size /*M*/,
+              block_k /*K*/,
+              K /*lda*/,
+              block_n /*ldc*/);
         }
         // store y_buf to output with dtype conversion
-        store_out<out_dtype, block_n>(
-          y_buf[0],
-          c_ptr + mci * block_m * N + nc * block_n,
-          m_size,
-          N /*lda*/);
+        store_out<out_dtype, block_n>(y_buf[0], c_ptr + mci * block_m * N + nc * block_n, m_size, N /*lda*/);
       }
     }
     if constexpr (cpublas_can_pack) {
@@ -685,25 +595,18 @@ void _da8w4_linear_impl(
   });
 }
 
-
-
-} // anonymous namespace
+}  // anonymous namespace
 
 /*
 return: packed_weight, packed_scales, packed_qzeros, compensation
 */
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-da8w4_linear_prepack_cpu(
-    const at::Tensor& weight,
-    const at::Tensor& scales,
-    const at::Tensor& qzeros) {
+convert_int4_weight_packed(const at::Tensor& weight, const at::Tensor& scales, const at::Tensor& qzeros) {
   // weight shape = [N, K]
   // scales shape = [N, G]
   // qzeros shape = [N, G]
-  TORCH_CHECK(weight.dim() == 2,
-              "DA8W4 CPU: Weight should be a 2D tensor for packing");
-  TORCH_CHECK(weight.size(1) % 2 == 0,
-              "DA8W4 CPU: Weight should have even number of columns for packing");
+  TORCH_CHECK(weight.dim() == 2, "DA8W4 CPU: Weight should be a 2D tensor for packing");
+  TORCH_CHECK(weight.size(1) % 2 == 0, "DA8W4 CPU: Weight should have even number of columns for packing");
 
   auto new_scales = scales;
   auto new_qzeros = qzeros;
@@ -754,7 +657,7 @@ da8w4_linear_prepack_cpu(
         // packed shape = [block_k / 4, block_n / 2, 4] viewed as [block_k, block_n / 2]
         constexpr int n_group_size = 8;
         constexpr int vnni_size = 4;
-        constexpr int n_group = block_n / n_group_size; // 4
+        constexpr int n_group = block_n / n_group_size;  // 4
         for (int nb = 0; nb < n_group; nb += 2) {
           for (int k = 0; k < block_k; k += vnni_size) {
             for (int ni = 0; ni < n_group_size; ++ni) {
@@ -773,86 +676,68 @@ da8w4_linear_prepack_cpu(
       }
     });
   } else
-  #endif
+#endif
   {
     // Pack weight: two int4 -> one int8
     using namespace at::indexing;
-    at::Tensor even_columns =
-        weight_reordered.index({Slice(), Slice(), Slice(), Slice(1, None, 2)});
+    at::Tensor even_columns = weight_reordered.index({Slice(), Slice(), Slice(), Slice(1, None, 2)});
     even_columns = even_columns.bitwise_left_shift(4);
-    at::Tensor odd_columns =
-        weight_reordered.index({Slice(), Slice(), Slice(), Slice(None, None, 2)});
+    at::Tensor odd_columns = weight_reordered.index({Slice(), Slice(), Slice(), Slice(None, None, 2)});
     blocked_weight = even_columns.bitwise_or(odd_columns);
   }
 
-  return std::make_tuple(std::move(blocked_weight), std::move(blocked_scales), std::move(blocked_qzeros), std::move(compensation));
+  return std::make_tuple(
+      std::move(blocked_weight), std::move(blocked_scales), std::move(blocked_qzeros), std::move(compensation));
 }
 
+at::Tensor int4_scaled_mm_cpu_with_quant(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const at::Tensor& weight_scales,
+    const at::Tensor& weight_qzeros,
+    const at::Tensor& compensation,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType output_dtype) {
+  RECORD_FUNCTION("sgl-kernel::int4_scaled_mm_cpu_with_quant", std::vector<c10::IValue>({input, weight}));
 
-at::Tensor da8w4_linear_cpu_with_quant(
-  const at::Tensor& input,
-  const at::Tensor& weight,
-  const at::Tensor& weight_scales,
-  const at::Tensor& weight_qzeros,
-  const at::Tensor& compensation,
-  const std::optional<at::Tensor>& bias,
-  at::ScalarType output_dtype) {
-  RECORD_FUNCTION(
-      "sgl-kernel::da8w4_linear_cpu_with_quant", std::vector<c10::IValue>({input, weight}));
+  int64_t M_a = input.size(0);
+  int64_t K_a = input.size(1);
+  int64_t lda = input.stride(0);
 
-int64_t M_a = input.size(0);
-int64_t K_a = input.size(1);
-int64_t lda = input.stride(0);
+  const auto st = input.scalar_type();
+  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf, "per_token_quant_int8: expect A to be bfloat16 or half.");
 
-const auto st = input.scalar_type();
-TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf,
-    "per_token_quant_int8: expect A to be bfloat16 or half.");
+  auto Aq = at::empty({M_a, K_a}, input.options().dtype(c10::kByte));
+  auto As = at::empty({M_a}, input.options().dtype(at::kFloat));
+  auto Azp = at::ones({M_a}, input.options().dtype(at::kInt));
+  Azp = Azp.mul(128);
+  static bool cpublas_can_pack = cpublas_could_pack();
+  bool sym_quant_a = false;
+  auto out_sizes = input.sizes().vec();
+  int64_t N = weight.size(0) * weight.size(-1) * 2;
+  out_sizes.back() = N;
+  auto output = at::empty(out_sizes, input.options().dtype(output_dtype));
 
-auto Aq = at::empty({M_a, K_a}, input.options().dtype(c10::kByte));
-auto As = at::empty({M_a}, input.options().dtype(at::kFloat));
-auto Azp = at::ones({M_a}, input.options().dtype(at::kInt));
-Azp = Azp.mul(128);
-static bool cpublas_can_pack = cpublas_could_pack();
-bool sym_quant_a = false;
-auto out_sizes = input.sizes().vec();
-int64_t N = weight.size(0) * weight.size(-1) * 2;
-out_sizes.back() = N;
-auto output = at::empty(out_sizes, input.options().dtype(output_dtype));
-
-#define call__da8w4_linear_with_quant_impl(cpublas_can_pack, sym_quant_act) \
-  AT_DISPATCH_FLOATING_TYPES_AND2( \
-      at::ScalarType::BFloat16, at::ScalarType::Half, output_dtype, "da8w4_linear_cpu_with_quant", [&] { \
-        uint8_t* __restrict__ Aq_data = Aq.data_ptr<uint8_t>(); \
-        float* __restrict__ As_data = As.data_ptr<float>();\
-        int32_t* __restrict__ Azp_data = Azp.data_ptr<int32_t>();\
-        const scalar_t* __restrict__ A_data = input.data_ptr<scalar_t>();\
-        at::parallel_for(0, M_a, 0, [&] (int64_t begin, int64_t end) {\
-          for (int64_t m = begin; m < end; ++m) {\
-            quantize_row_int8<scalar_t>(\
-                Aq_data + m * K_a,\
-                As_data[m],\
-                A_data + m * lda,\
-                K_a);\
-          }\
-        });\
-        _da8w4_linear_impl<scalar_t, cpublas_can_pack, sym_quant_act>( \
-            Aq, \
-            As, \
-            Azp, \
-            weight, \
-            weight_scales, \
-            weight_qzeros, \
-            compensation, \
-            bias, \
-            output); \
+#define call__da8w4_linear_with_quant_impl(cpublas_can_pack, sym_quant_act)                                \
+  AT_DISPATCH_FLOATING_TYPES_AND2(                                                                         \
+      at::ScalarType::BFloat16, at::ScalarType::Half, output_dtype, "int4_scaled_mm_cpu_with_quant", [&] { \
+        uint8_t* __restrict__ Aq_data = Aq.data_ptr<uint8_t>();                                            \
+        float* __restrict__ As_data = As.data_ptr<float>();                                                \
+        int32_t* __restrict__ Azp_data = Azp.data_ptr<int32_t>();                                          \
+        const scalar_t* __restrict__ A_data = input.data_ptr<scalar_t>();                                  \
+        at::parallel_for(0, M_a, 0, [&](int64_t begin, int64_t end) {                                      \
+          for (int64_t m = begin; m < end; ++m) {                                                          \
+            quantize_row_int8<scalar_t>(Aq_data + m * K_a, As_data[m], A_data + m * lda, K_a);             \
+          }                                                                                                \
+        });                                                                                                \
+        _da8w4_linear_impl<scalar_t, cpublas_can_pack, sym_quant_act>(                                     \
+            Aq, As, Azp, weight, weight_scales, weight_qzeros, compensation, bias, output);                \
       });
 
-if (cpublas_can_pack) {
+  if (cpublas_can_pack) {
     call__da8w4_linear_with_quant_impl(true, false);
-} else {
+  } else {
     call__da8w4_linear_with_quant_impl(false, false);
+  }
+  return output;
 }
-return output;
-}
-
-
