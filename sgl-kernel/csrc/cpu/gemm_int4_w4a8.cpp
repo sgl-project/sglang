@@ -24,10 +24,10 @@ bool cpublas_could_pack() {
 template <bool sym_quant_a>
 struct ActDtype;
 template <>
+template <>
 struct ActDtype<true> {
-  using type = uint8_t;
+  using type = int8_t;
 };
-
 template <>
 struct ActDtype<false> {
   using type = uint8_t;
