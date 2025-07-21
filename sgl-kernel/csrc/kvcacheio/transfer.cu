@@ -4,21 +4,30 @@
 
 #include <cstdint>
 
+#include "utils.h"  // WARP_SIZE
+#ifndef USE_ROCM
 #include "pytorch_extension_utils.h"
+#else
+#include "pytorch_extension_utils_rocm.h"
+#endif
 
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
-  // todo, different chunk size
-  int total_chunks = item_size_bytes / 8;
-  const int64_t* src_8 = reinterpret_cast<const int64_t*>(src_addr);
-  int64_t* dst_8 = reinterpret_cast<int64_t*>(dst_addr);
+  const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
+  uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
+  const int total_chunks = item_size_bytes / sizeof(uint64_t);
+
 #pragma unroll
-  for (int j = lane_id; j < total_chunks; j += 32) {
-    const int64_t* src_addr_lane = &src_8[j];
-    int64_t* dst_addr_lane = &dst_8[j];
-    int64_t temp_val;
-    asm volatile("ld.global.nc.b64 %0, [%1];" : "=l"(temp_val) : "l"(src_addr_lane) : "memory");
-    asm volatile("st.global.cg.b64 [%0], %1;" ::"l"(dst_addr_lane), "l"(temp_val) : "memory");
+  for (int j = lane_id; j < total_chunks; j += WARP_SIZE) {
+#ifndef USE_ROCM
+    uint64_t tmp;
+    asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src + j) : "memory");
+    asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst + j), "l"(tmp) : "memory");
+
+#else
+    uint64_t tmp = __builtin_nontemporal_load(src + j);
+    __builtin_nontemporal_store(tmp, dst + j);
+#endif
   }
 }
 
