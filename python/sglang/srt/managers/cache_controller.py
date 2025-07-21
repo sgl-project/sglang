@@ -249,6 +249,12 @@ class HiCacheController:
                 self.enable_storage = True
                 # todo: threshold policy for prefetching
                 self.prefetch_threshold = prefetch_threshold
+            elif storage_backend == "nixl":
+                from sglang.srt.mem_cache.hicache_nixl import HiCacheNixl
+                self.storage_backend = HiCacheNixl()
+                self.enable_storage = True
+                # todo: threshold policy for prefetching
+                self.prefetch_threshold = prefetch_threshold
             else:
                 raise NotImplementedError(
                     f"Unsupported storage backend: {storage_backend}"
