@@ -131,110 +131,199 @@ jobs:
         SERVER_PID=$!
         echo "server_pid=$SERVER_PID" >> $GITHUB_OUTPUT
 
-        echo "Waiting for router to become healthy..."
-        TIMEOUT=300
-        ELAPSED=0
-        while [ $ELAPSED -lt $TIMEOUT ]; do
-          if curl --connect-timeout 5 --silent http://127.0.0.9:8000 > /dev/null 2>&1; then
-            echo "✓ Router is reachable"
-            break
+        # Wait for all 8 servers to be healthy (script already does this)
+        wait_count=0
+        while [ $wait_count -lt 30 ]; do
+          if ps -p $SERVER_PID > /dev/null; then
+            # Check if the startup script printed success message
+            sleep 2
+            wait_count=$((wait_count + 1))
+          else
+            # Script exited - check if it was successful
+            wait $SERVER_PID
+            exit_code=$?
+            if [ $exit_code -eq 0 ]; then
+              echo "✓ All disaggregation servers are healthy"
+              break
+            else
+              echo "Error: Server startup failed with code $exit_code"
+              exit 1
+            fi
           fi
-          if ! ps -p $SERVER_PID > /dev/null; then
-            echo "Error: Server processes failed to start"
-            exit 1
-          fi
-          echo "Waiting for router... (${ELAPSED}s/${TIMEOUT}s)"
-          sleep 10
-          ELAPSED=$((ELAPSED + 10))
         done
 
-        if [ $ELAPSED -ge $TIMEOUT ]; then
-          echo "Error: Router health check timeout after ${TIMEOUT}s"
-          exit 1
-        fi
+        echo "✓ Servers started (PID: $SERVER_PID)"
 
-        echo "✓ Servers started and healthy (PID: $SERVER_PID)"
-
-    - name: Test API functionality
-      timeout-minutes: 5
+    - name: Test all policies sequentially
+      timeout-minutes: 30
       run: |
+        POLICIES=("random" "round_robin" "cache_aware" "power_of_two")
         BASE_URL="http://127.0.0.9:8000"
 
-        echo "Testing API completions..."
-        response=$(curl -s -X POST "$BASE_URL/v1/chat/completions" \
-          -H "Content-Type: application/json" \
-          -H "Authorization: Bearer test-token" \
-          -d '{
-            "model": "/raid/models/meta-llama/Llama-3.1-8B-Instruct",
-            "messages": [
-              {"role": "user", "content": "Write a Python function to calculate fibonacci numbers recursively"}
-            ],
-            "stream": false,
-            "max_tokens": 100
-          }')
+        for policy in "${POLICIES[@]}"; do
+          echo ""
+          echo "=================================================="
+          echo "Testing policy: $policy"
+          echo "=================================================="
 
-        if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
-          echo "✓ API test passed"
-        else
-          echo "✗ API test failed: $response"
-          exit 1
-        fi
+          # Start router with the current policy
+          echo "Starting router with policy: $policy..."
+          python3 -m sglang_router.launch_router \
+            --pd-disaggregation \
+            --policy "$policy" \
+            --prefill http://127.0.0.1:30001 9001 \
+            --prefill http://127.0.0.2:30002 9002 \
+            --prefill http://127.0.0.3:30003 9003 \
+            --prefill http://127.0.0.4:30004 9004 \
+            --decode http://127.0.0.5:30005 \
+            --decode http://127.0.0.6:30006 \
+            --decode http://127.0.0.7:30007 \
+            --decode http://127.0.0.8:30008 \
+            --host 127.0.0.9 \
+            --port 8000 &
+          ROUTER_PID=$!
 
-        echo "Testing streaming API..."
-        stream_response=$(timeout 30 curl -s -X POST "$BASE_URL/v1/chat/completions" \
-          -H "Content-Type: application/json" \
-          -H "Authorization: Bearer test-token" \
-          -d '{
-            "model": "/raid/models/meta-llama/Llama-3.1-8B-Instruct",
-            "messages": [
-              {"role": "user", "content": "Count from 1 to 5"}
-            ],
-            "stream": true,
-            "max_tokens": 50
-          }')
+          # Wait for router to become healthy
+          echo "Waiting for router to become healthy..."
+          TIMEOUT=60
+          ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            if curl --connect-timeout 5 --silent http://127.0.0.9:8000 > /dev/null 2>&1; then
+              echo "✓ Router is reachable"
+              break
+            fi
+            if ! ps -p $ROUTER_PID > /dev/null; then
+              echo "Error: Router process died"
+              exit 1
+            fi
+            sleep 5
+            ELAPSED=$((ELAPSED + 5))
+          done
 
-        if echo "$stream_response" | grep -q "data:"; then
-          echo "✓ Streaming API test passed"
-        else
-          echo "✗ Streaming API test failed"
-          exit 1
-        fi
+          if [ $ELAPSED -ge $TIMEOUT ]; then
+            echo "Error: Router health check timeout"
+            kill $ROUTER_PID 2>/dev/null || true
+            exit 1
+          fi
 
-    - name: Run benchmark test
-      timeout-minutes: 5
-      run: |
-        echo "Running benchmark test..."
-        benchmark_output=$(python3 -m sglang.bench_one_batch_server \
-          --model-path "/raid/models/meta-llama/Llama-3.1-8B-Instruct" \
-          --base-url "http://127.0.0.9:8000" \
-          --batch-size 8 \
-          --input-len 4096 \
-          --output-len 5 \
-          --skip-warmup)
+          # Test API functionality
+          echo "Testing API completions for $policy..."
+          response=$(curl -s -X POST "$BASE_URL/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer test-token" \
+            -d '{
+              "model": "/raid/models/meta-llama/Llama-3.1-8B-Instruct",
+              "messages": [
+                {"role": "user", "content": "Write a Python function to calculate fibonacci numbers recursively"}
+              ],
+              "stream": false,
+              "max_tokens": 100
+            }')
 
-        echo "$benchmark_output"
+          if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
+            echo "✓ API test passed for $policy"
+          else
+            echo "✗ API test failed for $policy: $response"
+            kill $ROUTER_PID 2>/dev/null || true
+            exit 1
+          fi
 
-        # Extract metrics from output
-        latency=$(echo "$benchmark_output" | grep "latency:" | awk '{print $2}' | sed 's/s//')
-        input_throughput=$(echo "$benchmark_output" | grep "input throughput:" | awk '{print $3}')
-        output_throughput=$(echo "$benchmark_output" | grep "output throughput:" | awk '{print $3}')
+          # Test streaming
+          echo "Testing streaming API for $policy..."
+          stream_response=$(timeout 30 curl -s -X POST "$BASE_URL/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer test-token" \
+            -d '{
+              "model": "/raid/models/meta-llama/Llama-3.1-8B-Instruct",
+              "messages": [
+                {"role": "user", "content": "Count from 1 to 5"}
+              ],
+              "stream": true,
+              "max_tokens": 50
+            }')
 
-        # Validate performance (latency<1.5s, input>20k, output>1k)
-        command -v bc >/dev/null || (apt-get update && apt-get install -y bc)
+          if echo "$stream_response" | grep -q "data:"; then
+            echo "✓ Streaming API test passed for $policy"
+          else
+            echo "✗ Streaming API test failed for $policy"
+            kill $ROUTER_PID 2>/dev/null || true
+            exit 1
+          fi
 
-        echo "Performance: ${latency}s | ${input_throughput} | ${output_throughput} tok/s"
+          # Run benchmark
+          echo "Running benchmark for $policy..."
+          benchmark_output=$(python3 -m sglang.bench_one_batch_server \
+            --model-path "/raid/models/meta-llama/Llama-3.1-8B-Instruct" \
+            --base-url "http://127.0.0.9:8000" \
+            --batch-size 8 \
+            --input-len 4096 \
+            --output-len 5 \
+            --skip-warmup)
 
-        fail=""
-        (( $(echo "$latency > 1.5" | bc -l) )) && fail="Latency too high (${latency}s>1.5s) "
-        (( $(echo "$input_throughput < 20000" | bc -l) )) && fail="${fail}Input too low (${input_throughput}<20k) "
-        (( $(echo "$output_throughput < 1000" | bc -l) )) && fail="${fail}Output too low (${output_throughput}<1k) "
+          echo "$benchmark_output"
 
-        if [ -n "$fail" ]; then
-          echo "✗ Benchmark failed: $fail"
-          exit 1
-        else
-          echo "✓ Performance validation passed"
-        fi
+          # Save benchmark output
+          echo "$benchmark_output" > "benchmark_${policy}.txt"
+
+          # Extract and validate metrics
+          latency=$(echo "$benchmark_output" | grep "latency:" | awk '{print $2}' | sed 's/s//')
+          input_throughput=$(echo "$benchmark_output" | grep "input throughput:" | awk '{print $3}')
+          output_throughput=$(echo "$benchmark_output" | grep "output throughput:" | awk '{print $3}')
+
+          command -v bc >/dev/null || (apt-get update && apt-get install -y bc)
+
+          echo "Performance for $policy: ${latency}s | ${input_throughput} | ${output_throughput} tok/s"
+
+          # Validate performance
+          fail=""
+          (( $(echo "$latency > 1.5" | bc -l) )) && fail="Latency too high (${latency}s>1.5s) "
+          (( $(echo "$input_throughput < 20000" | bc -l) )) && fail="${fail}Input too low (${input_throughput}<20k) "
+          (( $(echo "$output_throughput < 1000" | bc -l) )) && fail="${fail}Output too low (${output_throughput}<1k) "
+
+          if [ -n "$fail" ]; then
+            echo "✗ Benchmark failed for $policy: $fail"
+            kill $ROUTER_PID 2>/dev/null || true
+            exit 1
+          else
+            echo "✓ Performance validation passed for $policy"
+          fi
+
+          # Stop router before testing next policy
+          echo "Stopping router for $policy..."
+          # First try graceful shutdown
+          kill $ROUTER_PID 2>/dev/null || true
+
+          # Wait up to 5 seconds for graceful shutdown
+          for i in {1..5}; do
+            if ! ps -p $ROUTER_PID > /dev/null 2>&1; then
+              echo "Router stopped gracefully"
+              break
+            fi
+            sleep 1
+          done
+
+          # Force kill if still running
+          if ps -p $ROUTER_PID > /dev/null 2>&1; then
+            echo "Force killing router..."
+            kill -9 $ROUTER_PID 2>/dev/null || true
+          fi
+
+          # Short delay to ensure port is released
+          sleep 2
+
+          echo "✓ Completed testing for $policy"
+        done
+
+        echo ""
+        echo "✅ All policies tested successfully!"
+
+
+    - name: Upload benchmark results
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-results-all-policies
+        path: benchmark_*.txt
 
     - name: Cleanup servers
       if: always()
@@ -247,3 +336,34 @@ jobs:
         sleep 5
         remaining=$(ps aux | grep -c "sglang.launch_server" || echo "0")
         echo "Cleanup completed. Remaining processes: $remaining"
+
+  summarize-benchmarks:
+    needs: test-disaggregation
+    runs-on: ubuntu-latest
+    if: success()
+
+    steps:
+    - name: Download benchmark results
+      uses: actions/download-artifact@v4
+      with:
+        name: benchmark-results-all-policies
+
+    - name: Create benchmark summary
+      run: |
+        echo "## PD Router Benchmark Results Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Policy | Latency (s) | Input Throughput (tok/s) | Output Throughput (tok/s) |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|-------------|-------------------------|--------------------------|" >> $GITHUB_STEP_SUMMARY
+
+        for policy in random round_robin cache_aware power_of_two; do
+          if [ -f "benchmark_${policy}.txt" ]; then
+            latency=$(grep "latency:" "benchmark_${policy}.txt" | awk '{print $2}')
+            input_throughput=$(grep "input throughput:" "benchmark_${policy}.txt" | awk '{print $3}')
+            output_throughput=$(grep "output throughput:" "benchmark_${policy}.txt" | awk '{print $3}')
+
+            echo "| ${policy} | ${latency} | ${input_throughput} | ${output_throughput} |" >> $GITHUB_STEP_SUMMARY
+          fi
+        done
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "✅ All policies tested successfully!" >> $GITHUB_STEP_SUMMARY
