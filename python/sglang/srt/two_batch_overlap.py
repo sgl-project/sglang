@@ -18,7 +18,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import BumpAllocator, DeepEPMode, get_bool_env_var
+from sglang.srt.utils import BumpAllocator, DeepEPMode, get_bool_env_var, is_hip
+
+_is_hip = is_hip()
 
 _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 
@@ -659,14 +661,22 @@ def _model_forward_tbo(
     )
     del inputs
 
-    with deep_gemm_wrapper.configure_deep_gemm_num_sms(
-        operations_strategy.deep_gemm_num_sms
-    ):
+    if _is_hip:
+        print ("CHAI: Two batch overlap enabled on ROCm.")
         outputs_arr = execute_overlapped_operations(
-            inputs_arr=inputs_arr,
-            operations_arr=[operations_strategy.operations] * 2,
-            delta_stages=[0, operations_strategy.tbo_delta_stages],
+                        inputs_arr=inputs_arr,
+                        operations_arr=[operations_strategy.operations] * 2,
+                        delta_stages=[0, operations_strategy.tbo_delta_stages],
         )
+    else:
+        with deep_gemm_wrapper.configure_deep_gemm_num_sms(
+            operations_strategy.deep_gemm_num_sms
+        ):
+            outputs_arr = execute_overlapped_operations(
+                inputs_arr=inputs_arr,
+                operations_arr=[operations_strategy.operations] * 2,
+                delta_stages=[0, operations_strategy.tbo_delta_stages],
+            )
 
     return _model_forward_tbo_merge_outputs(*outputs_arr)
 
