@@ -10,7 +10,6 @@ import triton.language as tl
 from einops import rearrange
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.utils import build_slope_tensor
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
