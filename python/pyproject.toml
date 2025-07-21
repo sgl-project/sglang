@@ -60,7 +60,7 @@ srt = [
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python @ git+https://github.com/yyihuang/flashinfer.git@7ed08046b74ffcb091de5f4b8bf539547e52d6ed",
+    "flashinfer_python @ git+https://github.com/flashinfer-ai/flashinfer.git",
 ]
 
 blackwell = [
@@ -71,7 +71,7 @@ blackwell = [
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python @ git+https://github.com/yyihuang/flashinfer.git@7ed08046b74ffcb091de5f4b8bf539547e52d6ed",
+    "flashinfer_python @ git+https://github.com/flashinfer-ai/flashinfer.git",
 ]
 
 
