@@ -295,10 +295,7 @@ class Exaone4DecoderLayer(nn.Module):
 
         # Use post-LN
         hidden_states = self.post_attention_layernorm(hidden_states)
-        orig_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        hidden_states = hidden_states + residual.to(torch.float32)
-        hidden_states = hidden_states.to(orig_dtype)
+        hidden_states = hidden_states + residual
         residual = hidden_states
 
         # Fully Connected
@@ -306,10 +303,7 @@ class Exaone4DecoderLayer(nn.Module):
 
         # Use post-LN
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-        orig_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        hidden_states = hidden_states + residual.to(torch.float32)
-        hidden_states = hidden_states.to(orig_dtype)
+        hidden_states = hidden_states + residual
         residual = hidden_states
 
         return hidden_states, residual
@@ -392,7 +386,7 @@ class Exaone4Model(nn.Module):
                 }
             )
         else:
-            hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
