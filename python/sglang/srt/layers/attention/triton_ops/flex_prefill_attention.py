@@ -10,6 +10,7 @@ from einops import rearrange
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_device_sm
 
 FLEXPREFILL_DEFAULT_BLOCK_SIZE = 128
 FLEXPREFILL_DEFAULT_MIN_BUDGET = 1024
@@ -19,7 +20,6 @@ FLEXPREFILL_THRESHOLD = max(
     * FLEXPREFILL_DEFAULT_BLOCK_SIZE,
 )
 
-
 def check_if_use_flexprefill(forward_batch: ForwardBatch) -> bool:
     return (
         forward_batch.batch_size == 1
@@ -27,38 +27,24 @@ def check_if_use_flexprefill(forward_batch: ForwardBatch) -> bool:
         and get_bool_env_var("SGL_USE_FLEXPREFILL")
     )
 
+sm = get_device_sm()
 
-def gpu_info():
-    if torch.cuda.is_available():
-        device_name = torch.cuda.get_device_name(0).lower()
-        device_capability = torch.cuda.get_device_capability()
-        major, minor = device_capability
-        return device_name, major
-    return None, None
-
-
-GPU_NAME, GPU_MAJOR = gpu_info()
-
-
-def get_num_warps_stages(head_dim, block_size, gpu_name):
+def get_num_warps_stages(head_dim: int, block_size: int):
     """
     Returns recommended num_warps and num_stages for a Sparse Attention kernel in Triton.
 
     Args:
         head_dim (int): Size of the head dimension.
         block_size (int): Size of the block in the attention matrix.
-        gpu_name (str): Name of the GPU.
 
     Returns:
         tuple: (num_warps, num_stages) recommended values.
     """
-    gpu_name = gpu_name.lower()
     # Determine if head_dim and block_size exceed 64
     head_large = head_dim > 64
     block_large = block_size > 64
 
-    if "h100" in gpu_name:
-        # Hopper GPU recommendations
+    if sm == 90:
         if head_large and block_large:
             num_warps = 8
             num_stages = 3
@@ -68,18 +54,17 @@ def get_num_warps_stages(head_dim, block_size, gpu_name):
         else:
             num_warps = 2
             num_stages = 2
-    elif "a100" in gpu_name:
-        # Ampere GPU recommendations
+    elif sm == 80:
         if head_large and block_large:
             num_warps = 8
             num_stages = 3
         elif head_large or block_large:
-            num_warps = 8
+            num_warps = 4
             num_stages = 3
         else:
             num_warps = 2
             num_stages = 2
-    elif "4090" in gpu_name:
+    elif sm == 89:
         if head_large and block_large:
             num_warps = 8
             num_stages = 2
@@ -520,7 +505,7 @@ def triton_block_wise_prefill_attention(
         idx_bins = torch_column_count_cumsum(block_idx, total_k_blocks)
     # launch attention kernel
     o = torch.empty_like(q)
-    num_warps, num_stages = get_num_warps_stages(head_dim, block_size, GPU_NAME)
+    num_warps, num_stages = get_num_warps_stages(head_dim, block_size)
     BLOCK_SIZE_D = triton.next_power_of_2(head_dim)
     block_wise_prefill_attention_kernel[(batch_size * num_q_heads, total_q_blocks)](
         q,

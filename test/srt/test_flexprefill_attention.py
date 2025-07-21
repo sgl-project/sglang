@@ -38,7 +38,7 @@ try:
     from lm_eval import evaluator
     from lm_eval.tasks import TaskManager
 except (ImportError, ModuleNotFoundError):
-    print("\nPlease install lm-eval via `pip install lm-eval[longtxt]`")
+    print("\nPlease install lm-eval via `pip install lm-eval[longtxt,api,ruler]`")
     raise
 
 
