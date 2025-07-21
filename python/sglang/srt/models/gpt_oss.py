@@ -246,7 +246,8 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
                               swiglu_beta=1.0,
                               enable_mxfp4_moe=global_server_args_dict["enable_w4_mxfp4_moe"] or global_server_args_dict["enable_w4a8_mxfp4_moe"],
                               enable_fp8_activation=global_server_args_dict["enable_w4a8_mxfp4_moe"],
-                              shuffle_weight=True)
+                              shuffle_weight=False,
+                              pair_wise_act=True)
 
         # Todo: add bias support in MoE impl class
         self.experts = get_moe_impl_class()(
