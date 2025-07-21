@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib
 import sys
 from types import MappingProxyType
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
 from torch.nn.parameter import Parameter
@@ -36,6 +36,9 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import TopKOutput
 
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -239,7 +242,7 @@ class W8A8Int8Config(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
-        from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if _is_npu:
@@ -469,15 +472,8 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
-        custom_routing_function: Optional[Callable] = None,
-        correction_bias: Optional[torch.Tensor] = None,
+        topk_output: TopKOutput,
+        *,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         inplace: bool = True,
@@ -485,26 +481,11 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-        from sglang.srt.layers.moe.topk import select_experts
-
-        # Expert selection
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
+            topk_weights, topk_ids, _ = topk_output
             x, topk_weights = apply_topk_weights_cpu(
                 apply_router_weight_on_input, topk_weights, x
             )
@@ -529,8 +510,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
             x,
             layer.w13_weight,
             layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
+            topk_output=topk_output,
             inplace=inplace,
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
@@ -754,6 +734,8 @@ class NPU_W8A8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        from sglang.srt.layers.linear import RowParallelLinear
+
         if isinstance(layer, RowParallelLinear):
             tp_rank = get_tensor_model_parallel_rank()
             return self.quant_method.apply(layer, x, bias, tp_rank)
@@ -905,7 +887,7 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         num_experts: int,
         hidden_size: int,
-        intermediate_size: List[int],
+        intermediate_size: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
@@ -982,52 +964,11 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         self,
         layer,
         x,
-        router_logits,
-        top_k,
-        renormalize,
-        use_grouped_topk,
-        topk_group,
-        num_expert_group,
-        num_fused_shared_experts,
-        custom_routing_function,
-        correction_bias,
-        activation,
-        apply_router_weight_on_input,
-        routed_scaling_factor,
+        topk_output: TopKOutput,
         **kwargs,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.topk import select_experts
 
-        global_num_experts = router_logits.shape[-1]
-        # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
-        if global_num_experts == 256:
-            topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
-                router_logits,
-                k=top_k,
-                bias=correction_bias,
-                k_group=topk_group,
-                group_count=num_expert_group,
-                group_select_mode=1,
-                renorm=0,
-                norm_type=1,
-                routed_scaling_factor=1,
-                eps=float(1e-20),
-            )
-        else:
-            topk_weights, topk_ids = select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                use_grouped_topk=use_grouped_topk,
-                top_k=top_k,
-                renormalize=renormalize,
-                topk_group=topk_group,
-                num_expert_group=num_expert_group,
-                num_fused_shared_experts=num_fused_shared_experts,
-                custom_routing_function=custom_routing_function,
-                correction_bias=correction_bias,
-                torch_native=True,
-                routed_scaling_factor=routed_scaling_factor,
-            )
+        topk_weights, topk_ids, _ = topk_output
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
         return npu_fused_experts(
@@ -1038,5 +979,5 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            top_k=top_k,
+            top_k=topk_ids.shape[1],
         )
