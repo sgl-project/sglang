@@ -900,7 +900,12 @@ class DeepseekV2AttentionMLA(nn.Module):
         # which requires self.w_kc and self.w_vc to be packed.
         # If not, we will use torch.bmm and weight shouldn't be packed in this case
         has_fused_proj = hasattr(self, "fused_qkv_a_proj_with_mqa")
-        if has_fused_proj and _is_cpu and _is_cpu_amx_available and self.attention_backend != "torch_native":
+        if (
+            has_fused_proj
+            and _is_cpu
+            and _is_cpu_amx_available
+            and self.attention_backend != "torch_native"
+        ):
             self.quant_method = PackWeightMethod(
                 weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
             )
