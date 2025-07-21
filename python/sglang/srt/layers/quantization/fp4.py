@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import fnmatch
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union, cast
 
 import torch
 import torch.nn.functional as F
@@ -90,20 +90,21 @@ class Fp4Config(QuantizationConfig):
 
     def get_quant_method(self, layer: torch.nn.Module,
                          prefix: str) -> Optional["QuantizeMethodBase"]:
+
         # Check if the layer is skipped for quantization.
-        #exclude_layers = cast(list[str], self.quant_config.get("exclude"))
         if len(self.ignored_layers) > 0 and should_ignore_layer(prefix,
                                ignore=self.ignored_layers,
                                fused_mapping=self.packed_modules_mapping):
             return UnquantizedLinearMethod()
         
         if isinstance(layer, LinearBase):
-            ##scheme = self.get_scheme(layer=layer, layer_name=prefix)
-            ##layer.scheme = scheme
-            ##return QuarkLinearMethod(self)
-            #return Fp8LinearMethod(self)
+            if self.is_checkpoint_fp4_serialized:
+                scheme = self.get_scheme(layer=layer, layer_name=prefix)
+                layer.scheme = scheme
 
             return Fp4LinearMethod(self)
+            # some debugging test
+            #return Fp8LinearMethod(self)
         
         if isinstance(layer, RadixAttention):
             return Fp4KVCacheMethod(self)
@@ -119,7 +120,7 @@ class Fp4Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "Fp4Config":
         quant_method = cls.get_from_keys(config, ["quant_method"])
-        is_checkpoint_fp4_serialized = "quark" in quant_method
+        is_checkpoint_fp4_serialized = True if quant_method else False #"quark" in quant_method
 
         kv_cache_group=[]
         pack_method=None
@@ -183,7 +184,7 @@ class Fp4Config(QuantizationConfig):
             if q_proj_q_config is not None:
                 q_proj_q_config["output_tensors"] = None
 
-        ignored_layers = cls.get_from_keys_or(config, ["exclude_layers"], None)
+        ignored_layers = cls.get_from_keys_or(config, ["exclude"], None)
 
         return cls(is_checkpoint_fp4_serialized=is_checkpoint_fp4_serialized,
                    quant_config=config,
@@ -679,7 +680,6 @@ class W4A4MXFp4MoEStaticMethod(Fp4MoEMethod):
                 f"{weight_qscheme}, {input_qscheme}")  # noqa E501
 
         self.static_input_scales = not self.input_quant.get("is_dynamic")
-        self.emulate = not supports_mx()
 
     def create_weights(self, layer: torch.nn.Module, num_experts: int,
                        hidden_size: int, intermediate_size_per_partition: int,
