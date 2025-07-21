@@ -110,6 +110,17 @@ class NewGELU(CustomOp):
         return self.forward_native(x)
 
 
+class ReLU2(nn.Module):
+    """
+    Applies the squared Rectified Linear Unit function.
+    y = max(0, x)^2
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(x)
+        return x * x
+
+
 class QuickGELU(CustomOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(1.702 * x)
@@ -165,6 +176,7 @@ _ACTIVATION_REGISTRY = {
     "gelu": nn.GELU(),
     "gelu_pytorch_tanh": nn.GELU(approximate="tanh"),
     "gelu_new": NewGELU(),
+    "relu2": ReLU2(),
 }
 
 
