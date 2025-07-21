@@ -3,6 +3,7 @@ import re
 from typing import List, Union
 
 from PIL import Image
+from transformers.video_utils import VideoMetadata
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
@@ -51,10 +52,12 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             r"<\|begin_of_video\|>(?:<\|video\|>)+<\|end_of_video\|>"
         )
 
-        self.mm_special_tokens = MultimodalSpecialTokens(
+        self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.IMAGE_TOKEN,
+            image_token_id=self.IM_TOKEN_ID,
             image_token_regex=self.IMAGE_TOKEN_REGEX,
             video_token=self.VIDEO_TOKEN,
+            video_token_id=self.VIDEO_TOKEN_ID,
             video_token_regex=self.VIDEO_TOKEN_REGEX,
         )
 
@@ -63,7 +66,6 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         image_data: List[Union[str, bytes]],
         input_text,
         request_obj,
-        max_req_input_len,
         *args,
         **kwargs,
     ):
@@ -71,26 +73,28 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             prompt=input_text,
             image_data=image_data,
             video_data=request_obj.video_data,
-            multimodal_tokens=self.mm_special_tokens,
-            max_req_input_len=max_req_input_len,
+            multimodal_tokens=self.mm_tokens,
         )
+        print(base_output.videos)
 
-        # TODO(Xinyuan): GLM-4V specific: resize images, current methods are inherited from Qwen2.5VL
-        if base_output.images and isinstance(base_output.images[0], Image.Image):
-            resize_tasks = [resize_image_async(image) for image in base_output.images]
-            base_output.images = await asyncio.gather(*resize_tasks)
+        # # TODO(Xinyuan): GLM-4V specific: resize images, current methods are inherited from Qwen2.5VL
+        # if base_output.images and isinstance(base_output.images[0], Image.Image):
+        #     resize_tasks = [resize_image_async(image) for image in base_output.images]
+        #     base_output.images = await asyncio.gather(*resize_tasks)
 
-        if base_output.videos:
-            base_output.videos = [
-                await preprocess_video(video) for video in base_output.videos
-            ]
+        # if base_output.videos:
+        #     base_output.videos = [
+        #         await preprocess_video(video) for video in base_output.videos
+        #     ]
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(base_output)
+        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+            base_output, self.mm_tokens
+        )
         input_ids = input_ids.flatten()
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
-            image_token_id=self.IM_TOKEN_ID,
-            video_token_id=self.VIDEO_TOKEN_ID,
+            image_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
             vision_start_token_id=[
                 self.IMAGE_START_TOKEN_ID,
                 self.VIDEO_START_TOKEN_ID,
@@ -109,12 +113,8 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         mm_inputs = {
             "input_ids": input_ids.flatten().tolist(),
             "mm_items": mm_items,
-            "im_token_id": self.IM_TOKEN_ID,
-            "video_token_id": self.VIDEO_TOKEN_ID,
-            "im_start_id": self.IMAGE_START_TOKEN_ID,
-            "im_end_id": self.IMAGE_END_TOKEN_ID,
-            "video_start_id": self.VIDEO_START_TOKEN_ID,
-            "video_end_id": self.VIDEO_END_TOKEN_ID,
+            "im_token_id": self.mm_tokens.image_token_id,
+            "video_token_id": self.mm_tokens.video_token_id,
             "mrope_positions": mrope_positions,
             "mrope_position_delta": mrope_position_delta,
         }

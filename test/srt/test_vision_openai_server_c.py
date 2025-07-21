@@ -27,6 +27,9 @@ class TestGLM4_1VThinkingServer(TestOpenAIVisionServer):
         )
         cls.base_url += "/v1"
 
+    def test_video_chat_completion(self):
+        self._test_video_chat_completion()
+
 
 if __name__ == "__main__":
     del TestOpenAIVisionServer  # avoid duplicate test
