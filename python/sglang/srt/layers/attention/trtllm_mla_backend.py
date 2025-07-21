@@ -102,13 +102,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """
         blocks = triton.cdiv(max_seq_len, self.page_size)
 
-       # Apply dual constraints (take LCM to satisfy both):
+        # Apply dual constraints (take LCM to satisfy both):
         # 1. TRT-LLM: block_num % (128 / page_size) == 0
         #    Reference: https://github.com/NVIDIA/TensorRT-LLM/issues/XYZ  # TODO: add actual link
         # 2. Triton: page table builder uses 64-index bursts, needs multiple of 64
         trtllm_constraint = TRTLLM_BLOCK_CONSTRAINT // self.page_size
         constraint_lcm = math.lcm(trtllm_constraint, TRITON_PAD_NUM_PAGE_PER_BLOCK)
-        
+
         if blocks % constraint_lcm != 0:
             blocks = triton.cdiv(blocks, constraint_lcm) * constraint_lcm
         return blocks
@@ -340,7 +340,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         bmm1_scale = layer.scaling
         bmm2_scale = 1.0
         bmm1_scale_tensor = bmm2_scale_tensor = None
-
 
         # Call TRT-LLM kernel with proper scale configuration
         raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
