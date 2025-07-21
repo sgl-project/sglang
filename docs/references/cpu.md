@@ -1,7 +1,7 @@
 # SGLang on CPU
 
 The document addresses how to set up the [SGLang](https://github.com/sgl-project/sglang) environment and run LLM inference on CPU servers.
-Specifically, the model service is well optimized on the CPUs equipped with Intel® AMX® Instructions,
+Specifically, SGLang is well optimized on the CPUs equipped with Intel® AMX® Instructions,
 which are 4th generation or newer Intel® Xeon® Scalable Processors.
 
 ## Optimized Model List
@@ -54,7 +54,7 @@ docker run \
 ### Install From Source
 
 If you'd prefer to install SGLang in a bare metal environment,
-the command list is similar with the procedure in the Dockerfile.
+the command list is as below.
 It is worth noting that the environment variable `SGLANG_USE_CPU_ENGINE=1`
 is required to enable SGLang service with CPU engine.
 
@@ -139,7 +139,7 @@ The server is ready when you see the log `The server is fired up and ready to ro
 
 ## Benchmarking with Requests
 
-We can benchmark the performance via the `bench_serving` script.
+You can benchmark the performance via the `bench_serving` script.
 Run the command in another terminal.
 
 ```bash
@@ -164,7 +164,7 @@ and sent via the command line (e.g. using `curl`) or via your own script.
 
 ## Example: Running DeepSeek-R1
 
-The example W8A8 model service launching command in the container on a Xeon® 6980P server would be
+An example command to launch service for W8A8 DeepSeek-R1 on a Xeon® 6980P server
 
 ```bash
 python -m sglang.launch_server                 \
@@ -179,7 +179,7 @@ python -m sglang.launch_server                 \
     --tp 6
 ```
 
-Similarly, the example FP8 model service launching command would be
+Similarly, an example command to launch service for FP8 DeepSeek-R1 would be
 
 ```bash
 python -m sglang.launch_server                 \
@@ -193,5 +193,5 @@ python -m sglang.launch_server                 \
     --tp 6
 ```
 
-Then we can test with `bench_serving` command or construct our own command or script
+Then you can test with `bench_serving` command or construct your own command or script
 following [the benchmarking example](#benchmarking-with-requests).
