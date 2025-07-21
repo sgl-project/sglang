@@ -13,7 +13,7 @@ import triton
 
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import (
-    NUM_PAGE_PER_BLOCK,
+    TRITON_PAD_NUM_PAGE_PER_BLOCK,
     create_flashmla_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -29,14 +29,17 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInfo
 
 # Constants
-TRTLLM_BLOCK_CONSTRAINT = (
-    128  # TRT-LLM kernel constraint: block_num % (128 / block_size) == 0
-)
-DEFAULT_WORKSPACE_SIZE_MB = 128
-DEFAULT_QUANTIZATION_SCALE = 1.0  # Default scale for FP8 quantization
-DEFAULT_SM_SCALE = 1.0  # Default softmax scale
+DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
 
+# Block constraint from flashinfer requirements
+# See: https://github.com/flashinfer-ai/flashinfer/blob/fe29ed63cb923f25cae70ef83f3fd16139305b35/flashinfer/decode.py#L2057
+TRTLLM_BLOCK_CONSTRAINT = 128
 
+# Quantization scale (1.0 for fp8->bf16 and bf16->bf16 conversions)
+DEFAULT_QUANTIZATION_SCALE = 1.0
+
+# Softmax scale (1.0 since TRTLLM applies 1/sqrt(head_dim) internally)
+DEFAULT_SM_SCALE = 1.0
 @dataclass
 class TRTLLMGENMLADecodeMetadata:
     """Metadata for TRTLLM MLA decode operations."""
@@ -46,7 +49,7 @@ class TRTLLMGENMLADecodeMetadata:
 
 
 class TRTLLMGENMLABackend(FlashInferMLAAttnBackend):
-    """TRTLLM MLA attention kernels from flashinfer."""
+    """TRTLLM MLA attention kernel from flashinfer."""
 
     def __init__(
         self,
@@ -59,7 +62,6 @@ class TRTLLMGENMLABackend(FlashInferMLAAttnBackend):
             model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
         )
 
-        # Cache model config for easier access
         config = model_runner.model_config
 
         # Model parameters
@@ -104,24 +106,15 @@ class TRTLLMGENMLABackend(FlashInferMLAAttnBackend):
         """
         blocks = triton.cdiv(max_seq_len, self.page_size)
 
-        # TWO constraints require padding:
-        # 1. TRT-LLM kernel expects: block_num % (128 / block_size) == 0
-        #    This is a hard requirement from the CUDA kernel implementation.
-        # 2. Our Triton helper `create_flashmla_kv_indices_triton` builds page tables
-        #    in fixed bursts of 64 indices per outer loop iteration. Each burst writes
-        #    unconditionally to positions [i*64, (i+1)*64) without per-element masking.
-        #    If the row length isn't a multiple of 64, the final burst would overrun
-        #    the allocated buffer and corrupt memory.
-        #
-        # We need to satisfy BOTH constraints, so we take the LCM of:
-        # - trtllm_constraint = 128 // page_size
-        # - triton_constraint = 64
+       # Apply dual constraints (take LCM to satisfy both):
+        # 1. TRT-LLM: block_num % (128 / page_size) == 0
+        #    Reference: https://github.com/NVIDIA/TensorRT-LLM/issues/XYZ  # TODO: add actual link
+        # 2. Triton: page table builder uses 64-index bursts, needs multiple of 64
         trtllm_constraint = TRTLLM_BLOCK_CONSTRAINT // self.page_size
-        triton_constraint = NUM_PAGE_PER_BLOCK
-        min_blocks = math.lcm(trtllm_constraint, triton_constraint)
-
-        if blocks % min_blocks != 0:
-            blocks = triton.cdiv(blocks, min_blocks) * min_blocks
+        constraint_lcm = math.lcm(trtllm_constraint, TRITON_PAD_NUM_PAGE_PER_BLOCK)
+        
+        if blocks % constraint_lcm != 0:
+            blocks = triton.cdiv(blocks, constraint_lcm) * constraint_lcm
         return blocks
 
     def _get_quantization_scales(self) -> tuple[float, float, float, float, float]:
@@ -410,6 +403,7 @@ class TRTLLMGENMLABackend(FlashInferMLAAttnBackend):
             o_scale=o_scale,
         )
 
+        #TODO: test?
         # Extract value projection part and reshape
         raw_out_v = raw_out[..., : layer.v_head_dim].contiguous()
         output = raw_out_v.view(-1, layer.tp_q_head_num * layer.v_head_dim)
