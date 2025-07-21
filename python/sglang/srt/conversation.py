@@ -718,6 +718,21 @@ register_conv_template(
     )
 )
 
+# reference: https://huggingface.co/microsoft/Phi-3-vision-128k-instruct
+register_conv_template(
+    Conversation(
+        name="phi-3v",
+        system_message="",
+        system_template="{system_message}",
+        roles=("<|user|>", "<|assistant|>"),
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
+        sep="<|end|>",
+        stop_str="<|end|>",
+        image_token="<|endoftext10|>",
+        audio_token="<|endoftext11|>",
+    )
+)
+
 # TODO (lifuhuang): Refactor BaseMultimodalProcessor to support the default image token "<|image_{index}|>" in the future.
 register_conv_template(
     Conversation(
