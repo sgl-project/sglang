@@ -9,8 +9,7 @@ import triton.language as tl
 from einops import rearrange
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils import get_device_sm
+from sglang.srt.utils import get_bool_env_var, get_device_sm
 
 FLEXPREFILL_DEFAULT_BLOCK_SIZE = 128
 FLEXPREFILL_DEFAULT_MIN_BUDGET = 1024
@@ -20,6 +19,7 @@ FLEXPREFILL_THRESHOLD = max(
     * FLEXPREFILL_DEFAULT_BLOCK_SIZE,
 )
 
+
 def check_if_use_flexprefill(forward_batch: ForwardBatch) -> bool:
     return (
         forward_batch.batch_size == 1
@@ -27,7 +27,9 @@ def check_if_use_flexprefill(forward_batch: ForwardBatch) -> bool:
         and get_bool_env_var("SGL_USE_FLEXPREFILL")
     )
 
+
 sm = get_device_sm()
+
 
 def get_num_warps_stages(head_dim: int, block_size: int):
     """
