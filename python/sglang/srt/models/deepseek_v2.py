@@ -157,7 +157,7 @@ if _is_cuda:
         dsv3_router_gemm,
         merge_state_v2,
     )
-elif _is_cpu and _is_cpu_amx_available:
+elif _is_cpu:
     pass
 elif _is_hip:
     from sglang.srt.layers.quantization.awq_triton import (
