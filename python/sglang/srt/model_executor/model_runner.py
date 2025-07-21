@@ -396,7 +396,7 @@ class ModelRunner:
                 ):
                     server_args.attention_backend = "fa3"
                 elif is_sm100_supported():
-                    server_args.attention_backend = "trtllm_mla"
+                    server_args.attention_backend = "flashinfer"
                 elif _is_hip:
                     head_num = self.model_config.get_num_kv_heads(self.tp_size)
                     # TODO current aiter only support head number 16 or 128 head number
@@ -1432,11 +1432,11 @@ class ModelRunner:
 
             return CutlassMLABackend(self)
         elif self.server_args.attention_backend == "trtllm_mla":
-            from sglang.srt.layers.attention.trtllm_gen_mla_backend import (
-                TRTLLMGENMLABackend,
+            from python.sglang.srt.layers.attention.trtllm_mla_backend import (
+                TRTLLMMLABackend,
             )
 
-            return TRTLLMGENMLABackend(self)
+            return TRTLLMMLABackend(self)
         elif self.server_args.attention_backend == "intel_amx":
             from sglang.srt.layers.attention.intel_amx_backend import (
                 IntelAMXAttnBackend,

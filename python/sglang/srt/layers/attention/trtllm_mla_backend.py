@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-Support attention backend for TRTLLM-Gen MLA kernels from flashinfer.
+Support attention backend for TRTLLM MLA kernels from flashinfer.
 """
 
 import math
@@ -35,20 +35,16 @@ DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
 # See: https://github.com/flashinfer-ai/flashinfer/blob/fe29ed63cb923f25cae70ef83f3fd16139305b35/flashinfer/decode.py#L2057
 TRTLLM_BLOCK_CONSTRAINT = 128
 
-# Quantization scale (1.0 for fp8->bf16 and bf16->bf16 conversions)
-DEFAULT_QUANTIZATION_SCALE = 1.0
 
-# Softmax scale (1.0 since TRTLLM applies 1/sqrt(head_dim) internally)
-DEFAULT_SM_SCALE = 1.0
 @dataclass
-class TRTLLMGENMLADecodeMetadata:
+class TRTLLMMLADecodeMetadata:
     """Metadata for TRTLLM MLA decode operations."""
 
     workspace: Optional[torch.Tensor] = None
     block_kv_indices: Optional[torch.Tensor] = None
 
 
-class TRTLLMGENMLABackend(FlashInferMLAAttnBackend):
+class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     """TRTLLM MLA attention kernel from flashinfer."""
 
     def __init__(
@@ -92,7 +88,7 @@ class TRTLLMGENMLABackend(FlashInferMLAAttnBackend):
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
         self.cuda_graph_kv_indices = None
-        self.forward_metadata: Union[TRTLLMGENMLADecodeMetadata] = None
+        self.forward_metadata: Union[TRTLLMMLADecodeMetadata] = None
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -116,68 +112,6 @@ class TRTLLMGENMLABackend(FlashInferMLAAttnBackend):
         if blocks % constraint_lcm != 0:
             blocks = triton.cdiv(blocks, constraint_lcm) * constraint_lcm
         return blocks
-
-    def _get_quantization_scales(self) -> tuple[float, float, float, float, float]:
-        """
-        Get quantization scales for q, k, v, sm, and o tensors.
-
-        Returns:
-            Tuple of (q_scale, k_scale, v_scale, sm_scale, o_scale)
-        """
-        # TODO: Implement proper quantization scale inference based on model config
-        # For now, use default values for FP8
-        return (
-            DEFAULT_QUANTIZATION_SCALE,  # q_scale
-            DEFAULT_QUANTIZATION_SCALE,  # k_scale
-            DEFAULT_QUANTIZATION_SCALE,  # v_scale
-            DEFAULT_SM_SCALE,  # sm_scale
-            DEFAULT_QUANTIZATION_SCALE,  # o_scale
-        )
-
-    def _prepare_kv_cache(
-        self, layer: RadixAttention, forward_batch: ForwardBatch
-    ) -> torch.Tensor:
-        """
-        Prepare KV cache tensor in the format expected by TRT-LLM kernel.
-
-        Args:
-            layer: Attention layer
-            forward_batch: Forward batch info
-
-        Returns:
-            KV cache tensor shaped (num_pages, 2, page_size, kv_cache_dim)
-        """
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        pages = k_cache.view(-1, self.page_size, self.kv_cache_dim)
-        # TRT-LLM expects stacked format: slice 0 → CKV+K, slice 1 → KPE
-        return torch.stack([pages, pages], dim=1)
-
-    def _prepare_query_tensor(
-        self, q: torch.Tensor, q_rope: Optional[torch.Tensor], layer: RadixAttention
-    ) -> torch.Tensor:
-        """
-        Prepare query tensor in the format expected by TRT-LLM kernel.
-
-        Args:
-            q: Query tensor
-            q_rope: Optional RoPE query tensor
-            layer: Attention layer
-
-        Returns:
-            Query tensor with concatenated NOPE and RoPE parts
-        """
-        if q_rope is not None:
-            # q contains the NOPE part (v_head_dim)
-            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-            q_rope = q_rope.view(
-                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
-            )
-        else:
-            reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-            q_nope = reshaped_q[:, :, : layer.v_head_dim]
-            q_rope = reshaped_q[:, :, layer.v_head_dim :]
-
-        return torch.cat([q_nope, q_rope], dim=-1)
 
     def _create_block_kv_indices(
         self,
@@ -259,7 +193,7 @@ class TRTLLMGENMLABackend(FlashInferMLAAttnBackend):
                 self.page_size,
             )
 
-            metadata = TRTLLMGENMLADecodeMetadata(
+            metadata = TRTLLMMLADecodeMetadata(
                 self.cuda_graph_workspace, block_kv_indices
             )
             self.decode_cuda_graph_metadata[bs] = metadata
@@ -342,7 +276,7 @@ class TRTLLMGENMLABackend(FlashInferMLAAttnBackend):
                 forward_batch.seq_lens.device,
             )
 
-            self.forward_metadata = TRTLLMGENMLADecodeMetadata(
+            self.forward_metadata = TRTLLMMLADecodeMetadata(
                 self.workspace_buffer, block_kv_indices
             )
             forward_batch.decode_trtllm_mla_metadata = self.forward_metadata
@@ -371,9 +305,27 @@ class TRTLLMGENMLABackend(FlashInferMLAAttnBackend):
             elif v is not None:
                 forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
-        # Prepare tensors for TRT-LLM kernel
-        query = self._prepare_query_tensor(q, q_rope, layer)
-        kv_cache = self._prepare_kv_cache(layer, forward_batch)
+        # Prepare query tensor inline (avoid helper for shape tweaks)
+        if q_rope is not None:
+            # q contains NOPE part (v_head_dim)
+            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope_reshaped = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+            query = torch.cat([q_nope, q_rope_reshaped], dim=-1)
+        else:
+            # q already has both parts
+            query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        # Ensure query has shape [bs, acc_q_len, num_q_heads, head_dim] when seq_len 1
+        if query.dim() == 3:
+            query = query.unsqueeze(1)
+
+        # Prepare KV cache inline (TRT-LLM expects stacked format)
+        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        pages = k_cache.view(-1, self.page_size, self.kv_cache_dim)
+        # TRT-LLM expects stacked format: slice 0 → CKV+K, slice 1 → KPE
+        kv_cache = torch.stack([pages, pages], dim=1)
 
         # Get metadata
         metadata = (
@@ -381,10 +333,16 @@ class TRTLLMGENMLABackend(FlashInferMLAAttnBackend):
             or self.forward_metadata
         )
 
-        # Get quantization scales
-        q_scale, k_scale, v_scale, sm_scale, o_scale = self._get_quantization_scales()
+        # Scale computation for TRTLLM MLA kernel:
+        # - BMM1 scale = q_scale * k_scale * softmax_scale
+        # - For FP16 output in DeepSeek R1: q_scale = k_scale = 1.0, softmax_scale = 1/sqrt(head_dim)
+        # - This reduces to layer.scaling which is pre-computed as 1/sqrt(head_dim)
+        bmm1_scale = layer.scaling
+        bmm2_scale = 1.0
+        bmm1_scale_tensor = bmm2_scale_tensor = None
 
-        # Call TRT-LLM kernel
+
+        # Call TRT-LLM kernel with proper scale configuration
         raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
@@ -396,20 +354,14 @@ class TRTLLMGENMLABackend(FlashInferMLAAttnBackend):
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             block_size=self.page_size,
             max_seq_len=int(metadata.block_kv_indices.shape[1] * self.page_size),
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            sm_scale=sm_scale,
-            o_scale=o_scale,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            bmm1_scale_tensor=bmm1_scale_tensor,
+            bmm2_scale_tensor=bmm2_scale_tensor,
         )
 
-        #TODO: test?
         # Extract value projection part and reshape
         raw_out_v = raw_out[..., : layer.v_head_dim].contiguous()
         output = raw_out_v.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-        # Truncate if needed
-        if output.shape[0] > forward_batch.batch_size:
-            output = output[: forward_batch.batch_size]
 
         return output

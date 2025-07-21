@@ -11,7 +11,7 @@ _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
-from sglang.srt.layers.attention.trtllm_gen_mla_backend import TRTLLMGENMLABackend, TRTLLMGENMLADecodeMetadata
+from python.sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend, TRTLLMMLADecodeMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -271,7 +271,7 @@ class TestTRTLLMMLA(CustomTestCase):
         model_runner_reference = MockModelRunner(config)
 
         # Create backends
-        trtllm_backend = TRTLLMGENMLABackend(model_runner_trtllm)
+        trtllm_backend = TRTLLMMLABackend(model_runner_trtllm)
         reference_backend = FlashInferMLAAttnBackend(model_runner_reference)
 
         # Create RadixAttention layer
@@ -613,7 +613,7 @@ class TestTRTLLMMLA(CustomTestCase):
                 self.assertIsNotNone(backend.forward_metadata)
                 self.assertIsInstance(
                     backend.forward_metadata, 
-                    TRTLLMGENMLADecodeMetadata
+                    TRTLLMMLADecodeMetadata
                 )
 
                 # Test metadata structure
