@@ -65,9 +65,9 @@ def _autoawq_to_int4pack(
         qweight = qweight.reshape(*dims, N // BLOCK_N, BLOCK_N, K // 2, 2)
         qweight = qweight.transpose(-3, -2)
         # bit packing
-        COUNT = 32
-        qweight = qweight.reshape(-1, COUNT * 2)
-        qweight = (qweight[:, COUNT:] << 4) | qweight[:, :COUNT]
+        BIT_COUNT = 32
+        qweight = qweight.reshape(-1, BIT_COUNT * 2)
+        qweight = (qweight[:, BIT_COUNT:] << 4) | qweight[:, :BIT_COUNT]
         qweight = qweight.reshape(*dims, N, K // 2)
         return qweight, qzeros, scales
 

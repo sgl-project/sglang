@@ -1,4 +1,3 @@
-#include <ATen/cpu/vec/vec.h>
 #include <ATen/native/CPUBlas.h>
 #include <c10/util/Unroll.h>
 #include <torch/all.h>
@@ -705,7 +704,7 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
   int64_t lda = input.stride(0);
 
   const auto st = input.scalar_type();
-  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf, "per_token_quant_int8: expect A to be bfloat16 or half.");
+  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf, "int4_scaled_mm_cpu_with_quant: expect A to be bfloat16 or half.");
 
   auto Aq = at::empty({M_a, K_a}, input.options().dtype(c10::kByte));
   auto As = at::empty({M_a}, input.options().dtype(at::kFloat));

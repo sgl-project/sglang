@@ -32,7 +32,13 @@ from sglang.srt.layers.quantization.marlin_utils import (
 from sglang.srt.layers.quantization.scalar_type import scalar_types
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import replace_parameter
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, use_intel_amx_backend
+from sglang.srt.utils import (
+    SGLANG_USE_CPU_INT4_W4A8,
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    use_intel_amx_backend,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
@@ -63,9 +69,6 @@ elif _is_hip:
 
     warnings.warn(f"HIP does not support fused_marlin_moe currently.")
 elif _is_cpu and _is_cpu_amx_available:
-    import os
-
-    SGLANG_USE_CPU_INT4_W4A8 = os.getenv("SGLANG_USE_CPU_INT4_W4A8", "0") == "1"
     from sglang.srt.layers.amx_utils import (
         _amx_process_int4_packed_qweight_after_loading,
     )

@@ -40,10 +40,7 @@ def get_moe_padding_size(weight_block_size):
             assert (
                 weight_block_size[0] == weight_block_size[1]
             ), "Only weight_block_size[0] == weight_block_size[1] is supported"
-            return weight_block_size[0]
-
-        elif len(weight_block_size) == 1:
-            return weight_block_size[0]
+        return weight_block_size[0]
 
     return DEFAULT_MOE_PADDING_SIZE
 
