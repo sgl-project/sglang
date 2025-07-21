@@ -24,7 +24,6 @@ bool cpublas_could_pack() {
 template <bool sym_quant_a>
 struct ActDtype;
 template <>
-template <>
 struct ActDtype<true> {
   using type = int8_t;
 };
@@ -704,14 +703,14 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
   int64_t lda = input.stride(0);
 
   const auto st = input.scalar_type();
-  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf, "int4_scaled_mm_cpu_with_quant: expect A to be bfloat16 or half.");
+  TORCH_CHECK(
+      st == at::kBFloat16 || st == at::kHalf, "int4_scaled_mm_cpu_with_quant: expect A to be bfloat16 or half.");
 
   auto Aq = at::empty({M_a, K_a}, input.options().dtype(c10::kByte));
   auto As = at::empty({M_a}, input.options().dtype(at::kFloat));
-  auto Azp = at::ones({M_a}, input.options().dtype(at::kInt));
-  Azp = Azp.mul(128);
+  auto Azp = at::ones({M_a}, input.options().dtype(at::kInt)).mul(128);
+  bool sym_quant_a = false;  // sym_a s8s8 is unified to u8s8 with compensation (128)
   static bool cpublas_can_pack = cpublas_could_pack();
-  bool sym_quant_a = false;
   auto out_sizes = input.sizes().vec();
   int64_t N = weight.size(0) * weight.size(-1) * 2;
   out_sizes.back() = N;
