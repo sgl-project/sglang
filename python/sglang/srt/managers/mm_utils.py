@@ -473,11 +473,9 @@ def embed_mm_inputs(
     for embedding, mask in zip(embeddings, masks):
         if embedding is None or mask is None:
             continue
-        mask = mask.expand_as(inputs_embeds).to(inputs_embeds.device)
-        inputs_embeds = inputs_embeds.masked_scatter(
-            mask,
-            embedding.to(inputs_embeds.device, inputs_embeds.dtype),
-        )
+        # in-place update
+        indices = torch.where(mask.squeeze(dim=-1))[0]
+        inputs_embeds[indices] = embedding.to(inputs_embeds.device, inputs_embeds.dtype)
     return inputs_embeds
 
 
