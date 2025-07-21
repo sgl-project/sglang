@@ -550,7 +550,7 @@ class Exaone4ForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
-    
+
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)
 
