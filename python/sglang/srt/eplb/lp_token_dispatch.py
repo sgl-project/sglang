@@ -94,11 +94,11 @@ def count_logical_expert_tokens(
     
     return logical_counts
 
-def get_global_logical_counts_cpu_reduce(local_counts: torch.Tensor) -> torch.Tensor:
+def get_global_logical_counts_on_rank0(local_counts: torch.Tensor) -> torch.Tensor:
     """Get global logical counts using SGLang's parallel state system.
     
-    All ranks move local_counts to CPU, then use the CPU communication group for all-reduce.
-    All ranks return the global result.
+    All ranks move local_counts to CPU, then use the CPU communication group for reduce.
+    The result is only correct on rank 0.
     
     Args:
         local_counts: Local logical counts tensor (on GPU)
@@ -149,7 +149,7 @@ def get_log2phy_prob(
     local_counts = count_logical_expert_tokens(topk_ids, num_logical_experts)
 
     # Step 2: All-reduce to get global counts
-    global_counts = get_global_logical_counts_cpu_reduce(local_counts)
+    global_counts = get_global_logical_counts_on_rank0(local_counts)
     
     # Step 3: Use LP to get the redundant token distribution probability
     if dist.get_rank() == 0:

@@ -71,12 +71,12 @@ class ExpertLocationDispatchInfo:
                 layer_id, :, :expert_location_metadata.logical_to_all_physical_map_num_valid[layer_id, :].max()
             ],
             lp_metadata={
-                "B1": lp_metadata.B1[layer_id].toarray(),
-                "B2": lp_metadata.B2[layer_id].toarray(),
-                "C": lp_metadata.C[layer_id].toarray(),
+                "B1": lp_metadata.B1[layer_id],
+                "B2": lp_metadata.B2[layer_id],
+                "C": lp_metadata.C[layer_id],
                 "c": lp_metadata.c[layer_id],
-                "G": lp_metadata.G[layer_id].toarray(),
-                "A": lp_metadata.A[layer_id].toarray(),
+                "G": lp_metadata.G[layer_id],
+                "A": lp_metadata.A[layer_id],
                 "single_expert_array": lp_metadata.single_expert_array[layer_id],
                 "log_replicated_expert_array": lp_metadata.log_replicated_expert_array[layer_id],
                 "phy_replicated_expert_array": lp_metadata.phy_replicated_expert_array[layer_id],

@@ -134,6 +134,7 @@ class TopK(CustomOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        lp_dispatch: bool = False,
     ) -> TopKOutput:
         torch_native = False
         return select_experts(
@@ -151,6 +152,7 @@ class TopK(CustomOp):
             routed_scaling_factor=self.routed_scaling_factor,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
+            lp_dispatch=lp_dispatch,
         )
 
     def forward_cpu(
