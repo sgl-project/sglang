@@ -498,7 +498,7 @@ class TboForwardBatchPreparer:
         )
 
         if is_enable_two_chunk:
-            cls.derive_some_fields_for_two_chunk(
+            cls.derive_fields_related_to_seq_len_for_two_chunk(
                 batch,
                 child_a=child_a,
                 child_b=child_b,
@@ -509,7 +509,7 @@ class TboForwardBatchPreparer:
         batch.tbo_children = [child_a, child_b]
 
     @classmethod
-    def derive_some_fields_for_two_chunk(
+    def derive_fields_related_to_seq_len_for_two_chunk(
         cls,
         batch: ForwardBatch,
         *,
