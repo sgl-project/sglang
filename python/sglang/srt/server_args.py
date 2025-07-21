@@ -164,6 +164,7 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
+    speculative_eagle_aux_capture_layer_ids: Optional[List[int]] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -1274,6 +1275,12 @@ class ServerArgs:
             type=str,
             help="The path of the draft model's small vocab table.",
             default=ServerArgs.speculative_token_map,
+        )
+        parser.add_argument(
+            "--speculative-eagle-aux-capture-layer-ids",
+            type=int,
+            nargs="+",
+            help="The list of layer IDs for which to capture auxiliary hidden states for Eagle3 speculative decoding",
         )
         parser.add_argument(
             "--mm-attention-backend",
