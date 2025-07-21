@@ -2,10 +2,10 @@ import json
 import time
 from argparse import ArgumentParser
 
-from data_gen import gen_arguments
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
 import sglang as sgl
+from data_gen import gen_arguments
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,

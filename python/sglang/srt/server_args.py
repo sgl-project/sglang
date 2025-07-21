@@ -215,6 +215,7 @@ class ServerArgs:
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
+    return_hidden_state_layers: Optional[str] = None
     warmups: Optional[str] = None
 
     # Debug tensor dumps
@@ -1485,6 +1486,12 @@ class ServerArgs:
             "--enable-return-hidden-states",
             action="store_true",
             help="Enable returning hidden states with responses.",
+        )
+        parser.add_argument(
+            "--return-hidden-state-layers",
+            type=str,
+            default=ServerArgs.return_hidden_state_layers,
+            help="Comma separated layer indices to return hidden states from, or 'all' for all layers.",
         )
         parser.add_argument(
             "--warmups",

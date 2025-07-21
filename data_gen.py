@@ -152,6 +152,7 @@ def main():
         model_path=args.model_name,
         skip_tokenizer_init=True,
         enable_return_hidden_states=True,
+        return_hidden_state_layers="1,23,44",
         tp_size=8,
         context_length=65536,
         disable_cuda_graph=True,

@@ -4,10 +4,10 @@ from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
-from data_gen import gen_arguments
 from tqdm import tqdm
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
+from data_gen import gen_arguments
 from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
 from sglang.utils import dump_state_text
 

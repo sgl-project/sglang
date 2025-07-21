@@ -253,6 +253,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disable-chunked-prefix-cache` | Disable chunked prefix cache feature for deepseek, which should save overhead for short sequences. | False |
 | `--disable-fast-image-processor` | Adopt base image processor instead of fast image processor. | False |
 | `--enable-return-hidden-states` | Enable returning hidden states with responses. | False |
+| `--return-hidden-state-layers` | Comma separated layer indices to return, or `all` for all layers. | None |
 | `--warmups` | Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests. | None |
 
 ## Prefill decode disaggregation

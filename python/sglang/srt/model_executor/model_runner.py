@@ -264,6 +264,13 @@ class ModelRunner:
         )
         self.num_effective_layers = self.end_layer - self.start_layer
 
+        if (
+            self.server_args.return_hidden_state_layers
+            and self.server_args.enable_return_hidden_states
+            and not self.server_args.speculative_algorithm
+        ):
+            self._set_hidden_state_layers(self.server_args.return_hidden_state_layers)
+
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
         # In layered loading, torchao may have been applied
@@ -295,8 +302,12 @@ class ModelRunner:
             self.cuda_graph_runner = None
             self.init_attention_backend()
 
-        # auxiliary hidden capture mode. TODO: expose this to server args?
-        if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
+        # auxiliary hidden capture mode
+        if (
+            not self.server_args.return_hidden_state_layers
+            and self.spec_algorithm.is_eagle3()
+            and not self.is_draft_worker
+        ):
             self.model.set_eagle3_layers_to_capture()
 
     def model_specific_adjustment(self):
@@ -609,6 +620,22 @@ class ModelRunner:
             raise ValueError(
                 f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
+
+    def _set_hidden_state_layers(self, layer_str: str):
+        """Configure which layers' hidden states to return."""
+        if not hasattr(self.model, "model"):
+            return
+        try:
+            if layer_str.lower() == "all":
+                layers = list(range(self.model.config.num_hidden_layers))
+            else:
+                layers = [int(x) for x in layer_str.split(",") if x.strip()]
+        except Exception as e:
+            raise ValueError(
+                f"Invalid format for return_hidden_state_layers: {layer_str}"
+            ) from e
+        self.model.capture_aux_hidden_states = True
+        self.model.model.layers_to_capture = layers
 
     def update_expert_location(
         self,

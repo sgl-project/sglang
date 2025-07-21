@@ -476,7 +476,7 @@ class Llama4Model(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.layers_to_capture = [2, 24, 45]
+        self.layers_to_capture = []
 
     def forward(
         self,
