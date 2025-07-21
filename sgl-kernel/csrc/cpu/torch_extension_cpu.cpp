@@ -322,11 +322,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "is_vnni) -> Tensor");
   m.impl("int8_scaled_mm_with_quant", torch::kCPU, &int8_scaled_mm_with_quant);
 
-  // quant + igemm
+  // int4 gemm
   m.def("int4_scaled_mm_cpu(Tensor x, Tensor w, Tensor w_zeros, Tensor w_scales, Tensor? bias) -> Tensor");
   m.impl("int4_scaled_mm_cpu", torch::kCPU, &int4_scaled_mm_cpu);
 
-  // quant + igemm
+  // weight prepack for int4 weights
   m.def("convert_int4_weight_packed(Tensor weight, Tensor scales, Tensor qzeros) -> (Tensor, Tensor, Tensor, Tensor)");
   m.impl("convert_int4_weight_packed", torch::kCPU, &convert_int4_weight_packed);
 
