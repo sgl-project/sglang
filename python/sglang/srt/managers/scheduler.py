@@ -252,6 +252,9 @@ class Scheduler(
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
+        self.enable_metrics_for_all_schedulers = (
+            server_args.enable_metrics_for_all_schedulers
+        )
         self.enable_kv_cache_events = server_args.kv_events_config is not None
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
@@ -259,6 +262,7 @@ class Scheduler(
         )
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.page_size = server_args.page_size
         self.dp_size = server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -279,9 +283,6 @@ class Scheduler(
             )
             self.send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-            )
-            self.send_metrics_from_scheduler = get_zmq_socket(
-                context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
 
             if server_args.skip_tokenizer_init:
@@ -308,9 +309,13 @@ class Scheduler(
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
-            self.send_metrics_from_scheduler = None
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+
+        if self.current_scheduler_metrics_enabled():
+            self.send_metrics_from_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.metrics_ipc_name, False
+            )
 
         # Init tokenizer
         self.init_tokenizer()
@@ -494,7 +499,7 @@ class Scheduler(
         self.init_profier()
 
         # Init metrics stats
-        self.init_metrics()
+        self.init_metrics(tp_rank, pp_rank, dp_rank)
         self.init_kv_events(server_args.kv_events_config)
 
         # Init request dispatcher
@@ -535,6 +540,9 @@ class Scheduler(
 
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
+
+    def current_scheduler_metrics_enabled(self):
+        return self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
@@ -606,6 +614,7 @@ class Scheduler(
                         == "fa3"  # hot fix for incompatibility
                         else server_args.hicache_io_backend
                     ),
+                    hicache_storage_backend=server_args.hicache_storage_backend,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -659,7 +668,7 @@ class Scheduler(
         self.profile_in_progress: bool = False
         self.rpd_profiler = None
 
-    def init_metrics(self):
+    def init_metrics(self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]):
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -667,15 +676,19 @@ class Scheduler(
         self.spec_num_total_forward_ct = 0
         self.cum_spec_accept_length = 0
         self.cum_spec_accept_count = 0
+        self.total_retracted_reqs = 0
         self.stats = SchedulerStats()
         if self.enable_metrics:
             engine_type = "unified"
-            self.metrics_collector = SchedulerMetricsCollector(
-                labels={
-                    "model_name": self.server_args.served_model_name,
-                    "engine_type": engine_type,
-                },
-            )
+            labels = {
+                "model_name": self.server_args.served_model_name,
+                "engine_type": engine_type,
+                "tp_rank": tp_rank,
+                "pp_rank": pp_rank,
+            }
+            if dp_rank is not None:
+                labels["dp_rank"] = dp_rank
+            self.metrics_collector = SchedulerMetricsCollector(labels=labels)
 
     def init_kv_events(self, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
@@ -1243,6 +1256,15 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
+            if self.enable_hicache_storage:
+                req.init_next_round_input(self.tree_cache)
+                last_hash = req.last_host_node.get_last_hash_value()
+                matched_len = len(req.prefix_indices) + req.host_hit_length
+                if (matched_len > 0 and last_hash is not None) or matched_len == 0:
+                    new_input_tokens = req.fill_ids[matched_len:]
+                    self.tree_cache.prefetch_from_storage(
+                        req.rid, req.last_host_node, new_input_tokens, last_hash
+                    )
             self.waiting_queue.append(req)
 
     def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
@@ -1368,8 +1390,6 @@ class Scheduler(
             f += f"#running-req: {running_bs}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
 
-        f += f"timestamp: {datetime.datetime.now().isoformat()}"
-
         logger.info(f)
 
         if self.enable_metrics:
@@ -1450,7 +1470,6 @@ class Scheduler(
             f"cuda graph: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
-            f"timestamp: {datetime.datetime.now().isoformat()}"
         )
 
         logger.info(msg)
@@ -1463,6 +1482,7 @@ class Scheduler(
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.spec_accept_length = spec_accept_length
+            self.stats.total_retracted_reqs = self.total_retracted_reqs
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
@@ -1515,7 +1535,7 @@ class Scheduler(
 
         if (
             self.enable_metrics
-            and self.attn_tp_rank == 0
+            and self.current_scheduler_metrics_enabled()
             and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
@@ -1715,6 +1735,9 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
                     break
 
+            if self.enable_hicache_storage:
+                self.tree_cache.check_prefetch_progress(req.rid)
+
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
 
@@ -1751,7 +1774,7 @@ class Scheduler(
             self.chunked_req.is_chunked += 1
 
         # Print stats
-        if self.attn_tp_rank == 0:
+        if self.current_scheduler_metrics_enabled():
             self.log_prefill_stats(adder, can_run_list, running_bs)
 
         # Create a new batch
@@ -1810,14 +1833,17 @@ class Scheduler(
             old_ratio = self.new_token_ratio
 
             retracted_reqs, new_token_ratio = batch.retract_decode(self.server_args)
+            num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
 
             logger.info(
                 "KV cache pool is full. Retract requests. "
-                f"#retracted_reqs: {len(retracted_reqs)}, "
+                f"#retracted_reqs: {num_retracted_reqs}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
+
             self._extend_requests_to_queue(retracted_reqs, is_retracted=True)
+            self.total_retracted_reqs += num_retracted_reqs
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
@@ -1941,7 +1967,7 @@ class Scheduler(
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
-            tp_cpu_group=self.tp_cpu_group,
+            tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
             spec_algorithm=self.spec_algorithm,
@@ -1950,6 +1976,7 @@ class Scheduler(
             enable_deepep_moe=self.server_args.enable_deepep_moe,
             deepep_mode=DeepEPMode[self.server_args.deepep_mode],
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
+            disable_overlap_schedule=self.server_args.disable_overlap_schedule,
         )
 
     @staticmethod
@@ -1957,7 +1984,7 @@ class Scheduler(
         local_batch: ScheduleBatch,
         dp_size,
         attn_tp_size: int,
-        tp_cpu_group,
+        tp_group,
         get_idle_batch,
         disable_cuda_graph: bool,
         spec_algorithm,
@@ -1966,6 +1993,7 @@ class Scheduler(
         enable_deepep_moe: bool,
         deepep_mode: DeepEPMode,
         require_mlp_tp_gather: bool,
+        disable_overlap_schedule: bool,
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -1996,6 +2024,12 @@ class Scheduler(
         )
 
         tbo_preparer = TboDPAttentionPreparer()
+        if disable_overlap_schedule:
+            group = tp_group.device_group
+            device = tp_group.device
+        else:
+            group = tp_group.cpu_group
+            device = "cpu"
 
         local_info = torch.tensor(
             [
@@ -2011,15 +2045,17 @@ class Scheduler(
                 ),
             ],
             dtype=torch.int64,
+            device=device,
         )
         global_info = torch.empty(
             (dp_size, attn_tp_size, 6),
             dtype=torch.int64,
+            device=device,
         )
         torch.distributed.all_gather_into_tensor(
             global_info.flatten(),
             local_info,
-            group=tp_cpu_group,
+            group=group,
         )
         global_num_tokens = global_info[:, 0, 0].tolist()
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
