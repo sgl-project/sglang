@@ -596,6 +596,7 @@ class DecodeTransferQueue:
                     output_top_logprobs_val,
                     output_top_logprobs_idx,
                     output_hidden_states,
+                    mrope_position_delta,
                 ) = self.metadata_buffers.get_buf(idx)
 
                 decode_req.req.output_ids.append(output_id[0].item())
@@ -619,6 +620,10 @@ class DecodeTransferQueue:
                         ].tolist()
                     )
 
+                if mrope_position_delta is not None:
+                    decode_req.req.decode_mrope_position_delta = mrope_position_delta[
+                        0
+                    ].item()
                 if hasattr(decode_req.kv_receiver, "clear"):
                     decode_req.kv_receiver.clear()
 

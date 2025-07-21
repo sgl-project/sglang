@@ -496,6 +496,9 @@ class Req:
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
 
+        # For qwen-vl series, P-D disaggregation, decode mode.
+        self.decode_mrope_position_delta: Optional[int] = None
+
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = []
@@ -1728,6 +1731,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
             multimodal_inputs=self.multimodal_inputs,
+            decode_mrope_position_delta=[
+                req.decode_mrope_position_delta for req in self.reqs
+            ],
             encoder_cached=self.encoder_cached,
             encoder_lens=self.encoder_lens,
             encoder_lens_cpu=self.encoder_lens_cpu,
@@ -1865,6 +1871,9 @@ class ModelWorkerBatch:
 
     # For multimodal
     multimodal_inputs: Optional[List[MultimodalInputs]]
+
+    # For qwen-vl series, P-D disaggregation, decode mode.
+    decode_mrope_position_delta: Optional[List[int]]
 
     # For encoder-decoder
     encoder_cached: Optional[List[bool]]

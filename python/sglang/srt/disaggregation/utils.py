@@ -92,6 +92,7 @@ class MetadataBuffers:
         dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
+        is_mrope_enabled: bool = False,
     ):
         self.custom_mem_pool = custom_mem_pool
         device = "cpu"
@@ -100,6 +101,7 @@ class MetadataBuffers:
             device = "npu"
         elif self.custom_mem_pool:
             device = "cuda"
+        self.is_mrope_enabled = is_mrope_enabled
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -126,6 +128,10 @@ class MetadataBuffers:
             self.output_hidden_states = torch.zeros(
                 (size, hidden_size), dtype=dtype, device=device
             )
+            if is_mrope_enabled:
+                self.mrope_position_delta = torch.zeros(
+                    (size, 16), dtype=torch.int32, device=device
+                )
 
     def get_buf_infos(self):
         ptrs = [
@@ -152,6 +158,10 @@ class MetadataBuffers:
             self.output_top_logprobs_idx[0].nbytes,
             self.output_hidden_states[0].nbytes,
         ]
+        if self.is_mrope_enabled:
+            ptrs.append(self.mrope_position_delta.data_ptr())
+            data_lens.append(self.mrope_position_delta.nbytes)
+            item_lens.append(self.mrope_position_delta[0].nbytes)
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
@@ -162,6 +172,7 @@ class MetadataBuffers:
             self.output_top_logprobs_val[idx],
             self.output_top_logprobs_idx[idx],
             self.output_hidden_states[idx],
+            self.mrope_position_delta[idx] if self.is_mrope_enabled else None,
         )
 
     def set_buf(self, req: Req):
@@ -194,6 +205,16 @@ class MetadataBuffers:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
+        if self.is_mrope_enabled:
+            if (
+                req.multimodal_inputs is not None
+                and req.multimodal_inputs.mrope_position_delta is not None
+            ):
+                self.mrope_position_delta[req.metadata_buffer_index][
+                    0
+                ] = req.multimodal_inputs.mrope_position_delta
+            else:
+                self.mrope_position_delta[req.metadata_buffer_index][0] = 0
 
 
 #########################

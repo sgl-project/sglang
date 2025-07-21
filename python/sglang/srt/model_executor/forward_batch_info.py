@@ -232,6 +232,9 @@ class ForwardBatch:
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
 
+    # For qwen-vl series, P-D disaggregation, decode mode.
+    decode_mrope_position_delta: Optional[List[int]] = None
+
     # Encoder-decoder
     encoder_cached: Optional[List[bool]] = None
     encoder_lens: Optional[torch.Tensor] = None
@@ -304,6 +307,7 @@ class ForwardBatch:
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
             mm_inputs=batch.multimodal_inputs,
+            decode_mrope_position_delta=batch.decode_mrope_position_delta,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
             encoder_lens_cpu=batch.encoder_lens_cpu,
@@ -488,20 +492,31 @@ class ForwardBatch:
         batch_size = self.seq_lens.shape[0]
         mrope_positions_list = [[]] * batch_size
         for batch_idx in range(batch_size):
-            mm_input = batch.multimodal_inputs[batch_idx]
+            mm_input = (
+                batch.multimodal_inputs[batch_idx]
+                if batch.multimodal_inputs is not None
+                else None
+            )
             if self.forward_mode.is_decode():
-                mrope_position_deltas = (
-                    [0]
-                    if mm_input is None
-                    else flatten_nested_list(mm_input.mrope_position_delta.tolist())
-                )
+                # priorly computed mrope position delta in the batch scheduler is set only
+                # in PD disaggregation, decode mode. So we use it directly if available.
+                # NOTE: mrope_position_delta can be None on decode warmup, and
+                #       the 'or 0' here prevents None to be accessed by the function here.
+                if batch.decode_mrope_position_delta:
+                    mrope_position_deltas = batch.decode_mrope_position_delta
+                else:
+                    mrope_position_deltas = (
+                        [0]
+                        if mm_input is None
+                        else flatten_nested_list(mm_input.mrope_position_delta.tolist())
+                    )
                 next_input_positions = []
                 for mrope_position_delta in mrope_position_deltas:
                     # batched deltas needs to be processed separately
                     # Convert list of lists to tensor with shape [3, seq_len]
                     next_input_positions += [
                         MRotaryEmbedding.get_next_input_positions(
-                            mrope_position_delta,
+                            mrope_position_delta or 0,
                             int(self.seq_lens[batch_idx]) - 1,
                             int(self.seq_lens[batch_idx]),
                         )
