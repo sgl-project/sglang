@@ -155,7 +155,7 @@ def get_log2phy_prob(
     if dist.get_rank() == 0:
         log2phy_prob = run_lp_solver(global_counts, expert_location_dispatch_info.lp_metadata, expert_location_dispatch_info.partial_logical_to_valid_physical_map.cpu())
     else:
-        log2phy_prob = torch.empty_like(expert_location_dispatch_info.partial_logical_to_valid_physical_map)
+        log2phy_prob = torch.empty_like(expert_location_dispatch_info.partial_logical_to_valid_physical_map, device='cpu')
 
     # Step 4: Broadcast to all ranks
     log2phy_prob = send_log2phy_prob_broadcast(log2phy_prob)
