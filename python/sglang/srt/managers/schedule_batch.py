@@ -239,6 +239,10 @@ class MultimodalDataItem:
     # For gemma3n
     input_features_mask: Optional[torch.Tensor] = None
 
+    # For phi4-mm
+    image_attention_mask: Optional[torch.Tensor] = None
+    audio_attention_mask: Optional[torch.Tensor] = None
+
     @staticmethod
     def is_empty_list(l):
         if l is None:
