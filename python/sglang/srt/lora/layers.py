@@ -1,8 +1,8 @@
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
 from sglang.srt.distributed import (
     divide,
@@ -76,45 +76,53 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         self.embedding_A_buffer = embedding_A_buffer
         self.embedding_B_buffer = embedding_B_buffer
 
-    def apply_lora(self, base_output: torch.Tensor, input_: torch.Tensor, batch_info: LoRABatchInfo) -> torch.Tensor:
+    def apply_lora(
+        self, base_output: torch.Tensor, input_: torch.Tensor, batch_info: LoRABatchInfo
+    ) -> torch.Tensor:
         """
         Apply LoRA to base embedding output.
         Formula: output = base_output + lora_a_embedding(input_) @ lora_b_weights
         """
         token_weight_indices = self._get_token_weight_indices(input_, batch_info)
-        
+
         lora_a_output = self._run_lora_a_embedding(input_, token_weight_indices)
-        
+
         lora_b_output = self.lora_backend.run_lora_b_sgemm(
             lora_a_output,
             self.embedding_B_buffer,
             base_output=base_output if self.lora_backend.fuse_output_add else None,
         )
-        
+
         return (
             lora_b_output
             if self.lora_backend.fuse_output_add
             else base_output + lora_b_output
         )
 
-    def _get_token_weight_indices(self, input_: torch.Tensor, batch_info: LoRABatchInfo) -> torch.Tensor:
+    def _get_token_weight_indices(
+        self, input_: torch.Tensor, batch_info: LoRABatchInfo
+    ) -> torch.Tensor:
         """Map each token position to its corresponding LoRA adapter index."""
-        token_weight_indices = torch.zeros(input_.shape[0], dtype=torch.int32, device=input_.device)
-        
+        token_weight_indices = torch.zeros(
+            input_.shape[0], dtype=torch.int32, device=input_.device
+        )
+
         current_pos = 0
         for i in range(batch_info.bs):
             seg_len = batch_info.seg_lens[i]
             weight_idx = batch_info.weight_indices[i]
-            token_weight_indices[current_pos:current_pos + seg_len] = weight_idx
+            token_weight_indices[current_pos : current_pos + seg_len] = weight_idx
             current_pos += seg_len
-            
+
         return token_weight_indices
 
-    def _run_lora_a_embedding(self, input_: torch.Tensor, token_weight_indices: torch.Tensor) -> torch.Tensor:
+    def _run_lora_a_embedding(
+        self, input_: torch.Tensor, token_weight_indices: torch.Tensor
+    ) -> torch.Tensor:
         lora_a_output = torch.zeros(
-            (input_.shape[0], self.embedding_A_buffer.shape[1]), 
-            dtype=self.embedding_A_buffer.dtype, 
-            device=input_.device
+            (input_.shape[0], self.embedding_A_buffer.shape[1]),
+            dtype=self.embedding_A_buffer.dtype,
+            device=input_.device,
         )
 
         unique_weight_indices = torch.unique(token_weight_indices)
@@ -122,18 +130,22 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         for idx in unique_weight_indices:
             token_mask = token_weight_indices == idx
             lora_a_weights = self.embedding_A_buffer[idx]
-            lora_a_output[token_mask] = F.embedding(input_[token_mask], lora_a_weights.t())
-            
+            lora_a_output[token_mask] = F.embedding(
+                input_[token_mask], lora_a_weights.t()
+            )
+
         return lora_a_output
 
     def forward(self, input_: torch.Tensor):
         batch_info = self.lora_backend.batch_info
         added_tokens_mask = torch.where(input_ > self.vocab_size - 1, 1, 0)
-        base_output = self.base_layer.forward(input_ * (1-added_tokens_mask))
+        base_output = self.base_layer.forward(input_ * (1 - added_tokens_mask))
 
         if added_tokens_mask.any():
-            base_output = self._forward(input_, added_tokens_mask, batch_info, base_output)
-        
+            base_output = self._forward(
+                input_, added_tokens_mask, batch_info, base_output
+            )
+
         if self.set_lora:
             output = self.apply_lora(base_output, input_, batch_info)
         else:
@@ -141,7 +153,13 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
         return output
 
-    def _forward(self, input_: torch.Tensor, added_tokens_mask: torch.Tensor, batch_info: LoRABatchInfo, base_output: torch.Tensor) -> torch.Tensor:        
+    def _forward(
+        self,
+        input_: torch.Tensor,
+        added_tokens_mask: torch.Tensor,
+        batch_info: LoRABatchInfo,
+        base_output: torch.Tensor,
+    ) -> torch.Tensor:
         token_weight_indices = self._get_token_weight_indices(input_, batch_info)
         added_weight_indices = token_weight_indices[added_tokens_mask.bool()]
         unique_added_weight_indices = torch.unique(added_weight_indices)
@@ -150,12 +168,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
             lora_mask = added_weight_indices == idx
             added_token_positions = torch.where(added_tokens_mask)[0][lora_mask]
             x = input_[added_token_positions] - self.vocab_size
-            new_embeddings = F.embedding(
-                x,
-                self.new_embeddings_buffer[idx]
-            )
+            new_embeddings = F.embedding(x, self.new_embeddings_buffer[idx])
             base_output[added_token_positions] = new_embeddings
-        
+
         return base_output
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
