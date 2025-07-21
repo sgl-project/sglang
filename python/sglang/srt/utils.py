@@ -84,7 +84,6 @@ from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager
-from video_reader import PyVideoReader
 
 logger = logging.getLogger(__name__)
 
@@ -692,11 +691,16 @@ def decode_video_base64(video_base64):
         )  # Return an empty array and size tuple if no frames were found
 
 
-def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarray:
+def load_audio(
+    audio_file: str, sr: Optional[int] = None, mono: bool = True
+) -> np.ndarray:
     # Use soundfile here, since librosa use it under the hood,
     # and librosa will not support audio loading in the future
     import soundfile as sf
     from scipy.signal import resample
+
+    if sr is None:
+        sr = 16000
 
     # Load audio data
     if isinstance(audio_file, bytes):
@@ -758,9 +762,16 @@ def load_image(
 
 def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
     # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
-    from video_reader import PyVideoReader
+    from decord import VideoReader, cpu, gpu
 
-    device = "cuda" if use_gpu and torch.cuda.is_available() else None
+    try:
+        from decord.bridge import decord_bridge
+
+        ctx = gpu(0)
+        _ = decord_bridge.get_ctx_device(ctx)
+    except Exception:
+        ctx = cpu(0)
+
     tmp_file = None
     vr = None
     try:
@@ -768,7 +779,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
             tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
             tmp_file.write(video_file)
             tmp_file.close()
-            vr = PyVideoReader(tmp_file.name, device=device, threads=0)
+            vr = VideoReader(tmp_file.name, ctx=ctx)
         elif isinstance(video_file, str):
             if video_file.startswith(("http://", "https://")):
                 timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
@@ -778,22 +789,22 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 for chunk in response.iter_content(chunk_size=8192):
                     tmp_file.write(chunk)
                 tmp_file.close()
-                vr = PyVideoReader(tmp_file.name, device=device, threads=0)
+                vr = VideoReader(tmp_file.name, ctx=ctx)
             elif video_file.startswith("data:"):
                 _, encoded = video_file.split(",", 1)
                 video_bytes = base64.b64decode(encoded)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()
-                vr = PyVideoReader(tmp_file.name, device=device, threads=0)
+                vr = VideoReader(tmp_file.name, ctx=ctx)
             elif os.path.isfile(video_file):
-                vr = PyVideoReader(video_file, device=device, threads=0)
+                vr = VideoReader(video_file, ctx=ctx)
             else:
                 video_bytes = base64.b64decode(video_file)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()
-                vr = PyVideoReader(tmp_file.name, device=device, threads=0)
+                vr = VideoReader(tmp_file.name, ctx=ctx)
         else:
             raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
@@ -1411,6 +1422,13 @@ def get_nvgpu_memory_capacity():
         ]
 
         if not memory_values:
+            # Fallback to torch.cuda.mem_get_info() when failed to get memory capacity from nvidia-smi,
+            # typically in NVIDIA MIG mode.
+            if torch.cuda.is_available():
+                logger.warning(
+                    "Failed to get GPU memory capacity from nvidia-smi, falling back to torch.cuda.mem_get_info()."
+                )
+                return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MB
             raise ValueError("No GPU memory values found.")
 
         # Return the minimum memory value
@@ -2874,3 +2892,17 @@ def parse_module_path(module_path, function_name, create_dummy):
         return final_module, getattr(final_module, function_name)
 
     return final_module, None
+
+
+# LoRA-related constants and utilities
+SUPPORTED_LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+LORA_TARGET_ALL_MODULES = "all"
