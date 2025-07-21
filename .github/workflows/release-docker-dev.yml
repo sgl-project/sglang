@@ -9,6 +9,15 @@ jobs:
   build-dev:
     if: ${{ github.repository == 'sgl-project/sglang' }}
     runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        variant:
+          - version: 12.6.1
+            type: all
+            tag: dev
+          - version: 12.8.1
+            type: blackwell
+            tag: blackwell
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,5 +41,5 @@ jobs:
 
       - name: Build and Push Dev Image
         run: |
-          docker build . -f docker/Dockerfile.dev -t lmsysorg/sglang:dev --no-cache
-          docker push lmsysorg/sglang:dev
+          docker buildx build --output type=image,compression=zstd . -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.version }} --build-arg BUILD_TYPE=${{ matrix.variant.type }} --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) -t lmsysorg/sglang:${{ matrix.variant.tag }} --no-cache
+          docker push lmsysorg/sglang:${{ matrix.variant.tag }}

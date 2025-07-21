@@ -9,7 +9,7 @@ else
 fi
 
 # Pull the image
-IMAGE="lmsysorg/sglang:v0.4.6.post5-rocm630"
+IMAGE="rocm/sgl-dev:v0.4.9.post2-rocm630-mi30x-20250715"
 echo "Pulling Docker image: $IMAGE"
 docker pull "$IMAGE"
 

@@ -19,7 +19,7 @@ format: check-deps ## Format modified Python files using isort and black
 FILES_TO_UPDATE = docker/Dockerfile.rocm \
                  python/pyproject.toml \
                  python/sglang/version.py \
-                 docs/developer/setup_github_runner.md \
+                 docs/references/setup_github_runner.md \
                  docs/start/install.md \
 				 benchmark/deepseek_v3/README.md
 

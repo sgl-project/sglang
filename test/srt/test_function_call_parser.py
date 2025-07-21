@@ -3,14 +3,15 @@ import unittest
 
 from xgrammar import GrammarCompiler, TokenizerInfo
 
+from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
+from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.openai_api.protocol import Function, Tool
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
@@ -515,7 +516,7 @@ class TestEBNFGeneration(unittest.TestCase):
         # Check that the EBNF contains expected patterns
         self.assertIn('call_get_weather ::= "get_weather" "(" ', ebnf)
         self.assertIn('"location" "=" basic_string', ebnf)
-        self.assertIn('[ "unit" "=" ("\\"celsius\\"" | "\\"fahrenheit\\"") ]', ebnf)
+        self.assertIn('( "unit" "=" ("\\"celsius\\"" | "\\"fahrenheit\\"") )', ebnf)
 
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
@@ -590,6 +591,224 @@ class TestEBNFGeneration(unittest.TestCase):
             self.assertIsNotNone(ctx, "EBNF should be valid and compile successfully")
         except RuntimeError as e:
             self.fail(f"Failed to compile EBNF: {e}")
+
+    def test_weather_function_optional_parameter_handling(self):
+        """Test that weather function with optional unit parameter generates correct EBNF without trailing commas."""
+        # Create a weather tool with required location and optional unit
+        weather_tool = Tool(
+            type="function",
+            function=Function(
+                name="get_current_weather",
+                description="Get the current weather in a given location",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "The city and state, e.g. San Francisco, CA",
+                        },
+                        "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                    },
+                    "required": ["location"],
+                },
+            ),
+        )
+
+        # Test all detectors with the weather tool
+        detectors = {
+            "pythonic": self.pythonic_detector,
+            "deepseekv3": self.deepseekv3_detector,
+            "llama32": self.llama32_detector,
+            "mistral": self.mistral_detector,
+            "qwen25": self.qwen25_detector,
+        }
+
+        for name, detector in detectors.items():
+            with self.subTest(detector=name):
+                ebnf = detector.build_ebnf([weather_tool])
+                self.assertIsNotNone(ebnf, f"{name} detector should generate EBNF")
+
+                # Check that the EBNF properly handles optional parameters
+                if name == "pythonic":
+                    # Pythonic format: location="Paris" ( , ( unit=("celsius" | "fahrenheit") )?
+                    self.assertIn('"location" "=" basic_string', ebnf)
+                    # The comma should be inside the optional brackets for unit
+                    self.assertIn('( "," ( "unit" "=" ', ebnf)
+                else:
+                    # JSON format: "location": "Paris" ( , ( "unit": ("celsius" | "fahrenheit") )?
+                    self.assertIn('"location\\"" ":" basic_string', ebnf)
+                    # The comma should be part of the optional group
+                    # This pattern ensures no trailing comma when unit is omitted
+                    self.assertIn('( "," ( "\\"unit\\"" ":"', ebnf)
+
+                # Validate that the EBNF can be compiled
+                try:
+                    ctx = self.grammar_compiler.compile_grammar(ebnf)
+                    self.assertIsNotNone(
+                        ctx, f"{name} EBNF should compile successfully"
+                    )
+                except RuntimeError as e:
+                    self.fail(f"Failed to compile {name} EBNF: {e}")
+
+    def test_multiple_optional_parameters_flexible_ordering(self):
+        """Test that multiple optional parameters allow flexible ordering using llama.cpp approach."""
+        # Create a tool with one required and multiple optional parameters
+        test_tool = Tool(
+            type="function",
+            function=Function(
+                name="test_func",
+                description="Test function with multiple optional parameters",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "required_field": {"type": "string"},
+                        "opt1": {"type": "number"},
+                        "opt2": {"type": "boolean"},
+                        "opt3": {"type": "string"},
+                    },
+                    "required": ["required_field"],
+                },
+            ),
+        )
+
+        # Test JSON-based detectors (not pythonic)
+        json_detectors = {
+            "deepseekv3": self.deepseekv3_detector,
+            "llama32": self.llama32_detector,
+            "mistral": self.mistral_detector,
+            "qwen25": self.qwen25_detector,
+        }
+
+        for name, detector in json_detectors.items():
+            with self.subTest(detector=name):
+                ebnf = detector.build_ebnf([test_tool])
+                self.assertIsNotNone(ebnf, f"{name} detector should generate EBNF")
+
+                # Print the arguments rule for debugging
+                lines = ebnf.split("\n")
+                args_rule = None
+                for line in lines:
+                    if line.startswith("arguments_test_func ::="):
+                        args_rule = line
+                        break
+
+                self.assertIsNotNone(
+                    args_rule, f"{name} should have arguments_test_func rule"
+                )
+
+                # Check required field
+                self.assertIn('"required_field\\"" ":" basic_string', ebnf)
+
+                # Check the structure for optional parameters
+                # The pattern should be: required_field ( "," ( opt1 ... | opt2 ... | opt3 ... ) )?
+                # This allows flexible ordering where any optional can be first
+
+                # Check that optional parameters are in a group with comma
+                if args_rule:  # Only check if args_rule was found
+                    self.assertIn(
+                        '( ","',
+                        args_rule,
+                        f"{name} should have comma grouped with optional parameters",
+                    )
+
+                    # Check for the alternation pattern that allows flexible ordering
+                    # Should contain patterns like: opt1 ... | opt2 ... | opt3
+                    self.assertIn('"opt1\\"" ":" basic_number', args_rule)
+                    self.assertIn('"opt2\\"" ":" basic_boolean', args_rule)
+                    self.assertIn('"opt3\\"" ":" basic_string', args_rule)
+
+                    # Check for alternation (|) which allows skipping optional parameters
+                    self.assertIn(
+                        "|",
+                        args_rule,
+                        f"{name} should use alternation for flexible optional ordering",
+                    )
+
+                    # Check that the pattern ends properly with closing braces
+                    self.assertTrue(
+                        args_rule.endswith('"}"'),
+                        f"{name} arguments rule should end with closing brace",
+                    )
+
+                # Validate compilation
+                try:
+                    ctx = self.grammar_compiler.compile_grammar(ebnf)
+                    self.assertIsNotNone(
+                        ctx, f"{name} EBNF should compile successfully"
+                    )
+                except RuntimeError as e:
+                    self.fail(f"Failed to compile {name} EBNF: {e}")
+
+    def test_all_optional_parameters_ordering(self):
+        """Test the behavior when ALL parameters are optional - verifies ordering constraints."""
+        # Create a tool with only optional parameters
+        all_optional_tool = Tool(
+            type="function",
+            function=Function(
+                name="optional_func",
+                description="Function with all optional parameters",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "opt1": {"type": "string"},
+                        "opt2": {"type": "number"},
+                        "opt3": {"type": "boolean"},
+                    },
+                    "required": [],  # No required parameters
+                },
+            ),
+        )
+
+        # Test JSON-based detectors
+        json_detectors = {
+            "deepseekv3": self.deepseekv3_detector,
+            "llama32": self.llama32_detector,
+            "mistral": self.mistral_detector,
+            "qwen25": self.qwen25_detector,
+        }
+
+        for name, detector in json_detectors.items():
+            with self.subTest(detector=name):
+                ebnf = detector.build_ebnf([all_optional_tool])
+                self.assertIsNotNone(ebnf, f"{name} detector should generate EBNF")
+
+                # Extract the arguments rule
+                lines = ebnf.split("\n")
+                args_rule = None
+                for line in lines:
+                    if line.startswith("arguments_optional_func ::="):
+                        args_rule = line
+                        break
+
+                self.assertIsNotNone(
+                    args_rule, f"{name} should have arguments_optional_func rule"
+                )
+
+                if args_rule:
+                    # When all parameters are optional, the pattern now uses alternation:
+                    # "{" ( opt1 ... | opt2 ... | opt3 ... )? "}"
+                    # This allows flexible ordering where any optional can appear first
+
+                    # Check the structure
+                    self.assertIn('"opt1\\"" ":" basic_string', args_rule)
+                    self.assertIn('"opt2\\"" ":" basic_number', args_rule)
+                    self.assertIn('"opt3\\"" ":" basic_boolean', args_rule)
+
+                    # The pattern SHOULD have alternation (|) for flexible ordering
+                    self.assertIn(
+                        "|",
+                        args_rule,
+                        f"{name} should use alternation for flexible ordering even when all properties are optional",
+                    )
+
+                # Validate compilation
+                try:
+                    ctx = self.grammar_compiler.compile_grammar(ebnf)
+                    self.assertIsNotNone(
+                        ctx, f"{name} EBNF should compile successfully"
+                    )
+                except RuntimeError as e:
+                    self.fail(f"Failed to compile {name} EBNF: {e}")
 
 
 class TestBaseFormatDetector(unittest.TestCase):
@@ -918,6 +1137,214 @@ class TestLlama32Detector(unittest.TestCase):
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertTrue(result.normal_text.strip().startswith("Some intro."))
+
+
+class TestKimiK2Detector(unittest.TestCase):
+
+    def setUp(self):
+        """Set up test tools and detector."""
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "City name",
+                            }
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_tourist_attractions",
+                    description="Get tourist attractions",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "City name",
+                            }
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = KimiK2Detector()
+
+    def test_single_tool_call(self):
+        """Test parsing a single tool call in a complete text."""
+        text = '<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city": "Paris"}<|tool_call_end|><|tool_calls_section_end|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[0].parameters, '{"city": "Paris"}')
+        self.assertEqual(result.normal_text, "")
+
+    def test_multiple_tool_calls(self):
+        """Test parsing multiple tool calls in a complete text."""
+        text = '<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city": "Paris"}<|tool_call_end|><|tool_call_begin|>functions.get_tourist_attractions:1<|tool_call_argument_begin|>{"city": "London"}<|tool_call_end|><|tool_calls_section_end|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[0].parameters, '{"city": "Paris"}')
+        self.assertEqual(result.calls[1].name, "get_tourist_attractions")
+        self.assertEqual(result.calls[1].parameters, '{"city": "London"}')
+        self.assertEqual(result.normal_text, "")
+
+    def test_streaming_tool_call(self):
+        """Test streaming incremental parsing of a tool call."""
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            '"city": "Paris"',
+            "}",
+            "<|tool_call_end|><|tool_calls_section_end|>",
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if tool_call_chunk.tool_index is not None:
+
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+
+                    tc = tool_calls[tool_call_chunk.tool_index]
+
+                    if tool_call_chunk.name:
+                        tc["name"] += tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"}')
+
+    def test_streaming_multiple_tool_calls(self):
+        """Test streaming incremental parsing of multiple tool calls."""
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            '"city": "Paris"',
+            "}<|tool_call_end|>",
+            "<|tool_call_begin|>functions.get_tourist_attractions:1<|tool_call_argument_begin|>{",
+            '"city": "London"',
+            "}<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if tool_call_chunk.tool_index is not None:
+
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+
+                    tc = tool_calls[tool_call_chunk.tool_index]
+
+                    if tool_call_chunk.name:
+                        tc["name"] += tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"}')
+        self.assertEqual(tool_calls[1]["name"], "get_tourist_attractions")
+        self.assertEqual(tool_calls[1]["parameters"], '{"city": "London"}')
+
+    def test_tool_call_completion(self):
+        """Test that the buffer and state are reset after a tool call is completed."""
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            '"city": "Paris"',
+            "}",
+            "<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+
+        # After processing all chunks, the buffer should be empty and current_tool_id should be reset
+        self.assertEqual(self.detector._buffer, "")
+        self.assertEqual(self.detector.current_tool_id, 1)
+
+    def test_tool_name_streaming(self):
+        """Test that tool names are streamed correctly with the right index."""
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            '"city": "Paris"',
+            "}",
+            "<|tool_call_end|>",
+            "<|tool_call_begin|>functions.get_tourist_attractions:1<|tool_call_argument_begin|>{",
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if tool_call_chunk.tool_index is not None:
+
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+
+                    tc = tool_calls[tool_call_chunk.tool_index]
+
+                    if tool_call_chunk.name:
+                        tc["name"] += tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"}')
+        self.assertEqual(tool_calls[1]["name"], "get_tourist_attractions")
+
+    def test_invalid_tool_call(self):
+        """Test that invalid tool calls are handled correctly."""
+        text = 'invalid_tool:0<|tool_call_argument_begin|>{"city": "Paris"}<|tool_call_end|><|tool_calls_section_end|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, text)
+
+    def test_partial_tool_call(self):
+        """Test that partial tool calls are handled correctly in streaming mode."""
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            '"city": "Paris"',
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if tool_call_chunk.tool_index is not None:
+
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+
+                    tc = tool_calls[tool_call_chunk.tool_index]
+
+                    if tool_call_chunk.name:
+                        tc["name"] += tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"')
 
 
 if __name__ == "__main__":

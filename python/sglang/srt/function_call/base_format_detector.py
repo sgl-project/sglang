@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
+from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
@@ -16,7 +17,6 @@ from sglang.srt.function_call.utils import (
     _is_complete_json,
     _partial_json_loads,
 )
-from sglang.srt.openai_api.protocol import Tool
 
 logger = logging.getLogger(__name__)
 
@@ -111,11 +111,10 @@ class BaseFormatDetector(ABC):
         # The current_text has tool_call if it is the start of a new tool call sequence
         # or it is the start of a new tool call after a tool call separator, when there is a previous tool call
         if not (
-            self.bot_token in current_text
-            or current_text.startswith("{")
+            self.has_tool_call(current_text)
             or (
                 self.current_tool_id > 0
-                and current_text.startswith(self.tool_call_separator + "{")
+                and current_text.startswith(self.tool_call_separator)
             )
         ):
             # Only clear buffer if we're sure no tool call is starting
@@ -143,6 +142,10 @@ class BaseFormatDetector(ABC):
             try:
                 if current_text.startswith(self.bot_token):
                     start_idx = len(self.bot_token)
+                elif self.current_tool_id > 0 and current_text.startswith(
+                    self.tool_call_separator + self.bot_token
+                ):
+                    start_idx = len(self.tool_call_separator + self.bot_token)
                 elif self.current_tool_id > 0 and current_text.startswith(
                     self.tool_call_separator
                 ):
