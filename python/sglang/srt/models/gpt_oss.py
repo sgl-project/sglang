@@ -243,7 +243,7 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
                               swiglu_beta=1.0,
                               enable_mxfp4_moe=global_server_args_dict["enable_w4_mxfp4_moe"] or global_server_args_dict["enable_w4a8_mxfp4_moe"],
                               enable_fp8_activation=global_server_args_dict["enable_w4a8_mxfp4_moe"],
-                              shuffle_weight=False)
+                              shuffle_weight=True)
 
         # Todo: add bias support in MoE impl class
         self.experts = get_moe_impl_class()(
@@ -641,11 +641,11 @@ class OpenAIMoeAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
-        attn_output = self.attn(*inner_state)
+        # attn_output = self.attn(*inner_state)
         # todo: check if sinks need fp32 before exp
         sinks = torch.exp(self.sinks)
         sinks = sinks.to(torch.float32)
-        # flashinfer_output = self.attn(*inner_state, sink=sinks)
+        attn_output = self.attn(*inner_state, sink=sinks)
         # o_ref = self.flashinfer_attention_ref(inner_state, sinks)
 
         # print(f"### layer_id={self.layer_id}, attn_output.shape={attn_output.shape}, o_ref.shape={o_ref.shape}, flashinfer_output.shape={flashinfer_output.shape}")

@@ -102,13 +102,21 @@ struct AttentionSink : AttentionVariantBase {
                                    uint8_t* smem_ptr) {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
-    window_left = kv_len;
+    window_left = (params.window_left >= 0) ? params.window_left : kv_len;
     sm_scale_log2 = params.sm_scale * math::log2e;
   }
 
+  REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+    return (kv_idx + qo_len + window_left >= kv_len + qo_idx);
+  })
+
   REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, {
-    float d_rcp = (m != -math::inf) ? math::ptx_rcp(d + params.sink[qo_head_idx] * math::ptx_exp2(-m)) : 0.f;
-    return output * d_rcp;
+    float log_sink = math::ptx_log2(params.sink[qo_head_idx]);
+    float m_all = (log_sink > m) ? log_sink : m;
+    float scale = math::ptx_exp2(m - m_all);
+    float d_all = d * scale;
+    float denom = math::ptx_exp2(log_sink - m_all) + d_all;
+    return (output * scale) * math::ptx_rcp(denom);
   });
 };
 """
@@ -620,7 +628,6 @@ class FlashInferAttnBackend(AttentionBackend):
 
         logits_soft_cap = layer.logit_cap
         window_left = layer.sliding_window_size if layer.sliding_window_size is not None and layer.sliding_window_size >= 0 else -1
-        print(f"### forward_extend: window_left={window_left}")
 
         q = q.contiguous()
         if not self.forward_metadata.use_ragged:
