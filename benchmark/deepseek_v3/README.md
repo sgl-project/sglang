@@ -178,6 +178,8 @@ python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1
 
 ### Example: Serving with 8 A100/A800 with AWQ Quantization
 
+**Recommended Usage**
+
 Add `--quantization moe_wna16` flag to enable moe wna16 kernel for better performance.
 One example is as follows:
 
@@ -185,6 +187,13 @@ One example is as follows:
 python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --quantization moe_wna16
 ```
 
+Alternatively, you can use `--quantization awq_marlin` as follows:
+
+```bash
+python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --quantization awq_marlin --dtype float16
+```
+
+Note that `awq_marlin` only supports `float16` now, which may lead to some precision loss.
 
 ### Example: Serving with 16 A100/A800 with int8 Quantization
 
