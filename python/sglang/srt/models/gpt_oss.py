@@ -110,11 +110,17 @@ def sink_attention_ref(
     sink: torch.Tensor,
     causal: bool,
     sm_scale: float,
-    window_left: int = -1,
+    window_left: bool,
 ) -> torch.Tensor:
     qo_len = q.shape[0] // batch_size
     kv_len = k.shape[0] // batch_size
     num_qo_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
+    if num_qo_heads != num_kv_heads:
+        # repeat interleave kv
+        k = torch.repeat_interleave(k, num_qo_heads // num_kv_heads, dim=1)
+        v = torch.repeat_interleave(v, num_qo_heads // num_kv_heads, dim=1)
+
     head_dim_qk = q.shape[2]
     head_dim_vo = v.shape[2]
     logits = (
@@ -126,33 +132,20 @@ def sink_attention_ref(
         * sm_scale
     )
 
-    # For decode case (qo_len=1), the query is at position kv_len-1
-    # For prefill case (qo_len=kv_len), queries start from position 0
-    if qo_len == 1:
-        # Decode: single query at the end
-        q_indices = torch.tensor([kv_len - 1], device=q.device)
-    else:
-        # Prefill: queries from kv_len-qo_len to kv_len-1
-        q_indices = torch.arange(kv_len - qo_len, kv_len, device=q.device)
-
-    k_indices = torch.arange(0, kv_len, device=q.device)
-
     if causal:
-        mask = q_indices.unsqueeze(1) >= k_indices.unsqueeze(0)
+        mask = torch.arange(kv_len - qo_len, kv_len, device=q.device).unsqueeze(
+            1
+        ) >= torch.arange(0, kv_len, device=q.device).unsqueeze(0)
+        if window_left >= 0:
+            row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[:, None]
+            col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[None, :]
+            mask &= row_idx - window_left <= col_idx
     else:
-        mask = torch.ones(qo_len, kv_len, device=q.device, dtype=torch.bool)
-
-    # Apply sliding window mask
-    if window_left >= 0:
-        # For sliding window, we can only attend to at most window_left + 1 tokens
-        # This matches the logic in the C++ kernel: kv_idx + qo_len + window_left >= kv_len + qo_idx
-        # Rearranging: kv_idx >= kv_len + qo_idx - qo_len - window_left
-        #             = kv_len - qo_len + qo_idx - window_left
-        #             = (kv_len - qo_len) + (qo_idx - window_left)
-        # For each query position q_indices[qo_idx], we can attend to k_indices[kv_idx] if:
-        # kv_idx >= q_indices[qo_idx] - window_left
-        sliding_window_mask = k_indices.unsqueeze(0) >= (q_indices.unsqueeze(1) - window_left)
-        mask = mask & sliding_window_mask
+        mask = torch.ones(qo_len, kv_len, device=q.device)
+        if window_left >= 0:
+            row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[:, None]
+            col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[None, :]
+            mask = row_idx - window_left <= col_idx
 
     logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
 
@@ -164,8 +157,8 @@ def sink_attention_ref(
             v.view(batch_size, kv_len, num_qo_heads, head_dim_vo).float(),
         )
         .contiguous()
-        .view(batch_size * qo_len, num_qo_heads, head_dim_vo)
-        .to(q)
+        .view(batch_size * qo_len, num_qo_heads * head_dim_vo)
+        
     )
 
     return o_ref
