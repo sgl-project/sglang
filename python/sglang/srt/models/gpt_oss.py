@@ -164,12 +164,8 @@ def sink_attention_ref(
     return o_ref
 
 
-# Todo: to make sure sliding window size for flashinfer is correct
-def get_attention_sliding_window_size(config, use_sliding_window=False):
-    # Todo: reference do not -1 but in SGLang do -1
-    sliding_window = config.sliding_window if use_sliding_window else 0
-    # sliding_window = config.sliding_window - 1 if use_sliding_window else -1
-    return sliding_window
+def get_attention_sliding_window_size(config):
+    return config.sliding_window - 1
 
 
 class OpenAIMoeMLP(nn.Module):
@@ -561,7 +557,7 @@ class OpenAIMoeAttention(nn.Module):
         # Todo: remove this, use CUDA impl. Currently sgl-kernel apply_rope_with_cos_sin_cache_inplace is not supported for Oai rope
         self.rotary_emb._forward_method = self.rotary_emb.forward_native
         use_sliding_window = True if config.layer_types[layer_id] == "sliding_attention" else False
-        self.sliding_window = get_attention_sliding_window_size(config, use_sliding_window)
+        self.sliding_window = self.sliding_window = get_attention_sliding_window_size(config) if use_sliding_window else -1
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -570,7 +566,7 @@ class OpenAIMoeAttention(nn.Module):
             layer_id=layer_id,
             sliding_window_size=(self.sliding_window),
             enable_attention_sink=True,
-            attention_sinks=self.sinks if global_server_args_dict["attention_backend"] == "torch_native_sink" else torch.exp(self.sinks).to(torch.float32),
+            attention_sinks=self.sinks,
             prefix=add_prefix("attn", prefix),
         )
         self.layer_id = layer_id
@@ -966,7 +962,8 @@ class OpenAIMoeForCausalLM(nn.Module):
             use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
         )
         self.logits_processor = LogitsProcessor(config)
-
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
     @torch.no_grad()
     def forward(
         self,
