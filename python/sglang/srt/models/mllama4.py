@@ -81,6 +81,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(
             config.text_config if hasattr(config, "text_config") else config
         )
+        self.padding_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
     def _has_vision_weights(self, config) -> bool:
         """Check if the model has vision components by examining the checkpoint."""
@@ -135,8 +136,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             return False
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return self.padding_pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(
         self,
