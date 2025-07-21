@@ -511,6 +511,7 @@ async def async_request_sglang_generate(
         st = time.perf_counter()
         most_recent_timestamp = st
         last_output_len = 0
+        success = True
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
@@ -527,6 +528,11 @@ async def async_request_sglang_generate(
                             pass
                         else:
                             data = json.loads(chunk)
+
+                            if "error" in data:
+                                output.error = data["error"]["message"]
+                                success = False
+                                break
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
@@ -553,11 +559,11 @@ async def async_request_sglang_generate(
 
                                 most_recent_timestamp = timestamp
                                 last_output_len = output_len
-
-                    output.generated_text = generated_text
-                    output.success = True
-                    output.latency = latency
-                    output.output_len = output_len
+                    if success:
+                        output.generated_text = generated_text
+                        output.success = True
+                        output.latency = latency
+                        output.output_len = output_len
                 else:
                     output.error = response.reason or ""
                     output.success = False
