@@ -25,6 +25,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -91,7 +92,7 @@ class ArceeMLP(nn.Module):
                 "Arcee model in SGLang only supports 'relu2'."
             )
         # The activation function is relu(x)^2
-        self.act_fn = lambda x: torch.pow(torch.relu(x), 2)
+        self.act_fn = get_act_fn(config.hidden_act)
 
     def forward(self, x, forward_batch=None):
         x, _ = self.up_proj(x)
