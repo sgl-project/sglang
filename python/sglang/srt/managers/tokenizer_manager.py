@@ -1171,14 +1171,36 @@ class TokenizerManager:
             self.server_args.disaggregation_bootstrap_port = bootstrap_port
             obj.bootstrap_port=bootstrap_port
             req = obj
-            os.environ["SGLANG_DISAGGREGATION_THREAD_POOL_SIZE"] = obj.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE
-            os.environ["SGLANG_DISAGGREGATION_QUEUE_SIZE"] = obj.SGLANG_DISAGGREGATION_QUEUE_SIZE
-            os.environ["SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT"] = obj.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT
+            if obj.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE is not None:
+                os.environ["SGLANG_DISAGGREGATION_THREAD_POOL_SIZE"] = obj.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE
+            else:
+                os.environ.pop("SGLANG_DISAGGREGATION_THREAD_POOL_SIZE", None)
+            
+            if obj.SGLANG_DISAGGREGATION_QUEUE_SIZE is not None:
+                os.environ["SGLANG_DISAGGREGATION_QUEUE_SIZE"] = obj.SGLANG_DISAGGREGATION_QUEUE_SIZE
+            else:
+                os.environ.pop("SGLANG_DISAGGREGATION_QUEUE_SIZE", None)
+            
+            if obj.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT is not None:
+                os.environ["SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT"] = obj.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT
+            else:
+                os.environ.pop("SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", None)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             req = obj
-            os.environ["SGLANG_DISAGGREGATION_WAITING_TIMEOUT"] = obj.SGLANG_DISAGGREGATION_WAITING_TIMEOUT
-            os.environ["SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES"] = obj.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES
-            os.environ["SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL"] = obj.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL
+            if obj.SGLANG_DISAGGREGATION_WAITING_TIMEOUT is not None:
+                os.environ["SGLANG_DISAGGREGATION_WAITING_TIMEOUT"] = obj.SGLANG_DISAGGREGATION_WAITING_TIMEOUT
+            else:
+                os.environ.pop("SGLANG_DISAGGREGATION_WAITING_TIMEOUT", None)
+            
+            if obj.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES is not None:
+                os.environ["SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES"] = obj.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES
+            else:
+                os.environ.pop("SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES", None)
+            
+            if obj.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL is not None:
+                os.environ["SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL"] = obj.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL
+            else:
+                os.environ.pop("SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL", None)
         else:
             return False, "Not support converting disaggregation of 'null'", None
 

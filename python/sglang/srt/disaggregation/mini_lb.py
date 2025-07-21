@@ -458,6 +458,7 @@ async def convert_pd_role(obj: PDConvertRequest):
             )
     logger.info(f"All requests to {server_url} have been done, now converting role...")
 
+    # post convert request to server
     async with aiohttp.ClientSession() as session:
         while True:
             # response = await session.post(f"{server_url}/convert_pd_role")
@@ -469,9 +470,11 @@ async def convert_pd_role(obj: PDConvertRequest):
             else:
                 logger.info("Have some requests bootstrapping, waiting...")
                 await asyncio.sleep(1)
-    # wait scheduler ready
-    await asyncio.sleep(5)
-    
+        
+    # wait scheduler event loop ready
+    async with aiohttp.ClientSession() as session:
+        response = await session.get(f"{server_url}/get_server_info")
+
     if content["success"]:
         if current_role == "prefill":
             load_balancer.add_decode_server(server_url)
