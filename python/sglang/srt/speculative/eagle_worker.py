@@ -844,7 +844,7 @@ class EAGLEWorker(TpModelWorker):
                 )
         batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
-        model_worker_batch.spec_num_draft_tokens = self.speculative_num_draft_tokens
+        model_worker_batch.spec_num_draft_tokens = self.speculative_num_steps + 1
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner

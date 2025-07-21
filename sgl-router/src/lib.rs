@@ -2,16 +2,15 @@ use pyo3::prelude::*;
 pub mod config;
 pub mod logging;
 use std::collections::HashMap;
+pub mod core;
+pub mod metrics;
 pub mod openai_api_types;
-pub mod pd_router;
-pub mod pd_types;
-pub mod prometheus;
-pub mod request_adapter;
-pub mod router;
+pub mod policies;
+pub mod routers;
 pub mod server;
 pub mod service_discovery;
 pub mod tree;
-use crate::prometheus::PrometheusConfig;
+use crate::metrics::PrometheusConfig;
 
 #[pyclass(eq)]
 #[derive(Clone, PartialEq, Debug)]
@@ -37,8 +36,8 @@ struct Router {
     eviction_interval_secs: u64,
     max_tree_size: usize,
     max_payload_size: usize,
-    verbose: bool,
     log_dir: Option<String>,
+    log_level: Option<String>,
     service_discovery: bool,
     selector: HashMap<String, String>,
     service_discovery_port: u16,
@@ -129,7 +128,7 @@ impl Router {
             discovery,
             metrics,
             log_dir: self.log_dir.clone(),
-            verbose: self.verbose,
+            log_level: self.log_level.clone(),
         })
     }
 }
@@ -150,8 +149,8 @@ impl Router {
         eviction_interval_secs = 60,
         max_tree_size = 2usize.pow(24),
         max_payload_size = 256 * 1024 * 1024,  // 256MB default for large batches
-        verbose = false,
         log_dir = None,
+        log_level = None,
         service_discovery = false,
         selector = HashMap::new(),
         service_discovery_port = 80,
@@ -179,8 +178,8 @@ impl Router {
         eviction_interval_secs: u64,
         max_tree_size: usize,
         max_payload_size: usize,
-        verbose: bool,
         log_dir: Option<String>,
+        log_level: Option<String>,
         service_discovery: bool,
         selector: HashMap<String, String>,
         service_discovery_port: u16,
@@ -208,8 +207,8 @@ impl Router {
             eviction_interval_secs,
             max_tree_size,
             max_payload_size,
-            verbose,
             log_dir,
+            log_level,
             service_discovery,
             selector,
             service_discovery_port,
@@ -239,11 +238,6 @@ impl Router {
                 e
             ))
         })?;
-
-        // Convert to internal policy config
-        let policy_config = router_config
-            .to_routing_policy_config()
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
         // Create service discovery config if enabled
         let service_discovery_config = if self.service_discovery {
@@ -281,11 +275,10 @@ impl Router {
             server::startup(server::ServerConfig {
                 host: self.host.clone(),
                 port: self.port,
-                worker_urls: self.worker_urls.clone(),
-                policy_config,
-                verbose: self.verbose,
+                router_config,
                 max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
+                log_level: self.log_level.clone(),
                 service_discovery_config,
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
