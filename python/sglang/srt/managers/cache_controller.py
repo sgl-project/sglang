@@ -15,7 +15,6 @@ limitations under the License.
 
 import logging
 import math
-import os
 import threading
 from queue import Empty, Full, PriorityQueue, Queue
 from typing import TYPE_CHECKING, List, Optional
