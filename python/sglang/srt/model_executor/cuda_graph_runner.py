@@ -28,7 +28,11 @@ from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    graph_capture,
+    set_pdmux_status,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -39,6 +43,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     enable_num_token_non_padded,
 )
+from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
@@ -225,6 +230,9 @@ class CudaGraphRunner:
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
+        self.enable_pdmux = model_runner.server_args.enable_pdmux
+        if self.enable_pdmux:
+            self.stream_groups = get_stream_groups()
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
@@ -251,6 +259,9 @@ class CudaGraphRunner:
         self.model_runner.attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
+        if self.enable_pdmux:
+            for attn_backend in self.model_runner.decode_attn_backend_group:
+                attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
@@ -349,11 +360,19 @@ class CudaGraphRunner:
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        is_bs_supported = (
-            cuda_graph_bs in self.graphs
-            if self.disable_padding
-            else cuda_graph_bs <= self.max_bs
-        )
+        if self.enable_pdmux:
+            current_stream_idx = get_current_stream_idx()
+            is_bs_supported = (
+                f"{current_stream_idx}_{cuda_graph_bs}" in self.graphs
+                if self.disable_padding
+                else cuda_graph_bs <= self.max_bs
+            )
+        else:
+            is_bs_supported = (
+                cuda_graph_bs in self.graphs
+                if self.disable_padding
+                else cuda_graph_bs <= self.max_bs
+            )
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
@@ -398,47 +417,64 @@ class CudaGraphRunner:
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 record_shapes=True,
             )
+        decode_stream_groups = []
+        if self.enable_pdmux:
+            set_pdmux_status(False)
+            for stream_group in self.stream_groups:
+                decode_stream_groups.append(stream_group[1])
+        else:
+            decode_stream_groups.append(torch.cuda.Stream())
+        num_stream = len(decode_stream_groups)
+        for stream_idx in range(num_stream):
+            with graph_capture(
+                stream=decode_stream_groups[stream_idx]
+            ) as graph_capture_context:
+                with profile_context as prof:
+                    self.stream = graph_capture_context.stream
+                    avail_mem = get_available_gpu_memory(
+                        self.model_runner.device,
+                        self.model_runner.gpu_id,
+                        empty_cache=False,
+                    )
+                    # Reverse the order to enable better memory sharing across cuda graphs.
+                    capture_range = (
+                        tqdm.tqdm(list(reversed(self.capture_bs)))
+                        if get_tensor_model_parallel_rank() == 0
+                        else reversed(self.capture_bs)
+                    )
+                    for i, bs in enumerate(capture_range):
+                        if get_tensor_model_parallel_rank() == 0:
+                            avail_mem = get_available_gpu_memory(
+                                self.model_runner.device,
+                                self.model_runner.gpu_id,
+                                empty_cache=False,
+                            )
+                            capture_range.set_description(
+                                f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                            )
 
-        with graph_capture() as graph_capture_context:
-            with profile_context as prof:
-                self.stream = graph_capture_context.stream
-                avail_mem = get_available_gpu_memory(
-                    self.model_runner.device,
-                    self.model_runner.gpu_id,
-                    empty_cache=False,
-                )
-                # Reverse the order to enable better memory sharing across cuda graphs.
-                capture_range = (
-                    tqdm.tqdm(list(reversed(self.capture_bs)))
-                    if get_tensor_model_parallel_rank() == 0
-                    else reversed(self.capture_bs)
-                )
-                for i, bs in enumerate(capture_range):
-                    if get_tensor_model_parallel_rank() == 0:
-                        avail_mem = get_available_gpu_memory(
-                            self.model_runner.device,
-                            self.model_runner.gpu_id,
-                            empty_cache=False,
-                        )
-                        capture_range.set_description(
-                            f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
-                        )
+                        with patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.num_tokens_per_bs,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            (
+                                graph,
+                                output_buffers,
+                            ) = self.capture_one_batch_size(bs, forward, stream_idx)
+                            if self.enable_pdmux:
+                                # For pd_multiplexing, we need to save the graph and output buffers
+                                self.graphs[f"{stream_idx}_{bs}"] = graph
+                                self.output_buffers[f"{stream_idx}_{bs}"] = (
+                                    output_buffers
+                                )
+                            else:
+                                self.graphs[bs] = graph
+                                self.output_buffers[bs] = output_buffers
 
-                    with patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.num_tokens_per_bs,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        (
-                            graph,
-                            output_buffers,
-                        ) = self.capture_one_batch_size(bs, forward)
-                        self.graphs[bs] = graph
-                        self.output_buffers[bs] = output_buffers
-
-                    # Save gemlite cache after each capture
-                    save_gemlite_cache()
+                        # Save gemlite cache after each capture
+                        save_gemlite_cache()
 
         if self.enable_profile_cuda_graph:
             log_message = (
@@ -453,7 +489,7 @@ class CudaGraphRunner:
             )
             logger.info(log_message)
 
-    def capture_one_batch_size(self, bs: int, forward: Callable):
+    def capture_one_batch_size(self, bs: int, forward: Callable, stream_idx: int):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
@@ -518,6 +554,12 @@ class CudaGraphRunner:
         else:
             lora_paths = None
 
+        attn_backend = (
+            self.model_runner.decode_attn_backend_group[stream_idx]
+            if self.enable_pdmux
+            else self.model_runner.attn_backend
+        )
+
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -526,7 +568,7 @@ class CudaGraphRunner:
             seq_lens=seq_lens,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.model_runner.attn_backend,
+            attn_backend=attn_backend,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
             encoder_lens=encoder_lens,
@@ -548,7 +590,7 @@ class CudaGraphRunner:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
-        self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
+        attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             num_tokens,
             req_pool_indices,
@@ -684,7 +726,12 @@ class CudaGraphRunner:
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = self.custom_mask
         # Attention backend
-        self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
+        if self.enable_pdmux:
+            stream_idx = get_current_stream_idx()
+            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
+        else:
+            attn_backend = self.model_runner.attn_backend
+        attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             self.req_pool_indices[:bs],
             self.seq_lens[:bs],
@@ -714,9 +761,12 @@ class CudaGraphRunner:
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
-        self.graphs[self.bs].replay()
-
-        output = self.output_buffers[self.bs]
+        if self.enable_pdmux:
+            self.graphs[f"{get_current_stream_idx()}_{self.bs}"].replay()
+            output = self.output_buffers[f"{get_current_stream_idx()}_{self.bs}"]
+        else:
+            self.graphs[self.bs].replay()
+            output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):
             return LogitsProcessorOutput(
                 next_token_logits=output.next_token_logits[: self.raw_num_token],
