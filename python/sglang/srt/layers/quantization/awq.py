@@ -15,7 +15,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-
 from sglang.srt.layers.quantization.marlin_utils import (
     apply_awq_marlin_linear,
     awq_to_marlin_zero_points,
@@ -65,6 +64,7 @@ elif _is_hip:
     warnings.warn(f"HIP does not support fused_marlin_moe currently.")
 elif _is_cpu and _is_cpu_amx_available:
     import os
+
     SGLANG_USE_CPU_INT4_W4A8 = os.getenv("SGLANG_USE_CPU_INT4_W4A8", "0") == "1"
     from sglang.srt.layers.amx_utils import (
         _amx_process_int4_packed_qweight_after_loading,
@@ -154,8 +154,6 @@ class AWQConfig(QuantizationConfig):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
                 return UnquantizedLinearMethod()
             return AWQLinearMethod(self)
-        # elif isinstance(layer, FusedMoE):
-        #     return Int4CPUMoEMethod(self)
 
         return None
 
