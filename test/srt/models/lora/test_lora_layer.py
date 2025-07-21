@@ -19,47 +19,11 @@ from typing import List, Optional
 import torch
 import torch.nn.functional as F
 import random
-import numpy as np
-# from utils import (
-#     EMBEDDING_LORA_MODELS,
-#     TORCH_DTYPES,
-#     LoRAModelCase,
-# )
-import dataclasses
-
-@dataclasses.dataclass
-class LoRAAdaptor:
-    name: str
-    prefill_tolerance: float = None
-    decode_tolerance: float = None
-    rouge_l_tolerance: float = None
-
-
-@dataclasses.dataclass
-class LoRAModelCase:
-    base: str
-    adaptors: List[LoRAAdaptor]
-    tp_size: int = 1
-    prefill_tolerance: float = 1e-1
-    decode_tolerance: float = 1e-1
-    rouge_l_tolerance: float = 1.0
-    max_loras_per_batch: int = 1
-    skip_long_prompt: bool = False
-
-    def __post_init__(self):
-        if len(self.adaptors) > self.max_loras_per_batch:
-            raise ValueError(
-                f"For base '{self.base}', number of adaptors ({len(self.adaptors)}) "
-                f"must be <= max_loras_per_batch ({self.max_loras_per_batch})"
-            )
-TORCH_DTYPES = [torch.float16]
-EMBEDDING_LORA_MODELS = [
-    LoRAModelCase(
-        base="meta-llama/Llama-2-7b-hf",
-        adaptors=[LoRAAdaptor(name="yard1/llama-2-7b-sql-lora-test")],
-        max_loras_per_batch=1,
-    ),
-]
+from utils import (
+    EMBEDDING_LORA_MODELS,
+    TORCH_DTYPES,
+    LoRAModelCase,
+)
 
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
@@ -68,7 +32,6 @@ from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import CustomTestCase, calculate_rouge_l
 
-# SRT Integration Test Constants
 PROMPTS = [
     """
 ### Instruction:
@@ -97,8 +60,6 @@ TOLERANCES = {
     torch.float32: (5e-3, 5e-3),
     torch.bfloat16: (3e-2, 2e-2),
 }
-BASE_MODEL = "meta-llama/Llama-2-7b-hf"
-DEFAULT_VOCAB_PADDING_SIZE = 64
 
 
 class TestLoRALayer(CustomTestCase):
