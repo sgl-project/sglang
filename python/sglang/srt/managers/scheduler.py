@@ -714,10 +714,7 @@ class Scheduler(
                 hidden_size=self.model_config.hf_text_config.hidden_size,
                 dtype=self.model_config.dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
-                is_mrope_enabled=(
-                    "rope_scaling" in self.model_config.hf_text_config
-                    and "mrope_section" in self.model_config.hf_text_config.rope_scaling
-                ),
+                is_mrope_enabled=self.model_config.is_mrope_enabled,
             )
 
             # The decode requests polling kv cache
@@ -767,10 +764,7 @@ class Scheduler(
                 hidden_size=self.model_config.hf_text_config.hidden_size,
                 dtype=self.model_config.dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
-                is_mrope_enabled=(
-                    "rope_scaling" in self.model_config.hf_text_config
-                    and "mrope_section" in self.model_config.hf_text_config.rope_scaling
-                ),
+                is_mrope_enabled=self.model_config.is_mrope_enabled,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(

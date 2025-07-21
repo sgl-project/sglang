@@ -516,6 +516,13 @@ class ModelConfig:
                 self.model_weights = self.model_path
                 self.model_path = client.get_local_dir()
 
+    @property
+    def is_mrope_enabled(self) -> bool:
+        return (
+            "rope_scaling" in self.hf_text_config
+            and "mrope_section" in self.hf_text_config.rope_scaling
+        )
+
 
 # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
 _STR_DTYPE_TO_TORCH_DTYPE = {
