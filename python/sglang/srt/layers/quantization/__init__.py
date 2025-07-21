@@ -88,13 +88,13 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 # VLLM-dependent quantization methods
 VLLM_QUANTIZATION_METHODS = {
     "aqlm": AQLMConfig,
-    "awq": AWQConfig,
     "deepspeedfp": DeepSpeedFPConfig,
     "tpu_int8": Int8TpuConfig,
     "fbgemm_fp8": FBGEMMFp8Config,
     "marlin": MarlinConfig,
     "gguf": GGUFConfig,
     "gptq_marlin_24": GPTQMarlin24Config,
+    "awq": AWQConfig,
     "awq_marlin": AWQMarlinConfig,
     "bitsandbytes": BitsAndBytesConfig,
     "qqq": QQQConfig,
