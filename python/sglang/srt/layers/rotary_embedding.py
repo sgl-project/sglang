@@ -761,60 +761,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         else:
             return self.forward_native(positions, query, key, offsets)
 
-    def forward_npu(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """PyTorch-native implementation equivalent to forward()."""
-        dtype = query.dtype
-        query_shape = query.shape
-        key_shape = key.shape
-        query_rot = query[..., : self.rotary_dim]
-        key_rot = key[..., : self.rotary_dim]
-        if self.rotary_dim < self.head_size:
-            query_pass = query[..., self.rotary_dim :]
-            key_pass = key[..., self.rotary_dim :]
-
-        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
-        cos_sin = self.cos_sin_cache[
-            torch.add(positions, offsets) if offsets is not None else positions
-        ]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.is_neox_style:
-            # NOTE(woosuk): Here we assume that the positions tensor has the
-            # shape [batch_size, seq_len].
-            cos = cos.repeat(1, 1, 2).unsqueeze(-2)
-            sin = sin.repeat(1, 1, 2).unsqueeze(-2)
-        else:
-            cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
-            sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
-
-        batch_size = 1  # positions.size(0)
-        positions = positions.flatten()
-        num_tokens = positions.shape[0]
-
-        cos = cos.reshape((batch_size, 1, -1, self.head_size))
-        sin = sin.reshape((batch_size, 1, -1, self.head_size))
-
-        query_rot = query_rot.view(batch_size, -1, num_tokens // batch_size, self.head_size)
-        query_rot = torch_npu.npu_interleave_rope(query_rot, cos, sin)
-
-        key_rot = key_rot.view(batch_size, -1, num_tokens // batch_size, self.head_size)
-        key_rot = torch_npu.npu_interleave_rope(key_rot, cos, sin)
-
-        query_rot = query_rot.reshape(query_shape)
-        key_rot = key_rot.reshape(key_shape)
-
-        if self.rotary_dim < self.head_size:
-            query = torch.cat((query_rot, query_pass), dim=-1)
-            key = torch.cat((key_rot, key_pass), dim=-1)
-        else:
-            query = query_rot
-            key = key_rot
-        return query.to(dtype), key.to(dtype)
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
 
