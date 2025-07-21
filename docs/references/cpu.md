@@ -19,8 +19,8 @@ and the phenomenal high-quality reasoning model DeepSeek-R1.
 | DeepSeek-Distilled-Llama |   | [RedHatAI/DeepSeek-R1-Distill-Llama-70B-quantized.w8a8](https://huggingface.co/RedHatAI/DeepSeek-R1-Distill-Llama-70B-quantized.w8a8) |   |
 | Qwen3-235B |   |   | [Qwen/Qwen3-235B-A22B-FP8](https://huggingface.co/Qwen/Qwen3-235B-A22B-FP8) |
 
-**Note:** In the above table, if the model identifier is listed in the grid,
-it means the model is verified.
+**Note:** The model identifiers listed in the table above
+have been verified on 6th Gen Intel® Xeon® P-core platforms.
 
 ## Installation
 
@@ -56,7 +56,7 @@ docker run \
 If you'd prefer to install SGLang in a bare metal environment,
 the command list is similar with the procedure in the Dockerfile.
 It is worth noting that the environment variable `SGLANG_USE_CPU_ENGINE=1`
-is required to be set to enable SGLang service with CPU engine.
+is required to enable SGLang service with CPU engine.
 
 ```bash
 # Create and activate a conda environment
@@ -81,7 +81,7 @@ git clone https://github.com/sgl-project/sglang.git
 cd sglang
 git checkout <YOUR-DESIRED-VERSION>
 
-# Install SGLang main package and its dependencies
+# Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
 conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl
 pip install intel-openmp
@@ -100,7 +100,7 @@ export LD_PRELOAD=${LD_PRELOAD}:${CONDA_PREFIX}/lib/libiomp5.so:${CONDA_PREFIX}/
 
 ## Launch of the Serving Engine
 
-An example command for LLM serving engine launching would be:
+Example command to launch SGLang serving:
 
 ```bash
 python -m sglang.launch_server   \
@@ -117,26 +117,25 @@ Notes:
 1. For running W8A8 quantized models, please add the flag `--quantization w8a8_int8`.
 
 2. The flag `--tp 6` specifies that tensor parallelism will be applied using 6 ranks (TP6).
-    In general, the number of TP ranks should correspond to the total number of sub-NUMA clusters (SNCs) on the server.
-    For instance, TP6 is suitable for a server with 2 sockets configured with SNC3.
+    The number of TP specified is how many TP ranks will be used during the execution.
+    In a CPU platform, a TP rank means a sub-NUMA cluster (SNC).
+    Usually we can get the SNC information (How many available) from Operation System.
+    User can specify TP to be no more than the total available SNCs in current system.
 
-    If the desired TP rank number differs from the total SNC count, the system will automatically
-    utilize the first `n` SNCs, provided `--tp n` is set and `n` is less than the total SNC count.
+    If the specified TP rank number differs from the total SNC count,
+    the system will automatically utilize the first `n` SNCs.
     Note that `n` cannot exceed the total SNC number, doing so will result in an error.
 
     To specify the cores to be used, we need to explicitly set the environment variable `SGLANG_CPU_OMP_THREADS_BIND`.
     For example, if we want to run the SGLang service using the first 40 cores of each SNC on a Xeon® 6980P server,
-    which has 43-43-42 cores on the 3 SNCs of a socket (reserving the remaining 16 cores for other tasks), we should set:
+    which has 43-43-42 cores on the 3 SNCs of a socket, we should set:
 
     ```bash
     export SGLANG_CPU_OMP_THREADS_BIND="0-39|43-82|86-125|128-167|171-210|214-253"
     ```
 
-    Additionally, include `--tp 6` in the `launch_server` command.
-
 3. A warmup step is automatically triggered when the service is started.
-When `The server is fired up and ready to roll!` is echoed,
-the server is ready to handle the incoming requests.
+The server is ready when you see the log `The server is fired up and ready to roll!`.
 
 ## Benchmarking with Requests
 
