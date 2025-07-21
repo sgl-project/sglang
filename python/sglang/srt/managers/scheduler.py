@@ -2511,7 +2511,7 @@ class Scheduler(
              its pp_rank. Only in this way, we can avoid CUDA OOM issue caused by deserialize a tensor in rank `m` which is
              ForkingPickler serialized in rank `n`. where `m` is not equal to `n`.
         """
-        if isinstance(recv_req.serialized_named_tensors[0], List):
+        if len(recv_req.serialized_named_tensors) > 0 and isinstance(recv_req.serialized_named_tensors[0], List):
             if self.pp_size != len(recv_req.serialized_named_tensors):
                 message = (f"The size of serialized_named_tensors in UpdateWeightsFromTensorReqInput must be equal to "
                            f"the size of pp_size, but got {len(recv_req.serialized_named_tensors)} vs. {self.pp_size}")
