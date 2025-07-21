@@ -265,7 +265,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
         # Process images one by one to handle flatten_batch=True constraint in vision_tower
-        all_pixel_values = flatten_nested_list([item.pixel_values for item in items])
+        all_pixel_values = flatten_nested_list([item.feature for item in items])
         vision_outputs_list = []
 
         for pixel_values_batch in all_pixel_values:
@@ -316,9 +316,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             audio_features (`torch.Tensor`): Audio feature tensor of shape `(num_audios, audio_length, embed_dim)`).
         """
         # Extract audio features and masks from items
-        all_input_features = flatten_nested_list(
-            [item.input_features for item in items]
-        )
+        all_input_features = flatten_nested_list([item.feature for item in items])
         all_input_features_mask = flatten_nested_list(
             [~item.input_features_mask for item in items]
         )  # Note(Xinyuan): reverse the mask according to the HF implementation
