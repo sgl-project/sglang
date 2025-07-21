@@ -573,7 +573,7 @@ class OpenAIMoeAttention(nn.Module):
             layer_id=layer_id,
             sliding_window_size=(self.sliding_window),
             enable_attention_sink=True,
-            attention_sinks=self.sinks,
+            attention_sinks=self.sinks if global_server_args_dict["attention_backend"] == "torch_native_sink" else torch.exp(self.sinks).to(torch.float32),
             prefix=add_prefix("attn", prefix),
         )
         self.layer_id = layer_id
@@ -643,9 +643,7 @@ class OpenAIMoeAttention(nn.Module):
             return hidden_states
         # attn_output = self.attn(*inner_state)
         # todo: check if sinks need fp32 before exp
-        sinks = torch.exp(self.sinks)
-        sinks = sinks.to(torch.float32)
-        attn_output = self.attn(*inner_state, sink=sinks)
+        attn_output = self.attn(*inner_state)
         # o_ref = self.flashinfer_attention_ref(inner_state, sinks)
 
         # print(f"### layer_id={self.layer_id}, attn_output.shape={attn_output.shape}, o_ref.shape={o_ref.shape}, flashinfer_output.shape={flashinfer_output.shape}")
