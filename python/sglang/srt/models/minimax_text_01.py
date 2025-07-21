@@ -24,6 +24,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.lightning_attn import (
     LightningAttentionMetadata,
     LightningAttnBackend,
+    build_slope_tensor,
     lightning_attention,
     linear_decode_forward_triton,
 )
@@ -313,7 +314,7 @@ class MiniMaxText01LinearAttention(nn.Module):
             eps=1e-5,
         )
 
-        slope_rate = MiniMaxText01LinearAttention._build_slope_tensor(self.num_heads)
+        slope_rate = build_slope_tensor(self.num_heads)
         if num_hidden_layer <= 1:
             self.slope_rate = slope_rate * (1 + 1e-5)
         else:
@@ -329,30 +330,6 @@ class MiniMaxText01LinearAttention(nn.Module):
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
         return
-
-    @staticmethod
-    def _build_slope_tensor(n_attention_heads: int):
-
-        def get_slopes(n):
-
-            def get_slopes_power_of_2(n):
-                start = 2 ** (-(2 ** -(math.log2(n) - 3)))
-                ratio = start
-                return [start * ratio**i for i in range(n)]
-
-            if math.log2(n).is_integer():
-                return get_slopes_power_of_2(n)
-            else:
-                closest_power_of_2 = 2 ** math.floor(math.log2(n))
-                return (
-                    get_slopes_power_of_2(closest_power_of_2)
-                    + get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
-                )
-
-        slopes = torch.tensor(
-            get_slopes(n_attention_heads), dtype=torch.float32
-        ).reshape(n_attention_heads, 1, 1)
-        return slopes
 
     def forward(
         self,
@@ -878,9 +855,7 @@ class MiniMaxText01Model(nn.Module):
             if self.decoder_attention_types[i] == 0
         )
         max_slots_number = (
-            getattr(scheduler_config, "max_num_seqs", 1024)
-            if scheduler_config
-            else 1024
+            getattr(scheduler_config, "max_num_seqs", 32) if scheduler_config else 32
         )
         self.cache_shape = (
             linear_layer_nums,

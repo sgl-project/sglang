@@ -10,6 +10,7 @@ import triton.language as tl
 from einops import rearrange
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.utils import build_slope_tensor
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -83,36 +84,11 @@ class LightningAttnBackend(AttentionBackend):
         # Forward metadata
         self.forward_metadata: Optional[LightningAttentionMetadata] = None
 
-    @staticmethod
-    def _build_slope_tensor(n_attention_heads: int):
-        """Build slope tensor for lightning attention decay rates."""
-        import math
-
-        def get_slopes(n):
-            def get_slopes_power_of_2(n):
-                start = 2 ** (-(2 ** -(math.log2(n) - 3)))
-                ratio = start
-                return [start * ratio**i for i in range(n)]
-
-            if math.log2(n).is_integer():
-                return get_slopes_power_of_2(n)
-            else:
-                closest_power_of_2 = 2 ** math.floor(math.log2(n))
-                return (
-                    get_slopes_power_of_2(closest_power_of_2)
-                    + get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
-                )
-
-        slopes = torch.tensor(
-            get_slopes(n_attention_heads), dtype=torch.float32
-        ).reshape(n_attention_heads, 1, 1)
-        return slopes
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize metadata from ForwardBatch."""
         # Ensure slope_rates is initialized for non-CUDA graph scenarios
         if self.slope_rates is None:
-            self.slope_rates = self._build_slope_tensor(self.num_heads)
+            self.slope_rates = build_slope_tensor(self.num_heads)
 
         metadata = self._create_metadata_from_forward_batch(forward_batch)
         self.forward_metadata = metadata
@@ -199,7 +175,7 @@ class LightningAttnBackend(AttentionBackend):
         """Initialize CUDA graph state and pre-allocate slope rates."""
         # Pre-allocate slope rates to avoid device operations during CUDA graph capture
         if self.slope_rates is None:
-            self.slope_rates = self._build_slope_tensor(self.num_heads)
+            self.slope_rates = build_slope_tensor(self.num_heads)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -1141,8 +1117,6 @@ def linear_decode_forward_triton(
 
     # Adjust BLOCK_SIZE if necessary
     actual_block_size = min(BLOCK_SIZE, D)
-    if actual_block_size <= 0:
-        actual_block_size = D
 
     # Calculate grid dimensions - ensure at least 1 in each dimension
     grid = (B, H, max(1, (D + actual_block_size - 1) // actual_block_size))
@@ -1188,3 +1162,39 @@ def linear_decode_forward_triton(
     # Reshape output and return
     output = rearrange(output, "b h n d -> b n (h d)")
     return output.squeeze(1).contiguous()
+
+
+def build_slope_tensor(n_attention_heads: int) -> torch.Tensor:
+    """
+    Build slope tensor for lightning attention decay rates.
+
+    This function generates slope values for linear attention mechanisms,
+    following the approach described in the Lightning Attention paper.
+
+    Args:
+        n_attention_heads: Number of attention heads
+
+    Returns:
+        torch.Tensor: Slope tensor with shape (n_attention_heads, 1, 1)
+    """
+    import math
+
+    def get_slopes(n):
+        def get_slopes_power_of_2(n):
+            start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+            ratio = start
+            return [start * ratio**i for i in range(n)]
+
+        if math.log2(n).is_integer():
+            return get_slopes_power_of_2(n)
+        else:
+            closest_power_of_2 = 2 ** math.floor(math.log2(n))
+            return (
+                get_slopes_power_of_2(closest_power_of_2)
+                + get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
+            )
+
+    slopes = torch.tensor(get_slopes(n_attention_heads), dtype=torch.float32).reshape(
+        n_attention_heads, 1, 1
+    )
+    return slopes
