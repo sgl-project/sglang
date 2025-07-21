@@ -52,3 +52,31 @@ python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-R1 --attenti
 ```bash
 python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --attention-backend ascend
 ```
+
+
+## Steps to add a new attention backend
+To add a new attention backend, you can learn from the existing backends
+(`python/sglang/srt/layers/attention/triton_backend.py`, `python/sglang/srt/layers/attention/flashattention_backend.py`)
+and follow the steps below.
+
+1. Run without cuda graph. Support the two forward functions
+    - forward_extend
+        - Will be used for prefill, prefill with KV cache, and target verification
+        - It will be called once per layer
+    - forward_decode
+        - Will be used for normal decode, and draft decode
+        - It will be called once per layer
+    - init_forward_metadata
+        - Initialize the class and common metadata shared by all layers
+        - Call the plan function for optimizations like split_kv
+        - It will be called once per forward
+2. Run with cuda graph. It has two phases (capture and replay) and you need to implement three functions
+    - init_cuda_graph_state
+        - It will be called once during life time
+        - Create all common shared buffers
+    - init_forward_metadata_capture_cuda_graph
+        - It will be called before capturing a cuda graph
+        - It is similar to init_forward_metadata but write the medatada to some pre-defined buffers
+    - init_forward_metadata_replay_cuda_graph
+        - It will be called before replaying a cuda graph
+        - This function is in the critical path and needs to be fast
