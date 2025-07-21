@@ -118,7 +118,7 @@ def get_global_token_dispatch_metadata():
 
 def set_global_token_dispatch_metadata(value):
     global _global_token_dispatch_metadata
-    assert _global_token_dispatch_metadata is None
+    
     _global_token_dispatch_metadata = value
 
 
