@@ -1021,7 +1021,6 @@ def get_active_blocks(
     return block_idx
 
 
-
 @torch.no_grad()
 def flex_prefill_attention(
     q: torch.Tensor,
