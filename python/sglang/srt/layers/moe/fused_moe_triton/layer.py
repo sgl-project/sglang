@@ -741,6 +741,7 @@ class FusedMoE(torch.nn.Module):
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
         shuffle_weight: bool = True,
+        pair_wise_act: bool = False,
     ):
         super().__init__()
 
@@ -803,6 +804,7 @@ class FusedMoE(torch.nn.Module):
         self.inplace = inplace
         self.no_combine = no_combine
         self.bias = bias
+        self.pair_wise_act = pair_wise_act
 
         if is_openai_moe:
             if self.ep_size > 1:
@@ -1188,9 +1190,15 @@ class FusedMoE(torch.nn.Module):
                         weight_per_partition = up_weight.shape[shard_dim] // tp_size
                         start_idx = tp_rank * weight_per_partition
                         end_idx = start_idx + weight_per_partition
-                        up_weight = up_weight[start_idx:end_idx, :]
-                        gate_weight = gate_weight[start_idx:end_idx, :]
-                        loaded_weight = torch.cat((up_weight, gate_weight), dim=0)
+                        if self.pair_wise_act:
+                            start_idx = tp_rank * weight_per_partition * 2
+                            end_idx = start_idx + weight_per_partition * 2
+                            up_gate_weight = torch.cat((up_weight, gate_weight), dim=0)
+                            loaded_weight = up_gate_weight[start_idx:end_idx, :]
+                        else:
+                            up_weight = up_weight[start_idx:end_idx, :]
+                            gate_weight = gate_weight[start_idx:end_idx, :]
+                            loaded_weight = torch.cat((up_weight, gate_weight), dim=0)
                     # Load into w13_weight
                     weight_param.data[expert_id].copy_(loaded_weight)
             else:
@@ -1220,9 +1228,15 @@ class FusedMoE(torch.nn.Module):
                         bias_per_partition = up_bias.shape[0] // tp_size
                         start_idx = tp_rank * bias_per_partition
                         end_idx = start_idx + bias_per_partition
-                        up_bias = up_bias[start_idx:end_idx]
-                        gate_bias = gate_bias[start_idx:end_idx]
-                        loaded_weight = torch.cat((gate_bias, up_bias), dim=0)
+                        if self.pair_wise_act:
+                            start_idx = tp_rank * bias_per_partition * 2
+                            end_idx = start_idx + bias_per_partition * 2
+                            up_gate_bias = torch.cat((gate_bias, up_bias), dim=0)
+                            loaded_weight = up_gate_bias[start_idx:end_idx]
+                        else:
+                            up_bias = up_bias[start_idx:end_idx]
+                            gate_bias = gate_bias[start_idx:end_idx]
+                            loaded_weight = torch.cat((gate_bias, up_bias), dim=0)
                     # Load into w13_bias
                     bias_param.data[expert_id].copy_(loaded_weight)
             elif shard_id in ("w1", "w3"):

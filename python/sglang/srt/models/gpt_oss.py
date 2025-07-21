@@ -165,8 +165,11 @@ def sink_attention_ref(
 
 
 # Todo: to make sure sliding window size for flashinfer is correct
-def get_attention_sliding_window_size(config):
-    return config.sliding_window - 1
+def get_attention_sliding_window_size(config, use_sliding_window=False):
+    # Todo: reference do not -1 but in SGLang do -1
+    sliding_window = config.sliding_window if use_sliding_window else 0
+    # sliding_window = config.sliding_window - 1 if use_sliding_window else -1
+    return sliding_window
 
 
 class OpenAIMoeMLP(nn.Module):
@@ -236,7 +239,8 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
                               swiglu_beta=1.0,
                               enable_mxfp4_moe=global_server_args_dict["enable_w4_mxfp4_moe"] or global_server_args_dict["enable_w4a8_mxfp4_moe"],
                               enable_fp8_activation=global_server_args_dict["enable_w4a8_mxfp4_moe"],
-                              shuffle_weight=False)
+                              shuffle_weight=False,
+                              pair_wise_act=True)
 
         # Todo: add bias support in MoE impl class
         self.experts = get_moe_impl_class()(
@@ -557,7 +561,7 @@ class OpenAIMoeAttention(nn.Module):
         # Todo: remove this, use CUDA impl. Currently sgl-kernel apply_rope_with_cos_sin_cache_inplace is not supported for Oai rope
         self.rotary_emb._forward_method = self.rotary_emb.forward_native
         use_sliding_window = True if config.layer_types[layer_id] == "sliding_attention" else False
-        self.sliding_window = get_attention_sliding_window_size(config) if use_sliding_window else -1
+        self.sliding_window = get_attention_sliding_window_size(config, use_sliding_window)
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -566,7 +570,7 @@ class OpenAIMoeAttention(nn.Module):
             layer_id=layer_id,
             sliding_window_size=(self.sliding_window),
             enable_attention_sink=True,
-            attention_sinks=self.sinks,
+            attention_sinks=self.sinks if global_server_args_dict["attention_backend"] == "torch_native_sink" else torch.exp(self.sinks).to(torch.float32),
             prefix=add_prefix("attn", prefix),
         )
         self.layer_id = layer_id
@@ -757,11 +761,11 @@ class OpenAIMoeDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        # Todo: remove this, simple WA for orangina
         # hidden_states, residual = self.layer_communicator.prepare_mlp(
         #     hidden_states, residual, forward_batch
         # )
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # TODO: Remove this, currently WA for got-oss
+        hidden_states, residual = self.post_attention_layernorm.forward_native(hidden_states, residual)
 
         hidden_states = self.mlp(hidden_states, forward_batch)
 
@@ -962,8 +966,7 @@ class OpenAIMoeForCausalLM(nn.Module):
             use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
         )
         self.logits_processor = LogitsProcessor(config)
-    def get_attention_sliding_window_size(self):
-        return get_attention_sliding_window_size(self.config)
+
     @torch.no_grad()
     def forward(
         self,
