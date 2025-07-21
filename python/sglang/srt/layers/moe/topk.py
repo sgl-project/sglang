@@ -499,7 +499,7 @@ def biased_grouped_topk_gpu(
         and is_power_of_two(correction_bias.shape[0])
     ):
         topk_weights, topk_ids = moe_fused_gate(
-            gating_output,
+            gating_output.to(dtype=torch.float32),
             correction_bias,
             num_expert_group,
             topk_group,
@@ -524,7 +524,7 @@ def biased_grouped_topk_gpu(
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         aiter_biased_grouped_topk(
-            gating_output,
+            gating_output.to(dtype=torch.float32),
             correction_bias,
             topk_weights,
             topk_ids,

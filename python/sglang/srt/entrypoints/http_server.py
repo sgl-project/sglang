@@ -77,7 +77,6 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
-    ReportHealthInput,
     ResumeMemoryOccupationReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
@@ -94,7 +93,6 @@ from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
-    ServerStatus,
     add_api_key_middleware,
     add_prometheus_middleware,
     delete_directory,
@@ -222,31 +220,8 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 
 @app.get("/health")
 async def health() -> Response:
-    """Check the status of the http server."""
-    code = HTTPStatus.SERVICE_UNAVAILABLE.value
-    if _global_state.tokenizer_manager.server_status == ServerStatus.Up:
-        code = HTTPStatus.OK.value
-    return Response(
-        status_code=code,
-        content=json.dumps(
-            {"status": _global_state.tokenizer_manager.server_status.value}
-        ),
-    )
-
-
-@app.post("/health")
-async def health_update(obj: ReportHealthInput, request: Request) -> Response:
-    """Update the Status of the http server."""
-    try:
-        server_status = ServerStatus(obj.status)
-        _global_state.tokenizer_manager.server_status = server_status
-        if server_status != ServerStatus.Up:
-            return Response(
-                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, content=obj.msg
-            )
-    except Exception as e:
-        logger.error(e)
-        return Response(status_code=HTTPStatus.SERVICE_UNAVAILABLE.value)
+    """Check the health of the http server."""
+    return Response(status_code=200)
 
 
 @app.get("/health_generate")
@@ -281,7 +256,7 @@ async def health_generate(request: Request) -> Response:
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
             _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            _global_state.tokenizer_manager.health_check_failed = False
             return Response(status_code=200)
 
     task.cancel()
@@ -295,7 +270,7 @@ async def health_generate(request: Request) -> Response:
         f"last_heartbeat time: {last_receive_time}"
     )
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-    _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+    _global_state.tokenizer_manager.health_check_failed = True
     return Response(status_code=503)
 
 
@@ -1047,13 +1022,9 @@ def _execute_server_warmup(
                 headers=headers,
                 timeout=600,
             )
-            if res.status_code == 200:
-                _global_state.tokenizer_manager.server_status = ServerStatus.Up
-            else:
-                _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
-            logger.info(f"{res}")
+            assert res.status_code == 200, f"{res}"
         else:
-            logger.info(f"Start of prefill/decode warmup ...")
+            logger.info(f"Start of prefill warmup ...")
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
@@ -1075,25 +1046,15 @@ def _execute_server_warmup(
                 headers=headers,
                 timeout=1800,  # because of deep gemm precache is very long if not precache.
             )
-            if res.status_code == 200:
-                logger.info(
-                    f"End of prefill disaggregation mode warmup with status {res.status_code}, resp: {res.json()}"
-                )
-                _global_state.tokenizer_manager.server_status = ServerStatus.Up
-            else:
-                logger.info(
-                    "Prefill disaggregation mode warm Up Failed, status code: {}".format(
-                        res.status_code
-                    )
-                )
-                _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+            logger.info(
+                f"End of prefill warmup with status {res.status_code}, resp: {res.json()}"
+            )
 
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        _global_state.tokenizer_manager.server_status = ServerStatus.Crashed
         kill_process_tree(os.getpid())
         return False
 
