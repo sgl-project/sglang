@@ -108,6 +108,7 @@ suites = {
         TestFile("test_vision_openai_server_b.py", 556),
         TestFile("test_w8a8_quantization.py", 46),
         TestFile("test_reasoning_parser.py", 5),
+        TestFile("test_flexprefill_attention.py", 20),
     ],
     "per-commit-amd": [
         TestFile("models/lora/test_lora_backend.py", 99),
