@@ -48,6 +48,7 @@ __all__ = ["Fp4MoEMethod", "W4A4MXFp4MoEDynamicMethod", "W4A4MXFp4MoEStaticMetho
 logger = logging.getLogger(__name__)
 
 use_aiter_moe = get_bool_env_var("SGLANG_USE_AITER")
+use_dynamic_mxfp4_linear = get_bool_env_var("SGLANG_USE_DYNAMIC_MXFP4_linear")
 
 OCP_MX_BLOCK_SIZE = 32
 
@@ -101,8 +102,13 @@ class Fp4Config(QuantizationConfig):
             if self.is_checkpoint_fp4_serialized:
                 scheme = self.get_scheme(layer=layer, layer_name=prefix)
                 layer.scheme = scheme
+                return Fp4LinearMethod(self)
 
-            return Fp4LinearMethod(self)
+            elif use_dynamic_mxfp4_linear:
+                return Fp4LinearMethod(self)
+            else:
+                return UnquantizedLinearMethod()
+        
             # some debugging test
             #return Fp8LinearMethod(self)
         
@@ -835,7 +841,7 @@ class Fp4KVCacheMethod(BaseKVCacheMethod):
     Supports loading kv-cache scaling factors from quark checkpoints.
     """
 
-    def __init__(self, quant_config: QuarkConfig):
+    def __init__(self, quant_config: Fp4Config):
         self.validate_kv_cache_config(quant_config.kv_cache_config)
         super().__init__(quant_config)
 
