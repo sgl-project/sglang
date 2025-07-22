@@ -660,7 +660,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         beta_slow: int = 1,
         mscale: float = 1,
         mscale_all_dim: float = 0,
-        device: Optional[str] = "cuda",
+        device: Optional[str] = "cuda" if not _is_npu else "npu",
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -679,7 +679,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         )
 
         # Re-dispatch
-        if _is_hip:
+        if _is_hip or _is_npu:
             self._forward_method = self.forward_native
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
