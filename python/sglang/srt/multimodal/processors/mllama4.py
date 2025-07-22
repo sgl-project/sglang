@@ -34,7 +34,6 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         self,
         image_data: List[Union[str, bytes]],
         input_text,
-        max_req_input_len,
         *args,
         **kwargs,
     ):
@@ -42,7 +41,6 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
-            max_req_input_len=max_req_input_len,
         )
 
         # Process the prompt and images
