@@ -39,7 +39,7 @@ def offload_modules(
             index=index, module=module, offloaders=offloaders
         )
 
-    return module
+    return all_modules
 
 def _hook_module_forward_for_offloader(index, module, offloaders):
     _hook_module_forward_raw(
