@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
 
-from sglang.srt.offloader import offload_modules
+from sglang.srt.offloader import ModuleOffloader
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -1977,6 +1977,7 @@ class DeepseekV2Model(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        module_offloader = None,
     ) -> None:
         super().__init__()
         self.padding_id = config.pad_token_id
@@ -1990,7 +1991,7 @@ class DeepseekV2Model(nn.Module):
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
-            offload_modules((
+            module_offloader.offload_modules((
                 DeepseekV2DecoderLayer(
                     config,
                     layer_id,
@@ -2075,8 +2076,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
+        self.module_offloader = ModuleOffloader()
         self.model = DeepseekV2Model(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config, quant_config, prefix=add_prefix("model", prefix),
+            module_offloader=self.module_offloader,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -2322,6 +2325,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             and self.quant_config.weight_block_size is not None
         ):
             self._weight_requant_ue8m0(is_nextn)
+
+        self.module_offloader.on_post_load()
 
     def _weight_requant_ue8m0(self, is_nextn=False):
         weight_block_size = self.quant_config.weight_block_size

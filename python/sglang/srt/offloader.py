@@ -9,46 +9,51 @@ from sglang.srt.utils import get_int_env_var, is_pin_memory_available
 logger = logging.getLogger(__name__)
 
 
-def offload_modules(
-    all_modules_generator: Generator[torch.nn.Module, None, None],
-    submodule_accessor: Callable[[torch.nn.Module], torch.nn.Module],
-):
-    module_interval = get_int_env_var("SGLANG_OFFLOAD_MODULE_INTERVAL", -1)
-    if module_interval < 0:
-        return list(all_modules_generator)
+# TODO improve
+class ModuleOffloader:
+    def offload_modules(
+        self,
+        all_modules_generator: Generator[torch.nn.Module, None, None],
+        submodule_accessor: Callable[[torch.nn.Module], torch.nn.Module],
+    ):
+        module_interval = get_int_env_var("SGLANG_OFFLOAD_MODULE_INTERVAL", -1)
+        if module_interval < 0:
+            return list(all_modules_generator)
 
-    logger.info(f"offload_module module_interval={module_interval}")
+        logger.info(f"offload_module module_interval={module_interval}")
 
-    alt_stream = torch.cuda.Stream()
+        alt_stream = torch.cuda.Stream()
 
-    # TODO maybe improve
-    all_modules = []
-    offload_submodules = []
-    offloaders = []
-    for module_index, module in enumerate(all_modules_generator):
-        logger.info(f"[offload_modules] {module_index=} {torch.cuda.memory_allocated()=}")
-        all_modules.append(module)
-        if module_index % module_interval == module_interval - 1:
-            submodule = submodule_accessor(module)
-            logger.info(f"[offload_modules] move {module_index=} submodule={type(submodule)} to cpu")
-            offload_submodules.append(submodule)
-            offloaders.append(_ModuleOffloader(submodule, alt_stream))
+        # TODO maybe improve
+        all_modules = []
+        offload_submodules = []
+        self.offloaders = []
+        for module_index, module in enumerate(all_modules_generator):
+            logger.info(f"[offload_modules] {module_index=} {torch.cuda.memory_allocated()=}")
+            all_modules.append(module)
+            if module_index % module_interval == module_interval - 1:
+                submodule = submodule_accessor(module)
+                logger.info(f"[offload_modules] move {module_index=} submodule={type(submodule)} to cpu")
+                offload_submodules.append(submodule)
+                self.offloaders.append(_ModuleOffloader(submodule, alt_stream))
 
-    offloaders[0].start_onload()
+        for index, module in enumerate(offload_submodules):
+            _hook_module_forward_for_offloader(
+                index=index, module=module, offloaders=self.offloaders
+            )
 
-    for index, module in enumerate(offload_submodules):
-        _hook_module_forward_for_offloader(
-            index=index, module=module, offloaders=offloaders
-        )
+        return all_modules
 
-    return all_modules
+    def on_post_load(self):
+        self.offloaders[0].start_onload()
+
 
 def _hook_module_forward_for_offloader(index, module, offloaders):
     _hook_module_forward_raw(
         module,
         on_forward_start=lambda: offloaders[
             (index + 1) % len(offloaders)
-        ].start_onload(),
+            ].start_onload(),
         on_forward_end=lambda: offloaders[index].offload(),
         get_parameter_and_buffer_dicts=lambda: offloaders[
             index
