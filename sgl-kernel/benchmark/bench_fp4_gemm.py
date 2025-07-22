@@ -6,7 +6,6 @@ import itertools
 import pytest
 import torch
 import triton
-
 from flashinfer import mm_fp4
 from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
 

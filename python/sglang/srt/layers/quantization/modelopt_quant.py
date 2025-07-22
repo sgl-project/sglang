@@ -38,7 +38,7 @@ if is_cuda():
     from sgl_kernel import scaled_fp4_quant
 
 try:
-    from flashinfer import mm_fp4 as fp4_gemm
+    from flashinfer import mm_fp4 as fp4_gem
 
     enable_flashinfer_fp4_gemm = True
 except ImportError:
