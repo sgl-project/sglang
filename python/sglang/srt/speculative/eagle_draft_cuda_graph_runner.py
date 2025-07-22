@@ -52,7 +52,7 @@ class EAGLEDraftCudaGraphRunner:
         self.dp_size = self.model_runner.dp_size
         self.tp_size = self.model_runner.tp_size
         self.topk = model_runner.server_args.speculative_eagle_topk
-        self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.num_steps = model_runner.server_args.speculative_num_steps
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
@@ -86,7 +86,7 @@ class EAGLEDraftCudaGraphRunner:
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
             self.out_cache_loc = torch.zeros(
-                (self.max_num_token * self.speculative_num_steps,), dtype=torch.int64
+                (self.max_num_token * self.num_steps,), dtype=torch.int64
             )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
@@ -159,7 +159,7 @@ class EAGLEDraftCudaGraphRunner:
         # Graph inputs
         req_pool_indices = self.req_pool_indices[:num_seqs]
         seq_lens = self.seq_lens[:num_seqs]
-        out_cache_loc = self.out_cache_loc[: num_tokens * self.speculative_num_steps]
+        out_cache_loc = self.out_cache_loc[: num_tokens * self.num_steps]
         positions = self.positions[:num_tokens]
         topk_p = self.topk_p[:num_seqs]
         topk_index = self.topk_index[:num_seqs]
@@ -280,7 +280,10 @@ class EAGLEDraftCudaGraphRunner:
         parents_list = [x[:raw_bs] for x in parents_list]
         return (score_list, token_list, parents_list)
 
-    def replay(self, forward_batch: ForwardBatch):
+    def replay_prepare(
+        self,
+        forward_batch: ForwardBatch,
+    ):
         assert forward_batch.out_cache_loc is not None
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
@@ -305,7 +308,7 @@ class EAGLEDraftCudaGraphRunner:
         # Common inputs
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        self.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
+        self.out_cache_loc[: raw_num_token * self.num_steps].copy_(
             forward_batch.out_cache_loc
         )
         self.positions[:raw_num_token].copy_(forward_batch.positions)
@@ -337,19 +340,38 @@ class EAGLEDraftCudaGraphRunner:
         self.model_runner.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
             forward_batch, bs
         )
-        # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
+
+        # Store fields
+        self.raw_bs = raw_bs
+        self.raw_num_token = raw_num_token
+        self.bs = bs
+
+    def replay(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool = False,
+    ):
+        if not skip_attn_backend_init:
+            self.replay_prepare(forward_batch)
+        else:
+            # In speculative decoding, these fields are wrong during the
+            # overlapped preparation, so we need to copy them again in the main stream.
+            self.topk_p[: self.raw_bs].copy_(forward_batch.spec_info.topk_p)
+            self.topk_index[: self.raw_bs].copy_(forward_batch.spec_info.topk_index)
+            self.hidden_states[: self.raw_bs].copy_(
+                forward_batch.spec_info.hidden_states
+            )
 
         # Replay
-        self.graphs[bs].replay()
-        out = self.output_buffers[bs]
+        self.graphs[self.bs].replay()
+        out = self.output_buffers[self.bs]
 
-        if bs != raw_bs:
-            out = self._postprocess_output_to_raw_bs(out, raw_bs)
-            forward_batch.batch_size = raw_bs
-            forward_batch.positions = self.positions[:raw_num_token]
-            forward_batch.seq_lens = self.seq_lens[:raw_bs]
-            forward_batch.req_pool_indices = self.req_pool_indices[:raw_bs]
+        if self.bs != self.raw_bs:
+            out = self._postprocess_output_to_raw_bs(out, self.raw_bs)
+            forward_batch.batch_size = self.raw_bs
+            forward_batch.positions = self.positions[: self.raw_num_token]
+            forward_batch.seq_lens = self.seq_lens[: self.raw_bs]
+            forward_batch.req_pool_indices = self.req_pool_indices[: self.raw_bs]
             if forward_batch.seq_lens_cpu is not None:
-                forward_batch.seq_lens_cpu = self.seq_lens_cpu[:raw_bs]
-
+                forward_batch.seq_lens_cpu = self.seq_lens_cpu[: self.raw_bs]
         return out

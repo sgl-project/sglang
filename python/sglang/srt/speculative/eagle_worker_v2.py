@@ -234,43 +234,20 @@ class EAGLEWorker(TpModelWorker):
             return batch_output
 
     def draft(self, batch: ModelWorkerBatch):
-        # Parse args
-        num_seqs = len(batch.seq_lens)
+        # Prepare for draft
         spec_info = batch.spec_info
-
-        # Assign cache locations
-        batch.out_cache_loc = torch.empty(
-            (num_seqs * self.topk * self.num_steps,),
-            dtype=torch.int64,
-            device=self.device,
-        )
-        assign_draft_cache_locs[(num_seqs,)](
-            batch.req_pool_indices,
-            self.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.out_cache_loc,
-            self.req_to_token_pool.req_to_token.shape[1],
-            self.topk,
-            self.num_steps,
+        forward_batch, can_cuda_graph = spec_info.prepare_for_draft(
+            batch, self.cuda_graph_runner, self.draft_model_runner
         )
 
-        # Get a forward batch
-        batch.capture_hidden_mode = CaptureHiddenMode.LAST
-        spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
-        forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
-
-        # Run forward
-        can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
-            forward_batch
-        )
+        # Run draft
         if can_cuda_graph:
             score_list, token_list, parents_list = self.cuda_graph_runner.replay(
-                forward_batch
+                forward_batch,
+                skip_attn_backend_init=True,
             )
         else:
-            # Initialize attention metadata
             self.draft_attn_backend.init_forward_metadata(forward_batch)
-            # Run draft decode steps
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
 
         # Build tree mask
