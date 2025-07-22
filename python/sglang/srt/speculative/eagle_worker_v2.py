@@ -181,6 +181,9 @@ class EAGLEWorker(TpModelWorker):
             )
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+        self.plan_stream_ctx = (
+            torch.cuda.stream(self.plan_stream) if self.plan_stream else empty_context()
+        )
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
@@ -356,13 +359,10 @@ class EAGLEWorker(TpModelWorker):
         # Parse args
         seq_lens_backup = batch.seq_lens
         bs = len(batch.seq_lens)
-        plan_stream_ctx = (
-            torch.cuda.stream(self.plan_stream) if self.plan_stream else empty_context()
-        )
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
-        with plan_stream_ctx:
+        with self.plan_stream_ctx:
             verify_forward_batch, can_run_cuda_graph = spec_info.prepare_for_verify(
                 batch, self.target_worker
             )
@@ -412,7 +412,7 @@ class EAGLEWorker(TpModelWorker):
         )
 
         # Prepare for draft extend in a separate stream
-        with plan_stream_ctx:
+        with self.plan_stream_ctx:
             forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
                 batch,
                 predict,
