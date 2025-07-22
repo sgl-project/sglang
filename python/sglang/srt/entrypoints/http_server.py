@@ -882,8 +882,10 @@ async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
     )
 
 
-def _create_error_response(e, status_code=HTTPStatus.BAD_REQUEST):
-    return ORJSONResponse({"error": {"message": str(e)}}, status_code=status_code)
+def _create_error_response(e):
+    return ORJSONResponse(
+        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+    )
 
 
 def launch_server(
