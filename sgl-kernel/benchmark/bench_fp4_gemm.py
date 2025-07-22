@@ -17,10 +17,10 @@ FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 def get_weight_shapes(args):
     models_tps = args.tp_sizes
     
-    if models_tps == 4:
+    if models_tps == [4]:
         return [[1024, 3584], [7168, 256], [7168, 2304], [9216, 3584]]
         
-    if models_tps == 8:
+    if models_tps == [8]:
         return [[512, 3584], [7168, 128], [7168, 1152], [4608, 3584]]
     return [[1024, 3584], [7168, 256], [7168, 2304], [9216, 3584], [512, 3584], [7168, 128], [7168, 1152], [4608, 3584]]
 
@@ -31,9 +31,9 @@ def get_weight_shapes(args):
         # x_vals = [64],
         x_log = False,
         line_arg = "provider",
-        line_vals = ["cutlass", "cudnn"],
-        line_names =["baseline cutlass fp4", "cudnn fp4"],
-        styles = [("red", "solid"), ("blue", "solid")],
+        line_vals = ["cutlass", "cudnn", "trtllm"],
+        line_names =["baseline cutlass fp4", "cudnn fp4", "trtllm fp4"],
+        styles = [("red", "solid"), ("blue", "solid"), ("green", "solid")],
         ylabel = "latency (ms)",
         plot_name = "fp4_gemm_benchmark",
         args = {}
@@ -44,7 +44,6 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
     M = batch_size
     packed_k = K 
     K = 2 * packed_k
-    block_size = 16
     a_dtype = torch.randn((M, K), dtype=dtype, device="cuda")
     b_dtype = torch.randn((N, K), dtype=dtype, device="cuda")
     a_global_scale = (
@@ -58,7 +57,7 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
     a_fp4, a_scale_interleaved = scaled_fp4_quant(a_dtype, a_global_scale)
     # print("a_fp4", a_fp4)
     b_fp4, b_scale_interleaved = scaled_fp4_quant(b_dtype, b_global_scale)
-    res_cudnn = torch.empty((M, N), dtype=dtype, device="cuda")
+    res_fi = torch.empty((M, N), dtype=dtype, device="cuda")
     
     quantiles = [0.5, 0.2, 0.8]
     if provider == "cutlass":
@@ -71,7 +70,16 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
     if provider == "cudnn":
         ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: mm_fp4(
-                a_fp4, b_fp4.T, a_scale_interleaved, b_scale_interleaved.T, alpha, dtype, res_cudnn
+                a_fp4, b_fp4.T, a_scale_interleaved, b_scale_interleaved.T, alpha, dtype, res_fi
+            ),
+            quantiles=quantiles,
+        )
+    if provider == "trtllm":
+        a_scale_interleaved = a_scale_interleaved.to(torch.uint8)
+        b_scale_interleaved = b_scale_interleaved.to(torch.uint8)
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+            lambda: mm_fp4(
+                a_fp4, b_fp4.T, a_scale_interleaved, b_scale_interleaved.T, alpha, dtype, res_fi, backend="trtllm"
             ),
             quantiles=quantiles,
         )
@@ -80,10 +88,14 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
             a_fp4, b_fp4, a_scale_interleaved, b_scale_interleaved, alpha, dtype
         )
         mm_fp4(
-                a_fp4, b_fp4.T, a_scale_interleaved, b_scale_interleaved.T, alpha, dtype, res_cudnn
+                a_fp4, b_fp4.T, a_scale_interleaved, b_scale_interleaved.T, alpha, dtype, res_fi, backend="cudnn"
             )
-        diff = torch.abs(res_cudnn - res_cutlass)
-        assert torch.allclose(res_cudnn, res_cutlass, atol=1e-3, rtol=1e-3)
+        assert torch.allclose(res_fi, res_cutlass, atol=1e-3, rtol=1e-3), "cudnn fp4 doesn't match cutlass fp4"
+        mm_fp4(
+                a_fp4, b_fp4.T, a_scale_interleaved, b_scale_interleaved.T, alpha, dtype, res_fi, backend="trtllm"
+            )
+        assert torch.allclose(res_fi, res_cutlass, atol=1e-3, rtol=1e-3), "trtllm fp4 doesn't match cutlass fp4"
+        
     if csv_file:
         with open(csv_file, "a", newline="") as f:
             writer = csv.writer(f)
@@ -120,9 +132,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     
-    results_filename = "results_cutlass_cudnn.csv"
     if args.csv:
-        with open(results_filename, "w", newline="") as f:
+        with open(args.csv, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["provider", "m", "n", "k", "time_ms"])
 

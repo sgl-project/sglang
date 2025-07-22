@@ -43,6 +43,8 @@ try:
 except ImportError:
     if is_cuda():
         from sgl_kernel import cutlass_scaled_fp4_mm as fp4_gemm
+    else:
+        fp4_gemm = None
     enable_flashinfer_fp4_gemm = False
 
 try:
@@ -53,7 +55,7 @@ except ImportError:
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
 
-# Supported activation schemes for the current fconfiguration
+# Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
 
 
