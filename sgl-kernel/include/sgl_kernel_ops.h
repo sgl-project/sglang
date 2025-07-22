@@ -477,8 +477,8 @@ void transfer_kv_all_layer_mla_lf_pf(
     int64_t num_warps_per_block);
 
 void transfer_kv_direct(
-    const std::vector<at::Tensor> src_layers,
-    const std::vector<at::Tensor> dst_layers,
+    const std::vector<at::Tensor>& src_layers,
+    std::vector<at::Tensor> dst_layers,
     const at::Tensor src_indices,
     const at::Tensor dst_indices,
     int64_t page_size);

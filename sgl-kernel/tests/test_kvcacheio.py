@@ -120,12 +120,12 @@ def test_transfer_kv(
                     src_indices_host,
                     dst_indices_device,
                 )
-            src_layers_device = torch.Tensor(
+            src_layers_device = torch.tensor(
                 [src_pool_host[layer_id].data_ptr() for layer_id in range(num_layers)],
                 dtype=torch.uint64,
                 device=device,
             )
-            dst_layers_device = torch.Tensor(
+            dst_layers_device = torch.tensor(
                 [
                     dst_pool_kernel[layer_id].data_ptr()
                     for layer_id in range(num_layers)
@@ -139,8 +139,8 @@ def test_transfer_kv(
                 src_indices_device,
                 dst_indices_device,
                 io_backend="kernel",
-                page_size=page_size,
                 item_size=item_size * dtype.itemsize,
+                num_layers=num_layers,
             )
             transfer_kv_direct(
                 [src_pool_host[layer_id] for layer_id in range(num_layers)],
@@ -202,17 +202,17 @@ def test_transfer_kv(
                     dst_indices_device,
                 )
 
-            src_k_layers_device = torch.Tensor(
+            src_k_layers_device = torch.tensor(
                 [src_k_pool[layer_id].data_ptr() for layer_id in range(num_layers)],
                 dtype=torch.uint64,
                 device=device,
             )
-            src_v_layers_device = torch.Tensor(
+            src_v_layers_device = torch.tensor(
                 [src_v_pool[layer_id].data_ptr() for layer_id in range(num_layers)],
                 dtype=torch.uint64,
                 device=device,
             )
-            dst_k_layers_device = torch.Tensor(
+            dst_k_layers_device = torch.tensor(
                 [
                     dst_k_pool_kernel[layer_id].data_ptr()
                     for layer_id in range(num_layers)
@@ -220,7 +220,7 @@ def test_transfer_kv(
                 dtype=torch.uint64,
                 device=device,
             )
-            dst_v_layers_device = torch.Tensor(
+            dst_v_layers_device = torch.tensor(
                 [
                     dst_v_pool_kernel[layer_id].data_ptr()
                     for layer_id in range(num_layers)

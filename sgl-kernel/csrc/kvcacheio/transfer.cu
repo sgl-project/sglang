@@ -82,7 +82,7 @@ __global__ void transfer_kernel_impl(
   int32_t warp_id = tid / 32;
 
   for (int i = 0; i < items_per_warp; ++i) {
-    int32_t item_id = warp_id * items_per_warp + i;
+    int64_t item_id = warp_id * items_per_warp + i;
     if (item_id >= num_items) {
       continue;
     }
@@ -134,7 +134,7 @@ void transfer_kv_launcher(
   TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
   TORCH_CHECK(item_size % 8 == 0, "Item byte size must be divisible by 8");
 
-  auto div_up = [](int32_t x, int32_t y) { return (x + y - 1) / y; };
+  auto div_up = [](int64_t x, int64_t y) { return (x + y - 1) / y; };
   const int64_t num_items = src_indices.numel();
   const int64_t items_per_warp = div_up(num_items, block_quota * num_warps_per_block);
   const int32_t num_blocks = div_up(num_items, items_per_warp * num_warps_per_block);
