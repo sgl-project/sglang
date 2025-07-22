@@ -575,7 +575,13 @@ class DummyModelLoader(BaseModelLoader):
             # 2. Post-processing of weights, including assigning specific member variables.
             # For `dummy_init`, only the second stage is required.
             if hasattr(model, "post_load_weights"):
-                model.post_load_weights()
+                if (
+                    model_config.hf_config.architectures[0]
+                    == "DeepseekV3ForCausalLMNextN"
+                ):
+                    model.post_load_weights(is_nextn=True)
+                else:
+                    model.post_load_weights()
 
         return model.eval()
 
