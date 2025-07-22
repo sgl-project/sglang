@@ -26,6 +26,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
+
+from sglang.srt.offloader import offload_modules
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -1988,7 +1990,7 @@ class DeepseekV2Model(nn.Module):
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
-            [
+            offload_modules((
                 DeepseekV2DecoderLayer(
                     config,
                     layer_id,
@@ -1997,7 +1999,7 @@ class DeepseekV2Model(nn.Module):
                     alt_stream=self.alt_stream,
                 )
                 for layer_id in range(config.num_hidden_layers)
-            ]
+            ), submodule_accessor=lambda layer: layer.mlp)
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
