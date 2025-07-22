@@ -100,7 +100,7 @@ class EagleDraftInput:
         batch.extend_prefix_lens = seq_lens_backup
         batch.extend_num_tokens = num_draft_tokens * bs
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        batch.forward_mode = ForwardMode.DRAFT_EXTEND
+        batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
         batch.return_logprob = False
         self.num_draft_tokens = num_draft_tokens
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
@@ -169,7 +169,6 @@ class EagleVerifyInput:
             dtype=torch.int64,
             device=device,
         )
-
         assign_extend_cache_locs[(bs,)](
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
@@ -181,9 +180,10 @@ class EagleVerifyInput:
         )
 
         # Get a forward batch
-        batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = self
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch.return_logprob = False
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
         # Run attention backend plan and cuda graph preparation

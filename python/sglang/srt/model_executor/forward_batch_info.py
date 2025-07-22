@@ -75,6 +75,8 @@ class ForwardMode(IntEnum):
     TARGET_VERIFY = auto()
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
+    # Used in speculative decoding: extend a batch in the draft model.
+    DRAFT_EXTEND_V2 = auto()
 
     # A dummy first batch to start the pipeline for overlap scheduler.
     # It is now used for triggering the sampling_info_done event for the first prefill batch.
@@ -87,8 +89,9 @@ class ForwardMode(IntEnum):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
-            or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.DRAFT_EXTEND
+            or self == ForwardMode.DRAFT_EXTEND_V2
         )
 
     def is_decode(self):
@@ -108,6 +111,9 @@ class ForwardMode(IntEnum):
 
     def is_draft_extend(self):
         return self == ForwardMode.DRAFT_EXTEND
+
+    def is_draft_extend_v2(self):
+        return self == ForwardMode.DRAFT_EXTEND_V2
 
     def is_extend_or_draft_extend_or_mixed(self):
         return (
