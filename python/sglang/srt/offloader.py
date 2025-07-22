@@ -15,7 +15,7 @@ def offload_modules(
 ):
     module_interval = get_int_env_var("SGLANG_OFFLOAD_MODULE_INTERVAL", -1)
     if module_interval < 0:
-        return
+        return list(all_modules_generator)
 
     logger.info(f"offload_module module_interval={module_interval}")
 
