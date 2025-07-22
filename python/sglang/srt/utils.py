@@ -1268,6 +1268,10 @@ def get_zmq_socket(
         raise ValueError(f"Unsupported socket type: {socket_type}")
 
     if bind:
+        # bind with local ip first
+        if endpoint.startswith("tcp://"):
+            portBase = int(endpoint.split(":")[-1])
+            endpoint = f"tcp://0.0.0.0:{portBase}"
         socket.bind(endpoint)
     else:
         socket.connect(endpoint)
