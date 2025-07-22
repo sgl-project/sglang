@@ -1089,7 +1089,7 @@ class Scheduler(
                         recv_req.rid,
                         finished_reason={
                             "type": "abort",
-                            "status_code": HTTPStatus.TOO_MANY_REQUESTS,
+                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                             "message": "The request queue is full.",
                         },
                     )

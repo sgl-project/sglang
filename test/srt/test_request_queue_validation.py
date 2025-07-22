@@ -66,8 +66,8 @@ class TestMaxQueuedRequests(CustomTestCase):
         )
 
         assert 200 in status_codes
-        assert 429 in status_codes
-        assert all(status_code in [200, 429] for status_code in status_codes)
+        assert 503 in status_codes
+        assert all(status_code in [200, 503] for status_code in status_codes)
 
     def test_max_running_requests_and_max_queued_request_validation(self):
         """Verify running request and queued request numbers based on server logs."""
