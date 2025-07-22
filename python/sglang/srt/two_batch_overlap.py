@@ -67,7 +67,13 @@ def compute_split_seq_index(
         raise NotImplementedError()
 
 
-def _is_two_chunk_split_enabled(left_sum, overall_sum):
+def _is_two_chunk_split_enabled(extend_lens: Sequence[int]) -> bool:
+    if extend_lens is None:
+        return False
+
+    vanilla_split_seq_index = _split_array_by_balanced_sum(extend_lens)
+    left_sum = sum(extend_lens[:vanilla_split_seq_index])
+    overall_sum = sum(extend_lens)
     threshold = global_server_args_dict["tbo_token_distribution_threshold"]
     assert threshold <= 0.5, f"{threshold=}"
     return left_sum < overall_sum * threshold or left_sum > overall_sum * (
@@ -76,29 +82,25 @@ def _is_two_chunk_split_enabled(left_sum, overall_sum):
 
 
 def _split_extend_seqs(arr: Sequence[int]) -> int:
-    split_seq_index = _split_array_by_balanced_sum(arr)
-
-    left_sum = sum(arr[:split_seq_index])
-    overall_sum = sum(arr)
-    if _is_two_chunk_split_enabled(left_sum, overall_sum):
+    if _is_two_chunk_split_enabled(arr):
         return _split_array_by_cum_less_than_half(arr)
 
-    return split_seq_index
+    return _split_array_by_balanced_sum(arr)
 
 
 def _split_array_by_cum_less_than_half(arr: Sequence[int]) -> int:
     left_sum = 0
     overall_sum = sum(arr)
     half_sum = overall_sum // 2
-    chosen_seq_index = 0
+    chosen_index = 0
 
     for i in range(len(arr)):
         left_sum += arr[i]
         if left_sum > half_sum:
-            chosen_seq_index = i
+            chosen_index = i
             break
 
-    return chosen_seq_index
+    return chosen_index
 
 
 def _split_array_by_balanced_sum(arr: Sequence[int]) -> int:
@@ -241,11 +243,9 @@ def compute_split_token_index(
 ) -> int:
     if forward_mode == ForwardMode.EXTEND:
         assert extend_seq_lens is not None
-        split_token_index = sum(extend_seq_lens[:split_seq_index])
-        overall_sum = sum(extend_seq_lens)
-        if _is_two_chunk_split_enabled(split_token_index, overall_sum):
-            return overall_sum // 2
-        return split_token_index
+        if _is_two_chunk_split_enabled(extend_seq_lens):
+            return sum(extend_seq_lens) // 2
+        return sum(extend_seq_lens[:split_seq_index])
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
         return split_seq_index * token_num_per_seq
@@ -451,9 +451,7 @@ class TboForwardBatchPreparer:
 
         is_enable_two_chunk = (
             batch.forward_mode == ForwardMode.EXTEND
-            and batch.extend_seq_lens_cpu is not None
-            and tbo_split_token_index
-            != sum(batch.extend_seq_lens_cpu[: batch.tbo_split_seq_index])
+            and _is_two_chunk_split_enabled(batch.extend_seq_lens_cpu)
         )
 
         if _tbo_debug:
@@ -518,9 +516,9 @@ class TboForwardBatchPreparer:
         tbo_split_seq_index: int,
     ):
         extend_seq_lens_cpu = batch.extend_seq_lens_cpu
-        overall_sum = sum(extend_seq_lens_cpu)
-        half_sum = overall_sum // 2
-        left_last_seq_token_num = half_sum - sum(
+        overall_seq_lens_sum = sum(extend_seq_lens_cpu)
+        half_seq_lens_sum = overall_seq_lens_sum // 2
+        left_last_seq_token_num = half_seq_lens_sum - sum(
             extend_seq_lens_cpu[:tbo_split_seq_index]
         )
         right_first_seq_token_num = (
@@ -538,8 +536,8 @@ class TboForwardBatchPreparer:
             )
 
         assert (
-            child_a.extend_num_tokens == half_sum
-        ), f"{child_a.extend_num_tokens=}, {half_sum=}"
+            child_a.extend_num_tokens == half_seq_lens_sum
+        ), f"{child_a.extend_num_tokens=}, {half_seq_lens_sum=}"
 
         seq_lens_cpu = (
             child_a.seq_lens_cpu.clone()
