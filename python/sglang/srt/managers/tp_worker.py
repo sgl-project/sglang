@@ -251,7 +251,7 @@ class TpModelWorker:
             )
             return pp_proxy_tensors.tensors, None, can_run_cuda_graph
 
-    def forward_batch_split_prefill(self, batch: ScheduleBatch, forward_count: int = 1):
+    def forward_batch_split_prefill(self, batch: ScheduleBatch):
         model_worker_batch = batch.get_model_worker_batch()
         if batch.split_index == 0:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
