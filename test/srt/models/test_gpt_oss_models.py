@@ -26,12 +26,14 @@ class TestOpenAIMoE(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--cuda-graph-bs",
-                "128",
-                "--disable-cuda-graph",
-                "--disable-radix-cache",
                 "--attention-backend",
                 "torch_native_sink", # "triton",
+                "--enable-w4a8-mxfp4-moe", # MoE W4A8
+                # "--enable-w4-mxfp4-moe", # MoE W4A16
+                "--cuda-graph-bs",
+                "128",
+                # "--disable-cuda-graph",
+                # "--disable-radix-cache",
             ],
         )
 
@@ -51,7 +53,7 @@ class TestOpenAIMoE(CustomTestCase):
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.71) # target
+        self.assertGreater(metrics["accuracy"], 0.70) # target
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -67,7 +69,7 @@ class TestOpenAIMoE(CustomTestCase):
         self.assertGreaterEqual(metrics["score"], 0.759) # target
 
     def test_bs_1_speed(self):
-        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=10, prompt="Human: What is the capital of France?\n\nAssistant:") # What is the capital of France?
+        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=10, prompt="Human: What is the capital of France?\n\nAssistant:")
         acc_length, speed = send_one_prompt(args)
 
         print(f"{speed=:.2f}")
