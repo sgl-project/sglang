@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 def offload_modules(
-    all_modules_generator: Generator[torch.nn.Module],
+    all_modules_generator: Generator[torch.nn.Module, None, None],
     submodule_accessor: Callable[[torch.nn.Module], torch.nn.Module],
 ):
     module_interval = get_int_env_var("SGLANG_OFFLOAD_MODULE_INTERVAL", -1)
