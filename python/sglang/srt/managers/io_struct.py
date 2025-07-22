@@ -1037,7 +1037,7 @@ class ExpertDistributionReq(Enum):
 
 @dataclass
 class ExpertDistributionReqOutput:
-    pass
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass

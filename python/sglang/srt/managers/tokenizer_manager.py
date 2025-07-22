@@ -503,7 +503,6 @@ class TokenizerManager:
                 "Please add `--is-embedding` when launching the server or try another model."
             )
 
-        obj.normalize_batch_and_arguments()
 
         if self.server_args.tokenizer_worker_num > 1:
             # Modify rid, add worker_id
