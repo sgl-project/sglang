@@ -213,6 +213,7 @@ class ServerArgs:
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
+    hicache_io_backend: str = ""
     hicache_storage_backend: Optional[str] = None
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
@@ -1491,6 +1492,13 @@ class ServerArgs:
             choices=["write_back", "write_through", "write_through_selective"],
             default=ServerArgs.hicache_write_policy,
             help="The write policy of hierarchical cache.",
+        )
+        parser.add_argument(
+            "--hicache-io-backend",
+            type=str,
+            choices=["direct", "kernel"],
+            default=ServerArgs.hicache_io_backend,
+            help="The IO backend for KV cache transfer between CPU and GPU",
         )
         parser.add_argument(
             "--hicache-storage-backend",

@@ -290,11 +290,9 @@ class HiCacheController:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         mem_pool_host: HostKVCache,
         page_size: int,
-        # enable_mooncake_store_l3_cache: bool,
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through_selective",
-        # mooncake_l3_kv_pool: MooncakeStore = None,
-        # mooncake_l3_load_cache_event: threading.Event = None,
+        io_backend: str = "",
         storage_backend: Optional[str] = None,
         prefetch_threshold: int = 256,
     ):
@@ -304,8 +302,15 @@ class HiCacheController:
         self.write_policy = write_policy
         self.page_size = page_size
         # using kernel for small page KV cache transfer and DMA for large pages
-        # todo: hardware aware config, server parameter
-        self.io_backend = "direct" if self.page_size >= 64 else "kernel"
+        if not io_backend:
+            IO_BACKEND_PAGE_SIZE_THRESHOLD = 64
+            self.io_backend = (
+                "direct"
+                if self.page_size >= IO_BACKEND_PAGE_SIZE_THRESHOLD
+                else "kernel"
+            )
+        else:
+            self.io_backend = io_backend
 
         self.enable_storage = False
         # todo: move backend initialization to storage backend module
@@ -313,8 +318,6 @@ class HiCacheController:
             if storage_backend == "file":
                 self.storage_backend = HiCacheFile()
                 self.enable_storage = True
-                # tracking prefetch operation progress
-                self.ongoing_prefetch: dict[int, PrefetchOperation] = {}
                 # todo: threshold policy for prefetching
                 self.prefetch_threshold = prefetch_threshold
                 self.storage_zerocopy = False
@@ -323,8 +326,6 @@ class HiCacheController:
                 self.storage_backend = MooncakeStore()
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
                 self.enable_storage = True
-                # tracking prefetch operation progress
-                self.ongoing_prefetch: dict[int, PrefetchOperation] = {}
                 # todo: threshold policy for prefetching
                 self.prefetch_threshold = prefetch_threshold
                 self.storage_zerocopy = True
@@ -626,15 +627,10 @@ class HiCacheController:
         operation = PrefetchOperation(
             request_id, host_indices, new_input_tokens, last_hash
         )
-        self.ongoing_prefetch[request_id] = operation
         self.prefetch_queue.put(operation)
+        return operation
 
-    def terminate_prefetch(self, request_id: str):
-        operation = self.ongoing_prefetch.pop(request_id, None)
-        if operation is None:
-            raise ValueError(
-                f"Request ID {request_id} not found in ongoing prefetches."
-            )
+    def terminate_prefetch(self, operation):
         operation.mark_done()
         return operation.completed_tokens, operation.hash_value
 
@@ -733,8 +729,7 @@ class HiCacheController:
                     exist_result = self.storage_backend.exists(hash_value)
                     storage_hit_count = sum(1 for v in exist_result.values() if v != 0) * self.page_size
                     hit_hash = [k for k, v in exist_result.items() if v != 0]
-                    logger.info(f"storage hit count: {storage_hit_count}")
-                    logger.info(f"len(hithash): {len(hit_hash)}")
+                    
 
                 if storage_hit_count < self.prefetch_threshold:
                     logger.info("not enough for prefetching")
