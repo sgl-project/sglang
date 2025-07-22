@@ -564,11 +564,11 @@ class ModelRunner:
                         "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
                         f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
                     )
-                # else:
-                #     raise ValueError(
-                #         "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                #         f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
-                #     )
+                else:
+                    raise ValueError(
+                        "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
+                        f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
+                    )
 
         logger.info(
             f"Init torch distributed ends. mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
