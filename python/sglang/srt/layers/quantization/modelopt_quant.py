@@ -39,6 +39,7 @@ if is_cuda():
 
 try:
     from flashinfer import mm_fp4 as fp4_gemm
+
     enable_flashinfer_fp4_gemm = True
 except ImportError:
     if is_cuda():
