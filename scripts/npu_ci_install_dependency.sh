@@ -27,10 +27,10 @@ git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG
 ### Install PyTorch and PTA
 PYTORCH_VERSION=2.6.0
 TORCHVISION_VERSION=0.21.0
-PTA_VERSION=2.6.0rc1
 pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
-pip install torch_npu==$PTA_VERSION
-
+wget https://pytorch-package.obs.cn-north-4.myhuaweicloud.com/pta/Daily/v2.6.0/20250710.1/pytorch_v2.6.0_py311.tar.gz --no-check-certificate
+tar -xzvf ./pytorch_v2.6.0_py310.tar.gz
+pip install ./torch_npu-2.6.0.dev20250710-cp311-cp311-manylinux_2_28_aarch64.whl
 
 ### Install Triton-Ascend
 TRITON_ASCEND_VERSION=3.2.0rc2
