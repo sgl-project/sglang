@@ -48,7 +48,7 @@ def get_num_heads_padding_size(tp_size, weight_block_size, head_dim):
         import math
 
         pad_size = tp_size * (
-            math.lcm(head_dim, weight_block_size[0]) / weight_block_size[0]
+            math.lcm(head_dim, weight_block_size[0]) // weight_block_size[0]
         )
 
     return pad_size
