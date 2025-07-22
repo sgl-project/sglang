@@ -172,6 +172,18 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(HTTPException)
+async def validation_exception_handler(request: Request, exc: HTTPException):
+    """Enrich HTTP exception with status code and other details"""
+    error = ErrorResponse(
+        object="error",
+        message=exc.detail,
+        type=str(exc.status_code),
+        code=exc.status_code,
+    )
+    return ORJSONResponse(content=error.model_dump(), status_code=exc.status_code)
+
+
 # Custom exception handlers to change validation error status codes
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -349,8 +361,6 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
-        except HTTPException as e:
-            return _create_error_response(e, status_code=e.status_code)
 
 
 @app.api_route("/generate_from_file", methods=["POST"])
@@ -375,8 +385,6 @@ async def generate_from_file_request(file: UploadFile, request: Request):
     except ValueError as e:
         logger.error(f"Error: {e}")
         return _create_error_response(e)
-    except HTTPException as e:
-        return _create_error_response(e, status_code=e.status_code)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
@@ -389,8 +397,6 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
         return ret
     except ValueError as e:
         return _create_error_response(e)
-    except HTTPException as e:
-        return _create_error_response(e, status_code=e.status_code)
 
 
 @app.api_route("/classify", methods=["POST", "PUT"])
@@ -403,8 +409,6 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         return ret
     except ValueError as e:
         return _create_error_response(e)
-    except HTTPException as e:
-        return _create_error_response(e, status_code=e.status_code)
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
