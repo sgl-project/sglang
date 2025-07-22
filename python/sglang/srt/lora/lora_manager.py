@@ -382,8 +382,6 @@ class LoRAManager:
         # Supported weight names (e.g., qkv_proj) for LoRA A and B respectively.
         self.lora_weight_names: Tuple[Set[str]] = (set(), set())
 
-        self.lora_embeddings_weight_names: Tuple[Set[str]] = (set(), set())
-
         # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
         self.lora_modules: Dict[int, Dict[str, BaseLayerWithLoRA]] = {
             i: {} for i in range(self.base_hf_config.num_hidden_layers)
@@ -451,9 +449,6 @@ class LoRAManager:
         """
 
         # Target lora weight names for lora_a and lora_b modules respectively.
-        if "embed_tokens" in self.target_modules:
-            self.lora_embeddings_weight_names[0].update(["embed_tokens"])
-            self.lora_embeddings_weight_names[1].update(["embed_tokens"])
         lora_A, lora_B = get_normalized_lora_weight_names(self.target_modules)
         self.lora_weight_names[0].update(lora_A)
         self.lora_weight_names[1].update(lora_B)
@@ -510,7 +505,6 @@ class LoRAManager:
             tp_rank=self.tp_rank,
             max_lora_rank=self.max_lora_rank,
             lora_weight_names=self.lora_weight_names,
-            lora_embeddings_weight_names=self.lora_embeddings_weight_names,
             base_model=self.base_model,
             max_extra_vocab_size=self.max_extra_vocab_size,
         )

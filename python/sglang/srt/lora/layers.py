@@ -17,7 +17,10 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo
 
@@ -46,7 +49,24 @@ class BaseLayerWithLoRA(nn.Module):
         pass
 
 
-class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
+class EmbeddingLayerWithLoRA(BaseLayerWithLoRA):
+    def __init__(
+        self,
+        base_layer: VocabParallelEmbedding,
+        lora_backend: BaseLoRABackend,
+    ) -> None:
+        super().__init__(base_layer, lora_backend)
+
+    def set_lora_info(self, *args):
+        pass
+
+    def _get_token_weight_indices(
+        self, input_: torch.Tensor, batch_info: LoRABatchInfo
+    ):
+        pass
+
+
+class VocabParallelEmbeddingWithLoRA(EmbeddingLayerWithLoRA):
     """
     Vocab parallel embedding layer with support for LoRA (Low-Rank Adaptation).
 
@@ -138,8 +158,8 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
     def forward(self, input_: torch.Tensor):
         batch_info = self.lora_backend.batch_info
-        added_tokens_mask = torch.where(input_ > self.vocab_size - 1, 1, 0)
-        base_output = self.base_layer.forward(input_ * (1 - added_tokens_mask))
+        added_tokens_mask = input_ > self.vocab_size - 1
+        base_output = self.base_layer.forward(input_.masked_fill(added_tokens_mask, 0))
 
         if added_tokens_mask.any():
             base_output = self._forward(
@@ -161,7 +181,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         base_output: torch.Tensor,
     ) -> torch.Tensor:
         token_weight_indices = self._get_token_weight_indices(input_, batch_info)
-        added_weight_indices = token_weight_indices[added_tokens_mask.bool()]
+        added_weight_indices = token_weight_indices[added_tokens_mask]
         unique_added_weight_indices = torch.unique(added_weight_indices)
 
         for idx in unique_added_weight_indices:
@@ -182,6 +202,23 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         end_idx = (tp_rank + 1) * shard_size
         B = B[start_idx:end_idx, :]
         return B
+
+
+class ParallelLMHeadWithLoRA(EmbeddingLayerWithLoRA):
+    """
+    Parallel LM head with support for LoRA (Low-Rank Adaptation).
+
+    Note: The current version does not yet implement the LoRA functionality.
+    This class behaves exactly the same as the base ParallelLMHead.
+    Future versions will integrate LoRA functionality to support efficient parameter fine-tuning.
+    """
+
+    def __init__(
+        self,
+        base_layer: ParallelLMHead,
+        lora_backend: BaseLoRABackend,
+    ) -> None:
+        super().__init__(base_layer, lora_backend)
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):

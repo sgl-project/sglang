@@ -1420,7 +1420,7 @@ class ModelRunner:
         # Check if embedding LoRA is present and disable CUDA graph
         if self.lora_manager is not None:
             assert "embed_tokens" not in self.lora_manager.target_modules, (
-                "Embedding LoRA is not supported in CUDA graph. "
+                "The current version does not yet support embedding LoRA in CUDA graph. "
                 "Please use `--disable-cuda-graph`."
             )
 

@@ -102,7 +102,7 @@ class TestLoRALayer(CustomTestCase):
                     lora_paths=lora_paths,
                     max_loras_per_batch=3,
                     lora_backend=backend,
-                    disable_cuda_graph=False,
+                    disable_cuda_graph=True,
                     disable_radix_cache=True,
                     cuda_graph_max_bs=1,
                 ) as srt_runner:
