@@ -69,6 +69,7 @@ class EagleDraftInput:
     # shape: (b + 1,)
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
+    last_page_lens: torch.Tensor = None
 
     def prepare_for_extend(self, batch: ScheduleBatch):
         if batch.forward_mode.is_idle():
@@ -513,6 +514,7 @@ class EagleVerifyInput:
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them
         accept_index = accept_index[accept_index != -1]
+        print(f"accept_index: {accept_index}")
         verified_id = predict[accept_index]
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False

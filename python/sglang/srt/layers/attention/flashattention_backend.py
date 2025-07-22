@@ -616,6 +616,41 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table[:, self.strided_indices] // self.page_size
             )
 
+            if self.topk > 1:
+                if (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    and forward_batch.spec_info.last_page_lens is not None
+                ):
+                    # The last page is calculated in the second part cascade
+                    last_page_lens = forward_batch.spec_info.last_page_lens.to(
+                        torch.int32
+                    )
+                    metadata.cache_seqlens_int32 -= last_page_lens  # Both (B, )
+
+                    # Second part handles last_page_len + decode steps calculation
+                    self.forward_metadata_spec_decode_expand.cache_seqlens_int32 += (
+                        last_page_lens
+                    )
+                    expand_page_table = cache_loc[
+                        :, : self.speculative_num_steps
+                    ].clone()
+                    strided_indices_expand = torch.arange(
+                        0,
+                        self.speculative_num_steps,
+                        self.page_size,
+                        device=self.device,
+                    )
+                    last_page_lens_broadcast = last_page_lens.expand(
+                        expand_page_table.shape[0], expand_page_table.shape[1]
+                    )
+                    expand_page_table -= last_page_lens_broadcast
+                    expand_page_table = (
+                        expand_page_table[:, strided_indices_expand] // self.page_size
+                    )
+                    self.forward_metadata_spec_decode_expand.page_table = (
+                        expand_page_table.to(torch.int32)
+                    )
+
         self.forward_metadata = metadata
 
     def forward_extend(
@@ -743,8 +778,11 @@ class FlashAttentionBackend(AttentionBackend):
                 o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k_cache=key_cache,
-                    v_cache=value_cache,
+                    # We can not use page_size > 1 for topk > 1 without significant overhead, thus, convert back.
+                    k_cache=key_cache.view(-1, 1, layer.tp_k_head_num, layer.head_dim),
+                    v_cache=value_cache.view(
+                        -1, 1, layer.tp_v_head_num, layer.head_dim
+                    ),
                     page_table=self.forward_metadata_spec_decode_expand.page_table,
                     cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
                     cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
@@ -1021,7 +1059,6 @@ class FlashAttentionBackend(AttentionBackend):
                     page_table=page_table,
                     cache_seqlens=cache_seqlens,
                     cu_seqlens_q=metadata.cu_seqlens_q,
-                    cu_seqlens_k_new=cu_seqlens_k,
                     max_seqlen_q=max_seqlen_q,
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
@@ -2039,7 +2076,7 @@ class FlashAttentionMultiStepBackend:
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        for i in range(self.speculative_num_steps - 1):
+        for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):

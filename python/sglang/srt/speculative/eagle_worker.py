@@ -496,7 +496,8 @@ class EAGLEWorker(TpModelWorker):
             out_cache_loc = out_cache_loc[
                 : num_seqs * self.topk * self.speculative_num_steps
             ]
-        torch.distributed.breakpoint()
+            spec_info.last_page_lens = last_page_lens
+
         batch.out_cache_loc = out_cache_loc
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         batch.return_hidden_states = False
@@ -622,7 +623,8 @@ class EAGLEWorker(TpModelWorker):
             parents_list.append(tree_info[2])
 
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
-            if i == self.speculative_num_steps - 1:
+            # TODO(yubowang): confirm on number of steps
+            if i == self.speculative_num_steps:
                 break
 
             # Set inputs
