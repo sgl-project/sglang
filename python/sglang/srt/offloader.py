@@ -25,7 +25,7 @@ def offload_modules(
     all_modules = []
     offload_submodules = []
     offloaders = []
-    for module_index, module in all_modules_generator:
+    for module_index, module in enumerate(all_modules_generator):
         all_modules.append(module)
         if module_index % module_interval == module_interval - 1:
             submodule = submodule_accessor(module)
