@@ -500,6 +500,7 @@ class TboForwardBatchPreparer:
             "capture_hidden_mode",
             "padded_static_len",
             "mrope_positions",  # only used by qwen2-vl, thus not care
+            "split_index",  # for split prefill
         ]:
             output_dict[key] = getattr(batch, key)
         if not batch.forward_mode.is_target_verify():

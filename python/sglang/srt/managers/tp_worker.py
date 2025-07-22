@@ -144,7 +144,6 @@ class TpModelWorker:
             self.tp_size * self.pp_rank + tp_rank,
             self.world_group.cpu_group,
             src=self.world_group.ranks[0],
-            device=self.device,
         )[0]
         set_random_seed(self.random_seed)
 

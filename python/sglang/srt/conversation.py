@@ -729,6 +729,7 @@ register_conv_template(
         sep="<|end|>",
         stop_str="<|end|>",
         image_token="<|endoftext10|>",
+        audio_token="<|endoftext11|>",
     )
 )
 

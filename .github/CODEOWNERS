@@ -1,23 +1,24 @@
 /3rdparty/amd @HaiShaw
 /docker @zhyncs @HaiShaw @ByronHsu
 /docs @zhaochenyang20
-/python/sglang/lang @merrymercy @Ying1123 @hnyls2002 @ByronHsu
+/python/sglang/lang @merrymercy @Ying1123 @hnyls2002
 /python/sglang/srt @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu
 /python/sglang/srt/constrained @hnyls2002
-/python/sglang/srt/disaggregation @hnyls2002 @ByronHsu
+/python/sglang/srt/disaggregation @ByronHsu @hnyls2002
 /python/sglang/srt/distributed @yizhang2077
-/python/sglang/srt/entrypoints @zhaochenyang20
-/python/sglang/srt/entrypoints/openai @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu @CatherineSue
+/python/sglang/srt/entrypoints @zhaochenyang20 @CatherineSue
+/python/sglang/srt/eplb @fzyzcjy
+/python/sglang/srt/function_call @CatherineSue
 /python/sglang/srt/layers @merrymercy @Ying1123 @zhyncs @ispobock @HaiShaw @ch-wan @BBuf
 /python/sglang/srt/lora @Ying1123 @Fridge003
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 /python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 /python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock
-/python/sglang/srt/models @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu @zhaochenyang20
-/python/sglang/srt/sampling @merrymercy @hnyls2002
-/python/sglang/srt/speculative @Ying1123 @merrymercy @rkooo567 @kssteven418
+/python/sglang/srt/models @zhyncs @ispobock @ByronHsu @zhaochenyang20
 /python/sglang/srt/multimodal @mickqian @JustinTong0323
-/test/lang @merrymercy @Ying1123 @ByronHsu
+/python/sglang/srt/sampling @hnyls2002
+/python/sglang/srt/speculative @Ying1123 @merrymercy @rkooo567 @kssteven418
+/test/lang @merrymercy @Ying1123
 /test/srt @merrymercy @Ying1123 @zhyncs
-/sgl-router @ByronHsu @Ying1123 @slin1237
+/sgl-router @ByronHsu @slin1237
 /sgl-kernel @zhyncs @ispobock @HandH1998 @BBuf @yizhang2077 @merrymercy @yinfan98 @HaiShaw

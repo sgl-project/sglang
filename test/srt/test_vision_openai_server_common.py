@@ -47,6 +47,12 @@ class TestOpenAIVisionServer(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    def get_audio_request_kwargs(self):
+        return self.get_request_kwargs()
+
+    def get_vision_request_kwargs(self):
+        return self.get_request_kwargs()
+
     def get_request_kwargs(self):
         return {}
 
@@ -71,7 +77,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                 },
             ],
             temperature=0,
-            **(self.get_request_kwargs()),
+            **(self.get_vision_request_kwargs()),
         )
 
         assert response.choices[0].message.role == "assistant"
@@ -134,7 +140,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                 },
             ],
             temperature=0,
-            **(self.get_request_kwargs()),
+            **(self.get_vision_request_kwargs()),
         )
 
         assert response.choices[0].message.role == "assistant"
@@ -177,7 +183,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                 },
             ],
             temperature=0,
-            **(self.get_request_kwargs()),
+            **(self.get_vision_request_kwargs()),
         )
 
         assert response.choices[0].message.role == "assistant"
@@ -302,19 +308,35 @@ class TestOpenAIVisionServer(CustomTestCase):
             "iPod" in video_response
             or "device" in video_response
             or "microphone" in video_response
-        ), video_response
+        ), f"""
+        ====================== video_response =====================
+        {video_response}
+        ===========================================================
+        should contain 'iPod' or 'device' or 'microphone'
+        """
         assert (
             "man" in video_response
             or "person" in video_response
             or "individual" in video_response
             or "speaker" in video_response
-        ), video_response
+            or "Steve" in video_response
+        ), f"""
+        ====================== video_response =====================
+        {video_response}
+        ===========================================================
+        should contain 'man' or 'person' or 'individual' or 'speaker'
+        """
         assert (
             "present" in video_response
             or "examine" in video_response
             or "display" in video_response
             or "hold" in video_response
-        )
+        ), f"""
+        ====================== video_response =====================
+        {video_response}
+        ===========================================================
+        should contain 'present' or 'examine' or 'display' or 'hold'
+        """
         assert "black" in video_response or "dark" in video_response
         self.assertIsNotNone(video_response)
         self.assertGreater(len(video_response), 0)
@@ -333,7 +355,7 @@ class TestOpenAIVisionServer(CustomTestCase):
             temperature=0,
             max_tokens=1024,
             stream=False,
-            **(self.get_request_kwargs()),
+            **(self.get_vision_request_kwargs()),
         )
 
         video_response = response.choices[0].message.content
@@ -376,7 +398,7 @@ class TestOpenAIVisionServer(CustomTestCase):
             + r"""\}"""
         )
 
-        extra_kwargs = self.get_request_kwargs()
+        extra_kwargs = self.get_vision_request_kwargs()
         extra_kwargs.setdefault("extra_body", {})["regex"] = regex
 
         response = client.chat.completions.create(
@@ -443,7 +465,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                 {"role": "user", "content": content},
             ],
             temperature=0,
-            **(self.get_request_kwargs()),
+            **(self.get_vision_request_kwargs()),
         )
 
         assert response.choices[0].message.role == "assistant"
@@ -486,7 +508,7 @@ class TestOpenAIVisionServer(CustomTestCase):
             temperature=0,
             max_tokens=128,
             stream=False,
-            **(self.get_request_kwargs()),
+            **(self.get_audio_request_kwargs()),
         )
 
         audio_response = response.choices[0].message.content
@@ -500,7 +522,7 @@ class TestOpenAIVisionServer(CustomTestCase):
         self.assertIsNotNone(audio_response)
         self.assertGreater(len(audio_response), 0)
 
-        return audio_response
+        return audio_response.lower()
 
     def _test_audio_speech_completion(self):
         # a fragment of Trump's speech

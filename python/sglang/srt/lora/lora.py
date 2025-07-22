@@ -186,10 +186,6 @@ class LoRAAdapter(nn.Module):
                 up_name = weight_name.replace("gate_proj", "up_proj")
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
                 if up_name not in weights:
-                    logger.warning(
-                        f"Gate projection {weight_name} does not have a corresponding up projection {up_name}. "
-                        f"Initializing up projection to zero."
-                    )
                     weights[up_name] = torch.zeros_like(weights[weight_name])
                     # FIXME: Add gate-only support for flashinfer in future implementations
                     assert self.lora_backend.name == "triton", (

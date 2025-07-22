@@ -54,7 +54,7 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.2.5",
+    "sgl-kernel==0.2.6.post1",
     "torch==2.7.1",
     "torchaudio==2.7.1",
     "torchvision==0.22.1",
@@ -79,6 +79,7 @@ blackwell = [
 srt_hip = [
     "sglang[runtime_common]",
     "torch",
+    "petit_kernel",
 ]
 
 # xpu is not enabled in public vllm and torch whl,

@@ -186,9 +186,9 @@ class LoRAManager:
         )
         if incompatible:
             raise ValueError(
-                f"LoRA adapter {lora_name} with rank {lora_config.r} is incompatible with the current LoRA memory pool configuration."
-                "We are still working on supporting dynamically updating LoRA shapes. If you expect to use adapters of different shapes, "
-                "You can specify expected configs via --max_lora_rank and --enable_lora_modules."
+                f"LoRA adapter {lora_name} with rank {lora_config.r} is incompatible with the current LoRA memory pool configuration. "
+                "Please ensure that the LoRA adapter's rank is within the configured `--max_lora_rank` and that the target modules are "
+                "included in `--enable_lora_modules`."
             )
 
     def unload_lora_adapter(self, lora_name: str) -> LoRAUpdateResult:

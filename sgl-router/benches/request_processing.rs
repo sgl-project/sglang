@@ -6,7 +6,7 @@ use sglang_router_rs::openai_api_types::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
     SamplingParams, StringOrArray, UserMessageContent,
 };
-use sglang_router_rs::request_adapter::{RouteableRequest, ToPdRequest};
+use sglang_router_rs::routers::request_adapter::{RouteableRequest, ToPdRequest};
 
 // Sample request data for benchmarks
 fn create_sample_generate_request() -> GenerateRequest {

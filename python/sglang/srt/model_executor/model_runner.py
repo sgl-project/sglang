@@ -304,11 +304,7 @@ class ModelRunner:
             self.apply_torch_tp()
 
         # Init lora
-        # TODO (lifuhuang): when we support dynamic LoRA loading / unloading, we should add
-        # a new server arg `enable_lora` to control whether to init LoRA manager to be more
-        # explicit, as it is perfectly valid to start a server with an empty lora_paths and
-        # load LoRA adapters dynamically later.
-        if server_args.lora_paths is not None:
+        if server_args.enable_lora:
             self.init_lora_manager()
 
         # Init memory pool and attention backends
@@ -411,7 +407,7 @@ class ModelRunner:
                 else:
                     server_args.attention_backend = "triton"
             logger.info(
-                f"Attention backend not set. Use {server_args.attention_backend} backend by default."
+                f"Attention backend not explicitly specified. Use {server_args.attention_backend} backend by default."
             )
         elif self.use_mla_backend:
             if server_args.device != "cpu":
@@ -463,7 +459,7 @@ class ModelRunner:
             if not self.is_multimodal_chunked_prefill_supported:
                 server_args.chunked_prefill_size = -1
                 logger.info(
-                    f"Automatically turn of --chunked-prefill-size as it is not supported for "
+                    f"Automatically turn off --chunked-prefill-size as it is not supported for "
                     f"{self.model_config.hf_config.model_type}"
                 )
 
@@ -561,7 +557,7 @@ class ModelRunner:
 
         # Check memory for tensor parallelism
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not self.is_draft_worker:
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
                     logger.warning(
@@ -895,7 +891,7 @@ class ModelRunner:
             max_lora_rank=self.server_args.max_lora_rank,
             target_modules=self.server_args.lora_target_modules,
         )
-        result = self.lora_manager.load_lora_adapters(self.server_args.lora_paths)
+        result = self.lora_manager.load_lora_adapters(self.server_args.lora_paths or {})
         if result.success:
             logger.info(
                 f"LoRA manager ready. Loaded LoRA adapters: {', '.join(result.loaded_adapters)}"
@@ -1513,11 +1509,34 @@ class ModelRunner:
             **kwargs,
         )
 
+    def forward_split_prefill(
+        self,
+        forward_batch: ForwardBatch,
+        reinit_attn_backend: bool = False,
+        forward_count: int = 1,
+    ) -> LogitsProcessorOutput:
+        if forward_batch.split_index == 0 or reinit_attn_backend:
+            self.attn_backend.init_forward_metadata(forward_batch)
+        next_split_index = min(
+            forward_batch.split_index + forward_count,
+            self.model_config.num_hidden_layers,
+        )
+        ret = self.model.forward_split_prefill(
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            (forward_batch.split_index, next_split_index),
+        )
+        forward_batch.split_index = next_split_index
+        return ret
+
     def forward(
         self,
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        reinit_attn_backend: bool = False,
+        split_forward_count: int = 1,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         self.forward_pass_id += 1
 
@@ -1526,7 +1545,11 @@ class ModelRunner:
             forward_batch,
         ):
             output = self._forward_raw(
-                forward_batch, skip_attn_backend_init, pp_proxy_tensors
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
             )
 
         if self.eplb_manager is not None:
@@ -1539,6 +1562,8 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool,
         pp_proxy_tensors: Optional[PPProxyTensors],
+        reinit_attn_backend: bool = False,
+        split_forward_count: int = 1,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         can_run_cuda_graph = bool(
             forward_batch.forward_mode.is_cuda_graph()
@@ -1558,6 +1583,12 @@ class ModelRunner:
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
+            )
+        elif forward_batch.forward_mode.is_split_prefill():
+            ret = self.forward_split_prefill(
+                forward_batch,
+                reinit_attn_backend=reinit_attn_backend,
+                forward_count=split_forward_count,
             )
         elif forward_batch.forward_mode.is_idle():
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
