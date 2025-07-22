@@ -52,7 +52,7 @@ class OpenAIServingBase(ABC):
         except Exception as e:
             logger.exception(f"Error in request: {e}")
             return self.create_error_response(
-                message=f"Internal server error: {str(e)} hello",
+                message=f"Internal server error: {str(e)}",
                 err_type="InternalServerError",
                 status_code=500,
             )
