@@ -45,7 +45,7 @@ except (ImportError, ModuleNotFoundError):
 class TestFlexPrefill(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen3-32B-FP8"
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         os.environ["SGL_USE_FLEXPREFILL"] = "1"
         cls.process = popen_launch_server(
@@ -60,7 +60,10 @@ class TestFlexPrefill(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_niah(self):
-        metadata = {"pretrained": "Qwen/Qwen3-32B-FP8", "max_seq_lengths": [32768]}
+        metadata = {
+            "pretrained": DEFAULT_MODEL_NAME_FOR_TEST,
+            "max_seq_lengths": [32768],
+        }
 
         tasks_list = [
             "niah_multikey_1",
@@ -70,7 +73,7 @@ class TestFlexPrefill(CustomTestCase):
         results = evaluator.simple_evaluate(
             model="openai-chat-completions",
             model_args="pretrained={},base_url={}/v1/chat/completions".format(
-                "Qwen/Qwen3-32B-FP8", DEFAULT_URL_FOR_TEST
+                DEFAULT_MODEL_NAME_FOR_TEST, DEFAULT_URL_FOR_TEST
             ),
             tasks=tasks_list,
             num_fewshot=None,
