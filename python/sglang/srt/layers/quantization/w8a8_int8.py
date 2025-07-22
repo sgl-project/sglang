@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import sys
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
@@ -57,6 +58,8 @@ if _is_npu:
         useMindIETurbo = False
     else:
         useMindIETurbo = True
+
+logger = logging.getLogger(__name__)
 
 
 # func refers to RMSNorm.__init__
@@ -185,7 +188,10 @@ class W8A8Int8Config(QuantizationConfig):
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
         if quant_config is None:
-            pass
+            logger.warning(
+                "The input quantization config is None, "
+                "and no additional configuration initialization process is performed."
+            )
         else:
             self.quant_description = quant_config
             self.is_dynamic = quant_config.get("is_dynamic", False)
