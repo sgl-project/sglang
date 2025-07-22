@@ -401,7 +401,7 @@ class EAGLEWorker(TpModelWorker):
         # Run attention backend plan and cuda graph preparation in a separate stream
         with plan_stream_ctx:
             verify_forward_batch, can_run_cuda_graph = spec_info.prepare_for_verify(
-                batch
+                batch, self.target_worker
             )
 
         # Correct some buffers due to the overlap plan
