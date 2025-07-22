@@ -84,7 +84,7 @@ __global__ void transfer_kernel_impl(
   for (int i = 0; i < items_per_warp; ++i) {
     int64_t item_id = warp_id * items_per_warp + i;
     if (item_id >= num_items) {
-      continue;
+      break;
     }
     const int64_t src_page_id = src_indices[item_id];
     const int64_t dst_page_id = dst_indices[item_id];
@@ -451,15 +451,15 @@ void transfer_kv_direct(
   auto src_indices_cpu = src_indices.cpu();
   auto dst_indices_cpu = dst_indices.cpu();
 
-  const int64_t num_layers = src_layers.size();
   const int64_t num_pages = src_indices_cpu.size(0) / page_size;
+  const int64_t num_layers = src_layers.size();
 
-  for (const auto i : c10::irange(num_pages)) {
-    auto s_index = src_indices_cpu[i * page_size].item<int64_t>();
-    auto d_index = dst_indices_cpu[i * page_size].item<int64_t>();
+  for (int64_t i = 0; i < num_pages; ++i) {
+    auto src_index = src_indices_cpu[i * page_size].item<int64_t>();
+    auto dst_index = dst_indices_cpu[i * page_size].item<int64_t>();
 
     for (int64_t j = 0; j < num_layers; ++j) {
-      transfer_page_direct(src_layers[j], dst_layers[j], s_index, d_index, page_size);
+      transfer_page_direct(src_layers[j], dst_layers[j], src_index, dst_index, page_size);
     }
   }
 }
