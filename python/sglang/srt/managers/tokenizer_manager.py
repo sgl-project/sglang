@@ -1042,7 +1042,7 @@ class TokenizerManager:
         async with self.model_update_lock.writer_lock:
             # Generate new uniquely identifiable LoRARef object.
             new_adapter = LoRARef(obj.lora_name, obj.lora_path)
-            obj.lora_id = new_adapter.id
+            obj.lora_id = new_adapter.lora_id
 
             # Register the new adapter in the registry.
             result = (await self.update_lora_adapter_communicator(obj))[0]
