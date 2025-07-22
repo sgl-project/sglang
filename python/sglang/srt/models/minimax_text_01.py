@@ -878,9 +878,7 @@ class MiniMaxText01Model(nn.Module):
             if self.decoder_attention_types[i] == 0
         )
         max_slots_number = (
-            getattr(scheduler_config, "max_num_seqs", 1024)
-            if scheduler_config
-            else 1024
+            getattr(scheduler_config, "max_num_seqs", 256) if scheduler_config else 256
         )
         self.cache_shape = (
             linear_layer_nums,
