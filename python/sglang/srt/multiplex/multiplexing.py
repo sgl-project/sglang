@@ -122,10 +122,14 @@ class SchedulerMultiplexMixin:
                     and not wait_prefill_kernel_done
                 ):
                     prefill_done = True
-                    forward_count = max(
-                        1,
-                        self.max_prefill_tokens
-                        // self.split_prefill_batch.extend_num_tokens,
+                    forward_count = (
+                        max(
+                            1,
+                            self.max_prefill_tokens
+                            // self.split_prefill_batch.extend_num_tokens,
+                        )
+                        if self.split_prefill_batch.extend_num_tokens > 0
+                        else self.model_config.num_hidden_layers
                     )
                     next_split_index = min(
                         self.split_prefill_batch.split_index + forward_count,
