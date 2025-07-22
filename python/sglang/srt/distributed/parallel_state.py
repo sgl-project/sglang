@@ -444,9 +444,13 @@ class GroupCoordinator:
 
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
-                torch.ops.sgl_kernel.shm_allreduce(
-                    input_, torch.distributed.ReduceOp.SUM
-                )
+                if torch._dynamo.is_compiling():
+                    # use int value instead of ReduceOp.SUM to support torch compile
+                    torch.ops.sgl_kernel.shm_allreduce(input_, 0)
+                else:
+                    torch.ops.sgl_kernel.shm_allreduce(
+                        input_, torch.distributed.ReduceOp.SUM
+                    )
             else:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_

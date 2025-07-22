@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -48,6 +48,32 @@ class IntelAMXAttnBackend(AttentionBackend):
         else:
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
         self.forward_metadata = (attn_logits, max_extend_len)
+
+    def init_forward_metadata_capture_graph(
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+    ):
+        """Init the metadata for graph capture of a forward pass."""
+        attn_logits = torch.zeros(
+            (
+                bs,
+                self.num_head,
+                8,  # self.num_kv_splits,
+                self.v_head_dim + 1,
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if forward_mode.is_decode_or_idle():
+            max_extend_len = None
+        else:
+            max_extend_len = torch.max(seq_lens).item()
+        self.forward_metadata = (attn_logits, max_extend_len)
+
+    def get_graph_seq_len_fill_value(self):
+        return 1
 
     def forward_extend(
         self,

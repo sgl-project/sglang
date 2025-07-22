@@ -2032,11 +2032,19 @@ class DeepseekV2Model(nn.Module):
             else total_num_layers
         )
         for i in range(normal_num_layers):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
+            # Create a dynamo-compatible approach to record expert distribution
+            if torch._dynamo.is_compiling():
+                # Skip the context manager during compilation
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual, zero_allocator
-                )
+                    )
+            else:
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    layer = self.layers[i]
+                    hidden_states, residual = layer(
+                        positions, hidden_states, forward_batch, residual, zero_allocator
+                    )
 
         if normal_num_layers != total_num_layers:
             hidden_states, residual = model_forward_maybe_tbo(
