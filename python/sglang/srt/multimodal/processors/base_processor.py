@@ -5,8 +5,7 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
-from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -22,7 +21,7 @@ class BaseMultiModalProcessorOutput:
     # input_text, with each frame of video/image represented with a image_token
     input_text: str
 
-    # frames loaded from image and video, in given order
+    # frames loaded from image, in given order
     images: Optional[list[Union[Image.Image, dict]]] = None
 
     # videos
@@ -45,13 +44,25 @@ class BaseMultiModalProcessorOutput:
 
 @dataclasses.dataclass
 class MultimodalSpecialTokens:
-    image_token: Optional[Union[int, str, List[str]]] = None
-    video_token: Optional[Union[int, str, List[str]]] = None
-    audio_token: Optional[Union[int, str, List[str]]] = None
+    image_token: Optional[Union[str, List[str]]] = None
+    video_token: Optional[Union[str, List[str]]] = None
+    audio_token: Optional[Union[str, List[str]]] = None
+
+    image_token_id: Optional[int] = None
+    video_token_id: Optional[int] = None
+    audio_token_id: Optional[int] = None
 
     image_token_regex: Optional[re.Pattern] = None
     video_token_regex: Optional[re.Pattern] = None
     audio_token_regex: Optional[re.Pattern] = None
+
+    combined_regex: Optional[re.Pattern] = None
+
+    def build(self, processor):
+        self.convert_to_strs(processor)
+        self.parse_regex()
+        self.get_combined_regex()
+        return self
 
     def convert_to_str(self, token: Union[str, int], processor) -> str:
         if token is None:
@@ -61,11 +72,14 @@ class MultimodalSpecialTokens:
         return processor.tokenizer.convert_ids_to_tokens([token])[0]
 
     def convert_to_strs(self, processor):
-        self.image_token = self.convert_to_str(self.image_token, processor)
-        self.video_token = self.convert_to_str(self.video_token, processor)
-        self.audio_token = self.convert_to_str(self.audio_token, processor)
+        if not self.image_token:
+            self.image_token = self.convert_to_str(self.image_token_id, processor)
+        if not self.video_token:
+            self.video_token = self.convert_to_str(self.video_token_id, processor)
+        if not self.audio_token:
+            self.audio_token = self.convert_to_str(self.audio_token_id, processor)
 
-    def get_modality_of_token(self, token) -> Optional[Modality]:
+    def get_modality_of_token(self, token: str) -> Optional[Modality]:
         """
         :return: the modality associated with the given token, if the token is a special_token or matches with the multimodal token regex
         """
@@ -87,6 +101,14 @@ class MultimodalSpecialTokens:
 
         return None
 
+    def get_token_id_by_modality(self, modality: Modality) -> Optional[int]:
+        return {
+            Modality.IMAGE: self.image_token_id,
+            Modality.MULTI_IMAGES: self.image_token_id,
+            Modality.VIDEO: self.video_token_id,
+            Modality.AUDIO: self.audio_token_id,
+        }.get(modality)
+
     def parse_regex(self):
         if self.image_token_regex is None and self.image_token is not None:
             self.image_token_regex = re.compile(re.escape(self.image_token))
@@ -95,7 +117,12 @@ class MultimodalSpecialTokens:
         if self.audio_token_regex is None and self.audio_token is not None:
             self.audio_token_regex = re.compile(re.escape(self.audio_token))
 
-    def combine_regex(self) -> re.Pattern:
+    def get_combined_regex(self) -> re.Pattern:
+        """
+        Builds and returns a regex, used to split input str into tokens (with mm special tokens)
+        """
+        if self.combined_regex:
+            return self.combined_regex
         tokens = [
             self.image_token_regex,
             self.video_token_regex,
@@ -108,7 +135,8 @@ class MultimodalSpecialTokens:
                 patterns.append(t.pattern)
                 flags |= t.flags
         combined = "(" + "|".join(f"(?:{p})" for p in patterns) + ")"
-        return re.compile(combined, flags)
+        self.combined_regex = re.compile(combined, flags)
+        return self.combined_regex
 
 
 class BaseMultimodalProcessor(ABC):
@@ -135,26 +163,32 @@ class BaseMultimodalProcessor(ABC):
         self.ATTR_NAME_TO_MODALITY = {
             # Image-related attributes
             "pixel_values": Modality.IMAGE,
-            "pixel_values_videos": Modality.VIDEO,
             "image_sizes": Modality.IMAGE,
             "image_grid_thw": Modality.IMAGE,
+            "image_attention_mask": Modality.IMAGE,
             "image_emb_mask": Modality.IMAGE,
-            "image_spatial_crop": Modality.IMAGE,
+            "images_spatial_crop": Modality.IMAGE,
             "tgt_size": Modality.IMAGE,
             "image_grid_hws": Modality.IMAGE,
-            "aspect_ratio_id": Modality.IMAGE,
+            "aspect_ratio_ids": Modality.IMAGE,
             "aspect_ratio_mask": Modality.IMAGE,
-            "second_per_grid_ts": Modality.IMAGE,
             # Audio-related attributes
             "audio_features": Modality.AUDIO,
             "audio_feature_lens": Modality.AUDIO,
             "input_features": Modality.AUDIO,
             "input_features_mask": Modality.AUDIO,
+            "audio_attention_mask": Modality.AUDIO,
             # Video-related attributes
+            "pixel_values_videos": Modality.VIDEO,
+            "second_per_grid_ts": Modality.VIDEO,
             "video_grid_thw": Modality.VIDEO,
             # Generic attributes that could apply to multiple modalities
-            # "precomputed_features" - handled specially as it can be any modality
+            # "precomputed_embeddings" - handled specially as it can be any modality
         }
+
+        # name of the feature filed
+        # TODO: pass from processors
+        self.FEATURE_NAMES = ["pixel_values", "pixel_values_videos", "audio_features"]
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -196,7 +230,6 @@ class BaseMultimodalProcessor(ABC):
         audio_data,
         input_text,
         request_obj,
-        max_req_input_len,
         **kwargs,
     ) -> Optional[Dict[str, Any]]:
         pass
@@ -227,7 +260,11 @@ class BaseMultimodalProcessor(ABC):
 
     @staticmethod
     def _load_single_item(
-        data, modality: Modality, frame_count_limit=None, discard_alpha_channel=True
+        data,
+        modality: Modality,
+        frame_count_limit=None,
+        audio_sample_rate: Optional[int] = None,
+        discard_alpha_channel=True,
     ):
         """
         Load a single multimodal data.
@@ -244,7 +281,7 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
-                return load_audio(data)
+                return load_audio(data, audio_sample_rate)
 
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")
@@ -253,11 +290,12 @@ class BaseMultimodalProcessor(ABC):
         self,
         text_parts: List[str],
         multimodal_tokens: MultimodalSpecialTokens,
-        data_iterators: dict,
+        data_iterators: dict[Modality, Iterator[Any]],
         discard_alpha_channel: bool = True,
         image_estimated_frames_iter: Optional[iter] = None,
         image_scaling_factor: float = 1.0,
         max_image_frames: int = 30,
+        audio_sample_rate: Optional[int] = None,
     ) -> Tuple[List, List]:
         """
         load multimodal data parallelly using iterators.
@@ -300,6 +338,7 @@ class BaseMultimodalProcessor(ABC):
                         data,
                         modality,
                         frame_count_limit,
+                        audio_sample_rate,
                         discard_alpha_channel,
                     )
                 )
@@ -322,12 +361,12 @@ class BaseMultimodalProcessor(ABC):
         self,
         prompt: str,
         multimodal_tokens: MultimodalSpecialTokens,
-        max_req_input_len: int,
         image_data: Optional[list] = None,
         video_data: Optional[list] = None,
         audio_data: Optional[list] = None,
         return_text: Optional[bool] = True,
         discard_alpha_channel: bool = True,
+        audio_sample_rate: Optional[int] = None,
     ) -> BaseMultiModalProcessorOutput:
         """
         Each frame of video/image will be replaced by a single image token
@@ -338,9 +377,8 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel: if True, discards the alpha channel in the returned images
 
         """
-        multimodal_tokens.convert_to_strs(self._processor)
-        multimodal_tokens.parse_regex()
-        multimodal_tokens_pattern = multimodal_tokens.combine_regex()
+        multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
+
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
             prompt = self._processor.tokenizer.decode(prompt)
@@ -367,6 +405,7 @@ class BaseMultimodalProcessor(ABC):
             multimodal_tokens=multimodal_tokens,
             data_iterators=data_iterators,
             discard_alpha_channel=discard_alpha_channel,
+            audio_sample_rate=audio_sample_rate,
         )
         task_info_iter = iter(task_info)
         futures_iter = iter(futures)
@@ -442,7 +481,6 @@ class BaseMultimodalProcessor(ABC):
             return result = [(2,4),(6,7)]
         """
         mask = input_ids == mm_token_id
-
         start_positions = (mask & ~torch.roll(mask, 1)).nonzero(as_tuple=True)[0]
         end_positions = (mask & ~torch.roll(mask, -1)).nonzero(as_tuple=True)[0]
 
@@ -457,50 +495,11 @@ class BaseMultimodalProcessor(ABC):
 
         return list(zip(indices_start.tolist(), indices_end.tolist()))
 
-    @staticmethod
-    def _extract_processor_features(
-        items: List[dict], attr_name: str
-    ) -> Optional[torch.Tensor]:
-        """
-        Helper function to concat extracted attributes from processor output.
-        """
-        values = [value for item in items if (value := item.get(attr_name)) is not None]
-        return torch.cat(values) if values else None
-
-    # When we assume that all the items have the same attributes
-    def _extract_processor_features_from_all_attributes(
-        self, items: List[dict]
-    ) -> dict:
-        values = {}
-        # Verify all items have the same keys
-        first_keys = set(items[0].keys())
-        for item in items[1:]:
-            if set(item.keys()) != first_keys:
-                raise ValueError(
-                    f"All items must have the same attributes. "
-                    f"First item has {first_keys}, but found {set(item.keys())}"
-                )
-
-        # Process each attribute
-        for k, v in items[0].items():
-            if isinstance(v, list):
-                values[k] = self._extract_processor_features(items, k)
-            else:
-                # Verify all items have the same value for non-list attributes
-                for item in items[1:]:
-                    if item[k] != v:
-                        raise ValueError(
-                            f"All items must have the same value for attribute {k}. "
-                            f"First item has {v}, but found {item[k]}"
-                        )
-                values[k] = v
-        return values
-
     def collect_mm_items_from_processor_output(
         self, data_dict: dict
     ) -> List[MultimodalDataItem]:
         """Create mm_items directly from processor output."""
-        items = {}  # modality -> MultimodalDataItem
+        items: dict[Modality, MultimodalDataItem] = {}
 
         for attr_name, value in data_dict.items():
             if attr_name == "input_ids":
@@ -509,23 +508,24 @@ class BaseMultimodalProcessor(ABC):
             # Get modality for this attribute
             modality = self.ATTR_NAME_TO_MODALITY.get(attr_name)
 
-            if not modality and attr_name == "precomputed_features":
+            if attr_name == "precomputed_embeddings":
                 modality_str = data_dict.get("modality")
-                try:
-                    modality = (
-                        Modality.from_str(modality_str)
-                        if modality_str
-                        else Modality.IMAGE
-                    )
-                except ValueError:
-                    modality = Modality.IMAGE
+                modality = Modality.IMAGE
+                if modality_str:
+                    try:
+                        modality = Modality.from_str(modality_str)
+                    except ValueError:
+                        pass
+
             if modality:
                 # Create item if needed
                 if modality not in items:
                     items[modality] = MultimodalDataItem(modality=modality)
 
-                # Set attribute
-                setattr(items[modality], attr_name, value)
+                if attr_name in self.FEATURE_NAMES:
+                    attr_name = "feature"
+
+                items[modality].set(attr_name, value)
 
         return list(items.values())
 
@@ -548,7 +548,10 @@ class BaseMultimodalProcessor(ABC):
         return collected_items, input_ids, ret
 
     def process_and_combine_mm_data(
-        self, base_output: BaseMultiModalProcessorOutput
+        self,
+        base_output: BaseMultiModalProcessorOutput,
+        mm_tokens: MultimodalSpecialTokens,
+        **kwargs,
     ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
         """
         Process multimodal data and return the combined multimodal items and input_ids.
@@ -581,7 +584,7 @@ class BaseMultimodalProcessor(ABC):
             else:
                 raise ValueError(f"Unknown multimodal item type: {type(item)}")
         # Process items and get input_ids
-        all_collected_items = []
+        all_collected_items: list[MultimodalDataItem] = []
         input_ids = None
 
         # Handle dict items (already processed)
@@ -597,6 +600,7 @@ class BaseMultimodalProcessor(ABC):
                 images=raw_images,
                 audios=raw_audios,
                 videos=raw_videos,
+                **kwargs,
             )
             all_collected_items.extend(collected_items)
         else:
@@ -612,22 +616,12 @@ class BaseMultimodalProcessor(ABC):
 
         # Add offsets to all items
         for mm_item in all_collected_items:
-            if mm_item.modality in [Modality.IMAGE, Modality.MULTI_IMAGES]:
-                mm_item.offsets = self.get_mm_items_offset(
-                    input_ids=input_ids,
-                    mm_token_id=self.IM_TOKEN_ID,
-                )
-            elif mm_item.modality == Modality.AUDIO:
-                mm_item.offsets = self.get_mm_items_offset(
-                    input_ids=input_ids,
-                    mm_token_id=self.AUDIO_TOKEN_ID,
-                )
-            elif mm_item.modality == Modality.VIDEO:
-                mm_item.offsets = self.get_mm_items_offset(
-                    input_ids=input_ids,
-                    mm_token_id=self.VIDEO_TOKEN_ID,
-                )
-            else:
-                raise ValueError(f"Unknown modality: {mm_item.modality}")
+            mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
+            if mm_token_id is None:
+                raise ValueError(f"No token id found for modality: {mm_item.modality}")
+            mm_item.offsets = self.get_mm_items_offset(
+                input_ids=input_ids,
+                mm_token_id=mm_token_id,
+            )
 
         return all_collected_items, input_ids, ret
