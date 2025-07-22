@@ -23,6 +23,8 @@ class TestGLM4_1VThinkingServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--mem-fraction-static",
                 "0.70",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"

@@ -1,6 +1,7 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/refs/tags/v0.6.6.post1/vllm/model_executor/layers/rotary_embedding.py
 
 """Rotary Positional Embeddings."""
+import itertools
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -1031,7 +1032,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         spatial_merge_size: int,
         image_token_id: int,
         video_token_id: int,
-        vision_start_token_id: int | list[int],
+        vision_start_token_id: int,
         model_type: str,
         tokens_per_second: Optional[int] = None,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1040,11 +1041,6 @@ class MRotaryEmbedding(RotaryEmbedding):
         second_per_grid_ts: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        vision_start_token_id = (
-            [vision_start_token_id]
-            if isinstance(vision_start_token_id, int)
-            else vision_start_token_id
-        )
         mrope_position_deltas = []
         if input_ids is not None and (
             image_grid_thw is not None or video_grid_thw is not None
@@ -1060,15 +1056,8 @@ class MRotaryEmbedding(RotaryEmbedding):
             image_index, video_index = 0, 0
             for i, input_ids in enumerate(total_input_ids):
                 image_nums, video_nums = 0, 0
-                vision_start_indices = torch.nonzero(
-                    torch.isin(
-                        input_ids,
-                        torch.tensor(
-                            vision_start_token_id,
-                            device=input_ids.device,
-                            dtype=input_ids.dtype,
-                        ),
-                    )
+                vision_start_indices = torch.argwhere(
+                    input_ids == vision_start_token_id
                 ).squeeze(1)
                 vision_tokens = input_ids[vision_start_indices + 1]
                 image_nums = (vision_tokens == image_token_id).sum()
@@ -1125,7 +1114,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                         torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
                     )
 
-                    if model_type == "qwen2_5_vl" or model_type == "glm4v":
+                    if model_type == "qwen2_5_vl":
                         range_tensor = torch.arange(llm_grid_t).view(-1, 1)
                         expanded_range = range_tensor.expand(
                             -1, llm_grid_h * llm_grid_w
@@ -1194,6 +1183,116 @@ class MRotaryEmbedding(RotaryEmbedding):
             )[0]
             mrope_position_deltas = max_position_ids + 1 - s
             return position_ids, mrope_position_deltas
+        
+    # Adapted from https://github.com/vllm-project/vllm/blob/3779eb8c81449b924a23457fc77e45a0e6171178/vllm/model_executor/layers/rotary_embedding.py#L1120
+    @staticmethod
+    def get_rope_index_glm4v(
+        input_ids: torch.Tensor,
+        hf_config: Any,
+        image_grid_thw: Union[list[list[int]], torch.Tensor],
+        video_grid_thw: Union[list[list[int]], torch.Tensor],
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get mrope input positions and delta value for GLM4V."""
+        device = input_ids.device
+        input_ids = input_ids.tolist()
+        image_token_id = hf_config.image_token_id
+        video_start_token_id = hf_config.video_start_token_id
+        video_end_token_id = hf_config.video_end_token_id
+        spatial_merge_size = hf_config.vision_config.spatial_merge_size
+        llm_pos_ids_list: list = []
+        mrope_position_deltas: list = []
+
+        if not (image_grid_thw is None and video_grid_thw is None):
+            if isinstance(image_grid_thw, torch.Tensor):
+                image_grid_thw = image_grid_thw.tolist()
+
+            input_token_type: list[str] = []
+            video_check_flg = False
+            for id in input_ids:
+                if id == video_start_token_id:
+                    video_check_flg = True
+                elif id == video_end_token_id:
+                    video_check_flg = False
+
+                if (id == image_token_id) and (video_check_flg is False):
+                    input_token_type.append("image")
+                elif (id == image_token_id) and (video_check_flg is True):
+                    input_token_type.append("video")
+                else:
+                    input_token_type.append("text")
+
+            input_type_group: list[tuple[str, int, int]] = []
+            for key, group_iter in itertools.groupby(
+                    enumerate(input_token_type), lambda x: x[1]):
+                group_list = list(group_iter)
+                start_index = group_list[0][0]
+                end_index = group_list[-1][0] + 1
+                input_type_group.append((key, start_index, end_index))
+
+            video_frame_num = 1
+            mm_data_idx = 0
+            for modality_type, start_idx, end_idx in input_type_group:
+                st_idx = llm_pos_ids_list[-1].max() + 1 if len(
+                    llm_pos_ids_list) > 0 else 0
+                if modality_type == "image":
+                    t, h, w = (
+                        image_grid_thw[mm_data_idx][0],
+                        image_grid_thw[mm_data_idx][1],
+                        image_grid_thw[mm_data_idx][2],
+                    )
+                    llm_grid_t, llm_grid_h, llm_grid_w = \
+                        t, h // spatial_merge_size, w // spatial_merge_size
+
+                    t_index = torch.arange(llm_grid_t).view(-1, 1).expand(
+                        -1, llm_grid_h * llm_grid_w).flatten()
+                    h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(
+                        llm_grid_t, -1, llm_grid_w).flatten()
+                    w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(
+                        llm_grid_t, llm_grid_h, -1).flatten()
+                    llm_pos_ids_list.append(
+                        torch.stack([t_index, h_index, w_index]) + st_idx)
+                    mm_data_idx += 1
+
+                elif modality_type == "video":
+                    t, h, w = (
+                        video_frame_num,
+                        image_grid_thw[mm_data_idx][1],
+                        image_grid_thw[mm_data_idx][2],
+                    )
+                    llm_grid_t, llm_grid_h, llm_grid_w = \
+                        t, h // spatial_merge_size, w // spatial_merge_size
+
+                    for t_idx in range(llm_grid_t):
+                        t_index = torch.tensor(t_idx).view(-1, 1).expand(
+                            -1, llm_grid_h * llm_grid_w).flatten()
+                        h_index = torch.arange(llm_grid_h).view(
+                            1, -1, 1).expand(1, -1, llm_grid_w).flatten()
+                        w_index = torch.arange(llm_grid_w).view(
+                            1, 1, -1).expand(1, llm_grid_h, -1).flatten()
+                        llm_pos_ids_list.append(
+                            torch.stack([t_index, h_index, w_index]) + st_idx)
+
+                    mm_data_idx += 1
+                    video_frame_num += 1
+
+                else:
+                    text_len = end_idx - start_idx
+                    llm_pos_ids_list.append(
+                        torch.arange(text_len).view(1, -1).expand(3, -1) +
+                        st_idx)
+                    video_frame_num = 1
+
+        else:
+            text_len = len(input_ids)
+            llm_pos_ids_list.append(
+                torch.arange(text_len).view(1, -1).expand(3, -1))
+
+        llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+        mrope_position_deltas = torch.tensor(
+            [llm_positions.max() + 1 - len(input_ids)], device=device
+        ).unsqueeze(1)
+        return llm_positions, mrope_position_deltas
 
     @staticmethod
     def get_next_input_positions(

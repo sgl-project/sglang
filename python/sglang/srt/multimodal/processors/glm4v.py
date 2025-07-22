@@ -1,20 +1,17 @@
-import asyncio
 import re
 from typing import List, Union
 
-from PIL import Image
 from transformers.video_utils import VideoMetadata
+from decord import VideoReader
+import torch
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
+    BaseMultiModalProcessorOutput,
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
-from sglang.srt.multimodal.processors.qwen_vl import (
-    preprocess_video,
-    resize_image_async,
-)
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
@@ -61,6 +58,34 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             video_token_regex=self.VIDEO_TOKEN_REGEX,
         )
 
+    def preprocess_video(self, vr: VideoReader):
+        """
+        Preprocess video using VideoReader from Decord backend.
+        
+        Args:
+            vr (VideoReader): VideoReader object from decord
+            
+        Returns:
+            tuple: A tuple containing processed frames and metadata
+        """
+        video_fps = vr.get_avg_fps()
+        total_num_frames = len(vr)
+        duration = total_num_frames / video_fps if video_fps else 0
+        
+        metadata = VideoMetadata(
+            total_num_frames=int(total_num_frames), 
+            fps=float(video_fps), 
+            duration=float(duration), 
+            video_backend="decord"
+        )
+        
+        # Extract all frames
+        indices = list(range(total_num_frames))
+        frames = vr.get_batch(indices).asnumpy()
+        metadata.frames_indices = indices
+        
+        return frames, metadata
+
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
@@ -75,43 +100,78 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             video_data=request_obj.video_data,
             multimodal_tokens=self.mm_tokens,
         )
-        print(base_output.videos)
+        
+        videos_processed = []
+        video_outputs = {}
+        if base_output.videos:
+            # devide the base output into image_base_output and video_base_output
+            video_base_output = BaseMultiModalProcessorOutput(
+                input_text="<|begin_of_video|><|video|><|end_of_video|>",
+                videos=base_output.videos,
+            )
+            base_output.videos = []
+            
+            # Process videos standalone first
+            video_grid_thw_lst = []
+            
+            for video_vr in video_base_output.videos:
+                # Process individual video
+                frames, metadata = self.preprocess_video(video_vr)
+                
+                video_base_output.videos = [[frames]]
+                
+                video_mm_items, video_input_ids, video_ret = self.process_and_combine_mm_data(
+                    video_base_output, self.mm_tokens, video_metadata=[[metadata]]
+                )
+                
+                # Replace image token IDs with video token IDs in the processed video
+                video_input_ids[video_input_ids == self.mm_tokens.image_token_id] = self.mm_tokens.video_token_id
+                # Get video placeholder text
+                video_placeholder = self._processor.tokenizer.batch_decode(video_input_ids.unsqueeze(0))[0]
+                
+                # Replace first remaining video token with the processed placeholder
+                input_text = input_text.replace(
+                    "<|begin_of_video|><|video|><|end_of_video|>",
+                    video_placeholder,
+                    1  # Replace first occurrence (next unprocessed video)
+                )
+                
+                # Collect video grid info
+                if hasattr(video_ret, "video_grid_thw") and video_ret.video_grid_thw is not None:
+                    grid_t = len(video_ret.video_grid_thw)
+                    _, grid_h, grid_w = video_ret.video_grid_thw[0]
+                    grid_thw = torch.tensor([[grid_t, grid_h, grid_w]])
+                    video_grid_thw_lst.append(grid_thw)
+                
+                videos_processed.append(video_mm_items)
+            
+            # Combine video outputs
+            if video_grid_thw_lst:
+                video_outputs["video_grid_thw"] = torch.cat(video_grid_thw_lst)
+            
+            base_output.input_text = input_text
 
-        # # TODO(Xinyuan): GLM-4V specific: resize images, current methods are inherited from Qwen2.5VL
-        # if base_output.images and isinstance(base_output.images[0], Image.Image):
-        #     resize_tasks = [resize_image_async(image) for image in base_output.images]
-        #     base_output.images = await asyncio.gather(*resize_tasks)
-
-        # if base_output.videos:
-        #     base_output.videos = [
-        #         await preprocess_video(video) for video in base_output.videos
-        #     ]
 
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
+        
+        # Combine video items with image items
+        if videos_processed:
+            for video_items in videos_processed:
+                mm_items.extend(video_items)
+
         input_ids = input_ids.flatten()
-        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
-            spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
-            image_token_id=self.mm_tokens.image_token_id,
-            video_token_id=self.mm_tokens.video_token_id,
-            vision_start_token_id=[
-                self.IMAGE_START_TOKEN_ID,
-                self.VIDEO_START_TOKEN_ID,
-            ],
-            model_type=self.hf_config.model_type,
-            tokens_per_second=getattr(
-                self.hf_config.vision_config, "tokens_per_second", None
-            ),
-            input_ids=input_ids.unsqueeze(0),
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
+            input_ids=input_ids,
+            hf_config=self.hf_config,
             image_grid_thw=getattr(ret, "image_grid_thw", None),
-            video_grid_thw=getattr(ret, "video_grid_thw", None),
-            second_per_grid_ts=getattr(ret, "second_per_grid_ts", None),
+            video_grid_thw=video_outputs.get("video_grid_thw", None) if video_outputs else None,
         )
         mrope_positions = mrope_positions.squeeze(1)
 
         mm_inputs = {
-            "input_ids": input_ids.flatten().tolist(),
+            "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
             "im_token_id": self.mm_tokens.image_token_id,
             "video_token_id": self.mm_tokens.video_token_id,
