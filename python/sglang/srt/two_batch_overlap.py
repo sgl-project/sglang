@@ -76,32 +76,32 @@ def _is_two_chunk_split_enabled(left_sum, overall_sum):
 
 
 def _split_extend_seqs(arr: Sequence[int]) -> int:
-    split_seq_index = _split_array_by_sequence(arr)
+    split_seq_index = _split_array_by_balanced_sum(arr)
 
     left_sum = sum(arr[:split_seq_index])
     overall_sum = sum(arr)
     if _is_two_chunk_split_enabled(left_sum, overall_sum):
-        return _split_array_by_token(arr)
+        return _split_array_by_cum_less_than_half(arr)
 
     return split_seq_index
 
 
-def _split_array_by_token(arr: Sequence[int]) -> int:
+def _split_array_by_cum_less_than_half(arr: Sequence[int]) -> int:
     left_sum = 0
     overall_sum = sum(arr)
     half_sum = overall_sum // 2
-    split_seq_index = 0
+    chosen_seq_index = 0
 
     for i in range(len(arr)):
         left_sum += arr[i]
         if left_sum > half_sum:
-            split_seq_index = i
+            chosen_seq_index = i
             break
 
-    return split_seq_index
+    return chosen_seq_index
 
 
-def _split_array_by_sequence(arr: Sequence[int]) -> int:
+def _split_array_by_balanced_sum(arr: Sequence[int]) -> int:
     overall_sum = sum(arr)
     left_sum = 0
     min_diff = float("inf")
@@ -120,7 +120,7 @@ def _split_array_by_sequence(arr: Sequence[int]) -> int:
     return best_index
 
 
-def _modify_some_fields(
+def _update_device_and_sum_field_from_cpu_field(
     batch: ForwardBatch, cpu_field: str, device_field: str, sum_field: str = None
 ):
     cpu_value = getattr(batch, cpu_field, None)
@@ -530,7 +530,7 @@ class TboForwardBatchPreparer:
         child_a.extend_seq_lens_cpu[-1] = left_last_seq_token_num
         child_b.extend_seq_lens_cpu[0] = right_first_seq_token_num
         for child in [child_a, child_b]:
-            _modify_some_fields(
+            _update_device_and_sum_field_from_cpu_field(
                 batch=child,
                 cpu_field="extend_seq_lens_cpu",
                 device_field="extend_seq_lens",
@@ -548,7 +548,7 @@ class TboForwardBatchPreparer:
             child_a.extend_seq_lens_cpu[-1] + child_a.extend_prefix_lens_cpu[-1]
         )
         child_a.seq_lens_cpu = seq_lens_cpu
-        _modify_some_fields(
+        _update_device_and_sum_field_from_cpu_field(
             batch=child_a,
             cpu_field="seq_lens_cpu",
             device_field="seq_lens",
@@ -556,7 +556,7 @@ class TboForwardBatchPreparer:
         )
 
         child_b.extend_prefix_lens_cpu[0] += left_last_seq_token_num
-        _modify_some_fields(
+        _update_device_and_sum_field_from_cpu_field(
             batch=child_b,
             cpu_field="extend_prefix_lens_cpu",
             device_field="extend_prefix_lens",
