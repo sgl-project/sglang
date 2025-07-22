@@ -195,7 +195,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             try:
                 # TODO: video input
                 raw_image = process_image_internvl(image)
-                pixel_value = [raw_image.to(torch.bfloat16).cuda()]
+                pixel_value = [raw_image.to(torch.bfloat16)]
                 pixel_values += pixel_value
                 num_patches = raw_image.shape[0]
                 num_patches_list += [num_patches]
