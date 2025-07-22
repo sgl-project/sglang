@@ -44,13 +44,16 @@ class QuarkW4A4MXFP4(QuarkScheme):
         return 70
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        wshuffle = shuffle_weight(layer.weight.data, layout=(16, 16))
-        w_scales_shuffle = e8m0_shuffle(layer.weight_scale.data).view(dtypes.fp8_e8m0)
+        return
 
-        layer.weight = torch.nn.Parameter(wshuffle,
-                                          requires_grad=False)
-        layer.weight_scale = torch.nn.Parameter(w_scales_shuffle,
-                                                requires_grad=False)
+        # for aiter implement        
+        #wshuffle = shuffle_weight(layer.weight.data, layout=(16, 16))
+        #w_scales_shuffle = e8m0_shuffle(layer.weight_scale.data).view(dtypes.fp8_e8m0)
+
+        #layer.weight = torch.nn.Parameter(wshuffle,
+        #                                  requires_grad=False)
+        #layer.weight_scale = torch.nn.Parameter(w_scales_shuffle,
+        #                                        requires_grad=False)
 
     def create_weights(self, layer: torch.nn.Module,
                        output_partition_sizes: list[int],
@@ -93,14 +96,27 @@ class QuarkW4A4MXFP4(QuarkScheme):
                       x: torch.Tensor,
                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
 
-        M = x.shape[0]
-        N = layer.weight.shape[0]
+        out_dtype = x.dtype
+        #M = x.shape[0]
+        #N = layer.weight.shape[0]
 
-        quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
-        x, x_scales_shuffle = quant_func(x, shuffle=True)
+        #quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+        #x, x_scales_shuffle = quant_func(x, shuffle=True)
 
-        y = torch.zeros((M + 255) // 256 * 256, N, device=x.device, dtype=self.out_dtype)
+        #y = torch.zeros((M + 255) // 256 * 256, N, device=x.device, dtype=self.out_dtype)
 
-        out = gemm_a4w4(x, layer.weight.data, x_scales_shuffle, layer.weight_scale.data, y, bias=bias)
+        #out = gemm_a4w4(x, layer.weight.data, x_scales_shuffle, layer.weight_scale.data, y, bias=bias)
 
-        return out[:M]
+        #return out[:M]
+
+
+        # triton implement
+        x_q, x_s = dynamic_mxfp4_quant(x)
+        y = torch.empty(x_q.shape[0],
+                            layer.weight.shape[0],
+                            device=x_q.device,
+                            dtype=out_dtype)
+
+        out = gemm_afp4wfp4(x_q, layer.weight, x_s, layer.weight_scale, out_dtype, y)
+
+        return out
