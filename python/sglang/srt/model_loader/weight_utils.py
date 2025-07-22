@@ -840,12 +840,12 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
                 )
                 return None
             return remapped_name
-    
+
     quark_scale_names = {
         ".q_proj.output_scale": ".attn.q_scale",
         ".k_proj.output_scale": ".attn.k_scale",
         ".v_proj.output_scale": ".attn.v_scale",
-        "self_attn.prob_output_scale": ".attn.prob_scale"
+        "self_attn.prob_output_scale": ".attn.prob_scale",
     }
     for quark_scale_name, sglang_scale_name in quark_scale_names.items():
         if name.endswith(quark_scale_name):
