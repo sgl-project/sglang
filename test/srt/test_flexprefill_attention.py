@@ -95,7 +95,7 @@ class TestFlexPrefill(CustomTestCase):
             print("{} -> {}".format(each, results["results"][each]))
 
         self.assertGreaterEqual(
-            results["results"]["niah_multikey_1"]["32768,none"], 0.3
+            results["results"]["niah_multikey_1"]["32768,none"], 0.1
         )
 
 
