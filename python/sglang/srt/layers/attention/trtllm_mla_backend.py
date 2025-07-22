@@ -321,11 +321,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if query.dim() == 3:
             query = query.unsqueeze(1)
 
-        # Prepare KV cache inline (TRT-LLM expects stacked format)
+        # Prepare KV cache inline
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         pages = k_cache.view(-1, self.page_size, self.kv_cache_dim)
-        # TRT-LLM expects stacked format: slice 0 → CKV+K, slice 1 → KPE
-        kv_cache = torch.stack([pages, pages], dim=1)
+        # TRT-LLM expects single KV data with extra dimension
+        kv_cache = pages.unsqueeze(1)
 
         # Get metadata
         metadata = (
@@ -339,7 +339,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # - This reduces to layer.scaling which is pre-computed as 1/sqrt(head_dim)
         bmm1_scale = layer.scaling
         bmm2_scale = 1.0
-        bmm1_scale_tensor = bmm2_scale_tensor = None
+        bmm1_scale_log2_tensor = bmm2_scale_tensor = None
 
         # Call TRT-LLM kernel with proper scale configuration
         raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
@@ -351,11 +351,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=metadata.block_kv_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
-            block_size=self.page_size,
             max_seq_len=int(metadata.block_kv_indices.shape[1] * self.page_size),
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
-            bmm1_scale_tensor=bmm1_scale_tensor,
+            bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
             bmm2_scale_tensor=bmm2_scale_tensor,
         )
 
