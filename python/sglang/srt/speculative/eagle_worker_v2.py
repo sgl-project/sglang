@@ -1,19 +1,13 @@
 import logging
 import os
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 from huggingface_hub import snapshot_download
 
-from sglang.srt.layers.dp_attention import disable_dp_size
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
-from sglang.srt.managers.schedule_batch import (
-    ModelWorkerBatch,
-    ScheduleBatch,
-    get_last_loc,
-)
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -41,12 +35,7 @@ from sglang.srt.speculative.eagle_utils_v2 import (
     select_top_k_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import (
-    empty_context,
-    get_available_gpu_memory,
-    is_cuda,
-    next_power_of_2,
-)
+from sglang.srt.utils import empty_context, get_available_gpu_memory, next_power_of_2
 
 logger = logging.getLogger(__name__)
 
@@ -105,41 +94,34 @@ class EAGLEWorker(TpModelWorker):
             self.hot_token_id = None
 
         # Init draft worker
-        with disable_dp_size():
-            super().__init__(
-                server_args=server_args,
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                pp_rank=0,  # FIXME
-                dp_rank=dp_rank,
-                nccl_port=nccl_port,
-                is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+        super().__init__(
+            server_args=server_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            pp_rank=0,  # FIXME
+            dp_rank=dp_rank,
+            nccl_port=nccl_port,
+            is_draft_worker=True,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+        )
+
+        # Share the embedding and lm_head
+        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        if self.speculative_algorithm.is_eagle3():
+            # EAGLE3 models don't share lm_head
+            self.draft_model_runner.model.set_embed(embed)
+
+            # grab hot token ids
+            self.hot_token_id = self.draft_model_runner.model.get_hot_token_id().to(
+                embed.device
             )
-
-        # Share the embedding and lm_head if they have the same tp size.
-        # It can save additional memory.
-        if True:
-            embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-            if self.speculative_algorithm.is_eagle3():
-                # EAGLE3 models don't share lm_head
-                self.draft_model_runner.model.set_embed(embed)
-
-                # grab hot token ids
-                self.hot_token_id = self.draft_model_runner.model.get_hot_token_id().to(
-                    embed.device
-                )
-            else:
-                if self.hot_token_id is not None:
-                    head = head.clone()
-                    self.hot_token_id = self.hot_token_id.to(head.device)
-                    head.data = head.data[self.hot_token_id]
-                self.draft_model_runner.model.set_embed_and_head(embed, head)
         else:
-            assert (
-                self.hot_token_id is None
-            ), "speculative_token_map is not supported for dp attention."
+            if self.hot_token_id is not None:
+                head = head.clone()
+                self.hot_token_id = self.hot_token_id.to(head.device)
+                head.data = head.data[self.hot_token_id]
+            self.draft_model_runner.model.set_embed_and_head(embed, head)
 
         # Init attention backend and cuda graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (
@@ -160,47 +142,31 @@ class EAGLEWorker(TpModelWorker):
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
 
-        self.draft_extend_attn_backend = None
-        self.padded_static_len = -1
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
         self.plan_stream = torch.cuda.Stream()
-
         if self.server_args.attention_backend == "flashinfer":
-            from sglang.srt.layers.attention.flashinfer_backend import (
-                FlashInferAttnBackend,
-                FlashInferMultiStepDraftBackend,
-            )
+            if not global_server_args_dict["use_mla_backend"]:
+                from sglang.srt.layers.attention.flashinfer_backend import (
+                    FlashInferMultiStepDraftBackend,
+                )
 
-            self.draft_attn_backend = FlashInferMultiStepDraftBackend(
-                self.draft_model_runner,
-                self.topk,
-                self.speculative_num_steps,
-            )
-            self.draft_extend_attn_backend = FlashInferAttnBackend(
-                self.draft_model_runner,
-                skip_prefill=False,
-                is_draft_model=True,
-            )
-            self.padded_static_len = self.speculative_num_steps + 1
-        elif self.server_args.attention_backend == "hopper":
-            from sglang.srt.layers.attention.hopper_backend import (
-                HopperAttnBackend,
-                HopperMultiStepDraftBackend,
-            )
+                self.draft_attn_backend = FlashInferMultiStepDraftBackend(
+                    self.draft_model_runner,
+                    self.topk,
+                    self.speculative_num_steps,
+                )
+            else:
+                from sglang.srt.layers.attention.flashinfer_mla_backend import (
+                    FlashInferMLAMultiStepDraftBackend,
+                )
 
-            self.draft_attn_backend = HopperMultiStepDraftBackend(
-                self.draft_model_runner,
-                self.topk,
-                self.speculative_num_steps,
-            )
-            self.draft_extend_attn_backend = HopperAttnBackend(
-                self.draft_model_runner,
-                skip_prefill=False,
-                is_draft_model=True,
-            )
+                self.draft_attn_backend = FlashInferMLAMultiStepDraftBackend(
+                    self.draft_model_runner,
+                    self.topk,
+                    self.speculative_num_steps,
+                )
         elif self.server_args.attention_backend == "triton":
             from sglang.srt.layers.attention.triton_backend import (
-                TritonAttnBackend,
                 TritonMultiStepDraftBackend,
             )
 
@@ -209,57 +175,12 @@ class EAGLEWorker(TpModelWorker):
                 self.topk,
                 self.speculative_num_steps,
             )
-            self.draft_extend_attn_backend = TritonAttnBackend(
-                self.draft_model_runner,
-                skip_prefill=False,
-            )
-        elif self.server_args.attention_backend in [
-            "cudnn_prefill",
-            "cudnn_prefill_blackwell_verify",
-        ]:
-            from sglang.srt.layers.attention.flashinfer_backend import (
-                FlashInferAttnBackend,
-                FlashInferMultiStepDraftBackend,
+        elif self.server_args.attention_backend == "fa3":
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionMultiStepBackend,
             )
 
-            self.draft_attn_backend = FlashInferMultiStepDraftBackend(
-                self.draft_model_runner,
-                self.topk,
-                self.speculative_num_steps,
-            )
-            self.draft_extend_attn_backend = FlashInferAttnBackend(
-                self.draft_model_runner,
-                skip_prefill=False,
-                is_draft_model=True,
-            )
-            self.padded_static_len = self.speculative_num_steps + 1
-            self.tree_mask_mode = (
-                TreeMaskMode.FULL_MASK
-                if self.server_args.attention_backend == "cudnn_prefill"
-                else TreeMaskMode.QLEN_ONLY
-            )
-        elif self.server_args.attention_backend == "cudnn":
-            from sglang.srt.layers.attention.cudnn_paged_backend import (
-                CuDNNPagedAttnBackend,
-                CuDNNPagedMultiStepDraftBackend,
-            )
-
-            self.draft_attn_backend = CuDNNPagedMultiStepDraftBackend(
-                self.draft_model_runner,
-                self.topk,
-                self.speculative_num_steps,
-            )
-            self.draft_extend_attn_backend = CuDNNPagedAttnBackend(
-                self.draft_model_runner,
-                is_draft_extend_attn_backend=True,
-            )
-            self.tree_mask_mode = TreeMaskMode.QLEN_ONLY_BITPACKING
-        elif self.server_args.attention_backend == "flashinfer_mla":
-            from sglang.srt.layers.attention.flashinfer_mla_backend import (
-                FlashInferMLAMultiStepDraftBackend,
-            )
-
-            self.draft_attn_backend = FlashInferMLAMultiStepDraftBackend(
+            self.draft_attn_backend = FlashAttentionMultiStepBackend(
                 self.draft_model_runner,
                 self.topk,
                 self.speculative_num_steps,
@@ -274,7 +195,6 @@ class EAGLEWorker(TpModelWorker):
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None
-        self.cuda_graph_runner_for_draft_extend = None
 
         if self.server_args.disable_cuda_graph:
             return
@@ -290,21 +210,6 @@ class EAGLEWorker(TpModelWorker):
         logger.info(
             f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
         )
-
-        # Capture extend
-        if self.draft_extend_attn_backend:
-            tic = time.perf_counter()
-            before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            logger.info(
-                f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
-            )
-            self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
-                self
-            )
-            after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            logger.info(
-                f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
-            )
 
     @property
     def draft_model_runner(self):
@@ -366,7 +271,6 @@ class EAGLEWorker(TpModelWorker):
 
         # Get a forward batch
         batch.out_cache_loc = out_cache_loc
-        batch.return_hidden_states = False
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
@@ -380,7 +284,7 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch
             )
         else:
-            # Initialize attention backend
+            # Initialize attention metadata
             self.draft_attn_backend.init_forward_metadata(forward_batch)
             # Run draft decode steps
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
