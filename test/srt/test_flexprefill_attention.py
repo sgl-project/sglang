@@ -52,7 +52,7 @@ class TestFlexPrefill(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--attention-backend", "fa3"],
+            other_args=["--attention-backend", "fa3", "--chunked-prefill-size", "-1"],
         )
 
     @classmethod
@@ -95,7 +95,7 @@ class TestFlexPrefill(CustomTestCase):
             print("{} -> {}".format(each, results["results"][each]))
 
         self.assertGreaterEqual(
-            results["results"]["niah_multikey_1"]["32768,none"], 0.1
+            results["results"]["niah_multikey_1"]["32768,none"], 0.7
         )
 
 
