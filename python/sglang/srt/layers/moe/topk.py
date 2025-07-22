@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, NamedTuple, Optional
 
 import torch
@@ -27,6 +28,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -59,10 +61,18 @@ if _is_npu:
     import torch_npu
 
 
-class TopKOutput(NamedTuple):
+@dataclass
+class TopKOutput:
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
     router_logits: torch.Tensor
+    top_k: int
+    renormalize: bool
+
+    def __iter__(self):
+        yield self.topk_weights
+        yield self.topk_ids
+        yield self.router_logits
 
 
 class TopK(CustomOp):
@@ -98,6 +108,10 @@ class TopK(CustomOp):
         self.correction_bias = correction_bias
         self.routed_scaling_factor = routed_scaling_factor
 
+        self.use_triton_kernels = (
+            not _is_cpu and global_server_args_dict["enable_triton_kernel_moe"]
+        )
+
     def forward_native(
         self,
         hidden_states: torch.Tensor,
@@ -132,23 +146,32 @@ class TopK(CustomOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
-        torch_native = False
-        return select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            top_k=self.top_k,
-            use_grouped_topk=self.use_grouped_topk,
-            renormalize=self.renormalize,
-            topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            num_fused_shared_experts=self.num_fused_shared_experts,
-            custom_routing_function=self.custom_routing_function,
-            correction_bias=self.correction_bias,
-            torch_native=torch_native,
-            routed_scaling_factor=self.routed_scaling_factor,
-            num_token_non_padded=num_token_non_padded,
-            expert_location_dispatch_info=expert_location_dispatch_info,
-        )
+        if self.use_triton_kernels:
+            return TopKOutput(
+                None,  # topk_weights
+                None,  # topk_ids
+                router_logits,  # router_logits
+                self.top_k,  # top_k
+                self.renormalize,  # renormalize
+            )
+        else:
+            torch_native = False
+            return select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                top_k=self.top_k,
+                use_grouped_topk=self.use_grouped_topk,
+                renormalize=self.renormalize,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                custom_routing_function=self.custom_routing_function,
+                correction_bias=self.correction_bias,
+                torch_native=torch_native,
+                routed_scaling_factor=self.routed_scaling_factor,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+            )
 
     def forward_cpu(
         self,
@@ -688,4 +711,4 @@ def select_experts(
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
-    return TopKOutput(topk_weights, topk_ids, router_logits)
+    return TopKOutput(topk_weights, topk_ids, router_logits, top_k, renormalize)
