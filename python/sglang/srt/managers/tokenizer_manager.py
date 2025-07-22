@@ -759,7 +759,7 @@ class TokenizerManager:
                     if (
                         finish_reason.get("type") == "abort"
                         and finish_reason.get("status_code")
-                        == HTTPStatus.TOO_MANY_REQUESTS
+                        == HTTPStatus.SERVICE_UNAVAILABLE
                     ):
                         # This is an abort request initiated by scheduler.
                         # Delete the key to prevent resending abort request to the scheduler and
