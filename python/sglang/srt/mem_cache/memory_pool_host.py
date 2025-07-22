@@ -315,6 +315,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             self.kv_lora_rank + self.qk_rope_head_dim,
         )
 
+
 _class_mapping = {
     MHATokenToKVPool: MHATokenToKVPoolHost,
     MLATokenToKVPool: MLATokenToKVPoolHost,

@@ -261,8 +261,12 @@ class HiCacheController:
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
         if draft_mem_pool_host:
-            self.draft_layer_done_counter = LayerDoneCounter(self.draft_mem_pool_device.layer_num)
-            self.draft_mem_pool_device.register_layer_transfer_counter(self.draft_layer_done_counter)
+            self.draft_layer_done_counter = LayerDoneCounter(
+                self.draft_mem_pool_device.layer_num
+            )
+            self.draft_mem_pool_device.register_layer_transfer_counter(
+                self.draft_layer_done_counter
+            )
 
         if write_policy not in [
             "write_through",
@@ -274,7 +278,9 @@ class HiCacheController:
         if self.draft_mem_pool_host:
             assert self.draft_mem_pool_device
             if self.enable_storage:
-                raise NotImplementedError("TODO: Storage backend is not supported for spec decode.")
+                raise NotImplementedError(
+                    "TODO: Storage backend is not supported for spec decode."
+                )
 
         self.write_queue = PriorityQueue()
         self.load_queue = PriorityQueue()
@@ -482,7 +488,6 @@ class HiCacheController:
                 self.load_stream,
             )
             if self.draft_mem_pool_host:
-                self.draft_layer_done_counter.reset()
                 self._layer_by_layer_load(
                     self.draft_layer_done_counter,
                     self.draft_mem_pool_host,

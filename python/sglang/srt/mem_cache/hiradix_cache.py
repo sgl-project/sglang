@@ -41,7 +41,6 @@ class HiRadixCache(RadixCache):
         if draft_kvcache := token_to_kv_pool_allocator.get_draft_kvcache():
             self.draft_token_to_kv_pool = get_host_kvcache(
                 draft_kvcache, hicache_ratio, hicache_size, page_size
-
             )
         else:
             self.draft_token_to_kv_pool = None
