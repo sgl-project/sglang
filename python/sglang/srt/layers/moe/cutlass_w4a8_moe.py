@@ -39,6 +39,7 @@ def cutlass_w4a8_moe(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     apply_router_weight_on_input: bool = False,
+    ep_mode: str = "ep",
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -97,7 +98,7 @@ def cutlass_w4a8_moe(
     m = a.size(0)
     k = w1_q.size(2) * 2  # w1_q is transposed and packed
     n = w2_q.size(2) * 2  # w2_q is transposed and packed
-    topk = topk_ids.size(1)
+    topk = topk_ids_.size(1) if ep_mode == "ep" else 8
 
     if apply_router_weight_on_input:
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
@@ -105,28 +106,34 @@ def cutlass_w4a8_moe(
     device = a.device
     topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
 
-    _, src2dst, _ = run_moe_ep_preproess(
-        topk_ids,
-        num_local_experts,
-    )
+    if ep_mode == "ep":
+        _, src2dst, _ = run_cutlass_moe_ep_preproess(
+            local_topk_ids,
+            num_experts,
+        )
 
-    gateup_input = torch.empty(
-        (m * topk, k),
-        device=device,
-        dtype=torch.float8_e4m3fn,
-    )
+        gateup_input = torch.empty(
+            (m * topk, k),
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
 
-    pre_reorder_triton_kernel_for_cutlass_moe[(m,)](
-        a,
-        gateup_input,
-        src2dst,
-        topk_ids,
-        a1_scale,
-        num_local_experts,
-        topk,
-        k,
-        BLOCK_SIZE=512,
-    )
+        pre_reorder_triton_kernel_for_cutlass_moe[(m,)](
+            a,
+            gateup_input,
+            src2dst,
+            local_topk_ids,
+            a1_scale,
+            total_num_experts,
+            topk,
+            k,
+            BLOCK_SIZE=512,
+        )
+    elif ep_mode == "deepep_normal":
+        gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=device)
+        sgl_per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
+    else:
+        raise ValueError(f"Invalid ep_mode: {ep_mode}")
 
     # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
     # they are kept to allow for a quick switch of the permutation logic
@@ -187,17 +194,21 @@ def cutlass_w4a8_moe(
         128,
         topk,
     )
-
-    output = torch.empty_like(a)
-    post_reorder_triton_kernel_for_cutlass_moe[(m,)](
-        c2,
-        output,
-        src2dst,
-        topk_ids,
-        topk_weights,
-        topk,
-        num_local_experts,
-        k,
-        BLOCK_SIZE=512,
-    )
+    if ep_mode == "ep":
+        output = torch.empty_like(a)
+        post_reorder_triton_kernel[(m,)](
+            c2,
+            output,
+            src2dst,
+            local_topk_ids,
+            topk_weights,
+            start_expert_id,
+            end_expert_id,
+            topk,
+            k,
+            0,
+            BLOCK_SIZE=512,
+        )
+    else:
+        output = c2
     return output
