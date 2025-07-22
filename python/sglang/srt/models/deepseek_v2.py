@@ -229,7 +229,7 @@ class MoEGate(nn.Module):
         )
         if config.topk_method == "noaux_tc":
             self.e_score_correction_bias = nn.Parameter(
-                torch.empty((config.n_routed_experts))
+                torch.empty((config.n_routed_experts), dtype=torch.float32)
             )
         else:
             self.e_score_correction_bias = None
@@ -254,9 +254,8 @@ class MoEGate(nn.Module):
             and self.weight.shape[0] == 256
             and _device_sm >= 90
         ):
-            logits = dsv3_router_gemm(hidden_states, self.weight).to(
-                hidden_states.dtype
-            )
+            # router gemm output float32
+            logits = dsv3_router_gemm(hidden_states, self.weight)
         else:
             logits = F.linear(hidden_states, self.weight, None)
 

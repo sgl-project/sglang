@@ -1422,6 +1422,13 @@ def get_nvgpu_memory_capacity():
         ]
 
         if not memory_values:
+            # Fallback to torch.cuda.mem_get_info() when failed to get memory capacity from nvidia-smi,
+            # typically in NVIDIA MIG mode.
+            if torch.cuda.is_available():
+                logger.warning(
+                    "Failed to get GPU memory capacity from nvidia-smi, falling back to torch.cuda.mem_get_info()."
+                )
+                return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MB
             raise ValueError("No GPU memory values found.")
 
         # Return the minimum memory value
@@ -2885,3 +2892,17 @@ def parse_module_path(module_path, function_name, create_dummy):
         return final_module, getattr(final_module, function_name)
 
     return final_module, None
+
+
+# LoRA-related constants and utilities
+SUPPORTED_LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+LORA_TARGET_ALL_MODULES = "all"
