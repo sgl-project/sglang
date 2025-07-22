@@ -99,7 +99,8 @@ class RouterArgs:
         parser.add_argument(
             "--worker-urls",
             type=str,
-            nargs="+",
+            nargs="*",
+            default=[],
             help="List of worker URLs (e.g., http://worker1:8000 http://worker2:8000)",
         )
 
