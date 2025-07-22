@@ -7,13 +7,15 @@ import dataclasses
 import logging
 import random
 import urllib
+from functools import wraps
+from http import HTTPStatus
 from itertools import chain
 from typing import List, Optional
 
 import aiohttp
 import orjson
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import PDRegistryRequest
@@ -71,14 +73,15 @@ class MiniLoadBalancer:
         return prefill_config.url, prefill_config.bootstrap_port, decode_server
 
     async def generate(
-        self, modified_request, prefill_server, decode_server, endpoint
+        self, modified_request, headers, prefill_server, decode_server, endpoint
     ) -> ORJSONResponse:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         async with aiohttp.ClientSession(
+            headers=headers,
             timeout=aiohttp.ClientTimeout(
                 total=3600
-            )  # Add timeout for request reliability
+            ),  # Add timeout for request reliability
         ) as session:
             tasks = [
                 session.post(f"{prefill_server}/{endpoint}", json=modified_request),
@@ -109,15 +112,21 @@ class MiniLoadBalancer:
             )
 
     async def generate_stream(
-        self, modified_request, prefill_server, decode_server, endpoint="generate"
+        self,
+        modified_request,
+        headers,
+        prefill_server,
+        decode_server,
+        endpoint="generate",
     ):
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         async def stream_results():
             async with aiohttp.ClientSession(
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(
                     total=3600
-                )  # Add timeout for request reliability
+                ),  # Add timeout for request reliability
             ) as session:
                 # Create the tasks for both prefill and decode requests
                 tasks = [
@@ -194,13 +203,26 @@ async def health_check():
     return Response(status_code=200)
 
 
+def with_auth_headers(func):
+    @wraps(func)
+    async def wrapper(request: Request, *args, **kwargs):
+        headers = {"Authorization": request.headers.get("Authorization")}
+        kwargs.update({"headers": headers, "request": request})
+        return await func(*args, **kwargs)
+
+    return wrapper
+
+
 @app.post("/flush_cache")
-async def flush_cache():
+@with_auth_headers
+async def flush_cache(headers: dict):
     prefill_servers, decode_servers = (
         load_balancer.prefill_servers,
         load_balancer.decode_servers,
     )
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(
+        headers=headers,
+    ) as session:
         # Create the tasks
         tasks = []
         for server in chain(prefill_servers, decode_servers):
@@ -211,7 +233,8 @@ async def flush_cache():
 
 
 @app.get("/get_server_info")
-async def get_server_info():
+@with_auth_headers
+async def get_server_info(headers: dict):
     prefill_servers, decode_servers = (
         load_balancer.prefill_servers,
         load_balancer.decode_servers,
@@ -220,7 +243,9 @@ async def get_server_info():
     decode_infos = []
     all_internal_states = []
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(
+        headers=headers,
+    ) as session:
         for server in chain(prefill_servers):
             server_info = await session.get(f"{server}/get_server_info")
             prefill_infos.append(await server_info.json())
@@ -266,13 +291,14 @@ async def get_model_info():
 
 
 @app.post("/generate")
-async def handle_generate_request(request_data: dict):
+@with_auth_headers
+async def handle_generate_request(headers: dict, request: Request):
     prefill_server, bootstrap_port, decode_server = load_balancer.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = parsed_url.hostname
-    modified_request = request_data.copy()
+    modified_request = await request.json()
 
     batch_size = _get_request_batch_size(modified_request)
     if batch_size is not None:
@@ -294,23 +320,23 @@ async def handle_generate_request(request_data: dict):
             }
         )
 
-    if request_data.get("stream", False):
-        return await load_balancer.generate_stream(
-            modified_request, prefill_server, decode_server, "generate"
-        )
-    else:
-        return await load_balancer.generate(
-            modified_request, prefill_server, decode_server, "generate"
-        )
+    generate_func = (
+        load_balancer.generate_stream
+        if modified_request.get("stream", False)
+        else load_balancer.generate
+    )
+    return await generate_func(
+        modified_request, headers, prefill_server, decode_server, "generate"
+    )
 
 
-async def _forward_to_backend(request_data: dict, endpoint_name: str):
+async def _forward_to_backend(headers: dict, request: Request, endpoint_name: str):
     prefill_server, bootstrap_port, decode_server = load_balancer.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = parsed_url.hostname
-    modified_request = request_data.copy()
+    modified_request = await request.json()
     modified_request.update(
         {
             "bootstrap_host": hostname,
@@ -319,30 +345,30 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
         }
     )
 
-    if request_data.get("stream", False):
-        return await load_balancer.generate_stream(
-            modified_request,
-            prefill_server,
-            decode_server,
-            endpoint=endpoint_name,
-        )
-    else:
-        return await load_balancer.generate(
-            modified_request,
-            prefill_server,
-            decode_server,
-            endpoint=endpoint_name,
-        )
+    generate_func = (
+        load_balancer.generate_stream
+        if modified_request.get("stream", False)
+        else load_balancer.generate
+    )
+    return await generate_func(
+        modified_request,
+        headers,
+        prefill_server,
+        decode_server,
+        endpoint=endpoint_name,
+    )
 
 
 @app.post("/v1/chat/completions")
-async def handle_chat_completion_request(request_data: dict):
-    return await _forward_to_backend(request_data, "v1/chat/completions")
+@with_auth_headers
+async def handle_chat_completion_request(headers: dict, request: Request):
+    return await _forward_to_backend(headers, request, "v1/chat/completions")
 
 
 @app.post("/v1/completions")
-async def handle_completion_request(request_data: dict):
-    return await _forward_to_backend(request_data, "v1/completions")
+@with_auth_headers
+async def handle_completion_request(headers: dict, request: Request):
+    return await _forward_to_backend(headers, request, "v1/completions")
 
 
 def _generate_bootstrap_room():
@@ -359,9 +385,12 @@ def _get_request_batch_size(request):
 
 
 @app.get("/v1/models")
-async def get_models():
+@with_auth_headers
+async def get_models(headers: dict):
     prefill_server = load_balancer.prefill_servers[0]  # Get the first prefill server
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(
+        headers=headers,
+    ) as session:
         try:
             response = await session.get(f"{prefill_server}/v1/models")
             if response.status != 200:
