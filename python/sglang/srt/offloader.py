@@ -1,5 +1,5 @@
 import logging
-from typing import List, Generator
+from typing import List, Generator, Callable
 
 import torch
 from torch.func import functional_call
@@ -9,7 +9,10 @@ from sglang.srt.utils import get_int_env_var, is_pin_memory_available
 logger = logging.getLogger(__name__)
 
 
-def offload_modules(all_modules_generator: Generator[torch.nn.Module], submodule_accessor):
+def offload_modules(
+    all_modules_generator: Generator[torch.nn.Module],
+    submodule_accessor: Callable[[torch.nn.Module], torch.nn.Module],
+):
     module_interval = get_int_env_var("SGLANG_OFFLOAD_MODULE_INTERVAL", -1)
     if module_interval < 0:
         return
