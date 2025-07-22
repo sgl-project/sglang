@@ -1,17 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 import fnmatch
-from typing import Any, Callable, Dict, List, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union, cast
 
 import torch
 import torch.nn.functional as F
 from torch.nn import Module
 
 import logging
-from sglang.srt.layers.linear import (LinearBase, LinearMethodBase,
-                                               UnquantizedLinearMethod)
-from sglang.srt.layers.quantization.base_config import (  # noqa: E501
-    QuantizationConfig, QuantizeMethodBase)
+from sglang.srt.layers.linear import (LinearBase, UnquantizedLinearMethod)
+
+from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
+    LinearMethodBase,
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme, QuarkW4A4MXFP4
 from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
 from sglang.srt.utils import get_device_capability, get_bool_env_var, set_weight_attrs, log_info_on_rank0
@@ -38,11 +44,11 @@ from aiter.ops.gemm_op_a4w4 import gemm_a4w4
 
 from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
 
-__all__ = ["Fp4MoEMethod", "W4A4MXFp4MoEDynamicMethod", "W4A4MXFp4MoEStaticMethod"]
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import TopKOutput
 
 logger = logging.getLogger(__name__)
 
-use_aiter_moe = get_bool_env_var("SGLANG_USE_AITER")
 use_dynamic_mxfp4_linear = get_bool_env_var("SGLANG_USE_DYNAMIC_MXFP4_linear")
 
 OCP_MX_BLOCK_SIZE = 32
@@ -83,6 +89,7 @@ class Fp4Config(QuantizationConfig):
     def get_quant_method(self, layer: torch.nn.Module,
                          prefix: str) -> Optional["QuantizeMethodBase"]:
 
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         # Check if the layer is skipped for quantization.
         if len(self.ignored_layers) > 0 and should_ignore_layer(prefix,
                                ignore=self.ignored_layers,
@@ -448,8 +455,6 @@ class Fp4LinearMethod(LinearMethodBase):
 
 class Fp4MoEMethod():
     def __new__(cls, *args, **kwargs):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
-
         if not hasattr(cls, "_initialized"):
             original_init = cls.__init__
             new_cls = type(
@@ -575,77 +580,33 @@ class W4A4MXFp4MoEDynamicMethod(Fp4MoEMethod):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
-        custom_routing_function: Optional[Callable] = None,
-        correction_bias: Optional[torch.Tensor] = None,
+        topk_output: TopKOutput,
+        *,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-        from sglang.srt.layers.moe.topk import select_experts
+        topk_weights, topk_ids, _ = topk_output
 
-        # Expert selection
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
+        return fused_moe(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights,
+            topk_ids,
+            quant_type=QuantType.per_1x32,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            activation=(
+                ActivationType.Silu
+                if activation == "silu"
+                else ActivationType.Gelu
+            ),
+            doweight_stage1=False,
+            block_size_M=32,
         )
-
-        if use_aiter_moe:
-            return fused_moe(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                quant_type=QuantType.per_1x32,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                activation=(
-                    ActivationType.Silu
-                    if activation == "silu"
-                    else ActivationType.Gelu
-                ),
-                doweight_stage1=False,
-                block_size_M=32,
-            )
-
-        else:
-            return fused_experts(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                inplace=False,#inplace and not no_combine,
-                activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                use_fp8_w8a8=False,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a1_scale=None,
-                a2_scale=None,
-                block_shape=None,
-                no_combine=no_combine,
-                use_mxf4_w4a4=True,
-            )
 
 class W4A4MXFp4MoEStaticMethod(Fp4MoEMethod):
 
@@ -741,38 +702,15 @@ class W4A4MXFp4MoEStaticMethod(Fp4MoEMethod):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
-        custom_routing_function: Optional[Callable] = None,
-        correction_bias: Optional[torch.Tensor] = None,
+        topk_output: TopKOutput,
+        *,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-        from sglang.srt.layers.moe.topk import select_experts
-
-        # Expert selection
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
+        topk_weights, topk_ids, _ = topk_output
 
         return fused_moe(
             x,

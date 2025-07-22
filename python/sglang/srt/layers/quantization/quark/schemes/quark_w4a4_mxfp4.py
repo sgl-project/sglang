@@ -9,7 +9,7 @@ import aiter
 
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
-from sglang.srt.utils import get_bool_env_var, supports_mx
+from sglang.srt.utils import get_bool_env_var
 
 from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
@@ -31,12 +31,6 @@ class QuarkW4A4MXFP4(QuarkScheme):
         self.qscheme = "per_group"
         self.weight_quant_spec = weight_quant_spec
         self.input_quant_spec = input_quant_spec
-        self.emulate = not supports_mx()
-
-        if get_bool_env_var("SGLANG_QUARK_EMU_MEM_OPT"):
-            self.emulate_memory = True
-        else:
-            self.emulate_memory = False
 
     @classmethod
     def get_min_capability(cls) -> int:
