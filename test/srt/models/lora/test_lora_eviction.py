@@ -70,7 +70,8 @@ class TestLoRAEviction(CustomTestCase):
         works correctly when reusing LoRA names.
         """
         output_history = {}
-        self._run_test(ADAPTERS, output_history, reuse_lora_name=True)
+        self._run_test(ADAPTERS, output_history, reuse_lora_name=True, repeat=1)
+        self._run_test(ADAPTERS, output_history, reuse_lora_name=False, repeat=1)
 
     def _run_test(
         self,
@@ -106,7 +107,7 @@ class TestLoRAEviction(CustomTestCase):
             for i in range(repeat):
                 for j, lora_path in enumerate(adapter_sequence):
                     print(
-                        f"\n========== Testing LoRA eviction with adapter '{lora_path}' (#{j + 1}/{len(adapter_sequence)}), reversed: {reverse}, repeat: {i + 1}/{repeat} ---"
+                        f"\n========== Testing LoRA eviction with adapter '{lora_path}' (#{j + 1}/{len(adapter_sequence)}), reuse_lora_name: {reuse_lora_name}, reversed: {reverse}, repeat: {i + 1}/{repeat} ---"
                     )
 
                     lora_name = REUSED_LORA_NAME if reuse_lora_name else lora_path
