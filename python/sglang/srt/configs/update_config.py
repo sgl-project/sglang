@@ -42,12 +42,15 @@ def get_moe_padding_size(weight_block_size):
 
 
 def get_num_heads_padding_size(tp_size, weight_block_size, head_dim):
-    pad_size = (
-        tp_size * 2
-        if weight_block_size is not None
-        and (tp_size % 2 == 1 or head_dim % weight_block_size[0] != 0)
-        else tp_size
-    )
+    pad_size = tp_size
+
+    if weight_block_size is not None and head_dim % weight_block_size[0] != 0:
+        import math
+
+        pad_size = tp_size * (
+            math.lcm(head_dim, weight_block_size[0]) / weight_block_size[0]
+        )
+
     return pad_size
 
 
