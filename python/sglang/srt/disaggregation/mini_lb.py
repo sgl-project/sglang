@@ -9,6 +9,7 @@ import random
 import urllib
 from itertools import chain
 from typing import List, Optional
+import time
 
 import aiohttp
 import orjson
@@ -410,6 +411,8 @@ async def register(obj: PDRegistryRequest):
 @app.post("/convert_pd_role")
 async def convert_pd_role(obj: PDConvertRequest):
     """ Convert identity of a PD server """
+    start_time = time.perf_counter()
+
     server_url = obj.server_url
     if server_url in load_balancer.prefill_servers:
         # if len(load_balancer.prefill_servers) <= 1:
@@ -437,7 +440,7 @@ async def convert_pd_role(obj: PDConvertRequest):
     
     # flush the cache first, when flush cache is success, then we can try to convert pd role
     # wait 10s for server to finish all requests
-    max_tries = 10
+    max_tries = 100
     async with aiohttp.ClientSession() as session:
         try:
             while max_tries > 0:
@@ -449,13 +452,16 @@ async def convert_pd_role(obj: PDConvertRequest):
                         f"There are some request to server {server_url} haven't been done. Waiting..."
                     )
                 max_tries -= 1
-                await asyncio.sleep(5)
+                await asyncio.sleep(1)
         except:
             raise HTTPException(
                 status_code=500,
-                detail=f"Wait 10s for server: {server_url} to finish all reqs. "
-                f"May be caused by: 1. Server is stuck or shut down, 2. 10s is not enough for server to finish all reqs.",
+                detail=f"Wait 100s for server: {server_url} to finish all reqs. "
+                f"May be caused by: 1. Server is stuck or shut down, 2. 100s is not enough for server to finish all reqs.",
             )
+    
+    wating_time = time.perf_counter()
+    logger.info(f"Waited {(wating_time-start_time):.2f}s for server {server_url} to finish all requests.")
     logger.info(f"All requests to {server_url} have been done, now converting role...")
 
     # post convert request to server
@@ -474,6 +480,9 @@ async def convert_pd_role(obj: PDConvertRequest):
     # wait scheduler event loop ready
     async with aiohttp.ClientSession() as session:
         response = await session.get(f"{server_url}/get_server_info")
+
+    finished_time = time.perf_counter()
+    logger.info(f"Convert role finished in {(finished_time-wating_time):.2f}s, response: {content}")
 
     if content["success"]:
         if current_role == "prefill":
