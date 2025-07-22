@@ -81,6 +81,32 @@ class EagleDraftInput:
             [self.allocate_lens, spec_info.allocate_lens], axis=0
         )
 
+    def prepare_for_extend_to_fill_draft_kvcache(
+        self,
+        batch: ModelWorkerBatch,
+        predict: torch.Tensor,
+        num_draft_tokens: int,
+        draft_model_runner: Any,
+    ):
+        seq_lens_backup = batch.seq_lens
+        bs = len(batch.seq_lens)
+
+        batch.spec_info = self
+        batch.input_ids = predict
+        batch.seq_lens = batch.seq_lens + num_draft_tokens
+        batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
+        batch.seq_lens_sum += num_draft_tokens * bs
+        batch.extend_seq_lens = torch.full_like(batch.seq_lens, num_draft_tokens)
+        batch.extend_prefix_lens = seq_lens_backup
+        batch.extend_num_tokens = num_draft_tokens * bs
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch.forward_mode = ForwardMode.DRAFT_EXTEND
+        batch.return_logprob = False
+        self.num_draft_tokens = num_draft_tokens
+        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+        return forward_batch
+
 
 @dataclass
 class EagleVerifyInput:
@@ -137,10 +163,11 @@ class EagleVerifyInput:
         # Assign cache locations
         bs = len(batch.req_pool_indices)
         batch.input_ids = self.draft_token
+        device = batch.input_ids.device
         batch.out_cache_loc = torch.empty(
             (bs * self.num_draft_tokens,),
             dtype=torch.int64,
-            device="cuda",
+            device=device,
         )
 
         assign_extend_cache_locs[(bs,)](
@@ -181,27 +208,24 @@ class EagleVerifyInput:
         self,
         batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
-        page_size: int,
-        draft_model_runner: Any,
-        plan_stream,
-    ) -> tuple:
+    ):
         """
         Verify and find accepted tokens based on logits output and batch
         (which contains spec decoding information).
         """
-        bs = self.retrive_index.shape[0]
+        bs = len(batch.seq_lens)
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits
+        device = batch.input_ids.device
 
         candidates = self.draft_token.reshape(bs, self.num_draft_tokens)
         predict = torch.zeros(
-            (bs * (self.spec_steps + 1),), dtype=torch.int32, device="cuda"
+            (bs * (self.spec_steps + 1),), dtype=torch.int32, device=device
         )
         accept_index = torch.full(
-            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device
         )
-        accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
+        accept_length = torch.empty((bs,), dtype=torch.int32, device=device)
 
         # Sample tokens
         if sampling_info.is_all_greedy:
@@ -245,7 +269,7 @@ class EagleVerifyInput:
             draft_probs = torch.empty_like(target_probs)
 
             all_coins = torch.rand(
-                (bs * self.num_draft_tokens + bs), dtype=torch.float32, device="cuda"
+                (bs * self.num_draft_tokens + bs), dtype=torch.float32, device=device
             )
             # coins for rejection sampling
             coins = all_coins[:-bs]
@@ -286,11 +310,11 @@ class EagleVerifyInput:
 
         # Include the bonus token
         accept_length.add_(1)
-        return predict, accept_index, accept_length
+        return predict, accept_length, accept_index
 
 
 @triton.jit
-def create_extend_after_decode_spec_info(
+def fill_new_verified_id(
     verified_id,
     accept_lens,
     new_verified_id,
@@ -414,7 +438,7 @@ def select_top_k_tokens(
         tree_info = (
             topk_p.unsqueeze(1),  # shape: (b, 1, topk)
             topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device="cuda")
+            torch.arange(-1, topk, dtype=torch.long, device=hidden_states.device)
             .unsqueeze(0)
             .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
         )
@@ -432,7 +456,7 @@ def select_top_k_tokens(
         input_ids = torch.gather(topk_index, index=topk_cs_index, dim=1).flatten()
 
         selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
-            0, hidden_states.shape[0], step=topk, device="cuda"
+            0, hidden_states.shape[0], step=topk, device=hidden_states.device
         ).repeat_interleave(topk)
         hidden_states = hidden_states[selected_input_index, :]
 
