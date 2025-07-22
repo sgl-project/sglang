@@ -20,16 +20,26 @@ def offload_modules(
     logger.info(f"offload_module module_interval={module_interval}")
 
     alt_stream = torch.cuda.Stream()
-    offload_modules = all_modules[module_interval - 1 :: module_interval]
-    offloaders = [_ModuleOffloader(layer, alt_stream) for layer in offload_modules]
+
+    # TODO maybe improve
+    all_modules = []
+    offload_submodules = []
+    offloaders = []
+    for module_index, module in all_modules_generator:
+        all_modules.append(module)
+        if module_index % module_interval == module_interval - 1:
+            submodule = submodule_accessor(module)
+            offload_submodules.append(submodule)
+            offloaders.append(_ModuleOffloader(submodule, alt_stream))
 
     offloaders[0].start_onload()
 
-    for index, module in enumerate(offload_modules):
+    for index, module in enumerate(offload_submodules):
         _hook_module_forward_for_offloader(
             index=index, module=module, offloaders=offloaders
         )
 
+    return module
 
 def _hook_module_forward_for_offloader(index, module, offloaders):
     _hook_module_forward_raw(
