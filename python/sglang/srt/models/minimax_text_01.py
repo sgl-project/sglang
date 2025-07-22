@@ -1121,29 +1121,19 @@ class MiniMaxText01ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        **kwargs,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            intermediate_tensors,
-            inputs_embeds,
-            **kwargs,
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
         )
-        if get_pp_group().is_last_rank:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            return hidden_states
 
     def load_weights(
         self,
