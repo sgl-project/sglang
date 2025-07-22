@@ -177,7 +177,7 @@ class EagleVerifyInput:
 
         return verify_forward_batch, can_run_cuda_graph
 
-    def verify(
+    def sample(
         self,
         batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
@@ -191,28 +191,20 @@ class EagleVerifyInput:
         (which contains spec decoding information).
         """
         bs = self.retrive_index.shape[0]
-        candidates = self.draft_token.reshape(bs, self.num_draft_tokens)
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits
 
+        candidates = self.draft_token.reshape(bs, self.num_draft_tokens)
         predict = torch.zeros(
-            (next_token_logits.shape[0],), dtype=torch.int32, device="cuda"
+            (bs * (self.spec_steps + 1),), dtype=torch.int32, device="cuda"
         )
         accept_index = torch.full(
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
         )
         accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
 
-        # Apply the custom logit processors if registered in the sampling info.
-        if sampling_info.has_custom_logit_processor:
-            apply_custom_logit_processor(
-                next_token_logits,
-                sampling_info,
-                num_tokens_in_batch=self.num_draft_tokens,
-            )
-
         # Sample tokens
-        if batch.sampling_info.is_all_greedy:
+        if sampling_info.is_all_greedy:
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.num_draft_tokens)
 
@@ -294,103 +286,7 @@ class EagleVerifyInput:
 
         # Include the bonus token
         accept_length.add_(1)
-
-        num_draft_tokens = self.num_draft_tokens
-        select_index = (
-            torch.arange(len(batch.seq_lens), device="cuda") * num_draft_tokens
-            + accept_length
-            - 1
-        )
-
-        ########## Insert extend_after_decode
-        with torch.cuda.stream(plan_stream):
-            draft_input = EagleDraftInput(
-                hidden_states=batch.spec_info.hidden_states,
-            )
-            old_positions = batch.spec_info.positions
-            seq_lens_backup = batch.seq_lens
-
-            batch.spec_info = draft_input
-            batch.input_ids = predict
-            batch.seq_lens = batch.seq_lens + num_draft_tokens
-            batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
-            batch.seq_lens_sum += num_draft_tokens * len(batch.seq_lens)
-            batch.extend_seq_lens = torch.full_like(batch.seq_lens, num_draft_tokens)
-            batch.forward_mode = ForwardMode.EXTEND
-            batch.extend_prefix_lens = seq_lens_backup
-            batch.extend_num_tokens = num_draft_tokens * len(batch.seq_lens)
-            batch.forward_mode = ForwardMode.DRAFT_EXTEND
-            batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            batch.return_logprob = False
-            batch.return_hidden_states = False
-            draft_input.positions = old_positions
-            draft_input.num_draft_tokens = num_draft_tokens
-            forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
-            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
-
-        torch.cuda.current_stream().wait_stream(plan_stream)
-
-        logits_output_2 = draft_model_runner.model.forward(
-            forward_batch.input_ids, forward_batch.positions, forward_batch
-        )
-        logits_output_2.next_token_logits = logits_output_2.next_token_logits[
-            select_index
-        ]
-        logits_output_2.hidden_states = logits_output_2.hidden_states[select_index]
-        probs = torch.softmax(logits_output_2.next_token_logits, dim=-1)
-        ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-        ret_hidden_states = logits_output_2.hidden_states
-
-        batch.seq_lens = seq_lens_backup
-        ##########
-        size = next_token_logits.shape[0]
-        verified_id = predict[accept_index]
-        new_seq_lens = batch.seq_lens + accept_length
-        next_batch_verified_id = torch.empty_like(accept_length, dtype=torch.int32)
-        create_extend_after_decode_spec_info[(bs,)](
-            verified_id,
-            accept_length,
-            next_batch_verified_id,
-            next_power_of_2(max(self.spec_steps + 1, bs)),
-        )
-        tgt_cache_loc = torch.zeros(
-            size,
-            dtype=torch.int64,
-            device="cuda",
-        )
-        assign_extend_cache_locs[(bs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + accept_length,
-            tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
-        accepted_out_cache_loc = torch.zeros(
-            size,
-            dtype=torch.int64,
-            device="cuda",
-        )
-        fill_accepted_out_cache_loc[(size,)](
-            accept_index,
-            batch.out_cache_loc,
-            accepted_out_cache_loc,
-            next_power_of_2(size),
-        )
-        token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-            tgt_cache_loc, accepted_out_cache_loc
-        )
-
-        return (
-            predict,
-            accept_length,
-            ret_topk_p,
-            ret_topk_index,
-            ret_hidden_states,
-            next_batch_verified_id,
-            new_seq_lens,
-        )
+        return predict, accept_index, accept_length
 
 
 @triton.jit

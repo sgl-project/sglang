@@ -23,15 +23,14 @@ from sglang.srt.speculative.build_eagle_tree import (
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
-from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
-    EAGLEDraftExtendCudaGraphRunner,
-)
 from sglang.srt.speculative.eagle_utils_v2 import (
     EagleDraftInput,
     EagleVerifyInput,
     assign_draft_cache_locs,
     assign_extend_cache_locs,
+    create_extend_after_decode_spec_info,
     fast_topk,
+    fill_accepted_out_cache_loc,
     select_top_k_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -431,19 +430,111 @@ class EAGLEWorker(TpModelWorker):
         spec_info.hidden_states = logits_output.hidden_states
         (
             predict,
+            accept_index,
             accept_length,
-            ret_topk_p,
-            ret_topk_index,
-            ret_hidden_states,
-            next_batch_verified_id,
-            new_seq_lens,
-        ) = spec_info.verify(
+            # ret_topk_p,
+            # ret_topk_index,
+            # ret_hidden_states,
+            # next_batch_verified_id,
+            # new_seq_lens,
+        ) = spec_info.sample(
             batch,
             logits_output,
             self.token_to_kv_pool_allocator,
             self.page_size,
             self.draft_model_runner,
             self.plan_stream,
+        )
+
+        ########## Insert extend_after_decode
+        num_draft_tokens = self.num_draft_tokens
+        select_index = (
+            torch.arange(len(batch.seq_lens), device="cuda") * num_draft_tokens
+            + accept_length
+            - 1
+        )
+        draft_model_runner = self.draft_model_runner
+        plan_stream = self.plan_stream
+        next_token_logits = logits_output.next_token_logits
+
+        with torch.cuda.stream(plan_stream):
+            draft_input = EagleDraftInput(
+                hidden_states=batch.spec_info.hidden_states,
+            )
+            old_positions = batch.spec_info.positions
+            seq_lens_backup = batch.seq_lens
+
+            batch.spec_info = draft_input
+            batch.input_ids = predict
+            batch.seq_lens = batch.seq_lens + num_draft_tokens
+            batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
+            batch.seq_lens_sum += num_draft_tokens * len(batch.seq_lens)
+            batch.extend_seq_lens = torch.full_like(batch.seq_lens, num_draft_tokens)
+            batch.forward_mode = ForwardMode.EXTEND
+            batch.extend_prefix_lens = seq_lens_backup
+            batch.extend_num_tokens = num_draft_tokens * len(batch.seq_lens)
+            batch.forward_mode = ForwardMode.DRAFT_EXTEND
+            batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            batch.return_logprob = False
+            batch.return_hidden_states = False
+            draft_input.positions = old_positions
+            draft_input.num_draft_tokens = num_draft_tokens
+            forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+
+        torch.cuda.current_stream().wait_stream(plan_stream)
+
+        logits_output_2 = draft_model_runner.model.forward(
+            forward_batch.input_ids, forward_batch.positions, forward_batch
+        )
+        logits_output_2.next_token_logits = logits_output_2.next_token_logits[
+            select_index
+        ]
+        logits_output_2.hidden_states = logits_output_2.hidden_states[select_index]
+        probs = torch.softmax(logits_output_2.next_token_logits, dim=-1)
+        ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+        ret_hidden_states = logits_output_2.hidden_states
+
+        batch.seq_lens = seq_lens_backup
+        ##########
+        bs = spec_info.retrive_index.shape[0]
+        size = next_token_logits.shape[0]
+        verified_id = predict[accept_index]
+        new_seq_lens = batch.seq_lens + accept_length
+        next_batch_verified_id = torch.empty_like(accept_length, dtype=torch.int32)
+        create_extend_after_decode_spec_info[(bs,)](
+            verified_id,
+            accept_length,
+            next_batch_verified_id,
+            next_power_of_2(max(self.speculative_num_steps + 1, bs)),
+        )
+        tgt_cache_loc = torch.zeros(
+            size,
+            dtype=torch.int64,
+            device="cuda",
+        )
+        assign_extend_cache_locs[(bs,)](
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + accept_length,
+            tgt_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+        accepted_out_cache_loc = torch.zeros(
+            size,
+            dtype=torch.int64,
+            device="cuda",
+        )
+        fill_accepted_out_cache_loc[(size,)](
+            accept_index,
+            batch.out_cache_loc,
+            accepted_out_cache_loc,
+            next_power_of_2(size),
+        )
+        self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+            tgt_cache_loc, accepted_out_cache_loc
         )
 
         draft_input = EagleDraftInput(
