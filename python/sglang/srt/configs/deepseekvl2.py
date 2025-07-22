@@ -42,6 +42,9 @@ def select_best_resolution(image_size, candidate_resolutions):
 
 
 class DictOutput(object):
+    def items(self):
+        return self.__dict__.items()
+
     def keys(self):
         return self.__dict__.keys()
 
@@ -59,7 +62,9 @@ class DictOutput(object):
 class VLChatProcessorOutput(DictOutput):
     input_ids: torch.LongTensor
     target_ids: torch.LongTensor
-    images: torch.Tensor
+    pixel_values: (
+        torch.Tensor
+    )  # rename from "images" to "pixel_values" for compatibility
     images_seq_mask: torch.BoolTensor
     images_spatial_crop: torch.LongTensor
 
@@ -312,10 +317,14 @@ class DeepseekVLV2Processor(ProcessorMixin):
             images = torch.stack(images_list, dim=0)
             images_spatial_crop = torch.tensor(images_spatial_crop, dtype=torch.long)
 
+        images_spatial_crop = torch.stack(
+            [images_spatial_crop], dim=0
+        )  # stack the tensor to make it a batch of 1
+
         prepare = VLChatProcessorOutput(
             input_ids=input_ids,
             target_ids=target_ids,
-            images=images,
+            pixel_values=images,
             images_seq_mask=images_seq_mask,
             images_spatial_crop=images_spatial_crop,
         )

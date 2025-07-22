@@ -23,11 +23,14 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
+from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.utils import (
+    align,
     direct_register_custom_op,
+    get_bool_env_var,
     get_device_core_count,
     get_device_name,
+    is_cpu,
     is_cuda,
     is_hip,
     log_info_on_rank0,
@@ -36,6 +39,8 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_cpu = is_cpu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
     from sgl_kernel import (
@@ -44,9 +49,21 @@ if _is_cuda:
         sgl_per_token_quant_fp8,
     )
 
-    from sglang.srt.layers.quantization.deep_gemm import (
-        gemm_nt_f8f8bf16 as deep_gemm_gemm_nt_f8f8bf16,
-    )
+if _is_hip:
+    if _use_aiter:
+        try:
+            from aiter import (  # v0.1.3
+                dynamic_per_tensor_quant,
+                dynamic_per_token_scaled_quant,
+                static_per_tensor_quant,
+            )
+        except ImportError:
+            raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+    else:
+        try:
+            import vllm._C
+        except ImportError:
+            raise ImportError("vllm is required when SGLANG_USE_AITER is set to False")
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +84,6 @@ else:
     fp8_max = torch.finfo(fp8_dtype).max
 fp8_min = -fp8_max
 
-
 if supports_custom_op():
 
     def deep_gemm_fp8_fp8_bf16_nt(
@@ -77,7 +93,7 @@ if supports_custom_op():
         Bs: torch.Tensor,
         C: torch.Tensor,
     ) -> None:
-        deep_gemm_gemm_nt_f8f8bf16((A, As), (B, Bs), C)
+        deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
     def deep_gemm_fp8_fp8_bf16_nt_fake(
         A: torch.Tensor,
@@ -164,8 +180,8 @@ def _per_token_group_quant_fp8_colmajor(
     """
     # Map the program id to the row of X and Y it should compute.
     g_id = tl.program_id(0)
-    y_ptr += g_id * group_size
-    y_q_ptr += g_id * group_size
+    y_ptr += g_id.to(tl.int64) * group_size
+    y_q_ptr += g_id.to(tl.int64) * group_size
 
     # Convert g_id the flattened block coordinate to 2D so we can index
     # into the output y_scales matrix
@@ -280,6 +296,7 @@ def sglang_per_token_group_quant_fp8(
     eps: float = 1e-10,
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
+    scale_ue8m0: bool = False,
 ):
     assert (
         x.shape[-1] % group_size == 0
@@ -287,8 +304,21 @@ def sglang_per_token_group_quant_fp8(
     assert x.is_contiguous(), "`x` is not contiguous"
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
-    if column_major_scales:
+    if scale_ue8m0:
+        assert column_major_scales and scale_tma_aligned
+        x_q_mn, x_q_k = x.shape
+        x_s_mn, x_s_k = x_q_mn, x_q_k // 128
+        aligned_mn = align(x_s_mn, 4)
+        aligned_k = align(x_s_k, 4)
+        # TODO(FIXME): Fix cuda kernel and recover here to empty.
+        x_s = torch.zeros(
+            (aligned_k // 4, aligned_mn),
+            device=x.device,
+            dtype=torch.int,
+        ).transpose(0, 1)[:x_s_mn, :]
+    elif column_major_scales:
         if scale_tma_aligned:
+            # TODO extract "align" function
             # aligned to 4 * sizeof(float)
             aligned_size = (x.shape[-2] + 3) // 4 * 4
             x_s = torch.empty(
@@ -309,7 +339,9 @@ def sglang_per_token_group_quant_fp8(
             dtype=torch.float32,
         )
     if x.shape[0] > 0:
-        sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
+        sgl_per_token_group_quant_fp8(
+            x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+        )
 
     return x_q, x_s
 
@@ -754,7 +786,15 @@ def prepare_block_fp8_matmul_inputs(
     assert A.shape[-1] == B.shape[-1]
     assert A.shape[:-1] == As.shape[:-1]
     assert A.is_contiguous()
-    assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+
+    if As.dtype == torch.float:
+        assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+    elif As.dtype == torch.int:
+        assert (
+            triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1]
+        ), f"{A.shape=} {As.shape=} {block_size=}"
+    else:
+        raise NotImplementedError
 
     M = A.numel() // A.shape[-1]
 
@@ -762,8 +802,17 @@ def prepare_block_fp8_matmul_inputs(
     assert B.is_contiguous()
     assert Bs.ndim == 2
     N, K = B.shape
-    assert triton.cdiv(N, block_n) == Bs.shape[0]
-    assert triton.cdiv(K, block_k) == Bs.shape[1]
+
+    if Bs.dtype == torch.float:
+        assert triton.cdiv(N, block_n) == Bs.shape[0]
+        assert triton.cdiv(K, block_k) == Bs.shape[1]
+    elif Bs.dtype == torch.int:
+        assert N == Bs.shape[0], f"{B.shape=} {Bs.shape=} {block_size=}"
+        assert (
+            triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1]
+        ), f"{B.shape=} {Bs.shape=} {block_size=}"
+    else:
+        raise NotImplementedError
 
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
@@ -782,12 +831,12 @@ def w8a8_block_fp8_matmul_deepgemm(
     M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
 
     # Deepgemm only supports output tensor type as bfloat16
-    assert C.dtype == torch.bfloat16 and _ENABLE_JIT_DEEPGEMM
+    assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
 
     if supports_custom_op():
         torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
     else:
-        deep_gemm_gemm_nt_f8f8bf16((A, As), (B, Bs), C)
+        deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
     return C
 
@@ -881,7 +930,7 @@ def w8a8_block_fp8_matmul(
     block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
-    if output_dtype == torch.bfloat16 and _ENABLE_JIT_DEEPGEMM:
+    if output_dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return w8a8_block_fp8_matmul_deepgemm(
             A, B, As, Bs, block_size, output_dtype=output_dtype
         )
@@ -1085,55 +1134,199 @@ def per_token_group_quant_mla_deep_gemm_masked_fp8(
     return x_q, x_s.transpose(1, 2), masked_m, m, aligned_m
 
 
-def scaled_fp8_quant(
-    input: torch.Tensor,
-    scale: Optional[torch.Tensor] = None,
-    num_token_padding: Optional[int] = None,
-    use_per_token_if_dynamic: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize input tensor to FP8 (8-bit floating point) format.
+"""
+Quantize input tensor to FP8 (8-bit floating point) format.
 
-    Args:
-        input (torch.Tensor): Input tensor to be quantized
-        scale (Optional[torch.Tensor]): Pre-computed scaling factor for static quantization.
-            If None, scales will be computed dynamically.
-        num_token_padding (Optional[int]): If specified, pad the first dimension
-            of the output to at least this value.
-        use_per_token_if_dynamic (bool): When using dynamic scaling (scale=None),
-            determines the quantization granularity:
-            - True: compute scale per token
-            - False: compute single scale per tensor
+Args:
+    input (torch.Tensor): Input tensor to be quantized
+    scale (Optional[torch.Tensor]): Pre-computed scaling factor for static quantization.
+        If None, scales will be computed dynamically.
+    num_token_padding (Optional[int]): If specified, pad the first dimension
+        of the output to at least this value.
+    use_per_token_if_dynamic (bool): When using dynamic scaling (scale=None),
+        determines the quantization granularity:
+        - True: compute scale per token
+        - False: compute single scale per tensor
 
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - quantized_tensor: The FP8 quantized version of input
-            - scale_tensor: The scaling factors used for quantization
+Returns:
+    Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+        - quantized_tensor: The FP8 quantized version of input
+        - scale_tensor: The scaling factors used for quantization
 
-    Raises:
-        AssertionError: If input is not 2D or if static scale's numel != 1
-    """
-    assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
-    shape = input.shape
-    if num_token_padding:
-        shape = (max(num_token_padding, input.shape[0]), shape[1])
-    output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
+Raises:
+    AssertionError: If input is not 2D or if static scale's numel != 1
+"""
+if _is_hip:
 
-    if scale is None:
-        # Dynamic scaling
-        if use_per_token_if_dynamic:
-            scale = torch.empty((shape[0], 1), device=input.device, dtype=torch.float32)
-            sgl_per_token_quant_fp8(input, output, scale)
+    def scaled_fp8_quant(
+        input: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        num_token_padding: Optional[int] = None,
+        use_per_token_if_dynamic: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
+        shape = input.shape
+        if num_token_padding:
+            shape = (max(num_token_padding, input.shape[0]), shape[1])
+        output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
+
+        if scale is None:
+            # Dynamic scaling
+            if use_per_token_if_dynamic:
+                scale = torch.empty(
+                    (shape[0], 1), device=input.device, dtype=torch.float32
+                )
+                if _use_aiter:
+                    dynamic_per_token_scaled_quant(output, input, scale)
+                else:
+                    torch.ops._C.dynamic_per_token_scaled_fp8_quant(
+                        output, input.contiguous(), scale, None
+                    )
+            else:
+                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+                if _use_aiter:
+                    dynamic_per_tensor_quant(output, input, scale)
+                else:
+                    torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
         else:
-            scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-            sgl_per_tensor_quant_fp8(
-                input, output, scale, is_static=False
-            )  # False for dynamic
-    else:
-        # Static scaling
-        assert scale.numel() == 1, f"Expected scalar scale, got numel={scale.numel()}"
-        sgl_per_tensor_quant_fp8(
-            input, output, scale, is_static=True
-        )  # True for static
+            # Static scaling
+            assert (
+                scale.numel() == 1
+            ), f"Expected scalar scale, got numel={scale.numel()}"
+            if _use_aiter:
+                static_per_tensor_quant(output, input, scale)
+            else:
+                torch.ops._C.static_scaled_fp8_quant(output, input, scale)
 
-    return output, scale
+        return output, scale
+
+else:
+
+    def scaled_fp8_quant(
+        input: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        num_token_padding: Optional[int] = None,
+        use_per_token_if_dynamic: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
+        shape = input.shape
+        if num_token_padding:
+            shape = (max(num_token_padding, input.shape[0]), shape[1])
+        output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
+
+        if scale is None:
+            # Dynamic scaling
+            if use_per_token_if_dynamic:
+                scale = torch.empty(
+                    (shape[0], 1), device=input.device, dtype=torch.float32
+                )
+                sgl_per_token_quant_fp8(input, output, scale)
+            else:
+                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+                sgl_per_tensor_quant_fp8(
+                    input, output, scale, is_static=False
+                )  # False for dynamic
+        else:
+            # Static scaling
+            assert (
+                scale.numel() == 1
+            ), f"Expected scalar scale, got numel={scale.numel()}"
+            sgl_per_tensor_quant_fp8(
+                input, output, scale, is_static=True
+            )  # True for static
+
+        return output, scale
+
+
+fp8_autotune = triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": block_m}, num_warps=num_warps)
+        for block_m in [16, 32, 64, 128]
+        for num_warps in [2, 4, 8]
+    ],
+    key=["K", "BLOCK_K", "M_ALIGNMENT"],
+)
+
+
+@triton.jit
+def _per_token_group_quant_fp8_hopper_moe_mn_major(
+    a,  # (M, K):(K, 1)
+    expert_offsets,  # (num_experts,)
+    problem_sizes,  # (num_experts, 3)
+    a_fp8,  # (M, K):(K, 1)
+    sfa,  # (M, k)
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    M_ALIGNMENT: tl.constexpr,
+    BLOCK_M: tl.constexpr,  # tune
+):
+    k_offset = tl.program_id(0)
+    expert_id = tl.program_id(1)
+
+    m = tl.load(problem_sizes + expert_id * 3)
+    current_expert_offset = tl.load(expert_offsets + expert_id).to(tl.int64)
+    tl.multiple_of(m, M_ALIGNMENT)
+    tl.multiple_of(current_expert_offset, M_ALIGNMENT)
+
+    coord_k = k_offset * BLOCK_K + tl.arange(0, BLOCK_K)
+    for i in tl.range(tl.cdiv(m, BLOCK_M)):
+        coord_m = i * BLOCK_M + tl.arange(0, BLOCK_M)
+        a_ptrs = a + current_expert_offset * K + coord_m[:, None] * K + coord_k[None, :]
+        a_mask = (coord_m < m)[:, None] & (coord_k < K)[None, :]
+
+        inp = tl.load(a_ptrs, mask=a_mask).to(tl.float32)  # [BLOCK_M, BLOCK_K]
+        inp_amax = tl.max(tl.abs(inp), axis=1)  # [BLOCK_M,]
+        inp_amax = tl.clamp(inp_amax, min=1e-4, max=float("inf"))
+        inp_fp8 = (inp * (448.0 / inp_amax[:, None])).to(tl.float8e4nv)
+
+        # Store fp8
+        a_fp8_ptrs = (
+            a_fp8 + current_expert_offset * K + coord_m[:, None] * K + coord_k[None, :]
+        )
+        tl.store(a_fp8_ptrs, inp_fp8, mask=a_mask)
+
+        # Store sfa
+        k = tl.cdiv(K, BLOCK_K)
+        sfa_ptrs = (
+            sfa + current_expert_offset * k + k_offset * m + coord_m
+        )  # MN-Major with sfa
+        tl.store(sfa_ptrs, inp_amax / 448.0, mask=coord_m < m)
+
+
+if not _is_cpu:
+    _per_token_group_quant_fp8_hopper_moe_mn_major = fp8_autotune(
+        _per_token_group_quant_fp8_hopper_moe_mn_major
+    )
+
+
+def per_token_group_quant_fp8_hopper_moe_mn_major(
+    A: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    problem_sizes: torch.Tensor,
+    group_size: int,
+    expert_tokens_alignment: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert A.dim() == 2
+    assert A.is_contiguous(), "`A` is not contiguous"
+    assert (
+        A.shape[-1] % group_size == 0
+    ), "the last dimension of `A` cannot be divisible by `group_size`"
+
+    a_q = torch.empty_like(A, device=A.device, dtype=fp8_dtype)
+    M, K = A.shape[0], A.shape[1]
+    k = K // group_size
+    sfa = torch.empty((M, k), device=A.device, dtype=torch.float32)
+    num_experts = problem_sizes.shape[0]
+    grid = (k, num_experts)
+    _per_token_group_quant_fp8_hopper_moe_mn_major[grid](
+        A,
+        expert_offsets,
+        problem_sizes,
+        a_q,
+        sfa,
+        K,
+        group_size,
+        expert_tokens_alignment,
+    )
+    return a_q, sfa

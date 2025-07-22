@@ -2,9 +2,11 @@
 #include <cudaTypedefs.h>
 #include <torch/all.h>
 
+#include <flashinfer/vec_dtypes.cuh>
 #include <iostream>
 
 #include "cutlass/array.h"
+#include "utils.h"
 
 constexpr uint64_t THREADS_PER_EXPERT = 512;
 
@@ -251,4 +253,140 @@ void shuffle_rows_caller(
 void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor) {
   shuffle_rows_caller(input_tensor, dst2src_map, output_tensor);
   return;
+}
+
+template <typename scalar_t>
+__global__ void apply_shuffle_mul_sum_kernel(
+    const scalar_t* __restrict__ input_tensor,  // [m * topk, k] (expert-major layout)
+    scalar_t* __restrict__ output_tensor,       // [m, k] (token-major layout)
+    const int32_t* __restrict__ permutation,    // [m * topk] (c_map: token-major-idx -> expert-major-idx)
+    int m,
+    int topk,
+    int row_stride,
+    const scalar_t* __restrict__ factors)  // [m * topk] (topk_weights, token-major layout)
+{
+  int i = blockIdx.x;
+  if (i >= m) {
+    return;
+  }
+
+  constexpr uint32_t vec_size = 16 / sizeof(scalar_t);
+  using t = float;
+  using vec_t = flashinfer::vec_t<t, vec_size>;
+  int thread_idx = threadIdx.x;
+  int stride = blockDim.x;
+
+  for (int d_vec_idx = thread_idx; d_vec_idx < row_stride / vec_size; d_vec_idx += stride) {
+    int d = d_vec_idx * vec_size;
+    vec_t sum_vec;
+    sum_vec.fill(0.0f);
+
+    for (int j = 0; j < topk; ++j) {
+      int token_major_idx = i * topk + j;
+      int src_row = permutation[token_major_idx];
+
+      vec_t val_vec;
+      val_vec.cast_load(input_tensor + src_row * row_stride + d);
+
+      t factor = 1.0;
+      if (factors != nullptr) {
+        factor = factors[token_major_idx];
+      }
+
+#pragma unroll
+      for (int k = 0; k < vec_size; ++k) {
+        sum_vec[k] += factor * val_vec[k];
+      }
+    }
+    sum_vec.cast_store(output_tensor + i * row_stride + d);
+  }
+
+  //  remainder part
+  int remainder_start = (row_stride / vec_size) * vec_size;
+  for (int d = remainder_start + thread_idx; d < row_stride; d += stride) {
+    t sum_val = 0.0;
+    for (int j = 0; j < topk; ++j) {
+      int token_major_idx = i * topk + j;
+      int src_row = permutation[token_major_idx];
+      t val = input_tensor[src_row * row_stride + d];
+
+      t factor = 1.0;
+      if (factors != nullptr) {
+        factor = factors[token_major_idx];
+      }
+      sum_val += factor * val;
+    }
+    output_tensor[i * row_stride + d] = sum_val;
+  }
+}
+
+void get_apply_shuffle_mul_sum_caller(
+    const torch::Tensor& input_tensor,                // [m * topk, row_stride], bf16/f16
+    torch::Tensor& output_tensor,                     // [m, row_stride], bf16/f16
+    const torch::Tensor& permutation,                 // [m * topk], int32
+    const std::optional<torch::Tensor>& factors_opt)  // optional [m * topk], bf16/f16
+{
+  TORCH_CHECK(input_tensor.dim() == 2, "input_tensor must be 2D [m * topk, row_stride]");
+  TORCH_CHECK(output_tensor.dim() == 2, "output_tensor must be 2D [m, row_stride]");
+  TORCH_CHECK(permutation.dim() == 1, "permutation must be 1D [m * topk]");
+
+  int m = output_tensor.size(0);
+  int topk = int(permutation.size(0) / m);
+  int row_stride = output_tensor.size(1);
+
+  TORCH_CHECK(permutation.size(0) == m * topk, "permutation size must match m * topk");
+
+  auto scalar_type = output_tensor.scalar_type();
+  uint32_t vec_size = 16 / sizeof(scalar_type);
+  auto blockDim = std::min(row_stride / vec_size, 1024U);
+  dim3 block(blockDim);
+
+  dim3 grid(m);  // blockIdx.x = j, blockIdx.y = i
+  auto stream = at::cuda::getCurrentCUDAStream(input_tensor.device().index());
+
+  const int32_t* perm_ptr = permutation.data_ptr<int32_t>();
+
+  void* factors_ptr = nullptr;
+  if (factors_opt.has_value()) {
+    TORCH_CHECK(factors_opt->dtype() == output_tensor.dtype(), "Factors must match output dtype");
+    TORCH_CHECK(factors_opt->numel() == m * topk, "Factors must have shape [m * topk]");
+    factors_ptr = factors_opt->data_ptr();
+  }
+
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(output_tensor.scalar_type(), scalar_t, [&] {
+    apply_shuffle_mul_sum_kernel<scalar_t><<<grid, block, 0, stream>>>(
+        static_cast<const scalar_t*>(input_tensor.data_ptr()),
+        static_cast<scalar_t*>(output_tensor.data_ptr()),
+        perm_ptr,
+        m,
+        topk,
+        row_stride,
+        static_cast<const scalar_t*>(factors_ptr));
+    return true;
+  });
+}
+
+/**
+ * @brief Applies a permutation-based shuffle, element-wise multiplication, and reduction over the second dimension.
+ *
+ * This function performs the equivalent of the following PyTorch expression:
+ *
+ *     (c2[c_map].view(m, topk, k) * topk_weights.view(m, topk, 1).to(out_dtype)).sum(dim=1)
+ *
+ * Specifically:
+ * - `input` is shuffled using the `permutation` tensor.
+ * - The shuffled tensor is reshaped and multiplied element-wise with `factors` (e.g., top-k weights).
+ * - The result is summed along dimension 1 (the top-k dimension), and stored in `output`.
+ *
+ * @param input        Input tensor of shape (m * topk, k), representing c2.
+ * @param output       Output tensor of shape (m, k), where the final reduced results are stored.
+ * @param permutation  Index tensor (e.g., c_map) that maps positions in `input` to shuffled layout.
+ * @param factors      Optional scaling factors (e.g., top-k weights), shape (m * topk) or (m, topk).
+ */
+void apply_shuffle_mul_sum(
+    const torch::Tensor& input,
+    torch::Tensor& output,
+    const torch::Tensor& permutation,
+    const std::optional<torch::Tensor>& factors) {
+  get_apply_shuffle_mul_sum_caller(input, output, permutation, factors);
 }
