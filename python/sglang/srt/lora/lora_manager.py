@@ -114,7 +114,8 @@ class LoRAManager:
             success=success,
             error_message=error_message,
             loaded_adapters={
-                lora_ref.name: lora_ref.path for lora_ref in self.lora_refs.values()
+                lora_ref.lora_name: lora_ref.path
+                for lora_ref in self.lora_refs.values()
             },
         )
 
