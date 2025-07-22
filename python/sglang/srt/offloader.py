@@ -29,6 +29,7 @@ def offload_modules(
         all_modules.append(module)
         if module_index % module_interval == module_interval - 1:
             submodule = submodule_accessor(module)
+            logger.info(f"offload_modules move {module_index=} submodule={type(submodule)} to cpu")
             offload_submodules.append(submodule)
             offloaders.append(_ModuleOffloader(submodule, alt_stream))
 
