@@ -29,6 +29,7 @@ from sglang.srt.layers.communicator import enable_moe_dense_fully_dp
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -91,16 +92,20 @@ class Ernie4Moe(nn.Module):
 
         self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
 
+        self.topk = TopK(
+            top_k=config.moe_k,
+            renormalize=True,
+            use_grouped_topk=False,
+            correction_bias=self.gate.e_score_correction_bias,
+        )
+
         self.experts = get_moe_impl_class()(
             num_experts=config.moe_num_experts,
             top_k=config.moe_k,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=self.layer_id,
-            renormalize=True,
             quant_config=quant_config,
-            use_grouped_topk=False,
-            correction_bias=self.gate.e_score_correction_bias,
             prefix=add_prefix("experts", prefix),
         )
 
@@ -134,8 +139,9 @@ class Ernie4Moe(nn.Module):
         )
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=hidden_states, topk_output=topk_output
         )
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
