@@ -18,11 +18,13 @@ def biased_grouped_topk_org(scores, bias, num_expert_group, topk_group, topk):
         renormalize=True,
         num_expert_group=num_expert_group,
         topk_group=topk_group,
-        routed_scaling_factor=2.5, # DeepSeek-R1 : 2.5, Kimi K2: 2.872
+        routed_scaling_factor=2.5,  # DeepSeek-R1 : 2.5, Kimi K2: 2.872
     )
 
 
-def biased_grouped_topk_org_fuse_kernel(scores, bias, num_expert_group, topk_group, topk):
+def biased_grouped_topk_org_fuse_kernel(
+    scores, bias, num_expert_group, topk_group, topk
+):
     return moe_fused_gate(scores, bias, num_expert_group, topk_group, topk)
 
 
