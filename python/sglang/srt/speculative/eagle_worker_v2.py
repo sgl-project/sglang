@@ -245,12 +245,14 @@ class EAGLEWorker(TpModelWorker):
 
         # Run draft
         if can_cuda_graph:
-            score_list, token_list, parents_list = self.cuda_graph_runner.replay(
+            parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch,
             )
         else:
             self.draft_attn_backend.init_forward_metadata(forward_batch)
-            score_list, token_list, parents_list = self.draft_forward(forward_batch)
+            parent_list, top_scores_index, draft_tokens = self.draft_forward(
+                forward_batch
+            )
 
         # Build tree mask
         # Directly write to cuda graph buffers for verify attn
@@ -267,9 +269,9 @@ class EAGLEWorker(TpModelWorker):
             draft_tokens,
         ) = build_tree_kernel_efficient(
             spec_info.verified_id,
-            score_list,
-            token_list,
-            parents_list,
+            parent_list,
+            top_scores_index,
+            draft_tokens,
             batch.seq_lens,
             batch.seq_lens_sum,
             self.topk,
@@ -347,7 +349,25 @@ class EAGLEWorker(TpModelWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
-        return score_list, token_list, parents_list
+        # Organize the results
+        score_list = torch.cat(score_list, dim=1).flatten(
+            1
+        )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
+        ss_token_list = torch.cat(
+            token_list, dim=1
+        )  # b, (self.topk + (num_steps-1) * self.topk)
+        top_scores = torch.topk(score_list, self.num_draft_tokens - 1, dim=-1)
+        top_scores_index = top_scores.indices
+        top_scores_index = torch.sort(top_scores_index).values
+        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+
+        if len(parents_list) > 1:
+            parent_list = torch.cat(parents_list[:-1], dim=1)
+        else:
+            batch_size = parents_list[0].shape[0]
+            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
+
+        return parent_list, top_scores_index, draft_tokens
 
     def verify(
         self,
