@@ -21,9 +21,6 @@ from sglang.srt.layers.radix_attention import RadixAttention
 
 from typing import List
 
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-from sglang.srt.layers.quantization.quark.quark import QuarkConfig
-
 from sglang.srt.layers.parameter import (
     ModelWeightParameter,
 )
@@ -42,7 +39,6 @@ from aiter.ops.gemm_op_a4w4 import gemm_a4w4
 from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
 from aiter.ops.triton.mxfp import upcast_from_mxfp
 
-#__all__ = ["QuarkLinearMethod"]
 __all__ = ["Fp4MoEMethod", "W4A4MXFp4MoEDynamicMethod", "W4A4MXFp4MoEStaticMethod"]
 
 logger = logging.getLogger(__name__)
@@ -75,10 +71,6 @@ class Fp4Config(QuantizationConfig):
 
         self.ignored_layers = ignored_layers or []
 
-        # for linear fp8 to use
-        self.is_checkpoint_fp8_serialized = False
-        self.weight_block_size = None
-
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
         return [torch.float16, torch.bfloat16]
 
@@ -108,9 +100,6 @@ class Fp4Config(QuantizationConfig):
                 return Fp4LinearMethod(self)
             else:
                 return UnquantizedLinearMethod()
-        
-            # some debugging test
-            #return Fp8LinearMethod(self)
         
         if isinstance(layer, RadixAttention):
             return Fp4KVCacheMethod(self)
@@ -748,17 +737,16 @@ class W4A4MXFp4MoEStaticMethod(Fp4MoEMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         float_dtype = torch.get_default_dtype()
 
-        if use_aiter_moe:
-            # Pre-shuffle weight scales
-            s0, s1, _ = layer.w13_weight_scale.shape
-            w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
-            w13_weight_scale = e8m0_shuffle(w13_weight_scale)
-            layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+        # Pre-shuffle weight scales
+        s0, s1, _ = layer.w13_weight_scale.shape
+        w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
+        w13_weight_scale = e8m0_shuffle(w13_weight_scale)
+        layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
 
-            s0, s1, _ = layer.w2_weight_scale.shape
-            w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
-            w2_weight_scale = e8m0_shuffle(w2_weight_scale)
-            layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+        s0, s1, _ = layer.w2_weight_scale.shape
+        w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
+        w2_weight_scale = e8m0_shuffle(w2_weight_scale)
+        layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
 
     def apply(
         self,
@@ -797,44 +785,23 @@ class W4A4MXFp4MoEStaticMethod(Fp4MoEMethod):
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        if use_aiter_moe:
-            return fused_moe(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                quant_type=QuantType.per_1x32,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                activation=(
-                    ActivationType.Silu
-                    if activation == "silu"
-                    else ActivationType.Gelu
-                ),
-                doweight_stage1=False,
-                block_size_M=32,
-            )
-
-        else:
-            return fused_experts(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                inplace=False,#inplace and not no_combine,
-                activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                use_fp8_w8a8=False,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a1_scale=None,
-                a2_scale=None,
-                block_shape=None,
-                no_combine=no_combine,
-                use_mxf4_w4a4=True,
-            )
+        return fused_moe(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights,
+            topk_ids,
+            quant_type=QuantType.per_1x32,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            activation=(
+                ActivationType.Silu
+                if activation == "silu"
+                else ActivationType.Gelu
+            ),
+            doweight_stage1=False,
+            block_size_M=32,
+        )
 
 class Fp4KVCacheMethod(BaseKVCacheMethod):
     """
