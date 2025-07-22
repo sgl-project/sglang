@@ -283,45 +283,6 @@ impl Router {
         HttpResponse::InternalServerError().body("All retry attempts failed")
     }
 
-    pub async fn route_to_all(
-        &self,
-        client: &reqwest::Client,
-        route: &str,
-        req: &HttpRequest,
-    ) -> HttpResponse {
-        // Get all worker URLs
-        let worker_urls = self.get_worker_urls();
-
-        // Send requests to all workers concurrently
-        let mut tasks = Vec::new();
-        for worker_url in &worker_urls {
-            let mut request_builder = client.post(format!("{}{}", worker_url, route));
-
-            // Copy headers from original request
-            for (name, value) in copy_request_headers(req) {
-                request_builder = request_builder.header(name, value);
-            }
-
-            tasks.push(request_builder.send());
-        }
-
-        // Wait for all responses
-        let results = futures_util::future::join_all(tasks).await;
-
-        // Check if all succeeded
-        let all_success = results.iter().all(|r| {
-            r.as_ref()
-                .map(|res| res.status().is_success())
-                .unwrap_or(false)
-        });
-
-        if all_success {
-            HttpResponse::Ok().body("Operation completed on all servers")
-        } else {
-            HttpResponse::InternalServerError().body("Operation failed on one or more servers")
-        }
-    }
-
     // New method to route typed requests directly
     pub async fn route_typed_request<
         T: crate::openai_api_types::GenerationRequest + serde::Serialize + Clone,
