@@ -1098,33 +1098,14 @@ def linear_decode_forward_triton(
         output: Attention output tensor
     """
     B, H, _, D = q.shape
-    assert k.shape == (B, H, 1, D), f"k shape {k.shape} != expected {(B, H, 1, D)}"
-    assert v.shape == (B, H, 1, D), f"v shape {v.shape} != expected {(B, H, 1, D)}"
-
-    # Validate inputs
-    if B == 0 or H == 0 or D == 0:
-        return torch.empty((B, D * H), device=q.device, dtype=q.dtype)
-
-    # Assert that slot_idx length matches the batch size
-    assert len(slot_idx) == B, (
-        f"slot_idx length {len(slot_idx)} does not match batch size {B}. "
-        "This indicates a bug in the upstream logic that should be investigated."
-    )
+    assert k.shape == (B, H, 1, D)
+    assert v.shape == (B, H, 1, D)
 
     # Initialize output tensor
     output = torch.empty_like(q)
 
-    # Adjust BLOCK_SIZE if necessary
-    actual_block_size = min(BLOCK_SIZE, D)
-
-    # Calculate grid dimensions - ensure at least 1 in each dimension
-    grid = (B, H, max(1, (D + actual_block_size - 1) // actual_block_size))
-
-    # Validate kv_caches shape
-    if kv_caches.dim() < 4:
-        raise ValueError(
-            f"kv_caches must have at least 4 dimensions, got {kv_caches.dim()}"
-        )
+    # Set grid dimensions for the kernel
+    grid = (B, H, D // BLOCK_SIZE)
 
     # Calculate strides for tensors
     qkv_b_stride = q.stride(0)
@@ -1135,28 +1116,24 @@ def linear_decode_forward_triton(
     cache_d0_stride = kv_caches.stride(2)
     cache_d1_stride = kv_caches.stride(3)
 
-    try:
-        # Launch the kernel
-        _linear_attn_decode_kernel[grid](
-            q,
-            k,
-            v,
-            kv_caches,
-            slope_rate,
-            slot_idx,
-            output,
-            D,
-            qkv_b_stride,
-            qkv_h_stride,
-            cache_b_stride,
-            cache_h_stride,
-            cache_d0_stride,
-            cache_d1_stride,
-            BLOCK_SIZE=actual_block_size,
-        )
-    except Exception as e:
-        logging.error(f"Triton kernel failed in linear_decode_forward_triton: {e}")
-        raise RuntimeError(f"Triton kernel execution failed: {e}") from e
+    # Launch the kernel
+    _linear_attn_decode_kernel[grid](
+        q,
+        k,
+        v,
+        kv_caches,
+        slope_rate,
+        slot_idx,
+        output,
+        D,
+        qkv_b_stride,
+        qkv_h_stride,
+        cache_b_stride,
+        cache_h_stride,
+        cache_d0_stride,
+        cache_d1_stride,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
 
     # Reshape output and return
     output = rearrange(output, "b h n d -> b n (h d)")
