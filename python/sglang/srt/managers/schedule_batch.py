@@ -1040,7 +1040,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         new_needed_lens = self.spec_info.allocate_lens + (
             max(
-                bs * worker.speculative_num_steps * worker.topk,
+                bs * worker.num_steps * worker.topk,
                 bs * worker.num_draft_tokens,
             )
         )
