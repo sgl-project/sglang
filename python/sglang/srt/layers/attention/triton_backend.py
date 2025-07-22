@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.spec_info import SpecInfo
 
 
 @dataclass
@@ -226,7 +227,6 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = None
         elif forward_batch.forward_mode.is_target_verify():
             # TODO: Support sliding window in spec inference
-            bs = len(forward_batch.req_pool_indices)
             qo_indptr = torch.arange(
                 0,
                 (1 + bs) * self.num_draft_tokens,
@@ -262,30 +262,13 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = None
             attn_lse = None
 
-        elif forward_batch.forward_mode.is_draft_extend():
-            kv_indices, kv_indptr, qo_indptr, custom_mask = (
-                spec_info.generate_attn_arg_prefill(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    None,
-                    self.req_to_token,
-                )
-            )
-            mask_indptr = None
-            # TODO(FIXME): This will trigger an invalid Eagle tree when using
-            # `max(spec_info.accept_length_cpu)`.
-            # It might have been forgotten to update somewhere.
-            max_extend_len = torch.max(spec_info.accept_length).item()
-            num_kv_splits = None
-            attn_logits = None
-            attn_lse = None
         else:
             kv_indptr[1 : bs + 1] = torch.cumsum(
                 forward_batch.extend_prefix_lens, dim=0
             )
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
-                forward_batch.extend_prefix_lens.sum().item(),
+                kv_indptr[-1].item(),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -465,7 +448,7 @@ class TritonAttnBackend(AttentionBackend):
             )
 
             custom_mask = self.cuda_graph_custom_mask
-            custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+            # custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
             seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
             mask_indptr = self.mask_indptr[: bs + 1]
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
@@ -628,6 +611,19 @@ class TritonAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        """
+        Return buffers for verify attention kernels that needs to be filled after draft.
+
+        Typically, these are tree mask and position buffers.
+        """
+        return [self.cuda_graph_custom_mask, None]
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInfo, cuda_graph_bs: Optional[int]
+    ):
+        pass
 
     def forward_extend(
         self,

@@ -34,6 +34,8 @@ if TYPE_CHECKING:
 
 class EAGLEDraftExtendCudaGraphRunner:
     def __init__(self, eagle_worker: EAGLEWorker):
+        return
+
         # Parse args
         self.eagle_worker = eagle_worker
         self.model_runner = model_runner = eagle_worker.model_runner

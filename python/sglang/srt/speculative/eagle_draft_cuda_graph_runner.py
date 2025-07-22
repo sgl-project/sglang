@@ -216,7 +216,6 @@ class EAGLEDraftCudaGraphRunner:
             topk_p=topk_p,
             topk_index=topk_index,
             hidden_states=hidden_states,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
         )
 
         # Forward batch
@@ -236,9 +235,7 @@ class EAGLEDraftCudaGraphRunner:
             gathered_buffer=gathered_buffer,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
-            capture_hidden_mode=(
-                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
-            ),
+            capture_hidden_mode=CaptureHiddenMode.LAST,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob,
         )
 

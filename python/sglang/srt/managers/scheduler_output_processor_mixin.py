@@ -5,10 +5,13 @@ import threading
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
+import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.utils import empty_context
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -43,29 +46,29 @@ class SchedulerOutputProcessorMixin:
                 next_token_ids,
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
+                copy_done,
             ) = (
                 result.logits_output,
                 result.next_token_ids,
                 result.extend_input_len_per_req,
                 result.extend_logprob_start_len_per_req,
+                result.copy_done,
             )
 
-            if self.enable_overlap:
-                logits_output, next_token_ids, _ = (
-                    self.tp_worker.resolve_last_batch_result(launch_done)
-                )
-            else:
-                # Move next_token_ids and logprobs to cpu
-                next_token_ids = next_token_ids.tolist()
-                if batch.return_logprob:
-                    if logits_output.next_token_logprobs is not None:
-                        logits_output.next_token_logprobs = (
-                            logits_output.next_token_logprobs.tolist()
-                        )
-                    if logits_output.input_token_logprobs is not None:
-                        logits_output.input_token_logprobs = tuple(
-                            logits_output.input_token_logprobs.tolist()
-                        )
+            if copy_done is not None:
+                copy_done.synchronize()
+
+            # Move next_token_ids and logprobs to cpu
+            next_token_ids = next_token_ids.tolist()
+            if batch.return_logprob:
+                if logits_output.next_token_logprobs is not None:
+                    logits_output.next_token_logprobs = (
+                        logits_output.next_token_logprobs.tolist()
+                    )
+                if logits_output.input_token_logprobs is not None:
+                    logits_output.input_token_logprobs = tuple(
+                        logits_output.input_token_logprobs.tolist()
+                    )
 
             hidden_state_offset = 0
 
@@ -197,23 +200,41 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: Optional[threading.Event] = None,
     ):
-        logits_output, next_token_ids, can_run_cuda_graph = (
+        logits_output, next_token_ids, can_run_cuda_graph, copy_done = (
             result.logits_output,
             result.next_token_ids,
             result.can_run_cuda_graph,
+            result.copy_done,
         )
         self.num_generated_tokens += len(batch.reqs)
 
-        if self.enable_overlap:
-            logits_output, next_token_ids, can_run_cuda_graph = (
-                self.tp_worker.resolve_last_batch_result(launch_done)
-            )
-            next_token_logprobs = logits_output.next_token_logprobs
-        elif batch.spec_algorithm.is_none():
-            # spec decoding handles output logprobs inside verify process.
+        if copy_done is not None:
+            ctx = torch.cuda.stream(self.copy_stream)
+            copy_done.synchronize()
+        else:
+            ctx = empty_context()
+
+        with ctx:
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
+
+            if batch.spec_algorithm.is_eagle():
+                accept_length_cpu = result.accept_length.tolist()
+                predict_cpu = next_token_ids
+                next_token_ids = []
+                num_draft_tokens = self.draft_worker.num_draft_tokens
+                for i, req in enumerate(batch.reqs):
+                    next_token_ids.append(
+                        predict_cpu[
+                            i * num_draft_tokens : i * num_draft_tokens
+                            + accept_length_cpu[i]
+                        ]
+                    )
+                    req.spec_verify_ct += 1
+                    self.num_generated_tokens += accept_length_cpu[i]
+                self.spec_num_total_accepted_tokens += sum(accept_length_cpu)
+                self.spec_num_total_forward_ct += 1
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -241,6 +262,8 @@ class SchedulerOutputProcessorMixin:
             if batch.spec_algorithm.is_none():
                 # speculative worker will solve the output_ids in speculative decoding
                 req.output_ids.append(next_token_id)
+            else:
+                req.output_ids.extend(next_token_id)
 
             req.check_finished()
             if req.finished():

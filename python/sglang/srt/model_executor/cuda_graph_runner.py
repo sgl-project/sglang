@@ -236,6 +236,7 @@ class CudaGraphRunner:
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
             else:
+                self.capture_hidden_mode = CaptureHiddenMode.FULL
                 self.capture_forward_mode = ForwardMode.TARGET_VERIFY
                 self.num_tokens_per_bs = (
                     self.model_runner.server_args.speculative_num_draft_tokens

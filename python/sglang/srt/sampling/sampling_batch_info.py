@@ -345,6 +345,15 @@ class SamplingBatchInfo:
             self.logit_bias, other.logit_bias, len(self), len(other), self.device, 0.0
         )
 
+    def copy_for_forward(self):
+        # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
+        self.update_penalties()
+        return dataclasses.replace(
+            self,
+            sampling_info_done=threading.Event(),
+            penalizer_orchestrator=None,
+        )
+
 
 def merge_bias_tensor(
     lhs: Optional[torch.Tensor],
