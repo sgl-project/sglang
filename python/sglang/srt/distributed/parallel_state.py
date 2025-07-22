@@ -470,6 +470,7 @@ class GroupCoordinator:
             and hasattr(input_, "symmetric_memory")
             and input_.symmetric_memory
         ):
+            #print(f"[parallel_state] Using symmetric memory")
             with self.pynccl_comm.change_state(enable=True, stream=torch.cuda.current_stream()):
                 self.pynccl_comm.all_reduce(input_)
                 return input_

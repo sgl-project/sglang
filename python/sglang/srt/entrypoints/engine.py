@@ -627,7 +627,8 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
-
+    # os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    # os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
     # Set prometheus env vars
     if server_args.enable_metrics:
         set_prometheus_multiproc_dir()
