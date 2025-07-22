@@ -12,10 +12,8 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -41,9 +39,6 @@ logger = logging.getLogger(__name__)
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
 SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
-
-# Grammar traversal time threshold (in seconds)
-TREE_TRAVERSE_TIME_THRESHOLD = 1
 
 
 @dataclass
@@ -89,20 +84,18 @@ class EagleDraftInput:
         draft_model_runner: Any,
     ):
         seq_lens_backup = batch.seq_lens
-        bs = len(batch.seq_lens)
+        extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
         batch.spec_info = self
         batch.input_ids = predict
         batch.seq_lens = batch.seq_lens + num_draft_tokens
         batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
-        batch.seq_lens_sum += num_draft_tokens * bs
+        batch.seq_lens_sum += extend_num_tokens
         batch.extend_seq_lens = torch.full_like(batch.seq_lens, num_draft_tokens)
         batch.extend_prefix_lens = seq_lens_backup
-        batch.extend_num_tokens = num_draft_tokens * bs
+        batch.extend_num_tokens = extend_num_tokens
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
-        batch.return_logprob = False
-        self.num_draft_tokens = num_draft_tokens
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         return forward_batch
@@ -117,7 +110,7 @@ class EagleVerifyInput:
     retrive_next_token: torch.Tensor
     retrive_next_sibling: torch.Tensor
     retrive_cum_len: torch.Tensor
-    spec_steps: int
+    num_steps: int
     topk: int
     num_draft_tokens: int
 
@@ -220,10 +213,10 @@ class EagleVerifyInput:
 
         candidates = self.draft_token.reshape(bs, self.num_draft_tokens)
         predict = torch.zeros(
-            (bs * (self.spec_steps + 1),), dtype=torch.int32, device=device
+            (bs * (self.num_steps + 1),), dtype=torch.int32, device=device
         )
         accept_index = torch.full(
-            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device
+            (bs, self.num_steps + 1), -1, dtype=torch.int32, device=device
         )
         accept_length = torch.empty((bs,), dtype=torch.int32, device=device)
 
@@ -305,7 +298,7 @@ class EagleVerifyInput:
                 accept_length=accept_length,  # mutable
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
-                spec_steps=self.spec_steps,
+                num_steps=self.num_steps,
             )
 
         # Include the bonus token
@@ -358,15 +351,10 @@ def assign_draft_cache_locs(
     req_pool_indices,
     req_to_token,
     seq_lens,
-    extend_lens,
-    num_new_pages_per_topk,
     out_cache_loc,
     pool_len: tl.constexpr,
     topk: tl.constexpr,
     speculative_num_steps: tl.constexpr,
-    page_size: tl.constexpr,
-    bs_upper: tl.constexpr,
-    iter_upper: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 128
     pid = tl.program_id(axis=0)
@@ -485,7 +473,7 @@ def _generate_simulated_accept_index(
     accept_length,
     simulate_acc_len,
     bs,
-    spec_steps,
+    num_steps,
 ):
     simulate_acc_len_float = float(simulate_acc_len)
     if SIMULATE_ACC_METHOD == "multinomial":
@@ -495,8 +483,8 @@ def _generate_simulated_accept_index(
             size=(1,),
             device="cpu",
         )
-        # clamp simulated values to be between 1 and self.spec_steps
-        simulated_values = torch.clamp(simulated_values, min=1.0, max=spec_steps + 1)
+        # clamp simulated values to be between 1 and self.num_steps
+        simulated_values = torch.clamp(simulated_values, min=1.0, max=num_steps + 1)
         simulate_acc_len = int(simulated_values.round().item())
     elif SIMULATE_ACC_METHOD == "match-expected":
         # multinomial sampling does not match the expected length
@@ -504,9 +492,9 @@ def _generate_simulated_accept_index(
         # but it's better to use "match-expected" for the cases that need to
         # match the expected length, One caveat is that this will only sample
         # either round down or round up of the expected length
-        simulate_acc_len_float = max(1.0, min(spec_steps + 1, simulate_acc_len_float))
+        simulate_acc_len_float = max(1.0, min(num_steps + 1, simulate_acc_len_float))
         lower = int(simulate_acc_len_float // 1)
-        upper = lower + 1 if lower < spec_steps + 1 else lower
+        upper = lower + 1 if lower < num_steps + 1 else lower
         if lower == upper:
             simulate_acc_len = lower
         else:
@@ -520,7 +508,7 @@ def _generate_simulated_accept_index(
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
-        (bs, spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+        (bs, num_steps + 1), -1, dtype=torch.int32, device="cuda"
     )
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device

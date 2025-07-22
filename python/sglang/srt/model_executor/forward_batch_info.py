@@ -76,6 +76,8 @@ class ForwardMode(IntEnum):
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
     # Used in speculative decoding: extend a batch in the draft model.
+    # This is used in eagle_worker_v2.
+    # It is almost the same as EXTEND, but returns all hidden states and logits.
     DRAFT_EXTEND_V2 = auto()
 
     # A dummy first batch to start the pipeline for overlap scheduler.

@@ -13,7 +13,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardBatchOutput,
-    ForwardMode,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.build_eagle_tree import (
@@ -53,12 +52,12 @@ class EAGLEWorker(TpModelWorker):
         # Parse arguments
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
+        self.num_steps = server_args.speculative_num_steps
         self.num_draft_tokens = server_args.speculative_num_draft_tokens
         self.enable_nan_detection = server_args.enable_nan_detection
-        self.gpu_id = gpu_id
         self.device = server_args.device
-        self.target_worker = target_worker.worker
+        self.gpu_id = gpu_id
+        self.target_worker = target_worker
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -130,14 +129,6 @@ class EAGLEWorker(TpModelWorker):
         self.init_attention_backend()
         self.init_cuda_graphs()
 
-        # Some dummy tensors
-        self.draft_alloc_num_new_pages_per_topk = torch.empty(
-            (), dtype=torch.int64, device=self.device
-        )
-        self.draft_alloc_extend_lens = torch.empty(
-            (), dtype=torch.int64, device=self.device
-        )
-
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
 
@@ -152,7 +143,7 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_attn_backend = FlashInferMultiStepDraftBackend(
                     self.draft_model_runner,
                     self.topk,
-                    self.speculative_num_steps,
+                    self.num_steps,
                 )
             else:
                 from sglang.srt.layers.attention.flashinfer_mla_backend import (
@@ -162,7 +153,7 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_attn_backend = FlashInferMLAMultiStepDraftBackend(
                     self.draft_model_runner,
                     self.topk,
-                    self.speculative_num_steps,
+                    self.num_steps,
                 )
         elif self.server_args.attention_backend == "triton":
             from sglang.srt.layers.attention.triton_backend import (
@@ -172,7 +163,7 @@ class EAGLEWorker(TpModelWorker):
             self.draft_attn_backend = TritonMultiStepDraftBackend(
                 self.draft_model_runner,
                 self.topk,
-                self.speculative_num_steps,
+                self.num_steps,
             )
         elif self.server_args.attention_backend == "fa3":
             from sglang.srt.layers.attention.flashattention_backend import (
@@ -182,7 +173,7 @@ class EAGLEWorker(TpModelWorker):
             self.draft_attn_backend = FlashAttentionMultiStepBackend(
                 self.draft_model_runner,
                 self.topk,
-                self.speculative_num_steps,
+                self.num_steps,
             )
         else:
             raise ValueError(
@@ -248,8 +239,8 @@ class EAGLEWorker(TpModelWorker):
         spec_info = batch.spec_info
 
         # Assign cache locations
-        out_cache_loc = torch.empty(
-            (num_seqs * self.topk * self.speculative_num_steps,),
+        batch.out_cache_loc = torch.empty(
+            (num_seqs * self.topk * self.num_steps,),
             dtype=torch.int64,
             device=self.device,
         )
@@ -257,19 +248,13 @@ class EAGLEWorker(TpModelWorker):
             batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,
             batch.seq_lens,
-            self.draft_alloc_extend_lens,
-            self.draft_alloc_num_new_pages_per_topk,
-            out_cache_loc,
+            batch.out_cache_loc,
             self.req_to_token_pool.req_to_token.shape[1],
             self.topk,
-            self.speculative_num_steps,
-            self.page_size,
-            next_power_of_2(num_seqs),
-            next_power_of_2(self.speculative_num_steps),
+            self.num_steps,
         )
 
         # Get a forward batch
-        batch.out_cache_loc = out_cache_loc
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
@@ -309,7 +294,7 @@ class EAGLEWorker(TpModelWorker):
             batch.seq_lens,
             batch.seq_lens_sum,
             self.topk,
-            self.speculative_num_steps,
+            self.num_steps,
             self.server_args.speculative_num_draft_tokens,
             self.tree_mask_mode,
             tree_mask_buf,
@@ -324,7 +309,7 @@ class EAGLEWorker(TpModelWorker):
             retrive_next_token=retrive_next_token,
             retrive_next_sibling=retrive_next_sibling,
             retrive_cum_len=None,
-            spec_steps=self.speculative_num_steps,
+            num_steps=self.num_steps,
             topk=self.topk,
             num_draft_tokens=self.server_args.speculative_num_draft_tokens,
         )
@@ -342,11 +327,9 @@ class EAGLEWorker(TpModelWorker):
             topk_index = self.hot_token_id[topk_index]
 
         out_cache_loc = out_cache_loc.reshape(
-            forward_batch.batch_size, self.topk, self.speculative_num_steps
+            forward_batch.batch_size, self.topk, self.num_steps
         )
-        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
-            self.speculative_num_steps, -1
-        )
+        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(self.num_steps, -1)
 
         # Return values
         score_list: List[torch.Tensor] = []
@@ -355,7 +338,7 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward multiple steps
         scores = None
-        for i in range(self.speculative_num_steps):
+        for i in range(self.num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
@@ -364,7 +347,7 @@ class EAGLEWorker(TpModelWorker):
             parents_list.append(tree_info[2])
 
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
-            if i == self.speculative_num_steps - 1:
+            if i == self.num_steps - 1:
                 break
 
             # Set inputs
@@ -480,7 +463,7 @@ class EAGLEWorker(TpModelWorker):
             verified_id,
             accept_length,
             next_batch_verified_id,
-            next_power_of_2(max(self.speculative_num_steps + 1, bs)),
+            next_power_of_2(max(self.num_steps + 1, bs)),
         )
 
         # Move the accepted tokens to the target KV cache
@@ -556,6 +539,14 @@ class EAGLEWorker(TpModelWorker):
         accept_index: torch.Tensor,
         accept_length: torch.Tensor,
     ):
+        """
+        Move accepted tokens to the target KV cache.
+
+        Args:
+            batch: The batch to run.
+            accept_index: The index of the accepted tokens.
+            accept_length: The length of the accepted tokens.
+        """
         bs = len(batch.seq_lens)
         size = bs * self.num_draft_tokens
 
