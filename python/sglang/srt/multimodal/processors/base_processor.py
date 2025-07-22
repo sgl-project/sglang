@@ -104,6 +104,7 @@ class MultimodalSpecialTokens:
     def get_token_id_by_modality(self, modality: Modality) -> Optional[int]:
         return {
             Modality.IMAGE: self.image_token_id,
+            Modality.MULTI_IMAGES: self.image_token_id,
             Modality.VIDEO: self.video_token_id,
             Modality.AUDIO: self.audio_token_id,
         }.get(modality)
