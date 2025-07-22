@@ -9,9 +9,9 @@ from datetime import datetime
 from typing import Optional
 
 import aiohttp
+import numpy as np
 import requests
 from tqdm.asyncio import tqdm
-import numpy as np
 
 from sglang.bench_serving import (
     RequestFuncOutput,
@@ -290,7 +290,9 @@ class WorkloadGenerator:
             i: {"round": 0, "history": init_requests[i][1]["text"]}
             for i in range(args.num_clients)
         }
-        self.ready_queue = ReadyQueue(init_requests=init_requests, policy=args.ready_queue_policy)
+        self.ready_queue = ReadyQueue(
+            init_requests=init_requests, policy=args.ready_queue_policy
+        )
         self.candidate_inputs = self.candidate_inputs[args.num_clients :]
 
         self.response_queue = queue.Queue()
