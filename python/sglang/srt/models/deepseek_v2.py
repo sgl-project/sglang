@@ -1999,7 +1999,7 @@ class DeepseekV2Model(nn.Module):
                     alt_stream=self.alt_stream,
                 )
                 for layer_id in range(config.num_hidden_layers)
-            ), submodule_accessor=lambda layer: layer.mlp)
+            ), submodule_accessor=lambda layer: layer.mlp.experts)
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
