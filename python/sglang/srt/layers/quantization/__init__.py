@@ -84,8 +84,8 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "qoq": QoQConfig,
     "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
-    "quark": Fp4Config,
-    "fp4": Fp4Config,
+    "quark_mxfp4": Fp4Config,
+    "mxfp4": Fp4Config,
 }
 
 # VLLM-dependent quantization methods
