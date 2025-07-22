@@ -86,7 +86,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.offloader import offload_modules
 from sglang.srt.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
     model_forward_maybe_tbo,
@@ -2321,8 +2320,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             and self.quant_config.weight_block_size is not None
         ):
             self._weight_requant_ue8m0(is_nextn)
-
-        offload_modules([x.mlp for x in self.model.layers])
 
     def _weight_requant_ue8m0(self, is_nextn=False):
         weight_block_size = self.quant_config.weight_block_size
