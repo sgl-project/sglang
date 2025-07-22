@@ -37,7 +37,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter import ActivationType
     from aiter.fused_moe import fused_moe
-    from aiter.fused_moe_bf16_asm import ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
 
 
