@@ -26,10 +26,11 @@ def offload_modules(
     offload_submodules = []
     offloaders = []
     for module_index, module in enumerate(all_modules_generator):
+        logger.info(f"[offload_modules] {module_index=} {torch.cuda.memory_allocated()=}")
         all_modules.append(module)
         if module_index % module_interval == module_interval - 1:
             submodule = submodule_accessor(module)
-            logger.info(f"offload_modules move {module_index=} submodule={type(submodule)} to cpu")
+            logger.info(f"[offload_modules] move {module_index=} submodule={type(submodule)} to cpu")
             offload_submodules.append(submodule)
             offloaders.append(_ModuleOffloader(submodule, alt_stream))
 
