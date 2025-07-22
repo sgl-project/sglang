@@ -27,6 +27,7 @@ from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.utils import (
     align,
     direct_register_custom_op,
+    get_bool_env_var,
     get_device_core_count,
     get_device_name,
     is_cpu,
@@ -39,6 +40,7 @@ from sglang.srt.utils import (
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
     from sgl_kernel import (
@@ -46,6 +48,22 @@ if _is_cuda:
         sgl_per_token_group_quant_fp8,
         sgl_per_token_quant_fp8,
     )
+
+if _is_hip:
+    if _use_aiter:
+        try:
+            from aiter import (  # v0.1.3
+                dynamic_per_tensor_quant,
+                dynamic_per_token_scaled_quant,
+                static_per_tensor_quant,
+            )
+        except ImportError:
+            raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+    else:
+        try:
+            import vllm._C
+        except ImportError:
+            raise ImportError("vllm is required when SGLANG_USE_AITER is set to False")
 
 logger = logging.getLogger(__name__)
 
@@ -1116,58 +1134,109 @@ def per_token_group_quant_mla_deep_gemm_masked_fp8(
     return x_q, x_s.transpose(1, 2), masked_m, m, aligned_m
 
 
-def scaled_fp8_quant(
-    input: torch.Tensor,
-    scale: Optional[torch.Tensor] = None,
-    num_token_padding: Optional[int] = None,
-    use_per_token_if_dynamic: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize input tensor to FP8 (8-bit floating point) format.
+"""
+Quantize input tensor to FP8 (8-bit floating point) format.
 
-    Args:
-        input (torch.Tensor): Input tensor to be quantized
-        scale (Optional[torch.Tensor]): Pre-computed scaling factor for static quantization.
-            If None, scales will be computed dynamically.
-        num_token_padding (Optional[int]): If specified, pad the first dimension
-            of the output to at least this value.
-        use_per_token_if_dynamic (bool): When using dynamic scaling (scale=None),
-            determines the quantization granularity:
-            - True: compute scale per token
-            - False: compute single scale per tensor
+Args:
+    input (torch.Tensor): Input tensor to be quantized
+    scale (Optional[torch.Tensor]): Pre-computed scaling factor for static quantization.
+        If None, scales will be computed dynamically.
+    num_token_padding (Optional[int]): If specified, pad the first dimension
+        of the output to at least this value.
+    use_per_token_if_dynamic (bool): When using dynamic scaling (scale=None),
+        determines the quantization granularity:
+        - True: compute scale per token
+        - False: compute single scale per tensor
 
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - quantized_tensor: The FP8 quantized version of input
-            - scale_tensor: The scaling factors used for quantization
+Returns:
+    Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+        - quantized_tensor: The FP8 quantized version of input
+        - scale_tensor: The scaling factors used for quantization
 
-    Raises:
-        AssertionError: If input is not 2D or if static scale's numel != 1
-    """
-    assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
-    shape = input.shape
-    if num_token_padding:
-        shape = (max(num_token_padding, input.shape[0]), shape[1])
-    output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
+Raises:
+    AssertionError: If input is not 2D or if static scale's numel != 1
+"""
+if _is_hip:
 
-    if scale is None:
-        # Dynamic scaling
-        if use_per_token_if_dynamic:
-            scale = torch.empty((shape[0], 1), device=input.device, dtype=torch.float32)
-            sgl_per_token_quant_fp8(input, output, scale)
+    def scaled_fp8_quant(
+        input: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        num_token_padding: Optional[int] = None,
+        use_per_token_if_dynamic: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
+        shape = input.shape
+        if num_token_padding:
+            shape = (max(num_token_padding, input.shape[0]), shape[1])
+        output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
+
+        if scale is None:
+            # Dynamic scaling
+            if use_per_token_if_dynamic:
+                scale = torch.empty(
+                    (shape[0], 1), device=input.device, dtype=torch.float32
+                )
+                if _use_aiter:
+                    dynamic_per_token_scaled_quant(output, input, scale)
+                else:
+                    torch.ops._C.dynamic_per_token_scaled_fp8_quant(
+                        output, input.contiguous(), scale, None
+                    )
+            else:
+                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+                if _use_aiter:
+                    dynamic_per_tensor_quant(output, input, scale)
+                else:
+                    torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
         else:
-            scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-            sgl_per_tensor_quant_fp8(
-                input, output, scale, is_static=False
-            )  # False for dynamic
-    else:
-        # Static scaling
-        assert scale.numel() == 1, f"Expected scalar scale, got numel={scale.numel()}"
-        sgl_per_tensor_quant_fp8(
-            input, output, scale, is_static=True
-        )  # True for static
+            # Static scaling
+            assert (
+                scale.numel() == 1
+            ), f"Expected scalar scale, got numel={scale.numel()}"
+            if _use_aiter:
+                static_per_tensor_quant(output, input, scale)
+            else:
+                torch.ops._C.static_scaled_fp8_quant(output, input, scale)
 
-    return output, scale
+        return output, scale
+
+else:
+
+    def scaled_fp8_quant(
+        input: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        num_token_padding: Optional[int] = None,
+        use_per_token_if_dynamic: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
+        shape = input.shape
+        if num_token_padding:
+            shape = (max(num_token_padding, input.shape[0]), shape[1])
+        output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
+
+        if scale is None:
+            # Dynamic scaling
+            if use_per_token_if_dynamic:
+                scale = torch.empty(
+                    (shape[0], 1), device=input.device, dtype=torch.float32
+                )
+                sgl_per_token_quant_fp8(input, output, scale)
+            else:
+                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+                sgl_per_tensor_quant_fp8(
+                    input, output, scale, is_static=False
+                )  # False for dynamic
+        else:
+            # Static scaling
+            assert (
+                scale.numel() == 1
+            ), f"Expected scalar scale, got numel={scale.numel()}"
+            sgl_per_tensor_quant_fp8(
+                input, output, scale, is_static=True
+            )  # True for static
+
+        return output, scale
 
 
 fp8_autotune = triton.autotune(
