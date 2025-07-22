@@ -873,9 +873,6 @@ def _convert_global_physical_count_to_logical_count(
     num_logical_experts: int,
     physical_to_logical_map: torch.Tensor,
 ):
-    print(
-        f"rank {torch.distributed.get_rank()} global_physical_count: {global_physical_count.sum(axis=0)}"
-    )
     dim_extra, _, _ = global_physical_count.shape
     dtype = global_physical_count.dtype
     device = global_physical_count.device
