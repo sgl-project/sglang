@@ -49,7 +49,7 @@ use_dynamic_mxfp4_linear = get_bool_env_var("SGLANG_USE_DYNAMIC_MXFP4_linear")
 OCP_MX_BLOCK_SIZE = 32
 
 
-class Fp4Config(QuantizationConfig):
+class MxFp4Config(QuantizationConfig):
 
     def __init__(
         self,
@@ -106,25 +106,25 @@ class Fp4Config(QuantizationConfig):
             if self.is_checkpoint_fp4_serialized:
                 scheme = self.get_scheme(layer=layer, layer_name=prefix)
                 layer.scheme = scheme
-                return Fp4LinearMethod(self)
+                return MxFp4LinearMethod(self)
 
             elif use_dynamic_mxfp4_linear:
-                return Fp4LinearMethod(self)
+                return MxFp4LinearMethod(self)
             else:
                 return UnquantizedLinearMethod()
 
         if isinstance(layer, RadixAttention):
-            return Fp4KVCacheMethod(self)
+            return MxFp4KVCacheMethod(self)
 
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            return Fp4MoEMethod.get_moe_method(self, module=layer, layer_name=prefix)
+            return MxFp4MoEMethod.get_moe_method(self, module=layer, layer_name=prefix)
 
         return None
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "Fp4Config":
+    def from_config(cls, config: dict[str, Any]) -> "MxFp4Config":
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp4_serialized = (
             True if quant_method else False
@@ -357,9 +357,9 @@ class Fp4Config(QuantizationConfig):
         return []
 
 
-class Fp4LinearMethod(LinearMethodBase):
+class MxFp4LinearMethod(LinearMethodBase):
 
-    def __init__(self, quantization_config: Fp4Config):
+    def __init__(self, quantization_config: MxFp4Config):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -481,7 +481,7 @@ class Fp4LinearMethod(LinearMethodBase):
             return out
 
 
-class Fp4MoEMethod:
+class MxFp4MoEMethod:
     def __new__(cls, *args, **kwargs):
         if not hasattr(cls, "_initialized"):
             original_init = cls.__init__
@@ -500,10 +500,10 @@ class Fp4MoEMethod:
 
     @staticmethod
     def get_moe_method(
-        quant_config: "Fp4Config",  # type: ignore # noqa E501 # noqa F821
+        quant_config: "MxFp4Config",  # type: ignore # noqa E501 # noqa F821
         module: torch.nn.Module,
         layer_name: str,
-    ) -> "Fp4MoEMethod":
+    ) -> "MxFp4MoEMethod":
 
         if quant_config.is_checkpoint_fp4_serialized:
             layer_quant_config = quant_config._find_matched_config(layer_name, module)
@@ -527,7 +527,7 @@ class Fp4MoEMethod:
             return W4A4MXFp4MoEDynamicMethod(quant_config)
 
 
-class W4A4MXFp4MoEDynamicMethod(Fp4MoEMethod):
+class W4A4MXFp4MoEDynamicMethod(MxFp4MoEMethod):
     def __init__(self, quant_config):
         self.quant_config = quant_config
 
@@ -651,7 +651,7 @@ class W4A4MXFp4MoEDynamicMethod(Fp4MoEMethod):
         )
 
 
-class W4A4MXFp4MoEStaticMethod(Fp4MoEMethod):
+class W4A4MXFp4MoEStaticMethod(MxFp4MoEMethod):
 
     def __init__(self, weight_config: dict[str, Any], input_config: dict[str, Any]):
         self.weight_quant = weight_config
@@ -785,12 +785,12 @@ class W4A4MXFp4MoEStaticMethod(Fp4MoEMethod):
         )
 
 
-class Fp4KVCacheMethod(BaseKVCacheMethod):
+class MxFp4KVCacheMethod(BaseKVCacheMethod):
     """
     Supports loading kv-cache scaling factors from quark checkpoints.
     """
 
-    def __init__(self, quant_config: Fp4Config):
+    def __init__(self, quant_config: MxFp4Config):
         self.validate_kv_cache_config(quant_config.kv_cache_config)
         super().__init__(quant_config)
 

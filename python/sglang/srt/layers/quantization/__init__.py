@@ -47,7 +47,7 @@ from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
-from sglang.srt.layers.quantization.fp4 import Fp4Config
+from sglang.srt.layers.quantization.fp4 import MxFp4Config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.gptq import (
     GPTQConfig,
@@ -84,8 +84,8 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "qoq": QoQConfig,
     "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
-    "quark_mxfp4": Fp4Config,
-    "mxfp4": Fp4Config,
+    "quark_mxfp4": MxFp4Config,
+    "mxfp4": MxFp4Config,
 }
 
 # VLLM-dependent quantization methods
