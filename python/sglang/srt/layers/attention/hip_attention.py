@@ -120,8 +120,8 @@ class HiPAttentionBackend(AttentionBackend):
         self._block_table = forward_batch.req_to_token_pool.req_to_token.index_select(
             dim=0, index=forward_batch.req_pool_indices
         )
-
-        if forward_batch.forward_mode.is_decode():
+        
+        if forward_batch.forward_mode.is_decode_or_idle():
             self.flashattention_backend.init_forward_metadata(forward_batch=forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int):
@@ -572,7 +572,7 @@ class HiPAttentionBackend(AttentionBackend):
         need_dense_prefill = using_chunked_sw or using_dense_prefill
         need_dense_decode = using_chunked_sw or delta_dense_decode or force_dense_decode
 
-        if need_dense_decode or False:
+        if need_dense_decode and False:
             o = self.flashattention_backend.forward_decode(
                 q=q,
                 k=k,
