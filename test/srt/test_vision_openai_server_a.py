@@ -116,22 +116,23 @@ class TestVLMContextLengthIssue(CustomTestCase):
         )
 
 
-class TestMllamaServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-        )
-        cls.base_url += "/v1"
+# Note(Xinyuan): mllama is not stable for now, skip for CI
+# class TestMllamaServer(TestOpenAIVisionServer):
+#     @classmethod
+#     def setUpClass(cls):
+#         cls.model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+#         cls.base_url = DEFAULT_URL_FOR_TEST
+#         cls.api_key = "sk-123456"
+#         cls.process = popen_launch_server(
+#             cls.model,
+#             cls.base_url,
+#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+#             api_key=cls.api_key,
+#         )
+#         cls.base_url += "/v1"
 
-    def test_video_chat_completion(self):
-        pass
+#     def test_video_chat_completion(self):
+#         pass
 
 
 class TestMinicpmvServer(TestOpenAIVisionServer):

@@ -227,7 +227,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         image_data: List[Union[str, bytes]],
         input_text,
         request_obj,
-        max_req_input_len,
         *args,
         **kwargs,
     ):
@@ -237,7 +236,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             image_data=image_data,
             video_data=request_obj.video_data,
             multimodal_tokens=self.mm_tokens,
-            max_req_input_len=max_req_input_len,
         )
 
         # Qwen-specific: resize images if they are raw Image objects
