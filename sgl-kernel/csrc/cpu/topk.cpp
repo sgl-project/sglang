@@ -642,6 +642,7 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
     switch (num_experts) {
       case 256:
         LAUNCH_BIASED_GROUPED_TOPK_KERNEL(256, 8);
+        break;
       case 384:
         LAUNCH_BIASED_GROUPED_TOPK_KERNEL(384, 8);
         break;
