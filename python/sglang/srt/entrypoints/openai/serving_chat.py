@@ -59,6 +59,8 @@ class OpenAIServingChat(OpenAIServingBase):
         """Validate that the input is valid."""
         if not request.messages:
             return "Messages cannot be empty."
+        
+        return None
 
     def _convert_to_internal_request(
         self,
