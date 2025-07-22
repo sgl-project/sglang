@@ -6,7 +6,10 @@ from functools import wraps
 from typing import List
 
 import torch
-from sgl_kernel.hf3fs_utils import read_shm, write_shm
+from pathlib import Path
+from torch.utils.cpp_extension import load
+root = Path(__file__).parent.resolve()
+hf3fs_utils = load(name="hf3fs_utils", sources=[f"{root}/hf3fs_utils.cpp"])
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +111,7 @@ class Hf3fsClient:
         resv = self.ior_r.submit().wait(min_results=ionum)
 
         # results
-        read_shm(self.shm_r_tensor, tensors)
+        hf3fs_utils.read_shm(self.shm_r_tensor, tensors)
         results = [res.result for res in resv]
 
         return results
@@ -118,7 +121,7 @@ class Hf3fsClient:
         self.check(offsets, tensors)
 
         # prepare
-        write_shm(tensors, self.shm_w_tensor)
+        hf3fs_utils.write_shm(tensors, self.shm_w_tensor)
         current = 0
         for offset, tensor in zip(offsets, tensors):
             size = tensor.numel() * tensor.itemsize

@@ -2,9 +2,12 @@ import multiprocessing.shared_memory
 
 import pytest
 import torch
-from sgl_kernel.hf3fs_utils import read_shm, write_shm
 from tqdm import tqdm
 
+from pathlib import Path
+from torch.utils.cpp_extension import load
+root = Path(__file__).parent.resolve()
+hf3fs_utils = load(name="hf3fs_utils", sources=[f"{root}/hf3fs_utils.cpp"], verbose=True)
 
 def test_rw_shm():
     numel = 8 << 20
@@ -23,8 +26,8 @@ def test_rw_shm():
         torch.empty(numel, dtype=dtype)
         for _ in tqdm(range(page_num), desc="prepare output")
     ]
-    write_shm(a, tshm)
-    read_shm(tshm, b)
+    hf3fs_utils.write_shm(a, tshm)
+    hf3fs_utils.read_shm(tshm, b)
     for _a, _b in tqdm(zip(a, b), desc="assert_close"):
         torch.testing.assert_close(_a, _b)
 

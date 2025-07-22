@@ -241,12 +241,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int cuda_stream) -> ()");
   m.impl("segment_packbits", torch::kCUDA, &segment_packbits);
 
-  // hf3fs_utils.cpp
-  m.def("read_shm(Tensor! shm, Tensor[] dst) -> ()");
-  m.impl("read_shm", torch::kCPU, &read_shm);
-  m.def("write_shm(Tensor[] src, Tensor! shm) -> ()");
-  m.impl("write_shm", torch::kCPU, &write_shm);
-
   /*
    * From csrc/kvcacheio
    */

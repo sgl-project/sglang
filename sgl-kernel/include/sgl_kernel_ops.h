@@ -386,12 +386,6 @@ void segment_packbits(
     int64_t cuda_stream = 0);
 
 /*
- * From csrc/hf3fs
- */
-void read_shm(const torch::Tensor& shm, std::vector<torch::Tensor> dst);
-void write_shm(const std::vector<torch::Tensor> src, torch::Tensor& shm);
-
-/*
  * From csrc/kvcacheio
  */
 void transfer_kv_per_layer(
