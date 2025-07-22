@@ -861,7 +861,6 @@ class ServerArgs:
         )
         parser.add_argument(
             "--disk-cache-max-capacity-gb",
-            "--disk-capacity",
             type=int,
             default=ServerArgs.disk_cache_max_capacity_gb,
             help="The maximum capacity limit of disk kv cache.",

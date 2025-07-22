@@ -28,19 +28,25 @@ KVCache actually holds the physical kv cache.
 
 import abc
 import logging
+import atexit
+import time
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple, Union
-
+import threading
 import numpy as np
 import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
-from sgl_kernel.kvcacheio import transfer_kv_per_layer, transfer_kv_per_layer_mla
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import RLock
+
+from sgl_kernel.kvcacheio import transfer_kv_per_layer, transfer_kv_per_layer_mla
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
+
 
 logger = logging.getLogger(__name__)
 
@@ -467,31 +473,9 @@ class MHATokenToKVPool(KVCache):
             next_power_of_2(len(tgt_loc)),
         )
 
-
-import torch
-import threading
-from typing import Optional, Tuple, Dict
-from concurrent.futures import ThreadPoolExecutor
-from threading import RLock
-from abc import ABC, abstractmethod
-import atexit
-import time
-
-class KVCache(ABC):
-    """Abstract base class for KV cache implementations"""
-
-    @abstractmethod
-    def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        pass
-
-    @abstractmethod
-    def set_kv_buffer(self, layer, loc, cache_k, cache_v, **kwargs):
-        pass
-
-
+# TODO(litteEast7) to complete the metric of MultiLevelKVCache
 class SafeStats:
     """Thread-safe statistics collector"""
-
     def __init__(self):
         self._stats = {
             'disk_hits': 0,
