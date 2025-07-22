@@ -72,12 +72,12 @@ class TestBiasedGroupedTopK(CustomTestCase):
         # expand gating_output by M, otherwise bfloat16 fall into same value aftering truncating
         hidden_states = torch.randn(M, 100, dtype=dtype)
         gating_output = torch.randn(M, E, dtype=dtype) * 2 * M
-        correction_bias = torch.randn(E, dtype=dtype)
+        correction_bias = torch.randn(E, dtype=torch.float32)
 
         ref_topk_weights, ref_topk_ids = native_biased_grouped_topk(
             hidden_states.float(),
             gating_output.float(),
-            correction_bias.float(),
+            correction_bias,
             topk,
             renormalize,
             G,
