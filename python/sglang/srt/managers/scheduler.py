@@ -1899,6 +1899,7 @@ class Scheduler(
             if forward_output.spec_info is not None:
                 spec_info = batch.spec_info = forward_output.spec_info
                 batch.seq_lens = spec_info.new_seq_lens
+                batch.verify_done = spec_info.verify_done
             else:
                 spec_info = None
 

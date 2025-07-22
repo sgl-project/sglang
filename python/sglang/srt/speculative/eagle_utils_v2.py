@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -20,6 +20,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+        EAGLEDraftCudaGraphRunner,
+    )
 
 if is_cuda():
     from sgl_kernel import (
@@ -57,6 +63,7 @@ class EagleDraftInput:
     # Metadata for seq_lens
     allocate_lens: torch.Tensor = None
     new_seq_lens: torch.Tensor = None
+    verify_done: torch.cuda.Event = None
 
     def filter_batch(self, new_indices: torch.Tensor):
         self.topk_p = self.topk_p[: len(new_indices)]
@@ -75,6 +82,40 @@ class EagleDraftInput:
         self.allocate_lens = torch.cat(
             [self.allocate_lens, spec_info.allocate_lens], axis=0
         )
+
+    def prepare_for_draft(
+        self,
+        batch: ModelWorkerBatch,
+        cuda_graph_runner: EAGLEDraftCudaGraphRunner,
+        draft_model_runner: ModelRunner,
+    ):
+        bs = len(batch.seq_lens)
+
+        # Assign cache locations
+        batch.out_cache_loc = torch.empty(
+            (bs * cuda_graph_runner.topk * cuda_graph_runner.num_steps,),
+            dtype=torch.int64,
+            device=batch.input_ids.device,
+        )
+        assign_draft_cache_locs[(bs,)](
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.out_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            cuda_graph_runner.topk,
+            cuda_graph_runner.num_steps,
+        )
+
+        # Get a forward batch
+        batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        self.positions = batch.seq_lens.repeat_interleave(cuda_graph_runner.topk, dim=0)
+        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+
+        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
+        if can_cuda_graph:
+            cuda_graph_runner.replay_prepare(forward_batch)
+        return forward_batch, can_cuda_graph
 
     def prepare_for_extend_to_fill_draft_kvcache(
         self,

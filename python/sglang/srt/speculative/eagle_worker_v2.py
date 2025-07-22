@@ -419,6 +419,9 @@ class EAGLEWorker(TpModelWorker):
             accept_length,
             accept_index,
         ) = spec_info.sample(batch, logits_output)
+        new_seq_lens = seq_lens_backup + accept_length
+        verify_done = torch.cuda.Event()
+        verify_done.record()
 
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
@@ -457,7 +460,6 @@ class EAGLEWorker(TpModelWorker):
         ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
         ret_hidden_states = logits_output_2.hidden_states
         verified_id = predict[accept_index]
-        new_seq_lens = seq_lens_backup + accept_length
         next_batch_verified_id = torch.empty_like(accept_length, dtype=torch.int32)
         fill_new_verified_id[(bs,)](
             verified_id,
@@ -482,6 +484,7 @@ class EAGLEWorker(TpModelWorker):
             verified_id=next_batch_verified_id,
             new_seq_lens=new_seq_lens,
             allocate_lens=old_spec_info.allocate_lens,
+            verify_done=verify_done,
         )
         return ForwardBatchOutput(
             logits_output=logits_output,

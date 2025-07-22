@@ -1038,6 +1038,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         worker = self.draft_worker
         bs = self.batch_size()
 
+        # This overallocates a lot of tokens.
+        # FIXME: we should use self.spec_info.seq_lens instead of self.spec_info.allocate_lens
         new_needed_lens = self.spec_info.allocate_lens + (
             max(
                 bs * worker.num_steps * worker.topk,
@@ -1062,7 +1064,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.spec_info.allocate_lens = new_allocate_lens
 
         # We need this to get the correct self.seq_lens
-        torch.cuda.synchronize()
+        if self.verify_done is not None:
+            self.verify_done.synchronize()
         self.seq_lens_sum = self.seq_lens.sum().item()
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
