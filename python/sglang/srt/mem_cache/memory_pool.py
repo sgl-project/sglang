@@ -530,9 +530,28 @@ class MultiLevelKVCache(KVCache):
                  enable_memory_saver: bool,
                  cache_dir: str = "./kv_cache",
                  prefetch_workers: int = 4,
+                 gpu_cache: Optional[KVCache] = None,
+                 disk_cache_max_capacity_gb: int = 10,
                  start_layer: Optional[int] = None,
                  end_layer: Optional[int] = None):
+        """
+        Initialize the multi-level cache
 
+        Args:
+            size: Total cache capacity in tokens
+            page_size: Size of each memory page
+            dtype: Data type for storage
+            head_num: Number of attention heads
+            head_dim: Dimension of each attention head
+            layer_num: Number of transformer layers
+            device: Target device (e.g., "cuda")
+            enable_memory_saver: Whether to enable memory optimization
+            cache_dir: Directory for disk cache files
+            prefetch_workers: Number of parallel prefetch threads
+            gpu_cache: KVCache that previously used
+            start_layer: First layer index to cache
+            end_layer: Last layer index to cache
+        """
         self.size = size
         self.page_size = page_size
         self.dtype = dtype
@@ -543,14 +562,18 @@ class MultiLevelKVCache(KVCache):
 
         # Initialize components
         self.disk_cache = DiskKVCache(
-            size, page_size, dtype, head_num, head_dim, layer_num, cache_dir
+            size, page_size, dtype, head_num, head_dim, layer_num,
+            disk_cache_max_capacity_gb, cache_dir
         )
 
         # Initialize GPU cache (with built-in CPU caching)
-        self.gpu_cache = MHATokenToKVPool(
-            size, page_size, dtype, head_num, head_dim, layer_num,
-            device, enable_memory_saver, start_layer, end_layer
-        )
+        if gpu_cache != None:
+            self.gpu_cache = gpu_cache
+        else:
+            self.gpu_cache = MHATokenToKVPool(
+                size, page_size, dtype, head_num, head_dim, layer_num,
+                device, enable_memory_saver, start_layer, end_layer
+            )
 
         # Thread safety controls
         self.prefetch_executor = ThreadPoolExecutor(max_workers=prefetch_workers)
@@ -606,10 +629,7 @@ class MultiLevelKVCache(KVCache):
         # Asynchronously update disk cache
         def update_disk():
             try:
-                k_disk, v_disk = self.disk_cache.get_kv_buffer(layer_id)
-                with self.disk_cache._file_locks[layer_id]:
-                    k_disk[loc] = cache_k.cpu()
-                    v_disk[loc] = cache_v.cpu()
+                self.disk_cache.set_kv_buffer(layer_id, loc, cache_k, cache_v)
             except Exception as e:
                 self.stats.increment('errors')
                 print(f"Disk update failed layer {layer_id}: {str(e)}")

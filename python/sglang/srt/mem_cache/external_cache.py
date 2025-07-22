@@ -3,7 +3,7 @@ import torch
 from threading import RLock
 from typing import Tuple, Dict
 
-
+GB = 1024 * 1024 * 1024
 class DiskKVCache:
     """
     Thread-safe disk-based KV cache using memory-mapped files
@@ -17,6 +17,7 @@ class DiskKVCache:
                  head_num: int,
                  head_dim: int,
                  layer_num: int,
+                 max_capacity_gb: int = 10,
                  cache_dir: str = "./kv_cache"):
         """
         Initialize disk cache with memory-mapped files
@@ -38,6 +39,11 @@ class DiskKVCache:
         self.layer_num = layer_num
         self.cache_dir = cache_dir
         self._file_locks: Dict[int, RLock] = {}  # Per-layer file locks
+        self.max_capacity_gb = max_capacity_gb
+        self.available_layers = set()
+
+        # check the capacity
+        self._check_capacity()
 
         os.makedirs(cache_dir, exist_ok=True)
 
@@ -48,28 +54,43 @@ class DiskKVCache:
             self._file_locks[i] = RLock()
             self._initialize_layer_file(i)
 
+    def _check_capacity(self):
+        """Check if the maximum capacity limit is exceeded"""
+        if self.max_capacity_gb is None:
+            return
+
+        total_elements = (self.size + self.page_size) * self.head_num * self.head_dim
+        element_size = torch.tensor([], dtype=self.dtype).element_size()
+        total_size_gb = (total_elements * element_size * self.layer_num * 2) / GB
+
+        if total_size_gb > self.max_capacity_gb:
+            raise ValueError(
+                f"Requested cache size {total_size_gb:.2f}GB "
+                f"exceeds maximum capacity {self.max_capacity_gb}GB"
+            )
+
     def _initialize_layer_file(self, layer_id: int):
         """Create and initialize memory-mapped file for single layer"""
         file_path = os.path.join(self.cache_dir, f"layer_{layer_id}.bin")
 
         # Calculate required file size
         element_size = torch.tensor([], dtype=self.dtype).element_size()
-        file_size = (self.size + self.page_size) * self.head_num * self.head_dim * element_size
+        file_size = (self.size + self.page_size) * self.head_num * self.head_dim * element_size * 2
 
         # Pre-allocate file space
         with open(file_path, "wb") as f:
             f.truncate(file_size)
 
         # Create memory-mapped tensors
-        k_buffer = torch.from_file(
+        cache_buffer = torch.from_file(
             file_path,
             dtype=self.dtype,
-            size=(self.size + self.page_size) * self.head_num * self.head_dim,
+            size=(self.size + self.page_size) * self.head_num * self.head_dim * 2,
             shared=True  # Enable multi-process sharing
-        ).view(self.size + self.page_size, self.head_num, self.head_dim)
+        ).view(2, self.size + self.page_size, self.head_num, self.head_dim)
 
-        self.k_buffers.append(k_buffer)
-        self.v_buffers.append(k_buffer.clone())
+        self.k_buffers.append(cache_buffer[0])
+        self.v_buffers.append(cache_buffer[1])
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -82,7 +103,16 @@ class DiskKVCache:
             Tuple of (key_buffer, value_buffer) tensors
         """
         with self._file_locks[layer_id]:
-            return self.k_buffers[layer_id], self.v_buffers[layer_id]
+            if layer_id not in self.available_layers:
+                raise RuntimeError(f"layer {layer_id}'s kvcache is not set")
+            else:
+                return self.k_buffers[layer_id], self.v_buffers[layer_id]
+
+    def set_kv_buffer(self, layer_id: int, loc: int, k_cache: torch.Tensor, v_cache: torch.Tensor):
+        with self._file_locks[layer_id]:
+            self.available_layers.add(layer_id)
+            self.k_buffers[layer_id][loc] = k_cache.cpu()
+            self.v_buffers[layer_id][loc] = v_cache.cpu()
 
     def cleanup(self):
         """Clean up all cache resources"""
