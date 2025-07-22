@@ -39,11 +39,20 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 elif _is_cpu and _is_cpu_amx_available:
     pass
+elif _is_hip:
+    from vllm import _custom_ops as vllm_ops  # gelu_and_mul, silu_and_mul
+
+    if _use_aiter:
+        try:
+            from aiter import moe_sum
+        except ImportError:
+            raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 else:
     from vllm import _custom_ops as vllm_ops
     from vllm._custom_ops import scaled_fp8_quant
@@ -1521,11 +1530,7 @@ def fused_experts_impl(
     routed_scaling_factor: Optional[float] = None,
 ):
     padded_size = padding_size
-    if (
-        not (use_fp8_w8a8 or use_int8_w8a8)
-        or block_shape is not None
-        or (_is_hip and get_bool_env_var("SGLANG_USE_AITER"))
-    ):
+    if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
         padded_size = 0
 
     # Check constraints.
@@ -1723,6 +1728,17 @@ def fused_experts_impl(
                         out_hidden_states[begin_chunk_idx:end_chunk_idx],
                         routed_scaling_factor,
                     )
+        elif _is_hip:
+            if _use_aiter:
+                moe_sum(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                )
+            else:
+                vllm_ops.moe_sum(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                )
         else:
             vllm_ops.moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),

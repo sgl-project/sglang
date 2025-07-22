@@ -54,13 +54,10 @@ _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if not _is_npu:
+if not (_is_npu or _is_hip):
     from sgl_kernel import silu_and_mul
 
     from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
-
-if _is_hip:
-    from vllm._custom_ops import scaled_fp8_quant
 
 if _use_aiter:
     from aiter import ActivationType, QuantType
