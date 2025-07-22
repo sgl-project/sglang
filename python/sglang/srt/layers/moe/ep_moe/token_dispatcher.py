@@ -1,3 +1,4 @@
+import os
 import logging
 from dataclasses import dataclass
 
@@ -242,7 +243,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         topk_idx = topk_idx.to(torch.int64)
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        #TODO gjw
+        if  os.getenv('USE_W4A8')=="1":
+            hidden_states=hidden_states
+        elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -255,7 +259,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return hidden_states, topk_idx, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        if   os.getenv('USE_W4A8')!="1" and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM :
             (
                 hidden_states,
                 topk_idx,
@@ -357,7 +361,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and os.getenv('USE_W4A8')!="1" else 1,
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
 
@@ -430,7 +434,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter:
+        if  (os.getenv('USE_W4A8')!="1"and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM )or _use_aiter:
             output = hidden_states
         else:
             if hidden_states.shape[0] > 0:
