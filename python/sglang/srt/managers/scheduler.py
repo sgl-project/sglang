@@ -445,6 +445,9 @@ class Scheduler(
             self.current_stream.synchronize = lambda: None  # No-op for CPU
         self.forward_sleep_time = None
         self.forward_stream = torch.get_device_module(self.device).Stream()
+        self.forward_stream_ctx = torch.get_device_module(self.device).stream(
+            self.forward_stream
+        )
         self.copy_stream = torch.get_device_module(self.device).Stream()
 
         # Init chunked prefill
@@ -1882,7 +1885,7 @@ class Scheduler(
                 )
 
                 # Run forward in a separate stream to avoid blocking the main stream.
-                with torch.cuda.stream(self.forward_stream):
+                with self.forward_stream_ctx:
                     forward_output = self.forward_worker.forward_batch_generation(
                         model_worker_batch
                     )

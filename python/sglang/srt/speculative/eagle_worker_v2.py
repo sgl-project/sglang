@@ -247,7 +247,6 @@ class EAGLEWorker(TpModelWorker):
         if can_cuda_graph:
             score_list, token_list, parents_list = self.cuda_graph_runner.replay(
                 forward_batch,
-                skip_attn_backend_init=True,
             )
         else:
             self.draft_attn_backend.init_forward_metadata(forward_batch)

@@ -111,10 +111,7 @@ class EagleDraftInput:
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
         self.positions = batch.seq_lens.repeat_interleave(cuda_graph_runner.topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
-
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
-        if can_cuda_graph:
-            cuda_graph_runner.replay_prepare(forward_batch)
         return forward_batch, can_cuda_graph
 
     def prepare_for_extend_to_fill_draft_kvcache(
