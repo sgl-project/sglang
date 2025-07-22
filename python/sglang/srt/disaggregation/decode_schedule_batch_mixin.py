@@ -62,38 +62,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
             req.already_computed = seq_len
             req.is_retracted = False
             pre_lens.append(pre_len)
-            if req.logprob_start_len >= pre_len:
-                req.extend_logprob_start_len = min(
-                    req.logprob_start_len - pre_len,
-                    req.extend_input_len,
-                    req.seqlen - 1,
-                )
-                global_start_idx, global_end_idx = (
-                    len(req.prefix_indices),
-                    len(req.fill_ids),
-                )
+            req.extend_logprob_start_len = 0
 
-                # Apply logprob_start_len
-                if global_start_idx < req.logprob_start_len:
-                    global_start_idx = req.logprob_start_len
-
-                logprob_token_ids = req.origin_input_ids[
-                    global_start_idx + 1 : global_end_idx + 1
-                ]
-                extend_input_logprob_token_ids.extend(logprob_token_ids)
-
-                extend_input_logprob_token_ids.extend(
-                    [0]
-                    * (
-                        req.extend_input_len
-                        - req.extend_logprob_start_len
-                        - len(logprob_token_ids)
-                    )
-                )
-
-            else:
-                req.extend_logprob_start_len = 0
-                extend_input_logprob_token_ids = None
+        extend_input_logprob_token_ids = None
 
         # Set fields
         self.input_ids = torch.tensor(
@@ -129,7 +100,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.output_ids = []
         for req in self.reqs:
             self.output_ids.append(req.output_ids[-1])
-            self.tree_cache.cache_unfinished_req(req)
             if req.grammar is not None:
                 req.grammar.accept_token(req.output_ids[-1])
                 req.grammar.finished = req.finished()

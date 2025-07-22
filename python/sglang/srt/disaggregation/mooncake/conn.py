@@ -83,7 +83,7 @@ class TransferInfo:
         else:
             dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
             dst_aux_index = int(msg[5].decode("ascii"))
-            prefix_cache_len = int(msg[6].decode("ascii"))
+            prefix_cache_len = int(msg[7].decode("ascii"))
             is_dummy = False
         return cls(
             room=int(msg[0].decode("ascii")),
@@ -929,20 +929,21 @@ class MooncakeKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
     ):
-        session_id = next(iter(self.kv_mgr.transfer_infos[self.bootstrap_room]))
-        decode_prefix_cache_len = self.kv_mgr.transfer_infos[self.bootstrap_room][
-            session_id
-        ].prefix_cache_len
-        if decode_prefix_cache_len >= self.curr_idx + len(kv_indices):
-            if decode_prefix_cache_len == self.num_kv_indices:
-                kv_indices = np.empty(0, dtype=np.int32)
+        if self.bootstrap_room in self.kv_mgr.transfer_infos:
+            session_id = next(iter(self.kv_mgr.transfer_infos[self.bootstrap_room]))
+            decode_prefix_cache_len = self.kv_mgr.transfer_infos[self.bootstrap_room][
+                session_id
+            ].prefix_cache_len
+            if decode_prefix_cache_len >= self.curr_idx + len(kv_indices):
+                if decode_prefix_cache_len == self.num_kv_indices:
+                    kv_indices = np.empty(0, dtype=np.int32)
+                    self.curr_idx = decode_prefix_cache_len
+                else:
+                    self.curr_idx += len(kv_indices)
+                    return
+            elif decode_prefix_cache_len > self.curr_idx:
+                kv_indices = kv_indices[decode_prefix_cache_len - self.curr_idx :]
                 self.curr_idx = decode_prefix_cache_len
-            else:
-                self.curr_idx += len(kv_indices)
-                return
-        elif decode_prefix_cache_len > self.curr_idx:
-            kv_indices = kv_indices[decode_prefix_cache_len - self.curr_idx :]
-            self.curr_idx = decode_prefix_cache_len
 
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
@@ -1266,7 +1267,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
                         kv_indices.tobytes() if not is_dummy else b"",
                         str(aux_index).encode("ascii") if not is_dummy else b"",
                         str(self.required_dst_info_num).encode("ascii"),
-                        str(prefix_cache_len).encode("ascii"),
+                        str(prefix_cache_len // self.kv_mgr.kv_args.page_size).encode(
+                            "ascii"
+                        ),
                     ]
                 )
         self.init_time = time.time()
