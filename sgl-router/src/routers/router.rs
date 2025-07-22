@@ -322,43 +322,6 @@ impl Router {
         }
     }
 
-    pub async fn get_all_loads(
-        &self,
-        client: &reqwest::Client,
-        _req: &HttpRequest,
-    ) -> HttpResponse {
-        let urls = self.get_worker_urls();
-        let prefill_urls: Vec<String> = Vec::new();
-        let decode_urls = urls;
-
-        // Collect loads from all servers
-        let mut prefill_loads = Vec::new();
-        let mut decode_loads = Vec::new();
-
-        // Get prefill loads
-        for url in &prefill_urls {
-            let load = self.get_worker_load(client, url).await.unwrap_or(-1);
-            prefill_loads.push(serde_json::json!({
-                "engine": format!("(Prefill@{})", url),
-                "load": load as i64
-            }));
-        }
-
-        // Get decode loads
-        for url in &decode_urls {
-            let load = self.get_worker_load(client, url).await.unwrap_or(-1);
-            decode_loads.push(serde_json::json!({
-                "engine": format!("(Decode@{})", url),
-                "load": load as i64
-            }));
-        }
-
-        HttpResponse::Ok().json(serde_json::json!({
-            "prefill": prefill_loads,
-            "decode": decode_loads
-        }))
-    }
-
     // New method to route typed requests directly
     pub async fn route_typed_request<
         T: crate::openai_api_types::GenerationRequest + serde::Serialize + Clone,
