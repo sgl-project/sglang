@@ -25,6 +25,7 @@ from transformers import PretrainedConfig
 from sglang.srt.hf_transformers_utils import (
     get_config,
     get_context_length,
+    get_generation_config,
     get_hf_text_config,
 )
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
@@ -52,7 +53,7 @@ class ModelConfig:
         trust_remote_code: bool = True,
         revision: Optional[str] = None,
         context_length: Optional[int] = None,
-        model_override_args: Optional[str] = None,
+        model_override_args: str = "{}",
         is_embedding: Optional[bool] = None,
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
@@ -60,13 +61,13 @@ class ModelConfig:
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
-        impl: Union[str, ModelImpl] = ModelImpl.AUTO,
+        model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
     ) -> None:
 
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
-        self.impl = impl
+        self.model_impl = model_impl
 
         # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
@@ -80,6 +81,13 @@ class ModelConfig:
             trust_remote_code=trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
+            **kwargs,
+        )
+
+        self.hf_generation_config = get_generation_config(
+            self.model_path,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
             **kwargs,
         )
 
@@ -278,7 +286,7 @@ class ModelConfig:
             dtype=server_args.dtype,
             quantization=server_args.quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
-            impl=server_args.impl,
+            model_impl=server_args.model_impl,
             **kwargs,
         )
 
@@ -383,6 +391,7 @@ class ModelConfig:
             "compressed-tensors",
             "fbgemm_fp8",
             "w8a8_fp8",
+            "petit_nvfp4",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -400,9 +409,11 @@ class ModelConfig:
             "moe_wna16",
             "qoq",
             "w4afp8",
+            "petit_nvfp4",
         ]
         compatible_quantization_methods = {
             "modelopt_fp4": ["modelopt"],
+            "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
@@ -413,7 +424,9 @@ class ModelConfig:
         quant_cfg = self._parse_quant_hf_config()
 
         if quant_cfg is not None:
-            quant_method = quant_cfg.get("quant_method", "").lower()
+            quant_method = quant_cfg.get(
+                "quant_method", "" if not self.quantization else self.quantization
+            ).lower()
 
             # Detect which checkpoint is it
             for _, method in QUANTIZATION_METHODS.items():
@@ -465,6 +478,19 @@ class ModelConfig:
         if eos_ids:
             # it can be either int or list of int
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
+        if eos_ids is None:
+            eos_ids = set()
+        if self.hf_generation_config:
+            generation_eos_ids = getattr(
+                self.hf_generation_config, "eos_token_id", None
+            )
+            if generation_eos_ids:
+                generation_eos_ids = (
+                    {generation_eos_ids}
+                    if isinstance(generation_eos_ids, int)
+                    else set(generation_eos_ids)
+                )
+                eos_ids = eos_ids | generation_eos_ids
         return eos_ids
 
     def maybe_pull_model_tokenizer_from_remote(self) -> None:
@@ -688,7 +714,6 @@ def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int)
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
     else:
-        raise ValueError(
-            "get_hybrid_layer_ids is only implemented for Llama4ForConditionalGeneration"
-        )
+        swa_attention_layer_ids = None
+        full_attention_layer_ids = None
     return swa_attention_layer_ids, full_attention_layer_ids
