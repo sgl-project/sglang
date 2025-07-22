@@ -2878,7 +2878,9 @@ class Scheduler(
             self.enable_hierarchical_cache = False
             # cuda graph
             self.server_args.disable_cuda_graph = recv_req.disable_cuda_graph
-            self.server_args.cuda_graph_max_bs = recv_req.cuda_graph_max_bs
+            if recv_req.cuda_graph_max_bs:
+                # ServerArgs init will set cuda_graph_max_bs to a num.
+                self.server_args.cuda_graph_max_bs = recv_req.cuda_graph_max_bs
             self.server_args.cuda_graph_bs = recv_req.cuda_graph_bs
             self.server_args.disable_cuda_graph_padding = recv_req.disable_cuda_graph_padding
             self.server_args.enable_profile_cuda_graph = recv_req.enable_profile_cuda_graph

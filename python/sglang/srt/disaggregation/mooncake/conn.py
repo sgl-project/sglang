@@ -141,6 +141,7 @@ class MooncakeKVManager(BaseKVManager):
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
         self.enable_dp_attention = server_args.enable_dp_attention
+        self.stop_event = threading.Event()
         if not server_args.enable_dp_attention and server_args.dp_size != 1:
             raise ValueError(
                 "If dp_attention is not enabled, dp size must be 1 in disaggregation mode."
@@ -148,7 +149,6 @@ class MooncakeKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self.rank_port = None
         self.server_socket = zmq.Context().socket(zmq.PULL)
-        self.stop_event = threading.Event()
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
@@ -485,9 +485,11 @@ class MooncakeKVManager(BaseKVManager):
     def transfer_worker(
         self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
     ):
-        while not self.stop_event.is_set():
+        while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                if kv_chunk is None:
+                    break
                 reqs_to_be_processed = (
                     self.transfer_infos[kv_chunk.room].values()
                     if kv_chunk.room in self.transfer_infos
@@ -624,8 +626,10 @@ class MooncakeKVManager(BaseKVManager):
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
-            while not self.stop_event.is_set():
+            while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                if waiting_req_bytes[0] == b"__EXIT__":
+                    break
                 room = waiting_req_bytes[0].decode("ascii")
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
@@ -653,7 +657,7 @@ class MooncakeKVManager(BaseKVManager):
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.update_status(room, KVPoll.WaitingForInput)
-
+            self.server_socket.close()
         threading.Thread(target=bootstrap_thread).start()
 
     def start_decode_thread(self):
@@ -661,10 +665,11 @@ class MooncakeKVManager(BaseKVManager):
         self.server_socket.bind(f"tcp://{self.local_ip}:{self.rank_port}")
 
         def decode_thread():
-            while not self.stop_event.is_set():
-                (bootstrap_room, status, prefill_rank) = (
-                    self.server_socket.recv_multipart()
-                )
+            while True:
+                recv_list = self.server_socket.recv_multipart()
+                if recv_list[0] == b"__EXIT__":
+                    break
+                (bootstrap_room, status, prefill_rank) = recv_list
                 status = int(status.decode("ascii"))
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
                 prefill_rank = int(prefill_rank.decode("ascii"))
@@ -689,10 +694,13 @@ class MooncakeKVManager(BaseKVManager):
                         f"Failed to get kvcache from prefill instance, it might be dead",
                     )
                     self.update_status(bootstrap_room, status)
-
+            self.server_socket.close()
+        
         def heartbeat_checker():
             while True:
-                time.sleep(self.heartbeat_interval)
+                self.stop_event.wait(self.heartbeat_interval)
+                if self.stop_event.is_set():
+                    break
                 with self.connection_lock:
                     addresses = list(self.prefill_dp_size_table.keys())
 
@@ -878,36 +886,35 @@ class MooncakeKVManager(BaseKVManager):
             f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), affected {len(affected_rooms)} requests"
         )
 
-    def __del__(self):
-        self.stop_event.set()
-
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+    def stop_all_threads(self):
+        self._connect(f"tcp://{self.local_ip}:{self.rank_port}").send_multipart([b"__EXIT__"])
+        if hasattr(self, "transfer_queues"):
+            # quit all transfer threads, for prefill
             for queue in self.transfer_queues:
-                while not queue.empty():
-                    queue._buf.popleft()
+                queue.put(None)
+        else:
+            self.stop_event.set()
+    
+        self._connect.cache_clear()
+            
+
+    
+    def __del__(self):
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for executor in self.executors:
                 executor.shutdown(wait=True)
-            self.server_socket.close()
         else:
             with self.session_pool_lock:
                 for session in self.session_pool.values():
                     session.close()
                 self.session_pool.clear()
 
-        if hasattr(self._connect, 'cache_clear'):
-            # release socket in _connect function
-            for socket in self._connect.cache.values():
-                socket.close()
-            self._connect.cache_clear()
-        for kv_data_ptr, kv_data_len in zip(
-            self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
-        ):
-            self.engine.deregister(kv_data_ptr, kv_data_len)
+        for kv_data_ptr in self.kv_args.kv_data_ptrs:
+            self.engine.deregister(kv_data_ptr)
 
-        for aux_data_ptr, aux_data_len in zip(
-            self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
-        ):
-            self.engine.deregister(aux_data_ptr, aux_data_len)
+        for aux_data_ptr in self.kv_args.aux_data_ptrs:
+            self.engine.deregister(aux_data_ptr)
+        
         del self.engine
 
 class MooncakeKVSender(BaseKVSender):

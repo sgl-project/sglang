@@ -532,6 +532,7 @@ class DecodePreallocQueue:
             raise RuntimeError(
                 "This could not happen, cause we should have flushed cache before releasing the queue"
             )
+        self.kv_manager.stop_all_threads()
         del self.kv_manager
 
 class DecodeTransferQueue:
@@ -659,13 +660,6 @@ class DecodeTransferQueue:
         ]
 
         return transferred_reqs
-
-    def __del__(self):
-        # when we release this, we have done flush_cache, so we can free all elements in queue
-        if len(self.queue) > 0:
-            raise RuntimeError(
-                "This could not happen, cause we should have flushed cache before releasing the queue"
-                )
 
 class SchedulerDisaggregationDecodeMixin:
 

@@ -257,6 +257,7 @@ class PrefillBootstrapQueue:
             return bootstrapped_reqs, failed_reqs
 
     def __del__(self):
+        self.kv_manager.stop_all_threads()
         del self.kv_manager
 
 class SchedulerDisaggregationPrefillMixin:
