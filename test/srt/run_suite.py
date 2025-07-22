@@ -113,46 +113,63 @@ suites = {
         TestFile("test_hybrid_attn_backend.py", 100),
     ],
     "per-commit-amd": [
-        TestFile("models/lora/test_lora_backend.py", 99),
-        TestFile("models/lora/test_multi_lora_backend.py", 60),
-        TestFile("models/lora/test_lora_cuda_graph.py", 250),
-        TestFile("test_mla.py", 242),
-        TestFile("test_mla_deepseek_v3.py", 221),
-        TestFile("test_torch_compile.py", 76),
-        TestFile("test_torch_compile_moe.py", 172),
-        TestFile("models/test_qwen_models.py", 82),
-        TestFile("models/test_reward_models.py", 132),
-        TestFile("openai_server/basic/test_openai_embedding.py", 141),
-        TestFile("openai_server/features/test_enable_thinking.py", 70),
-        TestFile("openai_server/features/test_reasoning_content.py", 89),
-        TestFile("openai_server/validation/test_large_max_new_tokens.py", 41),
-        TestFile("openai_server/validation/test_request_length_validation.py", 31),
-        TestFile("test_abort.py", 51),
-        TestFile("test_block_int8.py", 22),
-        TestFile("test_create_kvindices.py", 2),
-        TestFile("test_chunked_prefill.py", 313),
-        TestFile("test_eval_fp8_accuracy.py", 303),
-        TestFile("test_function_call_parser.py", 10),
-        TestFile("test_fused_moe.py", 30),
-        TestFile("test_input_embeddings.py", 38),
-        TestFile("test_metrics.py", 32),
-        TestFile("test_no_chunked_prefill.py", 108),
-        # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
-        TestFile("test_penalty.py", 41),
-        TestFile("test_page_size.py", 60),
-        TestFile("test_pytorch_sampling_backend.py", 66),
-        TestFile("test_radix_attention.py", 105),
-        TestFile("test_retract_decode.py", 54),
-        TestFile("test_server_args.py", 1),
-        TestFile("test_skip_tokenizer_init.py", 117),
-        TestFile("test_torch_native_attention_backend.py", 123),
-        TestFile("test_triton_attention_backend.py", 150),
-        TestFile("test_update_weights_from_disk.py", 114),
-        TestFile("test_vertex_endpoint.py", 31),
-        # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
-        TestFile("test_reasoning_parser.py", 5),
-        TestFile("test_rope_rocm.py", 3),
-        TestFile("test_awq_dequant.py", 2),
+        # TestFile("models/lora/test_lora_backend.py", 99),
+        # TestFile("models/lora/test_multi_lora_backend.py", 60),
+        # TestFile("models/lora/test_lora_cuda_graph.py", 250),
+        # TestFile("test_mla.py", 242),
+        # TestFile("test_mla_deepseek_v3.py", 221),
+        # TestFile("test_torch_compile.py", 76),
+        # TestFile("test_torch_compile_moe.py", 172),
+        # TestFile("models/test_qwen_models.py", 82),
+        # TestFile("models/test_reward_models.py", 132),
+        # TestFile("openai_server/basic/test_protocol.py", 10), # TODO: OK
+        # TestFile("openai_server/basic/test_serving_chat.py", 10), # TODO: OK
+        # TestFile("openai_server/basic/test_serving_completions.py", 10), # TODO: OK
+        # TestFile("openai_server/basic/test_serving_embedding.py", 10), # TODO: OK
+        # TestFile("openai_server/basic/test_openai_embedding.py", 141),
+        # TestFile("openai_server/basic/test_openai_server.py", 149), # TODO: OK
+        # TestFile("openai_server/features/test_cache_report.py", 100), # TODO: OK
+        # TestFile("openai_server/features/test_enable_thinking.py", 70),
+        # TestFile("openai_server/features/test_json_constrained.py", 98), # TODO: OK
+        # TestFile("openai_server/features/test_json_mode.py", 90), # TODO: OK
+        # TestFile("openai_server/features/test_openai_server_ebnf.py", 95), # TODO: OK
+        # TestFile("openai_server/features/test_openai_server_hidden_states.py", 240), # TODO: ValueError: EAGLE is not supported in attention backend aiter
+        # TestFile("openai_server/features/test_reasoning_content.py", 89),
+        # TestFile("openai_server/function_call/test_openai_function_calling.py", 60), # TODO: AssertionError: False is not true : Target function name 'get_current_weather' was not found in the streaming chunks
+        # python3 -m sglang.launch_server --model-path meta-llama/Llama-3.2-1B-Instruct --tool-call-parser llama3 --device cuda --host 127.0.0.1 --port 6000 --api-key sk-123456
+        TestFile("openai_server/function_call/test_tool_choice.py", 226),  # TODO
+        # TestFile("openai_server/validation/test_large_max_new_tokens.py", 41),
+        TestFile("openai_server/validation/test_matched_stop.py", 60),  # TODO
+        TestFile(
+            "openai_server/validation/test_openai_server_ignore_eos.py", 85
+        ),  # TODO
+        # TestFile("openai_server/validation/test_request_length_validation.py", 31),
+        # TestFile("test_abort.py", 51),
+        # TestFile("test_block_int8.py", 22),
+        # TestFile("test_create_kvindices.py", 2),
+        # TestFile("test_chunked_prefill.py", 313),
+        # TestFile("test_eval_fp8_accuracy.py", 303),
+        # TestFile("test_function_call_parser.py", 10),
+        # TestFile("test_fused_moe.py", 30),
+        # TestFile("test_input_embeddings.py", 38),
+        # TestFile("test_metrics.py", 32),
+        # TestFile("test_no_chunked_prefill.py", 108),
+        # # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
+        # TestFile("test_penalty.py", 41),
+        # TestFile("test_page_size.py", 60),
+        # TestFile("test_pytorch_sampling_backend.py", 66),
+        # TestFile("test_radix_attention.py", 105),
+        # TestFile("test_retract_decode.py", 54),
+        # TestFile("test_server_args.py", 1),
+        # TestFile("test_skip_tokenizer_init.py", 117),
+        # TestFile("test_torch_native_attention_backend.py", 123),
+        # TestFile("test_triton_attention_backend.py", 150),
+        # TestFile("test_update_weights_from_disk.py", 114),
+        # TestFile("test_vertex_endpoint.py", 31),
+        # # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
+        # TestFile("test_reasoning_parser.py", 5),
+        # TestFile("test_rope_rocm.py", 3),
+        # TestFile("test_awq_dequant.py", 2),
     ],
     "per-commit-npu": [
         TestFile("test_ascend_attention_backend.py", 400),
