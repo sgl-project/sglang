@@ -37,7 +37,6 @@ from aiter.utility.fp4_utils import e8m0_shuffle
 from aiter.ops.gemm_op_a4w4 import gemm_a4w4
 
 from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
-from aiter.ops.triton.mxfp import upcast_from_mxfp
 
 __all__ = ["Fp4MoEMethod", "W4A4MXFp4MoEDynamicMethod", "W4A4MXFp4MoEStaticMethod"]
 
@@ -340,26 +339,26 @@ class Fp4LinearMethod(LinearMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        #return 
-        if self.quantization_config.is_checkpoint_fp4_serialized:
-            layer.scheme.process_weights_after_loading(layer)
-        else:
-            #w, w_scales = dynamic_mxfp4_quant(layer.weight.data)
-            ##log_info_on_rank0(logger, f"w.shape: {w.shape}")
+        return 
+        #if self.quantization_config.is_checkpoint_fp4_serialized:
+        #    layer.scheme.process_weights_after_loading(layer)
+        #else:
+        #    #w, w_scales = dynamic_mxfp4_quant(layer.weight.data)
+        #    ##log_info_on_rank0(logger, f"w.shape: {w.shape}")
 
-            #wshuffle = w#shuffle_weight(w, layout=(16, 16))
-            #w_scales_shuffle = w_scales#e8m0_shuffle(w_scales).view(dtypes.fp8_e8m0)
+        #    #wshuffle = w#shuffle_weight(w, layout=(16, 16))
+        #    #w_scales_shuffle = w_scales#e8m0_shuffle(w_scales).view(dtypes.fp8_e8m0)
 
-            quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+        #    quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
 
-            w, w_scales_shuffle = quant_func(layer.weight.data, shuffle=True)
+        #    w, w_scales_shuffle = quant_func(layer.weight.data, shuffle=True)
 
-            wshuffle = shuffle_weight(w, layout=(16, 16))
+        #    wshuffle = shuffle_weight(w, layout=(16, 16))
 
-            layer.weight = torch.nn.Parameter(wshuffle,
-                                              requires_grad=False)
-            layer.weight_scale = torch.nn.Parameter(w_scales_shuffle,
-                                                    requires_grad=False)
+        #    layer.weight = torch.nn.Parameter(wshuffle,
+        #                                      requires_grad=False)
+        #    layer.weight_scale = torch.nn.Parameter(w_scales_shuffle,
+        #                                            requires_grad=False)
 
     def create_weights(self, layer: torch.nn.Module,
                        input_size_per_partition: int,
@@ -419,43 +418,33 @@ class Fp4LinearMethod(LinearMethodBase):
                 raise ValueError("A scheme must be defined for each layer")
             return scheme.apply_weights(layer, x, bias=bias)
         else:
-
-            #dq_w = upcast_from_mxfp(layer.weight, layer.weight_scale, x.dtype, axis=1, swizzle_axis=None)
-            #out = F.linear(x, dq_w, bias)
-
-            #out = F.linear(x, layer.weight.data, bias) 
-
             out_dtype = x.dtype
 
             # ck or asm implement
-            M = x.shape[0]
-            N = layer.weight.shape[0]
+            #M = x.shape[0]
+            #N = layer.weight.shape[0]
 
 
-            quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+            #quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
 
-            x, x_scales_shuffle = quant_func(x, shuffle=True)
+            #x, x_scales_shuffle = quant_func(x, shuffle=True)
 
-            #log_info_on_rank0(logger, f"x.shape: {x.shape} x_scales_shuffle.shape: {x_scales_shuffle.shape} layer.weight.data: {layer.weight.data.shape} layer.weight_scale.data: {layer.weight_scale.data.shape}")
+            #y = torch.zeros((M + 255) // 256 * 256, N, device=x.device, dtype=out_dtype)
 
-            y = torch.zeros((M + 255) // 256 * 256, N, device=x.device, dtype=out_dtype)
+            #out = gemm_a4w4(x, layer.weight.data, x_scales_shuffle, layer.weight_scale.data, y, bias=bias)
 
-            out = gemm_a4w4(x, layer.weight.data, x_scales_shuffle, layer.weight_scale.data, y, bias=bias)
-
-            return out[:M]
+            #return out[:M]
 
             # triton implement
-            #x_q, x_s = dynamic_mxfp4_quant(x)
-            #y = torch.empty(x_q.shape[0],
-            #                    layer.weight.shape[0],
-            #                    device=x_q.device,
-            #                    dtype=out_dtype)
+            x_q, x_s = dynamic_mxfp4_quant(x)
+            y = torch.empty(x_q.shape[0],
+                                layer.weight.shape[0],
+                                device=x_q.device,
+                                dtype=out_dtype)
 
-            #out = gemm_afp4wfp4(x_q, layer.weight, x_s, layer.weight_scale, out_dtype, y)
+            out = gemm_afp4wfp4(x_q, layer.weight, x_s, layer.weight_scale, out_dtype, y)
 
-            #log_info_on_rank0(logger, f"out.dtype: {out.dtype} out.shape: {out.shape} out_dtype: {out_dtype}")
-
-            #return out
+            return out
 
 class Fp4MoEMethod():
     def __new__(cls, *args, **kwargs):

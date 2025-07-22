@@ -13,7 +13,6 @@ from sglang.srt.utils import get_bool_env_var, supports_mx
 
 from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
-from aiter.ops.triton.mxfp import upcast_from_mxfp
 from aiter.ops.gemm_op_a4w4 import gemm_a4w4
 from aiter.ops.shuffle import shuffle_weight
 
