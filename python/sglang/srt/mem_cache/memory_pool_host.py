@@ -314,3 +314,24 @@ class MLATokenToKVPoolHost(HostKVCache):
             1,
             self.kv_lora_rank + self.qk_rope_head_dim,
         )
+
+_class_mapping = {
+    MHATokenToKVPool: MHATokenToKVPoolHost,
+    MLATokenToKVPool: MLATokenToKVPoolHost,
+}
+
+
+def get_host_kvcache(
+    device_pool: KVCache,
+    host_to_device_ratio: float,
+    host_size: int,
+    page_size: int,
+    pin_memory: bool = True,
+    device: str = "cpu",
+):
+    try:
+        return _class_mapping[type(device_pool)](
+            device_pool, host_to_device_ratio, host_size, page_size, pin_memory, device
+        )
+    except KeyError:
+        raise ValueError(f"Unsupported device pool type: {type(device_pool)}")

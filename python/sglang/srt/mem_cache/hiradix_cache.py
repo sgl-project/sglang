@@ -14,10 +14,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.memory_pool_host import (
-    MHATokenToKVPoolHost,
-    MLATokenToKVPoolHost,
-)
+from sglang.srt.mem_cache.memory_pool_host import get_host_kvcache
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
 logger = logging.getLogger(__name__)
@@ -38,16 +35,16 @@ class HiRadixCache(RadixCache):
         hicache_storage_backend: Optional[str] = None,
     ):
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
-        if isinstance(self.kv_cache, MHATokenToKVPool):
-            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
-                self.kv_cache, hicache_ratio, hicache_size, page_size
-            )
-        elif isinstance(self.kv_cache, MLATokenToKVPool):
-            self.token_to_kv_pool_host = MLATokenToKVPoolHost(
-                self.kv_cache, hicache_ratio, hicache_size, page_size
+        self.token_to_kv_pool_host = get_host_kvcache(
+            self.kv_cache, hicache_ratio, hicache_size, page_size
+        )
+        if draft_kvcache := token_to_kv_pool_allocator.get_draft_kvcache():
+            self.draft_token_to_kv_pool = get_host_kvcache(
+                draft_kvcache, hicache_ratio, hicache_size, page_size
+
             )
         else:
-            raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
+            self.draft_token_to_kv_pool = None
 
         self.tp_group = tp_cache_group
         self.enable_storage = hicache_storage_backend is not None
@@ -62,6 +59,7 @@ class HiRadixCache(RadixCache):
             load_cache_event=self.load_cache_event,
             write_policy=hicache_write_policy,
             io_backend=hicache_io_backend,
+            draft_mem_pool_host=self.draft_token_to_kv_pool,
             storage_backend=hicache_storage_backend,
             prefetch_threshold=self.prefetch_threshold,
         )

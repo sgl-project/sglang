@@ -1285,6 +1285,7 @@ class ModelRunner:
                     )
         else:
             assert self.is_draft_worker
+            self.token_to_kv_pool_allocator.set_draft_kvcache(self.token_to_kv_pool)
 
         logger.info(
             f"Memory pool end. "

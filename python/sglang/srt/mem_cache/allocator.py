@@ -49,6 +49,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.dtype = dtype
         self.device = device
         self._kvcache = kvcache
+        self._draft_kvcache = None
 
         self.free_pages = None
         self.is_not_in_free_group = True
@@ -62,6 +63,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def get_kvcache(self):
         return self._kvcache
+
+    def set_draft_kvcache(self, kvcache: KVCache):
+        self._draft_kvcache = kvcache
 
     def restore_state(self, free_pages):
         self.free_pages = free_pages

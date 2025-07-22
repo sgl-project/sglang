@@ -222,6 +222,7 @@ class HiCacheController:
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through_selective",
         io_backend: str = "",
+        draft_mem_pool_host: Optional[HostKVCache] = None,
         storage_backend: Optional[str] = None,
         prefetch_threshold: int = 256,
     ):
@@ -230,6 +231,8 @@ class HiCacheController:
         self.mem_pool_host = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
+        self.draft_mem_pool_host = draft_mem_pool_host
+        self.draft_mem_pool_device = token_to_kv_pool_allocator.get_draft_kvcache()
         # using kernel for small page KV cache transfer and DMA for large pages
         if not io_backend:
             IO_BACKEND_PAGE_SIZE_THRESHOLD = 64
@@ -257,6 +260,9 @@ class HiCacheController:
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
+        if draft_mem_pool_host:
+            self.draft_layer_done_counter = LayerDoneCounter(self.draft_mem_pool_device.layer_num)
+            self.draft_mem_pool_device.register_layer_transfer_counter(self.draft_layer_done_counter)
 
         if write_policy not in [
             "write_through",
@@ -264,6 +270,11 @@ class HiCacheController:
             "write_back",
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
+
+        if self.draft_mem_pool_host:
+            assert self.draft_mem_pool_device
+            if self.enable_storage:
+                raise NotImplementedError("TODO: Storage backend is not supported for spec decode.")
 
         self.write_queue = PriorityQueue()
         self.load_queue = PriorityQueue()
@@ -398,10 +409,20 @@ class HiCacheController:
         """
         torch.cuda.set_stream(self.write_stream)
         while not self.stop_event.is_set():
+            op = None
             try:
-                operation = self.write_queue.get(block=True, timeout=1)
+                op = self.write_queue.get(block=True, timeout=1)
+                while self.write_queue.qsize() > 0:
+                    op.merge(self.write_queue.get(block=False))
+            except Empty:
+                pass
+            except Exception as e:
+                logger.error(e)
+            if op is None:
+                continue
+            try:
                 host_indices, device_indices = self.move_indices(
-                    operation.host_indices, operation.device_indices
+                    op.host_indices, op.device_indices
                 )
                 self.mem_pool_device.backup_to_host_all_layer(
                     self.mem_pool_host,
@@ -409,13 +430,18 @@ class HiCacheController:
                     device_indices,
                     self.io_backend,
                 )
+                if self.draft_mem_pool_host:
+                    self.draft_mem_pool_device.backup_to_host_all_layer(
+                        self.draft_mem_pool_host,
+                        host_indices,
+                        device_indices,
+                        self.io_backend,
+                    )
                 self.write_stream.synchronize()
-                self.mem_pool_host.complete_io(operation.host_indices)
-                for node_id in operation.node_ids:
+                self.mem_pool_host.complete_io(op.host_indices)
+                for node_id in op.node_ids:
                     if node_id != 0:
                         self.ack_write_queue.put(node_id)
-            except Empty:
-                continue
             except Exception as e:
                 logger.error(e)
 
@@ -446,21 +472,51 @@ class HiCacheController:
             host_indices, device_indices = self.move_indices(
                 batch_operation.host_indices, batch_operation.device_indices
             )
-            for i in range(self.mem_pool_host.layer_num):
-                self.mem_pool_device.load_from_host_per_layer(
-                    self.mem_pool_host,
+            # target first because it is extended first
+            self._layer_by_layer_load(
+                self.layer_done_counter,
+                self.mem_pool_host,
+                self.mem_pool_device,
+                host_indices,
+                device_indices,
+                self.load_stream,
+            )
+            if self.draft_mem_pool_host:
+                self.draft_layer_done_counter.reset()
+                self._layer_by_layer_load(
+                    self.draft_layer_done_counter,
+                    self.draft_mem_pool_host,
+                    self.draft_mem_pool_device,
                     host_indices,
                     device_indices,
-                    i,
-                    self.io_backend,
+                    self.load_stream,
                 )
-                self.load_stream.synchronize()
-                self.layer_done_counter.increment()
 
             self.mem_pool_host.complete_io(batch_operation.host_indices)
             for node_id in batch_operation.node_ids:
                 if node_id != 0:
                     self.ack_load_queue.put(node_id)
+
+    def _layer_by_layer_load(
+        self,
+        layer_done_counter,
+        mem_pool_host,
+        mem_pool_device,
+        host_indices,
+        device_indices,
+        stream,
+    ):
+        layer_done_counter.reset()
+        for i in range(mem_pool_host.layer_num):
+            mem_pool_device.load_from_host_per_layer(
+                mem_pool_host,
+                host_indices,
+                device_indices,
+                i,
+                self.io_backend,
+            )
+            stream.synchronize()
+            layer_done_counter.increment()
 
     def evict_device(
         self, device_indices: torch.Tensor, host_indices: torch.Tensor
