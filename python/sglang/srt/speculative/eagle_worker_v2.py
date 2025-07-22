@@ -30,7 +30,7 @@ from sglang.srt.speculative.eagle_utils_v2 import (
     EagleDraftInput,
     EagleVerifyInput,
     assign_draft_cache_locs,
-    assign_verify_cache_locs,
+    assign_extend_cache_locs,
     fast_topk,
     select_top_k_tokens,
 )
@@ -327,7 +327,7 @@ class EAGLEWorker(TpModelWorker):
             retrive_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
-            draft_token_num=self.server_args.speculative_num_draft_tokens,
+            num_draft_tokens=self.server_args.speculative_num_draft_tokens,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -394,54 +394,15 @@ class EAGLEWorker(TpModelWorker):
         spec_info: EagleVerifyInput,
         old_spec_info: EagleDraftInput,
     ):
-        ctx = (
+        plan_stream_ctx = (
             torch.cuda.stream(self.plan_stream) if self.plan_stream else empty_context()
         )
 
         # Run attention backend plan and cuda graph preparation in a separate stream
-        with ctx:
-            # Assign cache locations
-            bs = len(batch.req_pool_indices)
-            batch.input_ids = spec_info.draft_token
-            batch.out_cache_loc = torch.empty(
-                (bs * self.num_draft_tokens,),
-                dtype=torch.int64,
-                device="cuda",
+        with plan_stream_ctx:
+            verify_forward_batch, can_run_cuda_graph = spec_info.prepare_for_verify(
+                batch
             )
-
-            assign_verify_cache_locs[(bs,)](
-                batch.req_pool_indices,
-                self.req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.seq_lens + self.num_draft_tokens,
-                batch.out_cache_loc,
-                self.req_to_token_pool.req_to_token.shape[1],
-                next_power_of_2(bs),
-            )
-
-            # Get a forward batch
-            batch.forward_mode = ForwardMode.TARGET_VERIFY
-            batch.spec_info = spec_info
-            batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            verify_forward_batch = ForwardBatch.init_new(
-                batch, self.target_worker.model_runner
-            )
-
-            # Run attention backend plan and cuda graph preparation
-            can_run_cuda_graph = bool(
-                self.target_worker.model_runner.cuda_graph_runner
-                and self.target_worker.model_runner.cuda_graph_runner.can_run(
-                    verify_forward_batch
-                )
-            )
-            if can_run_cuda_graph:
-                self.target_worker.model_runner.cuda_graph_runner.replay_prepare(
-                    verify_forward_batch
-                )
-            else:
-                self.target_worker.model_runner.attn_backend.init_forward_metadata(
-                    verify_forward_batch
-                )
 
         # Correct some buffers due to the overlap plan
         if self.plan_stream:
