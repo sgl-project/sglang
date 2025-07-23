@@ -233,10 +233,7 @@ class MiniMaxText01MoE(nn.Module):
             prefix=f"{prefix}.experts",
         )
 
-        self.topk = TopK(
-            top_k=top_k,
-            renormalize=True if top_k > 1 else False,
-        )
+        self.topk = TopK(top_k=top_k, renormalize=True)
         return
 
     @staticmethod
@@ -777,6 +774,72 @@ def is_pp_missing_parameter(
         return True
 
 
+class MiniMaxText01RotaryEmbedding(CustomOp):
+    name = "MiniMaxText01RotaryEmbedding"
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position: int,
+        base: float,
+        is_neox_style: bool,
+        cache_dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        self.max_position_embeddings = max_position
+        self.base = base
+        self.is_neox_style = is_neox_style
+        self.cache_dtype = cache_dtype
+        cache = self._compute_cos_sin_cache().to(cache_dtype)
+        self.register_buffer("cos_sin_cache", cache, persistent=False)
+
+    def _compute_inv_freq(self, base: float) -> torch.Tensor:
+        """Compute the inverse frequency."""
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+            )
+        )
+        return inv_freq
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        """Compute the cos and sin cache."""
+        inv_freq = self._compute_inv_freq(self.base)
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        cache = torch.cat((cos, sin), dim=-1)
+        return cache
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from vllm import _custom_ops as ops
+
+        self.cos_sin_cache = self.cos_sin_cache.to(positions.device)
+        query_cast = query.to(self.cache_dtype)
+        key_cast = key.to(self.cache_dtype)
+        ops.rotary_embedding(
+            positions,
+            query_cast,
+            key_cast,
+            self.head_size,
+            self.cos_sin_cache,
+            self.is_neox_style,
+        )
+        query = query_cast.to(query.dtype)
+        key = key_cast.to(key.dtype)
+        return query, key
+
+
 class MiniMaxText01Model(nn.Module):
 
     def __init__(
@@ -882,13 +945,13 @@ class MiniMaxText01Model(nn.Module):
             max_position_embeddings = min(max_position_embeddings, config.max_model_len)
 
         rope_theta = getattr(config, "rope_theta", 10000)
-        self.rotary_emb = RotaryEmbedding(
+        self.rotary_emb = MiniMaxText01RotaryEmbedding(
             head_dim,
             rotary_dim=config.rotary_dim if hasattr(config, "rotary_dim") else head_dim,
-            max_position_embeddings=max_position_embeddings,
+            max_position=max_position_embeddings,
             base=int(rope_theta),
             is_neox_style=True,
-            dtype=torch.float32,
+            cache_dtype=torch.float32,
         )
 
         norm_kwargs = {}

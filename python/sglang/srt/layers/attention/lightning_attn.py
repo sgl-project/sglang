@@ -359,14 +359,9 @@ class LightningAttnBackend(AttentionBackend):
         num_prefill_tokens = getattr(attn_metadata, "num_prefill_tokens", 0)
         num_prefills = getattr(attn_metadata, "num_prefills", 0)
 
-        if num_prefill_tokens > 0:
-            q = q[num_prefill_tokens:].unsqueeze(2).contiguous()
-            k = k[num_prefill_tokens:].unsqueeze(2).contiguous()
-            v = v[num_prefill_tokens:].unsqueeze(2).contiguous()
-        else:
-            q = q.unsqueeze(2).contiguous()
-            k = k.unsqueeze(2).contiguous()
-            v = v.unsqueeze(2).contiguous()
+        q = q[num_prefill_tokens:].unsqueeze(2).contiguous()
+        k = k[num_prefill_tokens:].unsqueeze(2).contiguous()
+        v = v[num_prefill_tokens:].unsqueeze(2).contiguous()
 
         # Ensure safe indexing for state_indices_tensor
         if (
