@@ -120,17 +120,19 @@ class LightningAttnBackend(AttentionBackend):
         if is_prefill or (
             extend_seq_lens is not None and extend_seq_lens.sum() > batch_size
         ):
-            # Prefill/Extend mode
+            # Prefill/Extend mode or Mixed mode
             if extend_seq_lens is not None:
                 actual_extend_lens = extend_seq_lens
+                num_prefills = (extend_seq_lens > 1).sum().item()
+                num_decode_tokens = (extend_seq_lens == 1).sum().item()
             else:
                 actual_extend_lens = torch.ones(
                     batch_size, dtype=torch.int32, device=device
                 )
+                num_prefills = batch_size
+                num_decode_tokens = 0
 
-            num_prefills = batch_size
             num_prefill_tokens = actual_extend_lens.sum().item()
-            num_decode_tokens = 0
 
             query_start_loc = torch.nn.functional.pad(
                 torch.cumsum(actual_extend_lens, dim=0, dtype=torch.int32), (1, 0)

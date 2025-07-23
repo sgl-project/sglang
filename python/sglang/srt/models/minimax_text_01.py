@@ -847,7 +847,6 @@ class MiniMaxText01Model(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         cache_config: Any = None,
-        scheduler_config=None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -915,9 +914,7 @@ class MiniMaxText01Model(nn.Module):
             for i in range(config.num_hidden_layers)
             if self.decoder_attention_types[i] == 0
         )
-        max_slots_number = (
-            getattr(scheduler_config, "max_num_seqs", 256) if scheduler_config else 256
-        )
+        max_slots_number = 256
         self.cache_shape = (
             linear_layer_nums,
             max_slots_number,
@@ -934,7 +931,7 @@ class MiniMaxText01Model(nn.Module):
         )
 
         # Initialize lightning attention backend with proper configuration
-        self.attn_backend = self._initialize_attention_backend(config, scheduler_config)
+        self.attn_backend = self._initialize_attention_backend(config)
 
         # Initialize rotary embedding
         head_dim = getattr(config, "head_dim", None)
@@ -964,7 +961,7 @@ class MiniMaxText01Model(nn.Module):
         self.embed_scale = 1.0
         return
 
-    def _initialize_attention_backend(self, config, scheduler_config):
+    def _initialize_attention_backend(self, config):
         """Initialize the lightning attention backend with proper configuration."""
 
         # Create a proper model runner stub for the backend
@@ -1126,7 +1123,6 @@ class MiniMaxText01ForCausalLM(nn.Module):
             self.config,
             quant_config,
             cache_config=getattr(config, "cache_config", None),
-            scheduler_config=getattr(config, "scheduler_config", None),
             prefix=maybe_prefix(prefix, "model"),
         )
         if get_pp_group().is_last_rank:
