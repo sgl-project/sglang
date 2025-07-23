@@ -1,13 +1,9 @@
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cutlass/bfloat16.h>
 #include <cutlass/float8.h>
-#include <torch/extension.h>
 
-#include <cute/algorithm/copy.hpp>
-#include <cute/algorithm/gemm.hpp>
 #include <cute/tensor.hpp>
+
+#include "utils.h"
 
 namespace cute {
 template <typename T>
