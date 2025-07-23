@@ -33,17 +33,13 @@ void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optiona
 #else
 
 #ifndef CUDART_INF_FP16
-#ifdef USE_ROCM
-#define CUDART_INF_FP16 (__half_raw{0x7C00u})
-#else
+#ifndef USE_ROCM
 #define CUDART_INF_FP16 __ushort_as_half((unsigned short)0x7C00U)
 #endif
 #endif
 
 #ifndef CUDART_INF_BF16
-#ifdef USE_ROCM
-#define CUDART_INF_BF16 (__nv_bfloat16{static_cast<unsigned short>(0x7F80u)})
-#else
+#ifndef USE_ROCM
 #define CUDART_INF_BF16 __ushort_as_bfloat16((unsigned short)0x7F80U)
 #endif
 #endif
