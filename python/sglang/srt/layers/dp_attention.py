@@ -354,12 +354,13 @@ def dp_scatter(
         )
 
 
-def attn_tp_reduce_scatter(
-    output: torch.Tensor,
-    input_list: List[torch.Tensor],
-):
-    return get_attention_tp_group().reduce_scatter(output, input_list)
+def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
+    return get_attention_tp_group().reduce_scatter_tensor(output, input)
 
 
-def attn_tp_all_gather(output_list: List[torch.Tensor], input_: torch.Tensor):
-    return get_attention_tp_group().all_gather(input_, output_tensor_list=output_list)
+def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
+    return get_attention_tp_group().all_gather_into_tensor(output, input)
+
+
+def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
+    return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)

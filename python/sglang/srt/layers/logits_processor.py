@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.dp_attention import (
     DPGatherMode,
     attn_tp_all_gather,
+    attn_tp_all_gather_into_tensor,
     dp_gather_replicate,
     dp_scatter,
     get_attention_dp_rank,
@@ -456,15 +457,31 @@ class LogitsProcessor(nn.Module):
 
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
-                global_logits = torch.empty(
-                    (self.config.vocab_size, logits.shape[0]),
-                    device=logits.device,
-                    dtype=logits.dtype,
-                )
-                global_logits = global_logits.T
-                attn_tp_all_gather(
-                    list(global_logits.tensor_split(self.attn_tp_size, dim=-1)), logits
-                )
+                if self.config.vocab_size % self.attn_tp_size == 0:
+                    global_logits = torch.empty(
+                        (
+                            self.attn_tp_size,
+                            logits.shape[0],
+                            self.config.vocab_size // self.attn_tp_size,
+                        ),
+                        device=logits.device,
+                        dtype=logits.dtype,
+                    )
+                    attn_tp_all_gather_into_tensor(global_logits, logits)
+                    global_logits = global_logits.permute(1, 0, 2).reshape(
+                        logits.shape[0], self.config.vocab_size
+                    )
+                else:
+                    global_logits = torch.empty(
+                        (self.config.vocab_size, logits.shape[0]),
+                        device=logits.device,
+                        dtype=logits.dtype,
+                    )
+                    global_logits = global_logits.T
+                    attn_tp_all_gather(
+                        list(global_logits.tensor_split(self.attn_tp_size, dim=-1)),
+                        logits,
+                    )
                 logits = global_logits
             else:
                 logits = tensor_model_parallel_all_gather(logits)
