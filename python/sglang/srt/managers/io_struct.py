@@ -1083,3 +1083,13 @@ class LoRAUpdateResult:
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
+
+
+class BlockReqType(Enum):
+    BLOCK = 1
+    UNBLOCK = 2
+
+
+@dataclass
+class BlockReqInput:
+    type: BlockReqType
