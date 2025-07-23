@@ -1186,7 +1186,7 @@ def get_config_dtype_str(
         # avoiding cases where kernel fails when float32 MoE
         # use fp16/bfloat16 configs
         return "float32"
-    # TODO: Once OCP MX is natively supported in the fused MOE kernel, we should return add it here.
+    # TODO: Once OCP MX is natively supported in the fused MOE kernel, we should add a return statement for it here. Currently, OCP MX is only simulated so we return `None` so that the relevant .json is loaded in `try_get_optimal_moe_config` later.
     return None
 
 
