@@ -1319,3 +1319,75 @@ def moe_ep_deepgemm_preprocess(
         gateup_input,
         gateup_input_scale,
     )
+
+
+@triton.jit
+def compute_problem_sizes_w4a8_kernel(
+    masked_m_ptr,
+    problem_sizes1_ptr,
+    problem_sizes2_ptr,
+    n,
+    k,
+    num_experts,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = pid < num_experts
+    final_occurrences = tl.load(masked_m_ptr + pid, mask=mask, other=0)
+    tl.store(problem_sizes1_ptr + pid * 3, 2 * n)
+    tl.store(problem_sizes1_ptr + pid * 3 + 1, final_occurrences)
+    tl.store(problem_sizes1_ptr + pid * 3 + 2, k)
+    tl.store(problem_sizes2_ptr + pid * 3, k)
+    tl.store(problem_sizes2_ptr + pid * 3 + 1, final_occurrences)
+    tl.store(problem_sizes2_ptr + pid * 3 + 2, n)
+
+
+def compute_problem_sizes_w4a8(
+    masked_m, problem_sizes1, problem_sizes2, n, k, num_experts
+):
+    BLOCK_SIZE = 256
+    grid = lambda meta: (triton.cdiv(num_experts, meta["BLOCK_SIZE"]),)
+    compute_problem_sizes_w4a8_kernel[grid](
+        masked_m,
+        problem_sizes1,
+        problem_sizes2,
+        n,
+        k,
+        num_experts,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return problem_sizes1, problem_sizes2
+
+
+def deepep_ll_get_cutlass_w4a8_moe_mm_data(
+    hidden_states,
+    masked_m,
+    expert_offsets,
+    problem_sizes1,
+    problem_sizes2,
+    num_experts,
+    n,
+    k,
+):
+    problem_sizes1, problem_sizes2 = compute_problem_sizes_w4a8(
+        masked_m, problem_sizes1, problem_sizes2, n, k, num_experts
+    )
+    masked_m_with_zero = torch.cat(
+        [torch.tensor([0], device=masked_m.device, dtype=masked_m.dtype), masked_m],
+        dim=0,
+    )
+    expert_offsets = torch.cumsum(masked_m_with_zero, dim=0)
+    expert_indices = torch.nonzero(masked_m, as_tuple=True)[0]
+    hidden_states_real = hidden_states[expert_indices]
+    hidden_states_real_reshaped = hidden_states_real.view(
+        -1, hidden_states_real.size(-1)
+    )
+    non_zero_rows_mask = (hidden_states_real_reshaped != 0).any(dim=-1)
+    hidden_states_real_reshaped = hidden_states_real_reshaped[non_zero_rows_mask]
+    logger.info(f"masked_m {masked_m}")
+    return (
+        hidden_states_real_reshaped,
+        expert_offsets.to(torch.int32),
+        problem_sizes1.to(torch.int32),
+        problem_sizes2.to(torch.int32),
+    )
