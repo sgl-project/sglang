@@ -216,7 +216,9 @@ class LoRAManager:
         # load active loras into lora memory pool
         cur_uids = set(forward_batch.lora_paths)
         assert len(cur_uids) <= self.max_loras_per_batch
-        self.memory_pool.prepare_lora_batch(cur_uids, self.loras, self.lora_modules)
+        self.memory_pool.prepare_lora_batch(
+            cur_uids, self.loras, self.lora_modules, self.lora_embeddings_modules
+        )
 
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
@@ -294,7 +296,7 @@ class LoRAManager:
             seg_lens = (
                 forward_batch.extend_seq_lens
                 if forward_batch.forward_mode.is_extend()
-                else torch.ones(bs, device=self.device)
+                else torch.ones(bs, device=self.device, dtype=torch.int32)
             )
 
             max_len = (
@@ -352,6 +354,17 @@ class LoRAManager:
                             weight_name, layer_id, LoRAType.LORA_B
                         ),
                     )
+        # call set_lora_info for embeddings
+        for module_name, module in self.lora_embeddings_modules.items():
+            if self.max_extra_vocab_size > 0:
+                new_embeddings_buffer = self.memory_pool.get_embedding_tensor(
+                    module_name
+                )
+            module.set_lora_info(
+                new_embeddings_buffer,
+                self.memory_pool.get_embedding_tensor(module_name, LoRAType.LORA_A),
+                self.memory_pool.get_embedding_tensor(module_name, LoRAType.LORA_B),
+            )
 
     def init_state(self):
         """
@@ -369,10 +382,16 @@ class LoRAManager:
         # Supported weight names (e.g., qkv_proj) for LoRA A and B respectively.
         self.lora_weight_names: Tuple[Set[str]] = (set(), set())
 
+        self.lora_embeddings_weight_names: Tuple[Set[str]] = (set(), set())
+
         # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
         self.lora_modules: Dict[int, Dict[str, BaseLayerWithLoRA]] = {
             i: {} for i in range(self.base_hf_config.num_hidden_layers)
         }
+
+        self.max_extra_vocab_size: int = 0
+        # Look-up table that essentially maps (layer_name, module_name) to the corresponding LoRA embeddings module.
+        self.lora_embeddings_modules: Dict[str, BaseLayerWithLoRA] = {}
 
         # The LoRA memory pool that manages the GPU buffers for active LoRA weights.
         # It is initialized lazily when the first LoRA adapter is loaded.
@@ -432,6 +451,9 @@ class LoRAManager:
         """
 
         # Target lora weight names for lora_a and lora_b modules respectively.
+        if "embed_tokens" in self.target_modules:
+            self.lora_embeddings_weight_names[0].update(["embed_tokens"])
+            self.lora_embeddings_weight_names[1].update(["embed_tokens"])
         lora_A, lora_B = get_normalized_lora_weight_names(self.target_modules)
         self.lora_weight_names[0].update(lora_A)
         self.lora_weight_names[1].update(lora_B)
@@ -463,6 +485,12 @@ class LoRAManager:
                 logger.info(f"Unloading LoRA adapter {name}")
                 del self.loras[name]
 
+        # Current max extra vocab size
+        for name, lora in self.loras.items():
+            self.max_extra_vocab_size = max(
+                self.max_extra_vocab_size, lora.extra_vocab_size
+            )
+
         # Additional checks for flashinfer backend
         # FIXME remove the restrictions after supporting multi-rank for flashinfer backend
         if self.lora_backend == "flashinfer":
@@ -482,7 +510,9 @@ class LoRAManager:
             tp_rank=self.tp_rank,
             max_lora_rank=self.max_lora_rank,
             lora_weight_names=self.lora_weight_names,
+            lora_embeddings_weight_names=self.lora_embeddings_weight_names,
             base_model=self.base_model,
+            max_extra_vocab_size=self.max_extra_vocab_size,
         )
 
     def set_lora_module(self, module_name, module):
@@ -510,8 +540,16 @@ class LoRAManager:
 
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in customized_target_names:
-                layer_id = get_layer_id(module_name)
-                if module_name not in self.lora_modules[layer_id]:
-                    self.lora_modules[layer_id][module_name] = self.set_lora_module(
+                if (
+                    "embed_tokens" in module_name
+                    and "embed_tokens" not in self.lora_embeddings_modules
+                ):
+                    self.lora_embeddings_modules["embed_tokens"] = self.set_lora_module(
                         module_name, module
                     )
+                else:
+                    layer_id = get_layer_id(module_name)
+                    if module_name not in self.lora_modules[layer_id]:
+                        self.lora_modules[layer_id][module_name] = self.set_lora_module(
+                            module_name, module
+                        )

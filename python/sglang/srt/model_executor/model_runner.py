@@ -1417,6 +1417,13 @@ class ModelRunner:
         if self.server_args.disable_cuda_graph:
             return
 
+        # Check if embedding LoRA is present and disable CUDA graph
+        if self.lora_manager is not None:
+            assert "embed_tokens" not in self.lora_manager.target_modules, (
+                "Embedding LoRA is not supported in CUDA graph. "
+                "Please use `--disable-cuda-graph`."
+            )
+
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(

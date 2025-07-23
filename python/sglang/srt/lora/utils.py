@@ -125,6 +125,8 @@ def get_normalized_lora_weight_names(
 
     result = (set(), set())
     for name in target_modules:
+        if name == "embed_tokens":
+            continue
         lora_a, lora_b = params_mapping.get(name, ([name], [name]))
         result[0].update(lora_a)
         result[1].update(lora_b)
@@ -162,7 +164,7 @@ def get_weight_name(
 
 
 # TODO: [PR #4274] For future use to simplify the mapping between HF module names and customized module names.
-VOCAB_PARALLELISM_EMBEDDING_NAMES = ["embeddings"]
+VOCAB_PARALLELISM_EMBEDDING_NAMES = ["embed_tokens"]
 COLUMN_PARALLELISM_LINEAR_LORA_NAMES = ["gate_proj", "up_proj"]
 MERGED_COLUMN_PARALLELISM_LINEAR_LORA_NAMES = ["gate_up_proj"]
 QKV_PARALLELISM_LINEAR_LORA_NAMES = ["qkv_proj"]
