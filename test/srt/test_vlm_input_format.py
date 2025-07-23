@@ -216,5 +216,144 @@ class TestKimiVLImageUnderstandsImage(
         )
 
 
+class TestLlama4ImageUnderstandsImage(
+    VLMInputTestBase, unittest.IsolatedAsyncioTestCase
+):
+    model_path = "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
+    chat_template = "llama_4_vision"
+
+    def setUp(self):
+        self.engine = Engine(
+            model_path=self.model_path,
+            tokenizer_path=self.model_path,
+            tokenizer_mode="auto",
+            skip_tokenizer_init=False,
+            load_format="auto",
+            model_loader_extra_config="{}",
+            trust_remote_code=True,
+            dtype="auto",
+            kv_cache_dtype="auto",
+            quantization_param_path=None,
+            context_length=20000,
+            served_model_name=self.model_path,
+            chat_template=self.chat_template,
+            completion_template=None,
+            is_embedding=False,
+            enable_multimodal=True,
+            revision=None,
+            hybrid_kvcache_ratio=None,
+            host="0.0.0.0",
+            port=8000,
+            mem_fraction_static=0.8,
+            max_running_requests=None,
+            max_total_tokens=None,
+            chunked_prefill_size=32768,
+            max_prefill_tokens=32768,
+            schedule_policy="fcfs",
+            schedule_conservativeness=1.0,
+            cpu_offload_gb=0,
+            page_size=1,
+            tp_size=8,
+            pp_size=1,
+            max_micro_batch_size=None,
+            stream_interval=1,
+            stream_output=False,
+            random_seed=941523765,
+            constrained_json_whitespace_pattern=None,
+            watchdog_timeout=300,
+            dist_timeout=None,
+            download_dir=None,
+            base_gpu_id=0,
+            gpu_id_step=1,
+            sleep_on_idle=False,
+            log_level="info",
+            log_level_http=None,
+            log_requests=False,
+            log_requests_level=0,
+            crash_dump_folder=None,
+            show_time_cost=False,
+            enable_metrics=False,
+            bucket_time_to_first_token=None,
+            bucket_e2e_request_latency=None,
+            bucket_inter_token_latency=None,
+            collect_tokens_histogram=False,
+            decode_log_interval=40,
+            enable_request_time_stats_logging=False,
+            kv_events_config=None,
+            api_key=None,
+            file_storage_path="sglang_storage",
+            enable_cache_report=False,
+            reasoning_parser=None,
+            tool_call_parser=None,
+            dp_size=1,
+            load_balance_method="round_robin",
+            dist_init_addr=None,
+            nnodes=1,
+            node_rank=0,
+            json_model_override_args="{}",
+            preferred_sampling_params=None,
+            lora_paths=None,
+            max_loras_per_batch=8,
+            lora_backend="triton",
+            attention_backend=None,
+            sampling_backend="flashinfer",
+            grammar_backend="xgrammar",
+            mm_attention_backend=None,
+            speculative_algorithm=None,
+            speculative_draft_model_path=None,
+            speculative_num_steps=None,
+            speculative_eagle_topk=None,
+            speculative_num_draft_tokens=None,
+            speculative_accept_threshold_single=1.0,
+            speculative_accept_threshold_acc=1.0,
+            speculative_token_map=None,
+            ep_size=1,
+            enable_ep_moe=False,
+            enable_deepep_moe=False,
+            enable_flashinfer_moe=False,
+            deepep_mode="auto",
+            ep_num_redundant_experts=0,
+            ep_dispatch_algorithm="static",
+            init_expert_location="trivial",
+            enable_eplb=False,
+            eplb_algorithm="auto",
+            eplb_rebalance_num_iterations=1000,
+            eplb_rebalance_layers_per_chunk=None,
+            expert_distribution_recorder_mode=None,
+            expert_distribution_recorder_buffer_size=1000,
+            enable_expert_distribution_metrics=False,
+            deepep_config=None,
+            moe_dense_tp_size=None,
+            enable_double_sparsity=False,
+            ds_channel_config_path=None,
+            ds_heavy_channel_num=32,
+            ds_heavy_token_num=256,
+            ds_heavy_channel_type="qk",
+            ds_sparse_decode_threshold=4096,
+            disable_radix_cache=True,
+            cuda_graph_max_bs=2000,
+            cuda_graph_bs=[2000],
+            disable_cuda_graph=False,
+        )
+
+    @classmethod
+    def _init_visual(cls):
+        model = AutoModel.from_pretrained(cls.model_path, trust_remote_code=True, torch_dtype="auto")
+        cls.vision_tower = model.vision_model.eval().to(cls.device)
+        cls.mm_projector = model.multi_modal_projector.eval().to(cls.device)
+
+        cls.visual = lambda tokenizer_output: cls.mm_projector(
+            cls.vision_tower(
+                pixel_values=tokenizer_output["pixel_values"],
+            ).last_hidden_state.flatten(0, -2)
+        )
+
+    def _pixel_values_image_data(self, processor_output):
+        return dict(
+            modality="IMAGE",
+            pixel_values=processor_output["pixel_values"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
