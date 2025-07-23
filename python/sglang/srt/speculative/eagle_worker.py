@@ -297,7 +297,7 @@ class EAGLEWorker(TpModelWorker):
 
     def forward_batch_speculative_generation(
         self, batch: ScheduleBatch
-    ) -> Tuple[LogitsProcessorOutput, List[int], int, int]:
+    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, int, bool]:
         """Run speculative decoding forward.
 
         NOTE: Many states of batch is modified as you go through. It is not guaranteed that
@@ -325,11 +325,16 @@ class EAGLEWorker(TpModelWorker):
                 self.verify(batch, spec_info)
             )
 
-            if self.check_forward_draft_extend_after_decode(batch):
-                with self.draft_tp_context(self.draft_model_runner.tp_group):
-                    self.forward_draft_extend_after_decode(
-                        batch,
-                    )
+            with self.draft_tp_context(self.draft_model_runner.tp_group):
+                # NOTE: We should use `check_forward_draft_extend_after_decode`
+                # when DP attention is enabled, but it is slow. Skip it for now.
+                if (
+                    self.server_args.enable_dp_attention
+                    or batch.spec_info.verified_id.shape[0] > 0
+                ):
+                    # decode is not finished
+                    self.forward_draft_extend_after_decode(batch)
+
             return (
                 logits_output,
                 verify_output.verified_id,
@@ -339,10 +344,7 @@ class EAGLEWorker(TpModelWorker):
             )
 
     def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        local_need_forward = (
-            batch.spec_info.verified_id is not None
-            and batch.spec_info.verified_id.shape[0] > 0
-        )
+        local_need_forward = batch.spec_info.verified_id.shape[0] > 0
         if not self.server_args.enable_dp_attention:
             return local_need_forward
 
@@ -361,7 +363,7 @@ class EAGLEWorker(TpModelWorker):
 
     def forward_target_extend(
         self, batch: ScheduleBatch
-    ) -> Tuple[LogitsProcessorOutput, List[int], int]:
+    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, Optional[torch.Tensor]]:
         """Run the target extend.
 
         Args:
@@ -782,8 +784,8 @@ class EAGLEWorker(TpModelWorker):
         self,
         batch: ScheduleBatch,
         hidden_states: torch.Tensor,
-        next_token_ids: List[int],
-        seq_lens_cpu: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
     ):
         """Run draft model extend. This API modifies the states of the batch.
 
@@ -819,29 +821,34 @@ class EAGLEWorker(TpModelWorker):
         req_pool_indices_backup = batch.req_pool_indices
         accept_length_backup = batch.spec_info.accept_length
         return_logprob_backup = batch.return_logprob
+
         input_is_idle = batch.forward_mode.is_idle()
-        if not input_is_idle:
-            # Prepare metadata
-            if batch.spec_info.verified_id is not None:
-                batch.spec_info.prepare_extend_after_decode(
-                    batch,
-                    self.speculative_num_steps,
-                )
-            else:
-                batch = batch.copy()
-                batch.prepare_for_idle()
-                hidden_size = (
-                    self.model_config.hidden_size * 3
-                    if self.speculative_algorithm.is_eagle3()
-                    else self.model_config.hidden_size
-                )
-                batch.spec_info = EagleDraftInput.create_idle_input(
-                    device=self.device,
-                    hidden_size=hidden_size,
-                    dtype=self.model_config.dtype,
-                    topk=self.topk,
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
-                )
+
+        if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
+            batch = batch.copy()
+            batch.prepare_for_idle()
+            hidden_size = (
+                self.model_config.hidden_size * 3
+                if self.speculative_algorithm.is_eagle3()
+                else self.model_config.hidden_size
+            )
+            batch.spec_info = EagleDraftInput.create_idle_input(
+                device=self.device,
+                hidden_size=hidden_size,
+                dtype=self.model_config.dtype,
+                topk=self.topk,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+            )
+        batch.spec_info.prepare_extend_after_decode(
+            batch,
+            self.speculative_num_steps,
+        )
+        batch.forward_mode = (
+            ForwardMode.DRAFT_EXTEND
+            if not batch.forward_mode.is_idle()
+            else ForwardMode.IDLE
+        )
+
         batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.spec_num_draft_tokens = self.speculative_num_steps + 1
