@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import time
 from dataclasses import dataclass
 from typing import List, Optional
-import copy
 
 import torch
 import torch.nn.functional as F
