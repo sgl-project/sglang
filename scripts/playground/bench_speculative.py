@@ -196,6 +196,20 @@ def main(args, server_args):
                 ]
             )
 
+        if server_args.enable_ep_moe:
+            other_args.extend(
+                [
+                    "--enable-ep-moe",
+                ]
+            )
+
+        if server_args.enable_deepep_moe:
+            other_args.extend(
+                [
+                    "--enable-deepep-moe",
+                ]
+            )
+
         process = popen_launch_server(
             args.model_path,
             base_url,
