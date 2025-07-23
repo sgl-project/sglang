@@ -185,6 +185,8 @@ class EAGLEWorker(TpModelWorker):
             torch.cuda.stream(self.plan_stream) if self.plan_stream else empty_context()
         )
 
+        self.draft_extend_done = None
+
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None
@@ -276,7 +278,7 @@ class EAGLEWorker(TpModelWorker):
             batch.seq_lens_sum,
             self.topk,
             self.num_steps,
-            self.server_args.speculative_num_draft_tokens,
+            self.num_draft_tokens,
             self.tree_mask_mode,
             tree_mask_buf,
             position_buf,
@@ -292,7 +294,7 @@ class EAGLEWorker(TpModelWorker):
             retrive_cum_len=None,
             num_steps=self.num_steps,
             topk=self.topk,
-            num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+            num_draft_tokens=self.num_draft_tokens,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -383,7 +385,9 @@ class EAGLEWorker(TpModelWorker):
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
             verify_forward_batch, can_run_cuda_graph = spec_info.prepare_for_verify(
-                batch, self.target_worker
+                batch,
+                self.target_worker,
+                self.draft_extend_done,
             )
 
         # Correct some buffers due to the overlap plan
@@ -419,6 +423,22 @@ class EAGLEWorker(TpModelWorker):
         verify_done = torch.cuda.Event()
         verify_done.record()
 
+        # Move the accepted tokens to the target KV cache
+        batch.seq_lens = seq_lens_backup
+        self.move_accepted_tokens_to_target_kvcache(
+            batch,
+            accept_index,
+            accept_length,
+        )
+        verified_id = predict[accept_index]
+        next_batch_verified_id = torch.empty_like(accept_length, dtype=torch.int32)
+        fill_new_verified_id[(bs,)](
+            verified_id,
+            accept_length,
+            next_batch_verified_id,
+            next_power_of_2(max(self.num_steps + 1, bs)),
+        )
+
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=logits_output.hidden_states,
@@ -443,34 +463,20 @@ class EAGLEWorker(TpModelWorker):
             torch.cuda.current_stream().wait_stream(self.plan_stream)
 
         # Run draft extend batch in the main compute stream
-        logits_output_2 = self.draft_model_runner.model.forward(
+        draft_logits_output = self.draft_model_runner.model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
         # Reorganize the spec info for the next batch
-        logits_output_2.next_token_logits = logits_output_2.next_token_logits[
+        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
             select_index
         ]
-        logits_output_2.hidden_states = logits_output_2.hidden_states[select_index]
-        probs = torch.softmax(logits_output_2.next_token_logits, dim=-1)
+        draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+            select_index
+        ]
+        probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
         ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-        ret_hidden_states = logits_output_2.hidden_states
-        verified_id = predict[accept_index]
-        next_batch_verified_id = torch.empty_like(accept_length, dtype=torch.int32)
-        fill_new_verified_id[(bs,)](
-            verified_id,
-            accept_length,
-            next_batch_verified_id,
-            next_power_of_2(max(self.num_steps + 1, bs)),
-        )
-
-        # Move the accepted tokens to the target KV cache
-        batch.seq_lens = seq_lens_backup
-        self.move_accepted_tokens_to_target_kvcache(
-            batch,
-            accept_index,
-            accept_length,
-        )
+        ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
         draft_input = EagleDraftInput(
@@ -482,6 +488,7 @@ class EAGLEWorker(TpModelWorker):
             allocate_lens=old_spec_info.allocate_lens,
             verify_done=verify_done,
         )
+
         return ForwardBatchOutput(
             logits_output=logits_output,
             next_token_ids=predict,

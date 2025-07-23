@@ -190,7 +190,11 @@ class EagleVerifyInput:
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
-    def prepare_for_verify(self, batch: ModelWorkerBatch, target_worker: TpModelWorker):
+    def prepare_for_verify(
+        self,
+        batch: ModelWorkerBatch,
+        target_worker: TpModelWorker,
+    ):
         # Assign cache locations
         bs = len(batch.req_pool_indices)
         batch.input_ids = self.draft_token
@@ -200,6 +204,7 @@ class EagleVerifyInput:
             dtype=torch.int64,
             device=device,
         )
+
         assign_extend_cache_locs[(bs,)](
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
