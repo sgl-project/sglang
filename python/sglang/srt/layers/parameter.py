@@ -49,26 +49,27 @@ class BasevLLMParameter(Parameter):
         :returns: a torch.nn.parameter
         """
 
+        # use _data to avoid infinite recursion caused by __torch_dispatch__
+        self._data = data
         self._weight_loader = weight_loader
 
     def __tensor_flatten__(self):
-        return ["data"], [
+        return ["_data"], [
             self.requires_grad,
             self._weight_loader,
         ]
 
     @staticmethod
     def __tensor_unflatten__(inner_tensors, ctx, outer_size, outer_stride):
-        out = BasevLLMParameter(data=inner_tensors["data"], weight_loader=ctx[1])
+        out = BasevLLMParameter(data=inner_tensors["_data"], weight_loader=ctx[1])
         return out
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs):
-        with torch._C._DisableTorchDispatch():
-            if kwargs is None:
-                kwargs = {}
-            args_data = pytree.tree_map_only(BasevLLMParameter, lambda x: x.data, args)
-            return func(*args_data, **kwargs)
+        if kwargs is None:
+            kwargs = {}
+        args_data = pytree.tree_map_only(BasevLLMParameter, lambda x: x._data, args)
+        return func(*args_data, **kwargs)
 
     @classmethod
     def __metadata_guard__(cls, orig_data, other):
@@ -78,18 +79,18 @@ class BasevLLMParameter(Parameter):
         )
 
     def __copy__(self):
-        new_param = BasevLLMParameter(data=self.data, weight_loader=self.weight_loader)
+        new_param = BasevLLMParameter(data=self._data, weight_loader=self.weight_loader)
         for k, v in self.__dict__.items():
-            if k != "data":
+            if k != "_data":
                 setattr(new_param, k, copy.copy(v))
         return new_param
 
     def __deepcopy__(self, memo):
         new_param = BasevLLMParameter(
-            data=copy.deepcopy(self.data, memo), weight_loader=copy.deepcopy(self.weight_loader, memo)
+            data=copy.deepcopy(self._data, memo), weight_loader=self.weight_loader
         )
         for k, v in self.__dict__.items():
-            if k != "data" or k != "weight_loader":
+            if k != "_data" :
                 setattr(new_param, k, copy.deepcopy(v, memo))
         return new_param
 
@@ -336,6 +337,7 @@ class ChannelQuantScaleParameter(_ColumnvLLMParameter):
     Parameter class for weight scales loaded for weights with
     channel-wise quantization. Equivalent to _ColumnvLLMParameter.
     """
+
     pass
 
 
