@@ -6,10 +6,8 @@ from typing import Any, Optional, cast
 import torch
 
 import logging
-from sglang.srt.layers.linear import (LinearBase, LinearMethodBase,
-                                               UnquantizedLinearMethod)
-from sglang.srt.layers.quantization.base_config import (  # noqa: E501
-    QuantizationConfig, QuantizeMethodBase)
+from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
+from sglang.srt.layers.quantization.base_config import LinearMethodBase, QuantizationConfig, QuantizeMethodBase
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme, QuarkW4A4MXFP4
 from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
 from sglang.srt.utils import get_device_capability

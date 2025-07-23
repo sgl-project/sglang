@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TYPE_CHECKING
 
 import torch
 
@@ -8,8 +8,12 @@ from sglang.srt.layers.quantization.mxfp4_utils import OCP_MX_BLOCK_SIZE
 
 from sglang.srt.utils import print_warning_once
 from sglang.srt.utils import set_weight_attrs
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase, FusedMoeWeightScaleSupported
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoeWeightScaleSupported
+from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import supports_mx
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import TopKOutput
 
 __all__ = ["QuarkMoEMethod", "QuarkW4A4MXFp4MoEMethod"]
 
@@ -134,46 +138,23 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        custom_routing_function: Optional[Callable] = None,
-        no_combine: bool = False,
-        correction_bias: Optional[torch.Tensor] = None,
-        apply_router_weight_on_input: bool = False,
+        topk_output: "TopKOutput",
+        *,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
         inplace: bool = True,
+        no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
-        num_fused_shared_experts: int = 0,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.topk import select_experts
         from sglang.srt.layers.moe.fused_moe_triton import fused_experts
 
         assert not no_combine, f"{no_combine=} is not supported."
-
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
 
         out = fused_experts(
             x,
             layer.w13_weight,
             layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
+            topk_output=topk_output,
             inplace=inplace,
             use_mxfp4_w4a4=True,
             apply_router_weight_on_input=apply_router_weight_on_input,
@@ -183,5 +164,6 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             a1_scale=None,
             a2_scale=None,
             block_shape=None,
+            routed_scaling_factor=routed_scaling_factor,
         )
         return out
