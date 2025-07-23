@@ -92,6 +92,82 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         function_name = tool_calls[0].function.name
         assert function_name == "add", "Function name should be 'add'"
 
+    def test_function_calling_multiturn(self):
+        """
+        Test: Whether the function call format returned by the AI is correct.
+        When returning a tool call, message.content should be None, and tool_calls should be a list.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "add",
+                    "description": "Compute the sum of two numbers",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "a": {
+                                "type": "int",
+                                "description": "A number",
+                            },
+                            "b": {
+                                "type": "int",
+                                "description": "A number",
+                            },
+                        },
+                        "required": ["a", "b"],
+                    },
+                },
+            }
+        ]
+
+        def add(a: int, b: int):
+            return a + b
+
+        available_tools = {"add": add}
+
+        messages = [{"role": "user", "content": "Compute (3+5)"}]
+
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.8,
+            top_p=0.8,
+            stream=False,
+            tools=tools,
+        )
+
+        tool_call = response.choices[0].message.tool_calls[0]
+        function_name = tool_call.function.name
+        assert function_name == "add", "Function name should be 'add'"
+        function_arguments = tool_call.function.arguments
+        assert function_arguments == '{"a": 3, "b": 5}', "Function arguments should be '{\"a\": 3, \"b\": 5}'"
+        tool_to_call = available_tools[function_name]
+        tool_result = tool_to_call(**(json.loads(function_arguments)))
+
+        messages.append(response.choices[0].message)
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": str(tool_result),
+            "name": function_name,
+        })
+
+        final_response = client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.8,
+            top_p=0.8,
+            stream=False,
+            tools=tools,
+        )
+
+        assert (
+            "8" in final_response.choices[0].message.content
+        ), "tool_call response should have the sum 8 in the content"
+
     def test_function_calling_streaming_simple(self):
         """
         Test: Whether the function name can be correctly recognized in streaming mode.
