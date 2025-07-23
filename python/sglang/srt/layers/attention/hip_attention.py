@@ -117,14 +117,16 @@ class HiPAttentionBackend(AttentionBackend):
         self._block_table: torch.Tensor = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        self._block_table = forward_batch.req_to_token_pool.req_to_token.index_select(
-            dim=0, index=forward_batch.req_pool_indices
-        )
-        
-        if forward_batch.forward_mode.is_decode_or_idle():
-            self.flashattention_backend.init_forward_metadata(forward_batch=forward_batch)
+        self.flashattention_backend.init_forward_metadata(forward_batch=forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int):
+        self._block_table = torch.zeros(
+            max_bs,
+            (self.max_context_len + self.page_size - 1) // self.page_size + 4,
+            dtype=torch.int32,
+            device=self.flashattention_backend.device,
+        )
+        
         self.flashattention_backend.init_cuda_graph_state(
             max_bs=max_bs,
         )
@@ -139,6 +141,11 @@ class HiPAttentionBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
+        _table = self.flashattention_backend.req_to_token.index_select(
+            dim=0, index=req_pool_indices
+        )
+        self._block_table[:_table.shape[0]] = _table
+        
         self.flashattention_backend.init_forward_metadata_capture_cuda_graph(
             bs=bs,
             num_tokens=num_tokens,
@@ -161,6 +168,11 @@ class HiPAttentionBackend(AttentionBackend):
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: torch.Tensor = None,
     ):
+        _table = self.flashattention_backend.req_to_token.index_select(
+            dim=0, index=req_pool_indices
+        )
+        self._block_table[:_table.shape[0]] = _table
+        
         self.flashattention_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=req_pool_indices,
@@ -323,7 +335,7 @@ class HiPAttentionBackend(AttentionBackend):
                     seq_lens=forward_batch.seq_lens,
                     req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
                     req_pool_indices=forward_batch.req_pool_indices,
-                    block_table=self._block_table,
+                    block_table=self._block_table[:forward_batch.batch_size],
                     rope_cos=layer.rope_cos,
                     rope_sin=layer.rope_sin,
                     rope_range=layer.rope_range,
@@ -380,7 +392,7 @@ class HiPAttentionBackend(AttentionBackend):
                         seq_lens=forward_batch.seq_lens,
                         req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
                         req_pool_indices=forward_batch.req_pool_indices,
-                        block_table=self._block_table,
+                        block_table=self._block_table[:forward_batch.batch_size],
                         rope_cos=layer.rope_cos,
                         rope_sin=layer.rope_sin,
                         rope_range=layer.rope_range,
@@ -478,7 +490,7 @@ class HiPAttentionBackend(AttentionBackend):
                         seq_lens=forward_batch.seq_lens,
                         req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
                         req_pool_indices=forward_batch.req_pool_indices,
-                        block_table=self._block_table,
+                        block_table=self._block_table[:forward_batch.batch_size],
                         rope_cos=layer.rope_cos,
                         rope_sin=layer.rope_sin,
                         rope_range=layer.rope_range,
@@ -543,7 +555,6 @@ class HiPAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -585,7 +596,7 @@ class HiPAttentionBackend(AttentionBackend):
                 k_rope=k_rope,
             )
         else:
-            if forward_batch.hip_metadata_cache_pool is not None:
+            if (forward_batch.hip_metadata_cache_pool is not None) and (not delta_dense_decode):
                 metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache(
                     layer.layer_id,
                     q.shape[0],
@@ -678,7 +689,8 @@ class HiPAttentionBackend(AttentionBackend):
                     seq_lens=forward_batch.seq_lens,
                     req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
                     req_pool_indices=forward_batch.req_pool_indices,
-                    block_table=self._block_table,
+                    # block_table=self._block_table,
+                    block_table=self._block_table[:forward_batch.batch_size],
                     rope_cos=layer.rope_cos,
                     rope_sin=layer.rope_sin,
                     rope_range=layer.rope_range,
@@ -701,6 +713,9 @@ class HiPAttentionBackend(AttentionBackend):
                     using_chunked_sliding_window=using_chunked_sw,
                     k_descale=k_descale,
                     v_descale=v_descale,
+                    cache_seqlens=self.flashattention_backend.forward_metadata.cache_seqlens_int32,
+                    cu_seqlens_q=self.flashattention_backend.forward_metadata.cu_seqlens_q,
+                    cu_seqlens_k=self.flashattention_backend.forward_metadata.cu_seqlens_k,
                 )
             else:
                 if k_cache is not None:
@@ -763,7 +778,7 @@ class HiPAttentionBackend(AttentionBackend):
                     seq_lens=forward_batch.seq_lens,
                     req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
                     req_pool_indices=forward_batch.req_pool_indices,
-                    block_table=self._block_table,
+                    block_table=self._block_table[:forward_batch.batch_size],
                     rope_cos=layer.rope_cos,
                     rope_sin=layer.rope_sin,
                     rope_range=layer.rope_range,
@@ -784,11 +799,14 @@ class HiPAttentionBackend(AttentionBackend):
                     offloading_metadata=offloading_metadata,
                     sliding_window_size=sw_size,
                     using_chunked_sliding_window=using_chunked_sw,
+                    cache_seqlens=self.flashattention_backend.forward_metadata.cache_seqlens_int32,
+                    cu_seqlens_q=self.flashattention_backend.forward_metadata.cu_seqlens_q,
+                    cu_seqlens_k=self.flashattention_backend.forward_metadata.cu_seqlens_k,
                 )
 
             if (metadata is not None) and (
                 forward_batch.hip_metadata_cache_pool is not None
-            ):
+            ) and (not delta_dense_decode):
                 forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
                     layer_id=layer.layer_id,
                     tdst=q.shape[0],
