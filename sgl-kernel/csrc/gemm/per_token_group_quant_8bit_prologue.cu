@@ -260,21 +260,43 @@ class PerTokenGroupQuantDispatcher {
 
   FuncPtr
   get_kernel_launcher(at::ScalarType type_in, at::ScalarType type_out, at::ScalarType type_scale, int group_size) {
-    static std::unordered_map<int64_t, FuncPtr> dispatch_map;
-    if (dispatch_map.empty()) {
-      register_func<
-          std::size(supported_in_types) - 1,
-          std::size(supported_out_types) - 1,
-          std::size(supported_scale_types) - 1,
-          std::size(supported_group_size) - 1>(dispatch_map);
-    }
     ComposedKey composed_key;
     composed_key.keys.type_in = type_in;
     composed_key.keys.type_out = type_out;
     composed_key.keys.type_scale = type_scale;
     composed_key.keys.group_size = group_size;
 
+    if (dispatch_map.find(composed_key.composed) == dispatch_map.end()) {
+      std::ostringstream oss;
+      oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << type_in << ' ' << type_out << ' ' << type_scale
+          << ' ' << group_size << ", supported params should be " << supported_string();
+      TORCH_CHECK(false, oss.str());
+    }
+
     return dispatch_map.at(composed_key.composed);
+  }
+
+  static std::string supported_string() {
+    std::ostringstream oss;
+    oss << "per_token_group_quant_with_prologue supports: ";
+    oss << "input.dtype=[";
+    for (auto dtype : supported_in_types) {
+      oss << dtype << ',';
+    }
+    oss << "], output_q.dtype=[";
+    for (auto dtype : supported_out_types) {
+      oss << dtype << ',';
+    }
+    oss << "], output_scale.dtype=[";
+    for (auto dtype : supported_scale_types) {
+      oss << dtype << ',';
+    }
+    oss << "], group_size=[";
+    for (auto group_size : supported_group_size) {
+      oss << group_size << ',';
+    }
+    oss << "]";
+    return oss.str();
   }
 
  private:
