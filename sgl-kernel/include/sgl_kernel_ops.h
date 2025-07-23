@@ -192,6 +192,15 @@ void sgl_per_token_group_quant_int8(
     double eps,
     double int8_min,
     double int8_max);
+void sgl_per_token_group_quant_8bit(
+    torch::Tensor input,
+    torch::Tensor output_q,
+    torch::Tensor output_scale,
+    int64_t group_size,
+    double eps,
+    double min_8bit,
+    double max_8bit,
+    bool scale_ue8m0);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 void bmm_fp8(
