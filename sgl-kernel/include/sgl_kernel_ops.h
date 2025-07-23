@@ -192,7 +192,7 @@ void sgl_per_token_group_quant_int8(
     double eps,
     double int8_min,
     double int8_max);
-void sgl_per_token_group_quant_8bit(
+void sgl_per_token_group_quant_8bit_prologue(
     torch::Tensor input,
     torch::Tensor output_q,
     torch::Tensor output_scale,

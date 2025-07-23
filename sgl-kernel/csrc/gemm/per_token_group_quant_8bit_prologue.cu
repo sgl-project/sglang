@@ -357,7 +357,7 @@ void check_contiguous_except_last(torch::Tensor x) {
   }
 }
 
-void sgl_per_token_group_quant_8bit(
+void sgl_per_token_group_quant_8bit_prologue(
     torch::Tensor input,
     torch::Tensor output_q,
     torch::Tensor output_scale,
