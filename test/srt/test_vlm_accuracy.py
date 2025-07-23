@@ -245,7 +245,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
                     MultimodalInputs(
                         mm_items=[
                             MultimodalDataItem(
-                                pixel_values=pixel_values_flat,
+                                feature=pixel_values_flat,
                                 offsets=image_offsets,
                                 tgt_size=tgt_sizes_flat,
                                 modality=Modality.IMAGE,
