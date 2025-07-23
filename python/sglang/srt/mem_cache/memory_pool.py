@@ -501,13 +501,13 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool):
             import kvcached.integration.sglang.interfaces as kvcached_interfaces
 
             self.kvcached_interfaces = kvcached_interfaces
-            self.kvcached_interfaces.init_kvcached(async_sche=enable_overlap_schedule)
+            self.kvcached_interfaces.init_kvcached(async_sched=enable_overlap_schedule)
 
             # Initialize KV allocator based on per-token KV size (cell_size)
             self.cell_size = self.head_num * self.head_dim * self.dtype.itemsize
 
             self.kvcached_allocator = kvcached_interfaces.get_kv_cache_manager(
-                self.size,
+                self.size + self.page_size,
                 self.page_size,
                 self.cell_size,
                 num_layers=layer_num,
@@ -540,13 +540,13 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool):
             raise ValueError("ElasticMHATokenToKVPool only supports cuda device")
 
         self.k_buffer, self.v_buffer = self.kvcached_interfaces.alloc_kv_cache(
-            self.size,
-            self.head_num,
-            self.head_dim,
-            self.dtype,
-            "cuda",
-            self.layer_num,
-            self.page_size,
+            kvcache_shape=(self.size + self.page_size, self.head_num, self.head_dim),
+            dtype=self.dtype,
+            device=self.device,
+            num_layers=self.layer_num,
+            page_size=self.page_size,
+            attention_type="MHA",
+            kv_layout="NHD",
         )
 
 

@@ -170,7 +170,7 @@ class ElasticTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.kvcached_allocator.available_size()
 
     def alloc(self, need_size: int):
-        indices = self.kvcached_allocator.alloc(need_size)
+        indices: List[int] = self.kvcached_allocator.alloc(need_size)
         indices = torch.tensor(indices, dtype=torch.int32, device="cuda")
         return indices
 
