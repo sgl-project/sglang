@@ -993,7 +993,7 @@ class DeepEPMoE(EPMoE):
             assert self.w2_weight.dtype == torch.int8
             assert (
                 hidden_states.shape[1] // 2 == self.w13_weight.shape[2]
-            ), f"a.shape[1]:{a.shape[1]} Hidden size mismatch w1 w1_q.shape[2]:{w1_q.shape[2]}"
+            ), f"Hidden size mismatch w1 "
             assert (
                 self.w13_weight.shape[2] * 2 == self.w2_weight.shape[1]
             ), "Hidden size mismatch w2"
