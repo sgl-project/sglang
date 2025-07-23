@@ -19,6 +19,10 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.multiplex.pdmux_context import (
+    get_current_stream_idx,
+    set_current_stream_idx,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,13 +31,14 @@ class SchedulerMultiplexMixin:
 
     # TODO(jason-fxz): This is a temporary demo
     def adjust_stream_groups(self) -> tuple[int, tuple[ExternalStream, ExternalStream]]:
-        stream_idx = 0
         if not self.running_batch.is_empty() and self.split_prefill_batch:
-            stream_idx = 1
+            set_current_stream_idx(1)
         elif not self.running_batch.is_empty():
-            stream_idx = 2
+            set_current_stream_idx(2)
         elif self.split_prefill_batch:
-            stream_idx = 0
+            set_current_stream_idx(0)
+
+        stream_idx = get_current_stream_idx()
 
         self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
         return stream_idx, self.stream_groups[stream_idx]

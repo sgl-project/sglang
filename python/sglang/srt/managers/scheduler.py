@@ -137,6 +137,11 @@ from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing import SchedulerMultiplexMixin
+from sglang.srt.multiplex.pdmux_context import (
+    get_sm_counts,
+    get_stream_groups,
+    initialize_stream_groups,
+)
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -323,21 +328,9 @@ class Scheduler(
 
         if self.enable_pdmux:
             # for pd_multiplexing, Init stream_groups
-            total_sm_count = spatial.get_sm_available(gpu_id)
-            self.sm_counts = [
-                # (prefill_sm_count, decode_sm_count)
-                (total_sm_count, 0),
-                (total_sm_count // 2, total_sm_count - total_sm_count // 2),
-                (0, total_sm_count),
-            ]
-            self.stream_groups = [
-                # (prefill_stream, decode_stream)
-                (torch.cuda.Stream(self.tp_rank), torch.cuda.Stream(self.tp_rank)),
-                spatial.create_greenctx_stream_by_value(
-                    total_sm_count // 2, total_sm_count - total_sm_count // 2, tp_rank
-                ),
-                (torch.cuda.Stream(self.tp_rank), torch.cuda.Stream(self.tp_rank)),
-            ]
+            initialize_stream_groups(gpu_id)
+            self.stream_groups = get_stream_groups()
+            self.sm_counts = get_sm_counts()
 
         # Init tokenizer
         self.init_tokenizer()
