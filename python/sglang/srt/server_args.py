@@ -410,6 +410,13 @@ class ServerArgs:
             )
             self.page_size = 128
 
+        if self.attention_backend == "trtllm_mla":
+            if self.page_size not in [32, 64]:
+                logger.warning(
+                    f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
+                )
+                self.page_size = 64
+
         # Choose grammar backend
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
