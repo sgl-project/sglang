@@ -38,6 +38,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -227,10 +228,14 @@ class MiniMaxText01MoE(nn.Module):
             intermediate_size=self.intermediate_size * self.tp_size,
             params_dtype=self.params_dtype,
             reduce_results=True,
-            renormalize=True,
             quant_config=self.quant_config,
             tp_size=self.tp_size,
             prefix=f"{prefix}.experts",
+        )
+
+        self.topk = TopK(
+            top_k=top_k,
+            renormalize=True if top_k > 1 else False,
         )
         return
 
@@ -244,9 +249,8 @@ class MiniMaxText01MoE(nn.Module):
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
         router_logits_fp32, _ = self.gate(hidden_states.to(torch.float32))
-        final_hidden_states = self.experts(
-            hidden_states, router_logits_fp32.to(hidden_states.dtype)
-        )
+        topk_output = self.topk(hidden_states, router_logits_fp32)
+        final_hidden_states = self.experts(hidden_states, topk_output)
         final_hidden = final_hidden_states.view(num_tokens, hidden_size)
         return final_hidden
 
@@ -368,69 +372,42 @@ class MiniMaxText01LinearAttention(nn.Module):
         qkvact = qkvact.view((qkv.shape[0], self.tp_heads, -1))
         q, k, v = torch.split(qkvact, [self.head_dim] * 3, dim=-1)
 
-        # Use the lightning attention backend
+        # Use the lightning attention backend with pre-initialized metadata
+        # Metadata should be initialized at the model level using forward_batch
         if attn_backend.forward_metadata is None:
-            # Create a proper forward batch for metadata initialization
-            class DummyForwardBatch:
-                def __init__(self):
-                    self.batch_size = q.shape[0]
-                    self.seq_lens = torch.ones(
-                        self.batch_size, dtype=torch.int32, device=q.device
-                    )
-                    self.forward_mode = None  # Will be treated as decode mode
-                    self.extend_seq_lens = None
-                    # Add missing attributes for the backend
-                    self.kv_caches = kv_caches.minimax_cache
-                    self.state_indices_tensor = kv_caches.state_indices_tensor
+            raise RuntimeError(
+                "LightningAttnBackend metadata should be initialized at model level"
+            )
 
-            dummy_batch = DummyForwardBatch()
-            attn_backend.init_forward_metadata(dummy_batch)
-
-        # Get metadata and ensure proper field assignment
+        # Get metadata from backend
         metadata = attn_backend.forward_metadata
 
-        # Create updated metadata with correct fields
-        updated_metadata = LightningAttentionMetadata(
-            num_prefills=getattr(metadata, "num_prefills", 0),
-            num_prefill_tokens=getattr(metadata, "num_prefill_tokens", 0),
-            num_decode_tokens=getattr(metadata, "num_decode_tokens", q.shape[0]),
-            query_start_loc=getattr(
-                metadata,
-                "query_start_loc",
-                torch.arange(0, q.shape[0] + 1, dtype=torch.int32, device=q.device),
-            ),
-            context_lens_tensor=getattr(
-                metadata,
-                "context_lens_tensor",
-                torch.ones(q.shape[0], dtype=torch.int32, device=q.device),
-            ),
-            rotary_emb=getattr(metadata, "rotary_emb", None),
-            kv_caches=kv_caches.minimax_cache,
-            state_indices_tensor=kv_caches.state_indices_tensor,
-            slope_rates=self.tp_slope,
-        )
+        # Update metadata with current layer's cache and slope information
+        if hasattr(metadata, "kv_caches"):
+            metadata.kv_caches = kv_caches.minimax_cache
+        if hasattr(metadata, "state_indices_tensor"):
+            metadata.state_indices_tensor = kv_caches.state_indices_tensor
+        if hasattr(metadata, "slope_rates"):
+            metadata.slope_rates = self.tp_slope
 
-        # Update backend metadata
-        attn_backend.forward_metadata = updated_metadata
-
-        decode_only = updated_metadata.num_prefills == 0
+        decode_only = metadata.num_prefills == 0
         if not decode_only:
             hidden = attn_backend._prefill_and_mix_infer(
                 q,
                 k,
                 v,
-                updated_metadata.kv_caches,
-                updated_metadata.state_indices_tensor,
-                updated_metadata,
+                metadata.kv_caches,
+                metadata.state_indices_tensor,
+                metadata,
             )
         else:
             hidden = attn_backend._decode_infer(
                 q,
                 k,
                 v,
-                updated_metadata.kv_caches,
-                updated_metadata.state_indices_tensor,
-                updated_metadata,
+                metadata.kv_caches,
+                metadata.state_indices_tensor,
+                metadata,
             )
 
         hidden = self.norm._forward(hidden)
@@ -670,7 +647,6 @@ class MiniMaxText01DecoderLayer(nn.Module):
         positions: torch.Tensor,
         kv_caches: Union[list[dict], Optional[torch.Tensor]],
         forward_batch: ForwardBatch,
-        attn_metadata: LightningAttentionMetadata = None,
         residual: Optional[torch.Tensor] = None,
         is_warmup: bool = False,
         attn_backend: Optional[LightningAttnBackend] = None,
@@ -680,7 +656,6 @@ class MiniMaxText01DecoderLayer(nn.Module):
         layernorm_output = self.input_layernorm(layernorm_input)
         residual = layernorm_output if self.postnorm else layernorm_input
 
-        # Pass the attention backend to linear attention layers
         if isinstance(self.self_attn, MiniMaxText01LinearAttention):
             self_attention_output = self.self_attn(
                 hidden_states=layernorm_output,
@@ -693,7 +668,7 @@ class MiniMaxText01DecoderLayer(nn.Module):
                 hidden_states=layernorm_output,
                 positions=positions,
                 forward_batch=forward_batch,
-                attn_metadata=attn_metadata,
+                attn_metadata=None,
                 **kwargs,
             )
 
@@ -904,9 +879,7 @@ class MiniMaxText01Model(nn.Module):
             head_dim = config.hidden_size // config.num_attention_heads
         max_position_embeddings = config.max_position_embeddings
         if hasattr(config, "max_model_len") and isinstance(config.max_model_len, int):
-            max_position_embeddings = min(
-                config.max_position_embeddings, config.max_model_len
-            )
+            max_position_embeddings = min(max_position_embeddings, config.max_model_len)
 
         rope_theta = getattr(config, "rope_theta", 10000)
         self.rotary_emb = RotaryEmbedding(
@@ -1003,29 +976,11 @@ class MiniMaxText01Model(nn.Module):
         attn_backend: Optional[LightningAttnBackend] = None,
         **kwargs,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        # Use provided backend or fall back to the model's initialized backend
         if attn_backend is None:
             attn_backend = self.attn_backend
 
-        # Auto-initialize AttentionMetadata if not provided
-        batch_size = (
-            input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
-        )
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
-
-        # Create metadata for lightning attention
-        attn_metadata = LightningAttentionMetadata(
-            num_prefills=0,
-            num_prefill_tokens=0,
-            num_decode_tokens=batch_size,
-            query_start_loc=torch.arange(
-                0, batch_size + 1, dtype=torch.int32, device=device
-            ),
-            context_lens_tensor=torch.ones(
-                batch_size, dtype=torch.int32, device=device
-            ),
-            rotary_emb=self.rotary_emb,
-        )
+        if attn_backend.forward_metadata is None:
+            attn_backend.init_forward_metadata(forward_batch)
 
         if "request_ids_to_seq_ids" not in kwargs:
             kwargs["request_ids_to_seq_ids"] = {}
@@ -1036,12 +991,12 @@ class MiniMaxText01Model(nn.Module):
             minimax_cache_tensors,
             state_indices_tensor,
         ) = self.minimax_cache.current_run_tensors(**kwargs)
-        if getattr(attn_metadata, "num_prefills", 0) > 0:
-            self._clear_prefill_cache(attn_metadata, minimax_cache_tensors, **kwargs)
 
-        minimax_cache_params = MinimaxCacheParams(
-            minimax_cache_tensors, state_indices_tensor
-        )
+        # Update the backend's metadata with cache information
+        if attn_backend.forward_metadata is not None:
+            attn_backend.forward_metadata.kv_caches = minimax_cache_tensors
+            attn_backend.forward_metadata.state_indices_tensor = state_indices_tensor
+
         if get_pp_group().is_first_rank:
             if inputs_embeds is None:
                 hidden_states = self.embed_scale * self.embed_tokens(input_ids)
@@ -1059,15 +1014,15 @@ class MiniMaxText01Model(nn.Module):
             _caches = None
             if isinstance(layer.self_attn, MiniMaxText01LinearAttention):
                 current_state_layer = minimax_cache_index
-                _caches = minimax_cache_params.at_layer_idx(current_state_layer)
+                _caches = MinimaxCacheParams(
+                    minimax_cache_tensors, state_indices_tensor
+                ).at_layer_idx(current_state_layer)
                 minimax_cache_index += 1
             hidden_states, residual = layer(
                 hidden_states=hidden_states,
                 positions=positions,
                 kv_caches=_caches,
                 forward_batch=forward_batch,
-                attn_metadata=attn_metadata,
-                residual=residual,
                 attn_backend=attn_backend,
             )
         if not get_pp_group().is_last_rank:
@@ -1163,7 +1118,7 @@ class MiniMaxText01ForCausalLM(nn.Module):
         )
         if get_pp_group().is_last_rank:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states.float(), self.lm_head, forward_batch
             )
         else:
             return hidden_states
