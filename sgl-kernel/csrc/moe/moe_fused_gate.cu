@@ -36,6 +36,24 @@ __device__ inline bool cmp_eq(const T& a, const T& b) {
   }
 }
 
+// Type-safe prefetch helper function
+template <typename T>
+__device__ __forceinline__ void safe_prefetch(const T* addr) {
+  if constexpr (std::is_same<T, float32_t>::value) {
+    // For standard floating-point types, use regular __ldg
+    volatile float dummy = __ldg(reinterpret_cast<const float*>(addr));
+  } 
+  else if constexpr (std::is_same<T, float16_t>::value || 
+                     std::is_same<T, bfloat16_t>::value) {
+    // Conversion of half-precision type to unsigned short
+    volatile unsigned short dummy = __ldg(reinterpret_cast<const unsigned short*>(addr));
+  }
+  else {
+    // Fallback option: Use volatile reads to trigger hardware prefetch
+    volatile T dummy = *addr;
+  }
+}
+
 // Fixed constants common to both dynamic and static template versions:
 static constexpr int WARP_SIZE = 32;
 static constexpr int WARPS_PER_CTA = 6;
@@ -113,8 +131,8 @@ __device__ void moe_fused_gate_impl(
       if (prefetch_size > 0) {
         #pragma unroll
         for (int i = 0; i < prefetch_size; i += 8) {
-          volatile T dummy1 = __ldg(&thread_read_ptr[next_offset + i]);
-          volatile T dummy2 = __ldg(&bias_thread_read_ptr[next_offset + i]);
+          safe_prefetch(&thread_read_ptr[next_offset + i]);
+          safe_prefetch(&bias_thread_read_ptr[next_offset + i]);
         }
       }
     }
