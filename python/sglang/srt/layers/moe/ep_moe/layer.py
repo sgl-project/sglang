@@ -962,33 +962,50 @@ class DeepEPMoE(EPMoE):
                 return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
         elif resolved_deepep_mode == DeepEPMode.low_latency:
             if self.use_w4afp8:
-                return self.forward_cutlass_w4a8_masked(hidden_states, masked_m, expected_m)
+                return self.forward_cutlass_w4a8_masked(
+                    hidden_states, masked_m, expected_m
+                )
             else:
                 return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
-        
-    def forward_cutlass_w4a8_masked(self,hidden_states, masked_m, expected_m):
-        #TODO gjw
-        logger.info(f"hidden_states[0].shape:{hidden_states[0].shape} \n hidden_states[1].shape:{hidden_states[1].shape} \n masked_m.shape:{masked_m.shape}\n   masked_m:{masked_m} \n expected_m:{expected_m}")
+
+    def forward_cutlass_w4a8_masked(self, hidden_states, masked_m, expected_m):
+        # TODO gjw
+        logger.info(
+            f"hidden_states[0].shape:{hidden_states[0].shape} \n hidden_states[1].shape:{hidden_states[1].shape} \n masked_m.shape:{masked_m.shape}\n   masked_m:{masked_m} \n expected_m:{expected_m}"
+        )
         result = hidden_states[0][masked_m.bool()]
         pass
 
-
-    def forward_cutlass_w4a8(self,hidden_states, topk_idx):
+    def forward_cutlass_w4a8(self, hidden_states, topk_idx):
 
         local_topk_ids = topk_idx
         # hidden_states,hidden_states_scale=hidden_states
-        local_topk_ids = torch.where(local_topk_ids == -1,  self.num_experts, topk_idx).to(torch.int32).contiguous()
+        local_topk_ids = (
+            torch.where(local_topk_ids == -1, self.num_experts, topk_idx)
+            .to(torch.int32)
+            .contiguous()
+        )
 
-        if hidden_states.shape[0]>0 :
+        if hidden_states.shape[0] > 0:
             assert self.w13_weight.dtype == torch.int8
             assert self.w2_weight.dtype == torch.int8
-            assert hidden_states.shape[1] // 2 == self.w13_weight.shape[2], f"a.shape[1]:{a.shape[1]} Hidden size mismatch w1 w1_q.shape[2]:{w1_q.shape[2]}"
-            assert self.w13_weight.shape[2] * 2 == self.w2_weight.shape[1], "Hidden size mismatch w2"
-            assert self.w13_weight.shape[0] == self.w2_weight.shape[0], "Expert number mismatch"
-            assert self.w13_weight.shape[0] == self.w13_weight_scale_inv.shape[0], "w1 scales expert number mismatch"
-            assert self.w2_weight.shape[0] == self.w2_weight_scale_inv.shape[0], "w2 scales expert number mismatch"
+            assert (
+                hidden_states.shape[1] // 2 == self.w13_weight.shape[2]
+            ), f"a.shape[1]:{a.shape[1]} Hidden size mismatch w1 w1_q.shape[2]:{w1_q.shape[2]}"
+            assert (
+                self.w13_weight.shape[2] * 2 == self.w2_weight.shape[1]
+            ), "Hidden size mismatch w2"
+            assert (
+                self.w13_weight.shape[0] == self.w2_weight.shape[0]
+            ), "Expert number mismatch"
+            assert (
+                self.w13_weight.shape[0] == self.w13_weight_scale_inv.shape[0]
+            ), "w1 scales expert number mismatch"
+            assert (
+                self.w2_weight.shape[0] == self.w2_weight_scale_inv.shape[0]
+            ), "w2 scales expert number mismatch"
             assert (
                 self.w13_weight_scale_inv.shape[1] == self.w13_weight.shape[2] * 2 / 512
                 and self.w13_weight_scale_inv.shape[2] == self.w13_weight.shape[1] * 4
@@ -998,19 +1015,31 @@ class DeepEPMoE(EPMoE):
                 and self.w2_weight_scale_inv.shape[2] == self.w2_weight.shape[1] * 4
             ), "W2 scale shape mismatch"
 
-            assert self.quant_method.a_strides1.shape[0] == self.w13_weight.shape[0], "A Strides 1 expert number mismatch"
-            assert self.quant_method.b_strides1.shape[0] == self.w13_weight.shape[0], "B Strides 1 expert number mismatch"
-            assert self.quant_method.a_strides2.shape[0] == self.w2_weight.shape[0], "A Strides 2 expert number  mismatch"
-            assert self.quant_method.b_strides2.shape[0] == self.w2_weight.shape[0], "B Strides 2 expert number mismatch"
+            assert (
+                self.quant_method.a_strides1.shape[0] == self.w13_weight.shape[0]
+            ), "A Strides 1 expert number mismatch"
+            assert (
+                self.quant_method.b_strides1.shape[0] == self.w13_weight.shape[0]
+            ), "B Strides 1 expert number mismatch"
+            assert (
+                self.quant_method.a_strides2.shape[0] == self.w2_weight.shape[0]
+            ), "A Strides 2 expert number  mismatch"
+            assert (
+                self.quant_method.b_strides2.shape[0] == self.w2_weight.shape[0]
+            ), "B Strides 2 expert number mismatch"
             num_experts = self.w13_weight.size(0)
             m = hidden_states.size(0)
             k = self.w13_weight.size(2) * 2  # w1_q is transposed and packed
             n = self.w2_weight.size(2) * 2  # w2_q is transposed and packed
             topk = local_topk_ids.size(1)
             device = hidden_states.device
-            
-            a_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
-            c_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
+
+            a_map = torch.empty(
+                (local_topk_ids.numel()), dtype=torch.int32, device=device
+            )
+            c_map = torch.empty(
+                (local_topk_ids.numel()), dtype=torch.int32, device=device
+            )
             get_cutlass_w4a8_moe_mm_data(
                 local_topk_ids,
                 self.quant_method.expert_offsets,
@@ -1022,14 +1051,14 @@ class DeepEPMoE(EPMoE):
                 n,
                 k,
             )
-            
-            c1 = torch.zeros((m , n * 2), device=device, dtype=torch.half)
-            c2 = torch.zeros((m , k), device=device, dtype=torch.half)
+
+            c1 = torch.zeros((m, n * 2), device=device, dtype=torch.half)
+            c2 = torch.zeros((m, k), device=device, dtype=torch.half)
 
             a_q = torch.empty(
                 hidden_states.shape, dtype=torch.float8_e4m3fn, device=device
             )
-            a1_scale_float=self.w13_input_scale.float()
+            a1_scale_float = self.w13_input_scale.float()
             sgl_per_tensor_quant_fp8(hidden_states, a_q, a1_scale_float, True)
 
             cutlass_w4a8_moe_mm(
@@ -1047,12 +1076,12 @@ class DeepEPMoE(EPMoE):
                 128,
                 topk,
             )
-            intermediate = torch.empty((m , n), device=device, dtype=torch.half)
+            intermediate = torch.empty((m, n), device=device, dtype=torch.half)
             silu_and_mul(c1, intermediate)
             intermediate_q = torch.empty(
                 intermediate.shape, dtype=torch.float8_e4m3fn, device=device
             )
-            a2_scale_float= self.w2_input_scale.float()
+            a2_scale_float = self.w2_input_scale.float()
             sgl_per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale_float, True)
 
             cutlass_w4a8_moe_mm(
