@@ -481,6 +481,7 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        enable_overlap_schedule: bool = True,
     ):
         super(MHATokenToKVPool, self).__init__(
             size=size,
@@ -500,7 +501,7 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool):
             import kvcached.integration.sglang.interfaces as kvcached_interfaces
 
             self.kvcached_interfaces = kvcached_interfaces
-            self.kvcached_interfaces.init_kvcached()
+            self.kvcached_interfaces.init_kvcached(async_sche=enable_overlap_schedule)
 
             # Initialize KV allocator based on per-token KV size (cell_size)
             self.cell_size = self.head_num * self.head_dim * self.dtype.itemsize
@@ -513,7 +514,7 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool):
             )
         except ImportError as e:
             raise ImportError(
-                "kvcached is not found. Please install it for elastic memory."
+                "kvcached is not found. Please install kvcached with `pip install kvcached --no-build-isolation` to use elastic KV cache."
             ) from e
 
         self._create_buffers()

@@ -1238,10 +1238,7 @@ class ModelRunner:
                     device=self.device,
                 )
             else:
-                token_to_kv_pool_cls = (
-                    ElasticMHATokenToKVPool if self.is_elastic else MHATokenToKVPool
-                )
-                self.token_to_kv_pool = token_to_kv_pool_cls(
+                mha_token_to_kv_pool_args = dict(
                     size=self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
@@ -1255,6 +1252,19 @@ class ModelRunner:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
+                if not self.is_elastic:
+                    self.token_to_kv_pool = MHATokenToKVPool(
+                        **mha_token_to_kv_pool_args
+                    )
+                else:
+                    # add enable overlap schedule args to elastic mha token to kv pool
+                    elastic_mha_token_to_kv_pool_args = mha_token_to_kv_pool_args
+                    elastic_mha_token_to_kv_pool_args["enable_overlap_schedule"] = (
+                        not self.server_args.disable_overlap_schedule
+                    )
+                    self.token_to_kv_pool = ElasticMHATokenToKVPool(
+                        **elastic_mha_token_to_kv_pool_args
+                    )
 
         if self.token_to_kv_pool_allocator is None:
             if self.page_size == 1:

@@ -129,10 +129,7 @@ from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import validate_input_length
-from sglang.srt.mem_cache.allocator import (
-    ElasticTokenToKVPoolAllocator,
-    SWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -1518,10 +1515,9 @@ class Scheduler(
             token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
 
         # disable memory leak check for elastic allocator, since the available size changes dynamically.
-        if isinstance(self.token_to_kv_pool_allocator, ElasticTokenToKVPoolAllocator):
-            memory_leak = False
+        enable_elastic_memory = get_bool_env_var("ENABLE_KVCACHED", "false")
 
-        if memory_leak:
+        if memory_leak and not enable_elastic_memory:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
             raise ValueError(msg)
 
