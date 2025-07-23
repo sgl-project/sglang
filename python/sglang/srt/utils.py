@@ -1153,13 +1153,16 @@ def point_to_point_pyobj(
     group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
     dst: int = 1,
+    force_cpu_device: bool = True,
 ):
     """Send data from src to dst in group using DeviceToDevice communication."""
-
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
+    )
     if rank == src:
         if len(data) == 0:
             tensor_size = torch.tensor(
-                [0], dtype=torch.long, device=torch.cuda.current_device()
+                [0], dtype=torch.long, device=device
             )
             dist.send(tensor_size, dst=dst, group=group)
         else:
@@ -1167,11 +1170,9 @@ def point_to_point_pyobj(
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
-            ).cuda(
-                device=torch.cuda.current_device()
-            )  # Move to GPU
+            ).to(device)
             tensor_size = torch.tensor(
-                [size], dtype=torch.long, device=torch.cuda.current_device()
+                [size], dtype=torch.long, device=device
             )
 
             dist.send(tensor_size, dst=dst, group=group)
@@ -1180,7 +1181,7 @@ def point_to_point_pyobj(
 
     elif rank == dst:
         tensor_size = torch.tensor(
-            [0], dtype=torch.long, device=torch.cuda.current_device()
+            [0], dtype=torch.long, device=device
         )
         dist.recv(tensor_size, src=src, group=group)
         size = tensor_size.item()
@@ -1189,7 +1190,7 @@ def point_to_point_pyobj(
             return []
 
         tensor_data = torch.empty(
-            size, dtype=torch.uint8, device=torch.cuda.current_device()
+            size, dtype=torch.uint8, device=device
         )
         dist.recv(tensor_data, src=src, group=group)
 
