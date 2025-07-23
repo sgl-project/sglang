@@ -240,10 +240,10 @@ union ComposedKey {
     at::ScalarType type_in;
     at::ScalarType type_out;
     at::ScalarType type_scale;
-    at::ScalarType _unused = at::ScalarType::Float;
+    at::ScalarType _unused;
     int group_size;
   } keys;
-  int64_t composed;
+  int64_t composed = 0;
 };
 
 class PerTokenGroupQuantDispatcher {
