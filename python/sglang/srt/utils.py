@@ -1927,48 +1927,6 @@ class MultiprocessingSerializer:
         return ForkingPickler.loads(data)
 
 
-class TorchPatchMultiprocessingSerializer:
-    """
-    A variant of MultiprocessingSerializer that applies torch reductions monkey patch
-    before serialization/deserialization operations.
-    """
-
-    @staticmethod
-    def serialize(obj, output_str: bool = False):
-        """
-        Serialize a Python object using ForkingPickler with torch patches applied.
-
-        Args:
-            obj: The object to serialize.
-            output_str (bool): If True, return a base64-encoded string instead of raw bytes.
-
-        Returns:
-            bytes or str: The serialized object.
-        """
-        from sglang.srt.patch_torch import monkey_patch_torch_reductions
-
-        monkey_patch_torch_reductions()
-
-        return MultiprocessingSerializer.serialize(obj, output_str)
-
-    @staticmethod
-    def deserialize(data):
-        """
-        Deserialize a previously serialized object with torch patches applied.
-
-        Args:
-            data (bytes or str): The serialized data, optionally base64-encoded.
-
-        Returns:
-            The deserialized Python object.
-        """
-        from sglang.srt.patch_torch import monkey_patch_torch_reductions
-
-        monkey_patch_torch_reductions()
-
-        return MultiprocessingSerializer.deserialize(data)
-
-
 def debug_timing(func):
     # todo: replace with a more organized instrumentation
     def wrapper(*args, **kwargs):
