@@ -62,7 +62,7 @@ class AscendAttnBackend(AttentionBackend):
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         self.native_attn = TorchNativeAttnBackend(model_runner)
         self.graph_metadata = {}
-        self.max_context_len = min(model_runner.model_config.context_len, 2048)
+        self.max_context_len = model_runner.model_config.context_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
 

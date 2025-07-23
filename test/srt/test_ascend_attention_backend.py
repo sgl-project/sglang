@@ -20,6 +20,8 @@ from sglang.test.test_utils import (
     run_bench_offline_throughput,
 )
 
+DEFAULT_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-7B-Instruct"
+
 
 class TestAscendAttnBackend(CustomTestCase):
     def test_latency(self):
