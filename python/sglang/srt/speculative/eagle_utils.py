@@ -70,6 +70,10 @@ class EagleDraftInput:
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
 
+    # Shape info for padding
+    num_tokens_per_batch: int = -1
+    num_tokens_for_logprob_per_batch: int = -1
+
     # Inputs for draft extend
     # shape: (b,)
     seq_lens_for_draft_extend: torch.Tensor = None

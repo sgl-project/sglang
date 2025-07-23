@@ -375,7 +375,6 @@ class EAGLEWorker(TpModelWorker):
         # We need the full hidden states to prefill the KV cache of the draft model.
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        model_worker_batch.spec_num_draft_tokens = 1
         logits_output, next_token_ids, _ = self.target_worker.forward_batch_generation(
             model_worker_batch
         )
@@ -507,13 +506,15 @@ class EAGLEWorker(TpModelWorker):
             self._draft_preprocess_decode(batch)
 
         spec_info = batch.spec_info
+        assert isinstance(spec_info, EagleDraftInput)
 
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        spec_info.num_tokens_per_batch = self.topk
+        spec_info.num_tokens_for_logprob_per_batch = self.topk
         batch.return_hidden_states = False
 
         # Get forward batch
         model_worker_batch = batch.get_model_worker_batch()
-        model_worker_batch.spec_num_draft_tokens = self.topk
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
@@ -526,6 +527,7 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch
             )
         else:
+            forward_batch.can_run_dp_cuda_graph = False
             if not forward_batch.forward_mode.is_idle():
                 # Initialize attention backend
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
@@ -577,6 +579,7 @@ class EAGLEWorker(TpModelWorker):
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info = forward_batch.spec_info
+        assert isinstance(spec_info, EagleDraftInput)
         out_cache_loc = forward_batch.out_cache_loc
         topk_p, topk_index, hidden_states = (
             spec_info.topk_p,
@@ -620,8 +623,8 @@ class EAGLEWorker(TpModelWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output = self.draft_model_runner.model.forward(
-                forward_batch.input_ids, forward_batch.positions, forward_batch
+            logits_output, _ = self.draft_model_runner.forward(
+                forward_batch, skip_attn_backend_init=True
             )
             self._detect_nan_if_needed(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -641,10 +644,10 @@ class EAGLEWorker(TpModelWorker):
             else ForwardMode.IDLE
         )
         batch.spec_info = spec_info
+
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=spec_info.seq_lens_cpu
         )
-        model_worker_batch.spec_num_draft_tokens = self.speculative_num_draft_tokens
         assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
         if batch.has_grammar:
@@ -794,6 +797,8 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids,
+            num_tokens_per_batch=1,
+            num_tokens_for_logprob_per_batch=1,
         )
         batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
@@ -801,7 +806,6 @@ class EAGLEWorker(TpModelWorker):
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=seq_lens_cpu
         )
-        model_worker_batch.spec_num_draft_tokens = 1
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
@@ -813,6 +817,7 @@ class EAGLEWorker(TpModelWorker):
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
+        assert isinstance(batch.spec_info, EagleDraftInput)
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
         req_pool_indices_backup = batch.req_pool_indices
@@ -836,6 +841,9 @@ class EAGLEWorker(TpModelWorker):
                 topk=self.topk,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
+
+        batch.spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
+        batch.spec_info.num_tokens_for_logprob_per_batch = 1
         batch.spec_info.prepare_extend_after_decode(
             batch,
             self.speculative_num_steps,
@@ -848,7 +856,6 @@ class EAGLEWorker(TpModelWorker):
 
         batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
-        model_worker_batch.spec_num_draft_tokens = self.speculative_num_steps + 1
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
@@ -873,12 +880,13 @@ class EAGLEWorker(TpModelWorker):
             )
             forward_batch.spec_info.hidden_states = logits_output.hidden_states
         else:
+            forward_batch.can_run_dp_cuda_graph = False
             if not forward_batch.forward_mode.is_idle():
                 self.draft_model_runner.attn_backend.init_forward_metadata(
                     forward_batch
                 )
-            logits_output = self.draft_model_runner.model.forward(
-                forward_batch.input_ids, forward_batch.positions, forward_batch
+            logits_output, _ = self.draft_model_runner.forward(
+                forward_batch, skip_attn_backend_init=True
             )
             self.capture_for_decode(logits_output, forward_batch.spec_info)
 

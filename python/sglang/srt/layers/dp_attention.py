@@ -3,7 +3,7 @@ from __future__ import annotations
 import functools
 import logging
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 import triton
@@ -162,7 +162,7 @@ def disable_dp_size():
         _ATTN_DP_SIZE = old_dp_size
 
 
-def get_dp_local_info(forward_batch: ForwardBatch):
+def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
     # `get_dp_local_info` is only called in global DP gather and scatter. We use global DP rank here.
     dp_rank = get_attention_dp_rank()
 
@@ -238,13 +238,6 @@ def _dp_gather(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
 
-        # NOTE: During draft extend, the gathered_buffer is padded to num_tokens * (speculative_num_steps + 1).
-        # But the size of local_tokens is total accepted tokens. We need to reduce the local_num_tokens to the
-        # actual size of the accepted tokens.
-        if forward_batch.forward_mode.is_draft_extend():
-            shape_tensor = local_num_tokens.new_full((), local_tokens.shape[0])
-            local_num_tokens = torch.minimum(local_num_tokens, shape_tensor)
-
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
         )
@@ -295,13 +288,6 @@ def dp_scatter(
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
-
-        # NOTE: During draft extend, the gathered_buffer is padded to num_tokens * (speculative_num_steps + 1).
-        # But the size of local_tokens is total accepted tokens. We need to reduce the local_num_tokens to the
-        # actual size of the accepted tokens.
-        if forward_batch.forward_mode.is_draft_extend():
-            shape_tensor = local_num_tokens.new_full((), local_tokens.shape[0])
-            local_num_tokens = torch.minimum(local_num_tokens, shape_tensor)
 
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
