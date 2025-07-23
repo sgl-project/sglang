@@ -110,7 +110,7 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
-#### Using [AMD Quark](https://github.com/amd/Quark/issues)
+#### Using [AMD Quark](https://quark.docs.amd.com/latest/)
 
 AMD Quark is a quantizer developed by AMD, targeting a wide range of data types, algorithms and pre-processing schemes.
 
@@ -118,7 +118,7 @@ The following per-quantized models can be loaded in sglang:
 
 * OCP MXFP4 weights, with dynamic per-group OCP MXFP4 activation quantization.
 
-Example usage, after installing the latest AMD Quark release:
+Example usage, after installing the [latest AMD Quark release](https://pypi.org/project/amd-quark/):
 
 ```bash
 python3 -m sglang.launch_server --model-path fxmarty/qwen_1.5-moe-a2.7b-mxfp4 --tensor-parallel-size 1
