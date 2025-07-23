@@ -534,6 +534,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hidden_states,
             input_global_scale,
             topk_idx,
+            use_fp8=False if os.getenv("USE_W4A8") == "1" else True,
         )
         return (
             hidden_states,

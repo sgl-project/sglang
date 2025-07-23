@@ -50,6 +50,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if not (_is_npu or _is_hip):
     from sgl_kernel import silu_and_mul
 
+    from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+
 if _use_aiter:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
@@ -226,13 +228,53 @@ class DeepEPMoE(FusedMoE):
                     dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args
                 )
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
-            return self.forward_deepgemm_masked(dispatch_output)
+            if self.use_w4afp8:
+                return self.forward_cutlass_w4a8_masked(
+                    hidden_states, masked_m, ep_mode="deepep_ll"
+                )
+            else:
+                return self.forward_deepgemm_masked(dispatch_output)
         else:
-            raise ValueError(
-                f"Dispatch output format {dispatch_output.format} is not supported"
-            )
+            raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
 
-    def combine(
+    def forward_cutlass_w4a8_masked(
+        self, hidden_states: torch.Tensor, masked_m: torch.Tensor, ep_mode: str
+    ):
+
+        total_m = torch.sum(masked_m)
+        if total_m > 0:
+            output = cutlass_w4a8_moe(
+                self.start_expert_id,
+                self.end_expert_id,
+                self.num_experts,
+                hidden_states,
+                self.w13_weight,
+                self.w2_weight,
+                self.w13_weight_scale_inv,
+                self.w2_weight_scale_inv,
+                None,
+                None,
+                masked_m,
+                self.quant_method.a_strides1,
+                self.quant_method.b_strides1,
+                self.quant_method.c_strides1,
+                self.quant_method.a_strides2,
+                self.quant_method.b_strides2,
+                self.quant_method.c_strides2,
+                self.quant_method.s_strides13,
+                self.quant_method.s_strides2,
+                self.quant_method.expert_offsets,
+                self.quant_method.problem_sizes1,
+                self.quant_method.problem_sizes2,
+                self.w13_input_scale,
+                self.w2_input_scale,
+                ep_mode=ep_mode,
+            )
+            return output.to(torch.bfloat16)
+        else:
+            return hidden_states.to(torch.bfloat16)
+
+    def forward_normal(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
