@@ -142,12 +142,16 @@ async def eval_mmmu(args) -> None:
         # For concurrency == 1, run in sequential mode to ensure consistent order
         # this is mainly for profiling
         for sample in tqdm(samples):
-            _, response = await process_sample(client, sample, sampling_params, lora_path)
+            _, response = await process_sample(
+                client, sample, sampling_params, lora_path
+            )
             process_result(response, sample, answer_dict, out_samples)
     else:
         semaphore = asyncio.Semaphore(args.concurrency)
         tasks = [
-            process_sample_with_semaphore(semaphore, client, sample, sampling_params, lora_path)
+            process_sample_with_semaphore(
+                semaphore, client, sample, sampling_params, lora_path
+            )
             for sample in samples
         ]
 
