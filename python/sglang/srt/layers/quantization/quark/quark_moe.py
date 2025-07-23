@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Callable, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
-from sglang.srt.layers.quantization.mxfp4_utils import OCP_MX_BLOCK_SIZE
-
-from sglang.srt.utils import print_warning_once
-from sglang.srt.utils import set_weight_attrs
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoeWeightScaleSupported
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.utils import supports_mx
+from sglang.srt.layers.quantization.mxfp4_utils import OCP_MX_BLOCK_SIZE
+from sglang.srt.utils import print_warning_once, set_weight_attrs, supports_mx
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
@@ -22,17 +19,18 @@ class QuarkMoEMethod(FusedMoEMethodBase):
 
     @staticmethod
     def get_moe_method(
-            quant_config: "QuarkConfig",  # type: ignore # noqa E501 # noqa F821
-            module: torch.nn.Module,
-            layer_name: str) -> "QuarkMoEMethod":
-        layer_quant_config = quant_config._find_matched_config(
-            layer_name, module)
+        quant_config: "QuarkConfig",  # type: ignore # noqa E501 # noqa F821
+        module: torch.nn.Module,
+        layer_name: str,
+    ) -> "QuarkMoEMethod":
+        layer_quant_config = quant_config._find_matched_config(layer_name, module)
 
-        if (layer_quant_config.get("output_tensors")
-                or layer_quant_config.get("bias")):
-            raise NotImplementedError("Currently, Quark models with "
-                                      "output_tensors and bias "
-                                      "quantized are not supported")
+        if layer_quant_config.get("output_tensors") or layer_quant_config.get("bias"):
+            raise NotImplementedError(
+                "Currently, Quark models with "
+                "output_tensors and bias "
+                "quantized are not supported"
+            )
         weight_config = layer_quant_config.get("weight")
         input_config = layer_quant_config.get("input_tensors")
 
@@ -44,19 +42,18 @@ class QuarkMoEMethod(FusedMoEMethodBase):
 
 class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
 
-    def __init__(self, weight_config: dict[str, Any], input_config: dict[str,
-                                                                         Any]):
+    def __init__(self, weight_config: dict[str, Any], input_config: dict[str, Any]):
         self.weight_quant = weight_config
         self.input_quant = input_config
 
         weight_qscheme = self.weight_quant.get("qscheme")
         input_qscheme = self.input_quant.get("qscheme")
-        if not (weight_qscheme == "per_group"
-                and input_qscheme == "per_group"):
+        if not (weight_qscheme == "per_group" and input_qscheme == "per_group"):
             raise ValueError(
                 "For MX(FP4) Fused MoE layers, only per-group scales "
                 "for weights and activations are supported. Found "
-                f"{weight_qscheme}, {input_qscheme}")  # noqa E501
+                f"{weight_qscheme}, {input_qscheme}"
+            )  # noqa E501
 
         self.static_input_scales = not self.input_quant.get("is_dynamic")
 
@@ -66,7 +63,8 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                 "The current platform does not support native MXFP4 "
                 "computation. Simulated weight dequantization and activation "
                 "QDQ (quantize and dequantize) will be used, with the linear "
-                "layers computed in high precision.")
+                "layers computed in high precision."
+            )
         else:
             self.emulate = True
             print_warning_once(
@@ -74,37 +72,50 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                 "computation, but kernels are not yet integrated in vLLM. "
                 "Simulated weight dequantization and activation "
                 "QDQ (quantize and dequantize) will be used, with the linear "
-                "layers computed in high precision.")
+                "layers computed in high precision."
+            )
 
-
-    def create_weights(self, layer: torch.nn.Module, num_experts: int,
-                       hidden_size: int, intermediate_size_per_partition: int,
-                       params_dtype: torch.dtype, **extra_weight_attrs):
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
 
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
         extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value})
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+        )
 
         params_dtype = torch.uint8
 
         # WEIGHTS
-        w13_weight = torch.nn.Parameter(torch.empty(
-            num_experts,
-            2 * intermediate_size_per_partition,
-            hidden_size // 2,
-            dtype=params_dtype),
-                                        requires_grad=False)
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // 2,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
         layer.register_parameter("w13_weight", w13_weight)
 
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
-        w2_weight = torch.nn.Parameter(torch.empty(
-            num_experts,
-            hidden_size,
-            intermediate_size_per_partition // 2,
-            dtype=params_dtype),
-                                       requires_grad=False)
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // 2,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
         layer.register_parameter("w2_weight", w2_weight)
 
         set_weight_attrs(w2_weight, extra_weight_attrs)

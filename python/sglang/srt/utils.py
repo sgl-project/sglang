@@ -1745,6 +1745,7 @@ sglang_lib = Library("sglang", "FRAGMENT")  # noqa
 def supports_custom_op() -> bool:
     return hasattr(torch.library, "custom_op")
 
+
 def supports_mx() -> bool:
     """
     Returns whether the current platform supports MX types.
@@ -1754,6 +1755,7 @@ def supports_mx() -> bool:
         return any(gfx in gcn_arch for gfx in ["gfx95"])
     else:
         return False
+
 
 def direct_register_custom_op(
     op_name: str,

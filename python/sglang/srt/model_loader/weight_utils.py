@@ -151,7 +151,7 @@ def get_quant_config(
     if hf_quant_config is None:
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
-    
+
     if hf_quant_config is not None:
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
         return quant_cls.from_config(hf_quant_config)
@@ -841,12 +841,12 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
                 )
                 return None
             return remapped_name
-    
+
     quark_scale_names = {
         ".q_proj.output_scale": ".attn.q_scale",
         ".k_proj.output_scale": ".attn.k_scale",
         ".v_proj.output_scale": ".attn.v_scale",
-        "self_attn.prob_output_scale": ".attn.prob_scale"
+        "self_attn.prob_output_scale": ".attn.prob_scale",
     }
     for quark_scale_name, sglang_scale_name in quark_scale_names.items():
         if name.endswith(quark_scale_name):

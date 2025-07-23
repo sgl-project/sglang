@@ -35,9 +35,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import add_prefix
-from sglang.srt.model_loader.weight_utils import (
-    maybe_remap_kv_scale_name,
-)
+
 logger = logging.getLogger(__name__)
 
 

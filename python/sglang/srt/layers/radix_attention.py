@@ -14,14 +14,16 @@
 """Radix attention."""
 
 from enum import Enum
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from torch import nn
+
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+
 
 class AttentionType(Enum):
     """
@@ -84,8 +86,13 @@ class RadixAttention(nn.Module):
 
         # Only fa3 and flashinfer attention backends implement FP8 KV cache.
         use_fp8_cache = self.k_scale is not None or self.v_scale is not None
-        if global_server_args_dict["attention_backend"] not in ["fa3", "flashinfer"] and use_fp8_cache:
-            print_warning_once(f"RadixAttention has registered key/value scales, but the attention backend {global_server_args_dict['attention_backend']} does not support KV cache quantization! Beware that the KV cache will not be quantized.")
+        if (
+            global_server_args_dict["attention_backend"] not in ["fa3", "flashinfer"]
+            and use_fp8_cache
+        ):
+            print_warning_once(
+                f"RadixAttention has registered key/value scales, but the attention backend {global_server_args_dict['attention_backend']} does not support KV cache quantization! Beware that the KV cache will not be quantized."
+            )
 
     def forward(
         self,

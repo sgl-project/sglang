@@ -23,6 +23,10 @@ from sglang.srt.layers.quantization.int8_kernel import (
     per_token_quant_int8,
     sglang_per_token_group_quant_int8,
 )
+from sglang.srt.layers.quantization.mxfp4_utils import (
+    dequant_mxfp4,
+    quant_dequant_mxfp4,
+)
 from sglang.srt.utils import (
     ceil_div,
     cpu_has_amx_support,
@@ -35,9 +39,6 @@ from sglang.srt.utils import (
     next_power_of_2,
     supports_mx,
 )
-
-from sglang.srt.layers.quantization.mxfp4_utils import (dequant_mxfp4, quant_dequant_mxfp4)
-
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()

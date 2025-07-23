@@ -55,7 +55,6 @@ from sglang.srt.layers.quantization.gptq import (
     GPTQMarlinLinearMethod,
     GPTQMarlinMoEMethod,
 )
-from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
@@ -63,6 +62,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
+from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.layers.quantization.utils import get_linear_quant_method
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
@@ -84,7 +84,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "qoq": QoQConfig,
     "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
-    "quark": QuarkConfig
+    "quark": QuarkConfig,
 }
 
 # VLLM-dependent quantization methods
