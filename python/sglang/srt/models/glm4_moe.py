@@ -789,11 +789,11 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
                 ):
                     suffix_list = [
                         "down_proj.weight",
-                        "down_proj.weight_scale_inv",
+                        "down_proj.weight_scale",
                         "gate_proj.weight",
-                        "gate_proj.weight_scale_inv",
+                        "gate_proj.weight_scale",
                         "up_proj.weight",
-                        "up_proj.weight_scale_inv",
+                        "up_proj.weight_scale",
                     ]
                 elif self.quant_config.get_name() == "awq":
                     suffix_list = [
