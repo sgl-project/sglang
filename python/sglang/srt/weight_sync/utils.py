@@ -22,6 +22,19 @@ async def update_weights(
     device_mesh: DeviceMesh,
     load_format: Optional[str] = None,
 ):
+    """
+    Update weights for the inference engine.
+    This function is designed to be stateless, so that the caller process could keep the stateful engine.
+    Example Use Case:
+        - Multiple Producer Process will call this function in a SPMD style
+
+    Args:
+        engine: The inference engine created by the caller process.
+        params_batch: A list of (name, tensor) tuples. We batched the tensors to avoid the overhead of cpu call.
+        device_mesh_key: The key of the device mesh. Typically "tp" or "infer_tp"
+        device_mesh: The device mesh.
+        load_format: The format of the weights.
+    """
     infer_tp_size = device_mesh[device_mesh_key].mesh.size()[0]
     infer_tp_rank = device_mesh[device_mesh_key].get_local_rank()
     # Monkey patching Torch to ensure torch reduce tensor
@@ -33,8 +46,6 @@ async def update_weights(
     # named_tensors_batch will be a list like:
     # [(name0, ipc_tensor0_tp0), (name1, ipc_tensor1_tp0), ...]
     named_tensors_batch = [
-        # FSDP: we gather tensor by calling full_tensor in _preprocess_tensor_for_update_weights
-        # Megatron: we do nothing here, assuming it is gathered when feed into this func
         (
             name,
             MultiprocessingSerializer.serialize(
@@ -101,6 +112,18 @@ async def update_weights(
 
 
 def _preprocess_tensor_for_update_weights(tensor: torch.Tensor):
+    """
+    Preprocess the tensor for update weights.
+    Example Use Case:
+        - FSDP: we gather tensor by calling full_tensor in _preprocess_tensor_for_update_weights
+        - Megatron: we do nothing here, assuming it is gathered when feed into this func
+
+    Args:
+        tensor: The tensor to be preprocessed.
+
+    Returns:
+        The full tensor.
+    """
     if isinstance(tensor, DTensor):
         return tensor.full_tensor()
     return tensor
