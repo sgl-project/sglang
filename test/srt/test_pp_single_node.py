@@ -62,6 +62,29 @@ class TestPPAccuracy(unittest.TestCase):
         # Wait a little bit so that the memory check happens.
         time.sleep(4)
 
+    def test_logprob(self):
+        response = requests.post(
+            f"{self.base_url}/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 16,
+                },
+                "return_logprob": True,
+                "top_logprobs_num": 5,
+                "logprob_start_len": 0,
+            },
+        )
+        response_json = response.json()
+        input_token_logprobs = response_json["meta_info"]["input_token_logprobs"]
+        output_token_logprobs = response_json["meta_info"]["output_token_logprobs"]
+        output_top_logprobs = response_json["meta_info"]["output_top_logprobs"]
+
+        assert len(input_token_logprobs) == 6
+        assert len(output_token_logprobs) == 16
+        assert len(output_top_logprobs) == 16
+
 
 class TestQwenPPAccuracy(unittest.TestCase):
     @classmethod
