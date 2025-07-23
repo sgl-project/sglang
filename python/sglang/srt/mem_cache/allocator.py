@@ -600,7 +600,7 @@ def alloc_decode_kernel_ascend(
     out_indices = (last_loc + 1) * (1 - num_new_pages) + free_pages[
         start_new_pages
     ] * page_size * num_new_pages
-    return out_indices, num_new_pages.sum()
+    return out_indices.int(), num_new_pages.sum()
 
 
 class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
