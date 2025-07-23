@@ -208,7 +208,7 @@ def gen_payload(prompt, output_len):
     return payload
 
 
-def log_to_jsonl_file(data, file_path="performance_metrics.jsonl", tag=""):
+    """Append the data with a timestamp and tag to the specified JSONL file."""
     """Append the data with a timestamp to the specified JSONL file."""
     timestamped_data = {"timestamp": datetime.now().isoformat(), "tag": tag, **data}
     try:
