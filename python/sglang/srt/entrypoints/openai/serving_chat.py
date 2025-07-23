@@ -60,6 +60,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
         
+        if request.tool_choice == "required" and not request.tools:
+            return "Tools cannot be empty if tool choice is set to required."
+
         return None
 
     def _convert_to_internal_request(
