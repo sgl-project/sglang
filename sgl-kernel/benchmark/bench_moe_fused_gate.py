@@ -30,8 +30,8 @@ def biased_grouped_topk_org_fuse_kernel(
 
 seq_length_range = [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000]
 configs = [(sq, 256, 8, 4, 8) for sq in seq_length_range]  # original config
-configs.extend([(sq, 64, 1, 1, 6) for sq in seq_length_range])  # kimi vl config
-configs.extend([(sq, 384, 1, 1, 8) for sq in seq_length_range])  # Kimi K2 config
+# configs = ([(sq, 64, 1, 1, 6) for sq in seq_length_range])  # kimi vl config
+# configs = ([(sq, 384, 1, 1, 8) for sq in seq_length_range])  # Kimi K2 config
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(

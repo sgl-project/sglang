@@ -39,7 +39,7 @@ __device__ inline bool cmp_eq(const T& a, const T& b) {
 // Fixed constants common to both dynamic and static template versions:
 static constexpr int WARP_SIZE = 32;
 static constexpr int WARPS_PER_CTA = 6;
-static constexpr int MAX_VPT = 384;  // maximum VPT we support, > params.VPT = num_expert / num_expert_group
+static constexpr int MAX_VPT = 512;  // maximum VPT we support, > params.VPT = num_expert / num_expert_group
 
 // Create an alias for Array using AlignedArray
 template <typename T, int N>
@@ -108,8 +108,15 @@ __device__ void moe_fused_gate_impl(
 
     // Prefetch the data of the next tile before processing the current one
     if (tile + 1 < (params.VPT + 31) / 32) {
-      __prefetch_global(vec_thread_read_ptr[0] + (tile+1)*32);
-      __prefetch_global(vec_bias_thread_read_ptr[0] + (tile+1)*32);
+      int next_offset = (tile+1)*32;
+      int prefetch_size = min(32, params.VPT - next_offset);
+      if (prefetch_size > 0) {
+        #pragma unroll
+        for (int i = 0; i < prefetch_size; i += 8) {
+          volatile T dummy1 = __ldg(&thread_read_ptr[next_offset + i]);
+          volatile T dummy2 = __ldg(&bias_thread_read_ptr[next_offset + i]);
+        }
+      }
     }
 
     // Read row_chunk and bias_chunk
@@ -468,8 +475,10 @@ std::vector<at::Tensor> moe_fused_gate(
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   dim3 block_dim(WARP_SIZE, WARPS_PER_CTA);
 
-  // Check 1: Ensure that num_experts is a power of 2.
-  TORCH_CHECK((num_experts & (num_experts - 1)) == 0, "num_experts must be a power of 2, but got ", num_experts);
+  // Check 1: Ensure that num_experts is a power of 2, or 384 for Kimi K2.
+  TORCH_CHECK(
+    (num_experts & (num_experts - 1)) == 0 || num_experts == 384,
+    "num_experts must be a power of 2 or 384, but got ", num_experts);
 
   // Check 2: Ensure that num_experts is divisible by num_expert_group. (this also means num_expert_group is power of 2)
   TORCH_CHECK(
@@ -480,7 +489,7 @@ std::vector<at::Tensor> moe_fused_gate(
       num_expert_group);
 
   int computed_vpt = num_experts / num_expert_group;
-  // Check 3: Ensure that num_experts/num_expert_group does not exceed MAX_VPT=128. Maximum VPT indicate max value per
+  // Check 3: Ensure that num_experts/num_expert_group does not exceed MAX_VPT=512. Maximum VPT indicate max value per
   // threads we can process.
   TORCH_CHECK(
       computed_vpt <= MAX_VPT,
@@ -492,14 +501,26 @@ std::vector<at::Tensor> moe_fused_gate(
 
   // Dispatch to templated kernel for known compile-time configurations.
   // We currently only support for:
-  //   Case 1: 256 experts, with 8 or 16 groups.
-  //   Case 2: 128 experts, with 4 or 8 groups.
-  //   Case 3: 64 experts, with 1 groups.
-  //   Case 4: other cases, require 8 <= num_experts / num_expert_group <= 128.
+  //   Case 1: 384 experts, with 1 group.
+  //   Case 2: 256 experts, with 8 or 16 groups.
+  //   Case 3: 128 experts, with 4 or 8 groups.
+  //   Case 4: 64 experts, with 1 groups.
+  //   Case 5: other cases, require 8 <= num_experts / num_expert_group <= 64.
   bool dispatched = false;
   switch (num_experts) {
+    case 384:
+      if (num_expert_group == 1)
+        // Kimi K2 配置: VPT = 384/1 = 384, ROWS_PER_WARP = 32/1 = 32
+        if (input.scalar_type() == at::kBFloat16) {
+          LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 384, 1);
+        } else if (input.scalar_type() == at::kHalf) {
+          LAUNCH_MOE_GATE_CONFIG(float16_t, 384, 1);
+        } else if (input.scalar_type() == at::kFloat) {
+          LAUNCH_MOE_GATE_CONFIG(float32_t, 384, 1);
+        }
+      break;
     case 256:
-      if (num_expert_group == 8)
+      if (num_expert_group == 8) {
         // This is deepseek v3 case. Here VPT = 256/8 = 32, ROWS_PER_WARP = 32/8 = 4, ROWS_PER_CTA = 6 * 4 = 24.
         if (input.scalar_type() == at::kBFloat16) {
           LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 256, 8);
@@ -507,41 +528,56 @@ std::vector<at::Tensor> moe_fused_gate(
           LAUNCH_MOE_GATE_CONFIG(float16_t, 256, 8);
         } else if (input.scalar_type() == at::kFloat) {
           LAUNCH_MOE_GATE_CONFIG(float32_t, 256, 8);
-        } else if (num_expert_group == 16)
-          // Here VPT = 256/16 = 16, ROWS_PER_WARP = 32/16 = 2, ROWS_PER_CTA = 6 * 2 = 12.
-          if (input.scalar_type() == at::kBFloat16) {
-            LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 256, 16);
-          } else if (input.scalar_type() == at::kHalf) {
-            LAUNCH_MOE_GATE_CONFIG(float16_t, 256, 16);
-          } else if (input.scalar_type() == at::kFloat) {
-            LAUNCH_MOE_GATE_CONFIG(float32_t, 256, 16);
-          }
+        }
+      } else if (num_expert_group == 16) {
+        // Here VPT = 256/16 = 16, ROWS_PER_WARP = 32/16 = 2, ROWS_PER_CTA = 6 * 2 = 12.
+        if (input.scalar_type() == at::kBFloat16) {
+          LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 256, 16);
+        } else if (input.scalar_type() == at::kHalf) {
+          LAUNCH_MOE_GATE_CONFIG(float16_t, 256, 16);
+        } else if (input.scalar_type() == at::kFloat) {
+          LAUNCH_MOE_GATE_CONFIG(float32_t, 256, 16);
+        }
+      }
       break;
     case 128:
-      if (num_expert_group == 4)
-        // VPT = 128/4 = 32, ROWS_PER_WARP = 32/16 = 2, ROWS_PER_CTA = 6 * 2 = 12.
+      if (num_expert_group == 4) {
+        // VPT = 128/4 = 32, ROWS_PER_WARP = 32/4 = 8, ROWS_PER_CTA = 6 * 8 = 48.
         if (input.scalar_type() == at::kBFloat16) {
           LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 128, 4);
         } else if (input.scalar_type() == at::kHalf) {
           LAUNCH_MOE_GATE_CONFIG(float16_t, 128, 4);
         } else if (input.scalar_type() == at::kFloat) {
           LAUNCH_MOE_GATE_CONFIG(float32_t, 128, 4);
-        } else if (num_expert_group == 8)
-          // VPT = 128/8 = 16, ROWS_PER_WARP = 32/8 = 4, ROWS_PER_CTA = 6 * 4 = 24.
-          if (input.scalar_type() == at::kBFloat16) {
-            LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 128, 8);
-          } else if (input.scalar_type() == at::kHalf) {
-            LAUNCH_MOE_GATE_CONFIG(float16_t, 128, 8);
-          } else if (input.scalar_type() == at::kFloat) {
-            LAUNCH_MOE_GATE_CONFIG(float32_t, 128, 8);
-          }
+        }
+      } else if (num_expert_group == 8) {
+        // VPT = 128/8 = 16, ROWS_PER_WARP = 32/8 = 4, ROWS_PER_CTA = 6 * 4 = 24.
+        if (input.scalar_type() == at::kBFloat16) {
+          LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 128, 8);
+        } else if (input.scalar_type() == at::kHalf) {
+          LAUNCH_MOE_GATE_CONFIG(float16_t, 128, 8);
+        } else if (input.scalar_type() == at::kFloat) {
+          LAUNCH_MOE_GATE_CONFIG(float32_t, 128, 8);
+        }
+      }
+      break;
+    case 64:
+      if (num_expert_group == 1)
+        // VPT = 64/1 = 64, ROWS_PER_WARP = 32/1 = 32, ROWS_PER_CTA = 6 * 32 = 192.
+        if (input.scalar_type() == at::kBFloat16) {
+          LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 64, 1);
+        } else if (input.scalar_type() == at::kHalf) {
+          LAUNCH_MOE_GATE_CONFIG(float16_t, 64, 1);
+        } else if (input.scalar_type() == at::kFloat) {
+          LAUNCH_MOE_GATE_CONFIG(float32_t, 64, 1);
+        }
       break;
     default:
       break;
   }
   if (!dispatched) {
     // Fallback to the dynamic kernel if none of the supported combinations match.
-    // currently only support num_experts / num_expert_group <= 128 for dynamic kernels
+    // currently only support num_experts / num_expert_group <= 512 for dynamic kernels
     if (input.scalar_type() == at::kBFloat16) {
       moe_fused_gate_kernel_dynamic<bfloat16_t><<<num_blocks, block_dim, 0, stream>>>(
           input.data_ptr(),

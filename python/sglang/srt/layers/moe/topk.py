@@ -495,8 +495,8 @@ def biased_grouped_topk_gpu(
     if (
         _is_cuda
         and gating_output.shape[1] // num_expert_group
-        <= 384  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=128 now. And when kernel can handle MAX_VPT > 384, we can remove this assertion.
-        and is_power_of_two(correction_bias.shape[0])
+        <= 512  # moe_fused_gate kernel now supports MAX_VPT up to 512, including Kimi K2's 384 experts
+        and (is_power_of_two(correction_bias.shape[0]) or correction_bias.shape[0] == 384)  # Kimi K2 has 384 experts
     ):
         topk_weights, topk_ids = moe_fused_gate(
             gating_output.to(dtype=torch.float32),
