@@ -240,7 +240,7 @@ union ComposedKey {
     at::ScalarType type_in;
     at::ScalarType type_out;
     at::ScalarType type_scale;
-    at::ScalarType _unused;
+    at::ScalarType _unused = 0;
     int group_size;
   } keys;
   int64_t composed;
@@ -268,8 +268,8 @@ class PerTokenGroupQuantDispatcher {
 
     if (dispatch_map.find(composed_key.composed) == dispatch_map.end()) {
       std::ostringstream oss;
-      oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << type_in << ' ' << type_out << ' ' << type_scale
-          << ' ' << group_size << ", supported params should be " << supported_string();
+      oss << __PRETTY_FUNCTION__ << " failed to dispatch data type [" << type_in << ',' << type_out << ',' << type_scale
+          << ',' << group_size << "], " << supported_string();
       TORCH_CHECK(false, oss.str());
     }
 

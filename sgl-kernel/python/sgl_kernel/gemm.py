@@ -126,6 +126,27 @@ def sgl_per_token_group_quant_int8(
     )
 
 
+def sgl_per_token_group_quant_8bit(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    group_size: int,
+    eps: float,
+    int8_min: float,
+    int8_max: float,
+    scale_ue8m0: bool,
+) -> None:
+    """
+    Quantize input tensor to 8bit according to  output_q.dtype and output_s.dtype.
+    If output_s.dtype is fp8, fp8 quant will be invoked, and int8 quant for output_s.dtype is int8.
+    If scale_ue8m0 is True, scale will be rounded to power of 2,
+    and output_s.dtype can be float(still store with float) or int(for ue8m0 packed)
+    """
+    torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit.default(
+        input, output_q, output_s, group_size, eps, int8_min, int8_max, scale_ue8m0
+    )
+
+
 def sgl_per_tensor_quant_fp8(
     input: torch.Tensor,
     output_q: torch.Tensor,
