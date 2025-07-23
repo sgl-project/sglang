@@ -801,9 +801,9 @@ class UpdateWeightFromDiskReqOutput:
 
 @dataclass
 class UpdateWeightsFromDistributedReqInput:
-    name: str
-    dtype: str
-    shape: List[int]
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
     # The group name
     group_name: str = "weight_update_group"
     # Whether to flush the cache after updating weights
@@ -928,6 +928,8 @@ class AbortReq:
     abort_all: bool = False
     rids: Optional[Union[List[str], str]] = None
 
+    def __post_init__(self):
+        self.rids = self.rid
 
 @dataclass
 class GetInternalStateReq:
