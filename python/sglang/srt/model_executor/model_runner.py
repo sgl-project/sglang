@@ -276,6 +276,7 @@ class ModelRunner:
         self.sampler = Sampler()
         self.load_model()
 
+        # Check if the model is using hybrid SWA
         if (
             not self.server_args.disable_hybrid_swa_memory
             and self.sliding_window_size is not None
@@ -1008,8 +1009,11 @@ class ModelRunner:
                 try:
                     layers = self.model.language_model.model.layers
                 except:
-                    self.is_hybrid = False
-                    return
+                    try:
+                        layers = self.model.language_model.layers
+                    except:
+                        self.is_hybrid = False
+                        return
 
             for layer in layers:
                 if (
