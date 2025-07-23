@@ -312,7 +312,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            query = torch.cat([q_nope, q_rope_reshaped], dim=-1)
+            # Use a pre-allocated staging buffer to avoid per-step tensor
+            # allocation and the CatArrayBatchedCopy kernel.
+            query = q.new_empty(q_nope.shape[0], layer.tp_q_head_num, layer.head_dim)
+            query[..., : layer.v_head_dim].copy_(q_nope)
+            query[..., layer.v_head_dim :].copy_(q_rope_reshaped)
         else:
             # q already has both parts
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -335,11 +339,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Scale computation for TRTLLM MLA kernel:
         # - BMM1 scale = q_scale * k_scale * softmax_scale
-        # - For FP16 output in DeepSeek R1: q_scale = k_scale = 1.0, softmax_scale = 1/sqrt(head_dim)
-        # - This reduces to layer.scaling which is pre-computed as 1/sqrt(head_dim)
-        bmm1_scale = layer.scaling
-        bmm2_scale = 1.0
-        bmm1_scale_log2_tensor = bmm2_scale_tensor = None
+        # - For FP16 path we keep q_scale = k_scale = 1.0, softmax_scale = 1/sqrt(head_dim) which is pre-computed as layer.scaling
+        # TODO: change once fp8 path is supported
+        q_scale = k_scale = 1.0 # for fp16 we keep 1 
+        bmm1_scale = q_scale * k_scale * layer.scaling 
 
         # Call TRT-LLM kernel with proper scale configuration
         raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
@@ -352,10 +355,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             block_tables=metadata.block_kv_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             max_seq_len=int(metadata.block_kv_indices.shape[1] * self.page_size),
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-            bmm1_scale_log2_tensor=bmm1_scale_log2_tensor,
-            bmm2_scale_tensor=bmm2_scale_tensor,
+            bmm1_scale=bmm1_scale
         )
 
         # Extract value projection part and reshape
