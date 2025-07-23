@@ -1789,6 +1789,20 @@ class ServerArgs:
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
+        if self.enable_pdmux:
+            assert (
+                self.pp_size == 1
+            ), "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
+            assert (
+                self.chunked_prefill_size == -1
+            ), "PD-Multiplexing is not compatible with chunked prefill."
+            assert (
+                self.disaggregation_mode == "null"
+            ), "PD-Multiplexing is not compatible with disaggregation mode."
+            assert (
+                self.disable_overlap_schedule
+            ), "PD-Multiplexing is not compatible with overlap schedule."
+
         if isinstance(self.lora_paths, list):
             lora_paths = self.lora_paths
             self.lora_paths = {}

@@ -36,7 +36,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
+from sglang.srt.managers.schedule_batch import (
+    ModelWorkerBatch,
+    ScheduleBatch,
+    global_server_args_dict,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -232,7 +236,7 @@ class TpModelWorker:
             if launch_done is not None:
                 launch_done.set()
 
-            if skip_sample:
+            if skip_sample or logits_output is None:
                 next_token_ids = None
             else:
                 next_token_ids = self.model_runner.sample(
@@ -246,6 +250,21 @@ class TpModelWorker:
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             return pp_proxy_tensors.tensors, None, can_run_cuda_graph
+
+    def forward_batch_split_prefill(self, batch: ScheduleBatch):
+        model_worker_batch = batch.get_model_worker_batch()
+        if batch.split_index == 0:
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            batch.split_forward_batch = forward_batch
+
+        logits_output, can_run_cuda_graph = self.model_runner.forward(
+            batch.split_forward_batch, split_forward_count=batch.split_forward_count
+        )
+        if logits_output:
+            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+        else:
+            next_token_ids = None
+        return logits_output, next_token_ids, can_run_cuda_graph
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
