@@ -116,8 +116,6 @@ class MxFp4Config(QuantizationConfig):
         if isinstance(layer, RadixAttention):
             return MxFp4KVCacheMethod(self)
 
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-
         if isinstance(layer, FusedMoE):
             return MxFp4MoEMethod.get_moe_method(self, module=layer, layer_name=prefix)
 
@@ -647,7 +645,6 @@ class W4A4MXFp4MoEDynamicMethod(MxFp4MoEMethod):
                 ActivationType.Silu if activation == "silu" else ActivationType.Gelu
             ),
             doweight_stage1=False,
-            block_size_M=32,
         )
 
 
@@ -781,7 +778,6 @@ class W4A4MXFp4MoEStaticMethod(MxFp4MoEMethod):
                 ActivationType.Silu if activation == "silu" else ActivationType.Gelu
             ),
             doweight_stage1=False,
-            block_size_M=32,
         )
 
 
