@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import datetime
 import faulthandler
 import logging
 import os
@@ -59,6 +60,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -66,9 +68,6 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.expert_distribution import (
-    get_global_expert_distribution_recorder,
-)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -83,6 +82,8 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    LoadLoRAAdapterReqInput,
+    LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -100,6 +101,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UnloadLoRAAdapterReqInput,
+    UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -128,9 +131,10 @@ from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import validate_input_length
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -148,6 +152,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_zmq_socket,
+    is_cpu,
     kill_itself_when_parent_died,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
@@ -165,6 +170,8 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
+
+_is_cpu = is_cpu()
 
 
 @dataclass
@@ -247,6 +254,9 @@ class Scheduler(
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
+        self.enable_metrics_for_all_schedulers = (
+            server_args.enable_metrics_for_all_schedulers
+        )
         self.enable_kv_cache_events = server_args.kv_events_config is not None
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
@@ -277,9 +287,6 @@ class Scheduler(
             self.send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
-            self.send_metrics_from_scheduler = get_zmq_socket(
-                context, zmq.PUSH, port_args.metrics_ipc_name, False
-            )
 
             if server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
@@ -305,9 +312,13 @@ class Scheduler(
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
-            self.send_metrics_from_scheduler = None
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+
+        if self.current_scheduler_metrics_enabled():
+            self.send_metrics_from_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.metrics_ipc_name, False
+            )
 
         # Init tokenizer
         self.init_tokenizer()
@@ -386,6 +397,14 @@ class Scheduler(
         global_server_args_dict.update(worker_global_server_args_dict)
         set_random_seed(self.random_seed)
 
+        # Hybrid
+        self.is_hybrid = self.tp_worker.is_hybrid
+        if self.is_hybrid:
+            self.sliding_window_size = self.tp_worker.sliding_window_size
+            self.full_tokens_per_layer, self.swa_tokens_per_layer = (
+                self.tp_worker.get_tokens_per_layer_info()
+            )
+
         # Print debug info
         if tp_rank == 0:
             avail_mem = get_available_gpu_memory(
@@ -418,13 +437,15 @@ class Scheduler(
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
         self.return_health_check_ct = 0
+        self.num_retracted_reqs: int = 0
+        self.num_paused_reqs: int = 0
+        self.kv_transfer_speed_gb_s: float = 0.0
+        self.kv_transfer_latency_ms: float = 0.0
+        self.sessions: Dict[str, Session] = {}
         self.current_stream = torch.get_device_module(self.device).current_stream()
         if self.device == "cpu":
             self.current_stream.synchronize = lambda: None  # No-op for CPU
         self.forward_sleep_time = None
-
-        # Init session info
-        self.sessions: Dict[str, Session] = {}
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
@@ -474,29 +495,14 @@ class Scheduler(
         t.start()
         self.parent_process = psutil.Process().parent()
 
-
-        # Init memory saver
+        # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
-
-        # Init profiler
-        self.torch_profiler = None
-        self.torch_profiler_output_dir: Optional[str] = None
-        self.profiler_activities: Optional[List[str]] = None
-        self.profile_id: Optional[str] = None
-        self.profiler_target_forward_ct: Optional[int] = None
-        self.profiler_target_prefill_ct: Optional[int] = None
-        self.profiler_target_decode_ct: Optional[int] = None
-        self.profiler_prefill_ct: Optional[int] = None
-        self.profiler_decode_ct: Optional[int] = None
-        self.profile_by_stage: bool = False
-        self.profile_steps: Optional[int] = None
-        self.profile_in_progress: bool = False
-        self.rpd_profiler = None
+        self.init_profier()
 
         # Init metrics stats
-        self.init_metrics()
+        self.init_metrics(tp_rank, pp_rank, dp_rank)
         self.init_kv_events(server_args.kv_events_config)
 
         # Init request dispatcher
@@ -524,9 +530,12 @@ class Scheduler(
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
+                (LoadLoRAAdapterReqInput, self.load_lora_adapter),
+                (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
             ]
         )
 
+        # Init disaggregation
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
@@ -535,13 +544,8 @@ class Scheduler(
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
 
-        self.setup_logging("/home/zzy/sglang/schedulerlog.log")
-
-    def setup_logging(self, log_file_path: str):
-        log_file = open(log_file_path, "w", buffering=1)  # line-buffered
-        sys.stdout = log_file
-        sys.stderr = log_file
-        print("log file initialized")
+    def current_scheduler_metrics_enabled(self):
+        return self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
@@ -584,7 +588,11 @@ class Scheduler(
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
         ):
-            self.tree_cache = ChunkCache(
+            if self.is_hybrid:
+                ChunkCacheClass = SWAChunkCache
+            else:
+                ChunkCacheClass = ChunkCache
+            self.tree_cache = ChunkCacheClass(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 page_size=self.page_size,
@@ -614,6 +622,17 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
+            elif self.is_hybrid:
+                assert (
+                    self.server_args.disaggregation_mode == "null"
+                ), "Hybrid mode does not support disaggregation yet"
+                self.tree_cache = SWARadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    sliding_window_size=self.sliding_window_size,
+                    page_size=self.page_size,
+                    disable=server_args.disable_radix_cache,
+                )
 
             else:
                 self.tree_cache = RadixCache(
@@ -636,7 +655,23 @@ class Scheduler(
             )
         )
 
-    def init_metrics(self):
+    def init_profier(self):
+        self.torch_profiler = None
+        self.torch_profiler_output_dir: Optional[str] = None
+        self.profiler_activities: Optional[List[str]] = None
+        self.profile_id: Optional[str] = None
+        self.profiler_start_forward_ct: Optional[int] = None
+        self.profiler_target_forward_ct: Optional[int] = None
+        self.profiler_target_prefill_ct: Optional[int] = None
+        self.profiler_target_decode_ct: Optional[int] = None
+        self.profiler_prefill_ct: Optional[int] = None
+        self.profiler_decode_ct: Optional[int] = None
+        self.profile_by_stage: bool = False
+        self.profile_steps: Optional[int] = None
+        self.profile_in_progress: bool = False
+        self.rpd_profiler = None
+
+    def init_metrics(self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]):
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -644,15 +679,19 @@ class Scheduler(
         self.spec_num_total_forward_ct = 0
         self.cum_spec_accept_length = 0
         self.cum_spec_accept_count = 0
+        self.total_retracted_reqs = 0
         self.stats = SchedulerStats()
         if self.enable_metrics:
             engine_type = "unified"
-            self.metrics_collector = SchedulerMetricsCollector(
-                labels={
-                    "model_name": self.server_args.served_model_name,
-                    "engine_type": engine_type,
-                },
-            )
+            labels = {
+                "model_name": self.server_args.served_model_name,
+                "engine_type": engine_type,
+                "tp_rank": tp_rank,
+                "pp_rank": pp_rank,
+            }
+            if dp_rank is not None:
+                labels["dp_rank"] = dp_rank
+            self.metrics_collector = SchedulerMetricsCollector(labels=labels)
 
     def init_kv_events(self, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
@@ -715,9 +754,6 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
-            # Metric for pre-allocation
-            self.num_tokens_pre_allocated = 0
-
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
@@ -773,6 +809,7 @@ class Scheduler(
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
+                self.check_tree_cache()
                 self.new_token_ratio = self.init_new_token_ratio
                 self.maybe_sleep_on_idle()
 
@@ -785,7 +822,6 @@ class Scheduler(
 
         while True:
             recv_reqs = self.recv_requests()
-            print("recv requests from overlap event loop")
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
@@ -819,6 +855,7 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
+                self.check_tree_cache()
                 self.new_token_ratio = self.init_new_token_ratio
                 self.maybe_sleep_on_idle()
 
@@ -938,7 +975,7 @@ class Scheduler(
                         point_to_point_pyobj(
                             recv_reqs,
                             self.pp_rank * self.tp_size + dp_offset,
-                            self.world_group.cpu_group,
+                            self.world_group.device_group,
                             self.pp_rank * self.tp_size + dp_offset,
                             (self.pp_rank + 1) * self.tp_size + dp_offset,
                         )
@@ -955,6 +992,7 @@ class Scheduler(
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self.check_memory()
+                self.check_tree_cache()
                 self.new_token_ratio = self.init_new_token_ratio
                 self.maybe_sleep_on_idle()
 
@@ -985,7 +1023,7 @@ class Scheduler(
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
-                    self.world_group.cpu_group,
+                    self.world_group.device_group,
                     (self.pp_rank - 1) * self.tp_size + dp_offset,
                     self.pp_rank * self.tp_size + dp_offset,
                 )
@@ -1110,7 +1148,7 @@ class Scheduler(
                 recv_req.session_params is not None
                 and recv_req.session_params.id is not None
             ):
-                req.finished_reason = FINISH_ABORT(
+                req.set_finish_with_abort(
                     f"Invalid request: session id {recv_req.session_params.id} does not exist"
                 )
                 self._add_request_to_queue(req)
@@ -1316,10 +1354,26 @@ class Scheduler(
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
 
-        num_used = self.max_total_num_tokens - (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
-        )
+        if self.is_hybrid:
+            (
+                full_num_used,
+                swa_num_used,
+                full_token_usage,
+                swa_token_usage,
+                _,
+                _,
+                _,
+                _,
+            ) = self._get_swa_token_info()
+            num_used = max(full_num_used, swa_num_used)
+            token_usage = max(full_token_usage, swa_token_usage)
+            token_msg = (
+                f"full token usage: {full_token_usage:.2f}, "
+                f"swa token usage: {swa_token_usage:.2f}, "
+            )
+        else:
+            num_used, token_usage, _, _ = self._get_token_info()
+            token_msg = f"token usage: {token_usage:.2f}, "
 
         num_new_seq = len(can_run_list)
         f = (
@@ -1327,17 +1381,17 @@ class Scheduler(
             f"#new-seq: {num_new_seq}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
-            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+            f"{token_msg}"
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
             f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)}, "
-            f += f"input throughput (token/s): {self.last_input_throughput:.2f} "
+            f += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
         else:
             f += f"#running-req: {running_bs}, "
-            f += f"#queue-req: {len(self.waiting_queue)}"
+            f += f"#queue-req: {len(self.waiting_queue)}, "
 
         logger.info(f)
 
@@ -1347,7 +1401,7 @@ class Scheduler(
             )
             self.stats.num_running_reqs = running_bs
             self.stats.num_used_tokens = num_used
-            self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
+            self.stats.token_usage = round(token_usage, 2)
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.cache_hit_rate = cache_hit_rate
 
@@ -1370,22 +1424,35 @@ class Scheduler(
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
-        num_used = self.max_total_num_tokens - (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
-        )
+        if self.is_hybrid:
+            (
+                full_num_used,
+                swa_num_used,
+                full_token_usage,
+                swa_token_usage,
+                _,
+                _,
+                _,
+                _,
+            ) = self._get_swa_token_info()
+            num_used = max(full_num_used, swa_num_used)
+            token_usage = max(full_token_usage, swa_token_usage)
+            token_msg = (
+                f"#full token: {full_num_used}, "
+                f"full token usage: {full_token_usage:.2f}, "
+                f"#swa token: {swa_num_used}, "
+                f"swa token usage: {swa_token_usage:.2f}, "
+            )
+        else:
+            num_used, token_usage, _, _ = self._get_token_info()
+            token_msg = f"#token: {num_used}, " f"token usage: {token_usage:.2f}, "
 
         if RECORD_STEP_TIME:
             self.step_time_dict[num_running_reqs].append(
                 gap_latency / self.server_args.decode_log_interval
             )
 
-        msg = (
-            f"Decode batch. "
-            f"#running-req: {num_running_reqs}, "
-            f"#token: {num_used}, "
-            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-        )
+        msg = f"Decode batch. #running-req: {num_running_reqs}, {token_msg}"
 
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
@@ -1399,47 +1466,59 @@ class Scheduler(
             msg += f"accept len: {spec_accept_length:.2f}, "
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
-            msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
+            msg += f"pre-allocated usage: {self.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         msg += (
             f"cuda graph: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-            f"#queue-req: {len(self.waiting_queue)}"
+            f"#queue-req: {len(self.waiting_queue)}, "
         )
 
         logger.info(msg)
         if self.enable_metrics:
             self.stats.num_running_reqs = num_running_reqs
             self.stats.num_used_tokens = num_used
-            self.stats.token_usage = num_used / self.max_total_num_tokens
+            self.stats.token_usage = round(token_usage, 2)
             self.stats.cache_hit_rate = 0.0
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.spec_accept_length = spec_accept_length
+            self.stats.total_retracted_reqs = self.total_retracted_reqs
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
 
     def check_memory(self):
-        available_size = (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
-        )
-        protected_size = self.tree_cache.protected_size()
-        memory_leak = available_size != (
-            self.max_total_num_tokens
-            if not self.enable_hierarchical_cache
-            else self.max_total_num_tokens - protected_size
-        )
-        if memory_leak:
-            msg = (
-                "token_to_kv_pool_allocator memory leak detected! "
-                f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
-                f"{self.token_to_kv_pool_allocator.available_size()=}\n"
-                f"{self.tree_cache.evictable_size()=}\n"
+        if self.is_hybrid:
+            (
+                full_num_used,
+                swa_num_used,
+                _,
+                _,
+                full_available_size,
+                full_evictable_size,
+                swa_available_size,
+                swa_evictable_size,
+            ) = self._get_swa_token_info()
+            memory_leak = full_num_used != 0 or swa_num_used != 0
+            token_msg = (
+                f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {self.tree_cache.full_protected_size()=}\n"
+                f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {self.tree_cache.swa_protected_size()=}\n"
             )
+        else:
+            _, _, available_size, evictable_size = self._get_token_info()
+            protected_size = self.tree_cache.protected_size()
+            memory_leak = (available_size + evictable_size) != (
+                self.max_total_num_tokens
+                if not self.enable_hierarchical_cache
+                else self.max_total_num_tokens - protected_size
+            )
+            token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+
+        if memory_leak:
+            msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
             raise ValueError(msg)
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -1459,23 +1538,69 @@ class Scheduler(
 
         if (
             self.enable_metrics
-            and self.attn_tp_rank == 0
+            and self.current_scheduler_metrics_enabled()
             and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
-            num_used = self.max_total_num_tokens - (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
-            )
+            if self.is_hybrid:
+                (
+                    full_num_used,
+                    swa_num_used,
+                    full_token_usage,
+                    swa_token_usage,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) = self._get_swa_token_info()
+                num_used = max(full_num_used, swa_num_used)
+                token_usage = max(full_token_usage, swa_token_usage)
+            else:
+                num_used, token_usage, _, _ = self._get_token_info()
             num_running_reqs = len(self.running_batch.reqs)
             self.stats.num_running_reqs = num_running_reqs
             self.stats.num_used_tokens = num_used
-            self.stats.token_usage = num_used / self.max_total_num_tokens
+            self.stats.token_usage = round(token_usage, 2)
             self.stats.gen_throughput = 0
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.metrics_collector.log_stats(self.stats)
         self._publish_kv_events()
+
+    def check_tree_cache(self):
+        if self.is_hybrid and isinstance(self.tree_cache, SWARadixCache):
+            self.tree_cache.sanity_check()
+
+    def _get_token_info(self):
+        available_size = self.token_to_kv_pool_allocator.available_size()
+        evictable_size = self.tree_cache.evictable_size()
+        num_used = self.max_total_num_tokens - (available_size + evictable_size)
+        token_usage = num_used / self.max_total_num_tokens
+        return num_used, token_usage, available_size, evictable_size
+
+    def _get_swa_token_info(self):
+        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        full_evictable_size = self.tree_cache.full_evictable_size()
+        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+        swa_evictable_size = self.tree_cache.swa_evictable_size()
+        full_num_used = self.full_tokens_per_layer - (
+            full_available_size + full_evictable_size
+        )
+        swa_num_used = self.swa_tokens_per_layer - (
+            swa_available_size + swa_evictable_size
+        )
+        full_token_usage = full_num_used / self.full_tokens_per_layer
+        swa_token_usage = swa_num_used / self.swa_tokens_per_layer
+        return (
+            full_num_used,
+            swa_num_used,
+            full_token_usage,
+            swa_token_usage,
+            full_available_size,
+            full_evictable_size,
+            swa_available_size,
+            swa_evictable_size,
+        )
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
@@ -1516,7 +1641,7 @@ class Scheduler(
         if need_dp_attn_preparation and not self.spec_algorithm.is_none():
             # In speculative decoding, prefill batches and decode batches cannot be processed in the same DP attention group.
             # We prepare idle batches in advance to skip preparing decode batches when there are prefill batches in the group.
-            new_batch, _ = self.prepare_mlp_sync_batch(new_batch)
+            new_batch = self.prepare_mlp_sync_batch(new_batch)
             need_dp_attn_preparation = new_batch is None
 
         if new_batch is not None:
@@ -1532,7 +1657,7 @@ class Scheduler(
 
         # Handle DP attention
         if need_dp_attn_preparation:
-            ret, _ = self.prepare_mlp_sync_batch(ret)
+            ret = self.prepare_mlp_sync_batch(ret)
 
         return ret
 
@@ -1614,13 +1739,9 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
                     break
 
-            # if self.enable_hierarchical_cache and self.enable_mooncake_store_l3_cache:
-            #     if not self.tree_cache.waiting_status_check(req):
-            #         continue
-
-            # if not self.enable_mooncake_store_l3_cache:
             if self.enable_hicache_storage:
                 self.tree_cache.check_prefetch_progress(req.rid)
+
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
 
@@ -1657,7 +1778,7 @@ class Scheduler(
             self.chunked_req.is_chunked += 1
 
         # Print stats
-        if self.attn_tp_rank == 0:
+        if self.current_scheduler_metrics_enabled():
             self.log_prefill_stats(adder, can_run_list, running_bs)
 
         # Create a new batch
@@ -1716,14 +1837,17 @@ class Scheduler(
             old_ratio = self.new_token_ratio
 
             retracted_reqs, new_token_ratio = batch.retract_decode(self.server_args)
+            num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
 
             logger.info(
                 "KV cache pool is full. Retract requests. "
-                f"#retracted_reqs: {len(retracted_reqs)}, "
+                f"#retracted_reqs: {num_retracted_reqs}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
+
             self._extend_requests_to_queue(retracted_reqs, is_retracted=True)
+            self.total_retracted_reqs += num_retracted_reqs
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
@@ -1847,7 +1971,7 @@ class Scheduler(
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
-            tp_cpu_group=self.tp_cpu_group,
+            tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
             spec_algorithm=self.spec_algorithm,
@@ -1856,6 +1980,7 @@ class Scheduler(
             enable_deepep_moe=self.server_args.enable_deepep_moe,
             deepep_mode=DeepEPMode[self.server_args.deepep_mode],
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
+            disable_overlap_schedule=self.server_args.disable_overlap_schedule,
         )
 
     @staticmethod
@@ -1863,7 +1988,7 @@ class Scheduler(
         local_batch: ScheduleBatch,
         dp_size,
         attn_tp_size: int,
-        tp_cpu_group,
+        tp_group,
         get_idle_batch,
         disable_cuda_graph: bool,
         spec_algorithm,
@@ -1872,6 +1997,7 @@ class Scheduler(
         enable_deepep_moe: bool,
         deepep_mode: DeepEPMode,
         require_mlp_tp_gather: bool,
+        disable_overlap_schedule: bool,
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -1902,6 +2028,12 @@ class Scheduler(
         )
 
         tbo_preparer = TboDPAttentionPreparer()
+        if disable_overlap_schedule:
+            group = tp_group.device_group
+            device = tp_group.device
+        else:
+            group = tp_group.cpu_group
+            device = "cpu"
 
         local_info = torch.tensor(
             [
@@ -1917,15 +2049,17 @@ class Scheduler(
                 ),
             ],
             dtype=torch.int64,
+            device=device,
         )
         global_info = torch.empty(
             (dp_size, attn_tp_size, 6),
             dtype=torch.int64,
+            device=device,
         )
         torch.distributed.all_gather_into_tensor(
             global_info.flatten(),
             local_info,
-            group=tp_cpu_group,
+            group=group,
         )
         global_num_tokens = global_info[:, 0, 0].tolist()
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
@@ -1957,8 +2091,7 @@ class Scheduler(
             if not disable_cuda_graph:
                 local_batch.can_run_dp_cuda_graph = can_cuda_graph
 
-        # TODO(ch-wan): refactor: any(is_extend_in_batch) now is a part of local_batch. Remove it from here.
-        return local_batch, any(is_extend_in_batch)
+        return local_batch
 
     def get_idle_batch(self):
         idle_batch = ScheduleBatch.init_new(
@@ -2066,11 +2199,30 @@ class Scheduler(
 
         if not disable_request_logging():
             # Print batch size and memory pool info to check whether there are de-sync issues.
+            if self.is_hybrid:
+                (
+                    _,
+                    _,
+                    _,
+                    _,
+                    full_available_size,
+                    full_evictable_size,
+                    swa_available_size,
+                    swa_evictable_size,
+                ) = self._get_swa_token_info()
+                info_msg = (
+                    f"{full_available_size=}, "
+                    f"{full_evictable_size=}, "
+                    f"{swa_available_size=}, "
+                    f"{swa_evictable_size=}, "
+                )
+            else:
+                _, _, available_size, evictable_size = self._get_token_info()
+                info_msg = f"{available_size=}, " f"{evictable_size=}, "
             logger.error(
                 f"{self.cur_batch.batch_size()=}, "
                 f"{self.cur_batch.reqs=}, "
-                f"{self.token_to_kv_pool_allocator.available_size()=}, "
-                f"{self.tree_cache.evictable_size()=}, "
+                f"{info_msg}"
             )
 
         pyspy_dump_schedulers()
@@ -2125,11 +2277,24 @@ class Scheduler(
 
     def get_load(self):
         # TODO(lsyin): use dynamically maintained num_waiting_tokens
-        load = (
-            self.max_total_num_tokens
-            - self.token_to_kv_pool_allocator.available_size()
-            - self.tree_cache.evictable_size()
-        )
+        if self.is_hybrid:
+            load_full = (
+                self.full_tokens_per_layer
+                - self.token_to_kv_pool_allocator.full_available_size()
+                - self.tree_cache.full_evictable_size()
+            )
+            load_swa = (
+                self.swa_tokens_per_layer
+                - self.token_to_kv_pool_allocator.swa_available_size()
+                - self.tree_cache.swa_evictable_size()
+            )
+            load = max(load_full, load_swa)
+        else:
+            load = (
+                self.max_total_num_tokens
+                - self.token_to_kv_pool_allocator.available_size()
+                - self.tree_cache.evictable_size()
+            )
         load += sum(len(req.origin_input_ids) for req in self.waiting_queue)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             load += sum(
@@ -2147,6 +2312,21 @@ class Scheduler(
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
         ret["last_gen_throughput"] = self.last_gen_throughput
+        ret["memory_usage"] = {
+            "weight": round(
+                self.tp_worker.worker.model_runner.weight_load_mem_usage, 2
+            ),
+            "kvcache": round(
+                self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
+            ),
+            "token_capacity": int(self.max_total_num_tokens),
+        }
+
+        if not _is_cpu:
+            ret["memory_usage"]["cuda_graph"] = round(
+                self.tp_worker.worker.model_runner.cuda_graph_mem_usage, 2
+            )
+
         if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
             ret["avg_spec_accept_length"] = (
                 self.cum_spec_accept_length / self.cum_spec_accept_count
@@ -2235,7 +2415,7 @@ class Scheduler(
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
-            if req.rid.startswith(recv_req.rid):
+            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting
@@ -2252,7 +2432,7 @@ class Scheduler(
             # Abort method 2: call `set_finish_with_abort`
             # The request will still run one prefill forward pass.
             # In this case, we change the input_ids to be only one token to make this prefill cheap.
-            if req.rid.startswith(recv_req.rid):
+            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
                 if req.grammar:
                     req.grammar.cancel()
@@ -2265,7 +2445,9 @@ class Scheduler(
             reqs = self.running_batch.reqs + self.cur_batch.reqs
 
         for req in reqs:
-            if req.rid.startswith(recv_req.rid) and not req.finished():
+            if not req.finished() and (
+                recv_req.abort_all or req.rid.startswith(recv_req.rid)
+            ):
                 # Abort method 3: set `to_abort=True`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
@@ -2285,6 +2467,36 @@ class Scheduler(
             logger.error(message)
         return UpdateWeightFromDiskReqOutput(success, message, 0)
 
+    def load_lora_adapter(
+        self, recv_req: LoadLoRAAdapterReqInput
+    ) -> LoadLoRAAdapterReqOutput:
+        """In-place loading a new lora adapter from disk or huggingface."""
+
+        result = self.tp_worker.load_lora_adapter(recv_req)
+
+        if result.success:
+            flush_cache_success = self.flush_cache()
+            assert flush_cache_success, "Cache flush failed after loading lora adapter."
+        else:
+            logger.error(result.error_message)
+        return result
+
+    def unload_lora_adapter(
+        self, recv_req: UnloadLoRAAdapterReqInput
+    ) -> UnloadLoRAAdapterReqOutput:
+        """Unload the lora adapter."""
+
+        result = self.tp_worker.unload_lora_adapter(recv_req)
+
+        if result.success:
+            flush_cache_success = self.flush_cache()
+            assert (
+                flush_cache_success
+            ), "Cache flush failed after unloading LoRA weights"
+        else:
+            logger.error(result.error_message)
+        return result
+
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
@@ -2297,8 +2509,9 @@ class Scheduler(
         """Update the online model parameter."""
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
-            flush_cache_success = self.flush_cache()
-            assert flush_cache_success, "Cache flush failed after updating weights"
+            if recv_req.flush_cache:
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
         return UpdateWeightsFromDistributedReqOutput(success, message)
@@ -2322,9 +2535,8 @@ class Scheduler(
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         tags = recv_req.tags
-        import subprocess
 
-        if tags is None:
+        if tags is None or len(tags) == 0:
             tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
@@ -2335,17 +2547,20 @@ class Scheduler(
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.worker.model_runner.model
             )
+            torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
         tags = recv_req.tags
+
         if tags is None or len(tags) == 0:
             tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
+            torch.distributed.barrier(self.tp_cpu_group)
             _import_static_state(
                 self.tp_worker.worker.model_runner.model,
                 self.stashed_model_static_state,
@@ -2366,9 +2581,10 @@ class Scheduler(
 
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
-            if recv_req.profile_by_stage:
+            if recv_req.profile_by_stage or recv_req.start_step:
                 return self.init_profile(
                     recv_req.output_dir,
+                    recv_req.start_step,
                     recv_req.num_steps,
                     recv_req.activities,
                     recv_req.with_stack,
@@ -2379,6 +2595,7 @@ class Scheduler(
             else:
                 self.init_profile(
                     recv_req.output_dir,
+                    recv_req.start_step,
                     recv_req.num_steps,
                     recv_req.activities,
                     recv_req.with_stack,
@@ -2393,6 +2610,7 @@ class Scheduler(
     def init_profile(
         self,
         output_dir: Optional[str],
+        start_step: Optional[int],
         num_steps: Optional[int],
         activities: Optional[List[str]],
         with_stack: Optional[bool],
@@ -2419,6 +2637,9 @@ class Scheduler(
         self.profiler_activities = activities
         self.profile_id = profile_id
 
+        if start_step:
+            self.profiler_start_forward_ct = max(start_step, self.forward_ct + 1)
+
         if num_steps:
             self.profile_steps = num_steps
             if self.profile_by_stage:
@@ -2426,6 +2647,10 @@ class Scheduler(
                 self.profiler_target_decode_ct = num_steps
                 self.profiler_prefill_ct = 0
                 self.profiler_decode_ct = 0
+            elif start_step:
+                self.profiler_target_forward_ct = (
+                    self.profiler_start_forward_ct + num_steps
+                )
             else:
                 self.profiler_target_forward_ct = self.forward_ct + num_steps
             # The caller will be notified when reaching profiler_target_forward_ct
@@ -2498,6 +2723,7 @@ class Scheduler(
 
         if "CUDA_PROFILER" in activities:
             torch.cuda.cudart().cudaProfilerStart()
+            self.profile_in_progress = True
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
@@ -2561,6 +2787,7 @@ class Scheduler(
         )
         self.torch_profiler = None
         self.profile_in_progress = False
+        self.profiler_start_forward_ct = None
 
         return ProfileReqOutput(success=True, message="Succeeded.")
 
@@ -2594,6 +2821,11 @@ class Scheduler(
                 and self.profiler_target_forward_ct <= self.forward_ct
             ):
                 self.stop_profile()
+            if (
+                self.profiler_start_forward_ct
+                and self.profiler_start_forward_ct == self.forward_ct
+            ):
+                self.start_profile()
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         if recv_req == ExpertDistributionReq.START_RECORD:

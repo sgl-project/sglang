@@ -16,7 +16,7 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
-from typing import Dict, Set, Tuple
+from typing import Dict, Iterable, Optional, Set, Tuple
 
 import torch
 
@@ -35,6 +35,7 @@ from sglang.srt.lora.utils import (
     get_normalized_lora_weight_names,
     get_weight_name,
 )
+from sglang.srt.managers.io_struct import LoRAUpdateResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import replace_submodule
 
@@ -52,6 +53,8 @@ class LoRAManager:
         lora_backend: str = "triton",
         tp_size: int = 1,
         tp_rank: int = 0,
+        max_lora_rank: Optional[int] = None,
+        target_modules: Optional[Iterable[str]] = None,
     ):
         self.base_model: torch.nn.Module = base_model
         self.base_hf_config: AutoConfig = base_hf_config
@@ -61,6 +64,10 @@ class LoRAManager:
         self.device: torch.device = next(self.base_model.parameters()).device
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
+        self.max_lora_rank: Optional[int] = max_lora_rank
+        self.target_modules: Optional[Set[str]] = (
+            set(target_modules) if target_modules else None
+        )
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -98,43 +105,112 @@ class LoRAManager:
                 ],
             )
 
-    def load_lora_adapters(self, lora_paths: Dict[str, str]):
+    def create_lora_update_result(
+        self, success: bool, error_message: str = ""
+    ) -> LoRAUpdateResult:
+        return LoRAUpdateResult(
+            success=success,
+            error_message=error_message,
+            loaded_adapters={
+                name: config.path for name, config in self.configs.items()
+            },
+        )
+
+    def load_lora_adapters(self, lora_paths: Dict[str, str]) -> LoRAUpdateResult:
         """
         Load LoRA adapters from the specified paths.
-        TODO (lifuhuang): This method should be exposed to the server/engine API to support dynamic LoRA loading.
 
         Args:
             lora_paths (Dict[str, str]): A dictionary mapping LoRA adapter names to their file paths.
             If a LoRA adapter is already loaded, it will be skipped with a warning.
         """
 
+        results = []
         for lora_name, lora_path in lora_paths.items():
-            if lora_name in self.loras:
-                logger.warning(
-                    f"LoRA adapter {lora_name} is already loaded."
-                    "If you want to reload it, please unload it first."
-                )
-                continue
-
-            self.configs[lora_name] = LoRAConfig(lora_path)
+            result = self.load_lora_adapter(lora_name, lora_path, update_state=False)
+            results.append(result)
 
         self.update_state_from_configs()
 
-    def unload_lora_adapters(self, lora_names: Set[str]):
+        return self.create_lora_update_result(
+            success=all(result.success for result in results),
+            error_message="\n".join(
+                result.error_message for result in results if not result.success
+            ),
+        )
+
+    def load_lora_adapter(
+        self, lora_name: str, lora_path: str, update_state: bool = True
+    ) -> LoRAUpdateResult:
+        """
+        Load a single LoRA adapter from the specified path.
+
+        Args:
+            lora_name (str): The name of the LoRA adapter.
+            lora_path (str): The file path to the LoRA adapter.
+            update_state (bool): Whether to refresh the internal state after loading the adapter. This is useful for batch loading.
+        """
+
+        success = True
+        error_message = ""
+
+        if lora_name in self.loras:
+            success = False
+            error_message = f"LoRA adapter {lora_name} is skipped as it is already loaded. If you want to reload it, please unload it first."
+
+        try:
+            new_adapter = LoRAConfig(lora_path)
+            self.validate_new_adapter(lora_name, new_adapter)
+            self.configs[lora_name] = new_adapter
+        except Exception as e:
+            success = False
+            error_message = (
+                f"Failed to load LoRA adapter {lora_name} from {lora_path}: {str(e)}"
+            )
+
+        if update_state:
+            self.update_state_from_configs()
+
+        return self.create_lora_update_result(
+            success=success,
+            error_message=error_message,
+        )
+
+    def validate_new_adapter(self, lora_name: str, lora_config: LoRAConfig):
+        """
+        Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
+        """
+
+        incompatible = self.memory_pool and not self.memory_pool.can_support(
+            lora_config
+        )
+        if incompatible:
+            raise ValueError(
+                f"LoRA adapter {lora_name} with rank {lora_config.r} is incompatible with the current LoRA memory pool configuration. "
+                "Please ensure that the LoRA adapter's rank is within the configured `--max_lora_rank` and that the target modules are "
+                "included in `--enable_lora_modules`."
+            )
+
+    def unload_lora_adapter(self, lora_name: str) -> LoRAUpdateResult:
         """
         Unload LoRA adapters by their names. This will remove the adapters from the memory pool and
         delete the corresponding LoRA modules.
-
-        Args:
-            lora_names (Set[str]): A set of LoRA adapter names to unload.
         """
-        for lora_name in lora_names:
-            if lora_name in self.loras:
-                del self.configs[lora_name]
-            else:
-                logger.warning(f"LoRA adapter {lora_name} is not loaded.")
+
+        success = True
+        error_message = ""
+        if lora_name in self.loras:
+            del self.configs[lora_name]
+        else:
+            error_message = f"LoRA adapter {lora_name} is not loaded."
+            success = False
 
         self.update_state_from_configs()
+
+        return self.create_lora_update_result(
+            success=success,
+            error_message=error_message,
+        )
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # load active loras into lora memory pool
@@ -161,7 +237,7 @@ class LoRAManager:
                 weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
                 if lora_path is not None:
                     lora = self.loras[lora_path]
-                    lora_ranks[weight_indices[i]] = lora.config.hf_config["r"]
+                    lora_ranks[weight_indices[i]] = lora.config.r
                     scalings[weight_indices[i]] = lora.scaling
 
             # Use pinned memory to avoid synchronizations during host-to-device transfer
@@ -266,7 +342,7 @@ class LoRAManager:
                     )
                 else:
                     weight_name = get_weight_name(
-                        module_name, self.lora_weight_names, LoRAType.LORA_A
+                        module_name, self.memory_pool.lora_weight_names, LoRAType.LORA_A
                     )
                     module.set_lora_info(
                         self.memory_pool.get_tensor(
@@ -298,58 +374,67 @@ class LoRAManager:
             i: {} for i in range(self.base_hf_config.num_hidden_layers)
         }
 
-        # Initialize memory pool
-        self.memory_pool = LoRAMemoryPool(
-            self.base_hf_config,
-            self.max_loras_per_batch,
-            self.dtype,
-            self.tp_size,
-            self.tp_rank,
-        )
+        # The LoRA memory pool that manages the GPU buffers for active LoRA weights.
+        # It is initialized lazily when the first LoRA adapter is loaded.
+        self.memory_pool: Optional[LoRAMemoryPool] = None
 
     def update_state_from_configs(self):
         """
         Update the internal state of the LoRAManager based on the current `self.configs`. This method
         should be called whenever `self.configs` is modified (e.g., when new LoRA adapters are loaded).
-
-        This includes:
-        - Initializing LoRA adapters if they are not already loaded.
-        - Collect all LoRA weight names based on the current loaded adapters.
-        - Lazily monkey-patching the base model to use LoRA layers where applicable.
-        - Preparing the GPU buffer pool for active LoRA weights.
         """
-
-        # Target module names in huggingface lora configs.
-        # e.g., {"k_proj", "q_proj", "v_proj", "o_proj"}
-        hf_target_module_names: Set[str] = set()
-        for config in self.configs.values():
-            hf_target_module_names.update(config.target_modules)
-        max_lora_dim: int = max([x.hf_config["r"] for x in self.configs.values()])
 
         # Loads / unloads LoRA adapters based on the latest configs.
         self.update_lora_adapters()
+        # Apply the latest LoRA configurations to the internal state for inferencing.
+        self.apply_lora_configs()
 
-        # Lazily update states for new LoRA weight name (e.g., qkv_proj) as needed.
-        #
-        # Please note that the following update operations are "monotonic" by design, meaning that we update
-        # multiple places to support the new weight names when the first adapter targeting such weight names
-        # is loaded. However, we never "rollback" the support (e.g., convert LoRA layer back to base layer)
-        # even if the associated adapters are unloaded later for both simplicity and practicality reasons: the
-        # list of LoRA weight names is expected to be extremely finite and stable.
-        self.update_lora_weight_names(hf_target_module_names)
-        self.update_lora_modules(hf_target_module_names)
-        self.update_memory_buffers(max_lora_dim)
+    def apply_lora_configs(self):
+        """
+        Apply the LoRA configurations to the base model and internal states of the LoRAManager for inferencing.
 
-    def update_lora_weight_names(self, hf_target_names: Set[str]):
+        Notes:
+        - Currently, this method is effectively only invoked during the initialization phase of the LoRAManager as
+          we do not yet support dynamically updating adapter shape configs, which has a dependency on (1) FlashInfer
+          LoRA backend deprecation and (2) CUDA graph recapture support. We are targeting completing these work in
+          early CY25H2.
+        """
+
+        if self.memory_pool is None:
+            # Infer max_lora_rank and target_modules if not explicitly specified in server args.
+            if self.target_modules is None:
+                self.target_modules = set()
+                for config in self.configs.values():
+                    self.target_modules.update(config.target_modules)
+
+            if self.max_lora_rank is None:
+                self.max_lora_rank = max(
+                    [x.hf_config["r"] for x in self.configs.values()],
+                    default=0,
+                )
+
+            self.update_lora_weight_names()
+            self.update_lora_modules()
+            self.update_memory_buffers()
+        else:
+            # No-op if the memory pool can support the current LoRA configurations.
+            # TODO (lifuhuang): support reinitializing the memory pool when the maximum LoRA rank or target
+            # module is changed once FlashInfer backend is deprecated.
+            assert self.memory_pool.can_support(self.configs.values()), (
+                "LoRA memory pool cannot support the current LoRA configuration. "
+                "This should never happen as we should have validated adapter compatibility. "
+                "Please create a Github issue to report.",
+            )
+
+    def update_lora_weight_names(self):
         """
         Add new LoRA weight names if needed based on the current `self.configs`.
         """
 
         # Target lora weight names for lora_a and lora_b modules respectively.
-        for module in hf_target_names:
-            lora_A, lora_B = get_normalized_lora_weight_names(module)
-            self.lora_weight_names[0].update(lora_A)
-            self.lora_weight_names[1].update(lora_B)
+        lora_A, lora_B = get_normalized_lora_weight_names(self.target_modules)
+        self.lora_weight_names[0].update(lora_A)
+        self.lora_weight_names[1].update(lora_B)
 
     def update_lora_adapters(self):
         """
@@ -372,8 +457,8 @@ class LoRAManager:
                 lora_adapter.initialize_weights()
                 self.loras[name] = lora_adapter
 
-        # Clean up unused LoRA adapters
-        for name in self.loras:
+        # Clean up unused LoRA adapters, copying the list to avoid modifying the dict during iteration.
+        for name in list(self.loras):
             if name not in self.configs:
                 logger.info(f"Unloading LoRA adapter {name}")
                 del self.loras[name]
@@ -381,21 +466,23 @@ class LoRAManager:
         # Additional checks for flashinfer backend
         # FIXME remove the restrictions after supporting multi-rank for flashinfer backend
         if self.lora_backend == "flashinfer":
-            lora_dims = set(x.hf_config["r"] for x in self.configs.values())
+            lora_dims = set(x.r for x in self.configs.values())
             scalings = set(x.scaling for x in self.loras.values())
             assert (
                 len(lora_dims) == 1 and len(scalings) == 1
             ), "Flashinfer backend currently only supports single LoRA rank and scaling across all adapters. "
 
-    def update_memory_buffers(self, max_lora_dim: int):
-        """
-        Update the LoRA memory pool buffers based on the current LoRA configurations and update
-        LoRA modules to use the new buffers. This method should be called after the LoRA configurations
-        are set or updated.
-        """
-
-        self.memory_pool.init_buffers(
-            self.lora_weight_names, self.base_model, max_lora_dim
+    def update_memory_buffers(self):
+        """(Re)initialize the LoRA memory pool based on the current configurations."""
+        self.memory_pool = LoRAMemoryPool(
+            base_hf_config=self.base_hf_config,
+            max_loras_per_batch=self.max_loras_per_batch,
+            dtype=self.dtype,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            max_lora_rank=self.max_lora_rank,
+            lora_weight_names=self.lora_weight_names,
+            base_model=self.base_model,
         )
 
     def set_lora_module(self, module_name, module):
@@ -403,11 +490,11 @@ class LoRAManager:
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
-    def update_lora_modules(self, hf_target_names: Set[str]):
+    def update_lora_modules(self):
         # Target module names of customized layers defined in python/sglang/srt/layers
         # e.g., {"qkv_proj", "o_proj"}
         customized_target_names = get_customized_names_from_hf_names(
-            hf_target_names, self.base_model
+            self.target_modules, self.base_model
         )
 
         for module_name, module in self.base_model.named_modules():

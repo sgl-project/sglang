@@ -1,9 +1,7 @@
 from typing import Callable, List, Optional, Tuple
 
-import einops
 import torch
 
-from sglang.math_utils import align
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.utils import is_sm100_supported
@@ -27,6 +25,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_triton,
 )
 from sglang.srt.utils import (
+    align,
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
@@ -43,7 +42,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
     import aiter
-    from aiter import gemm_a8w8_blockscale_CK, get_hip_quant
+    from aiter import gemm_a8w8_blockscale, get_hip_quant
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
@@ -275,7 +274,7 @@ def aiter_w8a8_block_fp8_linear(
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
-    output = gemm_a8w8_blockscale_CK(
+    output = gemm_a8w8_blockscale(
         q_input, weight, x_scale, weight_scale, dtype=input.dtype
     )
 

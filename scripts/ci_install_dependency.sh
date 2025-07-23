@@ -38,5 +38,8 @@ pip install huggingface_hub[hf_xet]
 # Install xformers
 pip install -U xformers --index-url https://download.pytorch.org/whl/cu126 --no-deps --force-reinstall
 
+# To help dumping traces when timeout occurred
+pip install py-spy
+
 # Show current packages
 pip list

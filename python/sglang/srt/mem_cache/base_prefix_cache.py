@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, List, NamedTuple, Tuple
+from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -26,8 +26,6 @@ class MatchResult(NamedTuple):
     last_device_node: Any
     last_host_node: Any
     host_hit_length: int = 0
-    last_l3_node: Any = None
-    l3_hit_length: int = 0
 
 
 
@@ -59,13 +57,25 @@ class BasePrefixCache(ABC):
         pass
 
     @abstractmethod
-    def dec_lock_ref(self, node: Any):
+    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
         pass
 
     def evictable_size(self):
         return 0
 
+    def full_evictable_size(self):
+        return 0
+
+    def swa_evictable_size(self):
+        return 0
+
     def protected_size(self):
+        return 0
+
+    def full_protected_size(self):
+        return 0
+
+    def swa_protected_size(self):
         return 0
 
     def total_size(self):

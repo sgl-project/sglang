@@ -135,7 +135,7 @@ class HiRadixCache(RadixCache):
         self.ongoing_backup[operation_id] = node
         node.protect_host()
 
-    def inc_hit_count(self, node: TreeNode, token_ids: Optional[List] = None):
+    def inc_hit_count(self, node: TreeNode):
         if self.cache_controller.write_policy == "write_back":
             return
         node.hit_count += 1
@@ -474,6 +474,7 @@ class HiRadixCache(RadixCache):
         if req_id not in self.ongoing_prefetch:
             # there is no ongoing prefetch for this request or it has been revoked
             return
+
         # todo: more policies for prefetch progress such as timeout
         # the current policy is to prefetch with best effort and terminate when queuing is over
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
@@ -482,7 +483,8 @@ class HiRadixCache(RadixCache):
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
-        logger.info(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+
         min_completed_tokens = torch.tensor(completed_tokens, dtype=torch.int)
         if torch.distributed.get_world_size(group=self.tp_group) > 1:
             # synchrnoize TP workers to make the same update to hiradix cache
@@ -508,7 +510,8 @@ class HiRadixCache(RadixCache):
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
 
-    def match_prefix(self, key: List[int], do_prefetch=False, **kwargs):
+
+    def match_prefix(self, key: List[int], **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         if self.disable or len(key) == 0:
             return MatchResult(
@@ -522,14 +525,12 @@ class HiRadixCache(RadixCache):
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
-        value, last_node = self._match_prefix_helper(self.root_node, key, do_prefetch)
+        value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
             value = torch.cat(value)
         else:
             value = empty_value
 
-        last_l3_node = None
-        l3_hit_length = 0
 
         host_hit_length = 0
         last_host_node = last_node
@@ -542,10 +543,9 @@ class HiRadixCache(RadixCache):
             last_device_node=last_node,
             last_host_node=last_host_node,
             host_hit_length=host_hit_length,
-            last_l3_node=last_l3_node,
-            l3_hit_length=l3_hit_length
         )
     
+
     def prefetch_from_storage(
         self,
         req_id: str,
@@ -611,8 +611,7 @@ class HiRadixCache(RadixCache):
             node.children[child_key] = new_node
         return matched_length
 
-    def _match_prefix_helper(self, node: TreeNode, key: List, do_prefetch=False):
-        total_key = key
+    def _match_prefix_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.monotonic()
         child_key = self.get_child_key_fn(key)
         value = []
@@ -625,14 +624,14 @@ class HiRadixCache(RadixCache):
             total_prefix_length += prefix_len
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
-                self.inc_hit_count(new_node, token_ids=total_key[:total_prefix_length])
+                self.inc_hit_count(new_node)
                 if not new_node.evicted:
                     value.append(new_node.value)
                 node = new_node
                 key = key[prefix_len:]
                 break
             else:
-                self.inc_hit_count(child, token_ids=total_key[:total_prefix_length])
+                self.inc_hit_count(child)
                 if not child.evicted:
                     value.append(child.value)
                 node = child
@@ -695,7 +694,7 @@ class HiRadixCache(RadixCache):
                     self.evictable_size_ += len(node.value)
                 else:
                     total_prefix_length += prefix_len
-                    self.inc_hit_count(node, token_ids=total_key[:total_prefix_length])
+                    self.inc_hit_count(node)
             else:
                 # partial match, split the node
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -705,9 +704,7 @@ class HiRadixCache(RadixCache):
                     self.evictable_size_ += len(new_node.value)
                 else:
                     total_prefix_length += prefix_len
-                    self.inc_hit_count(
-                        new_node, token_ids=total_key[:total_prefix_length]
-                    )
+                    self.inc_hit_count(new_node)
                 node = new_node
 
             key = key[prefix_len:]
@@ -725,7 +722,7 @@ class HiRadixCache(RadixCache):
             self.evictable_size_ += len(value)
 
             if self.cache_controller.write_policy != "write_back":
-                self.inc_hit_count(new_node, token_ids=total_key)
+                self.inc_hit_count(new_node)
         return total_prefix_length
 
     def _collect_leaves_device(self):

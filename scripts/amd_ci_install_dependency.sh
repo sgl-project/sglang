@@ -19,3 +19,4 @@ mkdir -p dummy-grok && wget https://sharkpublic.blob.core.windows.net/sharkpubli
 docker cp ./dummy-grok ci_sglang:/
 
 docker exec ci_sglang pip install huggingface_hub[hf_xet]
+docker exec ci_sglang pip install pytest

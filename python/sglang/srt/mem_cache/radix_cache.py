@@ -61,7 +61,7 @@ class TreeNode:
         # store the host indices of KV cache
         self.host_value: Optional[torch.Tensor] = None
         # store hash values of each pages
-        self.hash_value: Optional[List[int]] = None
+        self.hash_value: Optional[List[str]] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -99,6 +99,27 @@ class TreeNode:
     def l2_backuped(self):
         return self.host_value is not None
 
+
+    @property
+    def backuped_storage(self):
+        return self.hash_value is not None and len(self.hash_value) > 0
+
+    def protect_host(self):
+        """Protect the host value from eviction."""
+        self.host_ref_counter += 1
+
+    def release_host(self):
+        """Release the host value, allowing it to be evicted."""
+        if self.host_ref_counter > 0:
+            self.host_ref_counter -= 1
+        else:
+            raise RuntimeError("Host reference counter is already zero.")
+
+    def get_last_hash_value(self) -> Optional[str]:
+        """Returns the hash value of the last page in this node."""
+        if self.hash_value is None or len(self.hash_value) == 0:
+            return None
+        return self.hash_value[-1]
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
@@ -274,7 +295,7 @@ class RadixCache(BasePrefixCache):
         )
 
         # The prefix indices could be updated, reuse it
-        new_indices, new_last_node, _, _, _, _ = self.match_prefix(page_aligned_token_ids)
+        new_indices, new_last_node, _, _ = self.match_prefix(page_aligned_token_ids)
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
             new_indices[len(req.prefix_indices) :],

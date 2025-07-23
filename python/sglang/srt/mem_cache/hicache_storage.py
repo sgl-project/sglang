@@ -37,14 +37,15 @@ def get_hash_str_mooncake(
 	return f"{prefix_str}_{int(current_hash_hex[:16], 16)}_{local_rank}"
 
 
-# todo: batch API for better performance
-
-
 class HiCacheStorage(ABC):
 	"""
 	HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
 	It abstracts the underlying storage mechanism, allowing different implementations to be used.
 	"""
+
+	# todo, translate tensor object access for different TP ranks
+	# potentially pass model and TP configs into storage backend
+	# todo, the page size of storage backend does not have to be the same as the same as host memory pool
 
 	@abstractmethod
 	def get(
@@ -60,6 +61,19 @@ class HiCacheStorage(ABC):
 		pass
 
 	@abstractmethod
+	def batch_get(
+		self,
+		keys,
+		target_locations: Optional[Any] = None,
+		target_sizes: Optional[Any] = None
+	) -> List[torch.Tensor | None]:
+		"""
+		Retrieve values for multiple keys.
+		Returns a list of tensors or None for each key.
+		"""
+		pass
+
+	@abstractmethod
 	def set(self, 
 		 	key, 
 		 	value: Optional[Any] = None, 
@@ -70,11 +84,16 @@ class HiCacheStorage(ABC):
 		Returns True if the operation was successful, False otherwise.
 		"""
 		pass
-
+		
 	@abstractmethod
-	def delete(self, key) -> None:
+	def batch_set(self,
+				  keys,
+				  values: Optional[Any] = None,
+				  target_locations: Optional[Any] = None,
+				  target_sizes: Optional[Any] = None) -> bool:
 		"""
-		Delete the value associated with the given key.
+		Store multiple key-value pairs.
+		Returns True if all operations were successful, False otherwise.
 		"""
 		pass
 
@@ -86,12 +105,6 @@ class HiCacheStorage(ABC):
 		"""
 		pass
 
-	@abstractmethod
-	def clear(self) -> None:
-		"""
-		Clear all entries in the storage.
-		"""
-		pass
 
 
 class HiCacheFile(HiCacheStorage):
@@ -119,6 +132,19 @@ class HiCacheFile(HiCacheStorage):
 				return None
 		except FileNotFoundError:
 			return None
+		
+	def batch_get(
+		self,
+		keys,
+		target_locations: Optional[Any] = None,
+		target_sizes: Optional[Any] = None
+	) -> List[torch.Tensor | None]:
+		return [
+			self.get(key, target_location)
+			for key, target_location in zip(
+				keys, target_locations or [None] * len(keys)
+			)
+		]
 
 	def set(self,
 			key, 
@@ -135,6 +161,16 @@ class HiCacheFile(HiCacheStorage):
 		except Exception as e:
 			logger.error(f"Failed to save tensor {key}: {e}")
 			return False
+
+	def batch_set(self,
+			      keys,
+				  values: Optional[Any] = None,
+				  target_locations: Optional[Any] = None,
+				  target_sizes: Optional[Any] = None) -> bool:
+		for key, value in zip(keys, values):
+			if not self.set(key, value):
+				return False
+		return True
 
 	def delete(self, key: str) -> None:
 		tensor_path = f"{self.file_path}/{key}.bin"
@@ -275,6 +311,24 @@ class MooncakeStore(HiCacheStorage):
 
 		self._put_batch_zero_copy_impl(key, target_location, target_sizes)
 
+	def batch_set(
+		self, 
+		key, 
+		value: Optional[Any] = None, 
+		target_location: Optional[List[int]] = None,
+		target_sizes: Optional[List[int]] = None) -> bool:
+		assert len(key) == len(target_location) == len(target_sizes)
+		if len(key) == 0:
+			return
+
+		for i in range(len(key)):
+			if (key[i] is None
+				or target_location[i] is None
+				or target_sizes[i] is None):
+				return
+
+		self._put_batch_zero_copy_impl(key, target_location, target_sizes)
+
 	def get(
 		self, 
 		key, 
@@ -293,6 +347,24 @@ class MooncakeStore(HiCacheStorage):
 
 		return self._get_batch_zero_copy_impl(key, target_location, target_sizes)
 	
+	def batch_get(
+		self, 
+		key, 
+		target_location: Optional[Any] = None,
+		target_sizes: Optional[Any] = None
+	) -> torch.Tensor | None:
+		assert len(key) == len(target_location) == len(target_sizes)
+		if len(key) == 0:
+			return
+
+		for i in range(len(key)):
+			if (key[i] is None
+				or target_location[i] is None
+				or target_sizes[i] is None):
+				return
+
+		return self._get_batch_zero_copy_impl(key, target_location, target_sizes)
+
 	def exists(self, keys) -> bool | dict:
 		_keys = []
 		for key in keys:
