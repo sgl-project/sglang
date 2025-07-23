@@ -345,7 +345,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ret = await _global_state.tokenizer_manager.generate_request(
                 obj, request
             ).__anext__()
-            return ret
+            return ORJSONResponse(ret)
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
