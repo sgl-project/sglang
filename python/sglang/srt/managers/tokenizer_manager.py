@@ -243,8 +243,10 @@ class TokenizerManager:
                     revision=server_args.revision,
                 )
 
-        # Initialize loaded loRA adapters with the initial lora paths in the server_args.
-        # This list will be updated when new LoRA adapters are loaded or unloaded dynamically.
+        # Initialize the `LoRARegistry` with initial LoRA adapter paths provided in `server_args`.
+        # The registry dynamically updates as adapters are loaded / unloaded during runtime. It
+        # serves as the source of truth for available adapters and maps user-friendly LoRA names
+        # to internally used unique LoRA IDs.
         self.lora_registry = LoRARegistry(self.server_args.lora_paths or {})
 
         # Store states

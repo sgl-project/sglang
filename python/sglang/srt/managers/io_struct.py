@@ -1082,7 +1082,7 @@ class LoadLoRAAdapterReqInput:
 @dataclass
 class UnloadLoRAAdapterReqInput:
     # The name of lora module to unload.
-    lora_name: Optional[str] = None
+    lora_name: str
     # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
     lora_id: Optional[str] = None
 

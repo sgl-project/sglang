@@ -191,8 +191,10 @@ class LoRAManager:
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # Load active loras into lora memory pool
-        # despite the confusing naming, `forward_batch.lora_paths` is actually a set of unique LoRA IDs, not LoRA paths.
-        # We must use unique IDs here (instead of LoRA names) as names can be reused across dynamic loading/unloading.
+        # TODO (lifuhuang): The naming of `forward_batch.lora_paths` is confusing. It actually contains a set of unique
+        # LoRA IDs, not LoRA paths. While unfortunately we cannot change the name in API for backward compatibility, we
+        # should consider (1) renaming the incorrect usage within the system, and (2) deprecating the parameter name in
+        # the current API schema and introducing a better request schema in the future (e.g., use `model_name`).
         cur_uids = set(forward_batch.lora_paths)
         assert len(cur_uids) <= self.max_loras_per_batch
         self.memory_pool.prepare_lora_batch(cur_uids, self.loras, self.lora_modules)
