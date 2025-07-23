@@ -431,7 +431,7 @@ class AWQLinearMethod(LinearMethodBase):
                     layer.qzeros,
                     layer.compensation,
                     bias,
-                    torch.bfloat16,
+                    x.dtype,
                 )
             else:
                 return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
