@@ -329,8 +329,8 @@ class EAGLEWorker(TpModelWorker):
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (
-                    not self.server_args.enable_dp_attention
-                    and batch.spec_info.verified_id.shape[0] > 0
+                    self.server_args.enable_dp_attention
+                    or batch.spec_info.verified_id.shape[0] > 0
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
