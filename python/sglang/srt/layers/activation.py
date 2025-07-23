@@ -100,7 +100,7 @@ class GeluAndMul(CustomOp):
         return out
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        y_npu, gelu_npu = torch_npu.geglu(
+        y_npu, gelu_npu = torch_npu.npu_geglu(
             x,
             dim=-1,
             approximate=1 if self.approximate == "tanh" else 0,
