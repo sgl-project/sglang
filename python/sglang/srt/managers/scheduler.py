@@ -1260,7 +1260,13 @@ class Scheduler(
                 last_hash = req.last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 if (matched_len > 0 and last_hash is not None) or matched_len == 0:
-                    new_input_tokens = req.fill_ids[matched_len:]
+                    new_input_tokens_len = len(req.fill_ids) - matched_len
+                    new_input_tokens_len = new_input_tokens_len - (
+                        new_input_tokens_len % self.page_size
+                    )
+                    new_input_tokens = req.fill_ids[
+                        matched_len : matched_len + new_input_tokens_len
+                    ]
                     self.tree_cache.prefetch_from_storage(
                         req.rid, req.last_host_node, new_input_tokens, last_hash
                     )
@@ -1735,7 +1741,8 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                self.tree_cache.check_prefetch_progress(req.rid)
+                if not self.tree_cache.check_prefetch_progress(req.rid):
+                    continue
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
