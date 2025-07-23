@@ -38,6 +38,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.dp_attention import get_attention_dp_rank
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import (
     flatten_nested_list,
@@ -242,7 +243,7 @@ class ForwardBatch:
     lora_paths: Optional[List[str]] = None
 
     # For input embeddings
-    input_embeds: Optional[torch.tensor] = None
+    input_embeds: Optional[torch.Tensor] = None
 
     # For cross-encoder model
     token_type_ids: Optional[torch.Tensor] = None
@@ -340,20 +341,38 @@ class ForwardBatch:
                 len(batch.input_ids), dtype=torch.int32
             ).to(device, non_blocking=True)
 
-        # For DP attention
+        # For MLP sync
         if batch.global_num_tokens is not None:
-
-            spec_num_draft_tokens = (
-                batch.spec_num_draft_tokens
-                if batch.spec_num_draft_tokens is not None
-                else 1
+            from sglang.srt.speculative.eagle_utils import (
+                EagleDraftInput,
+                EagleVerifyInput,
             )
-            global_num_tokens = [
-                x * spec_num_draft_tokens for x in batch.global_num_tokens
-            ]
-            global_num_tokens_for_logprob = [
-                x * spec_num_draft_tokens for x in batch.global_num_tokens_for_logprob
-            ]
+
+            assert batch.global_num_tokens_for_logprob is not None
+            # process global_num_tokens and global_num_tokens_for_logprob
+            if batch.spec_info is not None:
+                if isinstance(batch.spec_info, EagleDraftInput):
+                    global_num_tokens = [
+                        x * batch.spec_info.num_tokens_per_batch
+                        for x in batch.global_num_tokens
+                    ]
+                    global_num_tokens_for_logprob = [
+                        x * batch.spec_info.num_tokens_for_logprob_per_batch
+                        for x in batch.global_num_tokens_for_logprob
+                    ]
+                else:
+                    assert isinstance(batch.spec_info, EagleVerifyInput)
+                    global_num_tokens = [
+                        x * batch.spec_info.draft_token_num
+                        for x in batch.global_num_tokens
+                    ]
+                    global_num_tokens_for_logprob = [
+                        x * batch.spec_info.draft_token_num
+                        for x in batch.global_num_tokens_for_logprob
+                    ]
+            else:
+                global_num_tokens = batch.global_num_tokens
+                global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
 
             ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
@@ -364,13 +383,6 @@ class ForwardBatch:
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
                 global_num_tokens_for_logprob, dtype=torch.int64
             ).to(device, non_blocking=True)
-
-            sum_len = sum(global_num_tokens)
-            ret.gathered_buffer = torch.zeros(
-                (sum_len, model_runner.model_config.hidden_size),
-                dtype=model_runner.dtype,
-                device=device,
-            )
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
@@ -572,6 +584,34 @@ class ForwardBatch:
                 self.req_to_token_pool.req_to_token.shape[1],
             )
             self.prefix_chunk_kv_indices.append(chunk_kv_indices)
+
+    def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int):
+        return torch.cat(
+            [tensor, tensor.new_zeros(size - tensor.shape[0], *tensor.shape[1:])], dim=0
+        )
+
+    def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
+        assert self.global_num_tokens_cpu is not None
+        global_num_tokens = self.global_num_tokens_cpu
+        sum_len = sum(global_num_tokens)
+        self.gathered_buffer = torch.zeros(
+            (sum_len, model_runner.model_config.hidden_size),
+            dtype=model_runner.dtype,
+            device=model_runner.device,
+        )
+        if self.forward_mode.is_draft_extend():
+            if len(global_num_tokens) > 1:
+                num_tokens = global_num_tokens[get_attention_dp_rank()]
+            else:
+                num_tokens = global_num_tokens[0]
+            self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
+            self.out_cache_loc = self._pad_tensor_to_size(
+                self.out_cache_loc, num_tokens
+            )
+            self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
+            self.spec_info.hidden_states = self._pad_tensor_to_size(
+                self.spec_info.hidden_states, num_tokens
+            )
 
     # Here we suppose the length of each chunk is equal
     # For example, if we have 4 sequences with prefix length [256, 512, 768, 1024], prefix_chunk_len = 256
