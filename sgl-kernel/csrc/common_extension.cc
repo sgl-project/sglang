@@ -125,7 +125,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "sgl_per_token_group_quant_8bit(Tensor input, Tensor output_q, Tensor output_s, int group_size, float eps, float "
-      "fp8_min, float fp8_max, bool ue8m0) -> ()");
+      "min_8bit, float max_8bit, bool ue8m0) -> ()");
   m.impl("sgl_per_token_group_quant_8bit", torch::kCUDA, &sgl_per_token_group_quant_8bit_prologue);
 
   m.def("sgl_per_tensor_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, bool is_static) -> ()");

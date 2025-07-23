@@ -113,13 +113,13 @@ __global__ void per_token_group_quant_with_prologue_kernel(
   // compute scale
   TI abs_max(eps);
   CUTE_UNROLL
-  for (int i = 0; i < size(reg_in); i += 2) {
+  for (int i = 0; i < size(reg_in); ++i) {
     abs_max = max_func(abs_max, abs_func(reg_in(i)));
   }
   abs_max = warp_reduce_max<TI, 1>(abs_max);
   float y_s = float(abs_max) / float(max_val);
   if (scale_ue8m0) {
-    y_s = exp2f(ceilf(log2f(fmaxf(fabsf(y_s), 1e-10f))));
+    y_s = exp2f(ceilf(log2f(fmaxf(y_s, 1e-10f))));
   }
 
   // store scale
@@ -405,7 +405,6 @@ void sgl_per_token_group_quant_8bit_prologue(
   int out_hidden_stride = output_q.stride(output_q.dim() - 2);
 
   CHECK(output_scale.dim() == 2);
-  int scale_hidden_dim = output_scale.size(1);
 
   int output_scale_stride0 = output_scale.stride(0);
   int output_scale_stride1 = output_scale.stride(1);
