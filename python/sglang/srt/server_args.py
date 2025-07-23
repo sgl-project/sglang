@@ -398,6 +398,11 @@ class ServerArgs:
             )
             self.page_size = 128
 
+        if self.moe_dense_tp_size == 1:
+            assert (
+                self.enable_dp_lm_head == True
+            ), "moe_dense_tp_size also need enable_dp_lm_head"
+
         if self.attention_backend == "flashmla":
             logger.warning(
                 "FlashMLA only supports a page_size of 64, change page_size to 64."
