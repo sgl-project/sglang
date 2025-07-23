@@ -269,12 +269,9 @@ inline void transfer_kv_direct_impl(
   auto src_indices_cpu = src_indices.cpu();
   auto dst_indices_cpu = dst_indices.cpu();
 
-  // TODO (csy): replace with argsort only
-  auto [sorted_src, sorted_indices] = src_indices_cpu.sort();
-  auto sorted_dst = dst_indices_cpu.index_select(0, sorted_indices);
-  int64_t* src_indices_ptr = sorted_src.data_ptr<int64_t>();
-  int64_t* dst_indices_ptr = sorted_dst.data_ptr<int64_t>();
-  auto num_indices = sorted_src.numel();
+  auto num_indices = src_indices_cpu.numel();
+  int64_t* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
+  int64_t* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
 
   int64_t start_index = 0;
   int64_t end_index = 0;
