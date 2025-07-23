@@ -528,7 +528,7 @@ std::vector<at::Tensor> moe_fused_gate(
   switch (num_experts) {
     case 384:
       if (num_expert_group == 1)
-        // Kimi K2 配置: VPT = 384/1 = 384, ROWS_PER_WARP = 32/1 = 32
+        // Kimi K2 config: VPT = 384/1 = 384, ROWS_PER_WARP = 32/1 = 32
         if (input.scalar_type() == at::kBFloat16) {
           LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 384, 1);
         } else if (input.scalar_type() == at::kHalf) {
