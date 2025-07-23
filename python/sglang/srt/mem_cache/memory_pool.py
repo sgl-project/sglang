@@ -832,6 +832,16 @@ class MLATokenToKVPool(KVCache):
         )
         self.mem_usage = kv_size / GB
 
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.kv_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_strides = torch.tensor(
+            [np.prod(x.shape[1:]) * x.dtype.itemsize for x in self.kv_buffer],
+            device=self.device,
+        )
+
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
         kv_size_bytes = 0
@@ -967,6 +977,16 @@ class MLATokenToKVPool(KVCache):
                 kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
         torch.cuda.synchronize()
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        copy_all_layer_kv_cache[(len(self.data_ptrs),)](
+            self.data_ptrs,
+            self.data_strides,
+            tgt_loc,
+            src_loc,
+            len(tgt_loc),
+            next_power_of_2(len(tgt_loc)),
+        )
 
 
 class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
