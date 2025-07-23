@@ -22,8 +22,16 @@ from typing import Any, Dict, Optional, Type, Union
 
 import torch
 from huggingface_hub import snapshot_download
+
+from sglang.srt.utils import get_bool_env_var
+
+# Conditional import based on SGLANG_USE_MODELSCOPE environment variable
+if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+    from modelscope import AutoConfig
+else:
+    from transformers import AutoConfig
+
 from transformers import (
-    AutoConfig,
     AutoProcessor,
     AutoTokenizer,
     GenerationConfig,
