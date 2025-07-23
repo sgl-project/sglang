@@ -96,6 +96,11 @@ class TreeNode:
         return self.hash_value[-1]
 
     def __lt__(self, other: "TreeNode"):
+        # prioritize the node that is already written to host
+        if self.host_value is not None and other.host_value is None:
+            return True
+        if self.host_value is None and other.host_value is not None:
+            return False
         return self.last_access_time < other.last_access_time
 
 
