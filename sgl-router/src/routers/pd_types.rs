@@ -1,6 +1,7 @@
 // Essential PDLB types extracted for PD routing
 
 use crate::core::{Worker, WorkerType};
+use crate::openai_api_types::CompletionRequest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -231,5 +232,41 @@ impl Bootstrap for ChatReqInput {
         self.bootstrap_host = Some(bootstrap_host);
         self.bootstrap_port = Some(bootstrap_port);
         self.bootstrap_room = Some(bootstrap_room);
+    }
+}
+
+// Bootstrap implementation for CompletionRequest to preserve OpenAI format
+impl Bootstrap for CompletionRequest {
+    fn is_stream(&self) -> bool {
+        self.stream
+    }
+
+    fn get_batch_size(&self) -> Result<Option<usize>, String> {
+        // Check if 'n' parameter is present and > 1
+        if let Some(n) = self.n {
+            if n > 1 {
+                return Ok(Some(n as usize));
+            }
+        }
+        Ok(None)
+    }
+
+    fn set_bootstrap_info(
+        &mut self,
+        bootstrap_host: BootstrapHost,
+        bootstrap_port: BootstrapPort,
+        bootstrap_room: BootstrapRoom,
+    ) {
+        // Add bootstrap info to the 'other' field to preserve OpenAI format
+        // This follows the same pattern as ChatReqInput
+        if let Ok(host_value) = serde_json::to_value(bootstrap_host) {
+            self.other.insert("bootstrap_host".to_string(), host_value);
+        }
+        if let Ok(port_value) = serde_json::to_value(bootstrap_port) {
+            self.other.insert("bootstrap_port".to_string(), port_value);
+        }
+        if let Ok(room_value) = serde_json::to_value(bootstrap_room) {
+            self.other.insert("bootstrap_room".to_string(), room_value);
+        }
     }
 }
