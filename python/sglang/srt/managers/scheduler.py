@@ -1389,8 +1389,6 @@ class Scheduler(
             f += f"#running-req: {running_bs}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
 
-        f += f"timestamp: {datetime.datetime.now().isoformat()}"
-
         logger.info(f)
 
         if self.enable_metrics:
@@ -1471,7 +1469,6 @@ class Scheduler(
             f"cuda graph: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
-            f"timestamp: {datetime.datetime.now().isoformat()}"
         )
 
         logger.info(msg)
