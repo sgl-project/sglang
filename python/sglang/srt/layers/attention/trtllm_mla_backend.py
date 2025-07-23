@@ -305,18 +305,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             elif v is not None:
                 forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
-        # Prepare query tensor inline (avoid helper for shape tweaks)
+        # Prepare query tensor inline
         if q_rope is not None:
             # q contains NOPE part (v_head_dim)
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            # Use a pre-allocated staging buffer to avoid per-step tensor
-            # allocation and the CatArrayBatchedCopy kernel.
-            query = q.new_empty(q_nope.shape[0], layer.tp_q_head_num, layer.head_dim)
-            query[..., : layer.v_head_dim].copy_(q_nope)
-            query[..., layer.v_head_dim :].copy_(q_rope_reshaped)
+            query = torch.cat([q_nope, q_rope_reshaped], dim=-1)  
         else:
             # q already has both parts
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
