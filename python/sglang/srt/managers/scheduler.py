@@ -247,7 +247,7 @@ class Scheduler(
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
-        self.lora_paths = server_args.lora_paths
+        self.enable_lora = server_args.enable_lora
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -262,6 +262,7 @@ class Scheduler(
         )
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.page_size = server_args.page_size
         self.dp_size = server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -614,6 +615,7 @@ class Scheduler(
                         == "fa3"  # hot fix for incompatibility
                         else server_args.hicache_io_backend
                     ),
+                    hicache_storage_backend=server_args.hicache_storage_backend,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -973,7 +975,6 @@ class Scheduler(
                             self.world_group.device_group,
                             self.pp_rank * self.tp_size + dp_offset,
                             (self.pp_rank + 1) * self.tp_size + dp_offset,
-                            device=self.device,
                         )
 
                     # send out proxy tensors to the next stage
@@ -1022,7 +1023,6 @@ class Scheduler(
                     self.world_group.device_group,
                     (self.pp_rank - 1) * self.tp_size + dp_offset,
                     self.pp_rank * self.tp_size + dp_offset,
-                    device=self.device,
                 )
             else:
                 recv_reqs = None
@@ -1053,7 +1053,6 @@ class Scheduler(
                     self.attn_tp_group.rank,
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
-                    device=self.device,
                 )
             if self.tp_size != 1:
                 control_reqs = broadcast_pyobj(
@@ -1061,7 +1060,6 @@ class Scheduler(
                     self.tp_group.rank,
                     self.tp_cpu_group,
                     src=self.tp_group.ranks[0],
-                    device=self.device,
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
@@ -1070,7 +1068,6 @@ class Scheduler(
                 self.tp_group.rank,
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
-                device=self.device,
             )
         return recv_reqs
 
@@ -1258,6 +1255,15 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
+            if self.enable_hicache_storage:
+                req.init_next_round_input(self.tree_cache)
+                last_hash = req.last_host_node.get_last_hash_value()
+                matched_len = len(req.prefix_indices) + req.host_hit_length
+                if (matched_len > 0 and last_hash is not None) or matched_len == 0:
+                    new_input_tokens = req.fill_ids[matched_len:]
+                    self.tree_cache.prefetch_from_storage(
+                        req.rid, req.last_host_node, new_input_tokens, last_hash
+                    )
             self.waiting_queue.append(req)
 
     def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
@@ -1383,8 +1389,6 @@ class Scheduler(
             f += f"#running-req: {running_bs}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
 
-        f += f"timestamp: {datetime.datetime.now().isoformat()}"
-
         logger.info(f)
 
         if self.enable_metrics:
@@ -1465,7 +1469,6 @@ class Scheduler(
             f"cuda graph: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
-            f"timestamp: {datetime.datetime.now().isoformat()}"
         )
 
         logger.info(msg)
@@ -1703,13 +1706,13 @@ class Scheduler(
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
-        if self.lora_paths:
+        if self.enable_lora:
             lora_set = set([req.lora_path for req in self.running_batch.reqs])
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if (
-                self.lora_paths
+                self.enable_lora
                 and len(
                     lora_set
                     | set([req.lora_path for req in adder.can_run_list])
@@ -1730,6 +1733,9 @@ class Scheduler(
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     self.running_batch.batch_is_full = True
                     break
+
+            if self.enable_hicache_storage:
+                self.tree_cache.check_prefetch_progress(req.rid)
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
@@ -2460,12 +2466,6 @@ class Scheduler(
         """In-place loading a new lora adapter from disk or huggingface."""
 
         result = self.tp_worker.load_lora_adapter(recv_req)
-
-        if result.success:
-            flush_cache_success = self.flush_cache()
-            assert flush_cache_success, "Cache flush failed after loading lora adapter."
-        else:
-            logger.error(result.error_message)
         return result
 
     def unload_lora_adapter(
@@ -2474,14 +2474,6 @@ class Scheduler(
         """Unload the lora adapter."""
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
-
-        if result.success:
-            flush_cache_success = self.flush_cache()
-            assert (
-                flush_cache_success
-            ), "Cache flush failed after unloading LoRA weights"
-        else:
-            logger.error(result.error_message)
         return result
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):

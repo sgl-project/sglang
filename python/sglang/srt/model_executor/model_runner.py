@@ -68,6 +68,7 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
@@ -304,11 +305,7 @@ class ModelRunner:
             self.apply_torch_tp()
 
         # Init lora
-        # TODO (lifuhuang): when we support dynamic LoRA loading / unloading, we should add
-        # a new server arg `enable_lora` to control whether to init LoRA manager to be more
-        # explicit, as it is perfectly valid to start a server with an empty lora_paths and
-        # load LoRA adapters dynamically later.
-        if server_args.lora_paths is not None:
+        if server_args.enable_lora:
             self.init_lora_manager()
 
         # Init memory pool and attention backends
@@ -381,6 +378,7 @@ class ModelRunner:
                     is_hopper_with_cuda_12_3()
                     and is_no_spec_infer_or_topk_one(server_args)
                     and is_fa3_default_architecture(self.model_config.hf_config)
+                    and (not server_args.enable_hierarchical_cache)
                 ):
                     server_args.attention_backend = "fa3"
                 elif _is_hip:
@@ -393,7 +391,9 @@ class ModelRunner:
                     )
             else:
                 # MLA architecture
-                if is_hopper_with_cuda_12_3():
+                if is_hopper_with_cuda_12_3() and (
+                    not server_args.enable_hierarchical_cache
+                ):
                     server_args.attention_backend = "fa3"
                 elif is_sm100_supported():
                     server_args.attention_backend = "flashinfer"
@@ -411,7 +411,7 @@ class ModelRunner:
                 else:
                     server_args.attention_backend = "triton"
             logger.info(
-                f"Attention backend not set. Use {server_args.attention_backend} backend by default."
+                f"Attention backend not explicitly specified. Use {server_args.attention_backend} backend by default."
             )
         elif self.use_mla_backend:
             if server_args.device != "cpu":
@@ -463,7 +463,7 @@ class ModelRunner:
             if not self.is_multimodal_chunked_prefill_supported:
                 server_args.chunked_prefill_size = -1
                 logger.info(
-                    f"Automatically turn of --chunked-prefill-size as it is not supported for "
+                    f"Automatically turn off --chunked-prefill-size as it is not supported for "
                     f"{self.model_config.hf_config.model_type}"
                 )
 
@@ -894,44 +894,38 @@ class ModelRunner:
             tp_rank=self.tp_rank,
             max_lora_rank=self.server_args.max_lora_rank,
             target_modules=self.server_args.lora_target_modules,
+            lora_paths=self.server_args.lora_paths,
         )
-        result = self.lora_manager.load_lora_adapters(self.server_args.lora_paths)
-        if result.success:
-            logger.info(
-                f"LoRA manager ready. Loaded LoRA adapters: {', '.join(result.loaded_adapters)}"
-            )
-        else:
-            raise RuntimeError(f"Failed to load LoRA adapters: {result.error_message}")
 
-    def load_lora_adapter(self, lora_name: str, lora_path: str):
+    def load_lora_adapter(self, lora_ref: LoRARef):
         """Load a new lora adapter from disk or huggingface."""
 
         logger.info(
-            f"LoRA adapter loading starts: name={lora_name}, path={lora_path}. "
+            f"LoRA adapter loading starts: {lora_ref}. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
-        result = self.lora_manager.load_lora_adapter(lora_name, lora_path)
+        result = self.lora_manager.load_lora_adapter(lora_ref)
 
         logger.info(
-            f"LoRA adapter loading completes: name={lora_name}, path={lora_path}. "
+            f"LoRA adapter loading completes: {lora_ref}. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
         return result
 
-    def unload_lora_adapter(self, lora_name: str):
+    def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
 
         logger.info(
-            f"LoRA adapter unloading starts: name={lora_name}. "
+            f"LoRA adapter unloading starts: {lora_ref}. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
-        result = self.lora_manager.unload_lora_adapter(lora_name)
+        result = self.lora_manager.unload_lora_adapter(lora_ref)
 
         logger.info(
-            f"LoRA adapter unloading completes: name={lora_name}. "
+            f"LoRA adapter unloading completes: {lora_ref}. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
