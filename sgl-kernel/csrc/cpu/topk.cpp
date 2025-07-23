@@ -252,21 +252,36 @@ void topk_softmax_kernel_impl(
   });
 }
 
-template <int SIZE>
-inline void apply_bias(float* __restrict__ scores2, const float* __restrict__ scores, const float* __restrict__ bias) {
-  using Vec = at::vec::Vectorized<float>;
-  for (int d = 0; d < SIZE; d += Vec::size()) {
-    Vec x_vec = Vec::loadu(scores + d) + Vec::loadu(bias + d);
-    x_vec.store(scores2 + d);
+template <typename bias_scalar_t, int SIZE>
+inline void
+apply_bias(float* __restrict__ scores2, const float* __restrict__ scores, const bias_scalar_t* __restrict__ bias) {
+  using fVec = at::vec::Vectorized<float>;
+  if constexpr (!(std::is_same<bias_scalar_t, double>::value) && !(std::is_same<bias_scalar_t, float>::value)) {
+    using bVec = at::vec::Vectorized<bias_scalar_t>;
+    for (int d = 0; d < SIZE; d += bVec::size()) {
+      bVec bias_vec = bVec::loadu(bias + d);
+      fVec bias0, bias1;
+      std::tie(bias0, bias1) = at::vec::convert_to_float(bias_vec);
+
+      fVec x0 = fVec::loadu(scores + d) + bias0;
+      fVec x1 = fVec::loadu(scores + d + fVec::size()) + bias1;
+      x0.store(scores2 + d);
+      x1.store(scores2 + d + fVec::size());
+    }
+  } else {
+    for (int d = 0; d < SIZE; d += fVec::size()) {
+      fVec x_vec = fVec::loadu(scores + d) + fVec::loadu(bias + d);
+      x_vec.store(scores2 + d);
+    }
   }
 }
 
-template <typename scalar_t, int NUM_EXPERTS, int TOPK>
+template <typename scalar_t, typename bias_scalar_t, int NUM_EXPERTS, int TOPK>
 void biased_grouped_topk_kernel_impl(
     float* __restrict__ topk_weights,
     int32_t* __restrict__ topk_ids,
     const scalar_t* __restrict__ gating_output,
-    const float* __restrict__ bias,
+    const bias_scalar_t* __restrict__ bias,
     int64_t num_tokens,
     int64_t num_groups,
     int64_t topk_group,
@@ -287,7 +302,8 @@ void biased_grouped_topk_kernel_impl(
     for (int64_t i = begin; i < end; ++i) {
       // do sigmoid to get scores
       sigmoid<scalar_t, NUM_EXPERTS>(scores, gating_output + i * NUM_EXPERTS);
-      apply_bias<NUM_EXPERTS>(scores2, scores, bias);
+
+      apply_bias<bias_scalar_t, NUM_EXPERTS>(scores2, scores, bias);
 
       for (int64_t g = 0; g < num_groups; ++g) {
         // find the max
@@ -398,15 +414,15 @@ void biased_grouped_topk_kernel_impl(
       topk,                               \
       renormalize);
 
-#define LAUNCH_BIASED_GROUPED_TOPK_KERNEL(NE, NTOPK)    \
-  biased_grouped_topk_kernel_impl<scalar_t, NE, NTOPK>( \
-      topk_weights.data_ptr<float>(),                   \
-      topk_ids.data_ptr<int32_t>(),                     \
-      gating_output.data_ptr<scalar_t>(),               \
-      correction_bias.data_ptr<float>(),                \
-      num_tokens,                                       \
-      num_expert_group,                                 \
-      topk_group,                                       \
+#define LAUNCH_BIASED_GROUPED_TOPK_KERNEL(NE, NTOPK)                   \
+  biased_grouped_topk_kernel_impl<scalar_t, bias_scalar_t, NE, NTOPK>( \
+      topk_weights.data_ptr<float>(),                                  \
+      topk_ids.data_ptr<int32_t>(),                                    \
+      gating_output.data_ptr<scalar_t>(),                              \
+      correction_bias.data_ptr<bias_scalar_t>(),                       \
+      num_tokens,                                                      \
+      num_expert_group,                                                \
+      topk_group,                                                      \
       renormalize);
 
 }  // anonymous namespace
@@ -627,7 +643,6 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
 
   const auto st = hidden_states.scalar_type();
   CHECK_EQ(gating_output.scalar_type(), st);
-  CHECK_EQ(correction_bias.scalar_type(), at::kFloat);
 
   int64_t num_tokens = hidden_states.size(0);
   int64_t num_experts = gating_output.size(1);
@@ -636,16 +651,23 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
   at::Tensor topk_weights = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kFloat));
   at::Tensor topk_ids = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kInt));
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "biased_grouped_topk_kernel", [&] {
-    // NOW only support DSv3 configs
-    TORCH_CHECK(topk == 8, "Unexpected topk: ", topk);
-    switch (num_experts) {
-      case 256:
-        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(256, 8);
-        break;
-      default:
-        TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
-    }
-  });
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::BFloat16,
+      at::ScalarType::Half,
+      correction_bias.scalar_type(),
+      "biased_grouped_topk_kernel2",
+      [&] {
+        using bias_scalar_t = scalar_t;
+        AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "biased_grouped_topk_kernel", [&] {
+          TORCH_CHECK(topk == 8, "Unexpected topk: ", topk);
+          switch (num_experts) {
+            case 256:
+              LAUNCH_BIASED_GROUPED_TOPK_KERNEL(256, 8);
+              break;
+            default:
+              TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
+          }
+        });
+      });
   return std::make_tuple(topk_weights, topk_ids);
 }
