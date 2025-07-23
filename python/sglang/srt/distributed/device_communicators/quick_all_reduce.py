@@ -1,22 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import ctypes
 import logging
 import os
-from contextlib import contextmanager
 from enum import Enum
-from functools import wraps
-from typing import Any, Callable, List, Optional, TypeVar, Union
+from typing import Union
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from typing_extensions import ParamSpec
 
 from sglang.srt import _custom_ops as ops
-from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
-    gpu_p2p_access_check,
     is_full_nvlink,
     is_weak_contiguous,
 )
@@ -38,7 +32,7 @@ except Exception:
 
 
 def qr_rocm_arch_available():
-    if not is_hip():
+    if not _is_hip:
         return False
     try:
         props = torch.cuda.get_device_properties(0)

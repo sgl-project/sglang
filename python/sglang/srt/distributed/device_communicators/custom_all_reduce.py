@@ -4,13 +4,11 @@ import ctypes
 import logging
 import os
 from contextlib import contextmanager
-from functools import wraps
-from typing import Any, Callable, List, Optional, TypeVar, Union
+from typing import Any, List, Optional, Union
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from typing_extensions import ParamSpec
 
 from sglang.srt import _custom_ops as ops
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
