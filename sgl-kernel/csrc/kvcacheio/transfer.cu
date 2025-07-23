@@ -269,29 +269,44 @@ inline void transfer_kv_direct_impl(
   auto src_indices_cpu = src_indices.cpu();
   auto dst_indices_cpu = dst_indices.cpu();
 
-  const int64_t num_pages = src_indices_cpu.size(0) / page_size;
+  // TODO (csy): replace with argsort only
+  auto [sorted_src, sorted_indices] = src_indices_cpu.sort();
+  auto sorted_dst = dst_indices_cpu.index_select(0, sorted_indices);
+  int64_t* src_indices_ptr = sorted_src.data_ptr<int64_t>();
+  int64_t* dst_indices_ptr = sorted_dst.data_ptr<int64_t>();
+  auto num_indices = sorted_src.numel();
 
-  for (const auto i : c10::irange(num_pages)) {
-    auto s_index = src_indices_cpu[i * page_size].item<int64_t>();
-    auto d_index = dst_indices_cpu[i * page_size].item<int64_t>();
+  int64_t start_index = 0;
+  int64_t end_index = 0;
+  for (int64_t i = 0; i < num_indices; ++i) {
+    if (i < num_indices - 1) {
+      auto src_diff = src_indices_ptr[i + 1] - src_indices_ptr[i];
+      auto dst_diff = dst_indices_ptr[i + 1] - dst_indices_ptr[i];
 
+      if (src_diff == 1 && dst_diff == 1) {
+        continue;
+      }
+      end_index = i + 1;
+    } else {  // last batch
+      end_index = num_indices;
+    }
+    auto src_index = src_indices_ptr[start_index];
+    auto dst_index = dst_indices_ptr[start_index];
+    auto num_pages = end_index - start_index;
     if constexpr (AllLayers) {
       for (const auto j : c10::irange(num_layers)) {
-        if constexpr (IsMLA) {
-          transfer_page_direct(src_k.select(0, j), dst_k.select(0, j), s_index, d_index, page_size);
-        } else {
-          transfer_page_direct(src_k.select(0, j), dst_k.select(0, j), s_index, d_index, page_size);
-          transfer_page_direct(src_v_opt.select(0, j), dst_v_opt.select(0, j), s_index, d_index, page_size);
+        transfer_page_direct(src_k.select(0, j), dst_k.select(0, j), src_index, dst_index, num_pages);
+        if constexpr (!IsMLA) {
+          transfer_page_direct(src_v_opt.select(0, j), dst_v_opt.select(0, j), src_index, dst_index, num_pages);
         }
       }
-    } else {  // Per-layer
-      if constexpr (IsMLA) {
-        transfer_page_direct(src_k, dst_k, s_index, d_index, page_size);
-      } else {
-        transfer_page_direct(src_k, dst_k, s_index, d_index, page_size);
-        transfer_page_direct(src_v_opt, dst_v_opt, s_index, d_index, page_size);
+    } else {
+      transfer_page_direct(src_k, dst_k, src_index, dst_index, num_pages);
+      if constexpr (!IsMLA) {
+        transfer_page_direct(src_v_opt, dst_v_opt, src_index, dst_index, num_pages);
       }
     }
+    start_index = end_index;
   }
 }
 
