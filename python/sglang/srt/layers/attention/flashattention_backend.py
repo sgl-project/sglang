@@ -757,6 +757,9 @@ class FlashAttentionBackend(AttentionBackend):
                 cache_seqlens = metadata.encoder_lens_int32
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
+            
+            if key_cache.dtype == torch.float8_e4m3fn:
+                q = q.to(key_cache.dtype)
 
             result = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
