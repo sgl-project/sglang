@@ -6,10 +6,11 @@ import torch
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import (
-    per_tensor_quant_mla_deep_gemm_masked_fp8,
     per_tensor_quant_mla_fp8,
     per_token_group_quant_fp8,
+    per_token_group_quant_mla_deep_gemm_masked_fp8,
     static_quant_fp8,
     w8a8_block_fp8_matmul,
 )
@@ -236,7 +237,7 @@ class TestPerTokenGroupQuantMlaDeepGemmMaskedFP8(CustomTestCase):
 
         with torch.inference_mode():
             ref_out, ref_scale = native_per_token_group_quant_fp8(x, group_size, 1e-12)
-            out, scale, _, _, _ = per_tensor_quant_mla_deep_gemm_masked_fp8(
+            out, scale, _, _, _ = per_token_group_quant_mla_deep_gemm_masked_fp8(
                 x, group_size
             )
             out = out[:, :num_tokens, :]
@@ -343,6 +344,7 @@ class TestW8A8BlockFP8Matmul(CustomTestCase):
         OUT_DTYPES = [torch.bfloat16]
         M = [64, 128, 512, 1024, 4096]
         NKs = [
+            (2112, 7168),
             (1536, 7168),
             (3072, 1536),
             (24576, 7168),
@@ -496,13 +498,17 @@ class TestW8A8BlockFP8FusedMoE(CustomTestCase):
         score = torch.randn((M, E), dtype=dtype)
 
         with torch.inference_mode():
+            topk_output = select_experts(
+                hidden_states=a,
+                router_logits=score,
+                top_k=topk,
+                renormalize=False,
+            )
             out = fused_moe(
                 a,
                 w1,
                 w2,
-                score,
-                topk,
-                renormalize=False,
+                topk_output,
                 use_fp8_w8a8=True,
                 w1_scale=w1_s,
                 w2_scale=w2_s,

@@ -15,7 +15,7 @@
 
 #include "utils.h"
 
-namespace vllm {
+namespace sglang {
 
 constexpr int kMaxBlocks = 36;
 // Counter may overflow, but it's fine since unsigned int overflow is
@@ -483,7 +483,7 @@ class CustomAllreduce {
 /**
  * To inspect PTX/SASS, copy paste this header file to compiler explorer and add
  a template instantiation:
- * template void vllm::CustomAllreduce::allreduce<half>(cudaStream_t, half *,
+ * template void sglang::CustomAllreduce::allreduce<half>(cudaStream_t, half *,
  half *, int, int, int);
 */
-}  // namespace vllm
+}  // namespace sglang

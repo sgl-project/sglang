@@ -919,7 +919,7 @@ def _fwd_kernel(
 
         e_max = n_e_max
 
-    # stage 2: compute the trianlge part
+    # stage 2: compute the triangle part
 
     cur_block_m_end = tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     for start_n in range(0, cur_block_m_end, BLOCK_N):

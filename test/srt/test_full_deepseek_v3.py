@@ -10,6 +10,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
@@ -35,7 +36,9 @@ class TestDeepseekV3(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_gsm8k(self):
+    def test_a_gsm8k(
+        self,
+    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
         args = SimpleNamespace(
             num_shots=8,
             data_path=None,
@@ -64,7 +67,10 @@ class TestDeepseekV3(CustomTestCase):
             write_github_step_summary(
                 f"### test_bs_1_speed (deepseek-v3)\n" f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(speed, 75)
+            if is_in_amd_ci():
+                self.assertGreater(speed, 12)
+            else:
+                self.assertGreater(speed, 75)
 
 
 class TestDeepseekV3MTP(CustomTestCase):
@@ -78,17 +84,15 @@ class TestDeepseekV3MTP(CustomTestCase):
             "--trust-remote-code",
             "--speculative-algorithm",
             "EAGLE",
-            "--speculative-draft",
-            "lmsys/DeepSeek-V3-0324-NextN",
             "--speculative-num-steps",
             "3",
             "--speculative-eagle-topk",
-            "2",
+            "1",
             "--speculative-num-draft-tokens",
             "4",
-            "--mem-fraction-static",
-            "0.7",
         ]
+        if not is_in_amd_ci():
+            other_args += ["--mem-frac", "0.7"]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -100,7 +104,9 @@ class TestDeepseekV3MTP(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_gsm8k(self):
+    def test_a_gsm8k(
+        self,
+    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
@@ -116,7 +122,9 @@ class TestDeepseekV3MTP(CustomTestCase):
         print(f"{metrics=}")
 
         server_info = requests.get(self.base_url + "/get_server_info")
-        avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
+        avg_spec_accept_length = server_info.json()["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
         print(f"{avg_spec_accept_length=}")
 
         if is_in_ci():
@@ -140,8 +148,14 @@ class TestDeepseekV3MTP(CustomTestCase):
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(acc_length, 2.9)
-            self.assertGreater(speed, 105)
+            if is_in_amd_ci():
+                self.assertGreater(acc_length, 2.8)
+            else:
+                self.assertGreater(acc_length, 2.9)
+            if is_in_amd_ci():
+                self.assertGreater(speed, 15)
+            else:
+                self.assertGreater(speed, 130)
 
 
 if __name__ == "__main__":

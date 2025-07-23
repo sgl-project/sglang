@@ -23,15 +23,17 @@ import triton.language as tl
 from torch import nn
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather,
     dp_gather_replicate,
     dp_scatter,
     get_attention_dp_rank,
     get_attention_dp_size,
+    get_attention_tp_size,
+    get_local_attention_dp_size,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -40,7 +42,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import dump_to_file
+from sglang.srt.utils import dump_to_file, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
@@ -198,12 +200,20 @@ class LogitsProcessor(nn.Module):
         super().__init__()
         self.config = config
         self.logit_scale = logit_scale
-        self.do_tensor_parallel_all_gather = (
-            not skip_all_gather and get_tensor_model_parallel_world_size() > 1
-        )
-        self.do_tensor_parallel_all_gather_dp_attn = (
-            self.do_tensor_parallel_all_gather and get_attention_dp_size() != 1
-        )
+        self.use_attn_tp_group = global_server_args_dict["enable_dp_lm_head"]
+        if self.use_attn_tp_group:
+            self.attn_tp_size = get_attention_tp_size()
+            self.do_tensor_parallel_all_gather = (
+                not skip_all_gather and self.attn_tp_size > 1
+            )
+            self.do_tensor_parallel_all_gather_dp_attn = False
+        else:
+            self.do_tensor_parallel_all_gather = (
+                not skip_all_gather and get_tensor_model_parallel_world_size() > 1
+            )
+            self.do_tensor_parallel_all_gather_dp_attn = (
+                self.do_tensor_parallel_all_gather and get_attention_dp_size() != 1
+            )
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -315,7 +325,8 @@ class LogitsProcessor(nn.Module):
 
         if self.debug_tensor_dump_output_folder:
             assert (
-                not self.do_tensor_parallel_all_gather or get_attention_dp_size() == 1
+                not self.do_tensor_parallel_all_gather
+                or get_local_attention_dp_size() == 1
             ), "dp attention + sharded lm_head doesn't support full logits"
             full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
             dump_to_file(self.debug_tensor_dump_output_folder, "logits", full_logits)
@@ -425,24 +436,45 @@ class LogitsProcessor(nn.Module):
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits_metadata.compute_dp_attention_metadata(hidden_states)
             hidden_states, local_hidden_states = (
-                logits_metadata.gathered_buffer,
-                hidden_states.clone(),
+                torch.empty_like(logits_metadata.gathered_buffer),
+                hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
         if hasattr(lm_head, "weight"):
-            logits = torch.matmul(
-                hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-            )
+            if use_intel_amx_backend(lm_head):
+                logits = torch.ops.sgl_kernel.weight_packed_linear(
+                    hidden_states.to(lm_head.weight.dtype),
+                    lm_head.weight,
+                    None,  # bias
+                    True,  # is_vnni
+                )
+            else:
+                logits = torch.matmul(
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                )
         else:
             # GGUF models
+            # TODO: use weight_packed_linear for GGUF models
             logits = lm_head.quant_method.apply(lm_head, hidden_states, embedding_bias)
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
         if self.do_tensor_parallel_all_gather:
-            logits = tensor_model_parallel_all_gather(logits)
+            if self.use_attn_tp_group:
+                global_logits = torch.empty(
+                    (self.config.vocab_size, logits.shape[0]),
+                    device=logits.device,
+                    dtype=logits.dtype,
+                )
+                global_logits = global_logits.T
+                attn_tp_all_gather(
+                    list(global_logits.tensor_split(self.attn_tp_size, dim=-1)), logits
+                )
+                logits = global_logits
+            else:
+                logits = tensor_model_parallel_all_gather(logits)
 
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits, global_logits = (

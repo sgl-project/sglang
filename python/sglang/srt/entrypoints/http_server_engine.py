@@ -1,4 +1,3 @@
-import base64
 import copy
 import dataclasses
 import multiprocessing
@@ -7,6 +6,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import pybase64
 import requests
 import torch
 import torch.distributed as dist
@@ -24,10 +24,10 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 
     base_url = server_args.url()
     timeout = 300.0  # Increased timeout to 5 minutes for downloading large models
-    start_time = time.time()
+    start_time = time.perf_counter()
 
     with requests.Session() as session:
-        while time.time() - start_time < timeout:
+        while time.perf_counter() - start_time < timeout:
             try:
                 headers = {
                     "Content-Type": "application/json; charset=utf-8",
@@ -64,11 +64,9 @@ class HttpServerEngineAdapter(EngineBase):
 
     def _make_request(self, endpoint: str, payload: Optional[dict] = None):
         """Make a POST request to the specified endpoint with the given payload.
-
         Args:
             endpoint: The API endpoint to call
             payload: The JSON payload to send (default: empty dict)
-
         Returns:
             The JSON response from the server
         """
@@ -85,7 +83,6 @@ class HttpServerEngineAdapter(EngineBase):
     ):
         """
         Update model weights from tensor data. The HTTP server will only post meta data, and the real weights will be copied directly from GPUs.
-
         Note: The model should be on GPUs rather than CPU for this functionality to work properly.
         If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
         """
@@ -140,3 +137,6 @@ class HttpServerEngineAdapter(EngineBase):
 
     def resume_memory_occupation(self):
         return self._make_request("resume_memory_occupation")
+
+    def flush_cache(self):
+        return self._make_request("flush_cache")

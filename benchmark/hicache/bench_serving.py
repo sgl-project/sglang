@@ -267,7 +267,7 @@ async def get_requests(
         try:
             request = await asyncio.wait_for(
                 input_requests_queue.get(), timeout=300
-            )  # Wait for 5 minites then abort
+            )  # Wait for 5 minutes then abort
         except Exception as e:
             print(f"exception: {e}")
             break
@@ -514,7 +514,7 @@ async def benchmark(
     print("{:<40} {:<10}".format("Traffic request rate:", request_rate))
     print(
         "{:<40} {:<10}".format(
-            "Max reqeuest concurrency:",
+            "Max request concurrency:",
             max_concurrency if max_concurrency else "not set",
         )
     )

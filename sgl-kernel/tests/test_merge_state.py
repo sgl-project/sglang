@@ -136,3 +136,7 @@ def test_merge_state(seq_len, num_heads, head_dim):
 
     assert torch.allclose(v_merged, v_merged_std, atol=1e-2)
     assert torch.allclose(s_merged, s_merged_std, atol=1e-2)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])

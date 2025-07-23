@@ -84,14 +84,14 @@ def main(args):
     #####################################
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     states = few_shot_gsm8k.run_batch(
         arguments,
         temperature=0,
         num_threads=args.parallel,
         progress_bar=True,
     )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     preds = []
     for i in range(len(states)):

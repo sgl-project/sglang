@@ -107,7 +107,7 @@ def main(args):
     backend = select_sglang_backend(args)
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     states = tree_search.run_batch(
         arguments,
         temperature=0,
@@ -115,7 +115,7 @@ def main(args):
         num_threads=args.parallel,
         progress_bar=True,
     )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
     answers_text = []
     for s in states:
         answers_text.append([x for xs in s["answer"] for x in xs])

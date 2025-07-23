@@ -9,20 +9,14 @@ import torch
 from torch.nn import functional as F
 
 from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.topk import TopKOutput
 
 
 def fused_moe_forward_native(
     layer: torch.nn.Module,
     x: torch.Tensor,
-    use_grouped_topk: bool,
-    top_k: int,
-    router_logits: torch.Tensor,
-    renormalize: bool,
-    topk_group: Optional[int] = None,
-    num_expert_group: Optional[int] = None,
-    custom_routing_function: Optional[Callable] = None,
-    correction_bias: Optional[torch.Tensor] = None,
+    topk_output: TopKOutput,
+    *,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     inplace: bool = True,
@@ -33,19 +27,7 @@ def fused_moe_forward_native(
     if apply_router_weight_on_input:
         raise NotImplementedError()
 
-    topk_weights, topk_ids = select_experts(
-        hidden_states=x,
-        router_logits=router_logits,
-        use_grouped_topk=use_grouped_topk,
-        top_k=top_k,
-        renormalize=renormalize,
-        topk_group=topk_group,
-        num_expert_group=num_expert_group,
-        custom_routing_function=custom_routing_function,
-        correction_bias=correction_bias,
-        routed_scaling_factor=routed_scaling_factor,
-        torch_native=True,
-    )
+    topk_weights, topk_ids, _ = topk_output
 
     w13_weights = layer.w13_weight[topk_ids]
     w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
@@ -65,30 +47,19 @@ def fused_moe_forward_native(
 def moe_forward_native(
     layer: torch.nn.Module,
     x: torch.Tensor,
-    use_grouped_topk: bool,
-    top_k: int,
-    router_logits: torch.Tensor,
-    renormalize: bool,
-    topk_group: Optional[int] = None,
-    num_expert_group: Optional[int] = None,
-    custom_routing_function: Optional[Callable] = None,
-    correction_bias: Optional[torch.Tensor] = None,
+    topk_output: TopKOutput,
+    *,
     activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
+    inplace: bool = True,
+    no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
-    topk_weights, topk_ids = select_experts(
-        hidden_states=x,
-        router_logits=router_logits,
-        use_grouped_topk=use_grouped_topk,
-        top_k=top_k,
-        renormalize=renormalize,
-        topk_group=topk_group,
-        num_expert_group=num_expert_group,
-        custom_routing_function=custom_routing_function,
-        correction_bias=correction_bias,
-        torch_native=True,
-        routed_scaling_factor=routed_scaling_factor,
-    )
+
+    if apply_router_weight_on_input:
+        raise NotImplementedError()
+
+    topk_weights, topk_ids, _ = topk_output
 
     # Ref code from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/e0828e3cc0a03408724b80c3cc92c8e072db8d01/modeling_deepseek.py#L589
     len_experts = layer.num_experts

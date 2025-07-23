@@ -22,9 +22,11 @@ def _per_token_quant_int8(
     x_ptr,
     xq_ptr,
     scale_ptr,
+    x_sum_ptr,
     stride_x,
     stride_xq,
     N,
+    CAL_SUM: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     # Adapted from https://github.com/InternLM/lmdeploy/blob/086481ed84b59bee3b8e4274e5fc69620040c048/lmdeploy/pytorch/kernels/cuda/w8a8_triton_kernels.py#L282
@@ -38,16 +40,23 @@ def _per_token_quant_int8(
     scale_x = absmax / 127
     x_q = x * (127 / absmax)
     x_q = tl.extra.cuda.libdevice.round(x_q).to(tl.int8)
+    if CAL_SUM:
+        x_sum = tl.sum(x, axis=0)
+        tl.store(x_sum_ptr + row_id, x_sum.to(x_sum_ptr.dtype.element_ty))
 
     tl.store(xq_ptr + row_id * stride_xq + cols, x_q, mask=mask)
-    tl.store(scale_ptr + row_id, scale_x)
+    tl.store(scale_ptr + row_id, scale_x.to(scale_ptr.dtype.element_ty))
 
 
-def per_token_quant_int8(x):
+def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]
     x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)
-    scales = torch.empty(x.shape[:-1] + (1,), device=x.device, dtype=torch.float32)
+    scales = torch.empty(x.shape[:-1] + (1,), device=x.device, dtype=scale_dtype)
+    if cal_sum:
+        x_sum = torch.empty(x.shape[:-1], device=x.device, dtype=x.dtype)
+    else:
+        x_sum = None
     BLOCK = triton.next_power_of_2(N)
     # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
@@ -57,15 +66,19 @@ def per_token_quant_int8(x):
         x,
         x_q,
         scales,
+        x_sum,
         stride_x=x.stride(-2),
         stride_xq=x_q.stride(-2),
         N=N,
+        CAL_SUM=cal_sum,
         BLOCK=BLOCK,
         num_warps=num_warps,
         num_stages=1,
     )
-
-    return x_q, scales
+    if cal_sum:
+        return x_q, scales, x_sum
+    else:
+        return x_q, scales
 
 
 @triton.jit
@@ -76,7 +89,7 @@ def _per_token_group_quant_int8(
     y_s_ptr,
     # Stride of input
     y_stride,
-    # Collums of input
+    # Columns of input
     N,
     # Avoid to divide zero
     eps,
@@ -370,7 +383,7 @@ def w8a8_block_int8_matmul(
         config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
     else:
         # Default config
-        # Block-wise quant: BLOCK_SIZE_K must be divisable by block_size[1]
+        # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
         config = {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": block_size[0],

@@ -162,14 +162,15 @@ async def benchmark(
         raise ValueError(f"Unknown backend: {backend}")
 
     print("Starting initial single prompt test run...")
-    test_prompt, test_prompt_len, test_output_len = input_requests[0]
+    test_request = input_requests[0]
     test_input = RequestFuncInput(
         model=model_id,
-        prompt=test_prompt,
+        prompt=test_request.prompt,
         api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=test_output_len,
+        prompt_len=test_request.prompt_len,
+        output_len=test_request.output_len,
         lora_name="dummy",  # the lora_name argument will not be used
+        image_data=None,
         extra_request_body=extra_request_body,
     )
     test_output = await request_func(request_func_input=test_input)
@@ -186,14 +187,14 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate):
-        prompt, prompt_len, output_len = request
         request_func_input = RequestFuncInput(
             model=model_id,
-            prompt=prompt,
+            prompt=request.prompt,
             api_url=api_url,
-            prompt_len=prompt_len,
-            output_len=output_len,
+            prompt_len=request.prompt_len,
+            output_len=request.output_len,
             lora_name="dummy",
+            image_data=None,
             extra_request_body=extra_request_body,
         )
         tasks.append(

@@ -91,10 +91,10 @@ def launch_server_process(
 
 def wait_for_server_health(host: str, port: int, timeout: int = 300) -> bool:
     """Wait for server to be healthy by checking /health endpoint."""
-    start_time = time.time()
+    start_time = time.perf_counter()
     url = f"http://{host}:{port}/health"
 
-    while time.time() - start_time < timeout:
+    while time.perf_counter() - start_time < timeout:
         try:
             response = requests.get(url, timeout=5)
             if response.status_code == 200:

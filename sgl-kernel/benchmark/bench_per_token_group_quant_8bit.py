@@ -20,7 +20,7 @@ def _per_token_group_quant_8bit(
     y_s_ptr,
     # Stride of input
     y_stride,
-    # Collums of input
+    # Columns of input
     N,
     # Avoid to divide zero
     eps,

@@ -175,7 +175,7 @@ def bench_character(args):
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 
-    tic = time.time()
+    tic = time.perf_counter()
 
     if args.backend != "lmql":
         if args.parallel == 1:
@@ -202,7 +202,7 @@ def bench_character(args):
                 asyncio.gather(*[get_one_answer_async(i) for i in bt])
             )
 
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     return states, latency
 
@@ -236,7 +236,7 @@ def bench_city_doc(args):
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 
-    tic = time.time()
+    tic = time.perf_counter()
     if args.parallel == 1:
         for i in tqdm(range(len(arguments))):
             get_one_answer(i)
@@ -246,7 +246,7 @@ def bench_city_doc(args):
             for _ in rets:
                 pass
 
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     return states, latency
 

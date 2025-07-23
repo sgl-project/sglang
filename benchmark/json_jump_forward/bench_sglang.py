@@ -67,14 +67,14 @@ def bench_city_doc(args):
     sgl.set_default_backend(backend)
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     states = city_gen.run_batch(
         arguments,
         temperature=0,
         num_threads=args.parallel,
         progress_bar=True,
     )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     return states, latency
 
@@ -91,14 +91,14 @@ def bench_character(args):
     sgl.set_default_backend(backend)
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     states = character_gen.run_batch(
         arguments,
         temperature=0,
         num_threads=args.parallel,
         progress_bar=True,
     )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     return states, latency
 

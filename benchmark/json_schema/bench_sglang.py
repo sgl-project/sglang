@@ -85,17 +85,17 @@ def bench_schema(args):
     sgl.set_default_backend(backend)
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     states = schema_gen.run_batch(
         arguments,
         temperature=0,
         num_threads=args.parallel,
         progress_bar=True,
     )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Check if the outputs are valid
-    indexs = []
+    indexes = []
     for i, state in enumerate(states):
         try:
             schema = json.loads(arguments[i]["json_schema"])
@@ -103,7 +103,7 @@ def bench_schema(args):
             assert jsonschema.validate(obj, schema) is None
         except Exception as e:
             print(e)
-            indexs.append(i)
+            indexes.append(i)
 
     return states, latency
 

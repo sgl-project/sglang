@@ -19,17 +19,12 @@ from sglang.test.test_utils import (
 
 # VLM models for testing
 MODELS = [
-    SimpleNamespace(
-        model="google/gemma-3-27b-it", chat_template="gemma-it", mmmu_accuracy=0.45
-    ),
+    SimpleNamespace(model="google/gemma-3-27b-it", mmmu_accuracy=0.45),
     SimpleNamespace(
         model="Qwen/Qwen2.5-VL-3B-Instruct",
-        chat_template="qwen2-vl",
         mmmu_accuracy=0.4,
     ),
-    SimpleNamespace(
-        model="openbmb/MiniCPM-V-2_6", chat_template="minicpmv", mmmu_accuracy=0.4
-    ),
+    SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),
 ]
 
 
@@ -50,7 +45,6 @@ class TestVLMModels(CustomTestCase):
     def run_mmmu_eval(
         self,
         model_version: str,
-        chat_template: str,
         output_path: str,
         *,
         env: dict | None = None,
@@ -69,11 +63,7 @@ class TestVLMModels(CustomTestCase):
         os.makedirs(output_path, exist_ok=True)
 
         # -------- compose --model_args --------
-        model_args = (
-            f'model_version="{model_version}",'
-            f'chat_template="{chat_template}",'
-            f"tp={tp}"
-        )
+        model_args = f'model_version="{model_version}",' f"tp={tp}"
 
         # -------- build command list --------
         cmd = [
@@ -122,8 +112,6 @@ class TestVLMModels(CustomTestCase):
                     timeout=self.time_out,
                     api_key=self.api_key,
                     other_args=[
-                        "--chat-template",
-                        model.chat_template,
                         "--trust-remote-code",
                         "--cuda-graph-max-bs",
                         "32",
@@ -134,7 +122,7 @@ class TestVLMModels(CustomTestCase):
                 )
 
                 # Run evaluation
-                self.run_mmmu_eval(model.model, model.chat_template, "./logs")
+                self.run_mmmu_eval(model.model, "./logs")
 
                 # Get the result file
                 result_file_path = glob.glob("./logs/*.json")[0]

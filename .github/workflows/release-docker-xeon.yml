@@ -1,0 +1,35 @@
+name: Release Docker Images
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "python/sglang/version.py"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-24.04
+    environment: 'prod'
+    strategy:
+      matrix:
+        build_type: ['all']
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push
+        run: |
+          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          tag=v${version}-xeon
+
+          docker build . -f docker/Dockerfile.xeon  -t lmsysorg/sglang:${tag} --no-cache
+          docker push lmsysorg/sglang:${tag}

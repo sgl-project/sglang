@@ -28,6 +28,7 @@ from llguidance.torch import (
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
+    INVALID_GRAMMAR_OBJ,
     BaseGrammarBackend,
     BaseGrammarObject,
 )
@@ -49,21 +50,6 @@ class GuidanceGrammar(BaseGrammarObject):
         )
         self.finished = False
         self.bitmask = None
-
-    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
-        ff_tokens = self.ll_matcher.compute_ff_tokens()
-        if ff_tokens:
-            return ff_tokens, ""
-        else:
-            return None
-
-    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
-        return "", -1
-
-    def jump_and_retokenize(
-        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
-    ):
-        pass
 
     def accept_token(self, token: int):
         if not self.ll_matcher.consume_token(token):
@@ -104,6 +90,21 @@ class GuidanceGrammar(BaseGrammarObject):
             serialized_grammar=self.serialized_grammar,
         )
 
+    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
+        ff_tokens = self.ll_matcher.compute_ff_tokens()
+        if ff_tokens:
+            return ff_tokens, ""
+        else:
+            return None
+
+    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
+        return "", -1
+
+    def jump_and_retokenize(
+        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
+    ):
+        pass
+
 
 class GuidanceBackend(BaseGrammarBackend):
 
@@ -126,16 +127,20 @@ class GuidanceBackend(BaseGrammarBackend):
                 serialized_grammar=serialized_grammar,
             )
         except Exception as e:
-            logger.warning(f"Skip invalid grammar: {serialized_grammar}, {e=}")
-            return None
+            logger.error(f"Hit invalid grammar: {serialized_grammar=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
 
     def dispatch_json(self, key_string: str) -> Optional[GuidanceGrammar]:
-        serialized_grammar = LLMatcher.grammar_from_json_schema(
-            key_string,
-            defaults={
-                "whitespace_pattern": self.whitespace_pattern,
-            },
-        )
+        try:
+            serialized_grammar = LLMatcher.grammar_from_json_schema(
+                key_string,
+                defaults={
+                    "whitespace_pattern": self.whitespace_pattern,
+                },
+            )
+        except Exception as e:
+            logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
         return self._from_serialized(serialized_grammar)
 
     def dispatch_regex(self, key_string: str) -> Optional[GuidanceGrammar]:
@@ -147,8 +152,8 @@ class GuidanceBackend(BaseGrammarBackend):
             serialized_grammar = grammar_from("ebnf", key_string)
             return self._from_serialized(serialized_grammar)
         except ValueError as e:
-            logger.warning(f"Skip invalid ebnf: regex={key_string}, {e=}")
-            return None
+            logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
 
     def dispatch_structural_tag(self, key_string: str) -> Optional[GuidanceGrammar]:
         try:
@@ -165,5 +170,5 @@ class GuidanceBackend(BaseGrammarBackend):
             g = StructTag.to_grammar(tags)
             return self._from_serialized(g)
         except Exception as e:
-            logging.warning(f"Skip invalid structural_tag: {key_string}, {e=}")
-            return None
+            logging.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
+            return INVALID_GRAMMAR_OBJ

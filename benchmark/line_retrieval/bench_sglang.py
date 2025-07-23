@@ -70,7 +70,7 @@ def eval_model(args, line_obj, num_hoops, src_indices, dst_percents):
     # Select backend
     backend = select_sglang_backend(args)
 
-    tic = time.time()
+    tic = time.perf_counter()
     states = line_retrieval.run_batch(
         arguments,
         temperature=0,
@@ -78,7 +78,7 @@ def eval_model(args, line_obj, num_hoops, src_indices, dst_percents):
         num_threads=args.parallel,
         progress_bar=True,
     )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     corrects = []
     for i in range(len(arguments)):

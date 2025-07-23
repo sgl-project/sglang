@@ -13,13 +13,17 @@
 # limitations under the License.
 # ==============================================================================
 
+import os
+import platform
 import sys
 from pathlib import Path
 
+import torch
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
+arch = platform.machine().lower()
 
 
 def _get_version():
@@ -45,7 +49,24 @@ sources = [
 
 cxx_flags = ["-O3"]
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
-extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
+extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
+
+default_target = "gfx942"
+amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)
+
+if torch.cuda.is_available():
+    try:
+        amdgpu_target = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    except Exception as e:
+        print(f"Warning: Failed to detect GPU properties: {e}")
+else:
+    print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
+
+if amdgpu_target not in ["gfx942", "gfx950"]:
+    print(
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
+    )
+    sys.exit(1)
 
 hipcc_flags = [
     "-DNDEBUG",
@@ -55,7 +76,7 @@ hipcc_flags = [
     "-fPIC",
     "-std=c++17",
     "-D__HIP_PLATFORM_AMD__=1",
-    "--amdgpu-target=gfx942",
+    f"--amdgpu-target={amdgpu_target}",
     "-DENABLE_BF16",
     "-DENABLE_FP8",
 ]

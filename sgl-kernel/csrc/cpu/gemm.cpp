@@ -318,8 +318,8 @@ void weight_packed_linear_kernel_impl(
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
 
-  // use avx512-bf16 when a) M is small; b) dtype is bfloat16, otherwise use amx
-  const bool use_brgemm = (M > 4) || (!std::is_same_v<scalar_t, at::BFloat16>);
+  // use avx512-bf16 when a) M is small; b) dtype is bfloat16, otherwise use amx c) N is small
+  const bool use_brgemm = (M > 4) || (!std::is_same_v<scalar_t, at::BFloat16>) || (N < 64);
 
   // parallel on [MB, NB]
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
@@ -424,7 +424,8 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
   const int64_t stride = OC * IC;
 
   TORCH_CHECK(
-      st == at::kBFloat16 || st == at::kHalf || st == at::kChar, "expect weight to be bfloat16, float16 or int8.");
+      st == at::kBFloat16 || st == at::kHalf || st == at::kChar || st == at::kFloat8_e4m3fn,
+      "expect weight to be bfloat16, float16, int8 or fp8_e4m3.");
 
   CPU_DISPATCH_PACKED_TYPES(st, [&] {
     // adjust most inner dimension size
@@ -462,7 +463,8 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
 // bias : [N]
 // out  : [M, N]
 //
-at::Tensor weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, std::optional<at::Tensor>& bias, bool is_vnni) {
+at::Tensor
+weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni) {
   RECORD_FUNCTION("sgl-kernel::weight_packed_linear", std::vector<c10::IValue>({mat1, mat2, bias}));
 
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);

@@ -41,7 +41,7 @@ def main(args):
     sgl.set_default_backend(backend)
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     if args.parallel == 1:
         for i in tqdm.tqdm(range(len(lines))):
             image_file = arguments[i]["image_file"]
@@ -52,7 +52,7 @@ def main(args):
         states = image_qa.run_batch(
             arguments, temperature=0, num_threads=args.parallel, progress_bar=True
         )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     print(f"Latency: {latency:.3f}")
 

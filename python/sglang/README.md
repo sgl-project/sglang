@@ -1,5 +1,6 @@
 # Code Structures
 
+- `eval`: The evaluation utilities.
 - `lang`: The frontend language.
 - `srt`: The backend engine for running local models. (SRT = SGLang Runtime).
 - `test`: The test utilities.
@@ -11,6 +12,5 @@
 - `check_env.py`: Check the environment variables and dependencies.
 - `global_config.py`: The global configs and constants.
 - `launch_server.py`: The entry point for launching the local server.
-- `llama3_eval.py`: Evaluation of Llama 3 using the Meta Llama dataset.
 - `utils.py`: Common utilities.
 - `version.py`: Version info.

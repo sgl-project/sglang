@@ -1,6 +1,7 @@
 #pragma once
-
 #include <ATen/native/CPUBlas.h>
+
+#include "common.h"
 
 // amx-bf16
 #define TILE_M 16
@@ -30,6 +31,11 @@ inline bool can_use_brgemm<at::Half>(int M) {
 template <>
 inline bool can_use_brgemm<int8_t>(int M) {
   return false;
+}
+
+template <>
+inline bool can_use_brgemm<at::Float8_e4m3fn>(int M) {
+  return M > 4;
 }
 
 // work around compiler internal error
@@ -79,7 +85,35 @@ void fused_experts_int8_kernel_impl(
     int64_t topk,
     int64_t num_tokens_post_pad);
 
-// shared expert implememntation for int8 w8a8
+// moe implementations for fp8 w8a16
+template <typename scalar_t>
+void fused_experts_fp8_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic0,
+    scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ ic2,
+    scalar_t* __restrict__ A_tmp,
+    scalar_t* __restrict__ B_tmp,
+    float* __restrict__ C_tmp,
+    const scalar_t* __restrict__ input,
+    const at::Float8_e4m3fn* __restrict__ packed_w1,
+    const at::Float8_e4m3fn* __restrict__ packed_w2,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
+    int64_t block_size_N,
+    int64_t block_size_K,
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ offsets,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t E,
+    int64_t topk,
+    int64_t num_tokens_post_pad);
+
+// shared expert implementation for int8 w8a8
 template <typename scalar_t>
 void shared_expert_int8_kernel_impl(
     scalar_t* __restrict__ output,
@@ -92,6 +126,26 @@ void shared_expert_int8_kernel_impl(
     const int8_t* __restrict__ packed_w2,
     const float* __restrict__ w1s,
     const float* __restrict__ w2s,
+    const scalar_t* __restrict__ fused_experts_out,
+    float routed_scaling_factor,
+    int64_t M,
+    int64_t N,
+    int64_t K);
+
+template <typename scalar_t>
+void shared_expert_fp8_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic0,
+    scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ B_tmp,
+    float* __restrict__ C_tmp,
+    const scalar_t* __restrict__ input,
+    const at::Float8_e4m3fn* __restrict__ packed_w1,
+    const at::Float8_e4m3fn* __restrict__ packed_w2,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
+    int64_t block_size_N,
+    int64_t block_size_K,
     const scalar_t* __restrict__ fused_experts_out,
     float routed_scaling_factor,
     int64_t M,
@@ -128,3 +182,20 @@ void tinygemm_kernel(
     int64_t ldb,
     int64_t ldc,
     bool brg);
+
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const at::Float8_e4m3fn* __restrict__ B,
+    scalar_t* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    float* __restrict__ Ctmp,
+    const float* __restrict__ scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg,
+    int64_t block_size_K);

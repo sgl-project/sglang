@@ -24,9 +24,12 @@
 #include <cuda_runtime.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
-// clang-format on
 
-#if defined CUDA_VERSION && CUDA_VERSION >= 12040
+#if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
+void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt) {
+  TORCH_CHECK(false, "CUDA version must be >= 12.4 for ApplyTokenBitmaskInplace");
+}
+#else
 
 #ifndef CUDART_INF_FP16
 #define CUDART_INF_FP16 __ushort_as_half((unsigned short)0x7C00U)
@@ -252,3 +255,4 @@ void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optiona
   }
 }
 #endif
+// clang-format on
