@@ -125,7 +125,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             }
         ]
 
-        messages = [{"role": "user", "content": "What is the temperature in Paris?"}]
+        messages = [{"role": "user", "content": "What is the temperature in Paris in celsius?"}]
 
         response_stream = client.chat.completions.create(
             model=self.model,
@@ -591,6 +591,39 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
             f"Function name '{found_names}' should container either 'get_weather' or 'get_tourist_attractions'",
         )
 
+
+class TestGLM45ServerFunctionCalling(TestOpenAIServerFunctionCalling):
+    @classmethod
+    def setUpClass(cls):
+        # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = "ZP2HF/GLM-4.5-Air-Test"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+
+        # Start the local OpenAI Server. If necessary, you can add other parameters such as --enable-tools.
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                # If your server needs extra parameters to test function calling, please add them here.
+                "--tool-call-parser",
+                "glm45",
+                "--reasoning-parser",
+                "glm45",
+                "--tp-size",
+                "8"
+            ],
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    def test_function_call_specific(self):
+        pass
+
+    def test_function_call_required(self):
+        pass
 
 if __name__ == "__main__":
     unittest.main()
