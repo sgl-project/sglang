@@ -247,7 +247,7 @@ class Scheduler(
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
-        self.lora_paths = server_args.lora_paths
+        self.enable_lora = server_args.enable_lora
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -1706,13 +1706,13 @@ class Scheduler(
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
-        if self.lora_paths:
+        if self.enable_lora:
             lora_set = set([req.lora_path for req in self.running_batch.reqs])
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if (
-                self.lora_paths
+                self.enable_lora
                 and len(
                     lora_set
                     | set([req.lora_path for req in adder.can_run_list])
@@ -2466,12 +2466,6 @@ class Scheduler(
         """In-place loading a new lora adapter from disk or huggingface."""
 
         result = self.tp_worker.load_lora_adapter(recv_req)
-
-        if result.success:
-            flush_cache_success = self.flush_cache()
-            assert flush_cache_success, "Cache flush failed after loading lora adapter."
-        else:
-            logger.error(result.error_message)
         return result
 
     def unload_lora_adapter(
@@ -2480,14 +2474,6 @@ class Scheduler(
         """Unload the lora adapter."""
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
-
-        if result.success:
-            flush_cache_success = self.flush_cache()
-            assert (
-                flush_cache_success
-            ), "Cache flush failed after unloading LoRA weights"
-        else:
-            logger.error(result.error_message)
         return result
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
