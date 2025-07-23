@@ -106,6 +106,20 @@ def adjust_scalar_to_fused_array(param, loaded_weight, shard_id):
     return param[shard_id], loaded_weight
 
 
+def adjust_shard_offsets(shard_offsets, loaded_weight, dim):
+    actual_weight_size = loaded_weight.size(dim)
+    target_weight_size = shard_offsets[-1][-1] + shard_offsets[-1][-2]
+    if actual_weight_size != target_weight_size:
+        new_shard_offsets = []
+        new_offset = 0
+        for shard_id, shard_offset, shard_size in shard_offsets:
+            actual_shard_size = actual_weight_size * shard_size // target_weight_size
+            new_shard_offsets.append((shard_id, new_offset, actual_shard_size))
+            new_offset += actual_shard_size
+        return new_shard_offsets
+    return shard_offsets
+
+
 class LinearBase(torch.nn.Module):
     """Base linear layer.
 
@@ -532,8 +546,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
             if _is_cpu:
-                from sglang.srt.model_loader.weight_utils import adjust_shard_offsets
-
                 shard_offsets = adjust_shard_offsets(
                     shard_offsets, loaded_weight, output_dim
                 )
@@ -981,8 +993,6 @@ class QKVParallelLinear(ColumnParallelLinear):
 
             packed_dim = getattr(param, "packed_dim", None)
             if _is_cpu:
-                from sglang.srt.model_loader.weight_utils import adjust_shard_offsets
-
                 shard_offsets = adjust_shard_offsets(
                     shard_offsets, loaded_weight, output_dim
                 )

@@ -980,20 +980,6 @@ def reset_param_data_if_needed(param_data, dim, start, length):
     return
 
 
-def adjust_shard_offsets(shard_offsets, loaded_weight, dim):
-    actual_weight_size = loaded_weight.size(dim)
-    target_weight_size = shard_offsets[-1][-1] + shard_offsets[-1][-2]
-    if actual_weight_size != target_weight_size:
-        new_shard_offsets = []
-        new_offset = 0
-        for shard_id, shard_offset, shard_size in shard_offsets:
-            actual_shard_size = actual_weight_size * shard_size // target_weight_size
-            new_shard_offsets.append((shard_id, new_offset, actual_shard_size))
-            new_offset += actual_shard_size
-        return new_shard_offsets
-    return shard_offsets
-
-
 def narrow_padded_param_and_loaded_weight(
     param_data,
     loaded_weight,

@@ -49,21 +49,23 @@ def get_num_heads_padding_size(tp_size, weight_block_size):
 
 
 def update_intermediate_size(model_config, attr_name, intermediate_padding_size):
-    if hasattr(model_config, "hf_config"):
-        if hasattr(model_config.hf_config, attr_name):
-            attr_value = getattr(model_config.hf_config, attr_name)
-            if attr_value % intermediate_padding_size != 0:
-                from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
-
-                attr_value = pad_vocab_size(attr_value, intermediate_padding_size)
-                setattr(model_config.hf_config, attr_name, attr_value)
-                setattr(model_config.hf_text_config, attr_name, attr_value)
+    attr_value = intermediate_padding_size
+    if hasattr(model_config, "hf_config") and hasattr(
+        model_config.hf_config, attr_name
+    ):
+        attr_value = getattr(model_config.hf_config, attr_name)
     elif hasattr(model_config, attr_name):
         attr_value = getattr(model_config, attr_name)
-        if attr_value % intermediate_padding_size != 0:
-            from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
-            attr_value = pad_vocab_size(attr_value, intermediate_padding_size)
+    if attr_value % intermediate_padding_size != 0:
+        from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
+
+        attr_value = pad_vocab_size(attr_value, intermediate_padding_size)
+        if hasattr(model_config, "hf_config"):
+            setattr(model_config.hf_config, attr_name, attr_value)
+            if hasattr(model_config, "hf_text_config"):
+                setattr(model_config.hf_text_config, attr_name, attr_value)
+        else:
             setattr(model_config, attr_name, attr_value)
 
     return model_config

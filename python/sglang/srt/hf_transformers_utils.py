@@ -122,6 +122,9 @@ def get_config(
         model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
     )
     if config.architectures[0] == "Phi4MMForCausalLM":
+        # Phi4MMForCausalLM uses a hard-coded vision_config. See:
+        # https://github.com/vllm-project/vllm/blob/6071e989df1531b59ef35568f83f7351afb0b51e/vllm/model_executor/models/phi4mm.py#L71
+        # We set it here to support cases where num_attention_heads is not divisible by the TP size.
         from transformers import SiglipVisionConfig
 
         vision_config = {
