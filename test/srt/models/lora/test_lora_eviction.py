@@ -72,7 +72,6 @@ class TestLoRAEviction(CustomTestCase):
             lora_paths=lora_paths,
             max_loras_per_batch=1,
             lora_backend=backend,
-            disable_radix_cache=True,
         ) as srt_runner:
             adapter_sequence = lora_paths if not reverse else lora_paths[::-1]
 
