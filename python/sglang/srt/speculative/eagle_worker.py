@@ -297,7 +297,7 @@ class EAGLEWorker(TpModelWorker):
 
     def forward_batch_speculative_generation(
         self, batch: ScheduleBatch
-    ) -> Tuple[LogitsProcessorOutput, List[int], int, int]:
+    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, int, bool]:
         """Run speculative decoding forward.
 
         NOTE: Many states of batch is modified as you go through. It is not guaranteed that
@@ -325,12 +325,15 @@ class EAGLEWorker(TpModelWorker):
                 self.verify(batch, spec_info)
             )
 
-            # NOTE: `check_forward_draft_extend_after_decode` is slow. Skip it for now.
-            # if self.check_forward_draft_extend_after_decode(batch):
-            #     with self.draft_tp_context(self.draft_model_runner.tp_group):
-            #         self.forward_draft_extend_after_decode(batch)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
-                self.forward_draft_extend_after_decode(batch)
+                # NOTE: We should use `check_forward_draft_extend_after_decode`
+                # when DP attention is enabled, but it is slow. Skip it for now.
+                if (
+                    not self.server_args.enable_dp_attention
+                    and batch.spec_info.verified_id.shape[0] > 0
+                ):
+                    # decode is not finished
+                    self.forward_draft_extend_after_decode(batch)
 
             return (
                 logits_output,
@@ -360,7 +363,7 @@ class EAGLEWorker(TpModelWorker):
 
     def forward_target_extend(
         self, batch: ScheduleBatch
-    ) -> Tuple[LogitsProcessorOutput, List[int], int]:
+    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, Optional[torch.Tensor]]:
         """Run the target extend.
 
         Args:
@@ -781,8 +784,8 @@ class EAGLEWorker(TpModelWorker):
         self,
         batch: ScheduleBatch,
         hidden_states: torch.Tensor,
-        next_token_ids: List[int],
-        seq_lens_cpu: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
     ):
         """Run draft model extend. This API modifies the states of the batch.
 
