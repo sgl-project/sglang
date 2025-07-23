@@ -9,6 +9,12 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+
+
 def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
     hasher = hashlib.sha256()
 
@@ -80,6 +86,9 @@ class HiCacheFile(HiCacheStorage):
 
     def __init__(self, file_path: str = "/tmp/hicache"):
         self.file_path = file_path
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+        self.tp_suffix = f"_{tp_rank}_{tp_size}" if tp_size > 1 else ""
         if not os.path.exists(self.file_path):
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
@@ -87,6 +96,7 @@ class HiCacheFile(HiCacheStorage):
     def get(
         self, key: str, target_location: Optional[torch.Tensor] = None
     ) -> torch.Tensor | None:
+        key += self.tp_suffix
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         try:
             # todo: fixing the target_location logic to enable in-place loading
@@ -112,6 +122,7 @@ class HiCacheFile(HiCacheStorage):
         ]
 
     def set(self, key: str, value: torch.Tensor) -> bool:
+        key += self.tp_suffix
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         if self.exists(key):
             logger.debug(f"Key {key} already exists. Skipped.")
@@ -130,10 +141,12 @@ class HiCacheFile(HiCacheStorage):
         return True
 
     def exists(self, key: str) -> bool:
+        key += self.tp_suffix
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         return os.path.exists(tensor_path)
 
     def delete(self, key: str) -> None:
+        key += self.tp_suffix
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         try:
             os.remove(tensor_path)
