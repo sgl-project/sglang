@@ -451,7 +451,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
-        self.shared_experts_weight_block_size = None
+        # self.shared_experts_weight_block_size = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = Glm4MoeMLP(
@@ -467,13 +467,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                     else {}
                 ),
             )
-            is_packed_weight = hasattr(
-                self.shared_experts.gate_up_proj.quant_method, "quant_config"
-            ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
-                "awq",
-                "awq_marlin",
-                "moe_wna16",
-            }
+            is_packed_weight = hasattr(self.shared_experts.gate_up_proj.quant_method, "quant_config")
             self.shared_experts_is_int8 = (
                 not is_packed_weight
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
@@ -482,14 +476,6 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                 not is_packed_weight
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
             )
-            if self.shared_experts_is_fp8:
-                assert (
-                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                    == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
-                )
-                self.shared_experts_weight_block_size = (
-                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                )
 
         self.top_k = config.num_experts_per_tok
 
