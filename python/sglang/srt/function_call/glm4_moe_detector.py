@@ -138,19 +138,9 @@ class Glm4MoeDetector(BaseFormatDetector):
         self._buffer = current_text[start:]
         return StreamingParseResult(normal_text=normal_text)
 
+    #TODO：Need Fix
     def structure_info(self) -> _GetInfoFunc:
-        return lambda name: StructureInfo(
-            begin=">" + name + "\n```json\n",
-            end="\n```<",
-            trigger=">" + name + "\n```json\n",
-        )
+        raise NotImplementedError()
 
     def build_ebnf(self, tools: List[Tool]):
-        return EBNFComposer.build_ebnf(
-            tools,
-            sequence_start_token=self.bot_token,
-            sequence_end_token=self.eot_token,
-            tool_call_separator="",
-            call_rule_fmt='"<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\\n```json\\n" {arguments_rule} "\\n```<｜tool▁call▁end｜>"',
-            function_format="json",
-        )
+        raise NotImplementedError()
