@@ -18,10 +18,13 @@ def biased_grouped_topk_org(scores, bias, num_expert_group, topk_group, topk):
         renormalize=True,
         num_expert_group=num_expert_group,
         topk_group=topk_group,
+        routed_scaling_factor=2.5,  # DeepSeek-R1 : 2.5, Kimi K2: 2.872
     )
 
 
-def biased_grouped_topk_org_kernel(scores, bias, num_expert_group, topk_group, topk):
+def biased_grouped_topk_org_fuse_kernel(
+    scores, bias, num_expert_group, topk_group, topk
+):
     return moe_fused_gate(scores, bias, num_expert_group, topk_group, topk)
 
 
@@ -60,7 +63,7 @@ def benchmark(seq_length, num_experts, num_expert_group, topk_group, topk, provi
         )
     elif provider == "kernel":
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: biased_grouped_topk_org_kernel(
+            lambda: biased_grouped_topk_org_fuse_kernel(
                 scores.clone(), bias.clone(), num_expert_group, topk_group, topk
             ),
             quantiles=quantiles,
