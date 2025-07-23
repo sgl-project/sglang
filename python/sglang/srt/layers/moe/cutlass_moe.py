@@ -228,7 +228,6 @@ def cutlass_moe_fp8(
     '''
     device = a.device
     num_experts, k_g, n_g = w.shape
-    problem_sizes = torch.zeros((num_experts, 3), device=device, dtype=torch.int32)
     layout_sfa = torch.zeros((num_experts, 5), device=device, dtype=torch.int32)
     layout_sfb = torch.zeros((num_experts, 5), device=device, dtype=torch.int32)
     a_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
@@ -239,11 +238,13 @@ def cutlass_moe_fp8(
     workspace = torch.empty((1024 * 1024 * 1024), device=device, dtype=torch.uint8)
     a_strides = torch.full((num_experts,), a.stride(0), device=device, dtype=torch.int64)
     c_strides = torch.full((num_experts,), c.stride(0), device=device, dtype=torch.int64)
-    
-    for expert in range(num_experts):
-        m_g = m_indices[expert]
-        problem_sizes[expert][:] = torch.tensor([m_g, n_g, k_g], device=device)
-    w_scale = w_scale.transpose(1, 2).contiguous()
+    m_tensor = m_indices[1:] - m_indices[:-1]
+    n_tensor = torch.full_like(m_tensor, fill_value=n_g)
+    k_tensor = torch.full_like(m_tensor, fill_value=k_g)
+    problem_sizes = torch.stack([m_tensor, n_tensor, k_tensor], dim=1)
+    # (E, K, N):(K*N, N, 1) -> (E, N, K):(N*K, 1, N) -> (E, N, K):(N*K, K, 1)
+    # w_scale = w_scale.transpose(1, 2).contiguous()
+    # TODO: a_scale
     
     fp8_blockwise_scaled_grouped_mm(
         c,

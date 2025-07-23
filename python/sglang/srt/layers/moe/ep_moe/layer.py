@@ -1248,8 +1248,8 @@ class DeepEPMoE(EPMoE):
 
         cutlass_moe_fp8(a=gateup_input_fp8, 
                         a_scale=gateup_input_scale,
-                        w=self.w13_weight,
-                        w_scale=self.w13_weight_scale,
+                        w=self.w13_weight_fp8[0],
+                        w_scale=self.w13_weight_fp8[1],
                         c=gateup_output,
                         m_indices=m_indices)
         del gateup_input_fp8, gateup_input_scale
@@ -1277,8 +1277,8 @@ class DeepEPMoE(EPMoE):
         down_input_scale = tma_align_input_scale(down_input_scale)
         cutlass_moe_fp8(a=down_input_fp8, 
                         a_scale=down_input_scale,
-                        w=self.w2_weight,
-                        w_scale=self.w2_weight_scale,
+                        w=self.w2_weight_fp8[0],
+                        w_scale=self.w2_weight_fp8[1],
                         c=down_output,
                         m_indices=m_indices)
         del down_input_fp8, down_input_scale
