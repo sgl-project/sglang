@@ -33,8 +33,8 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
-    is_npu,
     is_hip,
+    is_npu,
     set_weight_attrs,
 )
 from sglang.utils import resolve_obj_by_qualname
