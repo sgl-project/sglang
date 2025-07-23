@@ -64,8 +64,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             )
 
         self.has_vision = (
-            self.has_vision_weights
-            and global_server_args_dict["enable_multimodal"]
+            self.has_vision_weights and global_server_args_dict["enable_multimodal"]
         )
 
         if self.has_vision:
