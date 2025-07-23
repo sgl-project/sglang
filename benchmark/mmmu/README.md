@@ -18,6 +18,15 @@ python benchmark/mmmu/bench_sglang.py --port 30000 --concurrency 16
 
 You can adjust the `--concurrency` to control the number of concurrent OpenAI calls.
 
+You can use `--lora-path` to specify the LoRA adapter to apply during benchmarking. E.g.,
+```
+# Launch server with LoRA enabled
+python -m sglang.launch_server --model-path microsoft/Phi-4-multimodal-instruct --port 30000 --trust-remote-code --disable-radix-cache --lora-paths vision=<LoRA path>
+
+# Apply LoRA adapter during inferencing
+python -m benchmark/mmmu/bench_sglang.py --concurrency 8 --lora-path vision
+```
+
 ### Evaluate hf
 
 ```

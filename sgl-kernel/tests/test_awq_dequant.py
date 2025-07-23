@@ -67,8 +67,8 @@ def sglang_awq_dequantize(
     "qweight_row,qweight_col,is_bf16_act",
     list(
         itertools.product(
-            [3584, 18944, 128, 256, 512, 1024],
-            [448, 576, 4736, 16, 32, 64, 128],
+            [3584, 18944, 128, 256, 512, 1024, 1536],
+            [448, 576, 4736, 16, 32, 64, 128, 72],
             [True, False],
         )
     ),
@@ -77,7 +77,6 @@ def test_awq_dequant_compare_implementations(
     qweight_row: int, qweight_col: int, is_bf16_act: bool
 ):
     device = torch.device("cuda")
-
     qweight = torch.randint(
         0,
         torch.iinfo(torch.int32).max,

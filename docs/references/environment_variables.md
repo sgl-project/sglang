@@ -88,6 +88,7 @@ SGLang supports various environment variables that can be used to configure its 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
 | `SGLANG_TORCH_PROFILER_DIR` | Directory for PyTorch profiler output | `/tmp` |
+| `SGLANG_PROFILE_WITH_STACK` | Set `with_stack` option (bool) for PyTorch profiler (capture stack trace) | `true` |
 
 ## Storage & Caching
 
