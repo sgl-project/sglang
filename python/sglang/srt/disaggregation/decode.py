@@ -25,6 +25,7 @@ from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+import gc
 
 import torch
 from torch.distributed import ProcessGroup
@@ -45,10 +46,13 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.cuda_graph_runner import set_global_graph_memory_pool
+from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import require_mlp_sync
 
@@ -708,7 +712,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.last_batch = batch
         
         # Flush the disaggregation resources
-        self.flush_disaggregation_resources()
+        self.flush_decode_resources()
         del self.stop_decode_event
 
     @torch.no_grad()
@@ -794,7 +798,7 @@ class SchedulerDisaggregationDecodeMixin:
             del tmp_batch
         if "tmp_result" in locals():
             del tmp_result
-        self.flush_disaggregation_resources()
+        self.flush_decode_resources()
         del self.stop_decode_event
 
     def _prepare_idle_batch_and_run(self: Scheduler, batch, delay_process=False):
@@ -901,3 +905,82 @@ class SchedulerDisaggregationDecodeMixin:
             self.disagg_decode_transfer_queue.pop_transferred()
         )  # the requests which kv has arrived
         self.waiting_queue.extend(alloc_reqs)
+    
+    def flush_decode_resources(self: Scheduler):
+        """ Flush decode resources. """
+        logger.info("Flushing decode resources...")
+        
+        del self.req_to_metadata_buffer_idx_allocator
+        del self.disagg_metadata_buffers
+
+        # get the right model_runner
+        if isinstance(self.tp_worker, TpModelWorkerClient):
+            model_runner = self.tp_worker.worker.model_runner
+        else:
+            model_runner = self.tp_worker.model_runner
+        
+        # release queues and kv_manager
+            del self.disagg_decode_transfer_queue
+            del self.disagg_decode_prealloc_queue
+
+            # update the DecodeReqToTokenPool to req-to-token-pool
+            pool_size=self.req_to_token_pool.size
+            pool_max_context_len=self.req_to_token_pool.max_context_len
+            pool_device=self.req_to_token_pool.device
+
+            # three place ref reqtotokenpool, all set None to release Cuda memory
+            self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+            self.req_to_token_pool = None
+            self.tree_cache.req_to_token_pool = None
+            model_runner.attn_backend.model_runner= None
+            model_runner.attn_backend = None
+
+            if model_runner.cuda_graph_runner is not None:
+                model_runner.cuda_graph_runner.model_runner = None
+                set_global_graph_memory_pool(None)
+                del model_runner.cuda_graph_runner
+            
+            del model_runner.req_to_token_pool
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            # replace the DecodeReqToTokenPool with ReqToTokenPool
+            model_runner.req_to_token_pool = ReqToTokenPool(
+                size=pool_size,
+                max_context_len=pool_max_context_len,
+                device=pool_device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+            )
+            model_runner.init_attention_backend()
+            model_runner.server_args = self.server_args
+            model_runner.init_cuda_graphs()
+            self.req_to_token_pool = model_runner.req_to_token_pool
+            self.tree_cache.req_to_token_pool = self.req_to_token_pool
+
+            # same code in ServerArgs
+            if self.server_args.disaggregation_decode_dp is None:
+                self.server_args.disaggregation_decode_dp = self.dp_size
+            if self.server_args.disaggregation_decode_tp is None:
+                self.server_args.disaggregation_decode_tp = self.tp_size
+            
+            self.server_args.validate_disagg_tp_size(self.tp_size, self.server_args.disaggregation_decode_tp)
+
+            if self.server_args.disaggregation_prefill_pp is None:
+                self.server_args.disaggregation_prefill_pp = self.pp_size
+            
+            self.disaggregation_mode = DisaggregationMode.PREFILL
+
+            # reinitialize the tree cache for prefill, as prefill may use radix_cache or hiradix_cache
+            if not self.server_args.disable_radix_cache:
+                self.policy.tree_cache = None
+                del self.tree_cache
+                del self.policy
+                self.init_memory_pool_and_cache()
+                self.policy = SchedulePolicy(
+                    self.schedule_policy,
+                    self.tree_cache,
+                    self.enable_hierarchical_cache,
+                )
+            self.init_disaggregation()
+            gc.collect()
+            torch.cuda.empty_cache()

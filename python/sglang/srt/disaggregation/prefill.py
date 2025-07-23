@@ -24,6 +24,7 @@ import threading
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
+import gc
 
 import torch
 
@@ -42,7 +43,11 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
+from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
+from sglang.srt.managers.schedule_policy import SchedulePolicy
+from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
+from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import require_mlp_sync
 
@@ -607,3 +612,68 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
         req.disagg_kv_sender.send(page_indices)
+
+    def flush_prefill_resources(self: Scheduler) -> None:
+        """ Flush prefill resources. """
+        logger.info("Flushing prefill resources...")
+
+        del self.req_to_metadata_buffer_idx_allocator
+        del self.disagg_metadata_buffers
+
+        # get the right model_runner
+        if isinstance(self.tp_worker, TpModelWorkerClient):
+            model_runner = self.tp_worker.worker.model_runner
+        else:
+            model_runner = self.tp_worker.model_runner
+        
+        # release queues and kv_manager
+        del self.disagg_prefill_bootstrap_queue
+        del self.disagg_prefill_inflight_queue
+
+        # update the req-to-token-pool to DecodeReqToTokenPool
+        pool_size=self.req_to_token_pool.size
+        pool_max_context_len=self.req_to_token_pool.max_context_len
+        pool_device=self.req_to_token_pool.device
+        pre_alloc_size = pool_size * 2 if pool_size <= 32 else 0
+        
+        # set all ref to req-to-token-pool to None to release Cuda memory
+        self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+        self.req_to_token_pool = None
+        self.tree_cache.req_to_token_pool = None
+        model_runner.attn_backend.model_runner= None
+        model_runner.attn_backend = None
+
+        del model_runner.req_to_token_pool
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # replace the ReqToTokenPool with DecodeReqToTokenPool
+        model_runner.req_to_token_pool = DecodeReqToTokenPool(
+            size=pool_size,
+            max_context_len=pool_max_context_len,
+            device=pool_device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            pre_alloc_size=pre_alloc_size,
+        )
+        model_runner.init_attention_backend()
+        model_runner.server_args = self.server_args
+        model_runner.init_cuda_graphs()
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.tree_cache.req_to_token_pool = self.req_to_token_pool
+
+        # reinitialize the disaggregation resources for decode
+        self.disaggregation_mode = DisaggregationMode.DECODE
+        if not isinstance(self.tree_cache,ChunkCache):
+            self.policy.tree_cache = None
+            del self.tree_cache
+            del self.policy
+            self.init_memory_pool_and_cache()
+            self.policy = SchedulePolicy(
+                self.schedule_policy,
+                self.tree_cache,
+                self.enable_hierarchical_cache,
+            )
+        self.init_disaggregation()
+        gc.collect()
+        torch.cuda.empty_cache()
+        

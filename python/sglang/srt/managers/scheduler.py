@@ -45,7 +45,6 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
-    DecodeReqToTokenPool,
 )
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.prefill import (
@@ -135,7 +134,6 @@ from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -165,8 +163,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-import gc
-from sglang.srt.model_executor.cuda_graph_runner import set_global_graph_memory_pool
+
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
@@ -2907,156 +2904,12 @@ class Scheduler(
                 self.server_args.hicache_write_policy = recv_req.hicache_write_policy
             # cuda graph
             self.server_args.disable_cuda_graph = True 
-            
-
             # stop decode event loop
             self.stop_decode_event.set()
             return ConvertDisaggregationRoleReqOutput(
                 success=True,
                 message="The role of this server is now PREFILL.",
             )
-
-    def flush_disaggregation_resources(self):
-        logger.info("Flushing disaggregation resources...")
-        print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-        print(f"Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
-        del self.req_to_metadata_buffer_idx_allocator
-        del self.disagg_metadata_buffers
-
-        # get the right model_runner
-        if isinstance(self.tp_worker, TpModelWorkerClient):
-            model_runner = self.tp_worker.worker.model_runner
-        else:
-            model_runner = self.tp_worker.model_runner
-        
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # release queues and kv_manager
-            del self.disagg_prefill_bootstrap_queue
-            del self.disagg_prefill_inflight_queue
-
-            # update the req-to-token-pool to DecodeReqToTokenPool
-            pool_size=self.req_to_token_pool.size
-            pool_max_context_len=self.req_to_token_pool.max_context_len
-            pool_device=self.req_to_token_pool.device
-            pre_alloc_size = pool_size * 2 if pool_size <= 32 else 0
-            
-            # set all ref to req-to-token-pool to None to release Cuda memory
-            self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
-            self.req_to_token_pool = None
-            self.tree_cache.req_to_token_pool = None
-            model_runner.attn_backend.model_runner= None
-            model_runner.attn_backend = None
-            gc.collect()
-            torch.cuda.empty_cache()
-            del model_runner.req_to_token_pool
-            gc.collect()
-            torch.cuda.empty_cache()
-            print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-            print(f"Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
-
-            # replace the ReqToTokenPool with DecodeReqToTokenPool
-            model_runner.req_to_token_pool = DecodeReqToTokenPool(
-                size=pool_size,
-                max_context_len=pool_max_context_len,
-                device=pool_device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                pre_alloc_size=pre_alloc_size,
-            )
-            model_runner.init_attention_backend()
-            model_runner.server_args = self.server_args
-            model_runner.init_cuda_graphs()
-            self.req_to_token_pool = model_runner.req_to_token_pool
-            self.tree_cache.req_to_token_pool = self.req_to_token_pool
-
-            # reinitialize the disaggregation resources for decode
-            self.disaggregation_mode = DisaggregationMode.DECODE
-            if not isinstance(self.tree_cache,ChunkCache):
-                self.policy.tree_cache = None
-                del self.tree_cache
-                del self.policy
-                self.init_memory_pool_and_cache()
-                self.policy = SchedulePolicy(
-                    self.schedule_policy,
-                    self.tree_cache,
-                    self.enable_hierarchical_cache,
-                )
-            self.init_disaggregation()
-            gc.collect()
-            torch.cuda.empty_cache()
-        else:
-            # release queues and kv_manager
-            del self.disagg_decode_transfer_queue
-            del self.disagg_decode_prealloc_queue
-
-            # update the DecodeReqToTokenPool to req-to-token-pool
-            pool_size=self.req_to_token_pool.size
-            pool_max_context_len=self.req_to_token_pool.max_context_len
-            pool_device=self.req_to_token_pool.device
-
-            # three place ref reqtotokenpool, all set None to release Cuda memory
-            self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
-            self.req_to_token_pool = None
-            self.tree_cache.req_to_token_pool = None
-            model_runner.attn_backend.model_runner= None
-            model_runner.attn_backend = None
-
-            if model_runner.cuda_graph_runner is not None:
-                model_runner.cuda_graph_runner.model_runner = None
-                set_global_graph_memory_pool(None)
-                del model_runner.cuda_graph_runner
-            gc.collect()
-            torch.cuda.empty_cache()
-            print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-            print(f"Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
-            del model_runner.req_to_token_pool
-            gc.collect()
-            torch.cuda.empty_cache()
-            print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-            print(f"Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
-
-            # replace the DecodeReqToTokenPool with ReqToTokenPool
-            model_runner.req_to_token_pool = ReqToTokenPool(
-                size=pool_size,
-                max_context_len=pool_max_context_len,
-                device=pool_device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-            )
-            model_runner.init_attention_backend()
-            model_runner.server_args = self.server_args
-            model_runner.init_cuda_graphs()
-            self.req_to_token_pool = model_runner.req_to_token_pool
-            self.tree_cache.req_to_token_pool = self.req_to_token_pool
-
-            # same code in ServerArgs
-            if self.server_args.disaggregation_decode_dp is None:
-                self.server_args.disaggregation_decode_dp = self.dp_size
-            if self.server_args.disaggregation_decode_tp is None:
-                self.server_args.disaggregation_decode_tp = self.tp_size
-            
-            self.server_args.validate_disagg_tp_size(self.tp_size, self.server_args.disaggregation_decode_tp)
-
-            if self.server_args.disaggregation_prefill_pp is None:
-                self.server_args.disaggregation_prefill_pp = self.pp_size
-            
-            self.disaggregation_mode = DisaggregationMode.PREFILL
-
-            # reinitialize the tree cache for prefill, as prefill may use radix_cache or hiradix_cache
-            if not self.server_args.disable_radix_cache:
-                self.policy.tree_cache = None
-                del self.tree_cache
-                del self.policy
-                self.init_memory_pool_and_cache()
-                self.policy = SchedulePolicy(
-                    self.schedule_policy,
-                    self.tree_cache,
-                    self.enable_hierarchical_cache,
-                )
-            self.init_disaggregation()
-            gc.collect()
-            torch.cuda.empty_cache()
-        print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-        print(f"Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
-
 
     def get_print_prefix(self):
         prefix = ""
