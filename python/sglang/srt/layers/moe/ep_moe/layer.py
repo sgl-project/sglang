@@ -1,14 +1,19 @@
 import logging
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
+import einops
 import torch
+from torch.nn import Module
 
+from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.ep_moe.kernels import (
+    deepep_ll_get_cutlass_w4a8_moe_mm_data,
     ep_gather,
     ep_scatter,
     gelu_and_mul_triton_kernel,
@@ -23,20 +28,22 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     silu_and_mul_triton_kernel,
     tma_align_input_scale,
 )
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE, FusedMoEMethodBase
+from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8EPMoEMethod
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
+    scaled_fp8_quant,
     sglang_per_token_group_quant_fp8,
     sglang_per_token_quant_fp8,
 )
-from sglang.srt.layers.quantization.unquant import UnquantizedEPMoEMethod
+from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -47,6 +54,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_hip,
     is_npu,
+    set_weight_attrs,
 )
 
 _is_hip = is_hip()
@@ -54,10 +62,17 @@ _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if not (_is_npu or _is_hip):
-    from sgl_kernel import silu_and_mul
+if not _is_npu:
+    from sgl_kernel import (
+        cutlass_w4a8_moe_mm,
+        get_cutlass_w4a8_moe_mm_data,
+        sgl_per_tensor_quant_fp8,
+        silu_and_mul,
+    )
 
     from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+if _is_hip:
+    from vllm._custom_ops import scaled_fp8_quant
 
 if _use_aiter:
     from aiter import ActivationType, QuantType
@@ -947,16 +962,115 @@ class DeepEPMoE(EPMoE):
             forward_batch.is_extend_in_batch
         )
         if resolved_deepep_mode == DeepEPMode.normal:
-            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            if self.use_w4afp8:
+                return self.forward_cutlass_w4a8(hidden_states, topk_idx)
+            elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
                 return self.forward_deepgemm_contiguous(
                     hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
                 )
             else:
                 return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
         elif resolved_deepep_mode == DeepEPMode.low_latency:
-            return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
+            if self.use_w4afp8:
+                return self.forward_cutlass_w4a8_masked(
+                    hidden_states, masked_m, expected_m
+                )
+            else:
+                return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
+
+    def forward_cutlass_w4a8_masked(self, hidden_states, masked_m, expected_m):
+        # TODO gjw
+        total_m = torch.sum(masked_m)
+        # logger.info(f"total_m:{total_m}")
+        if total_m > 0:
+            # m = hidden_states.size(0)
+            num_tokens = hidden_states.size(1)
+            device = hidden_states.device
+            k = self.w13_weight.size(2) * 2  # w1_q is transposed and packed
+            n = self.w2_weight.size(2) * 2
+            num_experts = self.w13_weight.size(0)
+
+            hidden_states, expert_offsets, problem_sizes1, problem_sizes2 = (
+                deepep_ll_get_cutlass_w4a8_moe_mm_data(
+                    hidden_states,
+                    masked_m,
+                    self.quant_method.expert_offsets,
+                    self.quant_method.problem_sizes1,
+                    self.quant_method.problem_sizes2,
+                    num_experts,
+                    n,
+                    k,
+                )
+            )
+            # logger.info(f"hidden_states {hidden_states}, hidden_states.shape {hidden_states.shape} \n")
+            c1 = torch.zeros((total_m, n * 2), device=device, dtype=torch.half)
+            c2 = torch.zeros((total_m, k), device=device, dtype=torch.half)
+            a1_scale_float = self.w13_input_scale.float()
+            hidden_states_q = torch.empty(
+                hidden_states.shape, dtype=torch.float8_e4m3fn, device=device
+            )
+            sgl_per_tensor_quant_fp8(
+                hidden_states, hidden_states_q, a1_scale_float, True
+            )
+            # logger.info(f"before first gemm hidden_states {hidden_states}, hidden_states.shape {hidden_states.shape} \n")
+            cutlass_w4a8_moe_mm(
+                c1,
+                hidden_states_q,
+                self.w13_weight,
+                a1_scale_float,
+                self.w13_weight_scale_inv,
+                expert_offsets[:-1],
+                problem_sizes1,
+                self.quant_method.a_strides1,
+                self.quant_method.b_strides1,
+                self.quant_method.c_strides1,
+                self.quant_method.s_strides13,
+                128,
+                1,
+            )
+            # logger.info(f"after  first gemm c1 {c1}, c1.shape {c1.shape} \n")
+            intermediate = torch.empty((total_m, n), device=device, dtype=torch.half)
+            silu_and_mul(c1, intermediate)
+            intermediate_q = torch.empty(
+                intermediate.shape, dtype=torch.float8_e4m3fn, device=device
+            )
+            a2_scale_float = self.w2_input_scale.float()
+            sgl_per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale_float, True)
+
+            cutlass_w4a8_moe_mm(
+                c2,
+                intermediate_q,
+                self.w2_weight,
+                a2_scale_float,
+                self.w2_weight_scale_inv,
+                expert_offsets[:-1],
+                problem_sizes2,
+                self.quant_method.a_strides2,
+                self.quant_method.b_strides2,
+                self.quant_method.c_strides2,
+                self.quant_method.s_strides2,
+                128,
+                1,
+            )
+            # logger.info(f"c2 {c2} c2.shape {c2.shape}")
+            result = torch.zeros(
+                (len(masked_m), num_tokens, k), device=device, dtype=c2.dtype
+            )
+            non_zero_indices = torch.nonzero(masked_m, as_tuple=True)[0]
+            logger.info(f"non_zero_indices {non_zero_indices}")
+            c2_index = 0
+            for expert_idx in non_zero_indices:
+                num_non_zero_rows = masked_m[expert_idx].item()
+                result[expert_idx, :num_non_zero_rows] = c2[
+                    c2_index : c2_index + num_non_zero_rows
+                ]
+                c2_index += num_non_zero_rows
+            # logger.info(f"result {result} result.shape {result.shape}")
+            return result.to(torch.bfloat16)
+        else:
+            return hidden_states.to(torch.bfloat16)
 
     def forward_normal(
         self,
