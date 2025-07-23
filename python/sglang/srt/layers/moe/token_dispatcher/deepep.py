@@ -144,9 +144,13 @@ class DeepEPBuffer:
             )
 
         if deepep_mode == DeepEPMode.NORMAL:
-            num_qps_per_rank = DeepEPConfig.get_instance().num_sms // 2
-        elif deepep_mode in [DeepEPMode.LOW_LATENCY, DeepEPMode.AUTO]:
+            num_qps_per_rank = DeepEPConfig.get_instance().num_sms
+        elif deepep_mode == DeepEPMode.LOW_LATENCY:
             num_qps_per_rank = num_experts // group.size()
+        elif deepep_mode == DeepEPMode.AUTO:
+            num_qps_per_rank = max(
+                DeepEPConfig.get_instance().num_sms, num_experts // group.size()
+            )
         else:
             raise NotImplementedError
 
