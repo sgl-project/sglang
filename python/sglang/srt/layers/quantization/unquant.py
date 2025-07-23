@@ -116,9 +116,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
 
         if use_intel_amx_backend(layer):
-            return torch.ops.sgl_kernel.weight_packed_linear(
+            x_shapes = x.shape
+            if len(x_shapes) == 3:
+                x = x.view(-1, x.shape[-1])
+            output = torch.ops.sgl_kernel.weight_packed_linear(
                 x, layer.weight, bias, True  # is_vnni
             )
+            if len(x_shapes) == 3:
+                output = output.view(x_shapes[0], x_shapes[1], -1)
+            return output
 
         return F.linear(x, layer.weight, bias)
 

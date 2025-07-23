@@ -121,6 +121,19 @@ def get_config(
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
     )
+    if config.architectures[0] == "Phi4MMForCausalLM":
+        from transformers import SiglipVisionConfig
+
+        vision_config = {
+            "hidden_size": 1152,
+            "image_size": 448,
+            "intermediate_size": 4304,
+            "model_type": "siglip_vision_model",
+            "num_attention_heads": 16,
+            "num_hidden_layers": 26,  # Model is originally 27-layer, we only need the first 26 layers for feature extraction.
+            "patch_size": 14,
+        }
+        config.vision_config = SiglipVisionConfig(**vision_config)
     text_config = get_hf_text_config(config=config)
 
     if isinstance(model, str) and text_config is not None:
