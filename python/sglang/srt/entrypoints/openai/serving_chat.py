@@ -60,7 +60,11 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
         
-        if request.tool_choice == "required" and not request.tools:
+        if (
+            isinstance(request.tool_choice, str)
+            and request.tool_choice.lower() == "required"
+            and not request.tools
+        ):
             return "Tools cannot be empty if tool choice is set to required."
 
         return None
