@@ -1384,7 +1384,6 @@ def deepep_ll_get_cutlass_w4a8_moe_mm_data(
     )
     non_zero_rows_mask = (hidden_states_real_reshaped != 0).any(dim=-1)
     hidden_states_real_reshaped = hidden_states_real_reshaped[non_zero_rows_mask]
-    logger.info(f"masked_m {masked_m}")
     return (
         hidden_states_real_reshaped,
         expert_offsets.to(torch.int32),
