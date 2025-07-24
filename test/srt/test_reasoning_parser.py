@@ -3,6 +3,7 @@ import unittest
 from sglang.srt.reasoning_parser import (
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
+    HunyuanDetector,
     KimiDetector,
     Qwen3Detector,
     ReasoningParser,
@@ -256,6 +257,43 @@ class TestKimiDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "answer")
 
 
+class TestHunyuanDetector(CustomTestCase):
+    def setUp(self):
+        self.detector = HunyuanDetector()
+
+    def test_init(self):
+        """Test HunyuanDetector initialization."""
+        self.assertEqual(self.detector.think_start_token, "<think>")
+        self.assertEqual(self.detector.think_end_token, "</think>")
+        self.assertFalse(self.detector._in_reasoning)  # force_reasoning=False
+        self.assertTrue(self.detector.stream_reasoning)
+        # Check Hunyuan-specific attributes
+        self.assertEqual(self.detector.answer_start, "<answer>")
+        self.assertEqual(self.detector.answer_end, "</answer>")
+        self.assertEqual(self.detector._post_think_buffer, "")
+
+    def test_detect_and_parse_hunyuan_format(self):
+        """Test parsing Hunyuan format with both think and answer tags."""
+        text = "<think>Let me analyze this problem</think><answer>The solution is 42</answer>"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Let me analyze this problem")
+        self.assertEqual(result.normal_text, "The solution is 42")
+
+    def test_detect_and_parse_without_thinking(self):
+        """Test parsing without thinking tags."""
+        text = "Direct response without thinking."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_detect_and_parse_answer_only(self):
+        """Test parsing with only answer tags."""
+        text = "<answer>This is the answer</answer>"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "This is the answer")
+
+
 class TestReasoningParser(CustomTestCase):
     def test_init_valid_model(self):
         """Test initialization with valid model types."""
@@ -267,6 +305,9 @@ class TestReasoningParser(CustomTestCase):
 
         parser = ReasoningParser("kimi")
         self.assertIsInstance(parser.detector, KimiDetector)
+
+        parser = ReasoningParser("hunyuan")
+        self.assertIsInstance(parser.detector, HunyuanDetector)
 
     def test_init_invalid_model(self):
         """Test initialization with invalid model type."""
@@ -313,10 +354,12 @@ class TestReasoningParser(CustomTestCase):
         parser1 = ReasoningParser("DeepSeek-R1")
         parser2 = ReasoningParser("QWEN3")
         parser3 = ReasoningParser("Kimi")
+        parser4 = ReasoningParser("HuNyUaN")
 
         self.assertIsInstance(parser1.detector, DeepSeekR1Detector)
         self.assertIsInstance(parser2.detector, Qwen3Detector)
         self.assertIsInstance(parser3.detector, KimiDetector)
+        self.assertIsInstance(parser4.detector, HunyuanDetector)
 
     def test_stream_reasoning_parameter(self):
         """Test stream_reasoning parameter is passed correctly."""
@@ -397,6 +440,44 @@ class TestIntegrationScenarios(CustomTestCase):
         reasoning, normal = parser.parse_non_stream(text)
         self.assertEqual(reasoning, "")
         self.assertEqual(normal, "Just the answer.")
+
+    def test_hunyuan_tool_calls_scenario(self):
+        """Test Hunyuan with tool calls preservation."""
+        parser = ReasoningParser("hunyuan")
+        text = """<think>User asked about weather in Tokyo. I need to use the weather tool.</think><answer>I'll check the weather for you.
+<tool_calls>
+[{"name": "get_weather", "arguments": {"city": "Tokyo"}}]
+</tool_calls>
+</answer>"""
+
+        reasoning, normal = parser.parse_non_stream(text)
+        self.assertIn("weather in Tokyo", reasoning)
+        # Verify answer tags are stripped but tool_calls preserved
+        self.assertIn("<tool_calls>", normal)
+        self.assertNotIn("<answer>", normal)
+
+    def test_hunyuan_streaming_with_answer_tags(self):
+        """Test Hunyuan streaming with answer tag handling."""
+        parser = ReasoningParser("hunyuan")
+        chunks = [
+            "<think>Analyzing",
+            " the problem</think>",
+            "<ans",  # Partial answer tag
+            "wer>The solution",
+            " is 42</ans",  # Partial end tag
+            "wer>",
+        ]
+
+        all_reasoning = ""
+        all_normal = ""
+
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            all_reasoning += reasoning
+            all_normal += normal
+
+        self.assertEqual(all_reasoning.strip(), "Analyzing the problem")
+        self.assertEqual(all_normal.strip(), "The solution is 42")
 
 
 if __name__ == "__main__":
