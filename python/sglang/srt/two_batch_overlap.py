@@ -662,7 +662,6 @@ def _model_forward_tbo(
     del inputs
 
     if _is_hip:
-        print ("CHAI: Two batch overlap enabled on ROCm.")
         outputs_arr = execute_overlapped_operations(
                         inputs_arr=inputs_arr,
                         operations_arr=[operations_strategy.operations] * 2,
