@@ -36,7 +36,6 @@ _is_hip = is_hip()
 
 if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_hip):
     from vllm import _custom_ops as vllm_ops
-    from vllm._custom_ops import scaled_fp8_quant
 
 try:
     import vllm
