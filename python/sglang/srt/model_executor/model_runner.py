@@ -109,7 +109,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
-    is_cuda,
     is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
