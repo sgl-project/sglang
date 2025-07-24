@@ -12,7 +12,7 @@
 | **TRTLLM MLA**           | ✅                | ❌*                | ✅      | ✅                 | ❌**            |
 | **Ascend**               | ✅                | ❌                 | ❌      | ❌                 | ❌              |
 
-**Notes:** 
+**Notes:**
 - \*\*TRTLLM MLA only implements decode operations. For prefill operations (including multimodal inputs), it falls back to FlashInfer MLA backend.
 
 Note: Every kernel backend is compatible with a page size > 1 by specifying an argument such as `--page-size 16`.

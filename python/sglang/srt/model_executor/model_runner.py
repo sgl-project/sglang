@@ -1433,9 +1433,7 @@ class ModelRunner:
             return CutlassMLABackend(self)
         elif self.server_args.attention_backend == "trtllm_mla":
             if not self.use_mla_backend:
-                raise ValueError(
-                    "trtllm_mla backend can only be used with MLA models."
-                )
+                raise ValueError("trtllm_mla backend can only be used with MLA models.")
             from python.sglang.srt.layers.attention.trtllm_mla_backend import (
                 TRTLLMMLABackend,
             )

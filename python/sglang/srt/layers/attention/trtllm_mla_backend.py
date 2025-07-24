@@ -343,10 +343,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         q_scale = 1.0  # for fp16 we keep q_scale as 1.0
 
         # silently pick k_scale (avoid per-call prints in CUDA graph)
-        k_scale = layer.k_scale_float if getattr(layer, "k_scale_float", None) is not None else 1.0
+        k_scale = (
+            layer.k_scale_float
+            if getattr(layer, "k_scale_float", None) is not None
+            else 1.0
+        )
 
         bmm1_scale = q_scale * k_scale * layer.scaling
-
 
         # Call TRT-LLM kernel
         raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
@@ -359,7 +362,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             block_tables=metadata.block_kv_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             max_seq_len=int(metadata.block_kv_indices.shape[1] * self.page_size),
-            bmm1_scale=bmm1_scale
+            bmm1_scale=bmm1_scale,
         )
 
         # Extract value projection part and reshape
