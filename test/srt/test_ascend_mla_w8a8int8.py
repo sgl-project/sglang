@@ -23,7 +23,7 @@ TEST_MODEL_MATRIX = {
 }
 
 
-class TestAscend_MLA_W8A8Int8(CustomTestCase):
+class TestAscendMlaW8A8Int8(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
