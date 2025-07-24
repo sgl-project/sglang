@@ -380,6 +380,7 @@ class ModelRunner:
                     and is_no_spec_infer_or_topk_one(server_args)
                     and is_fa3_default_architecture(self.model_config.hf_config)
                     and (not server_args.enable_hierarchical_cache)
+                    and (not server_args.enable_mixed_chunk)
                 ):
                     server_args.attention_backend = "fa3"
                 elif _is_hip:
