@@ -540,10 +540,7 @@ class Scheduler(
         self.init_disaggregation()
 
         if get_bool_env_var("SGLANG_GC_LOG"):
-            configure_gc_logger()
-        
-    
-
+            configure_gc_logger()  
 
     def current_scheduler_metrics_enabled(self):
         return self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
@@ -805,8 +802,7 @@ class Scheduler(
 
             if batch:
                 result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
-                 
+                self.process_batch_result(batch, result)                
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
