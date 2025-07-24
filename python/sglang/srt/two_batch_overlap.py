@@ -663,9 +663,9 @@ def _model_forward_tbo(
 
     if _is_hip:
         outputs_arr = execute_overlapped_operations(
-                        inputs_arr=inputs_arr,
-                        operations_arr=[operations_strategy.operations] * 2,
-                        delta_stages=[0, operations_strategy.tbo_delta_stages],
+            inputs_arr=inputs_arr,
+            operations_arr=[operations_strategy.operations] * 2,
+            delta_stages=[0, operations_strategy.tbo_delta_stages],
         )
     else:
         with deep_gemm_wrapper.configure_deep_gemm_num_sms(
