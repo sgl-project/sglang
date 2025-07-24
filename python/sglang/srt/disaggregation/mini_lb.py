@@ -466,16 +466,9 @@ async def convert_pd_role(obj: PDConvertRequest):
 
     # post convert request to server
     async with aiohttp.ClientSession() as session:
-        while True:
-            # response = await session.post(f"{server_url}/convert_pd_role")
-            response = await session.post(f"{server_url}/convert_pd_role",json=dataclasses.asdict(obj))
-            content = await response.json()
-
-            if content["message"] != "bootstrap":
-                break
-            else:
-                logger.info("Have some requests bootstrapping, waiting...")
-                await asyncio.sleep(1)
+        # response = await session.post(f"{server_url}/convert_pd_role")
+        response = await session.post(f"{server_url}/convert_pd_role",json=dataclasses.asdict(obj))
+        content = await response.json()
         
     # wait scheduler event loop ready
     async with aiohttp.ClientSession() as session:
