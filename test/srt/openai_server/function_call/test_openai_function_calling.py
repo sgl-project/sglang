@@ -248,6 +248,82 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             "Final response of function calling should have finish_reason 'tool_calls'",
         )
 
+    def test_function_calling_streaming_no_tool_call(self):
+        """
+        Test: Whether the finish_reason is stop in streaming mode when no tool call is given.
+        - Expect no function call to be found.
+        - Verify that finish_reason is stop
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_weather",
+                    "description": "Get the current weather in a given location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "The city to find the weather for",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "description": "Weather unit (celsius or fahrenheit)",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["city", "unit"],
+                    },
+                },
+            }
+        ]
+
+        messages = [{"role": "user", "content": "Who are you?"}]
+
+        response_stream = client.chat.completions.create(
+            model=self.model,
+            max_tokens=2048,
+            messages=messages,
+            temperature=0.8,
+            top_p=0.8,
+            stream=True,
+            tools=tools,
+            tool_choice="none",
+        )
+
+        chunks = list(response_stream)
+        self.assertTrue(len(chunks) > 0, "Streaming should return at least one chunk")
+
+        found_function_name = False
+        for chunk in chunks:
+            choice = chunk.choices[0]
+            # Check whether the current chunk contains tool_calls
+            if choice.delta.tool_calls:
+                tool_call = choice.delta.tool_calls[0]
+                if tool_call.function.name:
+                    self.assertEqual(
+                        tool_call.function.name,
+                        "get_current_weather",
+                        "Function name should be 'get_current_weather'",
+                    )
+                    found_function_name = True
+                    break
+
+        self.assertFalse(
+            found_function_name,
+            "Target function name 'get_current_weather' was found in the streaming chunks",
+        )
+
+        finish_reason = chunks[-1].choices[0].finish_reason
+        self.assertEqual(
+            finish_reason,
+            "stop",
+            "Final response of no function calling should have finish_reason 'stop'",
+        )
+
     def test_function_calling_streaming_args_parsing(self):
         """
         Test: Whether the function call arguments returned in streaming mode can be correctly concatenated into valid JSON.
