@@ -1219,10 +1219,11 @@ class Scheduler(
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
-            # Expand a single image token into multiple dummy tokens for receiving image embeddings
-            req.origin_input_ids = self.pad_input_ids_func(
-                req.origin_input_ids, image_inputs
-            )
+            if self.pad_input_ids_func:
+                # Expand a single image token into multiple dummy tokens for receiving image embeddings
+                req.origin_input_ids = self.pad_input_ids_func(
+                    req.origin_input_ids, image_inputs
+                )
             req.extend_image_inputs(image_inputs)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
