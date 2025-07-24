@@ -405,12 +405,6 @@ class MultimodalInputs:
         # other args would be kept intact
 
 
-class WaitingStatus(Enum):
-    UNREADY = auto()
-    READY = auto()
-    LOADING = auto()
-
-
 class Req:
     """The input and output status of a request."""
 
@@ -615,8 +609,6 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
-
-        self.waiting_status = WaitingStatus.UNREADY
 
     @property
     def seqlen(self):
