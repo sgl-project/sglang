@@ -20,7 +20,6 @@ limitations under the License.
 #include <hip/hip_bf16.h>
 #include <hip/hip_common.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_fp8.h>
 
 // Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)d
 

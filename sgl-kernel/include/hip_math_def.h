@@ -20,7 +20,6 @@ limitations under the License.
 #include <hip/hip_bf16.h>
 #include <hip/hip_common.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_fp8.h>
 
 // Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)
 
@@ -68,19 +67,6 @@ __forceinline__ __device__ __hip_bfloat16 cast(float fval) {
   return __float2bfloat16(fval);
 }
 
-template <>
-__forceinline__ __device__ uint8_t cast(float fval) {
-#if HIP_FP8_TYPE_FNUZ
-  return __hip_cvt_float_to_fp8(fval, __HIP_SATFINITE, __HIP_E4M3_FNUZ);
-#else
-#if HIP_FP8_TYPE_E4M3
-  return __hip_cvt_float_to_fp8(fval, __HIP_SATFINITE, __HIP_E4M3);
-#else
-#error "__hip_cvt_float_to_fp8 is not supported in this processor (arch < gfx942)."
-#endif  // HIP_FP8_TYPE_E4M3
-#endif  // HIP_FP8_TYPE_FNUZ
-}
-
 }  // namespace amdgpu
 
 template <typename T>
@@ -91,11 +77,6 @@ __forceinline__ __device__ T __shfl_xor_sync(unsigned mask, T var, int laneMask,
 template <typename srcDtype>
 __device__ __forceinline__ float castToFloat(srcDtype val) {
   return amdgpu::cast<srcDtype, float>(val);
-}
-
-template <typename srcDtype>
-__device__ __forceinline__ uint8_t castToFP8Storage(srcDtype val) {
-  return amdgpu::cast<srcDtype, uint8_t>(val);
 }
 
 template <typename dstDtype>
