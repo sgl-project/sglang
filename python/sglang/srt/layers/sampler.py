@@ -193,8 +193,10 @@ def top_p_normalize_probs_torch(
     # See also top_k_top_p_min_p_sampling_from_probs_torch
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    # sort is non-deterministic, prevent probs masked to zero
+    probs_sort_copy = probs_sort.clone()
+    probs_sort_copy[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+    probs_sort.div_(probs_sort_copy.sum(dim=-1, keepdim=True))
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
 
 
