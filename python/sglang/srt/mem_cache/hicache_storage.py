@@ -170,18 +170,18 @@ class HiCacheFile(HiCacheStorage):
             if not self.set(key, value):
                 return False
         return True
+    
+    def exists(self, key) -> bool | dict:
+        tensor_path = os.path.join(self.file_path, f"{key}.bin")
+        return os.path.exists(tensor_path)
 
     def delete(self, key: str) -> None:
-        tensor_path = f"{self.file_path}/{key}.bin"
+        tensor_path = os.path.join(self.file_path, f"{key}.bin")
         try:
             os.remove(tensor_path)
         except FileNotFoundError:
             logger.warning(f"Key {key} does not exist. Cannot delete.")
             return
-
-    def exists(self, key) -> bool | dict:
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
-        return os.path.exists(tensor_path)
 
     def clear(self) -> None:
         try:
