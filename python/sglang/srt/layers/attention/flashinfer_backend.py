@@ -267,6 +267,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 # use_ragged = False
                 use_ragged = True
                 wrappers = self.prefill_wrappers_mixed
+                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             else:
                 use_ragged = True
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
