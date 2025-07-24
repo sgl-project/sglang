@@ -25,7 +25,6 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_utils_v2 import (
     EagleDraftInput,
     EagleVerifyInput,
-    assign_draft_cache_locs,
     assign_extend_cache_locs,
     fast_topk,
     fill_accepted_out_cache_loc,
@@ -185,8 +184,6 @@ class EAGLEWorker(TpModelWorker):
             torch.cuda.stream(self.plan_stream) if self.plan_stream else empty_context()
         )
 
-        self.draft_extend_done = None
-
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None
@@ -242,7 +239,11 @@ class EAGLEWorker(TpModelWorker):
         # Prepare for draft
         spec_info = batch.spec_info
         forward_batch, can_cuda_graph = spec_info.prepare_for_draft(
-            batch, self.cuda_graph_runner, self.draft_model_runner
+            batch,
+            self.cuda_graph_runner,
+            self.draft_model_runner,
+            self.topk,
+            self.num_steps,
         )
 
         # Run draft
@@ -387,7 +388,6 @@ class EAGLEWorker(TpModelWorker):
             verify_forward_batch, can_run_cuda_graph = spec_info.prepare_for_verify(
                 batch,
                 self.target_worker,
-                self.draft_extend_done,
             )
 
         # Correct some buffers due to the overlap plan
@@ -423,19 +423,19 @@ class EAGLEWorker(TpModelWorker):
         verify_done = torch.cuda.Event()
         verify_done.record()
 
-        # Move the accepted tokens to the target KV cache
+        # Move the accepted tokens to the target KV cache locations
         batch.seq_lens = seq_lens_backup
         self.move_accepted_tokens_to_target_kvcache(
             batch,
             accept_index,
             accept_length,
         )
-        verified_id = predict[accept_index]
-        next_batch_verified_id = torch.empty_like(accept_length, dtype=torch.int32)
+        all_verified_id = predict[accept_index]
+        verified_id = torch.empty_like(accept_length, dtype=torch.int32)
         fill_new_verified_id[(bs,)](
-            verified_id,
+            all_verified_id,
             accept_length,
-            next_batch_verified_id,
+            verified_id,
             next_power_of_2(max(self.num_steps + 1, bs)),
         )
 
@@ -483,7 +483,7 @@ class EAGLEWorker(TpModelWorker):
             topk_p=ret_topk_p,
             topk_index=ret_topk_index,
             hidden_states=ret_hidden_states,
-            verified_id=next_batch_verified_id,
+            verified_id=verified_id,
             new_seq_lens=new_seq_lens,
             allocate_lens=old_spec_info.allocate_lens,
             verify_done=verify_done,

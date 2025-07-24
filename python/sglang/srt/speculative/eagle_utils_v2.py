@@ -88,12 +88,14 @@ class EagleDraftInput:
         batch: ModelWorkerBatch,
         cuda_graph_runner: EAGLEDraftCudaGraphRunner,
         draft_model_runner: ModelRunner,
+        topk: int,
+        num_steps: int,
     ):
         bs = len(batch.seq_lens)
 
         # Assign cache locations
         batch.out_cache_loc = torch.empty(
-            (bs * cuda_graph_runner.topk * cuda_graph_runner.num_steps,),
+            (bs * topk * num_steps,),
             dtype=torch.int64,
             device=batch.input_ids.device,
         )
@@ -103,13 +105,13 @@ class EagleDraftInput:
             batch.seq_lens,
             batch.out_cache_loc,
             batch.req_to_token_pool.req_to_token.shape[1],
-            cuda_graph_runner.topk,
-            cuda_graph_runner.num_steps,
+            topk,
+            num_steps,
         )
 
         # Get a forward batch
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
-        self.positions = batch.seq_lens.repeat_interleave(cuda_graph_runner.topk, dim=0)
+        self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
@@ -122,6 +124,7 @@ class EagleDraftInput:
         draft_model_runner: Any,
     ):
         seq_lens_backup = batch.seq_lens
+        seq_lens_cpu_backup = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
         batch.spec_info = self
@@ -131,6 +134,7 @@ class EagleDraftInput:
         batch.seq_lens_sum += extend_num_tokens
         batch.extend_seq_lens = torch.full_like(batch.seq_lens, num_draft_tokens)
         batch.extend_prefix_lens = seq_lens_backup
+        batch.extend_prefix_lens_cpu = seq_lens_cpu_backup
         batch.extend_num_tokens = extend_num_tokens
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
@@ -219,7 +223,6 @@ class EagleVerifyInput:
         batch.spec_info = self
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        batch.return_logprob = False
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
         # Run attention backend plan and cuda graph preparation

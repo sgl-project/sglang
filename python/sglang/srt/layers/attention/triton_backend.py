@@ -119,6 +119,8 @@ class TritonAttnBackend(AttentionBackend):
 
         self.max_context_len = model_runner.model_config.context_len
 
+        self.cuda_graph_custom_mask = None
+
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
 
