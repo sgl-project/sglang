@@ -97,6 +97,7 @@ fn create_sample_completion_request() -> CompletionRequest {
         logit_bias: None,
         user: None,
         seed: None,
+        other: serde_json::Map::new(),
     }
 }
 
