@@ -231,7 +231,7 @@ class W8A8Int8Config(QuantizationConfig):
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
-        return []
+        return ["quant_model_description.json"]
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> W8A8Int8Config:
