@@ -63,6 +63,12 @@ DEFAULT_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_FP8 = (
 )
 DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8 = "Qwen/Qwen3-1.7B-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE = "gaunernst/DeepSeek-V2-Lite-Chat-FP8"
+DEFAULT_MODEL_NAME_FOR_TEST_FP8_DS_R1 = "MollyHexapotato/custom-deepseek-r1-4L"
+
+# INT8 models
+DEFAULT_MODEL_NAME_FOR_TEST_INT8_DS_R1 = (
+    "MollyHexapotato/custom_DeepSeek-R1-Channel-INT8_4L"
+)
 
 # W8A8 models
 DEFAULT_MODEL_NAME_FOR_TEST_W8A8 = "RedHatAI/Llama-3.2-3B-quantized.w8a8"

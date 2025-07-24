@@ -13,8 +13,9 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_MODEL_NAME_FOR_TEST_DSR1_NEXTN,
+    DEFAULT_MODEL_NAME_FOR_TEST_FP8_DS_R1,
     DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+    DEFAULT_MODEL_NAME_FOR_TEST_INT8_DS_R1,
     DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8,
     DEFAULT_MODEL_NAME_FOR_TEST_W8A8,
     DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
@@ -71,9 +72,33 @@ class TestIntelAMXAttnBackend(CustomTestCase):
         if is_in_ci():
             self.assertGreater(decode_throughput, 10)
 
-    def test_latency_dsr1_proxy_model(self):
+    @with_cpu_omp_threads_bind()
+    def test_latency_dsr1_fp8_proxy_model(self):
         prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
-            DEFAULT_MODEL_NAME_FOR_TEST_DSR1_NEXTN,
+            DEFAULT_MODEL_NAME_FOR_TEST_FP8_DS_R1,
+            [
+                "--attention-backend",
+                "intel_amx",
+                "--mem-fraction-static",
+                "0.05",
+                "--disable-radix",
+                "--trust-remote-code",
+                "--batch-size",
+                "4",
+            ],
+        )
+
+        print(f"{prefill_latency=}")
+        print(f"{decode_throughput=}")
+        print(f"{decode_latency=}")
+
+        if is_in_ci():
+            self.assertGreater(decode_throughput, 100)
+
+    @with_cpu_omp_threads_bind()
+    def test_latency_dsr1_int8_proxy_model(self):
+        prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
+            DEFAULT_MODEL_NAME_FOR_TEST_INT8_DS_R1,
             [
                 "--attention-backend",
                 "intel_amx",
