@@ -1,13 +1,16 @@
 import multiprocessing.shared_memory
+from pathlib import Path
 
 import pytest
 import torch
+from torch.utils.cpp_extension import load
 from tqdm import tqdm
 
-from pathlib import Path
-from torch.utils.cpp_extension import load
 root = Path(__file__).parent.resolve()
-hf3fs_utils = load(name="hf3fs_utils", sources=[f"{root}/hf3fs_utils.cpp"], verbose=True)
+hf3fs_utils = load(
+    name="hf3fs_utils", sources=[f"{root}/hf3fs_utils.cpp"], verbose=True
+)
+
 
 def test_rw_shm():
     numel = 8 << 20

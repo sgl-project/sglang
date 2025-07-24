@@ -3,11 +3,12 @@ import multiprocessing
 import os
 import threading
 from functools import wraps
+from pathlib import Path
 from typing import List
 
 import torch
-from pathlib import Path
 from torch.utils.cpp_extension import load
+
 root = Path(__file__).parent.resolve()
 hf3fs_utils = load(name="hf3fs_utils", sources=[f"{root}/hf3fs_utils.cpp"])
 

@@ -1,3 +1,4 @@
+import atexit
 import concurrent.futures
 import json
 import logging
@@ -91,6 +92,8 @@ class HiCacheHF3FS(HiCacheStorage):
         self.lock = threading.RLock()
         self.free_pages = list(range(self.num_pages))
         self.key_to_index = OrderedDict()
+
+        atexit.register(self.close)
 
     @staticmethod
     def from_env_config(
@@ -261,6 +264,7 @@ class HiCacheHF3FS(HiCacheStorage):
         self.key_to_index.clear()
 
     def close(self) -> None:
+        logger.info("close HiCacheHF3FS")
         for c in self.clients:
             c.close()
         self.executor.shutdown(wait=True)
