@@ -322,15 +322,7 @@ class LightningAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        """Forward pass for extend/prefill mode.
-
-        Used for:
-        - Prefill: Processing initial prompt tokens
-        - Prefill with KV cache: Processing with existing KV cache
-        - Target verification: Verifying draft tokens
-        """
-        if self.forward_metadata is None:
-            self.init_forward_metadata(forward_batch)
+        """Forward pass for extend/prefill mode."""
 
         # Save KV cache if requested
         if save_kv_cache and k is not None and v is not None:
@@ -350,9 +342,6 @@ class LightningAttnBackend(AttentionBackend):
                 getattr(layer, "v_scale", 1.0),
             )
 
-        metadata = self.forward_metadata
-
-        # Get KV cache and state indices
         kv_caches = None
         state_indices_tensor = None
 
@@ -362,15 +351,8 @@ class LightningAttnBackend(AttentionBackend):
         if hasattr(forward_batch, "req_pool_indices"):
             state_indices_tensor = forward_batch.req_pool_indices
 
-        # Update metadata with actual KV cache info
-        if kv_caches is not None:
-            metadata.kv_caches = kv_caches
-        if state_indices_tensor is not None:
-            metadata.state_indices_tensor = state_indices_tensor
-
-        # Use the prefill and mixed inference from original code
         return self._prefill_and_mix_infer(
-            q, k, v, metadata.kv_caches, metadata.state_indices_tensor, metadata
+            q, k, v, kv_caches, state_indices_tensor, self.forward_metadata
         )
 
     def forward_decode(
@@ -383,14 +365,6 @@ class LightningAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        """Forward pass for decode mode.
-
-        Used for:
-        - Normal decode: Generating next token
-        - Draft decode: Generating draft tokens for speculation
-        """
-        if self.forward_metadata is None:
-            self.init_forward_metadata(forward_batch)
 
         # Save KV cache if requested
         if save_kv_cache and k is not None and v is not None:
@@ -410,9 +384,6 @@ class LightningAttnBackend(AttentionBackend):
                 getattr(layer, "v_scale", 1.0),
             )
 
-        metadata = self.forward_metadata
-
-        # Get KV cache and state indices
         kv_caches = None
         state_indices_tensor = None
 
@@ -422,16 +393,47 @@ class LightningAttnBackend(AttentionBackend):
         if hasattr(forward_batch, "req_pool_indices"):
             state_indices_tensor = forward_batch.req_pool_indices
 
-        # Update metadata with actual KV cache info
-        if kv_caches is not None:
-            metadata.kv_caches = kv_caches
-        if state_indices_tensor is not None:
-            metadata.state_indices_tensor = state_indices_tensor
-
-        # Use the decode inference from original code
         return self._decode_infer(
-            q, k, v, metadata.kv_caches, metadata.state_indices_tensor, metadata
+            q, k, v, kv_caches, state_indices_tensor, self.forward_metadata
         )
+
+    def forward_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: torch.Tensor,
+        state_indices_tensor: torch.Tensor,
+        slope_rates: torch.Tensor,
+        is_decode_only: bool = False,
+    ) -> torch.Tensor:
+
+        if is_decode_only:
+            num_prefill_tokens = getattr(self.forward_metadata, "num_prefill_tokens", 0)
+            num_prefills = getattr(self.forward_metadata, "num_prefills", 0)
+
+            q = q[num_prefill_tokens:].unsqueeze(2).contiguous()
+            k = k[num_prefill_tokens:].unsqueeze(2).contiguous()
+            v = v[num_prefill_tokens:].unsqueeze(2).contiguous()
+
+            if (
+                state_indices_tensor is not None
+                and len(state_indices_tensor) > num_prefills
+            ):
+                slot_id = state_indices_tensor[num_prefills:]
+            else:
+                decode_batch_size = q.shape[0]
+                slot_id = torch.arange(
+                    decode_batch_size, dtype=torch.long, device=q.device
+                )
+
+            return linear_decode_forward_triton(
+                q, k, v, kv_cache, slope_rates, slot_id, 32
+            )
+        else:
+            return self._prefill_and_mix_infer(
+                q, k, v, kv_cache, state_indices_tensor, self.forward_metadata
+            )
 
     def support_triton(self) -> bool:
         """Check if the current backend supports triton."""

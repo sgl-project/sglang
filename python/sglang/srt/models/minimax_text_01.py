@@ -369,43 +369,28 @@ class MiniMaxText01LinearAttention(nn.Module):
         qkvact = qkvact.view((qkv.shape[0], self.tp_heads, -1))
         q, k, v = torch.split(qkvact, [self.head_dim] * 3, dim=-1)
 
-        # Use the lightning attention backend with pre-initialized metadata
-        # Metadata should be initialized at the model level using forward_batch
         if attn_backend.forward_metadata is None:
             raise RuntimeError(
-                "LightningAttnBackend metadata should be initialized at model level"
+                "LightningAttnBackend metadata should be initialized by model_runner"
             )
 
-        # Get metadata from backend
         metadata = attn_backend.forward_metadata
-
-        # Update metadata with current layer's cache and slope information
-        if hasattr(metadata, "kv_caches"):
-            metadata.kv_caches = kv_caches.minimax_cache
-        if hasattr(metadata, "state_indices_tensor"):
-            metadata.state_indices_tensor = kv_caches.state_indices_tensor
-        if hasattr(metadata, "slope_rates"):
+        if not hasattr(metadata, "_slope_rates_set") or metadata._slope_rates_set != id(
+            self
+        ):
             metadata.slope_rates = self.tp_slope
+            metadata._slope_rates_set = id(self)
 
         decode_only = metadata.num_prefills == 0
-        if not decode_only:
-            hidden = attn_backend._prefill_and_mix_infer(
-                q,
-                k,
-                v,
-                metadata.kv_caches,
-                metadata.state_indices_tensor,
-                metadata,
-            )
-        else:
-            hidden = attn_backend._decode_infer(
-                q,
-                k,
-                v,
-                metadata.kv_caches,
-                metadata.state_indices_tensor,
-                metadata,
-            )
+        hidden = attn_backend.forward_attention(
+            q,
+            k,
+            v,
+            kv_caches.minimax_cache,
+            kv_caches.state_indices_tensor,
+            self.tp_slope,
+            is_decode_only=decode_only,
+        )
 
         hidden = self.norm._forward(hidden)
         gate, _ = self.output_gate(hidden_states)
@@ -1052,10 +1037,17 @@ class MiniMaxText01Model(nn.Module):
             state_indices_tensor,
         ) = self.minimax_cache.current_run_tensors(**kwargs)
 
-        # Update the backend's metadata with cache information
         if attn_backend.forward_metadata is not None:
-            attn_backend.forward_metadata.kv_caches = minimax_cache_tensors
-            attn_backend.forward_metadata.state_indices_tensor = state_indices_tensor
+            if not hasattr(
+                attn_backend.forward_metadata, "_last_cache_id"
+            ) or attn_backend.forward_metadata._last_cache_id != id(
+                minimax_cache_tensors
+            ):
+                attn_backend.forward_metadata.kv_caches = minimax_cache_tensors
+                attn_backend.forward_metadata.state_indices_tensor = (
+                    state_indices_tensor
+                )
+                attn_backend.forward_metadata._last_cache_id = id(minimax_cache_tensors)
 
         if get_pp_group().is_first_rank:
             if inputs_embeds is None:
