@@ -172,6 +172,7 @@ def cutlass_w4a8_moe(
         sgl_per_tensor_quant_fp8(
             gateup_input_origin, gateup_input, a1_scale.float(), True
         )
+        m = gateup_input_origin.size(0)
 
     else:
         a_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
