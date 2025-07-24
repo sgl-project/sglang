@@ -478,6 +478,7 @@ impl Router {
         }
     }
 
+    // TODO (rui): Better accommodate to the Worker abstraction
     fn extract_dp_rank(worker_url: &str) -> Result<(&str, usize), String> {
         let parts: Vec<&str> = worker_url.split('@').collect();
         if parts.len() != 2 {
