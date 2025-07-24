@@ -172,7 +172,7 @@ impl BasicWorker {
             }
             // Ensure the second part (the dp_rank) can be parsed as an integer
             match parts[1].parse::<usize>() {
-                Ok(_) => Ok((parts[0])),  // Only need the first part
+                Ok(_) => Ok(parts[0]),
                 Err(_) => Err(WorkerError::InvalidUrl { url: self.url().to_string() }),
             }
         } else {
