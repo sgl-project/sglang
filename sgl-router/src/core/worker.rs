@@ -168,12 +168,16 @@ impl BasicWorker {
             // Need to extract the URL from "http://host:port@dp_rank"
             let parts: Vec<&str> = self.url().split('@').collect();
             if parts.len() != 2 {
-                return Err(WorkerError::InvalidUrl { url: self.url().to_string() });
+                return Err(WorkerError::InvalidUrl {
+                    url: self.url().to_string(),
+                });
             }
             // Ensure the second part (the dp_rank) can be parsed as an integer
             match parts[1].parse::<usize>() {
                 Ok(_) => Ok(parts[0]),
-                Err(_) => Err(WorkerError::InvalidUrl { url: self.url().to_string() }),
+                Err(_) => Err(WorkerError::InvalidUrl {
+                    url: self.url().to_string(),
+                }),
             }
         } else {
             Ok(self.url())

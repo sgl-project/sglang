@@ -179,10 +179,7 @@ impl Router {
         }
     }
 
-    fn get_worker_dp_size(
-        worker_url: &str,
-        api_key: &Option<String>
-    ) -> Result<usize, String> {
+    fn get_worker_dp_size(worker_url: &str, api_key: &Option<String>) -> Result<usize, String> {
         let sync_client = reqwest::blocking::Client::new();
         let mut req_builder = sync_client.get(&format!("{}/get_server_info", worker_url));
         if let Some(key) = api_key {
@@ -192,7 +189,8 @@ impl Router {
         match req_builder.send() {
             Ok(res) => {
                 if res.status().is_success() {
-                    let server_info = res.text()
+                    let server_info = res
+                        .text()
                         .map_err(|e| format!("failed to read text from response: {}", e))?;
 
                     let server_info: serde_json::Value = serde_json::from_str(&server_info)
@@ -211,7 +209,7 @@ impl Router {
                 } else {
                     Err(format!("unexpected status code: {}", res.status()))
                 }
-            },
+            }
             Err(e) => Err(format!("error response: {}", e)),
         }
     }
@@ -229,7 +227,7 @@ impl Router {
                     for i in 0..dp_size {
                         dp_aware_workers.push(format!("{}@{}", url, i));
                     }
-                },
+                }
                 Err(e) => return Err(format!("Failed to get DP size for {}: {}", url, e)),
             }
         }
@@ -262,7 +260,7 @@ impl Router {
                 Err(e) => {
                     error!("Failed to extract dp_rank: {}", e);
                     return HttpResponse::InternalServerError().finish();
-                },
+                }
             };
             worker_url_prefix
         } else {
@@ -488,7 +486,10 @@ impl Router {
         // Parse the second part (dp_rank) into an integer
         match parts[1].parse::<usize>() {
             Ok(dp_rank) => Ok((parts[0], dp_rank)),
-            Err(_) => Err(format!("failed to parse dp_rank from worker_url: {}", worker_url)),
+            Err(_) => Err(format!(
+                "failed to parse dp_rank from worker_url: {}",
+                worker_url
+            )),
         }
     }
 
@@ -516,24 +517,31 @@ impl Router {
                 Err(e) => {
                     error!("Failed to extract dp_rank: {}", e);
                     return HttpResponse::InternalServerError().finish();
-                },
+                }
             };
 
             // Parse the request body
             let mut json_val = match serde_json::to_value(typed_req) {
                 Ok(j) => j,
-                Err(e) => return HttpResponse::BadRequest()
-                    .body(format!("Convert into serde_json::Value failed: {}", e)),
+                Err(e) => {
+                    return HttpResponse::BadRequest()
+                        .body(format!("Convert into serde_json::Value failed: {}", e));
+                }
             };
 
             // Insert the data_parallel_rank field
             if let Some(map) = json_val.as_object_mut() {
-                map.insert(String::from("data_parallel_rank"), serde_json::json!(dp_rank));
-                debug!("Modified request body: {}",
-                    serde_json::to_string(&json_val).unwrap_or(String::from("ERR")));
+                map.insert(
+                    String::from("data_parallel_rank"),
+                    serde_json::json!(dp_rank),
+                );
+                debug!(
+                    "Modified request body: {}",
+                    serde_json::to_string(&json_val).unwrap_or(String::from("ERR"))
+                );
             } else {
                 return HttpResponse::BadRequest()
-                    .body("Failed to insert the data_parallel_rank field into the request body")
+                    .body("Failed to insert the data_parallel_rank field into the request body");
             }
 
             client
@@ -848,7 +856,7 @@ impl Router {
                 Err(e) => {
                     error!("Failed to extract dp_rank: {}", e);
                     return None;
-                },
+                }
             };
             worker_url_prefix
         } else {
@@ -939,7 +947,7 @@ impl Router {
                 Err(e) => {
                     debug!("Failed to extract dp_rank: {}", e);
                     return None;
-                },
+                }
             };
             worker_url_prefix
         } else {
@@ -1105,7 +1113,7 @@ impl RouterTrait for Router {
                     Err(e) => {
                         error!("Failed to extract dp_rank: {}", e);
                         return HttpResponse::InternalServerError().finish();
-                    },
+                    }
                 };
                 worker_url_prefix
             } else {
