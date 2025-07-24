@@ -14,15 +14,15 @@ logger = logging.getLogger(__name__)
 
 
 def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
-	hasher = hashlib.sha256()
+    hasher = hashlib.sha256()
 
-	if prior_hash:
-		hasher.update(bytes.fromhex(prior_hash))
+    if prior_hash:
+        hasher.update(bytes.fromhex(prior_hash))
 
-	for t in token_ids:
-		hasher.update(t.to_bytes(4, byteorder="little", signed=False))
+    for t in token_ids:
+        hasher.update(t.to_bytes(4, byteorder="little", signed=False))
 
-	return hasher.hexdigest()
+    return hasher.hexdigest()
 
 def get_hash_str_mooncake(
 	prefix_block_key: str, current_page_ids: List, local_rank: int
