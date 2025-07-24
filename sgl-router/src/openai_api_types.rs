@@ -91,6 +91,10 @@ pub struct CompletionRequest {
     /// If specified, our system will make a best effort to sample deterministically
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
+
+    /// Additional fields including bootstrap info for PD routing
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 impl GenerationRequest for CompletionRequest {
