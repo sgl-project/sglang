@@ -218,8 +218,8 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(result)
 
-        self.assertLess(res["median_e2e_latency_ms"], 8800)
-        self.assertLess(res["median_ttft_ms"], 130)
+        self.assertLess(res["median_e2e_latency_ms"], 5400)
+        self.assertLess(res["median_ttft_ms"], 88)
 
     def test_lora_online_latency_with_concurrent_adapter_updates(self):
         # TODO (lifuhuang): verify LoRA support in AMD.
@@ -238,10 +238,10 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(result)
 
-        self.assertLess(res["median_e2e_latency_ms"], 12000)
+        self.assertLess(res["median_e2e_latency_ms"], 7600)
 
         # TODO (lifuhuang): This will be fixed by the overlapped LoRA update in a separate PR.
-        self.assertLess(res["median_ttft_ms"], 5500)
+        self.assertLess(res["median_ttft_ms"], 3300)
 
     def _run_lora_latency_test(self, enable_background_task: bool):
         """
