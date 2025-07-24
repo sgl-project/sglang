@@ -35,7 +35,7 @@ class SchedulerMultiplexMixin:
             set_current_stream_idx(1)
         elif not self.running_batch.is_empty():
             set_current_stream_idx(2)
-        elif self.split_prefill_batch:
+        else:
             set_current_stream_idx(0)
 
         stream_idx = get_current_stream_idx()
@@ -64,7 +64,7 @@ class SchedulerMultiplexMixin:
         prefill_done = False
         wait_prefill_kernel_done = False
         adjust_stream_group = False
-        stream_idx = 0
+        stream_idx = get_current_stream_idx()
         stream_group = self.stream_groups[stream_idx]
         prefill_stream = stream_group[0]
         decode_stream = stream_group[1]
@@ -74,23 +74,25 @@ class SchedulerMultiplexMixin:
         logger.debug(
             f"sm_counts: {len(self.sm_counts)}\n mem:{torch.cuda.memory_allocated()}"
         )
-
         while True:
-            with torch.cuda.stream(prefill_stream):
-                set_pdmux_status(True)
+            with torch.cuda.stream(decode_stream):
+                set_pdmux_status(False)
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
+
+            with torch.cuda.stream(prefill_stream):
+                set_pdmux_status(True)
+                sm_count = self.sm_counts[stream_idx][0]
                 if not wait_prefill_kernel_done:
-                    sm_count = self.sm_counts[stream_idx][0]
                     adjust_stream_group = (
                         self.update_split_prefill_batch(sm_count) or adjust_stream_group
                     )
+
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
                 self.running_batch = self.update_running_batch(self.running_batch)
                 adjust_stream_group = adjust_stream_group or (
-                    stream_idx > 0
-                    and (self.running_batch is None or self.running_batch.is_empty())
+                    stream_idx > 0 and self.running_batch.is_empty()
                 )
                 if self.running_batch.is_empty() and self.split_prefill_batch is None:
                     # print(f"Running batch is None or empty, stream_idx: {stream_idx}, sm_counts: {self.sm_counts}")
@@ -177,18 +179,19 @@ class SchedulerMultiplexMixin:
                         if prefill_exe_done_flag
                         else torch.zeros(1, device="cpu", dtype=torch.int32)
                     )
-                else:
-                    flags = torch.zeros(1, device="cpu", dtype=torch.int32)
 
-                self.tp_cpu_group.allreduce(flags, dist.ReduceOp.SUM).wait()
-                if flags.item() == self.tp_size:
-                    # logger.debug(f"Processing prefill batch result...")
-                    self.process_batch_result(self.split_prefill_batch, prefill_result)
-                    if self.running_batch and not self.running_batch.is_empty():
-                        self.running_batch.merge_batch(self.split_prefill_batch)
-                    else:
-                        self.running_batch = self.split_prefill_batch
+                    self.tp_cpu_group.allreduce(flags, dist.ReduceOp.SUM).wait()
+                    # print(f"Flags after allreduce: {flags.item()}")
+                    if flags.item() == self.tp_size:
+                        # logger.debug(f"Processing prefill batch result...")
+                        self.process_batch_result(
+                            self.split_prefill_batch, prefill_result
+                        )
+                        if self.running_batch and not self.running_batch.is_empty():
+                            self.running_batch.merge_batch(self.split_prefill_batch)
+                        else:
+                            self.running_batch = self.split_prefill_batch
 
-                    self.split_prefill_batch = None
-                    wait_prefill_kernel_done = False
-                    adjust_stream_group = True
+                        self.split_prefill_batch = None
+                        wait_prefill_kernel_done = False
+                        adjust_stream_group = True
