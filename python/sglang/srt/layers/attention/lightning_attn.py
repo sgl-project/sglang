@@ -178,6 +178,20 @@ class LightningAttnBackend(AttentionBackend):
         if self.slope_rates is None:
             self.slope_rates = build_slope_tensor(self.num_heads)
 
+        # Pre-allocate CUDA graph buffers
+        self.cuda_graph_seq_lens = torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
+        )
+        self.cuda_graph_query_start_loc = torch.zeros(
+            max_bs + 1, dtype=torch.int32, device=self.device
+        )
+        self.cuda_graph_context_lens = torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
+        )
+
+        # Metadata buffers for CUDA graph
+        self.cuda_graph_metadata = None
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -190,15 +204,50 @@ class LightningAttnBackend(AttentionBackend):
     ):
         """Initialize metadata for CUDA graph capture."""
 
-        class DummyForwardBatch:
-            def __init__(self):
-                self.batch_size = bs
-                self.seq_lens = seq_lens
-                self.forward_mode = forward_mode
-                self.extend_seq_lens = None
+        # Copy seq_lens to pre-allocated buffer
+        self.cuda_graph_seq_lens[:bs] = seq_lens[:bs]
+        self.cuda_graph_context_lens[:bs] = seq_lens[:bs]
 
-        dummy_batch = DummyForwardBatch()
-        self.forward_metadata = self._create_metadata_from_forward_batch(dummy_batch)
+        # Determine extend lengths based on forward mode
+        if forward_mode.is_decode_or_idle():
+            # Decode mode: each request generates 1 token
+            extend_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
+            num_prefills = 0
+            num_prefill_tokens = 0
+            num_decode_tokens = bs
+        else:
+            # Extend/prefill mode: vary based on actual extend lengths
+            # For simplicity in CUDA graph, assume 1 token per request during capture
+            extend_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
+            num_prefills = bs
+            num_prefill_tokens = bs
+            num_decode_tokens = 0
+
+        # Compute query start locations
+        self.cuda_graph_query_start_loc[: bs + 1] = torch.nn.functional.pad(
+            torch.cumsum(extend_lens, dim=0, dtype=torch.int32), (1, 0)
+        )
+
+        # Get kv caches and state indices if available from spec_info or other sources
+        kv_caches = None
+        state_indices_tensor = None
+        if hasattr(self, "kv_caches"):
+            kv_caches = self.kv_caches
+
+        # Create metadata for CUDA graph capture
+        self.cuda_graph_metadata = LightningAttentionMetadata(
+            num_prefills=num_prefills,
+            num_prefill_tokens=num_prefill_tokens,
+            num_decode_tokens=num_decode_tokens,
+            query_start_loc=self.cuda_graph_query_start_loc[: bs + 1],
+            context_lens_tensor=self.cuda_graph_context_lens[:bs],
+            rotary_emb=None,
+            kv_caches=kv_caches,
+            state_indices_tensor=state_indices_tensor,
+            slope_rates=self.slope_rates,
+        )
+
+        self.forward_metadata = self.cuda_graph_metadata
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -213,16 +262,51 @@ class LightningAttnBackend(AttentionBackend):
     ):
         """Initialize metadata for CUDA graph replay."""
 
-        # Similar to capture, but might need to update some fields
-        class DummyForwardBatch:
-            def __init__(self):
-                self.batch_size = bs
-                self.seq_lens = seq_lens
-                self.forward_mode = forward_mode  # Use the provided forward_mode
-                self.extend_seq_lens = None
+        # Update seq_lens in pre-allocated buffer (critical path - must be fast)
+        self.cuda_graph_seq_lens[:bs] = seq_lens[:bs]
+        self.cuda_graph_context_lens[:bs] = seq_lens[:bs]
 
-        dummy_batch = DummyForwardBatch()
-        self.forward_metadata = self._create_metadata_from_forward_batch(dummy_batch)
+        # Determine extend lengths based on forward mode
+        if forward_mode.is_decode_or_idle():
+            # Decode mode: each request generates 1 token
+            extend_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
+            num_prefills = 0
+            num_prefill_tokens = 0
+            num_decode_tokens = bs
+        else:
+            # Extend/prefill mode: for CUDA graph replay, typically still 1 token per request
+            extend_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
+            num_prefills = bs
+            num_prefill_tokens = bs
+            num_decode_tokens = 0
+
+        # Update query start locations
+        self.cuda_graph_query_start_loc[: bs + 1] = torch.nn.functional.pad(
+            torch.cumsum(extend_lens, dim=0, dtype=torch.int32), (1, 0)
+        )
+
+        # Update metadata for replay (reuse the same metadata object to avoid allocation)
+        if self.cuda_graph_metadata is not None:
+            # Update existing metadata in-place for performance
+            self.cuda_graph_metadata.num_prefills = num_prefills
+            self.cuda_graph_metadata.num_prefill_tokens = num_prefill_tokens
+            self.cuda_graph_metadata.num_decode_tokens = num_decode_tokens
+            # Note: query_start_loc and context_lens_tensor already point to the updated buffers
+        else:
+            # Fallback: create new metadata (should not happen in normal replay)
+            self.cuda_graph_metadata = LightningAttentionMetadata(
+                num_prefills=num_prefills,
+                num_prefill_tokens=num_prefill_tokens,
+                num_decode_tokens=num_decode_tokens,
+                query_start_loc=self.cuda_graph_query_start_loc[: bs + 1],
+                context_lens_tensor=self.cuda_graph_context_lens[:bs],
+                rotary_emb=None,
+                kv_caches=getattr(self, "kv_caches", None),
+                state_indices_tensor=getattr(self, "state_indices_tensor", None),
+                slope_rates=self.slope_rates,
+            )
+
+        self.forward_metadata = self.cuda_graph_metadata
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get fill value for padded sequence lengths."""
@@ -238,17 +322,51 @@ class LightningAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        """Forward pass for extend/prefill mode."""
+        """Forward pass for extend/prefill mode.
+
+        Used for:
+        - Prefill: Processing initial prompt tokens
+        - Prefill with KV cache: Processing with existing KV cache
+        - Target verification: Verifying draft tokens
+        """
         if self.forward_metadata is None:
             self.init_forward_metadata(forward_batch)
 
         # Save KV cache if requested
         if save_kv_cache and k is not None and v is not None:
+            cache_loc = (
+                forward_batch.out_cache_loc
+                if not layer.is_cross_attention
+                else getattr(
+                    forward_batch, "encoder_out_cache_loc", forward_batch.out_cache_loc
+                )
+            )
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer,
+                cache_loc,
+                k,
+                v,
+                getattr(layer, "k_scale", 1.0),
+                getattr(layer, "v_scale", 1.0),
             )
 
         metadata = self.forward_metadata
+
+        # Get KV cache and state indices
+        kv_caches = None
+        state_indices_tensor = None
+
+        if hasattr(forward_batch, "token_to_kv_pool"):
+            kv_caches = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+        if hasattr(forward_batch, "req_pool_indices"):
+            state_indices_tensor = forward_batch.req_pool_indices
+
+        # Update metadata with actual KV cache info
+        if kv_caches is not None:
+            metadata.kv_caches = kv_caches
+        if state_indices_tensor is not None:
+            metadata.state_indices_tensor = state_indices_tensor
 
         # Use the prefill and mixed inference from original code
         return self._prefill_and_mix_infer(
@@ -265,17 +383,50 @@ class LightningAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        """Forward pass for decode mode."""
+        """Forward pass for decode mode.
+
+        Used for:
+        - Normal decode: Generating next token
+        - Draft decode: Generating draft tokens for speculation
+        """
         if self.forward_metadata is None:
             self.init_forward_metadata(forward_batch)
 
         # Save KV cache if requested
         if save_kv_cache and k is not None and v is not None:
+            cache_loc = (
+                forward_batch.out_cache_loc
+                if not layer.is_cross_attention
+                else getattr(
+                    forward_batch, "encoder_out_cache_loc", forward_batch.out_cache_loc
+                )
+            )
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer,
+                cache_loc,
+                k,
+                v,
+                getattr(layer, "k_scale", 1.0),
+                getattr(layer, "v_scale", 1.0),
             )
 
         metadata = self.forward_metadata
+
+        # Get KV cache and state indices
+        kv_caches = None
+        state_indices_tensor = None
+
+        if hasattr(forward_batch, "token_to_kv_pool"):
+            kv_caches = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+        if hasattr(forward_batch, "req_pool_indices"):
+            state_indices_tensor = forward_batch.req_pool_indices
+
+        # Update metadata with actual KV cache info
+        if kv_caches is not None:
+            metadata.kv_caches = kv_caches
+        if state_indices_tensor is not None:
+            metadata.state_indices_tensor = state_indices_tensor
 
         # Use the decode inference from original code
         return self._decode_infer(
