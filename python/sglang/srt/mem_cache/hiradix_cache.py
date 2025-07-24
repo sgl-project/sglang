@@ -1,17 +1,14 @@
-import hashlib
 import heapq
 import logging
 import threading
 import time
 from typing import List, Optional
 
-import numpy as np
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-from sglang.srt.managers.schedule_batch import Req, WaitingStatus
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -586,7 +583,6 @@ class HiRadixCache(RadixCache):
         return new_node
 
     def _insert_helper(self, node: TreeNode, key: List, value):
-        total_key = key
         node.last_access_time = time.monotonic()
         if len(key) == 0:
             return 0
@@ -607,8 +603,8 @@ class HiRadixCache(RadixCache):
                     self.token_to_kv_pool_host.update_synced(node.host_value)
                     self.evictable_size_ += len(node.value)
                 else:
-                    total_prefix_length += prefix_len
                     self.inc_hit_count(node)
+                    total_prefix_length += prefix_len
             else:
                 # partial match, split the node
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -617,8 +613,8 @@ class HiRadixCache(RadixCache):
                     self.token_to_kv_pool_host.update_synced(new_node.host_value)
                     self.evictable_size_ += len(new_node.value)
                 else:
-                    total_prefix_length += prefix_len
                     self.inc_hit_count(new_node)
+                    total_prefix_length += prefix_len
                 node = new_node
 
             key = key[prefix_len:]
