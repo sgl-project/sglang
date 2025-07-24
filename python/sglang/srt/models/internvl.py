@@ -66,9 +66,11 @@ class InternAttention(nn.Module):
             use_qkv_parallel=True,
             quant_config=quant_config,
             dropout=getattr(config, "dropout", 0.0),
-            qkv_bias=getattr(config, "qkv_bias", False),
+            qkv_bias=getattr(config, "qkv_bias", False)
+            or getattr(config, "attention_bias", False),
             num_dummy_heads=getattr(config, "num_dummy_heads", 0),
-            qk_normalization=getattr(config, "qk_normalization", False),
+            qk_normalization=getattr(config, "qk_normalization", False)
+            or getattr(config, "use_qk_norm", False),
             flatten_batch=False,
         )
 
@@ -89,8 +91,16 @@ class InternVisionEmbeddings(nn.Module):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
-        self.image_size = config.image_size
-        self.patch_size = config.patch_size
+        self.image_size = (
+            config.image_size
+            if isinstance(config.image_size, int)
+            else config.image_size[0]
+        )
+        self.patch_size = (
+            config.patch_size
+            if isinstance(config.patch_size, int)
+            else config.patch_size[0]
+        )
 
         self.class_embedding = nn.Parameter(
             torch.randn(1, 1, self.embed_dim),
