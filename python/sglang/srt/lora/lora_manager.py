@@ -186,7 +186,7 @@ class LoRAManager:
         )
         if incompatible:
             raise ValueError(
-                f"LoRA adapter {lora_name} with rank {lora_config.r} is incompatible with the current LoRA memory pool configuration. "
+                f"LoRA adapter {lora_name} with rank {lora_config.r} and extra_vocab_size {lora_config.extra_vocab_size} is incompatible with the current LoRA memory pool configuration. "
                 "Please ensure that the LoRA adapter's rank is within the configured `--max_lora_rank` and that the target modules are "
                 "included in `--enable_lora_modules`."
             )
@@ -387,7 +387,6 @@ class LoRAManager:
             i: {} for i in range(self.base_hf_config.num_hidden_layers)
         }
 
-        self.max_extra_vocab_size: int = 0
         # Look-up table that essentially maps (layer_name, module_name) to the corresponding LoRA embeddings module.
         self.lora_embeddings_modules: Dict[str, BaseLayerWithLoRA] = {}
 
@@ -429,6 +428,11 @@ class LoRAManager:
                     [x.hf_config["r"] for x in self.configs.values()],
                     default=0,
                 )
+
+            self.max_extra_vocab_size = max(
+                [x.extra_vocab_size for x in self.configs.values()],
+                default=0,
+            )
 
             self.update_lora_weight_names()
             self.update_lora_modules()
@@ -479,12 +483,6 @@ class LoRAManager:
             if name not in self.configs:
                 logger.info(f"Unloading LoRA adapter {name}")
                 del self.loras[name]
-
-        # Current max extra vocab size
-        for name, lora in self.loras.items():
-            self.max_extra_vocab_size = max(
-                self.max_extra_vocab_size, lora.extra_vocab_size
-            )
 
         # Additional checks for flashinfer backend
         # FIXME remove the restrictions after supporting multi-rank for flashinfer backend

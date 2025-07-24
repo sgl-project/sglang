@@ -71,7 +71,6 @@ class LoRAAdapter(nn.Module):
 
         self.weights: Dict[str, torch.Tensor] = {}
         self.new_embeddings: Dict[str, torch.Tensor] = {}
-        self.extra_vocab_size: int = 0
 
     # initialize the LoRA weights to cpu
     def initialize_weights(self):
@@ -89,7 +88,6 @@ class LoRAAdapter(nn.Module):
                 self.layers[layer_id].weights[name] = loaded_weight.cpu()
             elif "input_embeddings" in name:
                 self.new_embeddings[name] = loaded_weight.cpu()
-                self.extra_vocab_size = loaded_weight.shape[0]
             else:
                 self.weights[name] = loaded_weight.cpu()
 

@@ -81,6 +81,8 @@ class LoRAMemoryPool:
             """
             if config.r > self.max_lora_rank:
                 return False
+            if config.extra_vocab_size > self.max_extra_vocab_size:
+                return False
             weights_a, weights_b = get_normalized_lora_weight_names(
                 config.target_modules
             )
@@ -357,7 +359,7 @@ class LoRAMemoryPool:
 
         # Load embeddings weights to buffer
         org_vocab_size = self.base_hf_config.vocab_size
-        extra_vocab_size = lora_adapter.extra_vocab_size
+        extra_vocab_size = lora_adapter.config.extra_vocab_size
         if lora_adapter.new_embeddings:
             for name, weights in lora_adapter.new_embeddings.items():
                 if "input_embeddings" in name:
