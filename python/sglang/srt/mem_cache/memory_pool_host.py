@@ -98,7 +98,7 @@ class HostKVCache(abc.ABC):
     @abc.abstractmethod
     def init_kv_buffer(self):
         raise NotImplementedError()
-    
+
     @abc.abstractmethod
     def get_flat_data_page(self, index) -> torch.Tensor:
         """
@@ -240,7 +240,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
         )
-    
+
     # todo, page first memory layout
     def get_flat_data_page(self, index) -> torch.Tensor:
         return self.kv_buffer[:, :, index : index + self.page_size, :, :].flatten()
@@ -324,7 +324,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
         )
-    
+
     def get_flat_data_page(self, index) -> torch.Tensor:
         return self.kv_buffer[:, index : index + self.page_size, :, :].flatten()
 
