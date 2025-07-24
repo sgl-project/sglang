@@ -112,7 +112,7 @@ def _preprocess_tensor_for_update_weights(tensor: torch.Tensor):
         tensor: The tensor to be preprocessed.
 
     Returns:
-        The full tensor.
+        The full tensor if it is a DTensor, otherwise the original tensor.
     """
     if isinstance(tensor, DTensor):
         return tensor.full_tensor()
