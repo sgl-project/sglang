@@ -692,7 +692,7 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 (last_loc + 2) % self.page_size == seq_lens % self.page_size
             )
 
-        need_new_pages = (seq_lens % page_size == 1).int()
+        need_new_pages = (seq_lens % self.page_size == 1).int()
         num_new_pages = need_new_pages.sum().item()
 
         if num_new_pages > len(self.free_pages):
@@ -706,9 +706,9 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if len(self.free_pages) == 0:
             out_indices = (last_loc + 1) * (1 - need_new_pages)
         else:
-            out_indices = (last_loc + 1) * (1 - need_new_pages) + free_pages[
+            out_indices = (last_loc + 1) * (1 - need_new_pages) + self.free_pages[
                 start_new_pages
-            ] * page_size * need_new_pages
+            ] * self.page_size * need_new_pages
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
