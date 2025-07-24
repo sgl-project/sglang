@@ -243,7 +243,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         topk_idx = topk_idx.to(torch.int64)
-        # TODO gjw
         if os.getenv("USE_W4A8") == "1":
             hidden_states = hidden_states
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
