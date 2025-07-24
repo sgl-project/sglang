@@ -125,7 +125,9 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             }
         ]
 
-        messages = [{"role": "user", "content": "What is the temperature in Paris?"}]
+        messages = [
+            {"role": "user", "content": "What is the temperature in Paris in celsius?"}
+        ]
 
         response_stream = client.chat.completions.create(
             model=self.model,
@@ -213,8 +215,9 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         )
 
         argument_fragments = []
+        chunks = list(response_stream)
         function_name = None
-        for chunk in response_stream:
+        for chunk in chunks:
             choice = chunk.choices[0]
             if choice.delta.tool_calls:
                 tool_call = choice.delta.tool_calls[0]
@@ -229,6 +232,13 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         self.assertTrue(
             len(joined_args) > 0,
             "No parameter fragments were returned in the function call",
+        )
+
+        finish_reason = chunks[-1].choices[0].finish_reason
+        self.assertEqual(
+            finish_reason,
+            "tool_calls",
+            "Final response of function calling should have finish_reason 'tool_calls'",
         )
 
         # Check whether the concatenated JSON is valid
