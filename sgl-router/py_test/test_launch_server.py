@@ -134,6 +134,7 @@ def popen_launch_server(
     model: str,
     base_url: str,
     timeout: float,
+    api_key: str = None,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -151,6 +152,9 @@ def popen_launch_server(
         "--base-gpu-id",
         "1",
     ]
+
+    if api_key is not None:
+        command.extend(["--api-key", api_key])
 
     process = subprocess.Popen(command, stdout=None, stderr=None)
 
@@ -518,6 +522,26 @@ class TestLaunchServer(unittest.TestCase):
         passed = score >= THRESHOLD
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
+
+        # 6. Start another worker with api_key set
+        port = find_available_port()
+        worker_url = f"http://127.0.0.1:{port}"
+        worker_process = popen_launch_server(
+            self.model,
+            worker_url,
+            DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key="correct_api_key",
+        )
+        self.other_process.append(worker_process)
+
+        # 7. Use the /add_worker API to add it to the router
+        # Should fail since the router would contact the worker's
+        # /get_server_info endpoint for the dp_size info, but it
+        # has no knowledge of the api key
+        with requests.Session() as session:
+            response = session.post(f"{self.base_url}/add_worker?url={worker_url}")
+            print(f"status code: {response.status_code}, response: {response.text}")
+            self.assertNotEqual(response.status_code, 200)
 
     def test_8_lazy_fault_tolerance_with_dp_aware(self):
         print("Running test_8_lazy_fault_tolerance_with_dp_aware...")
