@@ -121,6 +121,8 @@ from sglang.srt.utils import (
     set_cuda_arch,
 )
 
+from sglang.srt.mem_cache.memory_pool import MultiLevelKVCache
+
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -1196,7 +1198,24 @@ class ModelRunner:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
-
+        if self.server_args.use_multilevel_backend:
+            logger.info("using MultiLevelKVCache")
+            self.token_to_kv_pool = MultiLevelKVCache(
+                self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(
+                    get_attention_tp_size()
+                ),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                gpu_cache=self.token_to_kv_pool,
+                disk_cache_max_capacity_gb = self.server_args.disk_cache_max_capacity_gb,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+            )
         if self.token_to_kv_pool_allocator is None:
             if self.page_size == 1:
                 if self.is_hybrid:
@@ -1233,11 +1252,17 @@ class ModelRunner:
                     )
         else:
             assert self.is_draft_worker
-
-        logger.info(
-            f"Memory pool end. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
+        if self.server_args.disk_cache_max_capacity_gb > 0:
+            logger.info(
+                f"Memory pool end. "
+                f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+                f"avail disk={disk_cache_max_capacity_gb} GB"
+            )
+        else:
+            logger.info(
+                f"Memory pool end. "
+                f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            )
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""

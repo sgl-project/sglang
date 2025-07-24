@@ -80,6 +80,8 @@ class ServerArgs:
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
     page_size: int = 1
+    use_multilevel_backend: bool = False
+    disk_cache_max_capacity_gb: int = 0
 
     # Other runtime options
     tp_size: int = 1
@@ -851,6 +853,17 @@ class ServerArgs:
                 "(0.0 = pure uniform: swa_size / full_size = 1)"
                 "(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length)"
             ),
+        )
+        parser.add_argument(
+            "--use-multilevel-backend",
+            action="store_true",
+            help="If using multi-level backend as kv cache.",
+        )
+        parser.add_argument(
+            "--disk-cache-max-capacity-gb",
+            type=int,
+            default=ServerArgs.disk_cache_max_capacity_gb,
+            help="The maximum capacity limit of disk kv cache.",
         )
 
         # Other runtime options
