@@ -15,8 +15,8 @@ from sglang.srt.multimodal.processors.base_processor import (
 class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
     models = [MiniCPMV, MiniCPMO]
 
-    def __init__(self, hf_config, server_args, _processor, *args):
-        super().__init__(hf_config, server_args, _processor, *args)
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         # Collect special token ids
         tokenizer = self._processor.tokenizer
         self.slice_start_id = getattr(tokenizer, "slice_start_id", None)

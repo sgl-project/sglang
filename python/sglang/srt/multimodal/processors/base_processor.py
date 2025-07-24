@@ -143,7 +143,9 @@ class MultimodalSpecialTokens:
 class BaseMultimodalProcessor(ABC):
     models = []
 
-    def __init__(self, hf_config, server_args, _processor, transport_mode):
+    def __init__(
+        self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
+    ):
         self.hf_config = hf_config
         self._processor = _processor
         self.arch = hf_config.architectures[0]
