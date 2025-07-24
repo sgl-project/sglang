@@ -76,6 +76,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         messages = [{"role": "user", "content": "Compute (3+5)"}]
         response = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -91,6 +92,83 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
 
         function_name = tool_calls[0].function.name
         assert function_name == "add", "Function name should be 'add'"
+
+    # This unit test is too difficult for default model. Mark it as optional unit tests so it won't trigger unless specified.
+    def _test_function_calling_multiturn(self):
+        """
+        Test: Whether the function call format returned by the AI is correct.
+        When returning a tool call, message.content should be None, and tool_calls should be a list.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "add",
+                    "description": "Compute the sum of two numbers",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "a": {
+                                "type": "int",
+                                "description": "A number",
+                            },
+                            "b": {
+                                "type": "int",
+                                "description": "A number",
+                            },
+                        },
+                        "required": ["a", "b"],
+                    },
+                },
+            }
+        ]
+
+        messages = [{"role": "user", "content": "Compute (3+5)"}]
+
+        response = client.chat.completions.create(
+            model=self.model,
+            max_tokens=2048,
+            messages=messages,
+            temperature=0.8,
+            top_p=0.8,
+            stream=False,
+            tools=tools,
+        )
+
+        tool_call = response.choices[0].message.tool_calls[0]
+        function_name = tool_call.function.name
+        assert function_name == "add", "Function name should be 'add'"
+        function_arguments = tool_call.function.arguments
+        assert (
+            function_arguments == '{"a": 3, "b": 5}'
+            or function_arguments == '{"a": "3", "b": "5"}'
+        ), 'Function arguments should be \'{"a": 3, "b": 5}\' or \'{"a": "3", "b": "5"}\''
+
+        messages.append(response.choices[0].message)
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": "8",
+                "name": function_name,
+            }
+        )
+
+        final_response = client.chat.completions.create(
+            model=self.model,
+            max_tokens=2048,
+            messages=messages,
+            temperature=0.8,
+            top_p=0.8,
+            stream=False,
+            tools=tools,
+        )
+
+        assert (
+            "8" in final_response.choices[0].message.content
+        ), "tool_call response should have the sum 8 in the content"
 
     def test_function_calling_streaming_simple(self):
         """
@@ -131,6 +209,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
 
         response_stream = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -207,6 +286,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
 
         response_stream = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.9,
             top_p=0.9,
@@ -291,6 +371,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         ]
         response = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -359,6 +440,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         messages = [{"role": "user", "content": "What is the capital of France?"}]
         response = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -446,6 +528,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         messages = [{"role": "user", "content": "What is the capital of France?"}]
         response = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -554,6 +637,7 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         response = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=self.PYTHONIC_MESSAGES,
             tools=self.PYTHONIC_TOOLS,
             temperature=0.1,
@@ -575,6 +659,7 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         response_stream = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=self.PYTHONIC_MESSAGES,
             tools=self.PYTHONIC_TOOLS,
             temperature=0.1,
