@@ -255,7 +255,7 @@ class HiCacheController:
                 self.storage_backend = HiCacheFile()
                 self.enable_storage = True
                 # todo: threshold policy for prefetching
-                self.prefetch_threshold = min(prefetch_threshold, self.page_size)
+                self.prefetch_threshold = max(prefetch_threshold, self.page_size)
             else:
                 raise NotImplementedError(
                     f"Unsupported storage backend: {storage_backend}"
@@ -664,7 +664,7 @@ class HiCacheController:
                 self.ack_backup_queue.put(
                     (
                         operation.id,
-                        operation.hash_value[:min_completed_tokens],
+                        operation.hash_value[: min_completed_tokens // self.page_size],
                         min_completed_tokens,
                     )
                 )
