@@ -121,6 +121,12 @@ def parse_args():
         default="random",
         help="Policy for popping requests from the ready queue (random or fifo)",
     )
+    parser.add_argument(
+        "--tag",
+        type=str,
+        default="",
+        help="Tag of a certain run in the log file",
+    )
     parser.add_argument("--seed", type=int, default=1, help="The random seed.")
     return parser.parse_args()
 
@@ -202,9 +208,9 @@ def gen_payload(prompt, output_len):
     return payload
 
 
-def log_to_jsonl_file(data, file_path="performance_metrics.jsonl"):
-    """Append the data with a timestamp to the specified JSONL file."""
-    timestamped_data = {"timestamp": datetime.now().isoformat(), **data}
+def log_to_jsonl_file(data, file_path="performance_metrics.jsonl", tag=""):
+    """Append the data with a timestamp and tag to the specified JSONL file."""
+    timestamped_data = {"timestamp": datetime.now().isoformat(), "tag": tag, **data}
     try:
         with open(file_path, "a") as file:
             file.write(
@@ -360,7 +366,7 @@ class WorkloadGenerator:
                     # append new request to client's history
                     self.client_records[client_id][
                         "history"
-                    ] += self.sub_question_inputs.pop()
+                    ] += self.sub_question_inputs.pop().prompt
                     self.ready_queue.append(
                         (
                             client_id,
@@ -428,7 +434,7 @@ class WorkloadGenerator:
         print(
             f"  Throughput: {performance_data['summary']['throughput']:.2f} requests per second"
         )
-        log_to_jsonl_file(performance_data, args.log_file)
+        log_to_jsonl_file(performance_data, args.log_file, tag=args.tag)
 
 
 if __name__ == "__main__":
