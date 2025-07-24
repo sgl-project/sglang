@@ -18,16 +18,21 @@ logger = logging.getLogger(__name__)
 
 
 class KimiK2Detector(BaseFormatDetector):
+    """
+    Detector for Kimi K2 model function call format.
+
+    Format Structure:
+    ```
+    <|tool_calls_section_begin|>
+    <|tool_call_begin|>functions.{func_name}:{index} <|tool_call_argument_begin|>{json_args}<|tool_call_end|>
+    <|tool_calls_section_end|>
+    ```
+
+    Reference: https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/docs/tool_call_guidance.md
+    """
 
     def __init__(self):
         super().__init__()
-        self._buffer = ""
-        self.current_tool_name_sent: bool = False
-        self.prev_tool_call_arr: list[dict] = []
-        self.current_tool_id: int = -1
-        self.streamed_args_for_tool: list[str] = (
-            []
-        )  # map what has been streamed for each tool so far to a list
 
         self.bot_token: str = "<|tool_calls_section_begin|>"
         self.eot_token: str = "<|tool_calls_section_end|>"
@@ -114,11 +119,7 @@ class KimiK2Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=new_text)
 
         if not hasattr(self, "_tool_indices"):
-            self._tool_indices = {
-                tool.function.name: i
-                for i, tool in enumerate(tools)
-                if tool.function and tool.function.name
-            }
+            self._tool_indices = self._get_tool_indices(tools)
 
         calls: list[ToolCallItem] = []
         try:
@@ -150,7 +151,7 @@ class KimiK2Detector(BaseFormatDetector):
                         )
                     )
                     self.current_tool_name_sent = True
-                    # Store the tool call info for adapter.py
+                    # Store the tool call info for serving layer completions endpoint
                     self.prev_tool_call_arr[self.current_tool_id] = {
                         "name": function_name,
                         "arguments": {},
@@ -214,7 +215,31 @@ class KimiK2Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=current_text)
 
     def structure_info(self) -> _GetInfoFunc:
-        raise NotImplementedError()
+        """Return function that creates StructureInfo for guided generation."""
 
-    def build_ebnf(self, tools: List[Tool]):
-        raise NotImplementedError()
+        def get_info(name: str) -> StructureInfo:
+            return StructureInfo(
+                begin=f"<|tool_calls_section_begin|><|tool_call_begin|>functions.{name}:0 <|tool_call_argument_begin|>",
+                end="<|tool_call_end|><|tool_calls_section_end|>",
+                trigger="<|tool_calls_section_begin|>",
+            )
+
+        return get_info
+
+    def build_ebnf(self, tools: List[Tool]) -> str:
+        """
+        Build EBNF grammar for KimiK2 tool call format.
+
+        NOTE: The call_rule_fmt uses [0-9]+ for the function index to allow the grammar
+        to accept any numeric index (0, 1, 2, etc.) for proper sequential indexing in
+        multiple function call scenarios, while still maintaining the correct KimiK2
+        format structure for constrained generation.
+        """
+        return EBNFComposer.build_ebnf(
+            tools,
+            sequence_start_token=self.bot_token,
+            sequence_end_token=self.eot_token,
+            tool_call_separator="",
+            call_rule_fmt='"<|tool_call_begin|>functions.{name}:" [0-9]+ " <|tool_call_argument_begin|>" {arguments_rule} "<|tool_call_end|>"',
+            function_format="json",
+        )

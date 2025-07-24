@@ -33,7 +33,6 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         image_data: List[Union[str, bytes, Dict]],
         input_text,
         request_obj,
-        max_req_input_len,
         *args,
         **kwargs,
     ):
@@ -41,7 +40,6 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
-            max_req_input_len=max_req_input_len,
             discard_alpha_channel=True,
         )
 

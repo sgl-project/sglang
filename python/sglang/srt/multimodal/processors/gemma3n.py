@@ -54,7 +54,6 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
         audio_data: Optional[List[Union[str, bytes, Dict]]] = None,
         input_text: str = "",
         request_obj=None,
-        max_req_input_len: int = 0,
         *args,
         **kwargs,
     ):
@@ -63,7 +62,6 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
             prompt=input_text,
             image_data=image_data,
             audio_data=audio_data,
-            max_req_input_len=max_req_input_len,
             multimodal_tokens=self.mm_tokens,
         )
 

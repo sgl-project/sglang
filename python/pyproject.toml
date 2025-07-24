@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.9.post2"
+version = "0.4.9.post3"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -54,7 +54,7 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.2.6",
+    "sgl-kernel==0.2.7",
     "torch==2.7.1",
     "torchaudio==2.7.1",
     "torchvision==0.22.1",
@@ -79,7 +79,7 @@ blackwell = [
 srt_hip = [
     "sglang[runtime_common]",
     "torch",
-    "petit_kernel",
+    "petit_kernel==0.0.2",
 ]
 
 # xpu is not enabled in public vllm and torch whl,
