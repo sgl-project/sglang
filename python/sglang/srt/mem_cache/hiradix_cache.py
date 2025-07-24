@@ -260,7 +260,7 @@ class HiRadixCache(RadixCache):
             for k, v in x.parent.children.items():
                 if v == x:
                     break
-            
+            del x.parent.children[k]
 
             if len(x.parent.children) == 0 and x.parent.evicted:
                 heapq.heappush(leaves, x.parent)
