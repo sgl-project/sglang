@@ -29,7 +29,7 @@ pub struct Router {
     policy: Arc<dyn LoadBalancingPolicy>,
     timeout_secs: u64,
     interval_secs: u64,
-    dp_awareness: bool,
+    dp_aware: bool,
     api_key: Option<String>,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
@@ -43,7 +43,7 @@ impl Router {
         policy: Arc<dyn LoadBalancingPolicy>,
         timeout_secs: u64,
         interval_secs: u64,
-        dp_awareness: bool,
+        dp_aware: bool,
         api_key: Option<String>,
     ) -> Result<Self, String> {
         // Update active workers gauge
@@ -54,7 +54,7 @@ impl Router {
             Self::wait_for_healthy_workers(&worker_urls, timeout_secs, interval_secs)?;
         }
 
-        let worker_urls = if dp_awareness {
+        let worker_urls = if dp_aware {
             // worker address now in the format of "http://host:port@dp_rank"
             Self::get_dp_aware_workers(&worker_urls, &api_key)
                 .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?
@@ -100,7 +100,7 @@ impl Router {
             policy,
             timeout_secs,
             interval_secs,
-            dp_awareness,
+            dp_aware,
             api_key,
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
@@ -255,7 +255,7 @@ impl Router {
     ) -> HttpResponse {
         let start = Instant::now();
 
-        let worker_url = if self.dp_awareness {
+        let worker_url = if self.dp_aware {
             // Need to extract the URL from "http://host:port@dp_rank"
             let (worker_url_prefix, _dp_rank) = match Self::extract_dp_rank(worker_url) {
                 Ok(tup) => tup,
@@ -510,7 +510,7 @@ impl Router {
             debug!("Sending request to {}: {}", route, json_str);
         }
 
-        let mut request_builder = if self.dp_awareness {
+        let mut request_builder = if self.dp_aware {
             let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
                 Ok(tup) => tup,
                 Err(e) => {
@@ -670,7 +670,7 @@ impl Router {
                     if res.status().is_success() {
                         info!("Worker {} health check passed", worker_url);
                         let mut workers_guard = self.workers.write().unwrap();
-                        if self.dp_awareness {
+                        if self.dp_aware {
                             // Need to contact the worker to extract the dp_size,
                             // and add them as multiple workers
                             let url_vec = vec![String::from(worker_url)];
@@ -750,7 +750,7 @@ impl Router {
 
     /// Remove all the worker(s) that match the URL prefix
     pub fn remove_worker(&self, worker_url: &str) {
-        if self.dp_awareness {
+        if self.dp_aware {
             // remove dp-aware workers in a prefix-matching fashion
             // without contacting the remote worker
             let mut candidate_workers: Vec<String> = Vec::new();
@@ -838,7 +838,7 @@ impl Router {
     }
 
     async fn get_worker_load(&self, client: &reqwest::Client, worker_url: &str) -> Option<isize> {
-        let worker_url = if self.dp_awareness {
+        let worker_url = if self.dp_aware {
             // Need to extract the URL from "http://host:port@dp_rank"
             let (worker_url_prefix, _dp_rank) = match Self::extract_dp_rank(worker_url) {
                 Ok(tup) => tup,
@@ -1095,7 +1095,7 @@ impl RouterTrait for Router {
         // Send requests to all workers concurrently without headers
         let mut tasks = Vec::new();
         for worker_url in &worker_urls {
-            let worker_url = if self.dp_awareness {
+            let worker_url = if self.dp_aware {
                 // Need to extract the URL from "http://host:port@dp_rank"
                 let (worker_url_prefix, _dp_rank) = match Self::extract_dp_rank(worker_url) {
                     Ok(tup) => tup,
@@ -1194,7 +1194,7 @@ mod tests {
             policy: Arc::new(RandomPolicy::new()),
             timeout_secs: 5,
             interval_secs: 1,
-            dp_awareness: false,
+            dp_aware: false,
             api_key: None,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,

@@ -22,7 +22,7 @@ pub struct RouterConfig {
     /// Worker health check interval in seconds
     pub worker_startup_check_interval_secs: u64,
     /// Enable data parallelism aware schedule
-    pub dp_awareness: bool,
+    pub dp_aware: bool,
     /// The api key used for the authorization with the worker
     pub api_key: Option<String>,
     /// Service discovery configuration (optional)
@@ -178,7 +178,7 @@ impl Default for RouterConfig {
             request_timeout_secs: 600,
             worker_startup_timeout_secs: 300,
             worker_startup_check_interval_secs: 10,
-            dp_awareness: false,
+            dp_aware: false,
             api_key: None,
             discovery: None,
             metrics: None,
@@ -285,7 +285,7 @@ mod tests {
             request_timeout_secs: 30,
             worker_startup_timeout_secs: 60,
             worker_startup_check_interval_secs: 5,
-            dp_awareness: false,
+            dp_aware: false,
             api_key: None,
             discovery: Some(DiscoveryConfig::default()),
             metrics: Some(MetricsConfig::default()),
@@ -692,7 +692,7 @@ mod tests {
             request_timeout_secs: 120,
             worker_startup_timeout_secs: 60,
             worker_startup_check_interval_secs: 5,
-            dp_awareness: false,
+            dp_aware: false,
             api_key: None,
             discovery: Some(DiscoveryConfig {
                 enabled: true,
@@ -740,7 +740,7 @@ mod tests {
             request_timeout_secs: 300,
             worker_startup_timeout_secs: 180,
             worker_startup_check_interval_secs: 15,
-            dp_awareness: false,
+            dp_aware: false,
             api_key: None,
             discovery: Some(DiscoveryConfig {
                 enabled: true,
@@ -779,7 +779,7 @@ mod tests {
             request_timeout_secs: 900,
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 20,
-            dp_awareness: false,
+            dp_aware: false,
             api_key: None,
             discovery: Some(DiscoveryConfig {
                 enabled: true,

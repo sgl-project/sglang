@@ -143,7 +143,7 @@ For unbalanced systems, this strategy tracks pending request counts per worker a
 
 ***Data-Parallelism Aware Routing***
 
-An additional DP-aware routing strategy can be enabled on top of the sgl-router’s hybrid cache-aware load-balancing strategy by setting the `--dp-awareness` flag when starting the router.
+An additional DP-aware routing strategy can be enabled on top of the sgl-router’s hybrid cache-aware load-balancing strategy by setting the `--dp-aware` flag when starting the router.
 
 When this flag is enabled, the router attempts to contact the workers to retrieve the `dp_size` of each one and registers the new workers at the DP-rank level.  In this mode, the router applies the cache-aware routing strategy in a more fine-grained manner, with assistance from the DP controller on the SRT side.
 

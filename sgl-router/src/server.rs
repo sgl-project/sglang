@@ -252,8 +252,8 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
 
     // Log service discovery status
     if let Some(service_discovery_config) = &config.service_discovery_config {
-        if config.router_config.dp_awareness {
-            info!("🚧 Service discovery disabled (conflict with dp_awareness)");
+        if config.router_config.dp_aware {
+            info!("🚧 Service discovery disabled (conflict with dp_aware)");
         } else {
             info!("🚧 Service discovery enabled");
             info!("🚧 Selector: {:?}", service_discovery_config.selector);
@@ -275,7 +275,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
 
     // Start the service discovery if enabled
     if let Some(service_discovery_config) = config.service_discovery_config {
-        if service_discovery_config.enabled && !config.router_config.dp_awareness {
+        if service_discovery_config.enabled && !config.router_config.dp_aware {
             info!("🚧 Initializing Kubernetes service discovery");
             // Pass the Arc<Router> directly
             match start_service_discovery(service_discovery_config, router_arc).await {

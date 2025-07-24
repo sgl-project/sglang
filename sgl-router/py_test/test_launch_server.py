@@ -30,7 +30,7 @@ def popen_launch_router(
     service_discovery_namespace: str = None,
     prometheus_port: int = None,
     prometheus_host: str = None,
-    dp_awareness: bool = False,
+    dp_aware: bool = False,
 ):
     """
     Launch the router server process.
@@ -50,7 +50,7 @@ def popen_launch_router(
         service_discovery_namespace: Kubernetes namespace to watch for pods. If None, watches all namespaces.
         prometheus_port: Port to expose Prometheus metrics. If None, Prometheus metrics are disabled.
         prometheus_host: Host address to bind the Prometheus metrics server.
-        dp_awareness: Enable data parallelism aware routing strategy.
+        dp_aware: Enable data parallelism aware routing strategy.
     """
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -104,8 +104,8 @@ def popen_launch_router(
     if log_dir is not None:
         command.extend(["--log-dir", log_dir])
 
-    if dp_awareness:
-        command.append("--router-dp-awareness")
+    if dp_aware:
+        command.append("--router-dp-aware")
 
     process = subprocess.Popen(command, stdout=None, stderr=None)
 
@@ -433,8 +433,8 @@ class TestLaunchServer(unittest.TestCase):
                 response.status_code, 200, "Request with correct api key should succeed"
             )
 
-    def test_6_mmlu_with_dp_awareness(self):
-        print("Running test_6_mmlu_with_dp_awareness...")
+    def test_6_mmlu_with_dp_aware(self):
+        print("Running test_6_mmlu_with_dp_aware...")
         # DP size = 2
         self.process = popen_launch_router(
             self.model,
@@ -442,7 +442,7 @@ class TestLaunchServer(unittest.TestCase):
             dp_size=2,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             policy="cache_aware",
-            dp_awareness=True,
+            dp_aware=True,
         )
 
         args = SimpleNamespace(
@@ -461,8 +461,8 @@ class TestLaunchServer(unittest.TestCase):
         msg = f"dp aware MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
 
-    def test_7_add_and_remove_worker_with_dp_awareness(self):
-        print("Running test_7_add_and_remove_worker_with_dp_awareness...")
+    def test_7_add_and_remove_worker_with_dp_aware(self):
+        print("Running test_7_add_and_remove_worker_with_dp_aware...")
 
         # Set dp_size = 1
         self.process = popen_launch_router(
@@ -471,7 +471,7 @@ class TestLaunchServer(unittest.TestCase):
             dp_size=1,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             policy="round_robin",  # make sure every worker processes requests
-            dp_awareness=True,  # dp aware strategy should work well with RR
+            dp_aware=True,  # dp aware strategy should work well with RR
         )
 
         # 1. Start a worker
@@ -519,8 +519,8 @@ class TestLaunchServer(unittest.TestCase):
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
 
-    def test_8_lazy_fault_tolerance_with_dp_awareness(self):
-        print("Running test_8_lazy_fault_tolerance_with_dp_awareness...")
+    def test_8_lazy_fault_tolerance_with_dp_aware(self):
+        print("Running test_8_lazy_fault_tolerance_with_dp_aware...")
 
         # Set dp_size = 1
         self.process = popen_launch_router(
@@ -529,7 +529,7 @@ class TestLaunchServer(unittest.TestCase):
             dp_size=1,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             policy="round_robin",
-            dp_awareness=True,
+            dp_aware=True,
         )
 
         # 1. Start a worker
@@ -576,8 +576,8 @@ class TestLaunchServer(unittest.TestCase):
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
 
-    def test_9_payload_size_with_dp_awareness(self):
-        print("Running test_9_payload_size_with_dp_awareness...")
+    def test_9_payload_size_with_dp_aware(self):
+        print("Running test_9_payload_size_with_dp_aware...")
 
         # Start the router with 1MB limit
         self.process = popen_launch_router(
@@ -587,7 +587,7 @@ class TestLaunchServer(unittest.TestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             policy="round_robin",
             max_payload_size=1 * 1024 * 1024,  # 1MB limit
-            dp_awareness=True,
+            dp_aware=True,
         )
 
         # Test case 1: Payload just under 1MB should succeed
@@ -626,8 +626,8 @@ class TestLaunchServer(unittest.TestCase):
                 f"1.2MB payload should fail with 413 but got status {response.status_code}",
             )
 
-    def test_10_api_key_with_dp_awareness(self):
-        print("Running test_10_api_key_with_dp_awareness...")
+    def test_10_api_key_with_dp_aware(self):
+        print("Running test_10_api_key_with_dp_aware...")
 
         self.process = popen_launch_router(
             self.model,
@@ -636,7 +636,7 @@ class TestLaunchServer(unittest.TestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             policy="round_robin",
             api_key="correct_api_key",
-            dp_awareness=True,
+            dp_aware=True,
         )
 
         # Test case 1: request without api key should fail
