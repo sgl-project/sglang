@@ -165,7 +165,8 @@ def fused_experts_oai(
     w2_bias: Optional[torch.Tensor],
     swiglu_alpha: torch.Tensor,
     swiglu_beta: torch.Tensor,
-    dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    dtype: torch.dtype = torch.bfloat16,
+    clamp_limit: Optional[float] = None) -> torch.Tensor:
 
     gemm1_weights = w13
     gemm2_weights = w2
@@ -187,7 +188,7 @@ def fused_experts_oai(
         gather_indx=gather_indx,
         precision_config=pc1)
 
-    pcs = triton_kernels.swiglu.PrecisionConfig(limit=None)
+    pcs = triton_kernels.swiglu.PrecisionConfig(limit=clamp_limit)
 
     act_out = triton_kernels.swiglu.swiglu(
         gemm1_output,
@@ -233,6 +234,7 @@ def fused_experts_mxfp4_oai(
     actual_w2_scale_shape: Optional[torch.Size] = None,
     intermediate_size: int = 0,
     hidden_size: int = 0,
+    clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
     if activation_dtype == torch.float8_e4m3fn:
         hidden_states, hidden_states_scale = quantize_fp8_per_tensor(hidden_states, fc31_input_dequant)
@@ -277,7 +279,7 @@ def fused_experts_mxfp4_oai(
                                         intermediate_size * 2,
                                         swizzle_scale).contiguous()
 
-    pcs = triton_kernels.swiglu.PrecisionConfig(limit=None)
+    pcs = triton_kernels.swiglu.PrecisionConfig(limit=clamp_limit)
     act_out = triton_kernels.swiglu.swiglu(
         gemm1_output,
         alpha=swiglu_alpha,

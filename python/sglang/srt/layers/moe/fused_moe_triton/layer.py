@@ -463,6 +463,7 @@ class UnquantizedFusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
                 swiglu_alpha=self.swiglu_alpha,
                 swiglu_beta=self.swiglu_beta,
                 dtype=x.dtype,
+                clamp_limit=7.0,
             )
     
     def forward_cpu(self, *args, **kwargs) -> torch.Tensor:
@@ -674,6 +675,7 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
             actual_w2_scale_shape=self.actual_w2_weight_shape,
             intermediate_size=self.intermediate_size,
             hidden_size=self.hidden_size,
+            clamp_limit=7.0,
         )
 
     def forward_cpu(self, *args, **kwargs) -> torch.Tensor:
