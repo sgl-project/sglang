@@ -524,6 +524,7 @@ class TestLaunchServer(unittest.TestCase):
         self.assertGreaterEqual(score, THRESHOLD, msg)
 
         # 6. Start another worker with api_key set
+        terminate_and_wait(worker_process)  # terminate the old worker process
         port = find_available_port()
         worker_url = f"http://127.0.0.1:{port}"
         worker_process = popen_launch_server(
