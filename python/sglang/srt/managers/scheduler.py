@@ -27,7 +27,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
-from queue import Queue
 
 import psutil
 import setproctitle
@@ -116,7 +115,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     Req,
     ScheduleBatch,
-    WaitingStatus,
     global_server_args_dict,
 )
 from sglang.srt.managers.schedule_policy import (
@@ -1249,7 +1247,6 @@ class Scheduler(
             self._add_request_to_queue(req)
 
     def _add_request_to_queue(self, req: Req):
-
         req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.disagg_prefill_bootstrap_queue.add(
@@ -1688,7 +1685,6 @@ class Scheduler(
             return None
 
         if self.enable_hierarchical_cache:
-            # check for completion of hierarchical cache activities to release memory
             self.tree_cache.check_hicache_events()
 
         # Get priority queue
@@ -2177,8 +2173,6 @@ class Scheduler(
                 batch.next_batch_sampling_info.update_regex_vocab_mask()
                 self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
-
-            
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""

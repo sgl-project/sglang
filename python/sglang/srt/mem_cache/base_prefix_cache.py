@@ -28,7 +28,6 @@ class MatchResult(NamedTuple):
     host_hit_length: int = 0
 
 
-
 class BasePrefixCache(ABC):
     """Cache can be indexed by either rid or key."""
 

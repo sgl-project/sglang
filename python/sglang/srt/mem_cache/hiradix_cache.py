@@ -659,3 +659,4 @@ class HiRadixCache(RadixCache):
                     if not cur_child.evicted:
                         stack.append(cur_child)
         return ret_list
+    
