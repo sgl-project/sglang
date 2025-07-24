@@ -89,7 +89,7 @@ class HiCacheFile(HiCacheStorage):
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
         self.tp_suffix = f"_{tp_rank}_{tp_size}" if tp_size > 1 else ""
-        if not os.path.exists(self.file_path):
+        if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
