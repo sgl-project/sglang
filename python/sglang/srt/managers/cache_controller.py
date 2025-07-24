@@ -73,75 +73,6 @@ class LayerDoneCounter:
         with self.conditions[self.producer_index]:
             self.counters[self.producer_index] = 0
 
-
-class L3LoadCacheOperation:
-    counter = 0
-
-    def __init__(
-        self,
-        device_indices: torch.Tensor,
-        data: torch.Tensor,
-        node_id: Union[int, List[int]],
-        priority: Optional[int] = None,
-    ):
-        self.device_indices = device_indices
-        self.node_ids = [node_id]
-        self.data = data
-
-        self.id = CacheOperation.counter
-        CacheOperation.counter += 1
-        # default priority is the order of creation
-        self.priority = priority if priority is not None else self.id
-
-    def merge(self, other: "L3LoadCacheOperation", cat_dim: int = 1) -> None:
-        # multiple operations can be merged into a single operation for batch processing
-        self.device_indices = torch.cat([self.device_indices, other.device_indices])
-        self.priority = min(self.priority, other.priority)
-        self.node_ids.extend(other.node_ids)
-        self.data = torch.cat([self.data, other.data], dim=cat_dim)
-
-    def __lt__(self, other: "L3LoadCacheOperation"):
-        return self.priority < other.priority
-
-
-class MooncakeStoreCacheOperation:
-    counter = 0
-
-    def __init__(
-        self,
-        mooncake_keys: List,
-        host_indices: torch.Tensor,
-        node_id: Union[int, List[int]],
-        priority: Optional[int] = None,
-    ):
-        self.host_indices = host_indices
-        self.node_ids = [node_id]
-        self.mooncake_keys = mooncake_keys
-
-        self.id = CacheOperation.counter
-        CacheOperation.counter += 1
-        # default priority is the order of creation
-        self.priority = priority if priority is not None else self.id
-
-    def merge(self, other: "MooncakeStoreCacheOperation") -> None:
-        # multiple operations can be merged into a single operation for batch processing
-        self.host_indices = torch.cat([self.host_indices, other.host_indices])
-        self.priority = min(self.priority, other.priority)
-        self.mooncake_keys.extend(other.mooncake_keys)
-        self.node_ids.extend(other.node_ids)
-
-    def __lt__(self, other: "MooncakeStoreCacheOperation"):
-        return self.priority < other.priority
-
-# class MooncakeIsBatchExistOperation:
-#     counter = 0
-
-#     def __init__(self, l3_keys: list, node_id: Union[int, List[int]]):
-#         self.l3_keys = l3_keys
-#         self.node_ids = [node_id]
-#         self.id = CacheOperation.counter
-#         CacheOperation.counter += 1
-
 class CacheOperation:
 
     counter = 0
@@ -272,50 +203,6 @@ class PrefetchOperation(StorageOperation):
     ):
         self.request_id = request_id
 
-        self._done_flag = threading.Event()
-
-        super().__init__(host_indices, token_ids, last_hash)
-
-    def mark_done(self):
-        self._done_flag.set()
-
-    def is_done(self) -> bool:
-        return self._done_flag.is_set()
-
-
-
-class StorageOperation:
-    counter = 0
-
-    def __init__(
-        self,
-        host_indices: torch.Tensor,
-        token_ids: List[int],
-        last_hash: Optional[str] = None,
-    ):
-        self.host_indices = host_indices
-        self.token_ids = token_ids
-        self.last_hash = last_hash
-        self.completed_tokens = 0
-        self.hash_value = []
-
-        self.id = StorageOperation.counter
-        StorageOperation.counter += 1
-
-    def __lt__(self, other: "StorageOperation"):
-        return self.id < other.id
-
-
-class PrefetchOperation(StorageOperation):
-    def __init__(
-        self,
-        request_id: str,
-        host_indices: torch.Tensor,
-        token_ids: List[int],
-        last_hash: Optional[str] = None,
-    ):
-        self.request_id = request_id
-
         self._done_flag = False
         self._lock = threading.Lock()
 
@@ -386,7 +273,7 @@ class HiCacheController:
                 raise NotImplementedError(
                     f"Unsupported storage backend: {storage_backend}"
                 )
-        
+
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
@@ -550,8 +437,6 @@ class HiCacheController:
                 )
                 self.write_stream.synchronize()
                 self.mem_pool_host.complete_io(operation.host_indices)
-
-
                 for node_id in operation.node_ids:
                     if node_id != 0:
                         self.ack_write_queue.put(node_id)
@@ -626,6 +511,7 @@ class HiCacheController:
             raise ValueError(
                 f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
             )
+
     def prefetch(
         self,
         request_id: str,
