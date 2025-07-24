@@ -192,7 +192,8 @@ class ServerArgs:
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
-    hicache_io_backend: str = ""
+    hicache_io_backend: str = "kernel"
+    hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
 
     # Double Sparsity
@@ -1422,6 +1423,14 @@ class ServerArgs:
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
         )
+        parser.add_argument(
+            "--hicache-mem-layout",
+            type=str,
+            choices=["layer_first", "page_first"],
+            default=ServerArgs.hicache_mem_layout,
+            help="The layout of host memory pool for hierarchical cache.",
+        )
+
         parser.add_argument(
             "--hicache-storage-backend",
             type=str,
