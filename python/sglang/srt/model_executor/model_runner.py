@@ -1436,10 +1436,6 @@ class ModelRunner:
                 raise ValueError(
                     "trtllm_mla backend can only be used with MLA models."
                 )
-            if not self.spec_algorithm.is_none():
-                raise ValueError(
-                    "trtllm_mla backend does not support speculative decoding yet."
-                )
             from python.sglang.srt.layers.attention.trtllm_mla_backend import (
                 TRTLLMMLABackend,
             )
