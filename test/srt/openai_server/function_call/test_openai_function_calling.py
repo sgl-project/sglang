@@ -141,10 +141,11 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         function_name = tool_call.function.name
         assert function_name == "add", "Function name should be 'add'"
         function_arguments = tool_call.function.arguments
-        assert (
-            function_arguments == '{"a": 3, "b": 5}'
-            or function_arguments == '{"a": "3", "b": "5"}'
-        ), 'Function arguments should be \'{"a": 3, "b": 5}\' or \'{"a": "3", "b": "5"}\''
+        function_arguments = json.loads(tool_call.function.arguments)
+        assert function_arguments in [
+            {"a": 3, "b": 5},
+            {"a": "3", "b": "5"},
+        ], f"Unexpected function arguments: {function_arguments}"
 
         messages.append(response.choices[0].message)
         messages.append(
