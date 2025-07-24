@@ -13,10 +13,10 @@ from sglang.srt.layers.moe.topk import biased_grouped_topk
     "params",
     [
         #(64, 1, 1, 6),   # Kimi-VL-A3B
-        #(128, 4, 2, 4),
+        (128, 4, 2, 4),
         (256, 8, 4, 8),  # deepseek v3
-        #(384, 1, 1, 8),  # Kimi K2
-        #(512, 16, 8, 16),
+        (384, 1, 1, 8),  # Kimi K2
+        (512, 16, 8, 16),
     ],
 )
 @pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
