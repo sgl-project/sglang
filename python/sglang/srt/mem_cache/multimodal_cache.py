@@ -26,11 +26,6 @@ class MultiModalCache:
         return True
 
     def put(self, mm_hash: int, embedding: torch.Tensor) -> bool:
-        if mm_hash in self.mm_cache:
-            # Move to end (most recently used) and update
-            self.mm_cache.move_to_end(mm_hash)
-            return True
-
         data_size = self._get_tensor_size(embedding)
         # Lazy free cache if not enough space
         if not self._allocate(data_size):
@@ -49,13 +44,6 @@ class MultiModalCache:
             self.mm_cache.move_to_end(mm_hash)
             return self.mm_cache[mm_hash]
         return None
-
-    def free(self, mm_hash: int) -> bool:
-        if mm_hash not in self.mm_cache:
-            return False
-        old_embedding = self.mm_cache.pop(mm_hash)
-        self.current_size -= self._get_tensor_size(old_embedding)
-        return True
 
     def clear(self):
         self.mm_cache.clear()

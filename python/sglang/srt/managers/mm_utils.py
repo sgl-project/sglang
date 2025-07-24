@@ -265,8 +265,10 @@ def _get_chunked_prefill_embedding(
             embedding_per_req = data_embedding_func(embedding_items_per_req)
             if not embedding_cache.put(embedding_items_hash, embedding_per_req):
                 print_warning_once(
-                    "Multimodal embedding cache is full. Consider increasing the "
-                    "`SGLANG_VLM_CACHE_SIZE_MB` environment variable."
+                    "Multimodal embedding cache is full. This typically occurs when a single "
+                    "embedding exceeds the cache size limit. Consider increasing the "
+                    "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
+                    "embedding size."
                 )
 
         embedding_per_req_chunk, _, _ = get_embedding_chunk(
