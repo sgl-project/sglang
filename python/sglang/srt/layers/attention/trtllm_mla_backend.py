@@ -32,7 +32,11 @@ if TYPE_CHECKING:
 DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
 
 # Block constraint from flashinfer requirements
-# See: https://github.com/flashinfer-ai/flashinfer/blob/fe29ed63cb923f25cae70ef83f3fd16139305b35/flashinfer/decode.py#L2057
+# From flashinfer.decode._check_trtllm_gen_mla_shape:
+#   block_num % (128 / block_size) == 0
+# This imposes that the total number of blocks must be divisible by
+# (128 / block_size). We capture the 128 constant here so we can
+# compute the LCM with other padding constraints.
 TRTLLM_BLOCK_CONSTRAINT = 128
 
 
@@ -52,11 +56,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         model_runner: ModelRunner,
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
-        kv_last_page_len_buf: Optional[torch.Tensor] = None,
+        q_indptr_decode_buf: Optional[torch.Tensor] = None,
     ):
-        super().__init__(
-            model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
-        )
+        super().__init__(model_runner, skip_prefill, kv_indptr_buf, q_indptr_decode_buf)
 
         config = model_runner.model_config
 
@@ -88,7 +90,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
         self.cuda_graph_kv_indices = None
-        self.forward_metadata: Union[TRTLLMMLADecodeMetadata] = None
+        self.forward_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -104,7 +106,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Apply dual constraints (take LCM to satisfy both):
         # 1. TRT-LLM: block_num % (128 / page_size) == 0
-        #    Reference: https://github.com/NVIDIA/TensorRT-LLM/issues/XYZ  # TODO: add actual link
         # 2. Triton: page table builder uses 64-index bursts, needs multiple of 64
         trtllm_constraint = TRTLLM_BLOCK_CONSTRAINT // self.page_size
         constraint_lcm = math.lcm(trtllm_constraint, TRITON_PAD_NUM_PAGE_PER_BLOCK)
@@ -281,6 +282,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
             forward_batch.decode_trtllm_mla_metadata = self.forward_metadata
         else:
+            # For prefill or other modes, fallback to parent implementation.
             super().init_forward_metadata(forward_batch)
 
     def forward_decode(
@@ -312,7 +314,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            query = torch.cat([q_nope, q_rope_reshaped], dim=-1)  
+            query = torch.cat([q_nope, q_rope_reshaped], dim=-1)
         else:
             # q already has both parts
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -335,12 +337,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Scale computation for TRTLLM MLA kernel:
         # - BMM1 scale = q_scale * k_scale * softmax_scale
-        # - For FP16 path we keep q_scale = k_scale = 1.0, softmax_scale = 1/sqrt(head_dim) which is pre-computed as layer.scaling
-        # TODO: change once fp8 path is supported
-        q_scale = k_scale = 1.0 # for fp16 we keep 1 
-        bmm1_scale = q_scale * k_scale * layer.scaling 
+        # - For FP16 path we keep q_scale = 1.0, softmax_scale = 1/sqrt(head_dim) which is pre-computed as layer.scaling
+        # - k_scale is read from model checkpoint if available
+        # TODO: Change once fp8 path is supported
+        q_scale = 1.0  # for fp16 we keep q_scale as 1.0
 
-        # Call TRT-LLM kernel with proper scale configuration
+        # silently pick k_scale (avoid per-call prints in CUDA graph)
+        k_scale = layer.k_scale_float if getattr(layer, "k_scale_float", None) is not None else 1.0
+
+        bmm1_scale = q_scale * k_scale * layer.scaling
+
+
+        # Call TRT-LLM kernel
         raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
