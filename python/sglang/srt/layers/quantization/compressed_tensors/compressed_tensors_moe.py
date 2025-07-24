@@ -558,7 +558,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 torch.empty((num_experts, 0), dtype=torch.int32, device=device),
                 requires_grad=False,
             )
-        
+
         from vllm import _custom_ops as vllm_ops
 
         marlin_w13_qweight = vllm_ops.gptq_marlin_moe_repack(
