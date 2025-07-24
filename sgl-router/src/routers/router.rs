@@ -754,31 +754,34 @@ impl Router {
             // remove dp-aware workers in a prefix-matching fashion
             // without contacting the remote worker
             let mut candidate_workers: Vec<String> = Vec::new();
+            let mut removed_workers: Vec<String> = Vec::new();
             let worker_url_prefix = format!("{}@", worker_url);
 
-            // find the candidate workers to be removed
-            let workers_guard = self.workers.read().unwrap();
-            for w in workers_guard.iter() {
-                if w.url().starts_with(&worker_url_prefix) {
-                    candidate_workers.push(w.url().to_string());
+            {
+                // find the candidate workers to be removed
+                let workers_guard = self.workers.read().unwrap();
+                for w in workers_guard.iter() {
+                    if w.url().starts_with(&worker_url_prefix) {
+                        candidate_workers.push(w.url().to_string());
+                    }
                 }
             }
 
-            // do the removing on the worker_urls
-            let mut workers_guard = self.workers.write().unwrap();
-            let mut removed_workers: Vec<String> = Vec::new();
-            for dp_url in candidate_workers.iter() {
-                if let Some(index) = workers_guard.iter().position(|w| w.url() == dp_url) {
-                    workers_guard.remove(index);
-                    info!("Removed worker: {}", dp_url);
-                    removed_workers.push(dp_url.to_string());
-                } else {
-                    warn!("Worker {} not found, skipping removal", dp_url);
-                    continue;
+            {
+                // do the removing on the worker_urls
+                let mut workers_guard = self.workers.write().unwrap();
+                for dp_url in candidate_workers.iter() {
+                    if let Some(index) = workers_guard.iter().position(|w| w.url() == dp_url) {
+                        workers_guard.remove(index);
+                        info!("Removed worker: {}", dp_url);
+                        removed_workers.push(dp_url.to_string());
+                    } else {
+                        warn!("Worker {} not found, skipping removal", dp_url);
+                        continue;
+                    }
                 }
+                RouterMetrics::set_active_workers(workers_guard.len());
             }
-
-            RouterMetrics::set_active_workers(workers_guard.len());
 
             // If cache aware policy, remove the workers from the tree
             if let Some(cache_aware) = self
