@@ -305,7 +305,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.running_batch.batch_is_full = False
 
         # Flush the disaggregation resources
-        self.flush_disaggregation_resources()
+        self.flush_prefill_resources()
         del self.stop_prefill_event
 
     @torch.no_grad()
@@ -363,7 +363,7 @@ class SchedulerDisaggregationPrefillMixin:
             del tmp_batch
         if "tmp_result" in locals():
             del tmp_result
-        self.flush_disaggregation_resources()
+        self.flush_prefill_resources()
         del self.stop_prefill_event
 
     def process_batch_result_disagg_prefill(
