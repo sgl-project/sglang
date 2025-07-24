@@ -101,51 +101,51 @@ class LightningAttnBackend(AttentionBackend):
         seq_lens = forward_batch.seq_lens
         device = seq_lens.device
 
-        # Check if we have extend information
         extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
 
-        # Determine if this is a prefill batch
-        is_prefill = False
+        num_prefills = 0
+        num_decode_tokens = 0
+        num_prefill_tokens = 0
+        decode_threshold = 1
 
-        # Handle forward_mode safely - it might be None in some cases
         if (
             hasattr(forward_batch, "forward_mode")
             and forward_batch.forward_mode is not None
         ):
             is_prefill = forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         elif extend_seq_lens is not None:
-            is_prefill = (extend_seq_lens > 1).any().item()
-        # If forward_mode is None and extend_seq_lens is None, default to decode mode (is_prefill=False)
+            is_prefill = (extend_seq_lens > decode_threshold).any().item()
+        else:
+            # If forward_mode is None and extend_seq_lens is None, default to decode mode
+            is_prefill = False
 
-        if is_prefill or (
-            extend_seq_lens is not None and extend_seq_lens.sum() > batch_size
-        ):
-            # Prefill/Extend mode or Mixed mode
-            if extend_seq_lens is not None:
-                actual_extend_lens = extend_seq_lens
-                num_prefills = (extend_seq_lens > 1).sum().item()
-                num_decode_tokens = (extend_seq_lens == 1).sum().item()
-            else:
-                actual_extend_lens = torch.ones(
-                    batch_size, dtype=torch.int32, device=device
-                )
-                num_prefills = batch_size
-                num_decode_tokens = 0
-
-            num_prefill_tokens = actual_extend_lens.sum().item()
-
-            query_start_loc = torch.nn.functional.pad(
-                torch.cumsum(actual_extend_lens, dim=0, dtype=torch.int32), (1, 0)
+        if extend_seq_lens is not None:
+            actual_extend_lens = extend_seq_lens
+            for num_tokens in extend_seq_lens:
+                if num_tokens <= decode_threshold:
+                    num_decode_tokens += num_tokens.item()
+                else:
+                    num_prefills += 1
+                    num_prefill_tokens += num_tokens.item()
+        elif is_prefill:
+            actual_extend_lens = torch.ones(
+                batch_size, dtype=torch.int32, device=device
             )
+            num_prefills = batch_size
+            num_prefill_tokens = batch_size
+            num_decode_tokens = 0
         else:
             # Pure decode mode
+            actual_extend_lens = torch.ones(
+                batch_size, dtype=torch.int32, device=device
+            )
             num_prefills = 0
             num_prefill_tokens = 0
             num_decode_tokens = batch_size
 
-            query_start_loc = torch.arange(
-                0, batch_size + 1, dtype=torch.int32, device=device
-            )
+        query_start_loc = torch.nn.functional.pad(
+            torch.cumsum(actual_extend_lens, dim=0, dtype=torch.int32), (1, 0)
+        )
 
         # Set context lengths
         context_lens_tensor = seq_lens.to(torch.int32)
