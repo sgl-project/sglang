@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, NamedTuple, Optional
 
 import torch
@@ -61,18 +60,12 @@ if _is_npu:
     import torch_npu
 
 
-@dataclass
-class TopKOutput:
+class TopKOutput(NamedTuple):
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
     router_logits: torch.Tensor
     top_k: int
     renormalize: bool
-
-    def __iter__(self):
-        yield self.topk_weights
-        yield self.topk_ids
-        yield self.router_logits
 
 
 class TopK(CustomOp):

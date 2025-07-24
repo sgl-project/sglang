@@ -1361,7 +1361,7 @@ def fused_experts(
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
 ):
-    topk_weights, topk_ids, _ = topk_output
+    topk_weights, topk_ids, _, _, _ = topk_output
     if inplace:
         assert not no_combine, "no combine + inplace makes no sense"
         torch.ops.sglang.inplace_fused_experts(
