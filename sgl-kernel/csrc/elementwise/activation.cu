@@ -68,7 +68,7 @@ __device__ __forceinline__ T gelu(const T& x) {
 
 // gelu_quick(x) = x * torch.sigmoid(1.702 * x)
 template <typename T>
-__device__ __forceinline__ T gelu_quick_kernel(const T& x) {
+__device__ __forceinline__ T gelu_quick_act(const T& x) {
   float f32_val = detail::to_f32(x);
   return detail::from_f32<T>(f32_val / (1.0f + expf(-f32_val * 1.702f)));
 }
@@ -161,7 +161,7 @@ void gelu_quick(at::Tensor& out, const at::Tensor& input) {
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     dim3 block(std::min(d / vec_size, 1024U));
-    sgl_hip::activation::act_only_kernel<c_type, gelu_quick_kernel>
+    sgl_hip::activation::act_only_kernel<c_type, gelu_quick_act>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 
     return true;

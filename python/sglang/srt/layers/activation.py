@@ -45,10 +45,10 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_hip = is_hip()
 
-if _is_cuda or _is_hip:
+if _is_cuda:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
-if _is_hip:
-    from sgl_kernel import gelu_quick
+elif _is_hip:
+    from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
 
 if is_npu():
     import torch_npu
