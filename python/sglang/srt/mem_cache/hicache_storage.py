@@ -121,7 +121,7 @@ class HiCacheFile(HiCacheStorage):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None
     ) -> torch.Tensor | None:
-        tensor_path = f"{self.file_path}/{key}.bin"
+        tensor_path = os.path.join(self.file_path, f"{key}.bin")
         try:
             # todo: fixing the target_location logic to enable in-place loading
             loaded_tensor = torch.load(tensor_path)
@@ -132,7 +132,7 @@ class HiCacheFile(HiCacheStorage):
                 return None
         except FileNotFoundError:
             return None
-        
+
     def batch_get(
         self,
         keys,
@@ -153,7 +153,7 @@ class HiCacheFile(HiCacheStorage):
             target_sizes: Optional[Any] = None) -> bool:
         tensor_path = f"{self.file_path}/{key}.bin"
         if self.exists(key):
-            logger.warning(f"Key {key} already exists. Skipped.")
+            logger.debug(f"Key {key} already exists. Skipped.")
             return True
         try:
             torch.save(value, tensor_path)
