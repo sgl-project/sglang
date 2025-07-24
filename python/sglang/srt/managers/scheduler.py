@@ -844,16 +844,7 @@ class Scheduler(
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
                 end_time = time.time()
-                
-                if self.server_args.dp_size != 1 and self.server_args.load_balance_method == "shortest_queue":
-                    completed_count = len(batch.requests)
-                    completed_tokens = sum(len(req.input_ids) for req in batch.requests)
-                    
-                    self.pending_updates["requests"] += completed_count
-                    self.pending_updates["tokens"] += completed_tokens
-                    self.pending_updates["taken_time"] +=(end_time-start_time)
-                    self._send_load_update()    
-                    
+                 
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
