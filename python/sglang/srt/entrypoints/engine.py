@@ -71,7 +71,6 @@ from sglang.srt.utils import (
     is_cuda,
     kill_process_tree,
     launch_dummy_health_check_server,
-    maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
@@ -636,11 +635,6 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set ulimit
     set_ulimit()
-
-    # Fix triton bugs
-    if server_args.tp_size * server_args.dp_size > 1:
-        # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
-        maybe_set_triton_cache_manager()
 
     # Check flashinfer version
     if server_args.attention_backend == "flashinfer":
