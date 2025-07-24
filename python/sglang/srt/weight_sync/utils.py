@@ -6,19 +6,15 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.managers.tokenizer_manager import (
-    TokenizerManager,
-    UpdateWeightsFromTensorReqInput,
-)
+from sglang.srt.managers.tokenizer_manager import UpdateWeightsFromTensorReqInput
 from sglang.srt.model_executor.model_runner import LocalSerializedTensor
-from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj
+from sglang.srt.utils import MultiprocessingSerializer
 
 
-# SPMD Style calling from FSDP SGLang
 async def update_weights(
     engine: Engine,
     params_batch: list[tuple[str, torch.Tensor]],
-    device_mesh_key: str,  # typically "infer_tp"
+    device_mesh_key: str,
     device_mesh: DeviceMesh,
     load_format: Optional[str] = None,
 ):
@@ -37,14 +33,14 @@ async def update_weights(
     """
     infer_tp_size = device_mesh[device_mesh_key].mesh.size()[0]
     infer_tp_rank = device_mesh[device_mesh_key].get_local_rank()
-    # Monkey patching Torch to ensure torch reduce tensor
     from sglang.srt.patch_torch import monkey_patch_torch_reductions
 
     monkey_patch_torch_reductions()
 
-    # On each rank, serialize a batch of (name, tensor) tuples.
-    # named_tensors_batch will be a list like:
-    # [(name0, ipc_tensor0_tp0), (name1, ipc_tensor1_tp0), ...]
+    # [
+    #   (name0, ipc_tensor0_tp0),
+    #   (name1, ipc_tensor1_tp0),
+    # ]
     named_tensors_batch = [
         (
             name,
@@ -56,18 +52,14 @@ async def update_weights(
     ]
 
     if infer_tp_rank == 0:
-        # On rank 0, prepare a list to hold the gathered batches from all ranks.
         gathered_serialized_batches = [None for _ in range(infer_tp_size)]
     else:
         gathered_serialized_batches = None
 
-    # Gather the named_tensors_batch from all ranks to rank 0.
-    # After this, on rank 0, gathered_serialized_batches will be a list of lists:
     # [
     #   [ (name0, ipc_tensor0_tp0), (name1, ipc_tensor1_tp0) ],
     #   [ (name0, ipc_tensor0_tp1), (name1, ipc_tensor1_tp1) ],
     # ]
-    # On other ranks, gathered_serialized_batches will be None.
     dist.gather_object(
         obj=named_tensors_batch,
         object_gather_list=gathered_serialized_batches,
@@ -85,7 +77,6 @@ async def update_weights(
         logical_tensors = zip(*gathered_serialized_batches, strict=True)
 
         named_tensors = [
-            # The final named_tensors is a List[Tuple[str, LocalSerializedTensor]]:
             # [
             #   (name0, LocalSerializedTensor(values=[ipc_tensor0_tp0, ipc_tensor0_tp1])),
             #   (name1, LocalSerializedTensor(values=[ipc_tensor1_tp0, ipc_tensor1_tp1])),
@@ -107,7 +98,6 @@ async def update_weights(
             load_format=load_format,
         )
 
-        # Passed in tokenizer manager from the created engine in Producer Process such as RL Training
         return await engine.update_weights_from_tensor(update_weights_request)
 
 
