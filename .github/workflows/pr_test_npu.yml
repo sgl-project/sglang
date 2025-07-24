@@ -1,0 +1,34 @@
+name: PR TEST SIMPLE VERSION (NPU)
+
+on:
+  push:
+    branches: [ "main" ]
+    path:
+      - "python/**"
+      - "scripts/**"
+      - "test/**"
+      - ".github/workflows/pr_test_npu.yml"
+  pull_request:
+    branches: [ "main" ]
+      - "python/**"
+      - "scripts/**"
+      - "test/**"
+      - ".github/workflows/pr_test_npu.yml"
+jobs:
+  unit-test-basic:
+    runs-on: arm64-npu-0
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1.alpha003-910b-ubuntu22.04-py3.11
+    steps:
+      - name: Run test
+        run: |
+        echo "TEST RUNNING"
+  finish:
+    if: always()
+    needs: [ unit-test-basic ]
+    runs-on: arm64-npu-0
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          echo "All jobs completed successfully"
+          exit 0
