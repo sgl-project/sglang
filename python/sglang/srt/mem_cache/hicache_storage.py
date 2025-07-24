@@ -241,8 +241,8 @@ class MooncakeStore(HiCacheStorage):
 		except ImportError as e:
 			raise ImportError(
 				"Please install mooncake by following the instructions at "
-				"https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
-				"to run vLLM with MooncakeConnector."
+				"https://kvcache-ai.github.io/Mooncake/getting_started/build.html"
+				"to run SGLang with MooncakeConnector."
 			) from e
 
 		try:
