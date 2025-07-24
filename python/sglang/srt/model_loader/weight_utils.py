@@ -229,7 +229,7 @@ def get_quant_config(
                     f"Unsupported quantization config"
                     f" found for {model_config.quantization} in {f}."
                 )
-        elif model_config.quantization == "w8a8_int8" and packed_modules_mapping:
+        elif model_config.quantization == "w8a8_int8":
             config["packed_modules_mapping"] = packed_modules_mapping
 
     return quant_cls.from_config(config)
