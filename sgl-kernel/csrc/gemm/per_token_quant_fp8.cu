@@ -1,11 +1,37 @@
-#include <ATen/cuda/CUDAContext.h>
-
+// clang-format off
+#include <tuple>
 #include <cmath>
+#include <ATen/cuda/CUDAContext.h>
+#include <cute/algorithm/functional.hpp>
+#include <cute/algorithm/gemm.hpp>
+#include <cute/arch/cluster_sm90.hpp>
+#include <cute/arch/copy_sm90.hpp>
+#include <cute/atom/copy_atom.hpp>
+#include <cute/algorithm/copy.hpp>
+#include <cute/tensor.hpp>
 #include <flashinfer/vec_dtypes.cuh>
+// clang-format on
 
 #include "utils.h"
 
+using namespace cute;
+
 static constexpr int kWarpSize = 32;
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+// No support for async
+#else
+
+__device__ inline void cp_async_commit_group() {
+  asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int n>
+__device__ inline void cp_async_wait_group() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
+}
+#endif
+
 
 // ---------------------------------------------------------------------------
 // 1. Warp‑local, no shared memory
@@ -152,6 +178,114 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
   }
 }
 
+// ---------------------------------------------------------------------------
+// 3. LargeTile kernel — 8 KiB tile with **single‑buffer** CUTE TiledCopy
+// ---------------------------------------------------------------------------
+template <typename T, int kBlockSize = 256, int kVecSize = 16, int kTileBytes = 8192, int kStages = 2>
+__launch_bounds__(kBlockSize) __global__ void per_token_quant_fp8_large_kernel(
+    const T* __restrict__ input,
+    FP8_TYPE* __restrict__ output_q,
+    float* __restrict__ output_s,
+    int hidden_dim,
+    int num_tokens) {
+  const int token = blockIdx.x;
+  if (token >= num_tokens) return;
+  const int tid = threadIdx.x;
+
+  // Gmem tensors
+  auto g_in = make_tensor(const_cast<T*>(input) + token * hidden_dim, make_shape(hidden_dim));
+  auto g_out = make_tensor(output_q + token * hidden_dim, make_shape(hidden_dim));
+
+  // Shared memory tile (8 KiB)
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  using AtomT = cutlass::uint128_t;  // 16  B
+  constexpr int kTileElems = kTileBytes / sizeof(T);
+  constexpr int kAtomsPerTile = kTileBytes / sizeof(AtomT);  // 4 for float
+  AtomT* smem = reinterpret_cast<AtomT*>(smem_raw);
+
+  int g_offset = 0;
+#pragma unroll
+  for (int stage = 0; stage < kStages; ++stage, g_offset += kTileElems) {
+    if (g_offset < hidden_dim) {
+      auto src =
+          cute::make_tensor(reinterpret_cast<const AtomT*>(g_in.data() + g_offset),
+          cute::make_shape(cute::Int<kAtomsPerTile>{}));
+      auto dst = cute::make_tensor(
+          smem + stage * kAtomsPerTile,
+          cute::make_shape(cute::Int<kAtomsPerTile>{}));
+      cute::copy(src, dst);
+    }
+  }
+  cp_async_commit_group();
+  cp_async_wait_group<1>();
+
+  //--------------------------------------------------------------------
+  // Pass-1: reduce max + prefetch next tile
+  //--------------------------------------------------------------------
+  float local_max = 0.f;
+  for (int g_base = 0; g_base < hidden_dim; g_base += kTileElems) {
+    int stage = (g_base / kTileElems) % kStages;
+    AtomT* tile_atom = smem + stage * kAtomsPerTile;
+    T* tile = reinterpret_cast<T*>(tile_atom);
+
+    // update max
+    for (int idx = tid * kVecSize; idx <= kTileElems - kVecSize && g_base + idx < hidden_dim; idx += kBlockSize * kVecSize) {
+      flashinfer::vec_t<T, kVecSize> v;
+      v.cast_load(tile + idx);
+#pragma unroll
+      for (int i = 0; i < kVecSize; ++i)
+        local_max = fmaxf(local_max, fabsf(float(v[i])));
+    }
+
+    // prefetch next tile to double buffer
+    int g_next = g_base + kStages * kTileElems;
+    if (g_next < hidden_dim) {
+      auto src = cute::make_tensor(
+          reinterpret_cast<const AtomT*>(g_in.data() + g_next), cute::make_shape(cute::Int<kAtomsPerTile>{}));
+      auto dst = cute::make_tensor(
+        smem + ((stage ^ 1) * kAtomsPerTile),
+        cute::make_shape(cute::Int<kAtomsPerTile>{}));
+      cute::copy(src, dst);
+    }
+    cp_async_commit_group();
+    cp_async_wait_group<1>();
+    __syncthreads();
+  }
+
+  // CTA reduce max & broadcast scale
+  float token_max = blockReduceMax(local_max);
+
+  __shared__ float scale;
+  if (tid == 0) {
+    scale = token_max / FP8_E4M3_MAX;
+    output_s[token] = scale;
+  }
+  __syncthreads();
+  const float inv_scale = scale ? 1.f / scale : 0.f;
+
+  //--------------------------------------------------------------------
+  // Pass-2: quantize write back（reuse data in SMEM in double buffer）
+  //--------------------------------------------------------------------
+  for (int g_base = 0; g_base < hidden_dim; g_base += kTileElems) {
+    int stage = (g_base / kTileElems) % kStages;
+    AtomT* tile_atom = smem + stage * kAtomsPerTile;
+    T* tile = reinterpret_cast<T*>(tile_atom);
+
+    for (int idx = tid * kVecSize; idx <= kTileElems - kVecSize && g_base + idx < hidden_dim; idx += kBlockSize * kVecSize) {
+      flashinfer::vec_t<T, kVecSize> v;
+      v.cast_load(tile + idx);
+      FP8_TYPE q[kVecSize];
+#pragma unroll
+      for (int i = 0; i < kVecSize; ++i) {
+        float f = fminf(fmaxf(float(v[i]) * inv_scale, -FP8_E4M3_MAX), FP8_E4M3_MAX);
+        q[i] = static_cast<FP8_TYPE>(f);
+      }
+      *reinterpret_cast<uint4*>(g_out.data() + g_base + idx) = *reinterpret_cast<const uint4*>(q);
+    }
+    __syncthreads();
+  }
+}
+
 void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
@@ -165,15 +299,21 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   // Hard-code sm_count
   int sm_count = 132;
   constexpr int TOKENS_PER_CTA = 8;
-  const bool use_warp_kernel = (num_tokens >= sm_count * 2 * TOKENS_PER_CTA);
+  const bool use_large_kernel = (hidden_dim > 8192) && (num_tokens >= sm_count * 2 * TOKENS_PER_CTA);
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
-    if (use_warp_kernel) {
-      // -------- warp‑local ---------------------------------------------------
-      constexpr int THREADS = TOKENS_PER_CTA * kWarpSize;  // 256
-      dim3 grid((num_tokens + TOKENS_PER_CTA - 1) / TOKENS_PER_CTA);
-      dim3 block(THREADS);
-      per_token_quant_fp8_kernel<scalar_t, TOKENS_PER_CTA, 16><<<grid, block, 0, stream>>>(
+    if (use_large_kernel) {
+      // -------- cute copy ---------------------------------------------------
+      constexpr int BLOCK_SIZE = 256;
+      constexpr int SMEM_BYTES = 2 * 8192;
+      dim3 grid(num_tokens), block(BLOCK_SIZE);
+
+      AT_CUDA_CHECK(cudaFuncSetAttribute(
+          per_token_quant_fp8_large_kernel<scalar_t, BLOCK_SIZE>,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          SMEM_BYTES));
+
+      per_token_quant_fp8_large_kernel<scalar_t, BLOCK_SIZE><<<grid, block, SMEM_BYTES, stream>>>(
           static_cast<const scalar_t*>(input.data_ptr()),
           static_cast<FP8_TYPE*>(output_q.data_ptr()),
           static_cast<float*>(output_s.data_ptr()),
