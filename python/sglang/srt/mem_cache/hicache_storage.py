@@ -84,7 +84,7 @@ class HiCacheStorage(ABC):
         Returns True if the operation was successful, False otherwise.
         """
         pass
-        
+
     @abstractmethod
     def batch_set(self,
                   keys,
@@ -104,7 +104,6 @@ class HiCacheStorage(ABC):
         Returns True if the key exists, False otherwise.
         """
         pass
-
 
 
 class HiCacheFile(HiCacheStorage):
@@ -181,7 +180,7 @@ class HiCacheFile(HiCacheStorage):
             return
 
     def exists(self, key) -> bool | dict:
-        tensor_path = f"{self.file_path}/{key}.bin"
+        tensor_path = os.path.join(self.file_path, f"{key}.bin")
         return os.path.exists(tensor_path)
 
     def clear(self) -> None:
