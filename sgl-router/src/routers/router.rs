@@ -676,7 +676,7 @@ impl Router {
                             let url_vec = vec![String::from(worker_url)];
                             let dp_url_vec = Self::get_dp_aware_workers(&url_vec, &self.api_key)
                                 .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?;
-                            let mut add_worker_flag: bool = false;
+                            let mut worker_added: bool = false;
                             for dp_url in &dp_url_vec {
                                 if workers_guard.iter().any(|w| w.url() == dp_url) {
                                     warn!("Worker {} already exists", dp_url);
@@ -685,9 +685,9 @@ impl Router {
                                 info!("Added worker: {}", dp_url);
                                 let new_worker = WorkerFactory::create_regular(dp_url.to_string());
                                 workers_guard.push(new_worker);
-                                add_worker_flag = true;
+                                worker_added = true;
                             }
-                            if !add_worker_flag {
+                            if !worker_added {
                                 return Err(format!("No worker added for {}", worker_url));
                             }
                         } else {
