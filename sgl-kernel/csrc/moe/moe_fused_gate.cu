@@ -36,24 +36,6 @@ __device__ inline bool cmp_eq(const T& a, const T& b) {
   }
 }
 
-// Type-safe prefetch helper function
-template <typename T>
-__device__ __forceinline__ void safe_prefetch(const T* addr) {
-  if constexpr (std::is_same<T, float32_t>::value) {
-    // For standard floating-point types, use regular __ldg
-    volatile float dummy = __ldg(reinterpret_cast<const float*>(addr));
-  } 
-  else if constexpr (std::is_same<T, float16_t>::value || 
-                     std::is_same<T, bfloat16_t>::value) {
-    // Conversion of half-precision type to unsigned short
-    volatile unsigned short dummy = __ldg(reinterpret_cast<const unsigned short*>(addr));
-  }
-  else {
-    // Fallback option: Use volatile reads to trigger hardware prefetch
-    volatile T dummy = *addr;
-  }
-}
-
 // Fixed constants common to both dynamic and static template versions:
 static constexpr int WARP_SIZE = 32;
 static constexpr int WARPS_PER_CTA = 6;
@@ -65,8 +47,14 @@ using Array = AlignedArray<T, N>;
 // QQ: NOTE expression must have a constant value, this has to be > params.VPT
 template <typename T>
 using AccessType = AlignedArray<T, MAX_VPT>;
-// Process up to 32 elements at a time, with the excess handled via tiling.
 
+template <typename T>
+__device__ inline T recalculate_sigmoid(int expert_idx, T* input_ptr) {
+  T val = input_ptr[expert_idx];
+  return static_cast<T>(1.0f / (1.0f + expf(-float(val))));
+}
+
+// Process up to 32 elements at a time, with the excess handled via tiling.
 template <typename T, typename Params>
 __device__ void moe_fused_gate_impl(
     void* input,
@@ -79,6 +67,12 @@ __device__ void moe_fused_gate_impl(
     int64_t num_fused_shared_experts,
     double routed_scaling_factor,
     Params params) {
+  // Add shared memory array to store processing results
+  // Only allocate shared memory for the currently processed tile, not the entire VPT
+  __shared__ T shared_sigmoid[WARP_SIZE * 32]; // 32 * 32 = 1024
+  __shared__ T shared_bias[WARP_SIZE * 32];    // 32 * 32 = 1024
+  __shared__ int current_tile_idx;
+
   int tidx = threadIdx.x;
   int64_t thread_row =
       blockIdx.x * params.ROWS_PER_CTA + threadIdx.y * params.ROWS_PER_WARP + tidx / params.THREADS_PER_ROW;
@@ -96,6 +90,10 @@ __device__ void moe_fused_gate_impl(
 
   int thread_group_idx = tidx % params.THREADS_PER_ROW;
   int first_elt_read_by_thread = thread_group_idx * params.VPT;
+  // Calculate the offset of the current thread in shared memory
+  int thread_linear_idx = threadIdx.y * WARP_SIZE + tidx;
+  // Calculate the offset of the current thread in the warp
+  int thread_shared_offset = tidx % WARP_SIZE;
 
   // Create local arrays for the row chunk and bias chunk and then reinterpret the address of row_chunk as a pointer to
   // AccessType.
@@ -120,9 +118,15 @@ __device__ void moe_fused_gate_impl(
 
 #pragma unroll
   for (int tile = 0; tile < (params.VPT + 31) / 32; ++tile) {
-    int tile_offset = tile * 32;
-    int tile_size = min(32, params.VPT - tile_offset);
-    if (tile_size <= 0) break;
+      // Synchronize threads to ensure all threads are ready for the next tile
+      if (tidx == 0 && threadIdx.y == 0) {
+        current_tile_idx = tile;
+      }
+      __syncthreads();
+      
+      int tile_offset = tile * 32;
+      int tile_size = min(32, params.VPT - tile_offset);
+      if (tile_size <= 0) break;
 
     // Prefetch the data of the next tile before processing the current one
     if (tile + 1 < (params.VPT + 31) / 32) {
@@ -130,9 +134,18 @@ __device__ void moe_fused_gate_impl(
       int prefetch_size = min(32, params.VPT - next_offset);
       if (prefetch_size > 0) {
         #pragma unroll
+        #pragma unroll
         for (int i = 0; i < prefetch_size; i += 8) {
-          safe_prefetch(&thread_read_ptr[next_offset + i]);
-          safe_prefetch(&bias_thread_read_ptr[next_offset + i]);
+          if (std::is_same<T, float32_t>::value) {
+            // Prefetching using __ldg for float32 type
+            volatile float dummy = __ldg(reinterpret_cast<const float*>(&thread_read_ptr[next_offset + i]));
+            volatile float dummy2 = __ldg(reinterpret_cast<const float*>(&bias_thread_read_ptr[next_offset + i]));
+          }
+          else {
+            // For other types, use volatile to ensure prefetching
+            volatile T dummy = thread_read_ptr[next_offset + i];
+            volatile T dummy2 = bias_thread_read_ptr[next_offset + i]; 
+          }
         }
       }
     }
@@ -145,20 +158,21 @@ __device__ void moe_fused_gate_impl(
       bias_chunk[ii] = vec_bias_thread_read_ptr[0][global_idx];
     }
 
-    // Merge Sigmoid, Add Bias, and find maximum operations to reduce __syncthreads() calls
+    // Calculate the maximum and second maximum values in the current tile
     #pragma unroll
     for (int ii = 0; ii < tile_size; ++ii) {
+      int global_idx = tile_offset + ii;
+      
       // Calculate Sigmoid
       T sigmoid_val = static_cast<T>(1.0f / (1.0f + expf(-float(row_chunk[ii]))));
       // Add bias
       T val_with_bias = sigmoid_val + bias_chunk[ii];
       
-      // Save result
-      row_chunk[ii] = sigmoid_val;
-      bias_chunk[ii] = val_with_bias;
+      // Store the result in shared memory
+      int shared_idx = (thread_shared_offset + ii * WARP_SIZE) % (WARP_SIZE * 32);
+      shared_sigmoid[shared_idx] = sigmoid_val;
+      shared_bias[shared_idx] = val_with_bias;
       
-      // Find the maximum value immediately
-      int global_idx = tile_offset + ii;
       if (cmp_gt(val_with_bias, global_max_val)) {
         global_max_val_second = global_max_val;
         global_max_second_idx = global_max_idx;
@@ -169,16 +183,7 @@ __device__ void moe_fused_gate_impl(
         global_max_second_idx = global_idx;
       }
     }
-
     __syncthreads();
-
-    // Write the processing results back to the corresponding location in global memory
-    #pragma unroll
-    for (int ii = 0; ii < tile_size; ++ii) {
-      int global_idx = tile_offset + ii;
-      thread_read_ptr[global_idx] = row_chunk[ii];
-      bias_thread_read_ptr[global_idx] = bias_chunk[ii];
-    }
   }
 
 ////////////////////// Exclude Groups //////////////////////
@@ -208,47 +213,50 @@ __device__ void moe_fused_gate_impl(
       }
     }
 
-    // clear the max value in the thread
-    if (k_idx < params.THREADS_PER_ROW - topk_group) {
-      int const thread_to_clear_in_group = expert / params.VPT;
-
-      if (thread_group_idx == thread_to_clear_in_group) {
-        // Need to clear the global maximum
-        int expert_mod = expert % params.VPT;
-        if (expert_mod == global_max_idx || expert_mod == global_max_second_idx) {
-          // Clear directly through global memory
-          bias_thread_read_ptr[expert_mod] = static_cast<T>(FLT_MAX);
+    int thread_to_clear_in_group = expert / params.VPT;
+    if (thread_group_idx == thread_to_clear_in_group) {
+      // Need to clear the global maximum
+      int expert_mod = expert % params.VPT;
+      if (expert_mod == global_max_idx || expert_mod == global_max_second_idx) {
+        int tile_idx = expert_mod / 32;
+        int local_idx = expert_mod % 32;
+        // Clear in shared memory
+        if (tile_idx == current_tile_idx) {
+          int shared_idx = (thread_shared_offset + local_idx * WARP_SIZE) % (WARP_SIZE * 32);
+          shared_bias[shared_idx] = static_cast<T>(FLT_MAX);
+        }
+        
+        // Reset global maximum values
+        global_max_val = static_cast<T>(-FLT_MAX);
+        global_max_val_second = static_cast<T>(-FLT_MAX);
+        global_max_idx = -1;
+        global_max_second_idx = -1;
+        
+        // Recalculate the maximum and second maximum values in the current tile
+        #pragma unroll
+        for (int i = 0; i < params.VPT; ++i) {
+          int tile_idx = i / 32;
+          int local_idx = i % 32;
           
-          // Recalculate the maximum value
-          global_max_val = static_cast<T>(-FLT_MAX);
-          global_max_val_second = static_cast<T>(-FLT_MAX);
-          global_max_idx = -1;
-          global_max_second_idx = -1;
-          
-          // Rescan all data to find the maximum value
-          #pragma unroll
-            for (int tile = 0; tile < (params.VPT + 31) / 32; ++tile) {
-              int tile_offset = tile * 32;
-              int tile_size = min(32, params.VPT - tile_offset);
-              if (tile_size <= 0) break;
-              
-              #pragma unroll
-              for (int ii = 0; ii < tile_size; ++ii) {
-                int idx = tile_offset + ii;
-                T val = bias_thread_read_ptr[idx];
-                
-                if (cmp_gt(val, global_max_val) && !cmp_eq(val, static_cast<T>(FLT_MAX))) {
-                  global_max_val_second = global_max_val;
-                  global_max_second_idx = global_max_idx;
-                  global_max_val = val;
-                  global_max_idx = idx;
-                } else if (cmp_gt(val, global_max_val_second) && !cmp_eq(val, static_cast<T>(FLT_MAX))) {
-                  global_max_val_second = val;
-                  global_max_second_idx = idx;
-                }
-              }
-            }
+          T val;
+          if (tile_idx == current_tile_idx) {
+            int shared_idx = (thread_shared_offset + local_idx * WARP_SIZE) % (WARP_SIZE * 32);
+            val = shared_bias[shared_idx];
+          } else {
+            // Recalculate the value for the current tile
+            val = recalculate_sigmoid(i, thread_read_ptr) + bias_thread_read_ptr[i];
           }
+          
+          if (cmp_gt(val, global_max_val) && !cmp_eq(val, static_cast<T>(FLT_MAX))) {
+            global_max_val_second = global_max_val;
+            global_max_second_idx = global_max_idx;
+            global_max_val = val;
+            global_max_idx = i;
+          } else if (cmp_gt(val, global_max_val_second) && !cmp_eq(val, static_cast<T>(FLT_MAX))) {
+            global_max_val_second = val;
+            global_max_second_idx = i;
+          }
+        }
       }
     }
   }
@@ -263,31 +271,35 @@ __device__ void moe_fused_gate_impl(
     int local_max_idx = -1;
     int expert = first_elt_read_by_thread;
 
-    // Scan all tiles
+    // Determine the current tile index
     #pragma unroll
-      for (int tile = 0; tile < (params.VPT + 31) / 32; ++tile) {
-        int tile_offset = tile * 32;
-        int tile_size = min(32, params.VPT - tile_offset);
-        if (tile_size <= 0) break;
-        
-        // Read the data of the current tile
-        #pragma unroll
-        for (int ii = 0; ii < tile_size; ++ii) {
-          int global_idx = tile_offset + ii;
-          T val = bias_thread_read_ptr[global_idx];
-          
-          if (cmp_gt(val, local_max_val) && !cmp_eq(val, static_cast<T>(FLT_MAX)) && 
-              !cmp_eq(val, static_cast<T>(-FLT_MAX))) {
-            local_max_val = val;
-            local_max_idx = global_idx;
-          }
-        }
+    for (int i = 0; i < params.VPT; ++i) {
+      int tile_idx = i / 32;
+      int local_idx = i % 32;
+      
+      // Read the value from shared memory or recalculate it
+      T val;
+      if (tile_idx == current_tile_idx) {
+        // In the current tile, read directly from shared memory.
+        val = shared_bias[thread_shared_offset + local_idx];
+      } else {
+        // Not in the current tile, recalculating
+        int global_offset = i;
+        val = recalculate_sigmoid(global_offset, thread_read_ptr) + bias_thread_read_ptr[global_offset];
       }
+      
+      if (cmp_gt(val, local_max_val) && !cmp_eq(val, static_cast<T>(FLT_MAX)) && 
+          !cmp_eq(val, static_cast<T>(-FLT_MAX))) {
+        local_max_val = val;
+        local_max_idx = i;
+      }
+    }
     
     // If no valid value is found
     if (local_max_idx == -1) {
       local_max_val = static_cast<T>(-FLT_MAX);
     } else {
+      // Update the expert index based on the local maximum index
       expert = first_elt_read_by_thread + local_max_idx;
     }
 
@@ -310,12 +322,21 @@ __device__ void moe_fused_gate_impl(
 
     if (thread_group_idx == thread_to_clear_in_group) {
       int expert_to_clear_in_thread = expert % params.VPT;
-
-      // clear the max value in the thread
-      bias_thread_read_ptr[expert_to_clear_in_thread] = static_cast<T>(-FLT_MAX);
-
-      // store output
-      output_ptr[idx] = static_cast<float>(thread_read_ptr[expert_to_clear_in_thread]);
+      int tile_idx = expert_to_clear_in_thread / 32;
+      int local_idx = expert_to_clear_in_thread % 32;
+      
+      // If the current thread is responsible for clearing the expert
+      if (tile_idx == current_tile_idx) {
+        int shared_idx = (thread_shared_offset + local_idx * WARP_SIZE) % (WARP_SIZE * 32);
+        shared_bias[shared_idx] = static_cast<T>(-FLT_MAX);
+        output_ptr[idx] = static_cast<float>(shared_sigmoid[shared_idx]);
+      } else {
+        // Recalculate the sigmoid value for the expert
+        output_ptr[idx] = static_cast<float>(recalculate_sigmoid(
+          expert_to_clear_in_thread, 
+          thread_read_ptr));
+      }
+      
       indices_ptr[idx] = static_cast<int32_t>(expert);
     }
 
@@ -409,8 +430,10 @@ __global__ void moe_fused_gate_kernel(
     /* If EXPERT_GROUP > WARP_SIZE, fall back to 1 row per warp */                                       \
     constexpr int ROWS_PER_WARP = ((EXPERT_GROUP) <= WARP_SIZE) ? (WARP_SIZE / (EXPERT_GROUP)) : 1;      \
     constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;                                          \
+    /* Calculate shared memory size */                                                                               \
+    size_t shared_mem_size = 2 * WARP_SIZE * 32 * sizeof(T) + sizeof(int);                        \
     moe_fused_gate_kernel<T, VPT, (EXPERTS), (EXPERT_GROUP), ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA> \
-        <<<num_blocks, block_dim, 0, stream>>>(                                                          \
+        <<<num_blocks, block_dim, shared_mem_size, stream>>>(                                            \
             input.data_ptr(),                                                                            \
             bias.data_ptr(),                                                                             \
             output.data_ptr<float>(),                                                                    \
@@ -597,7 +620,10 @@ std::vector<at::Tensor> moe_fused_gate(
     // Fallback to the dynamic kernel if none of the supported combinations match.
     // currently only support num_experts / num_expert_group <= 512 for dynamic kernels
     if (input.scalar_type() == at::kBFloat16) {
-      moe_fused_gate_kernel_dynamic<bfloat16_t><<<num_blocks, block_dim, 0, stream>>>(
+      // QQ NOTE: for bfloat16, we use cutlass::bfloat16_t
+      // QQ NOTE: shared memory size is 2 * WARP_SIZE * 32 * sizeof(bfloat16_t) + sizeof(int)
+      size_t shared_mem_size_bf16 = 2 * WARP_SIZE * 32 * sizeof(bfloat16_t) + sizeof(int);
+      moe_fused_gate_kernel_dynamic<bfloat16_t><<<num_blocks, block_dim, shared_mem_size_bf16, stream>>>(
           input.data_ptr(),
           bias.data_ptr(),
           output.data_ptr<float>(),
@@ -610,7 +636,8 @@ std::vector<at::Tensor> moe_fused_gate(
           num_fused_shared_experts,
           routed_scaling_factor);
     } else if (input.scalar_type() == at::kHalf) {
-      moe_fused_gate_kernel_dynamic<float16_t><<<num_blocks, block_dim, 0, stream>>>(
+      size_t shared_mem_size_f16 = 2 * WARP_SIZE * 32 * sizeof(float16_t) + sizeof(int);
+      moe_fused_gate_kernel_dynamic<float16_t><<<num_blocks, block_dim, shared_mem_size_f16, stream>>>(
           input.data_ptr(),
           bias.data_ptr(),
           output.data_ptr<float>(),
@@ -623,7 +650,8 @@ std::vector<at::Tensor> moe_fused_gate(
           num_fused_shared_experts,
           routed_scaling_factor);
     } else if (input.scalar_type() == at::kFloat) {
-      moe_fused_gate_kernel_dynamic<float32_t><<<num_blocks, block_dim, 0, stream>>>(
+      size_t shared_mem_size_f32 = 2 * WARP_SIZE * 32 * sizeof(float32_t) + sizeof(int);
+      moe_fused_gate_kernel_dynamic<float32_t><<<num_blocks, block_dim, shared_mem_size_f32, stream>>>(
           input.data_ptr(),
           bias.data_ptr(),
           output.data_ptr<float>(),
