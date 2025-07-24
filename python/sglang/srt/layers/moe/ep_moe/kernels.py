@@ -1334,12 +1334,29 @@ def compute_problem_sizes_w4a8_kernel(
     pid = tl.program_id(axis=0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = pid < num_experts
     final_occurrences = tl.load(masked_m_ptr + pid, mask=mask, other=0)
-    tl.store(problem_sizes1_ptr + pid * 3, 2 * n)
-    tl.store(problem_sizes1_ptr + pid * 3 + 1, final_occurrences)
-    tl.store(problem_sizes1_ptr + pid * 3 + 2, k)
-    tl.store(problem_sizes2_ptr + pid * 3, k)
-    tl.store(problem_sizes2_ptr + pid * 3 + 1, final_occurrences)
-    tl.store(problem_sizes2_ptr + pid * 3 + 2, n)
+
+    ps1_idx_0 = pid * 3
+    ps1_idx_1 = ps1_idx_0 + 1
+    ps1_idx_2 = ps1_idx_0 + 2
+
+    ps2_idx_0 = pid * 3
+    ps2_idx_1 = ps2_idx_0 + 1
+    ps2_idx_2 = ps2_idx_0 + 2
+
+    ps1_mask_0 = ps1_idx_0 < num_experts * 3
+    ps1_mask_1 = ps1_idx_1 < num_experts * 3
+    ps1_mask_2 = ps1_idx_2 < num_experts * 3
+    ps2_mask_0 = ps2_idx_0 < num_experts * 3
+    ps2_mask_1 = ps2_idx_1 < num_experts * 3
+    ps2_mask_2 = ps2_idx_2 < num_experts * 3
+
+    tl.store(problem_sizes1_ptr + ps1_idx_0, 2 * n, mask=ps1_mask_0)
+    tl.store(problem_sizes1_ptr + ps1_idx_1, final_occurrences, mask=ps1_mask_1)
+    tl.store(problem_sizes1_ptr + ps1_idx_2, k, mask=ps1_mask_2)
+
+    tl.store(problem_sizes2_ptr + ps2_idx_0, k, mask=ps2_mask_0)
+    tl.store(problem_sizes2_ptr + ps2_idx_1, final_occurrences, mask=ps2_mask_1)
+    tl.store(problem_sizes2_ptr + ps2_idx_2, n, mask=ps2_mask_2)
 
 
 def compute_problem_sizes_w4a8(
