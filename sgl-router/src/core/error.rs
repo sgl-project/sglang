@@ -40,7 +40,7 @@ impl fmt::Display for WorkerError {
                 write!(f, "Worker at capacity: {}", url)
             }
             WorkerError::InvalidUrl { url } => {
-                write!(f, "Invalid URL fromat: {}", url)
+                write!(f, "Invalid URL format: {}", url)
             }
         }
     }
