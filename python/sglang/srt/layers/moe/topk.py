@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Callable, NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -39,10 +39,10 @@ from sglang.srt.utils import (
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -54,7 +54,6 @@ if _use_aiter:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
-
 if _is_npu:
     import torch_npu
 
@@ -451,6 +450,11 @@ def biased_grouped_topk_impl(
     return topk_weights, topk_ids
 
 
+biased_grouped_topk_impl_compiled = torch.compile(
+    biased_grouped_topk_impl, dynamic=True, backend=get_compiler_backend()
+)
+
+
 def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
 
@@ -536,11 +540,7 @@ def biased_grouped_topk_gpu(
         return topk_weights, topk_ids
     else:
         biased_grouped_topk_fn = (
-            torch.compile(
-                biased_grouped_topk_impl, dynamic=True, backend=get_compiler_backend()
-            )
-            if compiled
-            else biased_grouped_topk_impl
+            biased_grouped_topk_impl_compiled if compiled else biased_grouped_topk_impl
         )
         return biased_grouped_topk_fn(
             hidden_states,
