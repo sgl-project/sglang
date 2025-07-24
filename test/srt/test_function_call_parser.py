@@ -507,6 +507,7 @@ class TestEBNFGeneration(unittest.TestCase):
         self.llama32_detector = Llama32Detector()
         self.mistral_detector = MistralDetector()
         self.qwen25_detector = Qwen25Detector()
+        self.kimik2_detector = KimiK2Detector()
 
     def test_pythonic_detector_ebnf(self):
         """Test that the PythonicDetector generates valid EBNF."""
@@ -534,6 +535,33 @@ class TestEBNFGeneration(unittest.TestCase):
         self.assertIn("<｜tool▁calls▁begin｜>", ebnf)
         self.assertIn("<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather", ebnf)
         self.assertIn('\\"location\\"" ":" basic_string ', ebnf)
+
+        # Validate that the EBNF can be compiled by GrammarCompiler
+        try:
+            ctx = self.grammar_compiler.compile_grammar(ebnf)
+            self.assertIsNotNone(ctx, "EBNF should be valid and compile successfully")
+        except RuntimeError as e:
+            self.fail(f"Failed to compile EBNF: {e}")
+
+    def test_kimik2_detector_ebnf(self):
+        """Test that the KimiK2Detector generates valid EBNF."""
+        ebnf = self.kimik2_detector.build_ebnf(self.tools)
+        self.assertIsNotNone(ebnf)
+
+        # Check that the EBNF contains expected patterns for KimiK2 format
+        self.assertIn("<|tool_calls_section_begin|>", ebnf)
+        self.assertIn("<|tool_calls_section_end|>", ebnf)
+
+        # Check for KimiK2-specific function call structure
+        self.assertIn("<|tool_call_begin|>functions.get_weather:", ebnf)
+        self.assertIn("<|tool_call_begin|>functions.search:", ebnf)
+        self.assertIn("<|tool_call_argument_begin|>", ebnf)
+        self.assertIn("<|tool_call_end|>", ebnf)
+
+        # Check that it uses the correct namespace.function format with numeric index pattern
+        self.assertIn("functions.get_weather:", ebnf)
+        self.assertIn("functions.search:", ebnf)
+        self.assertIn("[0-9]+", ebnf)  # Numeric index pattern
 
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
