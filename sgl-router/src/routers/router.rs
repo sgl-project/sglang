@@ -765,10 +765,12 @@ impl Router {
 
             // do the removing on the worker_urls
             let mut workers_guard = self.workers.write().unwrap();
+            let mut removed_workers: Vec<String> = Vec::new();
             for dp_url in candidate_workers.iter() {
                 if let Some(index) = workers_guard.iter().position(|w| w.url() == dp_url) {
                     workers_guard.remove(index);
                     info!("Removed worker: {}", dp_url);
+                    removed_workers.push(dp_url.to_string());
                 } else {
                     warn!("Worker {} not found, skipping removal", dp_url);
                     continue;
@@ -783,11 +785,7 @@ impl Router {
                 .as_any()
                 .downcast_ref::<crate::policies::CacheAwarePolicy>()
             {
-                let workers_guard = self.workers.read().unwrap();
-                for dp_url in candidate_workers.iter() {
-                    if !workers_guard.iter().any(|w| w.url() == dp_url) {
-                        continue;
-                    }
+                for dp_url in removed_workers.iter() {
                     cache_aware.remove_worker(dp_url);
                     info!("Removed worker from tree: {}", dp_url);
                 }
@@ -815,12 +813,12 @@ impl Router {
         }
     }
 
-    /// Remove a specific failure worker; for internal usage
+    /// Remove a specific failed worker; for internal usage
     fn remove_failed_worker(&self, worker_url: &str) {
         let mut workers_guard = self.workers.write().unwrap();
         if let Some(index) = workers_guard.iter().position(|w| w.url() == worker_url) {
             workers_guard.remove(index);
-            info!("Removed worker: {}", worker_url);
+            info!("Removed failed worker: {}", worker_url);
             RouterMetrics::set_active_workers(workers_guard.len());
         } else {
             warn!("Worker {} not found, skipping removal", worker_url);
@@ -834,7 +832,7 @@ impl Router {
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
         {
             cache_aware.remove_worker(worker_url);
-            info!("Removed worker from tree: {}", worker_url);
+            info!("Removed failed worker from tree: {}", worker_url);
         }
     }
 
