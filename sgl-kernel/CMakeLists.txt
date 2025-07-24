@@ -56,7 +56,7 @@ if("${CUDA_VERSION}" VERSION_EQUAL "12.8")
   set(DeepGEMM_TAG "blackwell")
 else()
   set(DeepGEMM_REPO "https://github.com/deepseek-ai/DeepGEMM")
-  set(DeepGEMM_TAG "8dfa3298274bfe6b242f6f8a3e6f3eff2707dd9f")
+  set(DeepGEMM_TAG "391755ada0ffefa9a6a52b6f14dcaf22d1a463e0")
 endif()
 
 FetchContent_Declare(

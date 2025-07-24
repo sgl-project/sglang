@@ -151,6 +151,27 @@ class TestGemma3itServer(TestOpenAIVisionServer):
         pass
 
 
+class TestGemma3nServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "google/gemma-3n-E2B-it"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.70",
+                "--cuda-graph-max-bs",
+                "1",
+            ],
+        )
+        cls.base_url += "/v1"
+
+
 class TestKimiVLServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
