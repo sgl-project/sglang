@@ -855,9 +855,7 @@ class FlashInferIndicesUpdaterPrefill:
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
-            paged_kernel_lens_sum = (
-                paged_kernel_lens.sum().to(device="cpu", non_blocking=True).item()
-            )
+            paged_kernel_lens_sum = paged_kernel_lens.sum().item()
         else:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
@@ -1032,20 +1030,38 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
         # cached part
-        wrapper_paged.plan(
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
+        args = [qo_indptr, kv_indptr, kv_indices]
+        if isinstance(wrapper_paged, BatchAttention):
+            args.append(paged_kernel_lens)
+        args += [
             self.kv_last_page_len[:bs],
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
-            1,
+        ]
+        wrapper_paged.plan(
+            *args,
+            page_size=1,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
             custom_mask=custom_mask,
             non_blocking=True,
         )
+
+    #     wrapper_paged.plan(
+    #         qo_indptr,
+    #         kv_indptr,
+    #         kv_indices,
+    #         self.kv_last_page_len[:bs],
+    #         self.num_qo_heads,
+    #         self.num_kv_heads,
+    #         self.head_dim,
+    #         page_size=1,
+    #         q_data_type=self.q_data_type,
+    #         kv_data_type=self.data_type,
+    #         custom_mask=custom_mask,
+    #         non_blocking=True,
+    #     )
 
 
 # Use as a fast path to override the indptr in flashinfer's plan function
