@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -1067,19 +1068,36 @@ class LoadLoRAAdapterReqInput:
     lora_name: str
     # The path of loading.
     lora_path: str
+    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+            lora_path=self.lora_path,
+        )
 
 
 @dataclass
 class UnloadLoRAAdapterReqInput:
     # The name of lora module to unload.
     lora_name: str
+    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+        )
 
 
 @dataclass
 class LoRAUpdateResult:
     success: bool
     error_message: Optional[str] = None
-    loaded_adapters: Dict[str, str] = field(default_factory=dict)
+    loaded_adapters: Dict[str, LoRARef] = field(default_factory=dict)
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
