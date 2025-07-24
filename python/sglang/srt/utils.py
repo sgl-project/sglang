@@ -2375,6 +2375,8 @@ def is_fa3_default_architecture(hf_config):
 # Can be more general if it is used in multiple places (keep it simple and thus not general now)
 class BumpAllocator:
     def __init__(self, buffer_size: int, dtype, device):
+        # kernel void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, std::array<char*, 1ul> >(int, at::native::FillFunctor<float>, std::array<char*, 1ul>)
+
         self._buffer = torch.zeros((buffer_size,), dtype=dtype, device=device)
         self._pointer = 0
 

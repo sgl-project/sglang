@@ -90,17 +90,43 @@ def rebalance_experts_hierarchical(
     num_gpus: int,
 ):
     """
-    Parameters:
-        weight: [num_moe_layers, num_logical_experts]
-        num_physical_experts: number of physical experts after replication
-        num_groups: number of expert groups
-        num_nodes: number of server nodes, where the intra-node network (e.g, NVLink) is faster
-        num_gpus: number of GPUs, must be a multiple of `num_nodes`
+    对专家进行分层负载均衡。
 
-    Returns:
-        physical_to_logical_map: [num_moe_layers, num_physical_experts]
-        logical_to_physical_map: [num_moe_layers, num_logical_experts, X]
-        logical_count: [num_moe_layers, num_logical_experts]
+    此函数旨在通过在不同硬件单元（首先是节点，然后是节点内的GPU）之间策略性地放置专家副本，
+    来平衡混合专家（MoE）模型中的工作负载。这对于最大化硬件利用率和最小化计算延迟至关重要。
+    该算法分三个主要步骤执行：
+
+    1.  **分组到节点 (Group to Node Packing)**:
+        首先，将逻辑专家分组。然后，根据每组的累计负载（通常是路由到该组专家的令牌数），
+        使用均衡打包算法将这些组分配到不同的计算节点上。目标是使每个节点的总负载尽可能均衡。
+
+    2.  **节点内专家复制 (Intra-Node Expert Replication)**:
+        在每个节点内部，根据分配给该节点的专家的负载，创建冗余的专家副本。
+        负载较重的逻辑专家会获得更多的物理副本，以分散其计算压力。这一步是为了平衡节点内部的负载。
+
+    3.  **物理专家到GPU (Physical Expert to GPU Packing)**:
+        最后，将上一步在节点内创建的物理专家（包括原始专家和副本）再次使用均衡打包算法分配到该节点内的各个GPU上。
+        这一步确保了单个节点内所有GPU的工作负载也是均衡的。
+
+    通过这种分层方法，该函数考虑了现代计算集群中常见的网络拓拓结构，
+    即节点内通信（如NVLink）远快于节点间通信。
+
+    参数:
+        weight: torch.Tensor, 形状为 `[num_moe_layers, num_logical_experts]` 的张量，
+                表示每个逻辑专家的负载权重（例如，令牌计数）。
+        num_physical_experts: int, 复制后物理专家的总数。
+        num_groups: int, 专家组的数量。逻辑专家总数必须能被组数整除。
+        num_nodes: int, 服务器节点的数量。节点内的网络（如NVLink）速度更快。
+        num_gpus: int, GPU的总数，必须是 `num_nodes` 的倍数。
+
+    返回:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        - pphy2log: 形状为 `[num_moe_layers, num_physical_experts]` 的张量，
+                    表示每个物理专家对应的逻辑专家ID。
+        - pphyrank: 形状为 `[num_moe_layers, num_physical_experts]` 的张量，
+                    表示每个物理专家是其对应逻辑专家的第几个副本（从0开始）。
+        - logcnt: 形状为 `[num_moe_layers, num_logical_experts]` 的张量，
+                  表示每个逻辑专家拥有的物理副本总数。
     """
     num_layers, num_logical_experts = weight.shape
     assert num_logical_experts % num_groups == 0

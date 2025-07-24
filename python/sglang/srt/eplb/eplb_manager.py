@@ -1,8 +1,12 @@
+import json
 import logging
+import os
 import time
+from datetime import datetime
 from typing import TYPE_CHECKING, List
 
-import torch.cuda
+import torch
+import torch.distributed
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -64,6 +68,50 @@ class EPLBManager:
         expert_location_metadata = ExpertLocationMetadata.init_by_eplb(
             self._server_args, self._model_runner.model_config, logical_count
         )
+        # Export the object to disk, with one file per GPU (rank)
+        try:
+            output_dir = "/tmp/expert_location_metadata"
+            os.makedirs(output_dir, exist_ok=True)
+
+            rank = torch.distributed.get_rank()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_path = os.path.join(output_dir, f"expert_metadata_rank_{rank}_{timestamp}.json")
+
+            data_to_save = {
+                "physical_to_logical_map": expert_location_metadata.physical_to_logical_map.cpu()
+                .numpy()
+                .tolist(),
+                "logical_to_all_physical_map": expert_location_metadata.logical_to_all_physical_map.cpu()
+                .numpy()
+                .tolist(),
+                "logical_to_all_physical_map_num_valid": expert_location_metadata.logical_to_all_physical_map_num_valid.cpu()
+                .numpy()
+                .tolist(),
+            }
+            if (
+                expert_location_metadata.logical_to_rank_dispatch_physical_map
+                is not None
+            ):
+                data_to_save["logical_to_rank_dispatch_physical_map"] = (
+                    expert_location_metadata.logical_to_rank_dispatch_physical_map.cpu()
+                    .numpy()
+                    .tolist()
+                )
+
+            with open(file_path, "w") as f:
+                json.dump(data_to_save, f, indent=4)
+
+            logger.info(
+                f"[EPLBManager] Saved expert location metadata for rank {rank} to {file_path}"
+            )
+        except ImportError as e:
+            logger.warning(
+                f"[EPLBManager] Could not save expert metadata, import error: {e}"
+            )
+        except Exception as e:
+            logger.error(
+                f"[EPLBManager] Error saving expert metadata: {e}", exc_info=True
+            )
 
         update_layer_ids_chunks = self._compute_update_layer_ids_chunks()
         for chunk_index, update_layer_ids in enumerate(update_layer_ids_chunks):

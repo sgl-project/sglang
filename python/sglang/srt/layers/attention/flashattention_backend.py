@@ -341,16 +341,35 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+        """
+        初始化前向传播元数据，以便前向传播中的所有层都可以复用它。
+
+        此方法根据 `forward_batch` 的状态（特别是 `forward_mode` 和 `spec_info`）创建和配置
+        一个 `FlashAttentionMetadata` 对象。该元数据包含了 FlashAttention 内核执行注意力计算
+        所需的所有信息，例如序列长度、累积序列长度、页表等。
+
+        处理的场景包括：
+        - 常规解码 (Normal Decode): 每个请求生成一个 token。
+        - 推测解码 (Speculative Decoding):
+            - 草稿阶段 (Draft Decode): 生成多个草稿 token。
+            - 验证阶段 (Target Verify): 并行验证草稿 token。
+        - 支持 Top-K 推测解码，其中为每个位置生成 K 个候选 token。
+        - 支持本地注意力（滑动窗口注意力）。
+
+        Args:
+            forward_batch (ForwardBatch): 包含当前批次所有请求信息的对象。
+        """
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            # Draft Decode
+            # 推测解码的草稿阶段或常规解码
             if forward_batch.spec_info is not None:
+                # --- 推测解码：草稿阶段 ---
                 if self.topk <= 1:
+                    # Top-1 推测（或常规的单步推测）
                     metadata.cache_seqlens_int32 = (
                         seqlens_in_batch + (self.speculative_step_id + 1)
                     ).to(torch.int32)
@@ -370,6 +389,7 @@ class FlashAttentionBackend(AttentionBackend):
                         forward_batch.req_pool_indices, : metadata.max_seq_len_k
                     ]
                 else:
+                    # Top-K 推测，为每个位置生成 K 个候选
                     metadata.cache_seqlens_int32 = (seqlens_in_batch).to(torch.int32)
                     metadata.max_seq_len_q = self.topk
                     metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
@@ -390,6 +410,7 @@ class FlashAttentionBackend(AttentionBackend):
                         forward_batch.req_pool_indices, : metadata.max_seq_len_k
                     ]
 
+                    # 为 Top-K 解码的扩展步骤创建单独的元数据
                     metadata_expand = FlashAttentionMetadata()
                     decode_length = self.speculative_step_id + 1
                     metadata_expand.cache_seqlens_int32 = torch.full(
@@ -412,7 +433,7 @@ class FlashAttentionBackend(AttentionBackend):
                         dtype=torch.int32,
                         device=device,
                     )
-                    # shape: [bs, num_steps, topk] -> [bs x topk, num_steps]
+                    # shape: [bs, num_steps, topk] -> [bs * topk, num_steps]
                     cache_loc = forward_batch.out_cache_loc.view(
                         -1, self.speculative_num_steps
                     )
@@ -421,7 +442,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                     self.forward_metadata_spec_decode_expand = metadata_expand
             else:
-                # Normal Decode
+                # --- 常规解码 ---
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
                 metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
                 metadata.cu_seqlens_q = torch.arange(
@@ -433,9 +454,10 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
-            # TODO: we need to test this part for llama 4 eagle case
+            # TODO: 我们需要为 llama 4 eagle 案例测试这部分
             self._init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
+            # --- 推测解码：验证阶段 ---
             if self.topk <= 1:
                 metadata.cache_seqlens_int32 = (
                     forward_batch.seq_lens + self.speculative_num_draft_tokens
@@ -464,6 +486,7 @@ class FlashAttentionBackend(AttentionBackend):
 
                 self._init_local_attn_metadata(forward_batch, metadata, device)
             else:
+                # Top-K 验证
                 metadata.cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
                 metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
@@ -495,7 +518,7 @@ class FlashAttentionBackend(AttentionBackend):
                     device=device,
                 )
 
-                # create expand page table
+                # 创建扩展的页表
                 offsets = torch.arange(
                     self.speculative_num_draft_tokens, device=device
                 ).unsqueeze(
@@ -557,6 +580,8 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 self.forward_metadata_spec_decode_expand = metadata_expand
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            # --- 扩展/预填充阶段 ---
+            # 处理初始输入（prefill）或 KV 缓存扩展
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
@@ -570,12 +595,14 @@ class FlashAttentionBackend(AttentionBackend):
                 any(forward_batch.extend_prefix_lens_cpu)
                 or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
             ):
+                # 当存在需要扩展的前缀或处于草稿扩展模式时
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
             else:
+                # 否则，查询序列和键序列的元数据相同
                 metadata.max_seq_len_q = metadata.max_seq_len_k
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 

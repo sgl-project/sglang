@@ -1,0 +1,4 @@
+{
+    "model": "DeepSeek-R1",
+    "messages": [{"role": "user", "content": "你好"}]
+}

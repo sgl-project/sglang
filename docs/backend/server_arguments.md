@@ -194,6 +194,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 ##  Expert parallelism
 
+专家并行（Expert Parallelism）是专门为混合专家模型（Mixture-of-Experts, MoE）设计的一种并行策略。在 MoE 模型中，存在大量的“专家”层，而每个输入 token 只会激活其中的一小部分专家。专家并行允许将这些专家分布到不同的计算设备（GPU）上，从而使得单个设备无需承载整个模型的全部权重，极大地扩展了能够运行的 MoE 模型的规模。SGLang 提供了先进的专家并行技术，包括动态负载均衡（EPLB），以优化推理性能。
+
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--expert-parallel-size` or `--ep-size` | The expert parallelism size. | 1 |

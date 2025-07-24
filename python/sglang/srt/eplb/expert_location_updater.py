@@ -34,6 +34,40 @@ _LOG_INPUT = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT")
 
 
 class ExpertLocationUpdater:
+    """
+    负责在分布式环境中根据负载均衡策略，物理上迁移专家模型权重。
+
+    在混合专家（MoE）模型的动态负载均衡中，当负载均衡器（如 `ExpertDistributionManager`）
+    计算出一个更优的专家布局（即 `ExpertLocationMetadata`）后，`ExpertLocationUpdater`
+    就负责执行这个布局。它通过在不同的计算设备（GPU）之间移动实际的专家权重张量，
+    来完成物理上的重新部署。
+
+    这个过程至关重要，因为它确保了模型的计算路由（即将令牌发送到哪个专家）与专家的
+    实际物理位置保持一致。
+
+    工作流程:
+    1.  **接收更新指令**: `update` 方法是整个流程的入口。它接收包含新专家位置的元数据
+        (`new_expert_location_metadata`) 以及需要更新的层（`update_layer_ids`）。
+
+    2.  **计算迁移计划**: 通过比较旧的专家位置和新的专家位置，该更新器确定哪些专家权重需要
+        从哪个源GPU移动到哪个目标GPU。
+
+    3.  **执行权重迁移**:
+        -   核心迁移逻辑在 `_update_expert_weights_raw` 和 `update_expert_weights_single_layer` 中实现。
+        -   它使用 `torch.distributed` 的点对点（P2P）通信操作（如 `isend` 和 `irecv`）来高效地在
+            GPU之间传输张量数据。
+        -   为了避免在迁移过程中发生数据竞争或覆盖，它会使用临时缓冲区（`temp_buffers`）来暂存数据。
+
+    4.  **金丝雀测试 (Canary Testing)**:
+        -   为了确保数据迁移的正确性，系统提供了一个可选的“金丝雀”测试机制（`_update_expert_weights_with_canary`）。
+        -   在迁移数据中插入一个已知的值（金丝雀值），并在迁移完成后检查该值是否正确到达目标位置。
+        -   这是一种健壮性检查，用于验证复杂的分布式通信是否按预期工作。
+
+    5.  **更新全局元数据**: 成功迁移所有权重后，它会更新全局的专家位置元数据
+        (`get_global_expert_location_metadata()`)，使其反映出新的专家布局。
+        这样，后续的模型前向传播就会将计算任务路由到专家的新位置。
+    """
+
     def __init__(self):
         self._first_execution = True
 
