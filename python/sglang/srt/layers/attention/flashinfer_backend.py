@@ -177,11 +177,12 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_wrappers = []
         for _ in range(self.num_wrappers):
             if not skip_prefill:
-                self.prefill_wrappers_mixed.append(
-                    BatchAttention(
-                        "NHD",
+                if not is_sm100_supported():
+                    self.prefill_wrappers_mixed.append(
+                        BatchAttention(
+                            "NHD",
+                        )
                     )
-                )
                 self.prefill_wrappers_paged.append(
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
@@ -258,19 +259,23 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             # Normal prefill
             prefix_lens = forward_batch.extend_prefix_lens
+            wrappers = self.prefill_wrappers_paged
             if self.is_multimodal:
                 use_ragged = False
                 extend_no_prefix = False
+            elif forward_batch.forward_mode.is_mixed():
+                # use_ragged = False
+                use_ragged = True
+                wrappers = self.prefill_wrappers_mixed
             else:
-                # use_ragged = True
-                use_ragged = False  # debug
+                use_ragged = True
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
             seq_lens = forward_batch.seq_lens
             req_pool_indices = forward_batch.req_pool_indices
             seq_lens_sum = forward_batch.seq_lens_sum
             self.forward_metadata = PrefillMetadata(
-                self.prefill_wrappers_paged, use_ragged, extend_no_prefix
+                wrappers, use_ragged, extend_no_prefix
             )
 
             self.indices_updater_prefill.update(
@@ -278,7 +283,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens,
                 seq_lens_sum,
                 prefix_lens,
-                prefill_wrappers=self.prefill_wrappers_paged,
+                prefill_wrappers=wrappers,
                 use_ragged=use_ragged,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=None,
@@ -356,9 +361,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
             for i in range(self.num_wrappers):
-                decode_wrappers[i].begin_forward = partial(
-                    fast_decode_plan, decode_wrappers[i]
-                )
+                decode_wrappers[i].plan = partial(fast_decode_plan, decode_wrappers[i])
         elif forward_mode.is_target_verify():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
@@ -674,9 +677,9 @@ class FlashInferIndicesUpdaterDecode:
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # Sliding window attention
-                paged_kernel_lens_tmp = torch.minimum(  # TODO: replace this with clamp
+                paged_kernel_lens_tmp = torch.clamp(
                     seq_lens,
-                    torch.tensor(self.sliding_window_size + 1),
+                    max=self.sliding_window_size + 1,
                 )
                 paged_kernel_lens_sum_tmp = paged_kernel_lens_tmp.sum().item()
                 kv_start_idx_tmp = seq_lens - paged_kernel_lens_tmp
@@ -776,7 +779,7 @@ class FlashInferIndicesUpdaterDecode:
                 )
             )
 
-        wrapper.begin_forward(
+        wrapper.plan(
             kv_indptr,
             kv_indices,
             self.kv_last_page_len[:bs],
@@ -1011,7 +1014,7 @@ class FlashInferIndicesUpdaterPrefill:
 
         if use_ragged:
             # extend part
-            wrapper_ragged.begin_forward(
+            wrapper_ragged.plan(
                 qo_indptr,
                 qo_indptr,
                 self.num_qo_heads,
@@ -1029,7 +1032,7 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
         # cached part
-        wrapper_paged.begin_forward(
+        wrapper_paged.plan(
             qo_indptr,
             kv_indptr,
             kv_indices,
