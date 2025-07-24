@@ -21,12 +21,9 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
-from sglang.srt.mem_cache.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
 logger = logging.getLogger(__name__)
-
-
 
 
 class HiRadixCache(RadixCache):
@@ -105,7 +102,6 @@ class HiRadixCache(RadixCache):
             height += 1
         return height
 
-    
     def write_backup(self, node: TreeNode, write_back=False):
         host_indices = self.cache_controller.write(
             device_indices=node.value,
@@ -174,42 +170,6 @@ class HiRadixCache(RadixCache):
             ack_id = self.cache_controller.ack_write_queue.get()
             self.dec_lock_ref(self.ongoing_write_through[ack_id])
             del self.ongoing_write_through[ack_id]
-
-    def waiting_status_check(self, req: Req):
-        if torch.distributed.get_world_size(group=self.tp_group) > 1:
-            check_ready = torch.tensor([req.waiting_status == WaitingStatus.READY])
-            torch.distributed.all_reduce(
-                check_ready,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            if not check_ready.item():
-                return False
-        else:
-            if req.waiting_status != WaitingStatus.READY:
-                return False
-
-        return True
-
-    def l3_loading_check(self):
-        while not self.cache_controller.mooncake_l3_ack_load_queue.empty():
-            try:
-                ack_id = self.cache_controller.mooncake_l3_ack_load_queue.get_nowait()
-                start_node, end_node, req = self.l3_ongoing_load_back[ack_id]
-                self.dec_lock_ref(end_node)
-                while end_node != start_node:
-                    assert end_node.loading
-                    end_node.loading = False
-                    end_node = end_node.parent
-                else:
-                    req.waiting_status = WaitingStatus.READY
-
-                # clear the reference
-                del self.l3_ongoing_load_back[ack_id]
-                req.last_host_node = req.last_l3_node
-                req.host_hit_length += req.l3_hit_length
-            except Exception:
-                break
 
     def loading_check(self):
         while not self.cache_controller.ack_load_queue.empty():
@@ -308,45 +268,6 @@ class HiRadixCache(RadixCache):
             if len(x.parent.children) == 0 and x.parent.evicted:
                 heapq.heappush(leaves, x.parent)
 
-    def mooncake_load_back(self, req: Req, node: TreeNode):
-        last_hit_node = node
-        if last_hit_node.id in self.l3_ongoing_load_back.keys():
-            return
-
-        l3_nodes_to_load = []
-        while node.evicted and not node.l2_backuped and node.l3_backuped:
-            l3_nodes_to_load.insert(0, node)
-            node = node.parent
-        else:
-            ancester_node = node
-
-        self.inc_lock_ref(ancester_node)
-
-        l3_keys = [key for n in l3_nodes_to_load for key in n.l3_keys]
-        slots_required = len(l3_keys) * self.page_size
-        host_indices=self.cache_controller.mooncake_load(l3_keys, slots_required, node_id=last_hit_node.id)
-        if host_indices is None:
-            self.evict_host(slots_required)
-            host_indices = self.cache_controller.mooncake_load(l3_keys, slots_required, node_id=last_hit_node.id)
-        self.dec_lock_ref(ancester_node)
-        if host_indices is None:
-            req.waiting_status = WaitingStatus.READY
-            return
-
-        self.l3_ongoing_load_back[last_hit_node.id] = (
-            ancester_node,
-            last_hit_node,
-            req,
-        )
-        offset = 0
-        for node in l3_nodes_to_load:
-            node.host_value = host_indices[
-                offset : offset + len(node.l3_keys) * self.page_size
-            ]
-            offset += len(node.l3_keys) * self.page_size
-        for node in l3_nodes_to_load:
-            node.loading = True
-
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
@@ -356,7 +277,7 @@ class HiRadixCache(RadixCache):
         nodes_to_load = []
         while node.evicted:
             assert (
-                node.l2_backuped
+                node.backuped
             ), "No backup available on evicted nodes, should not happen"
             nodes_to_load.insert(0, node)
             node = node.parent
@@ -396,6 +317,7 @@ class HiRadixCache(RadixCache):
             node.loading = True
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
+
         return device_indices
 
     def init_load_back(
@@ -424,7 +346,6 @@ class HiRadixCache(RadixCache):
     def ready_to_load_host_cache(self):
         producer_index = self.cache_controller.layer_done_counter.next_producer()
         self.load_cache_event.set()
-        
         return producer_index
 
     def check_hicache_events(self):
@@ -510,7 +431,6 @@ class HiRadixCache(RadixCache):
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
 
-
     def match_prefix(self, key: List[int], **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         if self.disable or len(key) == 0:
@@ -531,7 +451,6 @@ class HiRadixCache(RadixCache):
         else:
             value = empty_value
 
-
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
@@ -544,7 +463,6 @@ class HiRadixCache(RadixCache):
             last_host_node=last_host_node,
             host_hit_length=host_hit_length,
         )
-    
 
     def prefetch_from_storage(
         self,
@@ -615,20 +533,17 @@ class HiRadixCache(RadixCache):
         node.last_access_time = time.monotonic()
         child_key = self.get_child_key_fn(key)
         value = []
-        total_prefix_length = 0
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(child.key, key)
-            total_prefix_length += prefix_len
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 self.inc_hit_count(new_node)
                 if not new_node.evicted:
                     value.append(new_node.value)
                 node = new_node
-                key = key[prefix_len:]
                 break
             else:
                 self.inc_hit_count(child)
@@ -639,7 +554,6 @@ class HiRadixCache(RadixCache):
 
                 if len(key):
                     child_key = self.get_child_key_fn(key)
-
 
         return value, node
 

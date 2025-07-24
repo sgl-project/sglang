@@ -95,9 +95,6 @@ class TreeNode:
             return None
         return self.hash_value[-1]
 
-    @property
-    def l2_backuped(self):
-        return self.host_value is not None
 
 
     @property
