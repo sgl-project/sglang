@@ -233,7 +233,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
                 None,
                 None,
                 None,
-                forward_batch.seq_lens_cpu.tolist(),
+                forward_batch.extend_seq_lens_cpu,
             )
 
     def init_cuda_graph_state(
