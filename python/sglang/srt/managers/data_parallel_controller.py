@@ -357,10 +357,9 @@ class DataParallelController:
             return
         
         seq_len = len(input_requests.input_ids)
-        selected_rank = self.load_table.get_min_load_rank()
-        self.load_table.update_add(rank=selected_rank,requests=1,tokens=seq_len)
+        selected_rank = self.load_table.get_shortest_queue()
+        self.load_table.update_add(selected_rank,seq_len)
         self.workers[selected_rank].send_pyobj(input_requests)
-
     def event_loop(self):
         while True:
             while True:

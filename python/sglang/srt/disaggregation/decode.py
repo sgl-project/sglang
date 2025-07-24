@@ -422,7 +422,7 @@ class DecodePreallocQueue:
         ]
 
         return preallocated_reqs
-    
+
     @property
     def num_tokens_pre_allocated(self):
         return sum(
@@ -628,7 +628,7 @@ class DecodeTransferQueue:
 
                 if hasattr(decode_req.kv_receiver, "clear"):
                     decode_req.kv_receiver.clear()
-                
+
                 # special handling for sampling_params.max_new_tokens == 1
                 if decode_req.req.sampling_params.max_new_tokens == 1:
                     # finish immediately
@@ -786,7 +786,7 @@ class SchedulerDisaggregationDecodeMixin:
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
-                    if prepare_mlp_sync_flag::
+                    if prepare_mlp_sync_flag:
                         batch_, result = self._prepare_idle_batch_and_run(
                             None, delay_process=True
                         )
@@ -794,7 +794,7 @@ class SchedulerDisaggregationDecodeMixin:
                             result_queue.append((batch_.copy(), result))
                             last_batch_in_queue = True
                 else:
-                    if prepare_mlp_sync_flag::
+                    if prepare_mlp_sync_flag:
                         self.prepare_mlp_sync_batch(batch)
                     start_time = time.perf_counter()
                     result = self.run_batch(batch)
