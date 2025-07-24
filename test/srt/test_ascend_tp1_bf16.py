@@ -23,7 +23,7 @@ TEST_MODEL_MATRIX = {
 }
 
 
-class TestAscend_TP1_BF16(CustomTestCase):
+class TestAscendTp1Bf16(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
