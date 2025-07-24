@@ -173,7 +173,7 @@ class ServerArgs:
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
-    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
+    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake", "lp"]] = None
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
     eplb_algorithm: str = "auto"

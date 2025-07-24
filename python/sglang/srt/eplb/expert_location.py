@@ -173,7 +173,9 @@ class ExpertLocationMetadata:
             + server_args.ep_num_redundant_experts
         )
         ep_size = server_args.ep_size
-        assert num_physical_experts % ep_size == 0
+        assert (
+            num_physical_experts % ep_size == 0
+        ), f"{num_physical_experts=}, {ep_size=}"
         num_local_physical_experts = num_physical_experts // ep_size
 
         return dict(
