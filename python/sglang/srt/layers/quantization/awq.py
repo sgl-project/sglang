@@ -32,6 +32,13 @@ from sglang.srt.layers.quantization.marlin_utils import (
 from sglang.srt.layers.quantization.scalar_type import scalar_types
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import replace_parameter
+from sglang.srt.utils import (
+    SGLANG_USE_CPU_INT4_W4A8,
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    use_intel_amx_backend,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
@@ -50,6 +57,9 @@ from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
+
 if _is_cuda:
     from sgl_kernel import awq_dequantize, fused_marlin_moe
 elif _is_hip:
@@ -58,8 +68,12 @@ elif _is_hip:
     )
 
     warnings.warn(f"HIP does not support fused_marlin_moe currently.")
+elif _is_cpu and _is_cpu_amx_available:
+    from sglang.srt.layers.amx_utils import (
+        _amx_process_int4_packed_qweight_after_loading,
+    )
 else:
-    warnings.warn(f"Only CUDA and HIP support AWQ currently.")
+    warnings.warn(f"Only CUDA, HIP and CPU support AWQ currently.")
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +123,7 @@ class AWQConfig(QuantizationConfig):
         return "awq"
 
     def get_supported_act_dtypes(self) -> List[torch.dtype]:
-        return [torch.half]
+        return [torch.half, torch.bfloat16]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -143,6 +157,7 @@ class AWQConfig(QuantizationConfig):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
                 return UnquantizedLinearMethod()
             return AWQLinearMethod(self)
+
         return None
 
 
@@ -394,9 +409,17 @@ class AWQLinearMethod(LinearMethodBase):
         layer.register_parameter("scales", scales)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
-        layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
-        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+        if _is_cpu:
+            assert (
+                _is_cpu_amx_available
+            ), "AWQLinearMethod on CPU requires that CPU has AMX support"
+            _amx_process_int4_packed_qweight_after_loading(
+                layer, ["qweight", "qzeros", "scales"], "awq"
+            )
+        else:
+            layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
+            layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
+            layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
     def apply(
         self,
@@ -404,6 +427,22 @@ class AWQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if use_intel_amx_backend(layer):
+            if SGLANG_USE_CPU_INT4_W4A8:
+                return torch.ops.sgl_kernel.int4_scaled_mm_cpu_with_quant(
+                    x,
+                    layer.qweight,
+                    layer.scales,
+                    layer.qzeros,
+                    layer.compensation,
+                    bias,
+                    torch.bfloat16,
+                )
+            else:
+                return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+                    x, layer.qweight, layer.qzeros, layer.scales, bias
+                )
+
         qweight = layer.qweight
         scales = layer.scales
         qzeros = layer.qzeros
