@@ -632,7 +632,7 @@ class BaseMultimodalProcessor(ABC):
                 )
             elif (
                 isinstance(item.precomputed_embeddings, torch.Tensor)
-                and item.feature.is_cuda
+                and item.precomputed_features.is_cuda
             ):
                 item.precomputed_embeddings = TransportProxyTensor(
                     transport_mode=self.transport_mode, data=item.precomputed_embeddings
