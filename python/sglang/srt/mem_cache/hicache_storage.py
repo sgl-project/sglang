@@ -147,10 +147,10 @@ class HiCacheFile(HiCacheStorage):
 
     def set(self,
             key, 
-             value: Optional[Any] = None, 
-             target_location: Optional[Any] = None,
+            value: Optional[Any] = None, 
+            target_location: Optional[Any] = None,
             target_sizes: Optional[Any] = None) -> bool:
-        tensor_path = f"{self.file_path}/{key}.bin"
+        tensor_path = os.path.join(self.file_path, f"{key}.bin")
         if self.exists(key):
             logger.debug(f"Key {key} already exists. Skipped.")
             return True
@@ -170,7 +170,7 @@ class HiCacheFile(HiCacheStorage):
             if not self.set(key, value):
                 return False
         return True
-    
+
     def exists(self, key) -> bool | dict:
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         return os.path.exists(tensor_path)
