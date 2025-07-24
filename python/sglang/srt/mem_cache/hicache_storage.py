@@ -23,6 +23,7 @@ def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
 
     return hasher.hexdigest()
 
+
 class HiCacheStorage(ABC):
     """
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
