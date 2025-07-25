@@ -155,10 +155,9 @@ class FunctionCallParser:
             or None if no constraint applies.
         """
         # NOTE: structural_tag only supports JSON-compatible content between the begin and end.
-        # It cannot parse or validate Python syntax like function calls.
+        # It cannot parse or validate function call Pythonic or XML-ish syntax.
         if (
-            not isinstance(self.detector, PythonicDetector)
-            and not isinstance(self.detector, Qwen3CoderDetector)
+            self.detector.supports_structural_tag()
             and tool_choice == "auto"
             and any(tool.function.strict for tool in self.tools)
         ):

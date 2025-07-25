@@ -9,7 +9,6 @@ from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
-    StructureInfo,
     ToolCallItem,
     _GetInfoFunc,
 )
@@ -134,12 +133,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 logger.warning("invalid tool call for %s dropped", fname)
         return res
 
+    def supports_structural_tag(self) -> bool:
+        return False
+
     def structure_info(self) -> _GetInfoFunc:
-        return lambda n: StructureInfo(
-            begin=f"{self.tool_call_start_token}\n<function={n}>",
-            end=f"</function>\n{self.tool_call_end_token}",
-            trigger=self.tool_call_start_token,
-        )
+        raise NotImplementedError
 
     def build_ebnf(self, tools: List[Tool]):
         return EBNFComposer.build_ebnf(
