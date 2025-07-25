@@ -12,9 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TORCH_CUDA_ARCH_LIST="10.0 12.0"
 
 # Set timezone and install all packages
-RUN rm -f /etc/apt/sources.list.d/cuda*.list \
- && rm -f /etc/apt/sources.list.d/nvidia*.list \
- && echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
+RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
  && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
  && apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
