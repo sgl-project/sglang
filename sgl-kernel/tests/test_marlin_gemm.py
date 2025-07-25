@@ -1,9 +1,10 @@
 import pytest
 import torch
 from sgl_kernel import gptq_marlin_gemm, moe_wna16_marlin_gemm
+
+from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 from sglang.srt.layers.quantization.scalar_type import scalar_types
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
-from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
 MNK_FACTORS = [
     (1, 1, 1),
@@ -65,7 +66,8 @@ def test_gptq_marlin_gemm(
         if group_size == 16:
             return
         w_ref, marlin_q_w, marlin_s, marlin_zp = awq_marlin_quantize(
-            b_weight, quant_type, group_size)
+            b_weight, quant_type, group_size
+        )
         g_idx = None
         sort_indices = None
         marlin_s2 = None
@@ -74,7 +76,8 @@ def test_gptq_marlin_gemm(
         if group_size == 16:
             return
         w_ref, marlin_q_w, marlin_s, g_idx, sort_indices, _ = marlin_quantize(
-            b_weight, quant_type, group_size, act_order)
+            b_weight, quant_type, group_size, act_order
+        )
         marlin_zp = None
         marlin_s2 = None
 
@@ -106,7 +109,8 @@ def test_gptq_marlin_gemm(
     torch.cuda.synchronize()
 
     max_diff = torch.mean(torch.abs(output - output_ref)) / torch.mean(
-        torch.abs(output_ref))
+        torch.abs(output_ref)
+    )
 
     assert max_diff < 0.04
 
