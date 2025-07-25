@@ -264,8 +264,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged = False
                 extend_no_prefix = False
             elif forward_batch.forward_mode.is_mixed():
-                # use_ragged = False
-                use_ragged = True
+                use_ragged = True  # still use ragged kernel for non-prefix part because TMA is fast
                 wrappers = self.prefill_wrappers_mixed
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             else:
@@ -489,6 +488,35 @@ class FlashInferAttnBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
+
+        # Persistent kernel only supports passing sm_scale through plan() for now.
+        apply_scale = lambda scale: (
+            scale is not None and (scale != 1.0).any()
+            if isinstance(scale, torch.Tensor)
+            else scale != 1.0
+        )
+
+        def persistent_attn_forward(
+            self,
+            prefill_wrapper_paged: BatchAttention,
+            q: torch.Tensor,
+            layer: RadixAttention,
+        ):
+            # TODO(Wenxuan) pass in kv scale after Flashinfer interface change
+            # TODO(Wenxuan) support logits_soft_cap in Flashinfer
+            prefill_wrapper_paged._sm_scale = (
+                layer.scaling * layer.k_scale
+                if apply_scale(layer.k_scale)
+                else layer.scaling
+            )
+            o, _ = prefill_wrapper_paged.run(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            )
+            if apply_scale(layer.v_scale):
+                o = o * layer.v_scale
+            return o
+
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
@@ -499,24 +527,32 @@ class FlashInferAttnBackend(AttentionBackend):
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
-
-            o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=not layer.is_cross_attention,
-                sm_scale=layer.scaling,
-                window_left=layer.sliding_window_size,
-                logits_soft_cap=logits_soft_cap,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
-            )
+            if isinstance(prefill_wrapper_paged, BatchAttention):
+                o = persistent_attn_forward(
+                    prefill_wrapper_paged,
+                    q,
+                    layer,
+                )
+            else:
+                o = prefill_wrapper_paged.forward(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    causal=not layer.is_cross_attention,
+                    sm_scale=layer.scaling,
+                    window_left=layer.sliding_window_size,
+                    logits_soft_cap=logits_soft_cap,
+                    k_scale=layer.k_scale,
+                    v_scale=layer.v_scale,
+                )
         else:
             causal = True
+            extend_no_prefix = self.forward_metadata.extend_no_prefix
             if layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
                 causal = False
+                extend_no_prefix = True
 
-            if self.forward_metadata.extend_no_prefix:
+            if extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
@@ -528,7 +564,6 @@ class FlashInferAttnBackend(AttentionBackend):
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
-
             else:
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -538,13 +573,19 @@ class FlashInferAttnBackend(AttentionBackend):
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
-                o2, s2 = prefill_wrapper_paged.forward_return_lse(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                    causal=False,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=logits_soft_cap,
-                )
+                if isinstance(prefill_wrapper_paged, BatchAttention):
+                    o2, s2 = prefill_wrapper_paged.run(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    )
+                else:
+                    o2, s2 = prefill_wrapper_paged.forward_return_lse(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                        causal=False,
+                        sm_scale=layer.scaling,
+                        logits_soft_cap=logits_soft_cap,
+                    )
 
                 o, _ = merge_state(o1, s1, o2, s2)
 
@@ -938,11 +979,13 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens = seq_lens
                 kv_start_idx = encoder_lens
                 paged_kernel_lens_sum = seq_lens_sum
+                causal = True
             else:
                 # cross attention
                 paged_kernel_lens = encoder_lens
                 kv_start_idx = torch.zeros_like(encoder_lens)
                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                causal = False
 
             self.call_begin_forward(
                 self.prefill_wrapper_ragged,
@@ -957,6 +1000,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.qo_indptr[wrapper_id],
                 use_ragged,
                 spec_info,
+                causal=causal,
             )
 
     def call_begin_forward(
@@ -974,6 +1018,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged: bool,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         use_sliding_window_kv_pool: bool = False,
+        causal: bool = True,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -999,6 +1044,10 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
         else:
+            assert not isinstance(wrapper_paged, BatchAttention), (
+                "Persistent kernel doesn't support custom mask yet; "
+                "there's a bug in the dispatch logic"
+            )
             assert isinstance(spec_info, EagleDraftInput) or isinstance(
                 spec_info, EagleVerifyInput
             )
@@ -1031,38 +1080,36 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
         # cached part
-        args = [qo_indptr, kv_indptr, kv_indices]
         if isinstance(wrapper_paged, BatchAttention):
-            args.append(paged_kernel_lens)
-        args += [
-            self.kv_last_page_len[:bs],
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        ]
-        wrapper_paged.plan(
-            *args,
-            page_size=1,
-            q_data_type=self.q_data_type,
-            kv_data_type=self.data_type,
-            custom_mask=custom_mask,
-            non_blocking=True,
-        )
-
-    #     wrapper_paged.plan(
-    #         qo_indptr,
-    #         kv_indptr,
-    #         kv_indices,
-    #         self.kv_last_page_len[:bs],
-    #         self.num_qo_heads,
-    #         self.num_kv_heads,
-    #         self.head_dim,
-    #         page_size=1,
-    #         q_data_type=self.q_data_type,
-    #         kv_data_type=self.data_type,
-    #         custom_mask=custom_mask,
-    #         non_blocking=True,
-    #     )
+            wrapper_paged.plan(
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                paged_kernel_lens,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                head_dim_qk=self.head_dim,
+                head_dim_vo=self.head_dim,
+                page_size=1,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+                causal=causal,
+            )
+        else:
+            wrapper_paged.plan(
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.kv_last_page_len[:bs],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                page_size=1,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+                custom_mask=custom_mask,
+                non_blocking=True,
+            )
 
 
 # Use as a fast path to override the indptr in flashinfer's plan function
