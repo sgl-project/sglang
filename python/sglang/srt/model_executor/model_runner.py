@@ -1434,9 +1434,7 @@ class ModelRunner:
         elif self.server_args.attention_backend == "trtllm_mla":
             if not self.use_mla_backend:
                 raise ValueError("trtllm_mla backend can only be used with MLA models.")
-            from python.sglang.srt.layers.attention.trtllm_mla_backend import (
-                TRTLLMMLABackend,
-            )
+            from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
             return TRTLLMMLABackend(self)
         elif self.server_args.attention_backend == "intel_amx":

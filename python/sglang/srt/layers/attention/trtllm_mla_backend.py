@@ -340,9 +340,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # - For FP16 path we keep q_scale = 1.0, softmax_scale = 1/sqrt(head_dim) which is pre-computed as layer.scaling
         # - k_scale is read from model checkpoint if available
         # TODO: Change once fp8 path is supported
-        q_scale = 1.0  # for fp16 we keep q_scale as 1.0
-
-        # silently pick k_scale (avoid per-call prints in CUDA graph)
+        q_scale = 1.0
         k_scale = (
             layer.k_scale_float
             if getattr(layer, "k_scale_float", None) is not None
