@@ -1252,6 +1252,7 @@ class ModelRunner:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                    disable_allocate_kvcache=(self.server_args.disaggregation_mode == "embedding")
                 )
 
         if self.token_to_kv_pool_allocator is None:
