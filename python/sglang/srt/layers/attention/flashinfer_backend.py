@@ -501,6 +501,7 @@ class FlashInferAttnBackend(AttentionBackend):
             prefill_wrapper_paged: BatchAttention,
             q: torch.Tensor,
             layer: RadixAttention,
+            logits_soft_cap: float,
         ):
             # TODO(Wenxuan) pass in kv scale after Flashinfer interface change
             # TODO(Wenxuan) support logits_soft_cap in Flashinfer
@@ -512,6 +513,7 @@ class FlashInferAttnBackend(AttentionBackend):
             o, _ = prefill_wrapper_paged.run(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                logits_soft_cap=logits_soft_cap,
             )
             if apply_scale(layer.v_scale):
                 o = o * layer.v_scale
@@ -532,6 +534,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     prefill_wrapper_paged,
                     q,
                     layer,
+                    logits_soft_cap,
                 )
             else:
                 o = prefill_wrapper_paged.forward(
@@ -832,6 +835,7 @@ class FlashInferIndicesUpdaterDecode:
             data_type=self.data_type,
             q_data_type=self.q_data_type,
             non_blocking=True,
+            logits_soft_cap=0.1,  # a dummy value to select the template with logits_soft_cap=true
         )
 
 
