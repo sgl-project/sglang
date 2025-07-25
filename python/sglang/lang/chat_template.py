@@ -624,6 +624,8 @@ def match_internvl_chat(model_path: str):
 
 @register_chat_template_matching_function
 def match_interns1_chat(model_path: str):
+    if re.search(r"intern-s1", model_path, re.IGNORECASE):
+        return "interns1"
     if re.search(r"interns1", model_path, re.IGNORECASE):
         return "interns1"
 
