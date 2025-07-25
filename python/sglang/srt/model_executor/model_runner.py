@@ -68,6 +68,7 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
@@ -110,7 +111,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
-    is_cuda,
     is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
@@ -279,6 +279,7 @@ class ModelRunner:
         self.sampler = Sampler()
         self.load_model()
 
+        # Check if the model is using hybrid SWA
         if (
             not self.server_args.disable_hybrid_swa_memory
             and self.sliding_window_size is not None
@@ -381,6 +382,7 @@ class ModelRunner:
                     is_hopper_with_cuda_12_3()
                     and is_no_spec_infer_or_topk_one(server_args)
                     and is_fa3_default_architecture(self.model_config.hf_config)
+                    and (not server_args.enable_hierarchical_cache)
                 ):
                     server_args.attention_backend = "fa3"
                 elif _is_hip:
@@ -393,7 +395,9 @@ class ModelRunner:
                     )
             else:
                 # MLA architecture
-                if is_hopper_with_cuda_12_3():
+                if is_hopper_with_cuda_12_3() and (
+                    not server_args.enable_hierarchical_cache
+                ):
                     server_args.attention_backend = "fa3"
                 elif is_sm100_supported():
                     server_args.attention_backend = "flashinfer"
@@ -894,44 +898,38 @@ class ModelRunner:
             tp_rank=self.tp_rank,
             max_lora_rank=self.server_args.max_lora_rank,
             target_modules=self.server_args.lora_target_modules,
+            lora_paths=self.server_args.lora_paths,
         )
-        result = self.lora_manager.load_lora_adapters(self.server_args.lora_paths or {})
-        if result.success:
-            logger.info(
-                f"LoRA manager ready. Loaded LoRA adapters: {', '.join(result.loaded_adapters)}"
-            )
-        else:
-            raise RuntimeError(f"Failed to load LoRA adapters: {result.error_message}")
 
-    def load_lora_adapter(self, lora_name: str, lora_path: str):
+    def load_lora_adapter(self, lora_ref: LoRARef):
         """Load a new lora adapter from disk or huggingface."""
 
         logger.info(
-            f"LoRA adapter loading starts: name={lora_name}, path={lora_path}. "
+            f"LoRA adapter loading starts: {lora_ref}. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
-        result = self.lora_manager.load_lora_adapter(lora_name, lora_path)
+        result = self.lora_manager.load_lora_adapter(lora_ref)
 
         logger.info(
-            f"LoRA adapter loading completes: name={lora_name}, path={lora_path}. "
+            f"LoRA adapter loading completes: {lora_ref}. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
         return result
 
-    def unload_lora_adapter(self, lora_name: str):
+    def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
 
         logger.info(
-            f"LoRA adapter unloading starts: name={lora_name}. "
+            f"LoRA adapter unloading starts: {lora_ref}. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
-        result = self.lora_manager.unload_lora_adapter(lora_name)
+        result = self.lora_manager.unload_lora_adapter(lora_ref)
 
         logger.info(
-            f"LoRA adapter unloading completes: name={lora_name}. "
+            f"LoRA adapter unloading completes: {lora_ref}. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
@@ -1014,8 +1012,11 @@ class ModelRunner:
                 try:
                     layers = self.model.language_model.model.layers
                 except:
-                    self.is_hybrid = False
-                    return
+                    try:
+                        layers = self.model.language_model.layers
+                    except:
+                        self.is_hybrid = False
+                        return
 
             for layer in layers:
                 if (
@@ -1484,9 +1485,13 @@ class ModelRunner:
         tensor_parallel(self.model, device_mesh)
 
     def forward_decode(
-        self, forward_batch: ForwardBatch, pp_proxy_tensors=None
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool = False,
+        pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
-        self.attn_backend.init_forward_metadata(forward_batch)
+        if not skip_attn_backend_init:
+            self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
@@ -1598,8 +1603,18 @@ class ModelRunner:
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-        elif forward_batch.forward_mode.is_decode():
-            ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+            return ret, can_run_cuda_graph
+
+        # For MLP sync
+        if forward_batch.global_num_tokens_cpu is not None:
+            forward_batch.prepare_mlp_sync_batch(self)
+
+        if forward_batch.forward_mode.is_decode():
+            ret = self.forward_decode(
+                forward_batch,
+                skip_attn_backend_init=skip_attn_backend_init,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
         elif forward_batch.forward_mode.is_extend():
             ret = self.forward_extend(
                 forward_batch,
@@ -1616,6 +1631,9 @@ class ModelRunner:
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+
+        if forward_batch.global_num_tokens_cpu is not None:
+            forward_batch.post_forward_mlp_sync_batch(ret)
 
         return ret, can_run_cuda_graph
 
