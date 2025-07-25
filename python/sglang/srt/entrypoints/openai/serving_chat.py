@@ -113,12 +113,12 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
                 tools = [
-                    item.function.model_dump()
+                    item.model_dump()
                     for item in request.tools
                     if item.function.name == request.tool_choice.function.name
                 ]
             else:
-                tools = [item.function.model_dump() for item in request.tools]
+                tools = [item.model_dump() for item in request.tools]
 
             tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
             parser = FunctionCallParser(request.tools, tool_call_parser)
@@ -164,6 +164,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 audio_data,
                 modalities,
             )
+
+            if "tool_calls" in processed_msg and isinstance(
+                processed_msg.get("tool_calls"), list
+            ):
+                for call in processed_msg["tool_calls"]:
+                    try:
+                        if "arguments" in call["function"] and isinstance(
+                            call["function"]["arguments"], str
+                        ):
+                            call["function"]["arguments"] = json.loads(
+                                call["function"]["arguments"]
+                            )
+                    except json.JSONDecodeError as e:
+                        # Log a warning or error if JSON parsing fails for arguments
+                        logger.warning(
+                            f"Failed to parse tool call arguments as JSON: {e}"
+                        )
+                        # Decide whether to continue or raise the exception based on desired behavior
+                        continue  # Or raise e if strict parsing is required
             openai_compatible_messages.append(processed_msg)
 
         # Handle assistant prefix for continue_final_message
@@ -465,7 +484,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # Handle tool calls
                 if request.tool_choice != "none" and request.tools:
-                    async for chunk in self._process_tool_call_stream(
+                    async for (
+                        chunk,
+                        tool_call_finish_reason_type,
+                    ) in self._process_tool_call_stream(
                         index,
                         delta,
                         parser_dict,
@@ -473,7 +495,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         request,
                         finish_reason_type,
                     ):
-                        yield chunk
+                        if chunk:
+                            yield chunk
+                        finish_reason_type = tool_call_finish_reason_type
+
                 else:
                     # Regular content
                     if delta or not (
@@ -846,7 +871,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 choices=[choice_data],
                 model=request.model,
             )
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json()}\n\n", finish_reason_type
 
         # Yield tool calls
         for call_item in calls:
@@ -901,4 +926,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 choices=[choice_data],
                 model=request.model,
             )
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json()}\n\n", finish_reason_type
+
+        if finish_reason_type == "stop":
+            yield None, "tool_calls"

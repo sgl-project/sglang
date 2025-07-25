@@ -174,6 +174,20 @@ class TpModelWorker:
             self.model_runner.token_to_kv_pool.size,
         )
 
+    @property
+    def sliding_window_size(self) -> Optional[int]:
+        return self.model_runner.sliding_window_size
+
+    @property
+    def is_hybrid(self) -> bool:
+        return self.model_runner.is_hybrid is not None
+
+    def get_tokens_per_layer_info(self):
+        return (
+            self.model_runner.full_max_total_num_tokens,
+            self.model_runner.swa_max_total_num_tokens,
+        )
+
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
 
@@ -279,11 +293,9 @@ class TpModelWorker:
         return parameter
 
     def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
-        result = self.model_runner.load_lora_adapter(
-            recv_req.lora_name, recv_req.lora_path
-        )
+        result = self.model_runner.load_lora_adapter(recv_req.to_ref())
         return result
 
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
-        result = self.model_runner.unload_lora_adapter(recv_req.lora_name)
+        result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
