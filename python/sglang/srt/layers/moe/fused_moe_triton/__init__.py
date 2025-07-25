@@ -1,14 +1,16 @@
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
-import sglang.srt.layers.moe.fused_moe_triton.fused_moe  # noqa
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_experts,
     get_config_file_name,
+    moe_align_block_size,
+    try_get_optimal_moe_config,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
-    FusedMoEMethodBase,
+    UnquantizedFusedMoEMethodOpenAI,
+    MXFP4FusedMoEMethodOpenAI,
     FusedMoeWeightScaleSupported,
 )
 
@@ -29,11 +31,14 @@ def get_config() -> Optional[Dict[str, Any]]:
 
 __all__ = [
     "FusedMoE",
-    "FusedMoEMethodBase", 
+    "FusedMoEMethodBase",
+    "UnquantizedFusedMoEMethodOpenAI",
+    "MXFP4FusedMoEMethodOpenAI",
     "FusedMoeWeightScaleSupported",
     "override_config",
     "get_config",
-    "fused_moe",
     "fused_experts",
     "get_config_file_name",
+    "moe_align_block_size",
+    "try_get_optimal_moe_config",
 ]

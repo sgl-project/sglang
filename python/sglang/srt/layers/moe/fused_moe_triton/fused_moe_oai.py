@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from sgl_kernel import sgl_per_tensor_quant_fp8
 
+from sglang.srt.layers.moe.topk import TopKOutput
+
 IS_TRITON_KERNELS_AVAILABLE = False
 try:
     import os
@@ -158,7 +160,8 @@ def fused_experts_oai(
     hidden_states: torch.Tensor,  # (num_tokens, hidden_dim)
     w13: torch.Tensor,  # (num_experts, hidden_dim, intermediate_dim * 2)
     w2: torch.Tensor,  # (num_experts, intermediate_dim, hidden_dim)
-    expert_logits: torch.Tensor,  # (num_tokens, num_experts)
+    # expert_logits: torch.Tensor,  # (num_tokens, num_experts)
+    topk_output: TopKOutput, # (topk_weights, topk_ids, router_logits)
     top_k: int,
     activation: str,  # "swiglu"
     w1_bias: Optional[torch.Tensor],
@@ -171,11 +174,17 @@ def fused_experts_oai(
     gemm1_weights = w13
     gemm2_weights = w2
 
+    # Todo: if simply use topk_weights and topk_ids
+    topk_weights, topk_ids, expert_logits = topk_output
+
     num_experts = expert_logits.shape[1]
     if num_experts > 1:
         rdata, gather_indx, scatter_indx = routing(expert_logits, top_k)
     else:
         rdata, gather_indx, scatter_indx = None, None, None
+    
+    # print(f">>> topk_weights: {topk_weights.shape}, topk_ids: {topk_ids.shape}, expert_logits: {expert_logits.shape}")
+    # print(f">>> rdata: {rdata}, gather_indx: {gather_indx}, scatter_indx: {scatter_indx}")
 
     pc1 = PrecisionConfig(flex_ctx=FlexCtx(),
                         allow_tf32=False,
@@ -215,7 +224,8 @@ def fused_experts_mxfp4_oai(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
     w2: torch.Tensor,
-    expert_logits: torch.Tensor,
+    # expert_logits: torch.Tensor,
+    topk_output: TopKOutput, # (topk_weights, topk_ids, router_logits)
     top_k: int,
     fc31_input_dequant: torch.Tensor,
     fc2_input_dequant: torch.Tensor,
@@ -245,6 +255,9 @@ def fused_experts_mxfp4_oai(
     gemm2_weights = w2
     gemm2_scales = w2_scale
     top_k = top_k
+
+    # Todo: if simply use topk_weights and topk_ids
+    topk_weights, topk_ids, expert_logits = topk_output
 
     num_experts = expert_logits.shape[1]
     if num_experts > 1:

@@ -46,6 +46,9 @@ _is_cpu = is_cpu()
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
+if is_npu():
+    import torch_npu
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,6 +72,10 @@ class SiluAndMul(CustomOp):
             return out
         else:
             return self.forward_native(x)
+
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch_npu.npu_swiglu(x)
+        return out
 
 
 class GeluAndMul(CustomOp):
@@ -101,6 +108,17 @@ class NewGELU(CustomOp):
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         # TODO: Implement the CUDA kernel for NewGELU in sgl-kernel
         return self.forward_native(x)
+
+
+class ReLU2(nn.Module):
+    """
+    Applies the squared Rectified Linear Unit function.
+    y = max(0, x)^2
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(x)
+        return x * x
 
 
 class QuickGELU(CustomOp):
@@ -172,6 +190,8 @@ class ScaledActivation(nn.Module):
 _ACTIVATION_REGISTRY = {
     "gelu": nn.GELU(),
     "gelu_pytorch_tanh": nn.GELU(approximate="tanh"),
+    "gelu_new": NewGELU(),
+    "relu2": ReLU2(),
 }
 
 

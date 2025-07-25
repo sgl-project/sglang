@@ -6,6 +6,7 @@ from xgrammar import GrammarCompiler, TokenizerInfo
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
+from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
@@ -506,6 +507,7 @@ class TestEBNFGeneration(unittest.TestCase):
         self.llama32_detector = Llama32Detector()
         self.mistral_detector = MistralDetector()
         self.qwen25_detector = Qwen25Detector()
+        self.kimik2_detector = KimiK2Detector()
 
     def test_pythonic_detector_ebnf(self):
         """Test that the PythonicDetector generates valid EBNF."""
@@ -533,6 +535,33 @@ class TestEBNFGeneration(unittest.TestCase):
         self.assertIn("<｜tool▁calls▁begin｜>", ebnf)
         self.assertIn("<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather", ebnf)
         self.assertIn('\\"location\\"" ":" basic_string ', ebnf)
+
+        # Validate that the EBNF can be compiled by GrammarCompiler
+        try:
+            ctx = self.grammar_compiler.compile_grammar(ebnf)
+            self.assertIsNotNone(ctx, "EBNF should be valid and compile successfully")
+        except RuntimeError as e:
+            self.fail(f"Failed to compile EBNF: {e}")
+
+    def test_kimik2_detector_ebnf(self):
+        """Test that the KimiK2Detector generates valid EBNF."""
+        ebnf = self.kimik2_detector.build_ebnf(self.tools)
+        self.assertIsNotNone(ebnf)
+
+        # Check that the EBNF contains expected patterns for KimiK2 format
+        self.assertIn("<|tool_calls_section_begin|>", ebnf)
+        self.assertIn("<|tool_calls_section_end|>", ebnf)
+
+        # Check for KimiK2-specific function call structure
+        self.assertIn("<|tool_call_begin|>functions.get_weather:", ebnf)
+        self.assertIn("<|tool_call_begin|>functions.search:", ebnf)
+        self.assertIn("<|tool_call_argument_begin|>", ebnf)
+        self.assertIn("<|tool_call_end|>", ebnf)
+
+        # Check that it uses the correct namespace.function format with numeric index pattern
+        self.assertIn("functions.get_weather:", ebnf)
+        self.assertIn("functions.search:", ebnf)
+        self.assertIn("[0-9]+", ebnf)  # Numeric index pattern
 
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
@@ -1136,6 +1165,303 @@ class TestLlama32Detector(unittest.TestCase):
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertTrue(result.normal_text.strip().startswith("Some intro."))
+
+
+class TestKimiK2Detector(unittest.TestCase):
+
+    def setUp(self):
+        """Set up test tools and detector."""
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "City name",
+                            }
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_tourist_attractions",
+                    description="Get tourist attractions",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "City name",
+                            }
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = KimiK2Detector()
+
+    def test_single_tool_call(self):
+        """Test parsing a single tool call in a complete text."""
+        text = '<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city": "Paris"}<|tool_call_end|><|tool_calls_section_end|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[0].parameters, '{"city": "Paris"}')
+        self.assertEqual(result.normal_text, "")
+
+    def test_multiple_tool_calls(self):
+        """Test parsing multiple tool calls in a complete text."""
+        text = '<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city": "Paris"}<|tool_call_end|><|tool_call_begin|>functions.get_tourist_attractions:1<|tool_call_argument_begin|>{"city": "London"}<|tool_call_end|><|tool_calls_section_end|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[0].parameters, '{"city": "Paris"}')
+        self.assertEqual(result.calls[1].name, "get_tourist_attractions")
+        self.assertEqual(result.calls[1].parameters, '{"city": "London"}')
+        self.assertEqual(result.normal_text, "")
+
+    def test_streaming_tool_call(self):
+        """Test streaming incremental parsing of a tool call."""
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            '"city": "Paris"',
+            "}",
+            "<|tool_call_end|><|tool_calls_section_end|>",
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if tool_call_chunk.tool_index is not None:
+
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+
+                    tc = tool_calls[tool_call_chunk.tool_index]
+
+                    if tool_call_chunk.name:
+                        tc["name"] += tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"}')
+
+    def test_streaming_multiple_tool_calls(self):
+        """Test streaming incremental parsing of multiple tool calls."""
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            '"city": "Paris"',
+            "}<|tool_call_end|>",
+            "<|tool_call_begin|>functions.get_tourist_attractions:1<|tool_call_argument_begin|>{",
+            '"city": "London"',
+            "}<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if tool_call_chunk.tool_index is not None:
+
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+
+                    tc = tool_calls[tool_call_chunk.tool_index]
+
+                    if tool_call_chunk.name:
+                        tc["name"] += tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"}')
+        self.assertEqual(tool_calls[1]["name"], "get_tourist_attractions")
+        self.assertEqual(tool_calls[1]["parameters"], '{"city": "London"}')
+
+    def test_tool_call_completion(self):
+        """Test that the buffer and state are reset after a tool call is completed."""
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            '"city": "Paris"',
+            "}",
+            "<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+
+        # After processing all chunks, the buffer should be empty and current_tool_id should be reset
+        self.assertEqual(self.detector._buffer, "")
+        self.assertEqual(self.detector.current_tool_id, 1)
+
+    def test_tool_name_streaming(self):
+        """Test that tool names are streamed correctly with the right index."""
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            '"city": "Paris"',
+            "}",
+            "<|tool_call_end|>",
+            "<|tool_call_begin|>functions.get_tourist_attractions:1<|tool_call_argument_begin|>{",
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if tool_call_chunk.tool_index is not None:
+
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+
+                    tc = tool_calls[tool_call_chunk.tool_index]
+
+                    if tool_call_chunk.name:
+                        tc["name"] += tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"}')
+        self.assertEqual(tool_calls[1]["name"], "get_tourist_attractions")
+
+    def test_invalid_tool_call(self):
+        """Test that invalid tool calls are handled correctly."""
+        text = 'invalid_tool:0<|tool_call_argument_begin|>{"city": "Paris"}<|tool_call_end|><|tool_calls_section_end|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, text)
+
+    def test_partial_tool_call(self):
+        """Test that partial tool calls are handled correctly in streaming mode."""
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            '"city": "Paris"',
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if tool_call_chunk.tool_index is not None:
+
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+
+                    tc = tool_calls[tool_call_chunk.tool_index]
+
+                    if tool_call_chunk.name:
+                        tc["name"] += tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"')
+
+
+class TestDeepSeekV3Detector(unittest.TestCase):
+    def setUp(self):
+        """Set up test tools and detector for DeepSeekV3 format testing."""
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "City name",
+                            }
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_tourist_attractions",
+                    description="Get tourist attractions",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "City name",
+                            }
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = DeepSeekV3Detector()
+
+    def test_parse_streaming_multiple_tool_calls_with_multi_token_chunk(self):
+        """Test parsing multiple tool calls when streaming chunks contains multi-tokens (e.g. DeepSeekV3 enable MTP)"""
+        # Simulate streaming chunks with multi-tokens for two consecutive tool calls
+        chunks = [
+            "<｜tool▁calls▁begin｜>",
+            "<｜tool▁call▁begin｜>function",
+            "<｜tool▁sep｜>get",
+            "_weather\n",
+            "```json\n",
+            '{"city":',
+            '"Shanghai',
+            '"}\n```<｜tool▁call▁end｜>',
+            "\n<｜tool▁call▁begin｜>",
+            "function<｜tool▁sep｜>",
+            "get_tour",
+            "ist_att",
+            "ractions\n```" 'json\n{"',
+            'city": "',
+            'Beijing"}\n',
+            "```<｜tool▁call▁end｜>",
+            "<｜tool▁calls▁end｜>",
+        ]
+
+        tool_calls_seen = []
+        tool_calls_parameters = []
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            if result.calls:
+                for call in result.calls:
+                    if call.name:
+                        tool_calls_seen.append(call.name)
+                    if call.parameters:
+                        tool_calls_parameters.append(call.parameters)
+
+        # Should see both tool names
+        self.assertIn("get_weather", tool_calls_seen, "Should process first tool")
+        self.assertIn(
+            "get_tourist_attractions", tool_calls_seen, "Should process second tool"
+        )
+
+        # Verify that the parameters are valid JSON and contain the expected content
+        params1 = json.loads(tool_calls_parameters[0])
+        params2 = json.loads(tool_calls_parameters[1])
+        self.assertEqual(params1["city"], "Shanghai")
+        self.assertEqual(params2["city"], "Beijing")
 
 
 if __name__ == "__main__":

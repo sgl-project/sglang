@@ -15,7 +15,7 @@ from sglang.test.test_utils import CustomTestCase
 convert_weight_packed = torch.ops.sgl_kernel.convert_weight_packed
 qkv_proj_with_rope = torch.ops.sgl_kernel.qkv_proj_with_rope
 qkv_proj_with_rope_fused_weight = torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight
-torch.manual_seed(0)
+torch.manual_seed(1234)
 # constants
 kv_lora_rank = 512
 qk_head_dim = 192
