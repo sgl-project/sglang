@@ -358,6 +358,7 @@ class HiPAttentionBackend(AttentionBackend):
                     offloading_metadata=offloading_metadata,
                     sliding_window_size=sw_size,
                     using_chunked_sliding_window=using_chunked_sw,
+                    self_extend_scale=self.hip_config.self_extend_scale,
                 )
             else:
                 if (
@@ -416,6 +417,7 @@ class HiPAttentionBackend(AttentionBackend):
                         offloading_metadata=offloading_metadata,
                         sliding_window_size=sw_size,
                         using_chunked_sliding_window=using_chunked_sw,
+                        self_extend_scale=self.hip_config.self_extend_scale,
                     )
                 else:
                     # Do absorbed multi-latent attention
@@ -512,6 +514,7 @@ class HiPAttentionBackend(AttentionBackend):
                         sliding_window_size=sw_size,
                         sliding_window_sink=sw_sink,
                         using_chunked_sliding_window=using_chunked_sw,
+                        self_extend_scale=self.hip_config.self_extend_scale,
                     )
 
                     if require_metadata_checkout and (metadata is not None):
@@ -716,6 +719,7 @@ class HiPAttentionBackend(AttentionBackend):
                     cache_seqlens=self.flashattention_backend.forward_metadata.cache_seqlens_int32,
                     cu_seqlens_q=self.flashattention_backend.forward_metadata.cu_seqlens_q,
                     cu_seqlens_k=self.flashattention_backend.forward_metadata.cu_seqlens_k,
+                    self_extend_scale=self.hip_config.self_extend_scale,
                 )
             else:
                 if k_cache is not None:
@@ -802,6 +806,7 @@ class HiPAttentionBackend(AttentionBackend):
                     cache_seqlens=self.flashattention_backend.forward_metadata.cache_seqlens_int32,
                     cu_seqlens_q=self.flashattention_backend.forward_metadata.cu_seqlens_q,
                     cu_seqlens_k=self.flashattention_backend.forward_metadata.cu_seqlens_k,
+                    self_extend_scale=self.hip_config.self_extend_scale,
                 )
 
             if (metadata is not None) and (
