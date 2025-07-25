@@ -80,7 +80,7 @@ class TestQuarkMXFP4Loading(CustomTestCase):
             model_type="generation",
             torch_dtype="auto",
             mem_fraction_static=model_case.mem_fraction_static,
-            context_length=model_case.context_length,
+            context_length=model_case.context_length
         ) as srt_runner:
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
@@ -118,6 +118,12 @@ class TestR1MXFP4Accuracy(CustomTestCase):
             "0.9",
             "--context-length",
             "38768",
+            # TODO: Use again aiter attention backend when it is debugged.
+            # Use to work on 20th May, but getting bad accuracy with
+            # aiter attention backend from ~9th June onwards (with aiter==0.1.4).
+            # Some changes to aiter_backend.py attention are probably responsible.
+            "--attention-backend",
+            "triton"
         ]
 
         cls.process = popen_launch_server(
