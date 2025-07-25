@@ -502,6 +502,7 @@ class DecodePreallocQueue:
         extend_num_tokens = num_tokens - len(req.prefix_indices)
 
         dummy_batch = ScheduleBatch(
+            reqs=None,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             model_config=self.scheduler.model_config,
             tree_cache=self.tree_cache,
