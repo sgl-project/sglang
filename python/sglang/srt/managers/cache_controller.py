@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -253,6 +254,19 @@ class HiCacheController:
 
             if storage_backend == "file":
                 self.storage_backend = HiCacheFile()
+                self.enable_storage = True
+                # todo: threshold policy for prefetching
+                self.prefetch_threshold = max(prefetch_threshold, self.page_size)
+            elif storage_backend == "mooncake":
+                from sglang.srt.mem_cache.mooncake_store import MooncakeStore
+                from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+                rank = get_tensor_model_parallel_rank()
+                bytes_per_page = (
+                    mem_pool_host.get_size_per_token() * mem_pool_host.page_size
+                )
+                dtype = mem_pool_host.dtype
+                self.storage_backend = MooncakeStore(rank, bytes_per_page, dtype)
                 self.enable_storage = True
                 # todo: threshold policy for prefetching
                 self.prefetch_threshold = max(prefetch_threshold, self.page_size)
@@ -521,8 +535,8 @@ class HiCacheController:
         while not self.stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
-                for h in operation.hash_value:
-                    page_data = self.storage_backend.get(h)
+                page_datas = self.storage_backend.batch_get(operation.hash_value)
+                for h, page_data in zip(operation.hash_value, page_datas):
                     if page_data is None:
                         logger.warning(
                             f"Prefetch operation {operation.request_id} failed to retrieve page {h}."
