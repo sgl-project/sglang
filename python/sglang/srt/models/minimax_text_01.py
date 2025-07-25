@@ -650,7 +650,6 @@ class MiniMaxText01DecoderLayer(nn.Module):
                 hidden_states=layernorm_output,
                 positions=positions,
                 forward_batch=forward_batch,
-                attn_metadata=None,
                 **kwargs,
             )
 
@@ -915,8 +914,8 @@ class MiniMaxText01Model(nn.Module):
             dtype=torch.float32, cache_shape=self.cache_shape
         )
 
-        # Initialize lightning attention backend with proper configuration
-        self.attn_backend = self._initialize_attention_backend(config)
+        self._attn_backend = None
+        self._config = config
 
         # Initialize rotary embedding
         head_dim = getattr(config, "head_dim", None)
@@ -980,8 +979,18 @@ class MiniMaxText01Model(nn.Module):
             max_context_len=max_context_len,
         )
 
+    @property
+    def attn_backend(self):
+        """Lazy initialization of attention backend."""
+        if self._attn_backend is None:
+            self._attn_backend = self._initialize_attention_backend(self._config)
+        return self._attn_backend
+
     def _clear_prefill_cache(
-        self, attn_metadata, minimax_cache_tensors: torch.Tensor, **kwargs
+        self,
+        attn_backend: LightningAttnBackend,
+        minimax_cache_tensors: torch.Tensor,
+        **kwargs,
     ):
         seq_to_slot_maps = {}
         seq_id_map = sum(list(kwargs["request_ids_to_seq_ids"].values()), [])
@@ -989,12 +998,12 @@ class MiniMaxText01Model(nn.Module):
             seq_to_slot_maps.update(seq_to_slot_map)
 
         slots_to_clear = []
-        for _prefill_id in range(getattr(attn_metadata, "num_prefills", 0)):
+        for _prefill_id in range(attn_backend.forward_metadata.num_prefills):
             if _prefill_id >= len(seq_id_map):
                 break
             seq_id = seq_id_map[_prefill_id]
             if (
-                attn_metadata.context_lens_tensor[_prefill_id] == 0
+                attn_backend.forward_metadata.context_lens_tensor[_prefill_id] == 0
                 and seq_id in seq_to_slot_maps
             ):
                 slots_to_clear.append(seq_to_slot_maps[seq_id])
@@ -1048,6 +1057,9 @@ class MiniMaxText01Model(nn.Module):
                     state_indices_tensor
                 )
                 attn_backend.forward_metadata._last_cache_id = id(minimax_cache_tensors)
+
+        if attn_backend.forward_metadata.num_prefills > 0:
+            self._clear_prefill_cache(attn_backend, minimax_cache_tensors, **kwargs)
 
         if get_pp_group().is_first_rank:
             if inputs_embeds is None:
