@@ -439,7 +439,7 @@ class LogitsProcessor(nn.Module):
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits_metadata.compute_dp_attention_metadata()
 
-            if self.global_num_tokens_for_logprob_cpu is None:
+            if logits_metadata.global_num_tokens_for_logprob_cpu is None:
                 gathered_buffer = torch.empty_like(logits_metadata.gathered_buffer)
             else:
                 gathered_buffer = logits_metadata.gathered_buffer
