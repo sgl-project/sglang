@@ -169,7 +169,7 @@ class LogitsMetadata:
             dp_padding_mode=DPPaddingMode.SUM_LEN,
         )
 
-    def compute_dp_attention_metadata(self, hidden_states: torch.Tensor):
+    def compute_dp_attention_metadata(self):
 
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
         dp_rank = get_attention_dp_rank()
@@ -186,14 +186,16 @@ class LogitsMetadata:
 
         if self.global_num_tokens_for_logprob_cpu is not None:
             # create a smaller buffer to reduce peak memory usage
-            self.gathered_buffer = torch.zeros(
+            self.gathered_buffer = torch.empty(
                 (
                     sum(self.global_num_tokens_for_logprob_cpu),
-                    hidden_states.shape[1],
+                    self.gathered_buffer.shape[1],
                 ),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
+        else:
+             self.gathered_buffer = torch.empty_like(self.gathered_buffer)
 
 
 class LogitsProcessor(nn.Module):
@@ -437,15 +439,9 @@ class LogitsProcessor(nn.Module):
         guarantee the given hidden_states follow this constraint.
         """
         if self.do_tensor_parallel_all_gather_dp_attn:
-            logits_metadata.compute_dp_attention_metadata(hidden_states)
-
-            if logits_metadata.global_num_tokens_for_logprob_cpu is None:
-                gathered_buffer = torch.empty_like(logits_metadata.gathered_buffer)
-            else:
-                gathered_buffer = logits_metadata.gathered_buffer
-
+            logits_metadata.compute_dp_attention_metadata()
             hidden_states, local_hidden_states = (
-                gathered_buffer,
+                logits_metadata.gathered_buffer,
                 hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
