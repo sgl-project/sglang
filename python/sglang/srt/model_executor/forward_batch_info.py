@@ -39,7 +39,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.dp_attention import (
-    DPGatherMode,
+    DPPaddingMode,
     get_attention_dp_rank,
     get_attention_tp_size,
 )
@@ -267,8 +267,8 @@ class ForwardBatch:
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
-    # The gather mode for DP attention
-    dp_gather_mode: Optional[DPGatherMode] = None
+    # The padding mode for DP attention
+    dp_padding_mode: Optional[DPPaddingMode] = None
     # for extend, local start pos and num tokens is different in logits processor
     # this will be computed in get_dp_local_info
     # this will be recomputed in LogitsMetadata.from_forward_batch
@@ -625,10 +625,10 @@ class ForwardBatch:
                 (global_num_tokens[i] - 1) // attn_tp_size + 1
             ) * attn_tp_size
 
-        dp_gather_mode = DPGatherMode.get_dp_gather_mode(global_num_tokens)
-        self.dp_gather_mode = dp_gather_mode
+        dp_padding_mode = DPPaddingMode.get_dp_padding_mode(global_num_tokens)
+        self.dp_padding_mode = dp_padding_mode
 
-        if dp_gather_mode.is_all_gather():
+        if dp_padding_mode.is_max_len():
             # when DP gather mode is all gather, we will use all_gather_into_tensor to gather hidden states,
             # where transferred tokens should be padded to the same length.
             max_num_tokens = max(global_num_tokens)
