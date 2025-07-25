@@ -1757,10 +1757,14 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             acc_chunk_len += chunk_len
 
-            if latent_cache_buf.dtype in (torch.float8_e5m2, ):
-                latent_cache = latent_cache_buf.view(torch.uint8)[
-                    block_table[ibatch : ibatch + 1, :prefix_len]
-                ].view(latent_cache_buf.dtype).to(q_chunk.dtype)
+            if latent_cache_buf.dtype in (torch.float8_e5m2,):
+                latent_cache = (
+                    latent_cache_buf.view(torch.uint8)[
+                        block_table[ibatch : ibatch + 1, :prefix_len]
+                    ]
+                    .view(latent_cache_buf.dtype)
+                    .to(q_chunk.dtype)
+                )
             else:
                 latent_cache = latent_cache_buf[
                     block_table[ibatch : ibatch + 1, :prefix_len]
@@ -1884,9 +1888,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.attn_mha.layer_id
             )
             if latent_cache_buf.dtype in (torch.float8_e5m2,):
-                latent_cache = latent_cache_buf.view(torch.uint8)[
-                    forward_batch.prefix_chunk_kv_indices[i]
-                ].view(latent_cache_buf.dtype).to(q.dtype).contiguous()
+                latent_cache = (
+                    latent_cache_buf.view(torch.uint8)[
+                        forward_batch.prefix_chunk_kv_indices[i]
+                    ]
+                    .view(latent_cache_buf.dtype)
+                    .to(q.dtype)
+                    .contiguous()
+                )
             else:
                 latent_cache = latent_cache_buf[
                     forward_batch.prefix_chunk_kv_indices[i]
