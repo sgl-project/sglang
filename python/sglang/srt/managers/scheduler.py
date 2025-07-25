@@ -313,6 +313,10 @@ class Scheduler(
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
+        self.poller = zmq.Poller()
+        self.poller.register(self.recv_from_tokenizer, zmq.POLLIN)
+        self.poller.register(self.recv_from_rpc, zmq.POLLIN)
+
         if self.current_scheduler_metrics_enabled():
             self.send_metrics_from_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
@@ -999,10 +1003,7 @@ class Scheduler(
             if self.attn_tp_rank == 0:
                 recv_reqs = []
 
-                poller = zmq.Poller()
-                poller.register(self.recv_from_tokenizer, zmq.POLLIN)
-                poller.register(self.recv_from_rpc, zmq.POLLIN)
-                sockets = dict(poller.poll(timeout=2))
+                sockets = dict(self.poller.poll(timeout=2))
 
                 if self.recv_from_tokenizer in sockets:
                     while True:
