@@ -2431,7 +2431,7 @@ class Scheduler(
                     req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
 
-        # Delete requests in the waiting queue when PD disaggregation is enabled
+        # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # Abort requests that have not yet been bootstrapped
             for i, req in enumerate(self.disagg_prefill_bootstrap_queue.queue):
