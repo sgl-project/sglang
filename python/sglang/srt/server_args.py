@@ -20,10 +20,10 @@ import logging
 import os
 import random
 import tempfile
-from token import OP
 from typing import List, Literal, Optional, Union
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
+from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     LORA_TARGET_ALL_MODULES,
@@ -145,7 +145,7 @@ class ServerArgs:
     enable_lora: Optional[bool] = None
     max_lora_rank: Optional[int] = None
     lora_target_modules: Optional[Union[set[str], List[str]]] = None
-    lora_paths: Optional[Union[dict[str, str], List[str]]] = None
+    lora_paths: Optional[Union[dict[str, str], dict[str, LoRARef], List[str]]] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
 
@@ -1099,6 +1099,7 @@ class ServerArgs:
                 "deepseekv3",
                 "pythonic",
                 "kimi_k2",
+                "qwen3",
             ],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', and 'kimi_k2'.",
@@ -1842,9 +1843,24 @@ class ServerArgs:
                 for lora_path in lora_paths:
                     if "=" in lora_path:
                         name, path = lora_path.split("=", 1)
-                        self.lora_paths[name] = path
+                        self.lora_paths[name] = LoRARef(lora_name=name, lora_path=path)
                     else:
-                        self.lora_paths[lora_path] = lora_path
+                        self.lora_paths[lora_path] = LoRARef(
+                            lora_name=lora_path,
+                            lora_path=lora_path,
+                        )
+            elif isinstance(self.lora_paths, dict):
+                self.lora_paths = {
+                    k: LoRARef(lora_name=k, lora_path=v)
+                    for k, v in self.lora_paths.items()
+                }
+            elif self.lora_paths is None:
+                self.lora_paths = {}
+            else:
+                raise ValueError(
+                    f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
+                    "Expected a list or a dictionary."
+                )
 
             # Expand target modules
             if self.lora_target_modules:

@@ -229,6 +229,7 @@ class HiCacheController:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         mem_pool_host: HostKVCache,
         page_size: int,
+        tp_group: torch.distributed.ProcessGroup,
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through_selective",
         io_backend: str = "",
@@ -254,21 +255,27 @@ class HiCacheController:
         self.enable_storage = False
         # todo: move backend initialization to storage backend module
         if storage_backend is not None:
+            # create a new communication group for synchronizing storage operations across TP workers
+            self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
+            if self.tp_world_size > 1:
+                group_ranks = torch.distributed.get_process_group_ranks(tp_group)
+                self.tp_group = torch.distributed.new_group(group_ranks, backend="gloo")
+
             if storage_backend == "file":
                 self.storage_backend = HiCacheFile()
                 self.enable_storage = True
                 # todo: threshold policy for prefetching
-                self.prefetch_threshold = prefetch_threshold
                 self.storage_zerocopy = False
                 self.storage_batchedio = False
+                self.prefetch_threshold = max(prefetch_threshold, self.page_size)
             elif storage_backend == "mooncake":
                 self.storage_backend = MooncakeStore()
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
                 self.enable_storage = True
                 # todo: threshold policy for prefetching
-                self.prefetch_threshold = prefetch_threshold
                 self.storage_zerocopy = True
                 self.storage_batchedio = True
+                self.prefetch_threshold = max(prefetch_threshold, self.page_size)
             else:
                 raise NotImplementedError(
                     f"Unsupported storage backend: {storage_backend}"
@@ -378,6 +385,7 @@ class HiCacheController:
         if host_indices is None:
             return None
         self.mem_pool_host.protect_write(host_indices)
+        torch.cuda.current_stream().synchronize()
         self.write_queue.put(
             CacheOperation(
                 host_indices,
@@ -630,14 +638,32 @@ class HiCacheController:
                     hit_hash = [k for k, v in exist_result.items() if v != 0]
                     
 
+                if self.tp_world_size > 1:
+                    storage_hit_count_tensor = torch.tensor(
+                        storage_hit_count, dtype=torch.int
+                    )
+                    torch.distributed.all_reduce(
+                        storage_hit_count_tensor,
+                        op=torch.distributed.ReduceOp.MIN,
+                        group=self.tp_group,
+                    )
+                    storage_hit_count = storage_hit_count_tensor.item()
+
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
-                else:
-                    operation.hash_value = hit_hash
-                    operation.host_indices = operation.host_indices[:(len(hit_hash) * self.page_size)]
                     logger.debug(
-                        f"Prefetching {len(hit_hash)} pages for request {operation.request_id}."
+                        f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
+                    )
+                else:
+                    operation.hash_value = hash_value[
+                        : (storage_hit_count // self.page_size)
+                    ]
+                    # free the pre-allocated memory for pages that are not hit
+                    self.mem_pool_host.free(operation.host_indices[storage_hit_count:])
+                    operation.host_indices = operation.host_indices[:storage_hit_count]
+                    logger.debug(
+                        f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
                     self.prefetch_buffer.put(operation)
 
@@ -693,7 +719,7 @@ class HiCacheController:
                     backup_hit_count += self.page_size
                     hash_value.append(last_hash)
                     remaining_tokens -= self.page_size
-                    operation.hash_value = hash_value
+                operation.hash_value = hash_value
 
                 if self.storage_batchedio:
                     if self.storage_zerocopy:
@@ -721,15 +747,36 @@ class HiCacheController:
                         if self.storage_zerocopy:
                             pass
                         else:
-                            self.storage_backend.set(
+                            success = self.storage_backend.set(
                                 last_hash,
                                 self.mem_pool_host.get_flat_data_page(
                                     operation.host_indices[i]
                                 ),
                             )
+                        if not success:
+                            logger.warning(f"Failed to write page {last_hash} to storage.")
+                            break
                         operation.completed_tokens += self.page_size
 
-                self.ack_backup_queue.put((operation.id, operation.hash_value))
+                min_completed_tokens = operation.completed_tokens
+                if self.tp_world_size > 1:
+                    completed_tokens_tensor = torch.tensor(
+                        min_completed_tokens, dtype=torch.int
+                    )
+                    torch.distributed.all_reduce(
+                        completed_tokens_tensor,
+                        op=torch.distributed.ReduceOp.MIN,
+                        group=self.tp_group,
+                    )
+                    min_completed_tokens = completed_tokens_tensor.item()
+
+                self.ack_backup_queue.put(
+                    (
+                        operation.id,
+                        operation.hash_value[: min_completed_tokens // self.page_size],
+                        min_completed_tokens,
+                    )
+                )
 
             except Empty:
                 continue
