@@ -12,6 +12,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -246,7 +247,7 @@ class WhisperEncoder(torch.nn.Module):
             embed_dim, embed_dim, kernel_size=3, stride=2, padding=1
         )
 
-        self.embed_positions = torch.nn.Embedding(
+        self.embed_positions = VocabParallelEmbedding(
             config.max_source_positions, embed_dim
         )
 
@@ -290,10 +291,8 @@ class WhisperDecoder(torch.nn.Module):
         self.max_source_positions = config.max_source_positions
         self.embed_scale = config.d_model**-0.5 if config.scale_embedding else 1.0
 
-        self.embed_tokens = torch.nn.Embedding(
-            config.vocab_size, config.d_model, config.pad_token_id
-        )
-        self.embed_positions = torch.nn.Embedding(
+        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.d_model)
+        self.embed_positions = VocabParallelEmbedding(
             self.max_target_positions, config.d_model
         )
 
