@@ -144,7 +144,7 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
 
 class Qwen3Detector(BaseReasoningFormatDetector):
     """
-    Detector for standard Qwen3 models (e.g., Qwen/Qwen3-235B-A22B).
+    Detector for Qwen3 models (e.g., Qwen/Qwen3-235B-A22B).
     Assumes reasoning format:
       (<think>)*(.*)</think>
 
@@ -152,12 +152,6 @@ class Qwen3Detector(BaseReasoningFormatDetector):
     mode using `enable_thinking` parameter in the request parameter.
       - enable_thinking=True: "<think>reasoning content</think>The answer is 42."
       - enable_thinking=False: "The answer is 42." (no thinking tokens)
-
-    This detector handles both cases.
-
-    NOTE: Do NOT use this detector for Qwen3-Thinking models (e.g., Qwen3-Thinking-2507).
-    Those models always generate thinking content without <think> start tags.
-    Use "qwen3-thinking" parser type for those models instead.
 
     Args:
         stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
@@ -169,31 +163,6 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             "<think>",
             "</think>",
             force_reasoning=force_reasoning,
-            stream_reasoning=stream_reasoning,
-        )
-
-
-class Qwen3ThinkingDetector(BaseReasoningFormatDetector):
-    """
-    Detector for Qwen3-Thinking models (e.g., Qwen3-Thinking-2507).
-    Assumes reasoning format:
-      *(.*)</think>
-
-    These models always generate thinking content without <think> start tag.
-    They do not support the enable_thinking parameter and always think.
-
-    Format: "I need to think about this...</think>The answer is 42."
-
-    Args:
-        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
-            If True, streams reasoning content as it arrives.
-    """
-
-    def __init__(self, stream_reasoning: bool = True):
-        super().__init__(
-            "<think>",
-            "</think>",
-            force_reasoning=True,
             stream_reasoning=stream_reasoning,
         )
 
@@ -230,7 +199,6 @@ class ReasoningParser:
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
         "qwen3": Qwen3Detector,
-        "qwen3-thinking": Qwen3ThinkingDetector,
         "kimi": KimiDetector,
     }
 
