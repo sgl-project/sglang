@@ -84,18 +84,11 @@ class TemplateManager:
     def _detect_reasoning_pattern(self, template: str) -> bool:
         """
         Detect if the chat template contains reasoning/thinking patterns.
-
-        This looks for patterns like:
-        - <|im_start|>assistant\\n<think>\\n in generation prompts
-        - <think> and </think> tags in assistant messages
         """
 
         # Look for reasoning patterns in the template
         reasoning_patterns = [
-            "<|im_start|>assistant\n<think>\n",
             "<think>",
-            "</think>",
-            "reasoning_content",
         ]
 
         has_reasoning = any(pattern in template for pattern in reasoning_patterns)
