@@ -1233,6 +1233,12 @@ def launch_server(
         app.server_args = server_args
         # Listen for HTTP requests
         if server_args.tokenizer_worker_num > 1:
+            from uvicorn.config import LOGGING_CONFIG
+            LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
+                "handlers": ["default"],
+                "level": "INFO",
+                "propagate": False,
+            }
             uvicorn.run(
                 "sglang.srt.entrypoints.http_server:app",
                 host=server_args.host,
