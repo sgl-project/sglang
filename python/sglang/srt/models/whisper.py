@@ -1,4 +1,4 @@
-from typing import Any, Iterable, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
 from transformers import WhisperConfig
@@ -12,6 +12,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 
@@ -393,6 +394,10 @@ class WhisperForConditionalGeneration(torch.nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+        # Whisper models handle text/audio separately, so we don't need to pad input ids
+        return input_ids
 
     def forward(
         self,
