@@ -9,12 +9,12 @@ from sglang.srt.layers import dp_attention as _dp_attn
 # Patch DP-attention globals before importing backends
 _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
 
-from python.sglang.srt.layers.attention.trtllm_mla_backend import (
+from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
+from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,
 )
-from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -76,8 +76,7 @@ TEST_CASES = {
         },
     ],
     "page_size_consistency": [
-        # Only 32 and 64 supported for now https://github.com/flashinfer-ai/flashinfer/blob/fe29ed63cb923f25cae70ef83f3fd16139305b35/flashinfer/decode.py#L2115
-        # TODO: Test 16 and 128. Pending cubins
+        # Only 32 and 64 supported for now in flashinfer TRTLLM-GEN MLA kernel
         {
             "name": "page_32",
             "batch_size": 8,
