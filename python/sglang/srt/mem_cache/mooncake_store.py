@@ -11,11 +11,15 @@ import numpy as np
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+
 logger = logging.getLogger(__name__)
 
 def get_hash_str_mooncake(
-    prefix_block_key: str, current_page_ids: List, local_rank: int
+    prefix_block_key: str, current_page_ids: List
 ):
+    local_rank = get_tensor_model_parallel_rank()
     prefix_str = ""
     if prefix_block_key:
         if len(prefix_block_key):

@@ -612,13 +612,11 @@ class HiCacheController:
                             last_hash,
                         )
                     elif isinstance(self.storage_backend, MooncakeStore):
-                        local_rank = torch.cuda.current_device()
                         last_hash = get_hash_str_mooncake(
                                 last_hash, 
                                 tokens_to_fetch[
                                     storage_hit_count : storage_hit_count + self.page_size
                                 ],
-                                local_rank
                             )
                     if not self.storage_batchedio:
                         exist_result = self.storage_backend.exists(last_hash)
@@ -708,13 +706,11 @@ class HiCacheController:
                             last_hash,
                         )
                     elif isinstance(self.storage_backend, MooncakeStore):
-                        local_rank = torch.cuda.current_device()
                         last_hash = get_hash_str_mooncake(
                                 last_hash, 
                                 tokens_to_backup[
                                     backup_hit_count : backup_hit_count + self.page_size
                                 ],
-                                local_rank
                             )
                     backup_hit_count += self.page_size
                     hash_value.append(last_hash)
@@ -723,19 +719,20 @@ class HiCacheController:
 
                 if self.storage_batchedio:
                     if self.storage_zerocopy:
-                        exist_hashvalues = self.storage_backend.exists(hash_value)
-                        indices = operation.host_indices.tolist()
-                        non_exist_keys = []
-                        non_exist_indices = []
-                        for i in range(len(hash_value)):
-                            if not exist_hashvalues[hash_value[i]]:
-                                non_exist_keys.append(hash_value[i])
-                                non_exist_indices.extend(indices[i * self.page_size: (i + 1) * self.page_size])
-                        if len(non_exist_keys) > 0:
-                            key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(non_exist_keys,
-                                                                                             non_exist_indices)
-                            self.storage_backend.batch_set(key_strs, target_location=buffer_ptrs, target_sizes=buffer_sizes)
-
+                        if len(hash_value):
+                            exist_hashvalues = self.storage_backend.exists(hash_value)
+                            indices = operation.host_indices.tolist()
+                            non_exist_keys = []
+                            non_exist_indices = []
+                            for i in range(len(hash_value)):
+                                if not exist_hashvalues[hash_value[i]]:
+                                    non_exist_keys.append(hash_value[i])
+                                    non_exist_indices.extend(indices[i * self.page_size: (i + 1) * self.page_size])
+                            if len(non_exist_keys) > 0:
+                                key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(non_exist_keys,
+                                                                                                 non_exist_indices)
+                                self.storage_backend.batch_set(key_strs, target_location=buffer_ptrs, target_sizes=buffer_sizes)
+    
                         operation.completed_tokens += len(hash_value) * self.page_size
                     else:
                         #unimplemented
