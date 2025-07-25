@@ -856,8 +856,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     extend_num_tokens: Optional[int] = None
     decoding_reqs: List[Req] = None
     extend_logprob_start_lens: List[int] = None
-    # For POD Attn
-    max_req_input_len: int = None
     # It comes empty list if logprob is not required.
     extend_input_logprob_token_ids: Optional[torch.Tensor] = None
 
@@ -1753,9 +1751,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
-            num_decode_reqs=(
-                len(self.decoding_reqs) if self.forward_mode.is_mixed() else 0
-            ),
             launch_done=self.launch_done,
         )
 

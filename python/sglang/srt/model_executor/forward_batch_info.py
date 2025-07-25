@@ -200,9 +200,6 @@ class ForwardBatch:
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
-    # For POD Attn
-    num_decode_reqs: Optional[int] = 0
-    max_req_input_len: Optional[int] = 0
 
     # For split prefill
     # intermediate values for split prefill
