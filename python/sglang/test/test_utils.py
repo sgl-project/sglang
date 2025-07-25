@@ -1261,7 +1261,7 @@ def dump_bench_raw_result(
     preds,
     labels,
 ):
-    if path == "":
+    if not path:
         return
 
     rows = []
