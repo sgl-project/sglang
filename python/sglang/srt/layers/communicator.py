@@ -32,6 +32,9 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
 )
+from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import use_symmetric_memory, SymmMemoryTensor
+
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -428,6 +431,12 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     hidden_states, residual
                 )
             else:
+                # if cls._symm_tensor is None:
+                #     cls._symm_tensor = SymmMemoryTensor(get_tp_group())
+                # hidden_states_out = cls._symm_tensor.get_tensor(hidden_states.shape, hidden_states.dtype)
+                # hidden_states_out.copy_(hidden_states)
+                # hidden_states_out.symmetric_memory = True
+                # hidden_states = hidden_states_out
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
