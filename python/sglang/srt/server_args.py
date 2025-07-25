@@ -113,6 +113,7 @@ class ServerArgs:
     bucket_time_to_first_token: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
+    bucket_kvcache_transfer_latency: Optional[List[float]] = None
     collect_tokens_histogram: bool = False
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
@@ -1020,6 +1021,13 @@ class ServerArgs:
             nargs="+",
             default=ServerArgs.bucket_e2e_request_latency,
             help="The buckets of end-to-end request latency, specified as a list of floats.",
+        )
+        parser.add_argument(
+            "--bucket-kvcache-transfer-latency",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_kvcache_transfer_latency,
+            help="The buckets of request kvcache transfer latency, specified as a list of floats.",
         )
         parser.add_argument(
             "--collect-tokens-histogram",

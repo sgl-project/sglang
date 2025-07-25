@@ -689,7 +689,10 @@ class Scheduler(
             }
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
-            self.metrics_collector = SchedulerMetricsCollector(labels=labels)
+            self.metrics_collector = SchedulerMetricsCollector(
+                labels=labels,
+                bucket_kvcache_transfer_latency=self.server_args.bucket_kvcache_transfer_latency,
+            )
 
     def init_kv_events(self, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
