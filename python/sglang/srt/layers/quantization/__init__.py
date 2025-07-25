@@ -88,13 +88,13 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 # VLLM-dependent quantization methods
 VLLM_QUANTIZATION_METHODS = {
     "aqlm": AQLMConfig,
-    "awq": AWQConfig,
     "deepspeedfp": DeepSpeedFPConfig,
     "tpu_int8": Int8TpuConfig,
     "fbgemm_fp8": FBGEMMFp8Config,
     "marlin": MarlinConfig,
     "gguf": GGUFConfig,
     "gptq_marlin_24": GPTQMarlin24Config,
+    "awq": AWQConfig,
     "awq_marlin": AWQMarlinConfig,
     "bitsandbytes": BitsAndBytesConfig,
     "qqq": QQQConfig,
@@ -112,7 +112,15 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
             f"Invalid quantization method: {quantization}. "
             f"Available methods: {list(QUANTIZATION_METHODS.keys())}"
         )
-    if quantization in VLLM_QUANTIZATION_METHODS and not VLLM_AVAILABLE:
+
+    from sglang.srt.utils import is_cpu
+
+    # for CPU quantization, will not need vLLM dependency
+    if (
+        not is_cpu()
+        and quantization in VLLM_QUANTIZATION_METHODS
+        and not VLLM_AVAILABLE
+    ):
         raise ValueError(
             f"{quantization} quantization requires some operators from vllm. "
             "Please install vllm by `pip install vllm==0.9.0.1`"
