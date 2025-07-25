@@ -744,9 +744,13 @@ def load_image(
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, stream=True, timeout=timeout).raw
-        image = Image.open(response)
-        response.close()
+        response = requests.get(image_file, stream=True, timeout=timeout)
+        try:
+            response.raise_for_status()
+            image = Image.open(response.raw)
+            image.load()  # Force loading to avoid issues after closing the stream
+        finally:
+            response.close()
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
@@ -2059,6 +2063,16 @@ def is_valid_ipv6_address(address: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def maybe_wrap_ipv6_address(address: str) -> str:
+    if is_valid_ipv6_address(address):
+        return f"[{address}]"
+    return address
+
+
+def format_tcp_address(ip: str, port: int) -> str:
+    return f"tcp://{maybe_wrap_ipv6_address(ip)}:{port}"
 
 
 def configure_ipv6(dist_init_addr):
