@@ -139,12 +139,13 @@ class Qwen3XMLDetector(BaseFormatDetector):
             trigger=self.tool_call_start_token,
         )
 
-    # TODO: fake ebnf for xml + outlines backend
     def build_ebnf(self, tools: List[Tool]):
         return EBNFComposer.build_ebnf(
             tools,
             individual_call_start_token=self.tool_call_start_token.replace("\n", "\\n"),
             individual_call_end_token=self.tool_call_end_token.replace("\n", "\\n"),
             tool_call_separator="\\n",
-            function_format="json",
+            function_format="xml",
+            call_rule_fmt='"<function={name}>\\n" {arguments_rule} "\\n</function>"',
+            key_value_rule_fmt='"<parameter={key}>\\n" {valrule} "\\n</parameter>"',
         )

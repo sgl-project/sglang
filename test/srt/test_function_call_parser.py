@@ -508,6 +508,7 @@ class TestEBNFGeneration(unittest.TestCase):
         self.llama32_detector = Llama32Detector()
         self.mistral_detector = MistralDetector()
         self.qwen25_detector = Qwen25Detector()
+        self.qwen3_detector = Qwen3XMLDetector()
         self.kimik2_detector = KimiK2Detector()
 
     def test_pythonic_detector_ebnf(self):
@@ -614,6 +615,26 @@ class TestEBNFGeneration(unittest.TestCase):
         self.assertIn('\\"name\\"" ":" "\\"get_weather\\"', ebnf)
         self.assertIn('"\\"arguments\\"" ":"', ebnf)
 
+        # Validate that the EBNF can be compiled by GrammarCompiler
+        try:
+            ctx = self.grammar_compiler.compile_grammar(ebnf)
+            self.assertIsNotNone(ctx, "EBNF should be valid and compile successfully")
+        except RuntimeError as e:
+            self.fail(f"Failed to compile EBNF: {e}")
+
+    def test_qwen3_detector_ebnf(self):
+        """Test that the Qwen3XMLDetector generates valid EBNF."""
+        ebnf = self.qwen3_detector.build_ebnf(self.tools)
+        self.assertIsNotNone(ebnf)
+        # Check that the EBNF contains expected patterns for XML format
+        self.assertIn("<tool_call>", ebnf)
+        self.assertIn("</tool_call>", ebnf)
+        self.assertIn('"<function=get_weather>\\n"', ebnf)
+        self.assertIn('"\\n</function>"', ebnf)
+        self.assertIn('"<parameter=location>\\n"', ebnf)
+        self.assertIn('"\\n</parameter>"', ebnf)
+        # Check that it uses xml_text for string parameters
+        self.assertIn("xml_text", ebnf)
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
             ctx = self.grammar_compiler.compile_grammar(ebnf)
