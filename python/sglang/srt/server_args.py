@@ -1810,7 +1810,7 @@ class ServerArgs:
         # Check model architecture
         model_arch = self.get_hf_config().architectures[0]
         if "Llama4" in model_arch:
-            assert self.atten_backend == "fa3", "fa3 is required for Llama4 model"
+            assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
 
         # Check LoRA
         self.check_lora_server_args()
