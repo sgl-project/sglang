@@ -13,6 +13,8 @@ from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
+DEFAULT_GLOBAL_SEGMENT_SIZE = 0  # 3.125 GiB
+DEFAULT_LOCAL_BUFFER_SIZE = 8 * 1024 * 1024 * 1024  # 8.0 GiB
 
 logger = logging.getLogger(__name__)
 
@@ -40,33 +42,59 @@ class MooncakeStoreConfig:
     master_server_address: str
 
     @staticmethod
-    def from_file(file_path: str) -> "MooncakeStoreConfig":
+    def from_file() -> "MooncakeStoreConfig":
         """Load the config from a JSON file."""
+        file_path = os.getenv("MOONCAKE_CONFIG_PATH")
+        if file_path is None:
+            raise ValueError(
+                "The environment variable 'MOONCAKE_CONFIG_PATH' is not set."
+            )
         with open(file_path) as fin:
             config = json.load(fin)
         return MooncakeStoreConfig(
             local_hostname=config.get("local_hostname"),
             metadata_server=config.get("metadata_server"),
             global_segment_size=config.get(
-                "global_segment_size"
+                "global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE
             ),
             local_buffer_size=config.get(
-                "local_buffer_size"
+                "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
             ),
             protocol=config.get("protocol", "tcp"),
-            device_name=config.get("device_name", ""),
+            device_name=config.get("device_name", "auto"),
             master_server_address=config.get("master_server_address"),
         )
 
     @staticmethod
     def load_from_env() -> "MooncakeStoreConfig":
-        """Load config from a file specified in the environment variable."""
-        config_file_path = os.getenv("MOONCAKE_CONFIG_PATH")
-        if config_file_path is None:
-            raise ValueError(
-                "The environment variable 'MOONCAKE_CONFIG_PATH' is not set."
-            )
-        return MooncakeStoreConfig.from_file(config_file_path)
+        """Load config from a file specified in the environment variable.
+        export MOONCAKE_MASTER=10.13.3.232:50051
+        export MOONCAKE_PROTOCOL="rdma"
+        export MOONCAKE_DEVICE="auto"
+        export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"
+        """
+        # other required environment variables...
+        if not os.getenv("MOONCAKE_MASTER"):
+            raise ValueError("The environment variable 'MOONCAKE_MASTER' is not set.")
+        return MooncakeStoreConfig(
+            local_hostname=os.getenv("LOCAL_HOSTNAME", "localhost"),
+            metadata_server=os.getenv("MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"),
+            global_segment_size=os.getenv(
+                "MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE
+            ),
+            local_buffer_size=os.getenv(
+                "MOONCAKE_LOCAL_BUFFER_SIZE", DEFAULT_LOCAL_BUFFER_SIZE
+            ),
+            protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
+            device_name=os.getenv("MOONCAKE_DEVICE", "auto"),
+            master_server_address=os.getenv("MOONCAKE_MASTER"),
+        )
+    
+
+    def __post_init__(self):
+        if self.device_name == "auto":
+            os.environ['MC_MS_AUTO_DISC'] = "1"
+            os.environ['MC_MS_FILTERS'] = "mlx5_bond_0, mlx5_bond_1, mlx5_bond_2, mlx5_bond_3" 
 
 
 class MooncakeStore(HiCacheStorage):
@@ -83,7 +111,7 @@ class MooncakeStore(HiCacheStorage):
         try:
             self.store = MooncakeDistributedStore()
             self.config = MooncakeStoreConfig.load_from_env()
-            logger.info("Mooncake Configuration loaded successfully.")
+            logger.info("Mooncake Configuration loaded from env successfully.")
 
             setup_code = self.store.setup(
                 self.config.local_hostname,
