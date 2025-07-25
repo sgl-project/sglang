@@ -63,8 +63,8 @@ async def update_weights(
     dist.gather_object(
         obj=named_tensors_batch,
         object_gather_list=gathered_serialized_batches,
-        dst=device_mesh["infer_tp"].mesh.tolist()[0],
-        group=device_mesh["infer_tp"].get_group(),
+        dst=device_mesh[device_mesh_key].mesh.tolist()[0],
+        group=device_mesh[device_mesh_key].get_group(),
     )
 
     if infer_tp_rank == 0:
