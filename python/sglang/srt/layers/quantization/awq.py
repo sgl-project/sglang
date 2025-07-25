@@ -752,7 +752,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
         orig_dtype = x.dtype
         x = x.half()
 
-        topk_weights, topk_ids, router_logits = topk_output
+        topk_weights, topk_ids, router_logits, _, _ = topk_output
 
         return fused_marlin_moe(
             x,

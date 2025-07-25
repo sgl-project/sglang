@@ -485,7 +485,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
-            topk_weights, topk_ids, _ = topk_output
+            topk_weights, topk_ids, _, _, _ = topk_output
             x, topk_weights = apply_topk_weights_cpu(
                 apply_router_weight_on_input, topk_weights, x
             )
@@ -968,7 +968,7 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         **kwargs,
     ) -> torch.Tensor:
 
-        topk_weights, topk_ids, _ = topk_output
+        topk_weights, topk_ids, _, _, _ = topk_output
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
         return npu_fused_experts(

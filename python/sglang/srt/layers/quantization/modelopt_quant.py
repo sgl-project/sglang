@@ -961,7 +961,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ), "apply_router_weight_on_input is not supported for Flashinfer"
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
-            topk_weights, topk_ids, _ = topk_output
+            topk_weights, topk_ids, _, _, _ = topk_output
             output = flashinfer_cutlass_fused_moe(
                 x,
                 topk_ids.to(torch.int),
@@ -987,7 +987,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 
-        topk_weights, topk_ids, _ = topk_output
+        topk_weights, topk_ids, _, _, _ = topk_output
         return cutlass_moe_fp4(
             a=x,
             a1_gscale=layer.w13_input_scale_quant,
