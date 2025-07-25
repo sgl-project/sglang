@@ -52,6 +52,9 @@ cd ..
 pip install -e "python[all_hip]"
 ```
 
+Note: Please refer to [the CPU environment setup command list](../references/cpu.md#install-from-source)
+to set up the SGLang environment for running the models with CPU servers.
+
 ## Method 3: Using docker
 
 The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
@@ -86,6 +89,9 @@ drun -p 30000:30000 \
 # Till flashinfer backend available, --attention-backend triton --sampling-backend pytorch are set by default
 drun v0.4.9.post3-rocm630 python3 -m sglang.bench_one_batch --batch-size 32 --input 1024 --output 128 --model amd/Meta-Llama-3.1-8B-Instruct-FP8-KV --tp 8 --quantization fp8
 ```
+
+Note: Please refer to [the CPU installation guide using Docker](../references/cpu.md#install-using-docker)
+to set up the SGLang environment for running the models with CPU servers.
 
 ## Method 4: Using docker compose
 
