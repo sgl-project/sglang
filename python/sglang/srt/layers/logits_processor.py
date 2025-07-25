@@ -437,7 +437,7 @@ class LogitsProcessor(nn.Module):
         guarantee the given hidden_states follow this constraint.
         """
         if self.do_tensor_parallel_all_gather_dp_attn:
-            logits_metadata.compute_dp_attention_metadata()
+            logits_metadata.compute_dp_attention_metadata(hidden_states)
 
             if logits_metadata.global_num_tokens_for_logprob_cpu is None:
                 gathered_buffer = torch.empty_like(logits_metadata.gathered_buffer)
