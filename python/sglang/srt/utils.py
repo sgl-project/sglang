@@ -2065,6 +2065,16 @@ def is_valid_ipv6_address(address: str) -> bool:
         return False
 
 
+def maybe_wrap_ipv6_address(address: str) -> str:
+    if is_valid_ipv6_address(address):
+        return f"[{address}]"
+    return address
+
+
+def format_tcp_address(ip: str, port: int) -> str:
+    return f"tcp://{maybe_wrap_ipv6_address(ip)}:{port}"
+
+
 def configure_ipv6(dist_init_addr):
     addr = dist_init_addr
     end = addr.find("]")
