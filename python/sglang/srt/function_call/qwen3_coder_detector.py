@@ -127,6 +127,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 params[pname] = _safe_val(pval)
             raw = {"name": fname, "arguments": params}
             try:
+                # TODO: fix idx in function call, the index for a function
+                # call will always be -1 in parse_base_json
                 res.extend(self.parse_base_json(raw, tools))
             except Exception:
                 logger.warning("invalid tool call for %s dropped", fname)
