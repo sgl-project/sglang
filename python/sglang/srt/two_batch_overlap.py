@@ -463,6 +463,7 @@ class TboForwardBatchPreparer:
             "extend_seq_lens_cpu",
             "extend_logprob_start_lens_cpu",
             "lora_paths",
+            "extend_input_logprob_token_ids_gpu",
         ]:
             old_value = getattr(batch, key)
             if old_value is None:
@@ -474,6 +475,7 @@ class TboForwardBatchPreparer:
                 or key == "extend_prefix_lens_cpu"
                 or key == "extend_seq_lens_cpu"
                 or key == "extend_logprob_start_lens_cpu"
+                or key == "extend_input_logprob_token_ids_gpu"
             ):
                 output_dict[key] = None
                 continue
