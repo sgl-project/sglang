@@ -52,8 +52,6 @@ class Glm4MoeDetector(BaseFormatDetector):
         self.func_call_regex = r'<tool_call>.*?</tool_call>'
         self.func_detail_regex = r'<tool_call>([^\n]*)\n(.*)</tool_call>'
         self.func_arg_regex = r'<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>'
-        self._last_arguments = ""
-        self.current_tool_id = -1
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 format tool call."""
@@ -112,7 +110,8 @@ class Glm4MoeDetector(BaseFormatDetector):
             if self.current_tool_id > 0:
                 current_text = ""
             return StreamingParseResult(normal_text=current_text)
-        end = current_text.rfind(self.eot_token)
+        # find ensures we find the first self.eot_token so there will be at most one tool_call in current_text[:end+len(self.eot_token)
+        end = current_text.find(self.eot_token)
         if end != -1:
             # Initialize state if this is the first tool call
             if self.current_tool_id == -1:
@@ -131,8 +130,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                     "arguments": result.calls[0].parameters
                 }
                 self.streamed_args_for_tool[self.current_tool_id] = result.calls[0].parameters
+                result.calls[0].tool_index = self.current_tool_id
+                self.current_tool_id += 1
             self._buffer = current_text[end + len(self.eot_token):]
-            self.current_tool_id += 1
             return result
         normal_text = current_text[:start]
         self._buffer = current_text[start:]
