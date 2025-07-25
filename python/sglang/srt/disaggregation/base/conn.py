@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional
 import numpy as np
 import numpy.typing as npt
 
+from sglang.srt.metrics.collector import SchedulerMetricsCollector
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -49,6 +50,7 @@ class BaseKVManager(ABC):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        scheduler_metrics_collector: Optional[SchedulerMetricsCollector] = None,
     ): ...
 
 
