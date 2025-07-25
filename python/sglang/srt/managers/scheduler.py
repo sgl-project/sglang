@@ -2431,6 +2431,38 @@ class Scheduler(
                     req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
 
+        # Delete requests in the waiting queue when PD disaggregation is enabled
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Abort requests that have not yet been bootstrapped
+            for i, req in enumerate(self.disagg_prefill_bootstrap_queue.queue):
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    prepare_abort(
+                        req,
+                        f"Aborted when bootstrapping. {req.rid=}",
+                    )
+            # Abort in-flight requests
+            for i, req in enumerate(self.disagg_prefill_inflight_queue):
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    prepare_abort(
+                        req,
+                        f"Aborted in flight. {req.rid=}",
+                    )
+
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            for i, decode_req in enumerate(self.disagg_decode_prealloc_queue.queue):
+                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                    prepare_abort(
+                        decode_req.req,
+                        f"Aborted when bootstrapping. {decode_req.req.rid=}",
+                    )
+            for i, decode_req in enumerate(self.disagg_decode_transfer_queue.queue):
+                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                    prepare_abort(
+                        decode_req.req,
+                        f"Aborted in flight. {decode_req.req.rid=}",
+                    )
+                    self.tree_cache.cache_finished_req(decode_req.req)
+
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:
             reqs = self.running_batch.reqs
