@@ -184,6 +184,7 @@ class ModelRunner:
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
+        self.multimodal_embedding_disaggregated = server_args.disaggregation_mode == "embedding"
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
             model_config.is_multimodal_chunked_prefill_supported
@@ -1249,6 +1250,7 @@ class ModelRunner:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                    disable_allocate_kvcache=(self.server_args.disaggregation_mode == "embedding")
                 )
 
         if self.token_to_kv_pool_allocator is None:
@@ -1416,6 +1418,9 @@ class ModelRunner:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
 
+        if self.multimodal_embedding_disaggregated:
+            return
+
         if self.server_args.disable_cuda_graph:
             return
 
@@ -1495,6 +1500,8 @@ class ModelRunner:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
+        if self.multimodal_embedding_disaggregated:
+            kwargs["get_multimodal_embedding"] = True
         return self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,

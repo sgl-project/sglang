@@ -278,10 +278,14 @@ class TokenizerManager:
             self.server_args.disaggregation_transfer_backend
         )
         # Start kv boostrap server on prefill
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # only start bootstrap server on prefill tm
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            or self.disaggregation_mode == DisaggregationMode.EMBEDDING
+        ):
+            # only start bootstrap server on prefill/embedding tm
+            is_multimodal = self.disaggregation_mode == DisaggregationMode.EMBEDDING
             kv_bootstrap_server_class = get_kv_class(
-                self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER
+                self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER, is_multimodal
             )
             self.bootstrap_server = kv_bootstrap_server_class(
                 self.server_args.disaggregation_bootstrap_port
@@ -501,7 +505,6 @@ class TokenizerManager:
             encoded = self.tokenizer(
                 input_text, return_token_type_ids=is_cross_encoder_request
             )
-
             input_ids = encoded["input_ids"]
             if is_cross_encoder_request:
                 input_ids = encoded["input_ids"][0]
@@ -644,6 +647,9 @@ class TokenizerManager:
                 mm_inputs,
                 token_type_ids,
                 sampling_params,
+                bootstrap_host=obj.bootstrap_host,
+                bootstrap_port=obj.bootstrap_port,
+                bootstrap_room=obj.bootstrap_room,
             )
 
         return tokenized_obj

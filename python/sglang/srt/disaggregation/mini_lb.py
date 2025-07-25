@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import PDRegistryRequest
+import copy
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64
@@ -48,11 +49,33 @@ class PrefillConfig:
     bootstrap_port: Optional[int] = None
 
 
+@dataclasses.dataclass
+class VisionConfig:
+    url: str
+    bootstrap_port: Optional[int] = None
+
+
 class MiniLoadBalancer:
-    def __init__(self, prefill_configs: List[PrefillConfig], decode_servers: List[str]):
+    def __init__(
+        self,
+        vision_configs: List[VisionConfig],
+        prefill_configs: List[PrefillConfig],
+        decode_servers: List[str],
+    ):
+        self.vision_configs = vision_configs
+        self.vision_servers = [v.url for v in vision_configs]
         self.prefill_configs = prefill_configs
         self.prefill_servers = [p.url for p in prefill_configs]
         self.decode_servers = decode_servers
+        self.enable_multimodal_disagg = bool(vision_configs)
+
+        # round robin selection of vision server and prefill server
+        self.vision_server_index = 0
+        self.prefill_server_index = 0
+
+    def add_vision_server(self, new_vision_config: VisionConfig):
+        self.vision_configs.append(new_vision_config)
+        self.vision_servers.append(new_vision_config.url)
 
     def add_prefill_server(self, new_prefill_config: PrefillConfig):
         self.prefill_configs.append(new_prefill_config)
@@ -63,12 +86,31 @@ class MiniLoadBalancer:
 
     def select_pair(self):
         # TODO: return some message instead of panic
-        assert len(self.prefill_configs) > 0, "No prefill servers available"
-        assert len(self.decode_servers) > 0, "No decode servers available"
-
-        prefill_config = random.choice(self.prefill_configs)
-        decode_server = random.choice(self.decode_servers)
-        return prefill_config.url, prefill_config.bootstrap_port, decode_server
+        if self.enable_multimodal_disagg:
+            # support random selection of vision server and prefill server
+            if len(self.vision_configs) == 0 or len(self.prefill_servers) == 0:
+                raise HTTPException(
+                    status_code=500,
+                    detail="No vision servers or prefill servers available"
+                )
+            vision_config = self.vision_configs[self.vision_server_index]
+            prefill_server = self.prefill_servers[self.prefill_server_index]
+            self.vision_server_index = (self.vision_server_index + 1) % len(
+                self.vision_configs
+            )
+            self.prefill_server_index = (self.prefill_server_index + 1) % len(
+                self.prefill_servers
+            )
+            return vision_config.url, vision_config.bootstrap_port, prefill_server
+        else:
+            if len(self.prefill_configs) == 0 or len(self.decode_servers) == 0:
+                raise HTTPException(
+                    status_code=500,
+                    detail="No prefill servers or decode servers available"
+                )
+            prefill_config = random.choice(self.prefill_configs)
+            decode_server = random.choice(self.decode_servers)
+            return prefill_config.url, prefill_config.bootstrap_port, decode_server
 
     async def generate(
         self, modified_request, prefill_server, decode_server, endpoint
@@ -107,6 +149,91 @@ class MiniLoadBalancer:
                 content=ret_json,
                 status_code=decode_response.status,
             )
+
+    async def multimodal_generate(
+        self,
+        vision_modified_request,
+        prefill_modified_request,
+        vision_server,
+        prefill_server,
+        endpoint="v1/chat/completions",
+    ) -> ORJSONResponse:
+        assert (
+            endpoint[0] != "/"
+        ), f"Endpoint should not start with '/': {endpoint}"
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(
+                total=3600
+            )  # Add timeout for request reliability
+        ) as session:
+            tasks = [
+                session.post(
+                    f"{vision_server}/{endpoint}", json=vision_modified_request
+                ),
+                session.post(
+                    f"{prefill_server}/{endpoint}",
+                    json=prefill_modified_request,
+                ),
+            ]
+            vision_response, ret_response = await asyncio.gather(*tasks)
+            return ORJSONResponse(
+                content=await ret_response.json(),
+                status_code=ret_response.status,
+            )
+
+    async def multimodal_generate_stream(
+        self,
+        vision_modified_request,
+        prefill_modified_request,
+        vision_server,
+        prefill_server,
+        endpoint="v1/chat/completions",
+    ):
+        assert (
+            endpoint[0] != "/"
+        ), f"Endpoint should not start with '/': {endpoint}"
+
+        async def stream_results():
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(
+                    total=3600
+                )  # Add timeout for request reliability
+            ) as session:
+                tasks = [
+                    session.post(
+                        f"{vision_server}/{endpoint}",
+                        json=vision_modified_request,
+                    ),
+                    session.post(
+                        f"{prefill_server}/{endpoint}",
+                        json=prefill_modified_request,
+                    ),
+                ]
+                vision_response, ret_response = await asyncio.gather(*tasks)
+
+                if prefill_modified_request.get("return_logprob", False):
+                    async for chunk in ret_response.content:
+                        # Note: This is inefficient
+                        # merge prefill input_token_logprobs, output_token_logprobs to decode
+                        decoded_chunk = chunk.decode("utf-8")
+                        if (
+                            decoded_chunk
+                            and decoded_chunk.startswith("data:")
+                            and "[DONE]" not in decoded_chunk
+                        ):
+                            ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
+                            yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
+                        else:
+                            yield chunk
+                else:
+                    async for chunk in ret_response.content:
+                        yield chunk
+
+        return StreamingResponse(
+            stream_results(),
+            media_type="text/event-stream",
+        )
 
     async def generate_stream(
         self, modified_request, prefill_server, decode_server, endpoint="generate"
@@ -335,9 +462,74 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
         )
 
 
+async def _forward_to_backend_multimodal(request_data: dict, endpoint_name: str):
+    if endpoint_name != "v1/chat/completions":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Endpoint name should be 'v1/chat/completions', but got {endpoint_name}"
+        )
+
+    vision_server, bootstrap_port, prefill_server = load_balancer.select_pair()
+
+    # Parse and transform prefill_server for bootstrap data
+    parsed_url = urllib.parse.urlparse(vision_server)
+    hostname = parsed_url.hostname
+    vision_modified_request = copy.deepcopy(request_data)
+    language_modified_request = copy.deepcopy(request_data)
+
+
+    bootstrap_room = (
+        _generate_bootstrap_room()
+        if request_data.get("bootstrap_room", None) is None
+        else request_data["bootstrap_room"]
+    )
+    vision_modified_request.update(
+        {
+            "bootstrap_host": hostname,
+            "bootstrap_port": bootstrap_port,
+            "bootstrap_room": bootstrap_room,
+        }
+    )
+    language_modified_request.update(
+        {
+            "bootstrap_host": hostname,
+            "bootstrap_port": bootstrap_port,
+            "bootstrap_room": bootstrap_room,
+        }
+    )
+    # only keep text input for language request
+    for message in language_modified_request["messages"]:
+        if isinstance(message["content"], list):
+            text_content = []
+            for content in message["content"]:
+                if content["type"] == "text":
+                    text_content.append(content)
+            message["content"] = text_content
+
+    if request_data.get("stream", False):
+        return await load_balancer.multimodal_generate_stream(
+            vision_modified_request,
+            language_modified_request,
+            vision_server,
+            prefill_server,
+            endpoint=endpoint_name
+        )
+    else:
+        return await load_balancer.multimodal_generate(
+            vision_modified_request,
+            language_modified_request,
+            vision_server,
+            prefill_server,
+            endpoint=endpoint_name
+        )
+
+
 @app.post("/v1/chat/completions")
 async def handle_chat_completion_request(request_data: dict):
-    return await _forward_to_backend(request_data, "v1/chat/completions")
+    if load_balancer.enable_multimodal_disagg:
+        return await _forward_to_backend_multimodal(request_data, "v1/chat/completions")
+    else:
+        return await _forward_to_backend(request_data, "v1/chat/completions")
 
 
 @app.post("/v1/completions")
@@ -386,6 +578,13 @@ async def register(obj: PDRegistryRequest):
     elif obj.mode == "decode":
         load_balancer.add_decode_server(obj.registry_url)
         logger.info(f"Registered decode server: {obj.registry_url}")
+    elif obj.mode == "vision":
+        load_balancer.add_vision_server(
+            VisionConfig(obj.registry_url, obj.bootstrap_port)
+        )
+        logger.info(
+            f"Registered vision server: {obj.registry_url} with bootstrap port: {obj.bootstrap_port}"
+        )
     else:
         raise HTTPException(
             status_code=400,
@@ -400,9 +599,9 @@ async def register(obj: PDRegistryRequest):
     return Response(status_code=200)
 
 
-def run(prefill_configs, decode_addrs, host, port):
+def run(vision_configs, prefill_configs, decode_addrs, host, port):
     global load_balancer
-    load_balancer = MiniLoadBalancer(prefill_configs, decode_addrs)
+    load_balancer = MiniLoadBalancer(vision_configs, prefill_configs, decode_addrs)
     uvicorn.run(app, host=host, port=port)
 
 
