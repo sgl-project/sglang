@@ -18,7 +18,11 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+
+try:
+    from transformers import Ernie4_5_MoEConfig  # Added in 4.54.0.dev0
+except (ImportError, AttributeError):
+    from transformers import PretrainedConfig as Ernie4_5_MoEConfig
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -36,7 +40,7 @@ from sglang.srt.utils import add_prefix
 class Ernie4ModelMTP(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: Ernie4_5_MoEConfig,
         layer_id: int,
         prefix: str,
         quant_config: Optional[QuantizationConfig] = None,
@@ -99,7 +103,7 @@ class Ernie4ModelMTP(nn.Module):
 class Ernie4_5_MoeForCausalLMMTP(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: Ernie4_5_MoEConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         mtp_layer_id: int = 0,
@@ -179,7 +183,9 @@ class Ernie4_5_MoeForCausalLMMTP(nn.Module):
                 else:
                     raise KeyError(f"Parameter '{name}' not found in MTP model.")
         if not mtp_layer_found:
-            raise KeyError(f"MTP layers 'mtp_*.{self.mtp_layer_id}.*' not found in weights.")
+            raise KeyError(
+                f"MTP layers 'mtp_*.{self.mtp_layer_id}.*' not found in weights."
+            )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

@@ -19,7 +19,11 @@ from typing import Iterable, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import ErnieConfig
+
+try:
+    from transformers import Ernie4_5_MoEConfig  # Added in 4.54.0.dev0
+except (ImportError, AttributeError):
+    from transformers import PretrainedConfig as Ernie4_5_MoEConfig
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -53,12 +57,9 @@ class MoEGate(nn.Module):
         self.weight = nn.Parameter(
             torch.empty((config.moe_num_experts, config.hidden_size))
         )
-        if getattr(config, "moe_use_aux_free", False):
-            self.e_score_correction_bias = nn.Parameter(
-                torch.empty((1, config.moe_num_experts))
-            )
-        else:
-            self.e_score_correction_bias = None
+        self.e_score_correction_bias = nn.Parameter(
+            torch.empty((1, config.moe_num_experts))
+        )
 
     def forward(self, hidden_states):
         logits = F.linear(hidden_states, self.weight, None)
@@ -68,7 +69,7 @@ class MoEGate(nn.Module):
 class Ernie4Moe(nn.Module):
     def __init__(
         self,
-        config: ErnieConfig,
+        config: Ernie4_5_MoEConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -250,7 +251,7 @@ class Ernie4DecoderLayer(nn.Module):
 class Ernie4Model(nn.Module):
     def __init__(
         self,
-        config: ErnieConfig,
+        config: Ernie4_5_MoEConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -313,12 +314,12 @@ class Ernie4_5_ForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: ErnieConfig,
+        config: Ernie4_5_MoEConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__()
-        self.config: ErnieConfig = config
+        self.config: Ernie4_5_MoEConfig = config
         self.quant_config = quant_config
         self.model = Ernie4Model(config, quant_config, add_prefix("model", prefix))
         if config.tie_word_embeddings:
