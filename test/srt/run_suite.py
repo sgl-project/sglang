@@ -57,6 +57,7 @@ suites = {
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
+        TestFile("test_eagle_simple_infer.py", 700),
         TestFile("test_ebnf_constrained.py", 108),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 376),

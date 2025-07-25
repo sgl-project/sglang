@@ -318,7 +318,14 @@ class ModelRunner:
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
-            self.init_cuda_graphs()
+
+            # NOTE: hard code, we init target model cuda graphs in simple_eagle
+            if self.spec_algorithm.is_simple_eagle():
+                self.cuda_graph_runner = None
+                self.cuda_graph_mem_usage = 0
+                logger.info("We init target model cuda graphs in simple eagle....")
+            else:
+                self.init_cuda_graphs()
         else:
             self.cuda_graph_runner = None
             self.cuda_graph_mem_usage = 0
@@ -1317,10 +1324,29 @@ class ModelRunner:
                     FlashInferAttnBackend,
                 )
 
+                kv_indptr_buf = None
+                kv_last_page_len_buf = None
                 # Init streams
-                if self.server_args.speculative_algorithm == "EAGLE":
+                if self.server_args.speculative_algorithm in ["EAGLE", "SIMPLE_EAGLE"]:
                     self.plan_stream_for_flashinfer = torch.cuda.Stream()
-                return FlashInferAttnBackend(self)
+
+                    # NOTE: Add for setting max-running-requests. If max-running-requests <= cuda graph capture bs, it will raise error.
+                    if self.server_args.speculative_algorithm == "SIMPLE_EAGLE":
+                        kv_indptr_buf = torch.zeros(
+                            (self.req_to_token_pool.size * 2 + 1,),
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        kv_last_page_len_buf = torch.ones(
+                            (self.req_to_token_pool.size * 2,),
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                return FlashInferAttnBackend(
+                    self,
+                    kv_indptr_buf=kv_indptr_buf,
+                    kv_last_page_len_buf=kv_last_page_len_buf,
+                )
             else:
                 from sglang.srt.layers.attention.flashinfer_mla_backend import (
                     FlashInferMLAAttnBackend,
@@ -1569,6 +1595,7 @@ class ModelRunner:
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         can_run_cuda_graph = bool(
             forward_batch.forward_mode.is_cuda_graph()
+            and not self.spec_algorithm.is_simple_eagle()  # Simple eagle use own cuda graph in simple_eagle_cuda_graph_runner
             and self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(forward_batch)
         )
@@ -1578,7 +1605,10 @@ class ModelRunner:
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-        elif forward_batch.forward_mode.is_decode():
+        elif (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_simple_verify()
+        ):
             ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         elif forward_batch.forward_mode.is_extend():
             ret = self.forward_extend(
