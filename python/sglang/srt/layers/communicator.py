@@ -108,7 +108,11 @@ class LayerScatterModes:
         if context.is_layer_sparse:
             return (
                 ScatterMode.SCATTERED
-                if global_server_args_dict["enable_deepep_moe"]
+                if (
+                    # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
+                    global_server_args_dict["enable_deepep_moe"]
+                    or global_server_args_dict["enable_flashinfer_fp4_allgather"]
+                )
                 else ScatterMode.FULL
             )
         else:
