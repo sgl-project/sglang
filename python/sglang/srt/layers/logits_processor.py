@@ -195,7 +195,7 @@ class LogitsMetadata:
                 device=self.gathered_buffer.device,
             )
         else:
-             self.gathered_buffer = torch.empty_like(self.gathered_buffer)
+            self.gathered_buffer = torch.empty_like(self.gathered_buffer)
 
 
 class LogitsProcessor(nn.Module):
