@@ -14,7 +14,7 @@ class TestFile:
 suites = {
     "per-commit": [
         TestFile("models/lora/test_lora.py", 200),
-        TestFile("models/lora/test_lora_eviction.py", 120),
+        TestFile("models/lora/test_lora_eviction.py", 200),
         TestFile("models/lora/test_lora_backend.py", 99),
         TestFile("models/lora/test_multi_lora_backend.py", 60),
         TestFile("models/lora/test_lora_cuda_graph.py", 250),
@@ -105,7 +105,7 @@ suites = {
         TestFile("test_vision_chunked_prefill.py", 175),
         TestFile("test_vlm_input_format.py", 300),
         TestFile("test_vision_openai_server_a.py", 584),
-        TestFile("test_vision_openai_server_b.py", 556),
+        TestFile("test_vision_openai_server_b.py", 620),
         TestFile("test_w8a8_quantization.py", 46),
         TestFile("test_reasoning_parser.py", 5),
     ],
