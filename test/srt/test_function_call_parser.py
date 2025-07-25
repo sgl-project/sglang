@@ -10,7 +10,7 @@ from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
-from sglang.srt.function_call.qwen3_detector import Qwen3XMLDetector
+from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -508,7 +508,7 @@ class TestEBNFGeneration(unittest.TestCase):
         self.llama32_detector = Llama32Detector()
         self.mistral_detector = MistralDetector()
         self.qwen25_detector = Qwen25Detector()
-        self.qwen3_detector = Qwen3XMLDetector()
+        self.qwen3_coder_detector = Qwen3CoderDetector()
         self.kimik2_detector = KimiK2Detector()
 
     def test_pythonic_detector_ebnf(self):
@@ -622,9 +622,9 @@ class TestEBNFGeneration(unittest.TestCase):
         except RuntimeError as e:
             self.fail(f"Failed to compile EBNF: {e}")
 
-    def test_qwen3_detector_ebnf(self):
-        """Test that the Qwen3XMLDetector generates valid EBNF."""
-        ebnf = self.qwen3_detector.build_ebnf(self.tools)
+    def test_qwen3_coder_detector_ebnf(self):
+        """Test that the Qwen3CoderDetector generates valid EBNF."""
+        ebnf = self.qwen3_coder_detector.build_ebnf(self.tools)
         self.assertIsNotNone(ebnf)
         # Check that the EBNF contains expected patterns for XML format
         self.assertIn("<tool_call>", ebnf)
@@ -1486,7 +1486,7 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         self.assertEqual(params2["city"], "Beijing")
 
 
-class TestQwen3XMLDetector(unittest.TestCase):
+class TestQwen3CoderDetector(unittest.TestCase):
     def setUp(self):
         # Create sample tools for testing
         self.tools = [
@@ -1526,7 +1526,7 @@ class TestQwen3XMLDetector(unittest.TestCase):
                 ),
             ),
         ]
-        self.detector = Qwen3XMLDetector()
+        self.detector = Qwen3CoderDetector()
 
     def test_has_tool_call(self):
         """Test detection of tool call markers."""

@@ -29,7 +29,7 @@ def _safe_val(raw: str) -> Any:
             return raw
 
 
-class Qwen3XMLDetector(BaseFormatDetector):
+class Qwen3CoderDetector(BaseFormatDetector):
     """
     Detector for Qwen 3 models.
     Assumes function call format:
