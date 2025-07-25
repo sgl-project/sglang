@@ -1,7 +1,6 @@
 import logging
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
-from python.sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.entrypoints.openai.protocol import (
     StructuralTagResponseFormat,
     StructuresResponseFormat,
@@ -15,6 +14,7 @@ from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
+from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 
 logger = logging.getLogger(__name__)
