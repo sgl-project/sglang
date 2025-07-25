@@ -661,21 +661,20 @@ def _model_forward_tbo(
     )
     del inputs
 
-    if _is_hip:
+    context = (
+        empty_context()
+        if _is_hip
+        else deep_gemm_wrapper.configure_deep_gemm_num_sms(
+            operations_strategy.deep_gemm_num_sms
+        )
+    )
+
+    with context:
         outputs_arr = execute_overlapped_operations(
             inputs_arr=inputs_arr,
             operations_arr=[operations_strategy.operations] * 2,
             delta_stages=[0, operations_strategy.tbo_delta_stages],
         )
-    else:
-        with deep_gemm_wrapper.configure_deep_gemm_num_sms(
-            operations_strategy.deep_gemm_num_sms
-        ):
-            outputs_arr = execute_overlapped_operations(
-                inputs_arr=inputs_arr,
-                operations_arr=[operations_strategy.operations] * 2,
-                delta_stages=[0, operations_strategy.tbo_delta_stages],
-            )
 
     return _model_forward_tbo_merge_outputs(*outputs_arr)
 
