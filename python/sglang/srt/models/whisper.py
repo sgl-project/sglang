@@ -12,7 +12,10 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -343,8 +346,8 @@ class WhisperForConditionalGeneration(torch.nn.Module):
         super().__init__()
         self.encoder = WhisperEncoder(config, quant_config)
         self.decoder = WhisperDecoder(config, quant_config)
-        self.proj_out = RowParallelLinear(
-            config.d_model, config.vocab_size, quant_config=quant_config
+        self.proj_out = ParallelLMHead(
+            config.vocab_size, config.d_model, quant_config=quant_config
         )
         self.logits_processor = LogitsProcessor(config)
         self.config = config
