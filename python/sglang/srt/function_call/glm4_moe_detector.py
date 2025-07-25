@@ -127,7 +127,7 @@ class Glm4MoeDetector(BaseFormatDetector):
             if result.calls:
                 self.prev_tool_call_arr[self.current_tool_id] = {
                     "name": result.calls[0].name,
-                    "arguments": result.calls[0].parameters
+                    "arguments": json.loads(result.calls[0].parameters)
                 }
                 self.streamed_args_for_tool[self.current_tool_id] = result.calls[0].parameters
                 result.calls[0].tool_index = self.current_tool_id
