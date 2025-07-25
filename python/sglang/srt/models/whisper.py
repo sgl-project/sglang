@@ -34,6 +34,7 @@ class WhisperAttention(torch.nn.Module):
         super().__init__()
         head_dim = embed_dim // num_heads
         self.is_cross_attention = is_cross_attention
+        self.is_encoder = is_encoder
 
         if (head_dim * num_heads) != embed_dim:
             raise ValueError(
@@ -91,7 +92,9 @@ class WhisperAttention(torch.nn.Module):
         # and enforce no scaling (1.0) in the attention call below.
         q = q * self.scaling
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = self.attn(
+            q, k, v, forward_batch, save_kv_cache=not self.is_encoder
+        )
 
         attn_output, _ = self.out_proj(attn_output)
 
@@ -142,7 +145,7 @@ class WhisperEncoderLayer(torch.nn.Module):
         hidden_states, _ = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
 
-        hidden_states = self.fc2(hidden_states)
+        hidden_states, _ = self.fc2(hidden_states)
 
         hidden_states = residual + hidden_states
 
@@ -412,7 +415,9 @@ class WhisperForConditionalGeneration(torch.nn.Module):
         dtype = self.encoder.conv1.weight.dtype
 
         encoder_outputs = self.encoder(features.to(dtype), forward_batch)
-        decoder_outputs = self.decoder(input_ids, encoder_outputs, forward_batch)
+        decoder_outputs = self.decoder(
+            input_ids, encoder_outputs, forward_batch, positions
+        )
 
         logits = self.logits_processor(
             input_ids=input_ids,
