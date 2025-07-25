@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.metrics.collector import SchedulerMetricsCollector
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     format_tcp_address,
@@ -974,7 +975,10 @@ class MooncakeKVSender(BaseKVSender):
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
-                if status == KVPoll.Failed and self.kv_mgr.scheduler_metrics_collector is not None:
+                if (
+                    status == KVPoll.Failed
+                    and self.kv_mgr.scheduler_metrics_collector is not None
+                ):
                     self.kv_mgr.scheduler_metrics_collector.increment_transfer_failed_reqs()
                 self.conclude_state = status
             elif status == KVPoll.Bootstrapping:
