@@ -1,10 +1,10 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/layers/vocab_parallel_embedding.py
 
+import logging
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.distributed import (
@@ -21,6 +21,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, set_weight_attrs
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
@@ -28,43 +29,7 @@ DEFAULT_VOCAB_PADDING_SIZE = 64
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
-
-class UnquantizedEmbeddingMethod(QuantizeMethodBase):
-    """Unquantized method for embeddings."""
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        """Create weights for embedding layer."""
-        weight = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
-        layer.register_parameter("weight", weight)
-        set_weight_attrs(weight, extra_weight_attrs)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return F.linear(x, layer.weight, bias)
-
-    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
-        return F.embedding(input_, layer.weight)
+logger = logging.getLogger(__name__)
 
 
 def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
@@ -562,9 +527,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         )
         self.quant_config = quant_config
 
-        # We only support pack LMHead if it's not quantized. For LMHead with quant_config, the weight_name will be "qweight"
-        if self.quant_config is None and _is_cpu and _is_cpu_amx_available:
-            self.quant_method = PackWeightMethod(weight_names=["weight"])
+        # We only support pack LMHead if it's not quantized.
+        if _is_cpu and _is_cpu_amx_available:
+            if hasattr(self, "weight") and self.weight.dtype == torch.bfloat16:
+                self.quant_method = PackWeightMethod(weight_names=["weight"])
 
         if bias:
             self.bias = Parameter(

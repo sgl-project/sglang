@@ -110,6 +110,7 @@ def process_content_for_template_format(
     msg_dict: dict,
     content_format: str,
     image_data: list,
+    video_data: list,
     audio_data: list,
     modalities: list,
 ) -> dict:
@@ -120,6 +121,7 @@ def process_content_for_template_format(
         msg_dict: Message dictionary with content
         content_format: 'string' or 'openai' (detected via AST analysis)
         image_data: List to append extracted image URLs
+        video_data: List to append extracted video URLs
         audio_data: List to append extracted audio URLs
         modalities: List to append modalities
 
@@ -143,6 +145,12 @@ def process_content_for_template_format(
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'image' type for template compatibility
                     processed_content_parts.append({"type": "image"})
+                elif chunk_type == "video_url":
+                    video_data.append(chunk["video_url"]["url"])
+                    if chunk.get("modalities"):
+                        modalities.append(chunk.get("modalities"))
+                    # Normalize to simple 'video' type for template compatibility
+                    processed_content_parts.append({"type": "video"})
                 elif chunk_type == "audio_url":
                     audio_data.append(chunk["audio_url"]["url"])
                     # Normalize to simple 'audio' type

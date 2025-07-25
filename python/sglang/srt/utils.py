@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import base64
 import builtins
 import ctypes
 import dataclasses
@@ -68,6 +67,7 @@ from typing import (
 
 import numpy as np
 import psutil
+import pybase64
 import requests
 import torch
 import torch.distributed
@@ -197,7 +197,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return backend not in ["torch_native", "intel_amx", "ascend"]
 
 
 try:
@@ -616,7 +616,7 @@ def decode_video_base64(video_base64):
     from PIL import Image
 
     # Decode the base64 string
-    video_bytes = base64.b64decode(video_base64)
+    video_bytes = pybase64.b64decode(video_base64, validate=True)
 
     # Placeholder for the start indices of each PNG image
     img_starts = []
@@ -691,18 +691,25 @@ def decode_video_base64(video_base64):
         )  # Return an empty array and size tuple if no frames were found
 
 
-def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarray:
+def load_audio(
+    audio_file: str, sr: Optional[int] = None, mono: bool = True
+) -> np.ndarray:
     # Use soundfile here, since librosa use it under the hood,
     # and librosa will not support audio loading in the future
     import soundfile as sf
     from scipy.signal import resample
+
+    if sr is None:
+        sr = 16000
 
     # Load audio data
     if isinstance(audio_file, bytes):
         audio, original_sr = sf.read(BytesIO(audio_file))
     elif audio_file.startswith("data:"):
         audio_file = audio_file.split(",")[1]
-        audio, original_sr = sf.read(BytesIO(base64.b64decode(audio_file)))
+        audio, original_sr = sf.read(
+            BytesIO(pybase64.b64decode(audio_file, validate=True))
+        )
     elif audio_file.startswith("http://") or audio_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
         response = requests.get(audio_file, stream=True, timeout=timeout)
@@ -726,33 +733,6 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
     return audio
 
 
-def encode_video(video_path, frame_count_limit=None):
-    # Lazy import because decord is not available on some arm platforms.
-    from decord import VideoReader, cpu
-
-    if not os.path.exists(video_path):
-        logger.error(f"Video {video_path} does not exist")
-        return []
-
-    if frame_count_limit == 0:
-        return []
-
-    def uniform_sample(l, n):
-        gap = len(l) / n
-        idxs = [int(i * gap + gap / 2) for i in range(n)]
-        return [l[i] for i in idxs]
-
-    vr = VideoReader(video_path, ctx=cpu(0))
-    sample_fps = round(vr.get_avg_fps() / 1)  # FPS
-    frame_indices = [i for i in range(0, len(vr), sample_fps)]
-    if frame_count_limit is not None and len(frame_indices) > frame_count_limit:
-        frame_indices = uniform_sample(frame_indices, frame_count_limit)
-
-    frames = vr.get_batch(frame_indices).asnumpy()
-    frames = [Image.fromarray(v.astype("uint8")) for v in frames]
-    return frames
-
-
 def load_image(
     image_file: Union[Image.Image, str, bytes],
 ) -> tuple[Image.Image, tuple[int, int]]:
@@ -764,23 +744,79 @@ def load_image(
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, stream=True, timeout=timeout).raw
-        image = Image.open(response)
-        response.close()
+        response = requests.get(image_file, stream=True, timeout=timeout)
+        try:
+            response.raise_for_status()
+            image = Image.open(response.raw)
+            image.load()  # Force loading to avoid issues after closing the stream
+        finally:
+            response.close()
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
         image_file = image_file.split(",")[1]
-        image = Image.open(BytesIO(base64.b64decode(image_file)))
-    elif image_file.startswith("video:"):
-        image_file = image_file.replace("video:", "")
-        image, image_size = decode_video_base64(image_file)
+        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     elif isinstance(image_file, str):
-        image = Image.open(BytesIO(base64.b64decode(image_file)))
+        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     else:
         raise ValueError(f"Invalid image: {image}")
 
     return image, image_size
+
+
+def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
+    # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
+    from decord import VideoReader, cpu, gpu
+
+    try:
+        from decord.bridge import decord_bridge
+
+        ctx = gpu(0)
+        _ = decord_bridge.get_ctx_device(ctx)
+    except Exception:
+        ctx = cpu(0)
+
+    tmp_file = None
+    vr = None
+    try:
+        if isinstance(video_file, bytes):
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            tmp_file.write(video_file)
+            tmp_file.close()
+            vr = VideoReader(tmp_file.name, ctx=ctx)
+        elif isinstance(video_file, str):
+            if video_file.startswith(("http://", "https://")):
+                timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+                response = requests.get(video_file, stream=True, timeout=timeout)
+                response.raise_for_status()
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                for chunk in response.iter_content(chunk_size=8192):
+                    tmp_file.write(chunk)
+                tmp_file.close()
+                vr = VideoReader(tmp_file.name, ctx=ctx)
+            elif video_file.startswith("data:"):
+                _, encoded = video_file.split(",", 1)
+                video_bytes = base64.b64decode(encoded)
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                tmp_file.write(video_bytes)
+                tmp_file.close()
+                vr = VideoReader(tmp_file.name, ctx=ctx)
+            elif os.path.isfile(video_file):
+                vr = VideoReader(video_file, ctx=ctx)
+            else:
+                video_bytes = base64.b64decode(video_file)
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                tmp_file.write(video_bytes)
+                tmp_file.close()
+                vr = VideoReader(tmp_file.name, ctx=ctx)
+        else:
+            raise ValueError(f"Unsupported video input type: {type(video_file)}")
+
+        return vr
+
+    finally:
+        if tmp_file and os.path.exists(tmp_file.name):
+            os.unlink(tmp_file.name)
 
 
 def suppress_other_loggers():
@@ -1390,6 +1426,13 @@ def get_nvgpu_memory_capacity():
         ]
 
         if not memory_values:
+            # Fallback to torch.cuda.mem_get_info() when failed to get memory capacity from nvidia-smi,
+            # typically in NVIDIA MIG mode.
+            if torch.cuda.is_available():
+                logger.warning(
+                    "Failed to get GPU memory capacity from nvidia-smi, falling back to torch.cuda.mem_get_info()."
+                )
+                return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MB
             raise ValueError("No GPU memory values found.")
 
         # Return the minimum memory value
@@ -1866,7 +1909,7 @@ class MultiprocessingSerializer:
 
         if output_str:
             # Convert bytes to base64-encoded string
-            output = base64.b64encode(output).decode("utf-8")
+            output = pybase64.b64encode(output).decode("utf-8")
 
         return output
 
@@ -1883,7 +1926,7 @@ class MultiprocessingSerializer:
         """
         if isinstance(data, str):
             # Decode base64 string to bytes
-            data = base64.b64decode(data)
+            data = pybase64.b64decode(data, validate=True)
 
         return ForkingPickler.loads(data)
 
@@ -2755,3 +2798,115 @@ def lru_cache_frozenset(maxsize=128):
         return wrapper
 
     return decorator
+
+
+def apply_module_patch(target_module, target_function, wrappers):
+    original_module, original_function = parse_module_path(
+        target_module, target_function, False
+    )
+
+    original_function_id = id(original_function)
+
+    candidate = original_function
+    for wrapper in wrappers:
+        candidate = wrapper(candidate)
+    if target_function is not None:
+        setattr(original_module, target_function, candidate)
+
+    for key, value in sys.modules.copy().items():
+        if (
+            target_function is not None
+            and hasattr(value, target_function)
+            and id(getattr(value, target_function)) == original_function_id
+        ):
+            setattr(value, target_function, candidate)
+
+
+def parse_module_path(module_path, function_name, create_dummy):
+    from importlib.machinery import ModuleSpec
+
+    def create_dummy_module(full_path, parent=None):
+        """Create and register a placeholder module"""
+        dummy = types.ModuleType(full_path)
+        dummy.__file__ = "vllm_ascend.dummy_module.py"
+        dummy.__spec__ = ModuleSpec(full_path, None)
+        sys.modules[full_path] = dummy
+        if parent:
+            setattr(parent, full_path.split(".")[-1], dummy)
+        return dummy
+
+    def create_placeholder_function(func_name):
+        """Create dummy function that raises when called"""
+
+        def placeholder(*args, **kwargs):
+            raise NotImplementedError(f"Function {func_name} is a placeholder")
+
+        placeholder.__name__ = func_name
+        return placeholder
+
+    modules = module_path.split(".")
+    current_module = None
+    processed_path = []
+
+    for idx, part in enumerate(modules):
+        current_path = ".".join(modules[: idx + 1])
+        parent_path = ".".join(modules[:idx]) if idx > 0 else None
+
+        try:
+            current_module = importlib.import_module(current_path)
+        except ModuleNotFoundError:
+            # Handle missing module
+            parent = importlib.import_module(parent_path) if parent_path else None
+            if parent and hasattr(parent, part):
+                # Use existing attribute from parent
+                current_module = getattr(parent, part)
+                # Check for early function resolution
+                if function_name and hasattr(current_module, function_name):
+                    return current_module, getattr(current_module, function_name)
+                if function_name and create_dummy:
+                    ph_func = create_placeholder_function(function_name)
+                    setattr(current_module, function_name, ph_func)
+                    return current_module, ph_func
+                if function_name:
+                    raise AttributeError(
+                        f"Function {function_name} missing in {current_path}"
+                    )
+            else:
+                if not create_dummy:
+                    raise
+                # Create and register dummy module
+                current_module = create_dummy_module(
+                    current_path,
+                    parent=(
+                        importlib.import_module(parent_path) if parent_path else None
+                    ),
+                )
+
+        processed_path.append(part)
+
+    # Final function handling
+    final_module = sys.modules[module_path]
+    if function_name is not None:
+        if not hasattr(final_module, function_name):
+            if create_dummy:
+                ph_func = create_placeholder_function(function_name)
+                setattr(final_module, function_name, ph_func)
+            else:
+                setattr(final_module, function_name, None)
+        return final_module, getattr(final_module, function_name)
+
+    return final_module, None
+
+
+# LoRA-related constants and utilities
+SUPPORTED_LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+LORA_TARGET_ALL_MODULES = "all"
