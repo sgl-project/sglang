@@ -3,6 +3,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import signal
 import threading
 from collections import OrderedDict
 from functools import wraps
@@ -94,6 +95,10 @@ class HiCacheHF3FS(HiCacheStorage):
         self.key_to_index = OrderedDict()
 
         atexit.register(self.close)
+
+        signal.signal(signal.SIGINT, lambda sig, frame: self.close())
+        signal.signal(signal.SIGTERM, lambda sig, frame: self.close())
+        signal.signal(signal.SIGQUIT, lambda sig, frame: self.close())
 
     @staticmethod
     def from_env_config(
