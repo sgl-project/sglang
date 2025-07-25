@@ -236,6 +236,8 @@ class ServerArgs:
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
+    mm_attention_backend: Optional[str] = None
+    pick_free_dp_port: bool = False
     enable_return_hidden_states: bool = False
     enable_triton_kernel_moe: bool = False
 
@@ -1765,6 +1767,12 @@ class ServerArgs:
             help="Disable mmap while loading weight using safetensors.",
         )
 
+        parser.add_argument(
+            "--pick-free-dp-port",
+            action="store_true",
+            help="Whether to picks dp ports from free ports, or use fixed dp port as default. Useful when get frequent port conflict under huge DP cases",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
@@ -1948,6 +1956,9 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 ZMQ_TCP_PORT_DELTA = 233
 
 
+dp_controller_zmq_ports: dict[int, int] = {}
+
+
 @dataclasses.dataclass
 class PortArgs:
     # The ipc filename for tokenizer to receive inputs from detokenizer (zmq)
@@ -1965,6 +1976,11 @@ class PortArgs:
 
     # The ipc filename for Scheduler to send metrics
     metrics_ipc_name: str
+
+    @staticmethod
+    def register_dp_controller_to_attn_tp_rk0_port(ports: dict[int, int]):
+        global dp_controller_zmq_ports
+        dp_controller_zmq_ports = ports
 
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
@@ -2010,8 +2026,10 @@ class PortArgs:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
             else:
-                scheduler_input_port = port_base + 4 + 1 + dp_rank
-
+                if server_args.pick_free_dp_port:
+                    scheduler_input_port = dp_controller_zmq_ports[dp_rank]
+                else:
+                    scheduler_input_port = port_base + 4 + 1 + dp_rank
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
