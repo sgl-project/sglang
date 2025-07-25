@@ -916,7 +916,12 @@ class DeepseekV2AttentionMLA(nn.Module):
         # which requires self.w_kc and self.w_vc to be packed.
         # If not, we will use torch.bmm and weight shouldn't be packed in this case
         has_fused_proj = hasattr(self, "fused_qkv_a_proj_with_mqa")
-        if has_fused_proj and _is_cpu and _is_cpu_amx_available:
+        if (
+            has_fused_proj
+            and _is_cpu
+            and _is_cpu_amx_available
+            and self.attention_backend != "torch_native"
+        ):
             self.quant_method = PackWeightMethod(
                 weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
             )
@@ -986,7 +991,15 @@ class DeepseekV2AttentionMLA(nn.Module):
                 else:
                     return AttnForwardMethod.MLA
 
-        if self.attention_backend == "ascend":
+        if self.attention_backend == "torch_native":
+            if (
+                forward_batch.forward_mode.is_extend()
+                and sum(forward_batch.extend_prefix_lens_cpu) == 0
+            ):
+                return AttnForwardMethod.MHA
+            else:
+                return AttnForwardMethod.MLA
+        elif self.attention_backend == "ascend":
             return AttnForwardMethod.MLA
         elif self.attention_backend == "flashinfer":
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
