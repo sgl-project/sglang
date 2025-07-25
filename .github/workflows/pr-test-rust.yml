@@ -46,13 +46,27 @@ jobs:
           cd sgl-router/
           cargo check --benches
 
+      - name: Check load test binary compilation
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-router/
+          cargo check --bin load_test
+
       - name: Quick benchmark sanity check
         timeout-minutes: 10
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
-          # Run quick benchmarks to ensure they work using Python script
-          python3 scripts/run_benchmarks.py --quick
+          # Run quick benchmarks to ensure they work
+          cargo bench --benches -- --test
+
+      - name: Test load test tool
+        timeout-minutes: 5
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-router/
+          # Quick test of load test tool
+          cargo run --release --bin load_test -- 100 2 10 --no-stream
 
   e2e-python:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'

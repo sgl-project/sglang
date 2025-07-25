@@ -51,6 +51,20 @@ name = "request_processing"
 harness = false
 path = "benches/request_processing.rs"
 
+[[bench]]
+name = "streaming_load_test"
+harness = false
+path = "benches/streaming_load_test.rs"
+
+[[bench]]
+name = "policy_comparison"
+harness = false
+path = "benches/policy_comparison.rs"
+
+[[bin]]
+name = "load_test"
+path = "benches/load_test.rs"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

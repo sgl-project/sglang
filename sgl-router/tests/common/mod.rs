@@ -6,6 +6,7 @@ use sglang_router_rs::config::{PolicyConfig, RouterConfig, RoutingMode};
 use sglang_router_rs::server::AppState;
 
 /// Helper function to create test router configuration
+#[allow(dead_code)]
 pub fn create_test_config(worker_urls: Vec<String>) -> RouterConfig {
     RouterConfig {
         mode: RoutingMode::Regular { worker_urls },
@@ -24,6 +25,7 @@ pub fn create_test_config(worker_urls: Vec<String>) -> RouterConfig {
 }
 
 /// Helper function to create test router configuration with no health check
+#[allow(dead_code)]
 pub fn create_test_config_no_workers() -> RouterConfig {
     RouterConfig {
         mode: RoutingMode::Regular {
@@ -44,6 +46,7 @@ pub fn create_test_config_no_workers() -> RouterConfig {
 }
 
 /// Helper function to create test app state
+#[allow(dead_code)]
 pub async fn create_test_app_state(config: RouterConfig) -> Result<web::Data<AppState>, String> {
     // Create a non-blocking client
     let client = Client::builder()
