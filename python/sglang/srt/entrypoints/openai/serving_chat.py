@@ -55,6 +55,20 @@ class OpenAIServingChat(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
 
+    def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
+        """Validate that the input is valid."""
+        if not request.messages:
+            return "Messages cannot be empty."
+
+        if (
+            isinstance(request.tool_choice, str)
+            and request.tool_choice.lower() == "required"
+            and not request.tools
+        ):
+            return "Tools cannot be empty if tool choice is set to required."
+
+        return None
+
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
