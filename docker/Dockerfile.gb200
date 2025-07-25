@@ -146,7 +146,7 @@ RUN apt update -y \
     && apt install nsight-systems-cli -y
 
 # --- Install Mooncake ---
-RUN pip install mooncake_transfer_engine==0.3.5
+RUN pip install mooncake-transfer-engine==0.3.5
 
 # Set up locale
 RUN locale-gen en_US.UTF-8
