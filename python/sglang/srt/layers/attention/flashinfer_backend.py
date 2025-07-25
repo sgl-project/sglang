@@ -493,7 +493,7 @@ class FlashInferAttnBackend(AttentionBackend):
         apply_scale = lambda scale: (
             scale is not None and (scale != 1.0).any()
             if isinstance(scale, torch.Tensor)
-            else scale != 1.0
+            else scale is not None and scale != 1.0
         )
 
         def persistent_attn_forward(
