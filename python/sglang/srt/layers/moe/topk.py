@@ -450,8 +450,6 @@ def biased_grouped_topk_impl(
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
 
-
-
 def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
 
