@@ -62,9 +62,9 @@ class HiCacheStorage(ABC):
 
     @abstractmethod
     def set(self, 
-             key, 
-             value: Optional[Any] = None, 
-             target_location: Optional[Any] = None,
+            key, 
+            value: Optional[Any] = None, 
+            target_location: Optional[Any] = None,
             target_sizes: Optional[Any] = None) -> bool:
         """
         Store the value associated with the given key.
