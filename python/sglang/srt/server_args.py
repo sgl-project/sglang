@@ -2118,10 +2118,10 @@ class ServerArgs:
             json_or_path = args.hip_attention_config
 
             args.hip_attention_config = HiPAttentionConfig(
-                json_or_path=json_or_path, 
+                json_or_path=json_or_path,
                 json_override=args.hip_attention_config_override_json,
             )
-            if args.attention_backend != 'hip_attention':
+            if args.attention_backend != "hip_attention":
                 logger.info(
                     f"attention_backend changed {args.attention_backend} -> hip_attention"
                 )
