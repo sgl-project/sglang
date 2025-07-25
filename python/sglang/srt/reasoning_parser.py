@@ -123,7 +123,7 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True):
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
         # DeepSeek-R1 is assumed to be reasoning until `</think>` token
         super().__init__(
             "<think>",
@@ -147,12 +147,12 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True):
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
         # Qwen3 won't be in reasoning mode when user passes `enable_thinking=False`
         super().__init__(
             "<think>",
             "</think>",
-            force_reasoning=False,
+            force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
         )
 
@@ -166,7 +166,7 @@ class KimiDetector(BaseReasoningFormatDetector):
     and the rest of the text as `normal_text`.
     """
 
-    def __init__(self, stream_reasoning: bool = True):
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
         super().__init__(
             "◁think▷",
             "◁/think▷",
@@ -192,7 +192,12 @@ class ReasoningParser:
         "kimi": KimiDetector,
     }
 
-    def __init__(self, model_type: Optional[str] = None, stream_reasoning: bool = True):
+    def __init__(
+        self,
+        model_type: Optional[str] = None,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+    ):
         if not model_type:
             raise ValueError("Model type must be specified")
 
@@ -200,7 +205,9 @@ class ReasoningParser:
         if not detector_class:
             raise ValueError(f"Unsupported model type: {model_type}")
 
-        self.detector = detector_class(stream_reasoning=stream_reasoning)
+        self.detector = detector_class(
+            stream_reasoning=stream_reasoning, force_reasoning=force_reasoning
+        )
 
     def parse_non_stream(self, full_text: str) -> Tuple[str, str]:
         """Non-streaming call: one-time parsing"""

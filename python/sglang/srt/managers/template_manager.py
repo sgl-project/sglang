@@ -54,6 +54,7 @@ class TemplateManager:
         self._chat_template_name: Optional[str] = None
         self._completion_template_name: Optional[str] = None
         self._jinja_template_content_format: Optional[str] = None
+        self._force_reasoning: bool = False
 
     @property
     def chat_template_name(self) -> Optional[str]:
@@ -69,6 +70,39 @@ class TemplateManager:
     def jinja_template_content_format(self) -> Optional[str]:
         """Get the detected template content format ('string' or 'openai' or None)."""
         return self._jinja_template_content_format
+
+    @property
+    def force_reasoning(self) -> bool:
+        """
+        Check if the current chat template enforces reasoning/thinking.
+
+        Returns:
+            True if the template contains reasoning patterns like <think> tags
+        """
+        return self._force_reasoning
+
+    def _detect_reasoning_pattern(self, template: str) -> bool:
+        """
+        Detect if the chat template contains reasoning/thinking patterns.
+
+        This looks for patterns like:
+        - <|im_start|>assistant\\n<think>\\n in generation prompts
+        - <think> and </think> tags in assistant messages
+        """
+
+        # Look for reasoning patterns in the template
+        reasoning_patterns = [
+            "<|im_start|>assistant\n<think>\n",
+            "<think>",
+            "</think>",
+            "reasoning_content",
+        ]
+
+        has_reasoning = any(pattern in template for pattern in reasoning_patterns)
+        if has_reasoning:
+            logger.info("Detected the force reasoning pattern in chat template.")
+
+        return has_reasoning
 
     def load_chat_template(
         self, tokenizer_manager, chat_template_arg: str, model_path: str
@@ -154,6 +188,10 @@ class TemplateManager:
         # Load completion template
         if completion_template:
             self.load_completion_template(completion_template)
+
+        self._force_reasoning = self._detect_reasoning_pattern(
+            tokenizer_manager.tokenizer.chat_template
+        )
 
     def _load_jinja_template(self, tokenizer_manager, template_path: str) -> None:
         """Load a Jinja template file."""
