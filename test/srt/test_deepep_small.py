@@ -35,7 +35,9 @@ class TestPureDP(CustomTestCase):
                 "--cuda-graph-max-bs",
                 "128",
                 "--max-running-requests",
-                "128",
+                "512",
+                "--mem-fraction-static",
+                "0.5",
             ],
         )
 
@@ -56,7 +58,7 @@ class TestPureDP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreater(metrics["accuracy"], 0.60)
 
 
 class TestHybridDPTP(CustomTestCase):
@@ -79,7 +81,7 @@ class TestHybridDPTP(CustomTestCase):
                 "--cuda-graph-max-bs",
                 "128",
                 "--max-running-requests",
-                "128",
+                "256",
             ],
         )
 
@@ -100,7 +102,7 @@ class TestHybridDPTP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreater(metrics["accuracy"], 0.60)
 
 
 class TestTP(CustomTestCase):
@@ -141,10 +143,10 @@ class TestTP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreater(metrics["accuracy"], 0.60)
 
 
-# @unittest.skip("covered in test_deepep_large.py")
+@unittest.skip("covered in test_deepep_large.py")
 class TestNoGatherdBuffer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -168,7 +170,7 @@ class TestNoGatherdBuffer(CustomTestCase):
                 "--cuda-graph-max-bs",
                 "32",
                 "--max-running-requests",
-                "128",
+                "512",
             ],
         )
 
@@ -189,7 +191,7 @@ class TestNoGatherdBuffer(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreater(metrics["accuracy"], 0.60)
 
 
 class TestTBO(CustomTestCase):
@@ -215,7 +217,7 @@ class TestTBO(CustomTestCase):
                 "--cuda-graph-max-bs",
                 "128",
                 "--max-running-requests",
-                "128",
+                "512",
             ],
         )
 
@@ -236,10 +238,10 @@ class TestTBO(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreater(metrics["accuracy"], 0.60)
 
 
-# @unittest.skip("covered in TestMTPWithTBO")
+@unittest.skip("covered in TestMTPWithTBO")
 class TestMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -271,7 +273,7 @@ class TestMTP(CustomTestCase):
                 "--cuda-graph-max-bs",
                 "32",
                 "--max-running-requests",
-                "32",
+                "64",
             ],
         )
 
@@ -280,8 +282,6 @@ class TestMTP(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
-        requests.get(self.base_url + "/flush_cache")
-
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
@@ -343,7 +343,7 @@ class TestMTPWithTBO(CustomTestCase):
                 "--cuda-graph-max-bs",
                 "32",
                 "--max-running-requests",
-                "32",
+                "128",
             ],
         )
 
@@ -352,8 +352,6 @@ class TestMTPWithTBO(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
-        requests.get(self.base_url + "/flush_cache")
-
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,

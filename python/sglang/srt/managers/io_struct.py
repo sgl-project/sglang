@@ -13,15 +13,16 @@
 # ==============================================================================
 """
 The definition of objects transferred between different
-processes (TokenizerManager, DetokenizerManager, Controller).
+processes (TokenizerManager, DetokenizerManager, Scheduler).
 """
 
 import copy
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -545,7 +546,7 @@ class EmbeddingReqInput:
     # The request id.
     rid: Optional[Union[List[str], str]] = None
     # Dummy sampling params for compatibility
-    sampling_params: Union[List[Dict], Dict] = None
+    sampling_params: Optional[Union[List[Dict], Dict]] = None
     # Dummy input embeds for compatibility
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -970,17 +971,6 @@ class ProfileReqType(Enum):
     STOP_PROFILE = 2
 
 
-class ExpertDistributionReq(Enum):
-    START_RECORD = 1
-    STOP_RECORD = 2
-    DUMP_RECORD = 3
-
-
-@dataclass
-class ExpertDistributionReqOutput:
-    pass
-
-
 @dataclass
 class ProfileReq:
     type: ProfileReqType
@@ -1027,6 +1017,17 @@ class OpenSessionReqOutput:
 
 @dataclass
 class HealthCheckOutput:
+    pass
+
+
+class ExpertDistributionReq(Enum):
+    START_RECORD = 1
+    STOP_RECORD = 2
+    DUMP_RECORD = 3
+
+
+@dataclass
+class ExpertDistributionReqOutput:
     pass
 
 
@@ -1084,19 +1085,36 @@ class LoadLoRAAdapterReqInput:
     lora_name: str
     # The path of loading.
     lora_path: str
+    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+            lora_path=self.lora_path,
+        )
 
 
 @dataclass
 class UnloadLoRAAdapterReqInput:
     # The name of lora module to unload.
     lora_name: str
+    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+        )
 
 
 @dataclass
 class LoRAUpdateResult:
     success: bool
     error_message: Optional[str] = None
-    loaded_adapters: Dict[str, str] = field(default_factory=dict)
+    loaded_adapters: Dict[str, LoRARef] = field(default_factory=dict)
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
