@@ -138,6 +138,9 @@ class Glm4MoeDetector(BaseFormatDetector):
         self._buffer = current_text[start:]
         return StreamingParseResult(normal_text=normal_text)
 
+    def supports_structural_tag(self) -> bool:
+        return False
+
     #TODO：Need Fix
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()

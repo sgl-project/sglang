@@ -624,7 +624,6 @@ class TestEBNFGeneration(unittest.TestCase):
         except RuntimeError as e:
             self.fail(f"Failed to compile EBNF: {e}")
 
-<<<<<<< HEAD
     def test_glm45_detector_ebnf(self):
         """Test that the Glm4MoeDetector generates valid EBNF."""
         ebnf = self.glm45_detector.build_ebnf(self.tools)
@@ -635,7 +634,6 @@ class TestEBNFGeneration(unittest.TestCase):
         self.assertIn('\\"name\\"" ":" "\\"get_weather\\"', ebnf)
         self.assertIn('"\\"arguments\\"" ":"', ebnf)
 
-=======
     def test_qwen3_coder_detector_ebnf(self):
         """Test that the Qwen3CoderDetector generates valid EBNF."""
         ebnf = self.qwen3_coder_detector.build_ebnf(self.tools)
@@ -649,7 +647,6 @@ class TestEBNFGeneration(unittest.TestCase):
         self.assertIn('"\\n</parameter>"', ebnf)
         # Check that it uses xml_text for string parameters
         self.assertIn("xml_text", ebnf)
->>>>>>> main
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
             ctx = self.grammar_compiler.compile_grammar(ebnf)
@@ -1503,29 +1500,13 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         self.assertEqual(params2["city"], "Beijing")
 
 
-<<<<<<< HEAD
-class TestGlm4MoeDetector(unittest.TestCase):
-    def setUp(self):
-=======
 class TestQwen3CoderDetector(unittest.TestCase):
     def setUp(self):
         # Create sample tools for testing
->>>>>>> main
         self.tools = [
             Tool(
                 type="function",
                 function=Function(
-<<<<<<< HEAD
-                    name="get_weather",
-                    description="Get weather information",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "city": {"type": "string", "description": "City name"},
-                            "date": {"type": "string", "description": "Date"},
-                        },
-                        "required": ["city", "date"],
-=======
                     name="get_current_weather",
                     description="Get the current weather",
                     parameters={
@@ -1555,132 +1536,10 @@ class TestQwen3CoderDetector(unittest.TestCase):
                             "dimensions": {"type": "object"},
                             "precision": {"type": "integer"},
                         }
->>>>>>> main
                     },
                 ),
             ),
         ]
-<<<<<<< HEAD
-        from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
-        self.detector = Glm4MoeDetector()
-
-    def test_single_tool_call(self):
-        text = (
-            "<tool_call>get_weather\n"
-            "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n"
-            "<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n"
-            "</tool_call>"
-        )
-        result = self.detector.detect_and_parse(text, self.tools)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}')
-        self.assertEqual(result.normal_text, "")
-
-    def test_multiple_tool_calls(self):
-        text = (
-            "<tool_call>get_weather\n"
-            "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n"
-            "<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n"
-            "</tool_call>"
-            "<tool_call>get_weather\n"
-            "<arg_key>city</arg_key>\n<arg_value>Shanghai</arg_value>\n"
-            "<arg_key>date</arg_key>\n<arg_value>2024-06-28</arg_value>\n"
-            "</tool_call>"
-        )
-        result = self.detector.detect_and_parse(text, self.tools)
-        self.assertEqual(len(result.calls), 2)
-        self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}')
-        self.assertEqual(result.calls[1].name, "get_weather")
-        self.assertEqual(result.calls[1].parameters, '{"city": "Shanghai", "date": "2024-06-28"}')
-        self.assertEqual(result.normal_text, "")
-
-    def test_streaming_tool_call(self):
-        """Test streaming incremental parsing of a tool call."""
-        chunks = [
-            "<tool_call>get_weather\n",
-            "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n",
-            "<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n",
-            "</tool_call>",
-        ]
-        tool_calls = []
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
-            for tool_call_chunk in result.calls:
-                if hasattr(tool_call_chunk, "tool_index") and tool_call_chunk.tool_index is not None:
-                    while len(tool_calls) <= tool_call_chunk.tool_index:
-                        tool_calls.append({"name": "", "parameters": {}})
-                    tc = tool_calls[tool_call_chunk.tool_index]
-                    if tool_call_chunk.name:
-                        tc["name"] = tool_call_chunk.name
-                    if tool_call_chunk.parameters:
-                        tc["parameters"] = tool_call_chunk.parameters
-        self.assertEqual(len(tool_calls), 1)
-        self.assertEqual(tool_calls[0]["name"], "get_weather")
-        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}')
-
-    def test_streaming_multiple_tool_calls(self):
-        """Test streaming incremental parsing of multiple tool calls."""
-        chunks = [
-            "<tool_call>get_weather\n",
-            "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n",
-            "<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n",
-            "</tool_call><tool_call>get_weather\n",
-            "<arg_key>city</arg_key>\n<arg_value>Shanghai</arg_value>\n",
-            "<arg_key>date</arg_key>\n<arg_value>2024-06-28</arg_value>\n",
-            "</tool_call>",
-        ]
-        tool_calls = []
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
-            for tool_call_chunk in result.calls:
-                if hasattr(tool_call_chunk, "tool_index") and tool_call_chunk.tool_index is not None:
-                    while len(tool_calls) <= tool_call_chunk.tool_index:
-                        tool_calls.append({"name": "", "parameters": {}})
-                    tc = tool_calls[tool_call_chunk.tool_index]
-                    if tool_call_chunk.name:
-                        tc["name"] = tool_call_chunk.name
-                    if tool_call_chunk.parameters:
-                        tc["parameters"] = tool_call_chunk.parameters
-        self.assertEqual(len(tool_calls), 2)
-        self.assertEqual(tool_calls[0]["name"], "get_weather")
-        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}')
-        self.assertEqual(tool_calls[1]["name"], "get_weather")
-        self.assertEqual(tool_calls[1]["parameters"], '{"city": "Shanghai", "date": "2024-06-28"}')
-
-    def test_tool_call_completion(self):
-        """Test that the buffer and state are reset after a tool call is completed."""
-        chunks = [
-            "<tool_call>get_weather\n",
-            "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n",
-            "<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n",
-            "</tool_call>",
-        ]
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
-        self.assertEqual(self.detector.current_tool_id, 1)
-
-    def test_invalid_tool_call(self):
-        """Test that invalid tool calls are handled correctly."""
-        text = '<tool_call>invalid_func\n<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n</tool_call>'
-        result = self.detector.detect_and_parse(text, self.tools)
-        self.assertEqual(len(result.calls), 0)
-
-    def test_partial_tool_call(self):
-        """Test parsing a partial tool call that spans multiple chunks."""
-        text1 = "<tool_call>get_weather\n<arg_key>city</arg_key>\n"
-        result1 = self.detector.parse_streaming_increment(text1, self.tools)
-        self.assertEqual(result1.normal_text, "")
-        self.assertEqual(result1.calls, [])
-        self.assertEqual(self.detector._buffer, text1)
-        text2 = "<arg_value>Beijing</arg_value>\n<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>"
-        result2 = self.detector.parse_streaming_increment(text2, self.tools)
-        self.assertEqual(len(result2.calls), 1)
-        self.assertEqual(result2.calls[0].name, "get_weather")
-        self.assertEqual(result2.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}')
-        self.assertEqual(self.detector._buffer, "")
-=======
         self.detector = Qwen3CoderDetector()
 
     def test_has_tool_call(self):
@@ -2072,7 +1931,6 @@ circle
         params2 = json.loads(accumulated_calls[1].parameters)
         self.assertEqual(params2["shape"], "circle")
         self.assertEqual(params2["dimensions"], {"radius": 5})
->>>>>>> main
 
 
 if __name__ == "__main__":
