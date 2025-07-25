@@ -131,7 +131,7 @@ def triton_kernel_fused_experts(
     elif activation == "gelu":
         gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
     elif activation == "relu":
-        # ReLU MoE activation for Smallthinker models
+        # ReLU MoE activation for SmallThinker models
         # First half: Gate, Second half: Up, out = ReLU(gate) * up
         intermediate_cache1 = intermediate_cache1.view(-1, N)
         intermediate_cache2 = torch.relu(intermediate_cache1[:, :N//2]) * intermediate_cache1[:, N//2:]

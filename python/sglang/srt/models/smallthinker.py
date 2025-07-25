@@ -1,4 +1,4 @@
-"""Inference-only Smallthinker model compatible with HuggingFace weights."""
+"""Inference-only SmallThinker model compatible with HuggingFace weights."""
 """Adapted from Qwen2MoE, Qwen3MoE and Mixtral"""
 
 import logging
@@ -47,22 +47,17 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 logger = logging.getLogger(__name__)
 
-"""Inference-only Smallthinker model compatible with HuggingFace weights."""
+"""Inference-only SmallThinker model compatible with HuggingFace weights."""
 
-class SmallthinkerMoeBlock(nn.Module):    
+class SmallThinkerMoeBlock(nn.Module):    
     def __init__(self, config, quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
         super().__init__()
         self.hidden_dim = config.hidden_size
         self.moe_ffn_hidden_size = config.moe_ffn_hidden_size
         self.num_primary_experts = config.moe_num_primary_experts
         self.num_active_primary_experts = config.moe_num_active_primary_experts
-        self.moe_enable_secondary_experts = config.moe_enable_secondary_experts
-        self.enable_early_router = config.moe_enable_early_router
         self.moe_primary_router_apply_softmax = config.moe_primary_router_apply_softmax
         self.tp_size = get_tensor_model_parallel_world_size()
-
-        # Sanitizer
-        assert not self.moe_enable_secondary_experts, "Secondary experts are not supported in Smallthinker SGLang yet."
 
         # Primary router
         self.primary_router = ReplicatedLinear(self.hidden_dim, self.num_primary_experts, bias=False, skip_bias_add=False, 
@@ -96,10 +91,7 @@ class SmallthinkerMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_input = router_input.view(-1, hidden_dim)
         
-        if self.enable_early_router:
-            router_logits = self.primary_router(router_input)
-        else:
-            router_logits = self.primary_router(hidden_states)
+        router_logits = self.primary_router(router_input)
 
         final_hidden_states = self.experts( hidden_states=hidden_states,
                                             router_logits=router_logits)
@@ -110,7 +102,7 @@ class SmallthinkerMoeBlock(nn.Module):
         return final_hidden_states.view(orig_shape), router_logits
 
 
-class SmallthinkerAttention(nn.Module):
+class SmallThinkerAttention(nn.Module):
     """Multi-head attention with optional sliding window."""
     
     def __init__(
@@ -219,7 +211,7 @@ class SmallthinkerAttention(nn.Module):
         return output
 
 
-class SmallthinkerDecoderLayer(nn.Module):
+class SmallThinkerDecoderLayer(nn.Module):
     """Decoder layer combining attention and MLP/MoE."""
     
     def __init__(
@@ -238,19 +230,14 @@ class SmallthinkerDecoderLayer(nn.Module):
         self.local_dp_size = get_local_attention_dp_size()
         
         # Attention
-        self.self_attn = SmallthinkerAttention(
+        self.self_attn = SmallThinkerAttention(
             config=config,
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
-
-        # Sanitizers
-        assert hasattr(config, 'moe_layer_layout') and config.moe_layer_layout, "Model configuration must have 'moe_layer_layout' defined."
-        assert layer_idx < len(config.moe_layer_layout), "Layer index exceeds the length of 'moe_layer_layout'."
-        assert config.moe_layer_layout[layer_idx], "Smallthinker SGLang impl only supports MoE layers."
         
-        self.mlp = SmallthinkerMoeBlock(
+        self.mlp = SmallThinkerMoeBlock(
             config=config,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
@@ -288,7 +275,7 @@ class SmallthinkerDecoderLayer(nn.Module):
         
         return hidden_states, residual
 
-class SmallthinkerModel(nn.Module):
+class SmallThinkerModel(nn.Module):
     """Main model class."""
     
     def __init__(
@@ -317,7 +304,7 @@ class SmallthinkerModel(nn.Module):
         # Decoder layers
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: SmallthinkerDecoderLayer(
+            lambda idx, prefix: SmallThinkerDecoderLayer(
                 config=config,
                 layer_idx=idx,
                 quant_config=quant_config,
@@ -375,7 +362,7 @@ class SmallthinkerModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-class SmallthinkerForCausalLM(nn.Module):
+class SmallThinkerForCausalLM(nn.Module):
     """Causal language model with vLLM optimization."""
     _tied_weights_keys = ["lm_head.weight"]
     def __init__(self, config, quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
@@ -385,7 +372,7 @@ class SmallthinkerForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
-        self.model = SmallthinkerModel(config=config, quant_config=quant_config, prefix=add_prefix("model", prefix))
+        self.model = SmallThinkerModel(config=config, quant_config=quant_config, prefix=add_prefix("model", prefix))
 
         # Language model head
         if get_pp_group().is_last_rank:
@@ -536,7 +523,7 @@ class SmallthinkerForCausalLM(nn.Module):
 
                     name = name.replace(weight_name, param_name)
                     
-                    # Smallthinker: expert name replace
+                    # SmallThinker: expert name replace
                     name = name.replace("block_sparse_moe", "mlp")
                     # Skip loading extra parameters for GPTQ/modelopt models.
                     if name.endswith(
@@ -605,4 +592,4 @@ class SmallthinkerForCausalLM(nn.Module):
             loaded_params.add(name)
         return loaded_params
     
-EntryClass = [SmallthinkerForCausalLM]
+EntryClass = [SmallThinkerForCausalLM]

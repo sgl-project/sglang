@@ -1661,7 +1661,7 @@ def fused_experts_impl(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
                 )
         elif activation == "relu":
-            # ReLU activation for Smallthinker models
+            # ReLU activation for SmallThinker models
             # First half: Gate, Second half: Up, out = ReLU(gate) * up
             intermediate_cache1 = intermediate_cache1.view(-1, N)
             intermediate_cache2 = torch.relu(intermediate_cache1[:, :N//2]) * intermediate_cache1[:, N//2:]
