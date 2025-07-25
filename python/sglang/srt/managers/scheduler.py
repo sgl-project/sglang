@@ -2447,14 +2447,16 @@ class Scheduler(
                         req,
                         f"Aborted in flight. {req.rid=}",
                     )
-
+                    self.tree_cache.cache_unfinished_req(req)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            # Abort requests that have not yet finished preallocation
             for i, decode_req in enumerate(self.disagg_decode_prealloc_queue.queue):
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     prepare_abort(
                         decode_req.req,
-                        f"Aborted when bootstrapping. {decode_req.req.rid=}",
+                        f"Aborted before preallocation. {decode_req.req.rid=}",
                     )
+            # Abort requests waiting for kvcache to release tree cache
             for i, decode_req in enumerate(self.disagg_decode_transfer_queue.queue):
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     prepare_abort(
