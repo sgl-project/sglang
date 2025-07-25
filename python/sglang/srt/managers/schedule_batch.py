@@ -431,6 +431,7 @@ class Req:
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
+        vocab_size: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -480,6 +481,7 @@ class Req:
         self.to_abort_message: str = None
         self.stream = stream
         self.eos_token_ids = eos_token_ids
+        self.vocab_size = vocab_size
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -712,6 +714,14 @@ class Req:
             if matched_eos:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
                 return
+
+        if last_token_id > self.vocab_size or last_token_id < 0:
+            if self.sampling_params.stop_token_ids:
+                self.output_ids[-1] = next(iter(self.sampling_params.stop_token_ids))
+            if self.eos_token_ids:
+                self.output_ids[-1] = next(iter(self.eos_token_ids))
+            self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
+            return
 
         # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
