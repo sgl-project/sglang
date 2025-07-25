@@ -20,17 +20,21 @@ import json
 import logging
 import os
 import time
+import threading
+import requests
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
 import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.connector import ConnectorType
 from sglang.srt.distributed import (
     get_tp_group,
     get_world_group,
@@ -120,6 +124,7 @@ from sglang.srt.utils import (
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
     set_cuda_arch,
+    parse_connector_type,
 )
 
 _is_hip = is_hip()
@@ -605,6 +610,8 @@ class ModelRunner:
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
+            seed_instance_url=self.server_args.seed_instance_url,
+            client_instance_id=self.server_args.client_instance_id,
             model_loader_extra_config=self.server_args.model_loader_extra_config,
         )
         if self.device == "cpu":
@@ -613,6 +620,28 @@ class ModelRunner:
             )
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
+
+        if self.server_args.load_format == LoadFormat.REMOTE_INSTANCE:
+            def trigger_seed():
+                url = self.server_args.seed_instance_url
+                parsed_group_url = urlparse(self.server_args.model_path)
+                group_port = int(parsed_group_url.port)
+                requests.post(
+                    f"{url}/init_weights_send_group_for_remote_instance",
+                    json={
+                        "master_address": parsed_group_url.hostname,
+                        "master_port": group_port,
+                        "group_rank": 0,
+                        "world_size": 2,
+                        "group_name": f"send_weights_{self.server_args.client_instance_id}",
+                        "backend": "nccl",
+                    },
+                )
+
+            if self.tp_rank == 0:
+                t = threading.Thread(target=trigger_seed)
+                t.start()
+
 
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
@@ -623,8 +652,10 @@ class ModelRunner:
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
-                device_config=DeviceConfig(self.device),
+                device_config=DeviceConfig(self.device, self.tp_rank, self.gpu_id),
             )
+        if self.server_args.load_format == LoadFormat.REMOTE_INSTANCE and self.tp_rank == 0:
+            t.join()
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
@@ -752,6 +783,77 @@ class ModelRunner:
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
+
+    def init_weights_send_group_for_remote_instance(
+        self,
+        master_address,
+        master_port,
+        group_rank,
+        world_size,
+        group_name,
+        backend="nccl",
+    ):
+        assert (
+            torch.distributed.is_initialized()
+        ), "Default torch process group must be initialized"
+        assert group_name != "", "Group name cannot be empty"
+
+        group_port = master_port + self.tp_rank
+        group_name = f"{group_name}_{self.tp_rank}"
+
+        logger.info(
+            f"init custom process group: tp_rank={self.tp_rank}, master_address={master_address}, master_port={master_port}, "
+            f"group_rank={group_rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
+        )
+
+        try:
+            self._model_update_group = init_custom_process_group(
+                backend=backend,
+                init_method=f"tcp://{master_address}:{group_port}",
+                world_size=world_size,
+                rank=group_rank,
+                group_name=group_name,
+                device_id=torch.device("cuda", self.tp_rank),
+            )
+
+            group_rank = self._model_update_group.rank()
+            assert (
+                group_rank == 0
+                ), f"Seed instance must be rank 0 in process group for send_weights_to_remote_instance, but get rank: {group_rank}"
+            return True, f"Succeeded to init group through {master_address}:{master_port} group."
+        except Exception as e:
+            message = f"Failed to init group: {e}."
+            logger.error(message)
+            return False, message
+
+    def send_weights_to_remote_instance(
+        self,
+        master_address,
+        master_port,
+        group_name,
+    ):
+        assert (
+            torch.distributed.is_initialized()
+        ), "Default torch process group must be initialized"
+        assert group_name != "", "Group name cannot be empty"
+
+        master_port = master_port + self.tp_rank
+        group_name = f"{group_name}_{self.tp_rank}"
+
+        try:
+            group_rank = self._model_update_group.rank()
+            assert (
+                group_rank == 0
+                ), f"Seed engine must be rank 0 in process group for sending weights, but get rank: {group_rank}"
+            param_dict = dict(self.model.named_parameters())
+            for name in param_dict:
+                weights = param_dict[name]
+                torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
+            return True, f"Succeeded to send weights through {master_address}:{master_port} {group_name}."
+        except Exception as e:
+            message = f"Failed to send weights: {e}."
+            logger.error(message)
+            return False, message
 
     def init_weights_update_group(
         self,
