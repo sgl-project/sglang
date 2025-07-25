@@ -192,9 +192,12 @@ class CompletionRequest(BaseModel):
     session_params: Optional[Dict] = None
 
     # For PD disaggregation
-    bootstrap_host: Optional[str] = None
-    bootstrap_port: Optional[int] = None
-    bootstrap_room: Optional[int] = None
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For request id
+    rid: Optional[Union[List[str], str]] = None
 
     @field_validator("max_tokens")
     @classmethod
@@ -233,7 +236,7 @@ class CompletionResponseStreamChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[Literal["stop", "length", "content_filter"]] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
 
@@ -264,6 +267,10 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
 
 
+class ChatCompletionMessageContentVideoURL(BaseModel):
+    url: str
+
+
 class ChatCompletionMessageContentAudioURL(BaseModel):
     url: str
 
@@ -274,6 +281,11 @@ class ChatCompletionMessageContentImagePart(BaseModel):
     modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
 
 
+class ChatCompletionMessageContentVideoPart(BaseModel):
+    type: Literal["video_url"]
+    video_url: ChatCompletionMessageContentVideoURL
+
+
 class ChatCompletionMessageContentAudioPart(BaseModel):
     type: Literal["audio_url"]
     audio_url: ChatCompletionMessageContentAudioURL
@@ -282,6 +294,7 @@ class ChatCompletionMessageContentAudioPart(BaseModel):
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentImagePart,
+    ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
 ]
 
@@ -309,6 +322,18 @@ class ChatCompletionMessageGenericParam(BaseModel):
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def _normalize_role(cls, v):
+        if isinstance(v, str):
+            v_lower = v.lower()
+            if v_lower not in {"system", "assistant", "tool"}:
+                raise ValueError(
+                    "'role' must be one of 'system', 'assistant', or 'tool' (case-insensitive)."
+                )
+            return v_lower
+        raise ValueError("'role' must be a string")
 
 
 class ChatCompletionMessageUserParam(BaseModel):
@@ -430,8 +455,8 @@ class ChatCompletionRequest(BaseModel):
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
 
-    # The request id.
-    rid: Optional[str] = None
+    # For request id
+    rid: Optional[Union[List[str], str]] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[str] = None
@@ -495,7 +520,9 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     delta: DeltaMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
-        Literal["stop", "length", "tool_calls", "content_filter", "function_call"]
+        Literal[
+            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+        ]
     ] = None
     matched_stop: Union[None, int, str] = None
 
@@ -529,7 +556,7 @@ class EmbeddingRequest(BaseModel):
     user: Optional[str] = None
 
     # The request id.
-    rid: Optional[str] = None
+    rid: Optional[Union[List[str], str]] = None
 
 
 class EmbeddingObject(BaseModel):
@@ -612,6 +639,7 @@ class MessageProcessingResult:
     prompt_ids: Union[str, List[int]]
     image_data: Optional[Any]
     audio_data: Optional[Any]
+    video_data: Optional[Any]
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[Any] = None
