@@ -399,7 +399,7 @@ class ServerArgs:
             self.page_size = 128
 
         # Set page size
-        if self.page_size is not None:
+        if self.page_size is None:
             self.page_size = 1
 
         # AMD-specific Triton attention KV splits default number
