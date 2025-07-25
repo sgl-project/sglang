@@ -169,7 +169,7 @@ class LogitsMetadata:
             dp_padding_mode=DPPaddingMode.SUM_LEN,
         )
 
-    def compute_dp_attention_metadata(self):
+    def compute_dp_attention_metadata(self, hidden_states: torch.Tensor):
 
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
         dp_rank = get_attention_dp_rank()
