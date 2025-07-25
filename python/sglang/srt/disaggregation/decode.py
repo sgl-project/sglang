@@ -44,7 +44,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch, get_last_loc
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
@@ -211,6 +211,7 @@ class DecodePreallocQueue:
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
+        kv_args.page_size = self.token_to_kv_pool_allocator.page_size
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
@@ -451,6 +452,8 @@ class DecodePreallocQueue:
         else:
             available_size = self.token_to_kv_pool_allocator.available_size()
 
+        available_size += self.tree_cache.evictable_size()
+
         allocatable_tokens = available_size - max(
             # preserve some space for future decode
             self.num_reserved_decode_tokens
@@ -492,10 +495,17 @@ class DecodePreallocQueue:
             req_pool_indices is not None
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
+        req.init_next_round_input(self.tree_cache)
+
         req.req_pool_idx = req_pool_indices[0]
         num_tokens = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        extend_num_tokens = num_tokens - len(req.prefix_indices)
 
-        req.init_next_round_input(self.tree_cache)
+        dummy_batch = ScheduleBatch(
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            model_config=self.scheduler.model_config,
+            tree_cache=self.tree_cache,
+        )
 
         if self.scheduler.model_config.is_hybrid:
             swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
@@ -504,11 +514,9 @@ class DecodePreallocQueue:
             self.tree_cache.inc_lock_ref(req.last_node)
 
         if self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(
-                num_tokens - len(req.prefix_indices)
-            )
+            kv_loc = dummy_batch.alloc_token_slots(extend_num_tokens)
         else:
-            kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+            kv_loc = dummy_batch.alloc_paged_token_slots_extend(
                 prefix_lens=torch.tensor(
                     [len(req.prefix_indices)],
                     dtype=torch.int64,
@@ -524,7 +532,7 @@ class DecodePreallocQueue:
                     dtype=torch.int64,
                     device=self.token_to_kv_pool.device,
                 ),
-                extend_num_tokens=num_tokens - len(req.prefix_indices),
+                extend_num_tokens=extend_num_tokens,
             )
 
         assert (
