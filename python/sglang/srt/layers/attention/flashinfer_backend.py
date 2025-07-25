@@ -171,6 +171,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.enable_attention_sink = enable_attention_sink
+        self.sliding_window_size = model_runner.sliding_window_size
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -395,7 +396,7 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
-            if self.is_multimodal:
+             if self.is_multimodal or (self.sliding_window_size is not None and self.sliding_window_size >= 0):
                 use_ragged = False
                 extend_no_prefix = False
             else:
