@@ -60,7 +60,10 @@ class Gds:
         valid_options = {"READ", "WRITE"}
         if mode not in valid_options:
             raise ValueError("mode has to be write/read")
-        logger.info(f"total len for the tensor: {device_indices.numel()} * {device_indices.element_size()}")
+        file_size = os.path.getsize(file_path)
+        if index > file_size:
+            logger.info(f"Skip this tranfer as read_ops {index} larger than file size {file_size}")
+            return
         gpu_reg_descs = self.x_agent.get_reg_descs(device_indices)
         agent_xfer_tensor = self.tensor_nixl_obj(device_indices)
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
