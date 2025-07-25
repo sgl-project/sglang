@@ -9,6 +9,7 @@ from transformers import (
     LlamaConfig,
     PretrainedConfig,
     PreTrainedTokenizer,
+    Qwen2Config,
 )
 
 from sglang.utils import logger
@@ -147,12 +148,14 @@ class InternLM2Config(PretrainedConfig):
             )
         if (
             rope_scaling_factor is None
-            or not isinstance(rope_scaling_factor, float)
+            or not isinstance(rope_scaling_factor, (float, int))
             or rope_scaling_factor < 1.0
         ):
             raise ValueError(
-                f"`rope_scaling`'s factor field must be a float >= 1, got {rope_scaling_factor}"
+                f"`rope_scaling`'s factor field must be a float|int >= 1, got {rope_scaling_factor=}, {type(rope_scaling_factor)=}"
             )
+        if isinstance(rope_scaling_factor, int):
+            rope_scaling_factor = float(rope_scaling_factor)
 
 
 class InternVisionConfig(PretrainedConfig):
@@ -309,6 +312,8 @@ class InternVLChatConfig(PretrainedConfig):
             self.llm_config = LlamaConfig(**llm_config)
         elif llm_config.get("architectures")[0] == "InternLM2ForCausalLM":
             self.llm_config = InternLM2Config(**llm_config)
+        elif llm_config.get("architectures")[0] == "Qwen2ForCausalLM":
+            self.llm_config = Qwen2Config(**llm_config)
         else:
             raise ValueError(
                 "Unsupported architecture: {}".format(

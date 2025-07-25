@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import requests
 import torch
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_cuda, is_hip, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -20,8 +20,50 @@ class TestMLADeepseekV3(CustomTestCase):
         cls.model = "lmsys/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code", "--chunked-prefill-size", "256"]
-        if torch.cuda.is_available() and torch.version.cuda:
+        if is_cuda():
             other_args.extend(["--enable-torch-compile", "--cuda-graph-max-bs", "2"])
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(metrics)
+
+        self.assertGreater(metrics["accuracy"], 0.62)
+
+
+@unittest.skipIf(is_hip(), "FA is not available.")
+class TestMLADeepseekV3Fa3Fp8Kvcache(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "lmsys/sglang-ci-dsv3-test"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--trust-remote-code",
+            "--chunked-prefill-size",
+            "256",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
+        ]
+        if is_cuda():
+            other_args.extend(["--attention-backend", "fa3"])
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

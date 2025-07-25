@@ -26,6 +26,8 @@ import torch
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterReqInput,
+    UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -99,6 +101,17 @@ class TpModelWorkerClient:
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
+
+    def get_tokens_per_layer_info(self):
+        return self.worker.get_tokens_per_layer_info()
+
+    @property
+    def sliding_window_size(self) -> Optional[int]:
+        return self.worker.sliding_window_size
+
+    @property
+    def is_hybrid(self) -> bool:
+        return self.worker.is_hybrid
 
     def get_pad_input_ids_func(self):
         return self.worker.get_pad_input_ids_func()
@@ -267,6 +280,12 @@ class TpModelWorkerClient:
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         return self.worker.get_weights_by_name(recv_req)
+
+    def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
+        return self.worker.load_lora_adapter(recv_req)
+
+    def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
+        return self.worker.unload_lora_adapter(recv_req)
 
     def __delete__(self):
         self.input_queue.put((None, None))

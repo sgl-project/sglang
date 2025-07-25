@@ -1,16 +1,17 @@
-from typing import Any, Callable, Dict, List, Optional
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.linear import LinearMethodBase
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
     ModelWeightParameter,
 )
 from sglang.srt.layers.quantization.base_config import (
+    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -71,7 +72,7 @@ class QoQConfig(QuantizationConfig):
         return 80
 
     @classmethod
-    def get_name(self) -> str:
+    def get_name(cls) -> str:
         return "qoq"
 
     @classmethod
@@ -83,7 +84,7 @@ class QoQConfig(QuantizationConfig):
         ]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "QoQConfig":
+    def from_config(cls, config: Dict[str, Any]) -> QoQConfig:
         weight_bits = cls.get_from_keys(config, ["wbits"])
         group_size = cls.get_from_keys(config, ["group_size"])
         return cls(weight_bits, group_size)
@@ -92,7 +93,7 @@ class QoQConfig(QuantizationConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
 
         if isinstance(layer, LinearBase):

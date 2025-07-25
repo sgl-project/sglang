@@ -2,6 +2,7 @@ import json
 import logging
 from typing import List
 
+from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -9,16 +10,18 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.ebnf_composer import EBNFComposer
-from sglang.srt.openai_api.protocol import Tool
 
 logger = logging.getLogger(__name__)
 
 
 class Llama32Detector(BaseFormatDetector):
     """
-    Detector for Llama 3.2 models.
-    Assumes function call format:
-      <|python_tag|>{"name":"xxx", "arguments":{...}}
+    Detector for Llama 3.2 models with json tool call format.
+
+    Format Structure:
+    ```
+    <python_tag>{"name":"xxx", "arguments":{...}}
+    ```
     """
 
     def __init__(self):

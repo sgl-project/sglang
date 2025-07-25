@@ -14,6 +14,7 @@
 """Utilities for Huggingface Transformers."""
 
 import contextlib
+import logging
 import os
 import warnings
 from pathlib import Path
@@ -25,6 +26,7 @@ from transformers import (
     AutoConfig,
     AutoProcessor,
     AutoTokenizer,
+    GenerationConfig,
     PretrainedConfig,
     PreTrainedTokenizer,
     PreTrainedTokenizerBase,
@@ -42,7 +44,7 @@ from sglang.srt.configs import (
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
-from sglang.srt.utils import is_remote_url
+from sglang.srt.utils import is_remote_url, lru_cache_frozenset
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ChatGLMConfig.model_type: ChatGLMConfig,
@@ -103,6 +105,7 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
+@lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
     trust_remote_code: bool,
@@ -150,6 +153,21 @@ def get_config(
         config.update({"architectures": [model_type]})
 
     return config
+
+
+@lru_cache_frozenset(maxsize=32)
+def get_generation_config(
+    model: str,
+    trust_remote_code: bool,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    try:
+        return GenerationConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+    except OSError as e:
+        return None
 
 
 # Models don't use the same configuration key for determining the maximum
