@@ -29,7 +29,7 @@ from torch.profiler import ProfilerActivity, profile
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
-from sglang.srt.layers.dp_attention import DPGatherMode, get_attention_tp_size
+from sglang.srt.layers.dp_attention import DPPaddingMode, get_attention_tp_size
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
 from sglang.srt.model_executor.forward_batch_info import (
@@ -565,7 +565,7 @@ class CudaGraphRunner:
             positions=positions,
             global_num_tokens_gpu=self.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
-            dp_gather_mode=DPGatherMode.get_default_mode_in_cuda_graph(),
+            dp_padding_mode=DPPaddingMode.get_default_mode_in_cuda_graph(),
             gathered_buffer=gathered_buffer,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,

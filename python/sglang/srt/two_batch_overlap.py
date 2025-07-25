@@ -542,7 +542,7 @@ class TboForwardBatchPreparer:
                 tbo_children=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
-                dp_gather_mode=None,
+                dp_padding_mode=None,
                 gathered_buffer=gathered_buffer,
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
