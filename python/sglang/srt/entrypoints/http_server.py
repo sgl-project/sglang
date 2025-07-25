@@ -63,6 +63,8 @@ from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompl
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
+from sglang.srt.entrypoints.anthropic.serving_messages import AnthropicServingMessages
+from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -141,6 +143,9 @@ async def lifespan(fast_api_app: FastAPI):
     )
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
         _global_state.tokenizer_manager
+    )
+    fast_api_app.state.anthropic_serving_messages = AnthropicServingMessages(
+        _global_state.tokenizer_manager, _global_state.template_manager
     )
 
     server_args: ServerArgs = fast_api_app.server_args
@@ -866,6 +871,15 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
     """Endpoint for reranking documents based on query relevance."""
     return await raw_request.app.state.openai_serving_rerank.handle_request(
+        request, raw_request
+    )
+
+
+## Anthropic API
+@app.post("/v1/messages", dependencies=[Depends(validate_json_request)])
+async def anthropic_v1_messages(request: AnthropicMessagesRequest, raw_request: Request):
+    """Anthropic-compatible messages endpoint."""
+    return await raw_request.app.state.anthropic_serving_messages.handle_request(
         request, raw_request
     )
 
