@@ -31,31 +31,32 @@ _LOCAL_ATTN_DP_SIZE = None
 _LOCAL_ATTN_DP_RANK = None
 
 
-class DPGatherMode(IntEnum):
+class DPPaddingMode(IntEnum):
 
-    # Gather tokens using `all_gather_into_tensor`
-    ALL_GATHER = auto()
-    # Gather tokens using `all_reduce`
-    ALL_REDUCE = auto()
+    # Padding tokens to max length and then gather tokens using `all_gather_into_tensor`
+    MAX_LEN = auto()
+    # Padding tokens to sum length and then gather tokens using `all_reduce`
+    SUM_LEN = auto()
 
-    def is_all_gather(self):
-        return self == DPGatherMode.ALL_GATHER
+    def is_max_len(self):
+        return self == DPPaddingMode.MAX_LEN
 
-    def is_all_reduce(self):
-        return self == DPGatherMode.ALL_REDUCE
+    def is_sum_len(self):
+        return self == DPPaddingMode.SUM_LEN
 
     @classmethod
-    def get_dp_gather_mode(cls, global_num_tokens: List[int]) -> DPGatherMode:
+    def get_dp_padding_mode(cls, global_num_tokens: List[int]) -> DPPaddingMode:
+        # we choose the mode that minimizes the communication cost
         max_len = max(global_num_tokens)
         sum_len = sum(global_num_tokens)
         if sum_len * 2 > max_len * get_attention_dp_size():
-            return cls.ALL_GATHER
+            return cls.MAX_LEN
         else:
-            return cls.ALL_REDUCE
+            return cls.SUM_LEN
 
     @classmethod
-    def get_default_mode_in_cuda_graph(cls) -> DPGatherMode:
-        return cls.ALL_GATHER
+    def get_default_mode_in_cuda_graph(cls) -> DPPaddingMode:
+        return cls.MAX_LEN
 
 
 def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):
@@ -306,7 +307,7 @@ def _dp_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    if forward_batch.dp_gather_mode.is_all_gather():
+    if forward_batch.dp_padding_mode.is_max_len():
         _dp_gather_via_all_gather(
             global_tokens, local_tokens, forward_batch, is_partial
         )

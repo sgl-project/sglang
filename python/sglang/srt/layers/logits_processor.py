@@ -27,7 +27,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.layers.dp_attention import (
-    DPGatherMode,
+    DPPaddingMode,
     attn_tp_all_gather,
     dp_gather_replicate,
     dp_scatter,
@@ -113,7 +113,7 @@ class LogitsMetadata:
     global_num_tokens_for_logprob_cpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     # The gather mode for DP attention
-    dp_gather_mode: Optional[DPGatherMode] = None
+    dp_padding_mode: Optional[DPPaddingMode] = None
     # for padding
     padded_static_len: int = -1
 
@@ -165,7 +165,7 @@ class LogitsMetadata:
             forward_batch_gathered_buffer=forward_batch.gathered_buffer,
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
-            dp_gather_mode=DPGatherMode.ALL_REDUCE,
+            dp_padding_mode=DPPaddingMode.SUM_LEN,
         )
 
     def compute_dp_attention_metadata(self):
