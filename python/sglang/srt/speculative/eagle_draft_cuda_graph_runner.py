@@ -336,7 +336,6 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.req_pool_indices = self.req_pool_indices[:bs]
             forward_batch.positions = self.positions[:num_tokens]
 
-        # Special handle for seq_len_cpu used when flashinfer mla is used
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(self.seq_len_fill_value)
