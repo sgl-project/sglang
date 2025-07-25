@@ -999,19 +999,27 @@ class Scheduler(
             if self.attn_tp_rank == 0:
                 recv_reqs = []
 
-                while True:
-                    try:
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
+                poller = zmq.Poller()
+                poller.register(self.recv_from_tokenizer, zmq.POLLIN)
+                poller.register(self.recv_from_rpc, zmq.POLLIN)
+                sockets = dict(poller.poll(timeout=2))
 
-                while True:
-                    try:
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
+                if self.recv_from_tokenizer in sockets:
+                    while True:
+                        try:
+                            recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        except zmq.Again:
+                            break
+                        recv_reqs.append(recv_req)
+
+                if self.recv_from_rpc in sockets:
+                    while True:
+                        try:
+                            recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                        except zmq.Again:
+                            break
+                        recv_reqs.append(recv_rpc)
+
             else:
                 recv_reqs = None
         else:
