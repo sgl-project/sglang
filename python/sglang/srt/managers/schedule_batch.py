@@ -1880,7 +1880,7 @@ class ModelWorkerBatch:
     sampling_info: SamplingBatchInfo
 
     # The input Embeds
-    input_embeds: Optional[torch.tensor] = None
+    input_embeds: Optional[torch.Tensor] = None
 
     # For corss-encoder model
     token_type_ids: Optional[torch.Tensor] = None
@@ -1890,7 +1890,6 @@ class ModelWorkerBatch:
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
-    spec_num_draft_tokens: Optional[int] = None
     hicache_consumer_index: int = 0
 
     # Overlap event
