@@ -451,10 +451,6 @@ def biased_grouped_topk_impl(
     return topk_weights, topk_ids
 
 
-biased_grouped_topk_impl_compiled = torch.compile(
-    biased_grouped_topk_impl, dynamic=True, backend=get_compiler_backend()
-)
-
 
 def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
