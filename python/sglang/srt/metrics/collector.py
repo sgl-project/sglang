@@ -145,6 +145,7 @@ class SchedulerStats:
     num_prefill_infight_queue_reqs: int = 0
     num_decode_prealloc_queue_reqs: int = 0
     num_decode_transfer_queue_reqs: int = 0
+    total_retracted_reqs: int = 0
     kvcache_transfer_latency: float = 0.0
 
 
@@ -220,6 +221,13 @@ class SchedulerMetricsCollector:
         self.avg_request_queue_latency = Gauge(
             name="sglang:avg_request_queue_latency",
             documentation="The average request queue latency for the last batch of requests in seconds.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.total_retracted_reqs = Gauge(
+            name="sglang:total_retracted_reqs",
+            documentation="The total number of retracted requests due to kvcache full.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -326,6 +334,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
+        self._log_gauge(self.total_retracted_reqs, stats.total_retracted_reqs)
 
         # Disaggregation metrics
         self._log_gauge(

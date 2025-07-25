@@ -691,11 +691,16 @@ def decode_video_base64(video_base64):
         )  # Return an empty array and size tuple if no frames were found
 
 
-def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarray:
+def load_audio(
+    audio_file: str, sr: Optional[int] = None, mono: bool = True
+) -> np.ndarray:
     # Use soundfile here, since librosa use it under the hood,
     # and librosa will not support audio loading in the future
     import soundfile as sf
     from scipy.signal import resample
+
+    if sr is None:
+        sr = 16000
 
     # Load audio data
     if isinstance(audio_file, bytes):
@@ -739,9 +744,13 @@ def load_image(
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, stream=True, timeout=timeout).raw
-        image = Image.open(response)
-        response.close()
+        response = requests.get(image_file, stream=True, timeout=timeout)
+        try:
+            response.raise_for_status()
+            image = Image.open(response.raw)
+            image.load()  # Force loading to avoid issues after closing the stream
+        finally:
+            response.close()
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
@@ -1417,6 +1426,13 @@ def get_nvgpu_memory_capacity():
         ]
 
         if not memory_values:
+            # Fallback to torch.cuda.mem_get_info() when failed to get memory capacity from nvidia-smi,
+            # typically in NVIDIA MIG mode.
+            if torch.cuda.is_available():
+                logger.warning(
+                    "Failed to get GPU memory capacity from nvidia-smi, falling back to torch.cuda.mem_get_info()."
+                )
+                return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MB
             raise ValueError("No GPU memory values found.")
 
         # Return the minimum memory value
@@ -2880,3 +2896,17 @@ def parse_module_path(module_path, function_name, create_dummy):
         return final_module, getattr(final_module, function_name)
 
     return final_module, None
+
+
+# LoRA-related constants and utilities
+SUPPORTED_LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+LORA_TARGET_ALL_MODULES = "all"

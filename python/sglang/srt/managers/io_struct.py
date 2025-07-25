@@ -13,15 +13,16 @@
 # ==============================================================================
 """
 The definition of objects transferred between different
-processes (TokenizerManager, DetokenizerManager, Controller).
+processes (TokenizerManager, DetokenizerManager, Scheduler).
 """
 
 import copy
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -42,8 +43,21 @@ class SessionParams:
     drop_previous_output: Optional[bool] = None
 
 
-AudioDataItem = Union[str, Dict]
-ImageDataItem = Union[Image, str, Dict]
+# Type definitions for multimodal input data
+# Individual data item types for each modality
+ImageDataInputItem = Union[Image, str, Dict]
+AudioDataInputItem = Union[str, Dict]
+VideoDataInputItem = Union[str, Dict]
+# Union type for any multimodal data item
+MultimodalDataInputItem = Union[
+    ImageDataInputItem, VideoDataInputItem, AudioDataInputItem
+]
+# Format types supporting single items, lists, or nested lists for batch processing
+MultimodalDataInputFormat = Union[
+    List[List[MultimodalDataInputItem]],
+    List[MultimodalDataInputItem],
+    MultimodalDataInputItem,
+]
 
 
 @dataclass
@@ -60,13 +74,11 @@ class GenerateReqInput:
     # - List of images (one per request in a batch)
     # - List of lists of images (multiple images per request)
     # See also python/sglang/srt/utils.py:load_image for more details.
-    image_data: Optional[
-        Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]
-    ] = None
-    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
-    audio_data: Optional[Union[List[AudioDataItem], AudioDataItem]] = None
+    image_data: Optional[MultimodalDataInputFormat] = None
     # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
-    video_data: Optional[Union[List[List[str]], List[str], str]] = None
+    video_data: Optional[MultimodalDataInputFormat] = None
+    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
+    audio_data: Optional[MultimodalDataInputFormat] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # The request id.
@@ -297,6 +309,9 @@ class GenerateReqInput:
                         self.modalities.append("image")
                     elif len(self.image_data[i]) > 1:
                         self.modalities.append("multi-images")
+                    else:
+                        # Ensure len(self.modalities) == len(self.image_data)
+                        self.modalities.append(None)
                 # Expand parallel_sample_num
                 self.image_data = self.image_data * self.parallel_sample_num
                 self.modalities = self.modalities * self.parallel_sample_num
@@ -521,19 +536,17 @@ class EmbeddingReqInput:
     # - List of images (one per request in a batch)
     # - List of lists of images (multiple images per request)
     # See also python/sglang/srt/utils.py:load_image for more details.
-    image_data: Optional[
-        Union[List[List[Union[Image, str]]], List[Union[Image, str]], Union[Image, str]]
-    ] = None
+    image_data: Optional[MultimodalDataInputFormat] = None
     # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
-    video_data: Optional[Union[List[str], str]] = None
+    video_data: Optional[MultimodalDataInputFormat] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
-    audio_data: Optional[Union[List[str], str]] = None
+    audio_data: Optional[MultimodalDataInputFormat] = None
     # The token ids for text; one can either specify text or input_ids.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The request id.
     rid: Optional[Union[List[str], str]] = None
     # Dummy sampling params for compatibility
-    sampling_params: Union[List[Dict], Dict] = None
+    sampling_params: Optional[Union[List[Dict], Dict]] = None
     # Dummy input embeds for compatibility
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -607,8 +620,6 @@ class EmbeddingReqInput:
         if self.is_cross_encoder_request:
             return EmbeddingReqInput(
                 text=[self.text[i]] if self.text is not None else None,
-                input_ids=None,
-                image_data=None,
                 sampling_params=self.sampling_params[i],
                 rid=self.rid[i],
                 is_cross_encoder_request=True,
@@ -618,6 +629,8 @@ class EmbeddingReqInput:
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             image_data=self.image_data[i] if self.image_data is not None else None,
+            audio_data=self.audio_data[i] if self.audio_data is not None else None,
+            video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
         )
@@ -941,17 +954,6 @@ class ProfileReqType(Enum):
     STOP_PROFILE = 2
 
 
-class ExpertDistributionReq(Enum):
-    START_RECORD = 1
-    STOP_RECORD = 2
-    DUMP_RECORD = 3
-
-
-@dataclass
-class ExpertDistributionReqOutput:
-    pass
-
-
 @dataclass
 class ProfileReq:
     type: ProfileReqType
@@ -998,6 +1000,17 @@ class OpenSessionReqOutput:
 
 @dataclass
 class HealthCheckOutput:
+    pass
+
+
+class ExpertDistributionReq(Enum):
+    START_RECORD = 1
+    STOP_RECORD = 2
+    DUMP_RECORD = 3
+
+
+@dataclass
+class ExpertDistributionReqOutput:
     pass
 
 
@@ -1055,19 +1068,36 @@ class LoadLoRAAdapterReqInput:
     lora_name: str
     # The path of loading.
     lora_path: str
+    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+            lora_path=self.lora_path,
+        )
 
 
 @dataclass
 class UnloadLoRAAdapterReqInput:
     # The name of lora module to unload.
     lora_name: str
+    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+        )
 
 
 @dataclass
 class LoRAUpdateResult:
     success: bool
     error_message: Optional[str] = None
-    loaded_adapters: Dict[str, str] = field(default_factory=dict)
+    loaded_adapters: Dict[str, LoRARef] = field(default_factory=dict)
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
