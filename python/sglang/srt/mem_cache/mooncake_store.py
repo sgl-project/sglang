@@ -79,12 +79,12 @@ class MooncakeStoreConfig:
         return MooncakeStoreConfig(
             local_hostname=os.getenv("LOCAL_HOSTNAME", "localhost"),
             metadata_server=os.getenv("MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"),
-            global_segment_size=os.getenv(
+            global_segment_size=int(os.getenv(
                 "MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE
-            ),
-            local_buffer_size=os.getenv(
+            )),
+            local_buffer_size=int(os.getenv(
                 "MOONCAKE_LOCAL_BUFFER_SIZE", DEFAULT_LOCAL_BUFFER_SIZE
-            ),
+            )),
             protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
             device_name=os.getenv("MOONCAKE_DEVICE", "auto"),
             master_server_address=os.getenv("MOONCAKE_MASTER"),
@@ -110,7 +110,7 @@ class MooncakeStore(HiCacheStorage):
 
         try:
             self.store = MooncakeDistributedStore()
-            self.config = MooncakeStoreConfig.load_from_env()
+            self.config = MooncakeStoreConfig.from_file()
             logger.info("Mooncake Configuration loaded from env successfully.")
 
             setup_code = self.store.setup(
