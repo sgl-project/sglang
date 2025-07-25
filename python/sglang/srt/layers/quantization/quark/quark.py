@@ -16,8 +16,8 @@ from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme, QuarkW4A4MXFP4
 from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_device_capability
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.utils import get_device_capability
 
 __all__ = ["QuarkLinearMethod"]
 
@@ -46,7 +46,9 @@ class QuarkConfig(QuantizationConfig):
         attention_backend = global_server_args_dict["attention_backend"]
 
         if attention_backend == "aiter":
-            raise ValueError('Quark models are not tested with `--attention-backend "aiter"` (the default on ROCm). Consider using `--attention-backend "triton"` for now, and opening an issue at https://github.com/sgl-project/sglang/issues.')
+            raise ValueError(
+                'Quark models are not tested with `--attention-backend "aiter"` (the default on ROCm). Consider using `--attention-backend "triton"` for now, and opening an issue at https://github.com/sgl-project/sglang/issues.'
+            )
 
     def get_linear_method(self) -> "QuarkLinearMethod":
         return QuarkLinearMethod(self)
