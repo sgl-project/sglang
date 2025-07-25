@@ -377,6 +377,10 @@ class EAGLEWorker(TpModelWorker):
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.spec_num_draft_tokens = 1
+        # Set hicache consumer for target model
+        self.target_worker.set_hicache_consumer(
+            model_worker_batch.hicache_consumer_index
+        )
         logits_output, next_token_ids, _ = self.target_worker.forward_batch_generation(
             model_worker_batch
         )
@@ -845,6 +849,8 @@ class EAGLEWorker(TpModelWorker):
         batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.spec_num_draft_tokens = self.speculative_num_steps + 1
+        # Set hicache consumer for draft model
+        self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner

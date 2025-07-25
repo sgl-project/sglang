@@ -620,6 +620,10 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
+                if self.draft_worker is not None:
+                    self.draft_worker.register_hicache_layer_transfer_counter(
+                        self.tree_cache.cache_controller.draft_layer_done_counter
+                    )
             elif self.is_hybrid:
                 assert (
                     self.server_args.disaggregation_mode == "null"
