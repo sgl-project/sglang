@@ -191,8 +191,8 @@ class LogitsMetadata:
                     sum(self.global_num_tokens_for_logprob_cpu),
                     self.gathered_buffer.shape[1],
                 ),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
+                dtype=self.gathered_buffer.dtype,
+                device=self.gathered_buffer.device,
             )
         else:
              self.gathered_buffer = torch.empty_like(self.gathered_buffer)
