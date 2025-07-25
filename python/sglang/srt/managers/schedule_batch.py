@@ -1756,7 +1756,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             num_decode_reqs=(
                 len(self.decoding_reqs) if self.forward_mode.is_mixed() else 0
             ),
-            max_req_input_len=self.max_req_input_len,
             launch_done=self.launch_done,
         )
 
@@ -1898,9 +1897,6 @@ class ModelWorkerBatch:
     spec_num_draft_tokens: Optional[int] = None
     hicache_consumer_index: int = 0
 
-    # For POD Attn, number of extend-only requests in chunked prefill
-    num_decode_reqs: Optional[int] = 0
-    max_req_input_len: Optional[int] = None
     # Overlap event
     launch_done: Optional[threading.Event] = None
 

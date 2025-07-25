@@ -838,7 +838,6 @@ class Scheduler(
                         reqs=None,
                         forward_mode=ForwardMode.DUMMY_FIRST,
                         next_batch_sampling_info=self.tp_worker.cur_sampling_info,
-                        max_req_input_len=self.max_req_input_len,
                     )
                     self.process_batch_result(tmp_batch, None, batch.launch_done)
 
@@ -1815,7 +1814,6 @@ class Scheduler(
             self.running_batch = ScheduleBatch(
                 reqs=[],
                 batch_is_full=self.running_batch.batch_is_full,
-                max_req_input_len=self.max_req_input_len,
             )
         else:
             new_batch.decoding_reqs = None
