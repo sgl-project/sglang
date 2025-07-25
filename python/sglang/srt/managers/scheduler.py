@@ -1396,8 +1396,10 @@ class Scheduler(
         logger.info(f)
 
         if self.enable_metrics:
-            cache_hit_rate = adder.log_hit_tokens / (
-                adder.log_input_tokens + adder.log_hit_tokens
+            total_tokens = adder.log_input_tokens + adder.log_hit_tokens
+
+            cache_hit_rate = (
+                adder.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
             )
             self.stats.num_running_reqs = running_bs
             self.stats.num_used_tokens = num_used
