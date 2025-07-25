@@ -68,8 +68,12 @@ class TimeStats:
             )
 
             queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-
-            forward_duration = self.completion_time - self.forward_entry_time
+            forward_duration = (
+                self.prefill_transfer_queue_entry_time - self.forward_entry_time
+            )
+            transfer_duration = (
+                self.completion_time - self.prefill_transfer_queue_entry_time
+            )
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
                 assert (
@@ -77,7 +81,13 @@ class TimeStats:
                     and queue_duration >= 0
                     and forward_duration >= 0
                 ), f"bootstrap_duration={bootstrap_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
-            return f"bootstrap_duration={self.format_duration(bootstrap_duration)}, queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.prefill_bootstrap_queue_entry_time}"
+            return (
+                f"bootstrap_duration={self.format_duration(bootstrap_duration)}, "
+                f"queue_duration={self.format_duration(queue_duration)}, "
+                f"forward_duration={self.format_duration(forward_duration)}, "
+                f"transfer_duration={self.format_duration(transfer_duration)}, "
+                f"start_time={self.prefill_bootstrap_queue_entry_time}"
+            )
         # if decode
         elif _type == self.RequestType.DECODE:
             prealloc_duration = (
@@ -90,6 +100,7 @@ class TimeStats:
             )
             queue_duration = self.forward_entry_time - self.wait_queue_entry_time
             forward_duration = self.completion_time - self.forward_entry_time
+            ttft = self.forward_entry_time - self.decode_prealloc_queue_entry_time
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
                 assert (
@@ -99,7 +110,14 @@ class TimeStats:
                     and forward_duration >= 0
                 ), f"prealloc_duration={prealloc_duration} < 0 or transfer_duration={transfer_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
 
-            return f"prealloc_duration={self.format_duration(prealloc_duration)}, transfer_duration={self.format_duration(transfer_duration)}, queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.decode_prealloc_queue_entry_time}"
+            return (
+                f"prealloc_duration={self.format_duration(prealloc_duration)}, "
+                f"transfer_duration={self.format_duration(transfer_duration)}, "
+                f"queue_duration={self.format_duration(queue_duration)}, "
+                f"TTFT={self.format_duration(ttft)}, "
+                f"forward_duration={self.format_duration(forward_duration)}, "
+                f"start_time={self.decode_prealloc_queue_entry_time}"
+            )
         else:
             return "Invalid Time Stats"
 
