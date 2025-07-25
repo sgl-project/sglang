@@ -54,8 +54,8 @@ class FusedMoeWeightScaleSupported(Enum):
 
 
 class UnquantizedFusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
-    def __init__(self, 
-        swiglu_alpha: Optional[float] = 1.702, 
+    def __init__(self,
+        swiglu_alpha: Optional[float] = 1.702,
         swiglu_beta: Optional[float] = 1.0,
         bias: bool = True,
         shuffle_weight: bool = True,
@@ -76,7 +76,7 @@ class UnquantizedFusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
         intermediate_size: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
-    ):        
+    ):
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.empty(
@@ -119,7 +119,7 @@ class UnquantizedFusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
         else:
             layer.register_parameter("w13_bias", None)
             layer.register_parameter("w2_bias", None)
-    
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.w13_weight.data = torch.transpose(layer.w13_weight.data, 1, 2)
         if self.shuffle_weight:
@@ -135,7 +135,7 @@ class UnquantizedFusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
             torch.cuda.empty_cache()
         return
-    
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -216,19 +216,19 @@ class UnquantizedFusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
                 dtype=x.dtype,
                 clamp_limit=7.0,
             )
-    
+
     def forward_cpu(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError("CPU is not supported for OpenAI MoE")
-    
+
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError("TPU is not supported for OpenAI MoE")
-    
+
     forward_native = forward_cpu
 
 
 class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
     def __init__(self,
-        swiglu_alpha: Optional[float] = 1.702, 
+        swiglu_alpha: Optional[float] = 1.702,
         swiglu_beta: Optional[float] = 1.0,
         bias: bool = True,
         activation_dtype: torch.dtype = torch.float8_e4m3fn,
@@ -252,7 +252,7 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
         intermediate_size: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
-    ):        
+    ):
         self.num_experts = num_experts
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -295,7 +295,7 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
         else:
             layer.register_parameter("w13_bias", None)
             layer.register_parameter("w2_bias", None)
-    
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         w1_weight_fp4, w1_weight_scale = quantize_to_mxfp4(layer.w13_weight.data[:, :self.intermediate_size, :])
         w3_weight_fp4, w3_weight_scale = quantize_to_mxfp4(layer.w13_weight.data[:, self.intermediate_size:, :])
@@ -310,7 +310,7 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
         tmp_w13_scale = torch.transpose(tmp_w13_scale, 1, 2).contiguous()
         if self.shuffle_weight:
             tmp_w13_scale = shuffle_for_activation_kernel(tmp_w13_scale)
-        
+
         tmp_w2_weight = torch.transpose(w2_weight_fp4, 1, 2).contiguous()
         tmp_w2_scale = torch.transpose(w2_weight_scale, 1, 2).contiguous()
 
@@ -323,7 +323,7 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
             tmp_w13_weight, tmp_w13_scale, self.swizzle_value, self.swizzle_scale)
         tmp_w2_weight, tmp_w2_scale, tmp_w2_scale_shape = swizzle_weight_and_scale(
             tmp_w2_weight, tmp_w2_scale, self.swizzle_value, self.swizzle_scale)
-        
+
         self.actual_w13_weight_shape = tmp_w13_scale_shape
         self.actual_w2_weight_shape = tmp_w2_scale_shape
 
@@ -343,7 +343,7 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
         layer.w13_weight_scale = tmp_w13_scale
         layer.w2_weight_scale = tmp_w2_scale
         return
-    
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -432,10 +432,10 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
 
     def forward_cpu(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError("CPU is not supported for OpenAI MoE")
-    
+
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError("TPU is not supported for OpenAI MoE")
-    
+
     forward_native = forward_cpu
 
 
@@ -547,7 +547,7 @@ class FusedMoE(torch.nn.Module):
         self.use_triton_kernels = (
             not _is_cpu and global_server_args_dict["enable_triton_kernel_moe"]
         )
-        
+
         if quant_config is None:
             if not is_openai_moe:
                 self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
@@ -1063,7 +1063,7 @@ class FusedMoE(torch.nn.Module):
                         start_idx = tp_rank * bias_per_partition
                         end_idx = start_idx + bias_per_partition
                         loaded_weight = loaded_weight[start_idx:end_idx]
-                    
+
                     if shard_id == "w1":
                         # Load into first half of w13_bias
                         bias_param.data[expert_id][:bias_param.data[expert_id].shape[0]//2] = loaded_weight
@@ -1136,7 +1136,7 @@ class FusedMoE(torch.nn.Module):
                     expert_id,
                     shard_id,
                 ))
-                
+
                 # Add bias mapping
                 bias_param_name = (
                     "experts.w13_bias"

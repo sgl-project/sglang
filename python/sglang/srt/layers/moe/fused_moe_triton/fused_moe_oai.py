@@ -59,7 +59,7 @@ def quantize_to_mxfp4(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     return tensor_fp4, tensor_scales
 
 def quantize_fp8_per_tensor(
-                input_q: torch.Tensor, 
+                input_q: torch.Tensor,
                 scale: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     fp8_type_ = torch.float8_e4m3fn
     output_q = torch.empty_like(input_q, dtype=fp8_type_, device=input_q.device)
@@ -127,8 +127,8 @@ def swizzle_weight_and_scale(weight_tensor: torch.Tensor,
                                                 swizzle_axis)
     return quant_tensor, scale, actual_scale_shape
 
-def pad_weight_and_scale_on_hopper(weight: torch.Tensor, 
-                                   scale: Optional[torch.Tensor], 
+def pad_weight_and_scale_on_hopper(weight: torch.Tensor,
+                                   scale: Optional[torch.Tensor],
                                    swizzle_scale: SwizzlingType) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     if swizzle_scale == SwizzlingType.HOPPER:
         assert weight.dim() in [2,
@@ -145,7 +145,7 @@ def pad_weight_and_scale_on_hopper(weight: torch.Tensor,
             scale = F.pad(scale, (0, pad_size)).contiguous()
     return (weight, scale) if scale is not None else weight
 
-def maybe_remove_padding(gemm_output: torch.Tensor, 
+def maybe_remove_padding(gemm_output: torch.Tensor,
                          expected_size: int,
                          swizzle_scale: SwizzlingType):
     assert gemm_output.dim() == 2
@@ -182,7 +182,7 @@ def fused_experts_oai(
         rdata, gather_indx, scatter_indx = routing(expert_logits, top_k)
     else:
         rdata, gather_indx, scatter_indx = None, None, None
-    
+
     # print(f">>> topk_weights: {topk_weights.shape}, topk_ids: {topk_ids.shape}, expert_logits: {expert_logits.shape}")
     # print(f">>> rdata: {rdata}, gather_indx: {gather_indx}, scatter_indx: {scatter_indx}")
 
@@ -264,7 +264,7 @@ def fused_experts_mxfp4_oai(
         rdata, gather_indx, scatter_indx = routing(expert_logits, top_k)
     else:
         rdata, gather_indx, scatter_indx = None, None, None
-    
+
     mx_ctx_1 = MicroscalingCtx(
             weight_scale=gemm1_scales,
             swizzle_value=swizzle_value,
@@ -324,7 +324,7 @@ def fused_experts_mxfp4_oai(
         scatter_indx=scatter_indx,
         precision_config=pc2,
         gammas=rdata.gate_scal if rdata else None)
-    gemm2_output = maybe_remove_padding(gemm2_output, 
+    gemm2_output = maybe_remove_padding(gemm2_output,
                                         hidden_size,
                                         swizzle_scale)
     return gemm2_output

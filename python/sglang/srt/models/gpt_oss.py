@@ -156,7 +156,7 @@ def sink_attention_ref(
         )
         .contiguous()
         .view(batch_size * qo_len, num_qo_heads * head_dim_vo)
-        
+
     )
 
     return o_ref

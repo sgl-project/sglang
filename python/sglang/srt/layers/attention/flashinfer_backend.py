@@ -238,7 +238,7 @@ class FlashInferAttnBackend(AttentionBackend):
         fmha_backend = "auto"
         if is_sm100_supported():
             fmha_backend = "cutlass"
-        
+
         # Prepare JIT args for attention sink if enabled
         if self.enable_attention_sink and not skip_prefill:
             # Common JIT args for attention sink
@@ -259,7 +259,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 "AttentionSink",
                 attention_sink_decl,
             ]
-            
+
             self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
                 self.workspace_buffer, "NHD", backend="fa2", jit_args=self.attention_sink_jit_args
             )
@@ -307,7 +307,7 @@ class FlashInferAttnBackend(AttentionBackend):
                             "NHD",
                         )
                     )
-            
+
             # Decode wrappers with attention sink support
             if self.enable_attention_sink:
                 # Create JIT args for decode with attention sink
@@ -398,7 +398,7 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
-             if self.is_multimodal or (self.sliding_window_size is not None and self.sliding_window_size >= 0):
+            if self.is_multimodal or (self.sliding_window_size is not None and self.sliding_window_size >= 0):
                 use_ragged = False
                 extend_no_prefix = False
             else:
@@ -617,11 +617,11 @@ class FlashInferAttnBackend(AttentionBackend):
         log_tensor(f"forward_extend_layer{layer.layer_id}_k", k)
         log_tensor(f"forward_extend_layer{layer.layer_id}_v", v)
         log_tensor(f"forward_extend_layer{layer.layer_id}_sink", layer.attention_sinks)
-        
+
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
-        
+
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -757,10 +757,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
         output = o.view(-1, layer.tp_q_head_num * layer.head_dim)
-        
+
         # Log output tensor
         log_tensor(f"forward_extend_layer{layer.layer_id}_output", output)
-        
+
         return output
 
     def forward_decode(
@@ -777,11 +777,11 @@ class FlashInferAttnBackend(AttentionBackend):
         log_tensor(f"forward_decode_layer{layer.layer_id}_k", k)
         log_tensor(f"forward_decode_layer{layer.layer_id}_v", v)
         log_tensor(f"forward_decode_layer{layer.layer_id}_sink", layer.attention_sinks)
-        
+
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
-        
+
         window_left = layer.sliding_window_size if layer.sliding_window_size is not None and layer.sliding_window_size >= 0 else -1
 
         cache_loc = (
@@ -825,10 +825,10 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
         output = o.view(-1, layer.tp_q_head_num * layer.head_dim)
-        
+
         # Log output tensor
         log_tensor(f"forward_decode_layer{layer.layer_id}_output", output)
-        
+
         return output
 
     def _get_wrapper_idx(self, layer: RadixAttention):
