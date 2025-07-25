@@ -24,6 +24,35 @@ DEFAULT_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-7B-Instruct"
 
 
 class TestAscendAttnBackend(CustomTestCase):
+    def test_latency(self):
+        output_throughput = run_bench_offline_throughput(
+            DEFAULT_MODEL_NAME_FOR_TEST,
+            [
+                "--attention-backend",
+                "ascend",
+            ],
+        )
+
+        print(f"{output_throughput=}")
+
+        if is_in_ci():
+            self.assertGreater(output_throughput, 28)
+
+    def test_latency_no_graph(self):
+        output_throughput = run_bench_offline_throughput(
+            DEFAULT_MODEL_NAME_FOR_TEST,
+            [
+                "--attention-backend",
+                "ascend",
+                "--disable-cuda-graph",
+            ],
+        )
+
+        print(f"{output_throughput=}")
+
+        if is_in_ci():
+            self.assertGreater(output_throughput, 18)
+
     def test_gsm8k(self):
         model = DEFAULT_MODEL_NAME_FOR_TEST
         base_url = DEFAULT_URL_FOR_TEST
