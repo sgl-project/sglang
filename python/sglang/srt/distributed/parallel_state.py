@@ -250,6 +250,8 @@ class GroupCoordinator:
 
         if is_cuda_alike():
             self.device = torch.device(f"cuda:{local_rank}")
+        elif is_npu():
+            self.device = torch.device(f"npu:{local_rank}")
         else:
             self.device = torch.device("cpu")
 
@@ -1460,6 +1462,8 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
                 )
         elif hasattr(torch, "xpu") and torch.xpu.is_available():
             torch.xpu.empty_cache()
+        elif hasattr(torch, "npu") and torch.npu.is_available():
+            torch.npu.empty_cache()
 
 
 def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
