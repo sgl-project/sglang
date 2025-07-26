@@ -355,7 +355,7 @@ class VisionAttention(nn.Module):
         prefix: str = "",
         proj_bias: bool = True,
         num_dummy_heads: int = 0,
-        qkv_bias: bool = False,
+        qkv_bias: bool = True,
         qk_normalization: bool = False,
         layer_norm_eps: float = 1e-06,
         **kwargs,
