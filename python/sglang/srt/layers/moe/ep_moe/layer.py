@@ -55,7 +55,12 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if not (_is_npu or _is_hip):
-    from sgl_kernel import silu_and_mul
+    from sgl_kernel import (
+        cutlass_w4a8_moe_mm,
+        get_cutlass_w4a8_moe_mm_data,
+        sgl_per_tensor_quant_fp8,
+        silu_and_mul,
+    )
 
     from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 
@@ -947,7 +952,11 @@ class DeepEPMoE(EPMoE):
             forward_batch.is_extend_in_batch
         )
         if resolved_deepep_mode == DeepEPMode.normal:
-            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            if self.use_w4afp8:
+                return self.forward_cutlass_w4a8(
+                    hidden_states, topk_idx, topk_weights, ep_mode="deepep_normal"
+                )
+            elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
                 return self.forward_deepgemm_contiguous(
                     hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
                 )
@@ -957,6 +966,52 @@ class DeepEPMoE(EPMoE):
             return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
+
+    def forward_cutlass_w4a8(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        ep_mode: str,
+    ):
+        local_topk_ids = topk_idx
+        # hidden_states,hidden_states_scale=hidden_states
+        local_topk_ids = (
+            torch.where(local_topk_ids == -1, self.num_experts, topk_idx)
+            .to(torch.int32)
+            .contiguous()
+        )
+        if hidden_states.shape[0] > 0:
+            output = cutlass_w4a8_moe(
+                self.start_expert_id,
+                self.end_expert_id,
+                self.num_experts,
+                hidden_states,
+                self.w13_weight,
+                self.w2_weight,
+                self.w13_weight_scale_inv,
+                self.w2_weight_scale_inv,
+                topk_weights,
+                topk_idx,
+                local_topk_ids,
+                self.quant_method.a_strides1,
+                self.quant_method.b_strides1,
+                self.quant_method.c_strides1,
+                self.quant_method.a_strides2,
+                self.quant_method.b_strides2,
+                self.quant_method.c_strides2,
+                self.quant_method.s_strides13,
+                self.quant_method.s_strides2,
+                self.quant_method.expert_offsets,
+                self.quant_method.problem_sizes1,
+                self.quant_method.problem_sizes2,
+                self.w13_input_scale,
+                self.w2_input_scale,
+                ep_mode=ep_mode,
+            )
+            return output.to(torch.bfloat16)
+        else:
+            return hidden_states.to(torch.bfloat16)
 
     def forward_normal(
         self,
