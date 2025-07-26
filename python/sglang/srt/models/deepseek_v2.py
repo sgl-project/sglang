@@ -438,8 +438,10 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         if not self._enable_deepep_moe:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
+            print("HACK: skip dual stream branch")
             if (
-                self.alt_stream is not None
+                False
+                and self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             ):
