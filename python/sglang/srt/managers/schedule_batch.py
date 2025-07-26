@@ -1689,13 +1689,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
         if self.forward_mode.is_decode_or_idle():
-            attention_backend_str = global_server_args_dict[
-                "decode_attention_backend"
-            ]
+            attention_backend_str = global_server_args_dict["decode_attention_backend"]
         else:
-            attention_backend_str = global_server_args_dict[
-                "prefill_attention_backend"
-            ]
+            attention_backend_str = global_server_args_dict["prefill_attention_backend"]
         # Create seq_lens_cpu when needed
         if (
             attention_backend_str == "fa3"
