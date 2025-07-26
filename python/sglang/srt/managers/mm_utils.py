@@ -749,11 +749,7 @@ def tensor_hash(tensor_list) -> int:
         ]
         tensor = torch.concat(tensor_list)
     if tensor.is_cuda:
-        print(f"{tensor.device.index=}")
-        print(f"{tensor.device=}")
-        print(f"{tensor.get_device=}")
         return gpu_tensor_hash(tensor.cuda())
-        # return gpu_tensor_hash(tensor.contiguous())
     tensor = tensor.detach().contiguous()
 
     if tensor.dtype == torch.bfloat16:
