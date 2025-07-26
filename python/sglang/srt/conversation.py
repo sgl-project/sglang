@@ -997,7 +997,7 @@ register_conv_template(
 
 @register_conv_template_matching_function
 def match_internvl(model_path: str):
-    if re.search(r"internvl2_5", model_path, re.IGNORECASE):
+    if re.search(r"internvl", model_path, re.IGNORECASE):
         return "internvl-2-5"
     if re.search(r"interns1", model_path, re.IGNORECASE):
         return "interns1"
