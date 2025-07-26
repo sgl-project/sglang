@@ -151,6 +151,6 @@ class Glm4MoeDetector(BaseFormatDetector):
             individual_call_end_token=self.eot_token,
             tool_call_separator="\\n",
             function_format="xml",
-            call_rule_fmt='"{name}" "\\n" {arguments_rule}',
+            call_rule_fmt='"{name}" "\\n" {arguments_rule} "\\n"',
             key_value_rule_fmt='"<arg_key>{key}</arg_key>" "\\n" "<arg_value>" {valrule} "</arg_value>"',
         )
