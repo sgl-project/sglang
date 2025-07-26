@@ -954,6 +954,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         assert activation == "silu", "Only SiLU activation is supported."
 
+        if x.shape[0] == 0:
+            return x
+
         if self.enable_flashinfer_moe:
             assert (
                 not apply_router_weight_on_input
