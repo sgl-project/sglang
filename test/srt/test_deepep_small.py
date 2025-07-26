@@ -35,7 +35,7 @@ class TestPureDP(CustomTestCase):
                 "--cuda-graph-max-bs",
                 "128",
                 "--max-running-requests",
-                "128",
+                "512",
                 "--mem-fraction-static",
                 "0.5",
             ],
@@ -81,7 +81,7 @@ class TestHybridDPTP(CustomTestCase):
                 "--cuda-graph-max-bs",
                 "128",
                 "--max-running-requests",
-                "128",
+                "256",
             ],
         )
 
@@ -170,7 +170,7 @@ class TestNoGatherdBuffer(CustomTestCase):
                 "--cuda-graph-max-bs",
                 "32",
                 "--max-running-requests",
-                "128",
+                "512",
             ],
         )
 
@@ -217,7 +217,7 @@ class TestTBO(CustomTestCase):
                 "--cuda-graph-max-bs",
                 "128",
                 "--max-running-requests",
-                "128",
+                "512",
             ],
         )
 
@@ -261,7 +261,7 @@ class TestMTP(CustomTestCase):
                 "--enable-dp-lm-head",
                 "--enable-deepep-moe",
                 "--speculative-algo",
-                "NEXTN",
+                "EAGLE",
                 "--speculative-draft",
                 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
                 "--speculative-num-steps",
@@ -273,7 +273,7 @@ class TestMTP(CustomTestCase):
                 "--cuda-graph-max-bs",
                 "32",
                 "--max-running-requests",
-                "32",
+                "64",
             ],
         )
 
@@ -329,7 +329,7 @@ class TestMTPWithTBO(CustomTestCase):
                 "--enable-deepep-moe",
                 "--trust-remote-code",
                 "--speculative-algorithm",
-                "NEXTN",
+                "EAGLE",
                 "--speculative-num-steps",
                 "2",
                 "--speculative-eagle-topk",
@@ -343,7 +343,7 @@ class TestMTPWithTBO(CustomTestCase):
                 "--cuda-graph-max-bs",
                 "32",
                 "--max-running-requests",
-                "32",
+                "128",
             ],
         )
 
