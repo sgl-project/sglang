@@ -63,12 +63,16 @@ class LogitsProcessorOutput:
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # The logprobs of the next tokens.                              shape: [#seq]
     next_token_logprobs: Optional[torch.Tensor] = None
+    # The origin logprobs of the next tokens.                              shape: [#seq]
+    next_token_original_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
     next_token_top_logprobs_val: Optional[List] = None
     next_token_top_logprobs_idx: Optional[List] = None
+    next_token_top_original_logprobs_val: Optional[List] = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     next_token_token_ids_logprobs_val: Optional[List] = None
     next_token_token_ids_logprobs_idx: Optional[List] = None
+    next_token_token_ids_original_logprobs_idx: Optional[List] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]

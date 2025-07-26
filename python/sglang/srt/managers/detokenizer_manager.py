@@ -225,14 +225,17 @@ class DetokenizerManager:
             input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
             output_token_logprobs_val=recv_obj.output_token_logprobs_val,
             output_token_logprobs_idx=recv_obj.output_token_logprobs_idx,
+            output_token_original_logprobs_val=recv_obj.output_token_original_logprobs_val,
             input_top_logprobs_val=recv_obj.input_top_logprobs_val,
             input_top_logprobs_idx=recv_obj.input_top_logprobs_idx,
             output_top_logprobs_val=recv_obj.output_top_logprobs_val,
             output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
+            output_top_original_logprobs_val=recv_obj.output_top_original_logprobs_val,
             input_token_ids_logprobs_val=recv_obj.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=recv_obj.input_token_ids_logprobs_idx,
             output_token_ids_logprobs_val=recv_obj.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
+            output_token_ids_original_logprobs_val=recv_obj.output_token_ids_original_logprobs_val,
             output_hidden_states=recv_obj.output_hidden_states,
         )
 

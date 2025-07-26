@@ -59,6 +59,7 @@ class Sampler(nn.Module):
                 performs sampling in draft workers.
         """
         logits = logits_output.next_token_logits
+        is_temperatures_one = torch.all(sampling_info.temperatures == 1.0)
 
         # Apply the custom logit processors if registered in the sampling info.
         if sampling_info.has_custom_logit_processor:
@@ -77,7 +78,21 @@ class Sampler(nn.Module):
             batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+                if not is_temperatures_one:
+                    original_logprobs = torch.softmax(
+                        logits_output.next_token_logits, dim=-1
+                    )
+                else:
+                    original_logprobs = logprobs
+
         else:
+            # Post process original logits
+            if not is_temperatures_one:
+                original_logits = logits.clone()
+                original_logits[:] = torch.softmax(original_logits, dim=-1)
+                original_logprobs = original_logits
+                del original_logits
+
             # Post process logits
             logits.div_(sampling_info.temperatures)
             logits[:] = torch.softmax(logits, dim=-1)
@@ -117,6 +132,12 @@ class Sampler(nn.Module):
             if return_logprob:
                 # clamp to avoid -inf
                 logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
+                if not is_temperatures_one:
+                    original_logprobs = torch.log(original_logprobs).clamp(
+                        min=torch.finfo(original_logprobs.dtype).min
+                    )
+                else:
+                    original_logprobs = logprobs
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
@@ -124,15 +145,25 @@ class Sampler(nn.Module):
                 (
                     logits_output.next_token_top_logprobs_val,
                     logits_output.next_token_top_logprobs_idx,
-                ) = get_top_logprobs(logprobs, top_logprobs_nums)
+                    logits_output.next_token_top_original_logprobs_val,
+                ) = get_top_logprobs(
+                    logprobs, original_logprobs, top_logprobs_nums, is_temperatures_one
+                )
 
             if any(x is not None for x in token_ids_logprobs):
                 (
                     logits_output.next_token_token_ids_logprobs_val,
                     logits_output.next_token_token_ids_logprobs_idx,
-                ) = get_token_ids_logprobs(logprobs, token_ids_logprobs)
+                    logits_output.next_token_token_ids_original_logprobs_val,
+                ) = get_token_ids_logprobs(
+                    logprobs, original_logprobs, token_ids_logprobs, is_temperatures_one
+                )
 
             logits_output.next_token_logprobs = logprobs[
+                torch.arange(len(batch_next_token_ids), device=sampling_info.device),
+                batch_next_token_ids,
+            ]
+            logits_output.next_token_original_logprobs = original_logprobs[
                 torch.arange(len(batch_next_token_ids), device=sampling_info.device),
                 batch_next_token_ids,
             ]
@@ -201,32 +232,66 @@ def top_p_normalize_probs_torch(
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
 
 
-def get_top_logprobs(logprobs: torch.Tensor, top_logprobs_nums: List[int]):
+def get_top_logprobs(
+    logprobs: torch.Tensor,
+    original_logprobs: torch.Tensor,
+    top_logprobs_nums: List[int],
+    is_temperture_one: bool,
+):
     max_k = max(top_logprobs_nums)
     ret = logprobs.topk(max_k, dim=1)
     values = ret.values.tolist()
     indices = ret.indices.tolist()
+    origin_ret = original_logprobs.topk(max_k, dim=1)
+    origin_values = origin_ret.values.tolist()
 
     output_top_logprobs_val = []
     output_top_logprobs_idx = []
+    output_top_original_logprobs_val = []
     for i, k in enumerate(top_logprobs_nums):
         output_top_logprobs_val.append(values[i][:k])
         output_top_logprobs_idx.append(indices[i][:k])
-    return output_top_logprobs_val, output_top_logprobs_idx
+        if not is_temperture_one:
+            output_top_original_logprobs_val.append(origin_values[i][:k])
+    if is_temperture_one:
+        output_top_original_logprobs_val = output_top_logprobs_val
+    return (
+        output_top_logprobs_val,
+        output_top_logprobs_idx,
+        output_top_original_logprobs_val,
+    )
 
 
-def get_token_ids_logprobs(logprobs: torch.Tensor, token_ids_logprobs: List[List[int]]):
+def get_token_ids_logprobs(
+    logprobs: torch.Tensor,
+    original_logprobs: torch.Tensor,
+    token_ids_logprobs: List[List[int]],
+    is_temperture_one: bool,
+):
     output_token_ids_logprobs_val = []
     output_token_ids_logprobs_idx = []
+    output_token_ids_original_logprobs_val = []
     for i, token_ids in enumerate(token_ids_logprobs):
         if token_ids is not None:
             output_token_ids_logprobs_val.append(logprobs[i, token_ids].tolist())
             output_token_ids_logprobs_idx.append(token_ids)
+            if not is_temperture_one:
+                output_token_ids_original_logprobs_val.append(
+                    original_logprobs[i, token_ids].tolist()
+                )
         else:
             output_token_ids_logprobs_val.append([])
             output_token_ids_logprobs_idx.append([])
+            if not is_temperture_one:
+                output_token_ids_original_logprobs_val.append([])
+        if is_temperture_one:
+            output_token_ids_original_logprobs_val = output_token_ids_logprobs_val
 
-    return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
+    return (
+        output_token_ids_logprobs_val,
+        output_token_ids_logprobs_idx,
+        output_token_ids_original_logprobs_val,
+    )
 
 
 def apply_custom_logit_processor(

@@ -745,12 +745,15 @@ class EAGLEWorker(TpModelWorker):
         token_ids_logprobs = batch.token_ids_logprobs
         accepted_indices = res.accepted_indices
         assert len(accepted_indices) == len(logits_output.next_token_logits)
+        is_temperatures_one = torch.all(batch.sampling_info.temperatures == 1.0)
         temperatures = batch.sampling_info.temperatures
         num_draft_tokens = batch.spec_info.draft_token_num
         # acceptance indices are the indices in a "flattened" batch.
         # dividing it to num_draft_tokens will yield the actual batch index.
         temperatures = temperatures[accepted_indices // num_draft_tokens]
-
+        original_logprobs = torch.nn.functional.log_softmax(
+            logits_output.next_token_logits, dim=-1
+        )
         logprobs = torch.nn.functional.log_softmax(
             logits_output.next_token_logits / temperatures, dim=-1
         )
@@ -770,13 +773,25 @@ class EAGLEWorker(TpModelWorker):
             (
                 logits_output.next_token_top_logprobs_val,
                 logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums_repeat_interleaved)
+                logits_output.next_token_top_original_logprobs_val,
+            ) = get_top_logprobs(
+                logprobs,
+                original_logprobs,
+                top_logprobs_nums_repeat_interleaved,
+                is_temperatures_one,
+            )
 
         if any(x is not None for x in token_ids_logprobs):
             (
                 logits_output.next_token_token_ids_logprobs_val,
                 logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(logprobs, token_ids_logprobs_repeat_interleaved)
+                logits_output.next_token_token_ids_original_logprobs_val,
+            ) = get_token_ids_logprobs(
+                logprobs,
+                original_logprobs,
+                token_ids_logprobs_repeat_interleaved,
+                is_temperatures_one,
+            )
 
         logits_output.next_token_logprobs = logprobs[
             torch.arange(len(batch_next_token_ids), device=batch.sampling_info.device),
