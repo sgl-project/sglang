@@ -144,7 +144,6 @@ class TpModelWorker:
             self.tp_size * self.pp_rank + tp_rank,
             self.world_group.cpu_group,
             src=self.world_group.ranks[0],
-            device=self.device,
         )[0]
         set_random_seed(self.random_seed)
 
@@ -294,11 +293,9 @@ class TpModelWorker:
         return parameter
 
     def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
-        result = self.model_runner.load_lora_adapter(
-            recv_req.lora_name, recv_req.lora_path
-        )
+        result = self.model_runner.load_lora_adapter(recv_req.to_ref())
         return result
 
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
-        result = self.model_runner.unload_lora_adapter(recv_req.lora_name)
+        result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
