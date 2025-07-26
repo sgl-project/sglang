@@ -66,6 +66,10 @@ class PrefillMetadata:
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
 
+# Use as a fast path to override the indptr in flashinfer's plan function
+# This is used to remove some host-to-device copy overhead.
+global_override_indptr_cpu = None
+
 
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
@@ -775,7 +779,9 @@ class FlashInferIndicesUpdaterDecode:
             )
 
         global global_override_indptr_cpu
-        if seq_lens_cpu is not None:
+        locally_override = False
+        if seq_lens_cpu is not None and global_override_indptr_cpu is None:
+            locally_override = True
             global_override_indptr_cpu = torch.empty_like(kv_indptr, device="cpu")
             global_override_indptr_cpu[0] = 0
             global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(seq_lens_cpu, dim=0)
@@ -793,7 +799,7 @@ class FlashInferIndicesUpdaterDecode:
             non_blocking=True,
         )
 
-        if seq_lens_cpu is not None:
+        if locally_override:
             global_override_indptr_cpu = None
 
 
@@ -1051,11 +1057,6 @@ class FlashInferIndicesUpdaterPrefill:
         )
 
 
-# Use as a fast path to override the indptr in flashinfer's plan function
-# This is used to remove some host-to-device copy overhead.
-global global_override_indptr_cpu
-
-
 class FlashInferMultiStepDraftBackend:
     """
     Wrap multiple flashinfer attention backends as one for multiple consecutive
@@ -1087,7 +1088,7 @@ class FlashInferMultiStepDraftBackend:
         self.kv_last_page_len = torch.ones(
             (max_bs,), dtype=torch.int32, device=model_runner.device
         )
-        self.attn_backends = []
+        self.attn_backends: List[FlashInferAttnBackend] = []
         for i in range(self.speculative_num_steps):
             self.attn_backends.append(
                 FlashInferAttnBackend(
@@ -1207,7 +1208,7 @@ class FlashInferMultiStepDraftBackend:
                 encoder_lens=None,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
-                seq_lens_cpu=None,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
