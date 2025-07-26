@@ -117,6 +117,8 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 
+ENABLE_TRTLLM_GEN_MOE = get_bool_env_var("SGLANG_ENABLE_TRTLLM_GEN_MOE", "false")
+
 if _is_cuda:
     from sgl_kernel import (
         awq_dequantize,
@@ -227,9 +229,10 @@ class MoEGate(nn.Module):
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
+        routing_bias_dtype = torch.bfloat16 if ENABLE_TRTLLM_GEN_MOE else torch.float32
         if config.topk_method == "noaux_tc":
             self.e_score_correction_bias = nn.Parameter(
-                torch.empty((config.n_routed_experts), dtype=torch.float32)
+                torch.empty((config.n_routed_experts), dtype=routing_bias_dtype)
             )
         else:
             self.e_score_correction_bias = None
@@ -246,6 +249,11 @@ class MoEGate(nn.Module):
             )
 
         # NOTE: For some unknown reason, router_gemm seems degrade accept length.
+        if ENABLE_TRTLLM_GEN_MOE and not self.is_nextn:
+            return torch.ops.trtllm.dsv3_router_gemm_op(
+                hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
+            )
+
         if (
             _is_cuda
             and not self.is_nextn
@@ -258,7 +266,6 @@ class MoEGate(nn.Module):
             logits = dsv3_router_gemm(hidden_states, self.weight)
         else:
             logits = F.linear(hidden_states, self.weight, None)
-
         return logits
 
 
@@ -447,15 +454,21 @@ class DeepseekV2MoE(nn.Module):
     def forward_normal_dual_stream(
         self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False
     ) -> torch.Tensor:
+        if not ENABLE_TRTLLM_GEN_MOE:
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
 
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states)
 
         with torch.cuda.stream(self.alt_stream):
-            # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            if ENABLE_TRTLLM_GEN_MOE:
+                # router_logits: (num_tokens, n_experts)
+                router_logits = self.gate(hidden_states)
+                topk_output = (self.topk, router_logits)
+            else:
+                topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, topk_output=topk_output
             )
@@ -478,7 +491,10 @@ class DeepseekV2MoE(nn.Module):
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        if ENABLE_TRTLLM_GEN_MOE:
+            topk_output = (self.topk, router_logits)
+        else:
+            topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, topk_output=topk_output
         )
