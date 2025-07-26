@@ -496,6 +496,12 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
         # if shared_output is not None:
         #     final_hidden_states = final_hidden_states + shared_output
+
+        print("HACK: make final_hidden_states and shared_output double")
+        assert final_hidden_states.dtype == shared_output.dtype == torch.bfloat16
+        final_hidden_states = final_hidden_states.double()
+        shared_output = shared_output.double()
+
         if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
@@ -504,6 +510,8 @@ class DeepseekV2MoE(nn.Module):
             dumper.dump("dpskmoe_willadd_final_hidden_states", final_hidden_states, layer_id=self.layer_id)
             dumper.dump("dpskmoe_willadd_shared_output", shared_output, layer_id=self.layer_id)
             final_hidden_states = final_hidden_states + shared_output
+
+        final_hidden_states = final_hidden_states.to(torch.bfloat16)
 
         return final_hidden_states
 
