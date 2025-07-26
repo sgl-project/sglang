@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -964,6 +965,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
             topk_weights, topk_ids, _ = topk_output
+
+            dumper.dump("cppmoe_x", x, layer_id=layer.layer_id)
+            dumper.dump("cppmoe_topk_ids", topk_ids, layer_id=layer.layer_id)
+            dumper.dump("cppmoe_topk_weights", topk_weights, layer_weight=layer.layer_weight)
+            print(f"{ep_size=} {ep_rank=} {tp_size=} {tp_rank=}")
 
             output = flashinfer_cutlass_fused_moe(
                 x,

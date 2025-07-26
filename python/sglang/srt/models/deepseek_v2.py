@@ -26,6 +26,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
+
+from sglang.srt.debug_utils.dumper import dumper
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -2155,6 +2157,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        dumper.on_forward_pass_start()
+
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
         return self.logits_processor(
