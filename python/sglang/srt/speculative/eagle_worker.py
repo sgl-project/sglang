@@ -149,10 +149,43 @@ class EAGLEWorker(TpModelWorker):
             if self.hot_token_id is not None:
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
-                head.data = head.data[self.hot_token_id]
+                # Create a boolean mask for hot tokens
+                vocab_size = head.data.shape[0]
+                mask_hot = torch.zeros(vocab_size, dtype=torch.bool, device=head.device)
+                mask_hot[self.hot_token_id] = True
+                # Save the number of cold tokens
+                self.num_cold_tokens = torch.sum(~mask_hot).item()
+                # Sum up the cold rows of the LM head
+                tail_sum = torch.sum(head.data[~mask_hot], dim=0)
+                # Remove cold rows
+                head.data = head.data[mask_hot]
+                # Add a row to sum up the cold rows
+                head.data = torch.cat([head.data, tail_sum.unsqueeze(0)], dim=0)
 
             # Share the embedding and lm_head
             self.draft_model_runner.model.set_embed_and_head(embed, head)
+
+        # Load weaker drafter map if provided
+        self.weaker_drafter = None
+        if server_args.speculative_weaker_drafter_probs is not None:
+            weaker_drafter_all_vocab = load_tensor_from_path(
+                server_args.speculative_weaker_drafter_probs
+            ).to(self.device)
+
+            if self.hot_token_id is not None:
+                # The loaded weaker_drafter is for the full vocabulary.
+                # We need to select the values for the cold tokens.
+                vocab_size = weaker_drafter_all_vocab.shape[0]
+                mask_hot = torch.zeros(vocab_size, dtype=torch.bool, device=self.device)
+                mask_hot[self.hot_token_id.to(self.device)] = True
+                self.weaker_drafter = weaker_drafter_all_vocab[~mask_hot]
+                # Normalize the weaker drafter
+                self.weaker_drafter = self.weaker_drafter / self.weaker_drafter.sum()
+            else:
+                # If there is no hot token map, all tokens are considered cold.
+                # However, the weaker_drafter logic is only triggered when there is
+                # a hot/cold split, so we do nothing here.
+                pass
 
         # Init attention backend and cuda graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (
@@ -630,7 +663,9 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch, skip_attn_backend_init=True
             )
             self._detect_nan_if_needed(logits_output)
+            self._post_process_draft_logits(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            probs = self._post_process_draft_probs(probs)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
@@ -905,10 +940,51 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info.accept_length = accept_length_backup
         batch.return_logprob = return_logprob_backup
 
+    def _post_process_draft_logits(self, logits_output: LogitsProcessorOutput):
+        """Lower bound the ExpSumLog for out-of-vocab tokens."""
+        if not hasattr(self, "num_cold_tokens") or self.num_cold_tokens == 0:
+            return
+
+        # Note: The last entry of the logits corresponds to the sum of cold tokens
+        logits = logits_output.next_token_logits
+        cold_token_logits = logits[..., -1]
+
+        num_cold_tokens_tensor = torch.tensor(
+            self.num_cold_tokens, device=logits.device, dtype=logits.dtype
+        )
+
+        logits[..., -1] = (
+            torch.log(num_cold_tokens_tensor) + cold_token_logits / self.num_cold_tokens
+        )
+
+    def _post_process_draft_probs(self, probs: torch.Tensor) -> torch.Tensor:
+        """Redistribute the probability mass of cold tokens."""
+        if (
+            not hasattr(self, "num_cold_tokens")
+            or self.num_cold_tokens == 0
+            or not hasattr(self, "weaker_drafter")
+            or self.weaker_drafter is None
+        ):
+            return probs
+
+        # Note: The last entry of the probs lower bounds the accumulated probability of cold tokens
+        cold_token_probs = probs[..., -1].unsqueeze(1)
+        hot_token_probs = probs[..., :-1]
+
+        # Reshape weaker_drafter for broadcasting
+        weaker_drafter_reshaped = self.weaker_drafter.unsqueeze(0)
+
+        # Redistribute probabilities
+        redistributed_cold_probs = cold_token_probs * weaker_drafter_reshaped
+
+        return torch.cat([hot_token_probs, redistributed_cold_probs], dim=-1)
+
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
+        self._post_process_draft_logits(logits_output)
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+        probs = self._post_process_draft_probs(probs)
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
 
@@ -918,6 +994,21 @@ class EAGLEWorker(TpModelWorker):
             if torch.any(torch.isnan(logits)):
                 logger.error("Detected errors during sampling! NaN in the logits.")
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
+
+
+def load_tensor_from_path(tensor_path: str) -> torch.Tensor:
+    if not os.path.exists(tensor_path):
+        cache_dir = snapshot_download(
+            os.path.dirname(tensor_path),
+            # Avoid downloading the large model weights
+            ignore_patterns=["*.bin", "*.safetensors"],
+        )
+        tensor_path = os.path.join(cache_dir, os.path.basename(tensor_path))
+    tensor = torch.load(tensor_path, weights_only=True)
+    if not isinstance(tensor, torch.Tensor):
+        # The loaded object could be a list of numbers
+        tensor = torch.tensor(tensor)
+    return tensor
 
 
 def load_token_map(token_map_path: str) -> List[int]:
