@@ -549,12 +549,9 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if self.storage_batchedio:
                     if self.storage_zerocopy:
-                        logger.info("batch get called")
-                        logger.info(f"len keys: {len(operation.hash_value)}")
                         key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(operation.hash_value,
                                                                                      operation.host_indices)
                         self.storage_backend.batch_get(key_strs, buffer_ptrs, buffer_sizes)
-                        logger.info("batch get end")
                     else:
                         pass
                     operation.increment(len(operation.hash_value) * self.page_size)
@@ -732,7 +729,7 @@ class HiCacheController:
                                 key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(non_exist_keys,
                                                                                                  non_exist_indices)
                                 self.storage_backend.batch_set(key_strs, target_location=buffer_ptrs, target_sizes=buffer_sizes)
-    
+
                         operation.completed_tokens += len(hash_value) * self.page_size
                     else:
                         #unimplemented
