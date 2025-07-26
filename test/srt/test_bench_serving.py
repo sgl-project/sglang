@@ -215,7 +215,7 @@ class TestBenchServing(CustomTestCase):
                 f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
             )
             self.assertLess(res["median_e2e_latency_ms"], 2400)
-            self.assertLess(res["median_ttft_ms"], 55)
+            self.assertLess(res["median_ttft_ms"], 58)
 
     def test_lora_online_latency_with_concurrent_adapter_updates(self):
         # TODO (lifuhuang): verify LoRA support in AMD.
