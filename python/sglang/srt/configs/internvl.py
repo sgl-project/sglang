@@ -7,11 +7,10 @@ import sentencepiece as spm
 from transformers import (
     TOKENIZER_MAPPING,
     LlamaConfig,
-    Qwen2Config,
-    Qwen3Config,
     PretrainedConfig,
     PreTrainedTokenizer,
     Qwen2Config,
+    Qwen3Config,
 )
 
 from sglang.utils import logger
