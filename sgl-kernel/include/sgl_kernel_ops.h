@@ -66,6 +66,13 @@ void register_graph_buffers(
     fptr_t _fa, const std::vector<std::string>& handles, const std::vector<std::vector<int64_t>>& offsets);
 torch::Tensor allocate_meta_buffer(int64_t size);
 torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor& inp);
+// quick allreduce
+fptr_t init_custom_qr(int64_t rank, int64_t world_size, std::optional<int64_t> qr_max_size = std::nullopt);
+void qr_destroy(fptr_t _fa);
+torch::Tensor qr_get_handle(fptr_t _fa);
+void qr_open_handles(fptr_t _fa, const std::vector<torch::Tensor>& handles);
+void qr_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int64_t quant_level, bool cast_bf2half = false);
+int64_t qr_max_size();
 #else
 // custom allreduce
 fptr_t
@@ -77,6 +84,8 @@ std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta
 void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs);
 void register_graph_buffers(
     fptr_t _fa, const std::vector<std::vector<int64_t>>& handles, const std::vector<std::vector<int64_t>>& offsets);
+
+// mscclpp
 torch::Tensor mscclpp_generate_unique_id();
 fptr_t mscclpp_init_context(
     const torch::Tensor& unique_id,
@@ -129,9 +138,10 @@ void sgl_fused_add_rmsnorm(
     torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps, bool enable_pdl);
 void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
-void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
-void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
-void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+void silu_and_mul(at::Tensor& out, at::Tensor& input);
+void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input);
+void gelu_and_mul(at::Tensor& out, at::Tensor& input);
+
 void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor q,
     at::Tensor k,
@@ -142,6 +152,9 @@ void apply_rope_pos_ids_cos_sin_cache(
     bool interleave,
     int64_t cuda_stream);
 
+#ifdef USE_ROCM
+void gelu_quick(at::Tensor& out, const at::Tensor& input);
+#endif
 /*
  * From csrc/gemm
  */
@@ -399,16 +412,7 @@ void transfer_kv_per_layer(
     int64_t block_quota,
     int64_t num_warps_per_block);
 
-void transfer_kv_per_layer_direct(
-    const at::Tensor src_k,
-    at::Tensor dst_k,
-    const at::Tensor src_v,
-    at::Tensor dst_v,
-    const at::Tensor src_indices,
-    const at::Tensor dst_indices,
-    int64_t page_size);
-
-void transfer_kv_all_layer(
+void transfer_kv_per_layer_pf_lf(
     const at::Tensor src_k,
     at::Tensor dst_k,
     const at::Tensor src_v,
@@ -416,21 +420,34 @@ void transfer_kv_all_layer(
     const at::Tensor src_indices,
     const at::Tensor dst_indices,
     int64_t item_size,
-    int64_t num_layers,
-    int64_t src_layer_offset,
-    int64_t dst_layer_offset,
+    int64_t src_layout_dim,
     int64_t block_quota,
     int64_t num_warps_per_block);
 
-void transfer_kv_all_layer_direct(
-    const at::Tensor src_k,
+void transfer_kv_all_layer(
+    const at::Tensor src_k_layers,
+    const at::Tensor dst_k_layers,
+    const at::Tensor src_v_layers,
+    const at::Tensor dst_v_layers,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_all_layer_lf_pf(
+    const at::Tensor src_k_layers,
     at::Tensor dst_k,
-    const at::Tensor src_v,
+    const at::Tensor src_v_layers,
     at::Tensor dst_v,
     const at::Tensor src_indices,
     const at::Tensor dst_indices,
-    int64_t page_size,
-    int64_t num_layers);
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
 
 void transfer_kv_per_layer_mla(
     const at::Tensor src,
@@ -441,32 +458,43 @@ void transfer_kv_per_layer_mla(
     int64_t block_quota,
     int64_t num_warps_per_block);
 
-void transfer_kv_per_layer_mla_direct(
-    const at::Tensor src,
-    at::Tensor dst,
-    const at::Tensor src_indices,
-    const at::Tensor dst_indices,
-    int64_t page_size);
-
-void transfer_kv_all_layer_mla(
+void transfer_kv_per_layer_mla_pf_lf(
     const at::Tensor src,
     at::Tensor dst,
     const at::Tensor src_indices,
     const at::Tensor dst_indices,
     int64_t item_size,
-    int64_t num_layers,
-    int64_t src_layer_offset,
-    int64_t dst_layer_offset,
+    int64_t src_layout_dim,
     int64_t block_quota,
     int64_t num_warps_per_block);
 
-void transfer_kv_all_layer_mla_direct(
-    const at::Tensor src,
+void transfer_kv_all_layer_mla(
+    const at::Tensor src_layers,
+    const at::Tensor dst_layers,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_all_layer_mla_lf_pf(
+    const at::Tensor src_layers,
     at::Tensor dst,
     const at::Tensor src_indices,
     const at::Tensor dst_indices,
-    int64_t page_size,
-    int64_t num_layers);
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_direct(
+    const std::vector<at::Tensor>& src_layers,
+    std::vector<at::Tensor> dst_layers,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t page_size);
 
 /*
  * From csrc/moe/cutlass_moe/w4a8

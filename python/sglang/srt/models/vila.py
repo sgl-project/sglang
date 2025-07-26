@@ -237,7 +237,7 @@ class VILAForConditionalGeneration(nn.Module):
         return cast(LogitsProcessorOutput, output)
 
     def get_image_feature(self, mm_input: List[MultimodalDataItem]) -> Tensor:
-        pixel_values = cast(Tensor, mm_input[0].pixel_values)
+        pixel_values = cast(Tensor, mm_input[0].feature)
 
         ##### BEGIN COPY modeling_vila.py #####
 
