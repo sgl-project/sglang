@@ -628,11 +628,18 @@ class TestEBNFGeneration(unittest.TestCase):
         """Test that the Glm4MoeDetector generates valid EBNF."""
         ebnf = self.glm45_detector.build_ebnf(self.tools)
         self.assertIsNotNone(ebnf)
-
-        # Check that the EBNF contains expected patterns
-        self.assertIn("<tool_call>", ebnf)
-        self.assertIn('\\"name\\"" ":" "\\"get_weather\\"', ebnf)
-        self.assertIn('"\\"arguments\\"" ":"', ebnf)
+        # Check that the EBNF contains expected patterns for XML format
+        self.assertIn('"<tool_call>" function_call "</tool_call>"', ebnf)
+        self.assertIn('"get_weather" "\\n" arguments_get_weather', ebnf)
+        self.assertIn('"<arg_key>location</arg_key>" "\\n" "<arg_value>" xml_text "</arg_value>" ( "\\n" ( "<arg_key>unit</arg_key>" "\\n" "<arg_value>" ("celsius" | "fahrenheit") "</arg_value>" ) )?', ebnf)
+        self.assertIn('"search" "\\n" arguments_search', ebnf)
+        self.assertIn('"<arg_key>query</arg_key>" "\\n" "<arg_value>" xml_text "</arg_value>"', ebnf)
+        # Validate that the EBNF can be compiled by GrammarCompiler
+        try:
+            ctx = self.grammar_compiler.compile_grammar(ebnf)
+            self.assertIsNotNone(ctx, "EBNF should be valid and compile successfully")
+        except RuntimeError as e:
+            self.fail(f"Failed to compile EBNF: {e}")
 
     def test_qwen3_coder_detector_ebnf(self):
         """Test that the Qwen3CoderDetector generates valid EBNF."""

@@ -695,9 +695,7 @@ class TestGLM45ServerFunctionCalling(TestOpenAIServerFunctionCalling):
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
 
-    def test_function_call_specific(self):
-        pass
-
+    # This test is too difficult for GLM4-moe. Skip it from the UT
     def test_function_call_required(self):
         pass
 
