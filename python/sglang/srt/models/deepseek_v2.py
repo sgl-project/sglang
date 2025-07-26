@@ -351,7 +351,6 @@ class DeepseekV2MoE(nn.Module):
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
-            print("HACK: shared_experts be DP!!")
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -361,8 +360,7 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    # if global_server_args_dict["enable_deepep_moe"]
-                    if True
+                    if global_server_args_dict["enable_deepep_moe"]
                     else {}
                 ),
             )
@@ -497,10 +495,14 @@ class DeepseekV2MoE(nn.Module):
         # if shared_output is not None:
         #     final_hidden_states = final_hidden_states + shared_output
 
-        print("HACK: make final_hidden_states and shared_output float")
-        assert final_hidden_states.dtype == shared_output.dtype == torch.bfloat16
-        final_hidden_states = final_hidden_states.float()
-        shared_output = shared_output.float()
+        # print("HACK: make final_hidden_states and shared_output float")
+        # assert final_hidden_states.dtype == shared_output.dtype == torch.bfloat16
+        # final_hidden_states = final_hidden_states.float()
+        # shared_output = shared_output.float()
+
+        if shared_output is not None:
+            print("HACK: pre-allreduce shared")
+            shared_output = tensor_model_parallel_all_reduce(shared_output)
 
         if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -511,7 +513,7 @@ class DeepseekV2MoE(nn.Module):
             dumper.dump("dpskmoe_willadd_shared_output", shared_output, layer_id=self.layer_id)
             final_hidden_states = final_hidden_states + shared_output
 
-        final_hidden_states = final_hidden_states.to(torch.bfloat16)
+        # final_hidden_states = final_hidden_states.to(torch.bfloat16)
 
         return final_hidden_states
 
