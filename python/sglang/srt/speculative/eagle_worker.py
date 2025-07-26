@@ -917,12 +917,10 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info.accept_length = accept_length_backup
         batch.return_logprob = return_logprob_backup
 
-    def _post_process_draft_logits(
-        self, logits_output: LogitsProcessorOutput
-    ) -> LogitsProcessorOutput:
+    def _post_process_draft_logits(self, logits_output: LogitsProcessorOutput) -> None:
         """Lower bound the ExpSumLog for out-of-vocab tokens."""
         if not hasattr(self, "num_cold_tokens") or self.num_cold_tokens == 0:
-            return logits_output
+            return
 
         # Note: The last entry of the logits corresponds to the sum of cold tokens
         logits = logits_output.next_token_logits
@@ -935,7 +933,6 @@ class EAGLEWorker(TpModelWorker):
         logits[..., -1] = (
             torch.log(num_cold_tokens_tensor) + cold_token_logits / self.num_cold_tokens
         )
-        return logits_output
 
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
