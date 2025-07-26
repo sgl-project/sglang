@@ -24,7 +24,7 @@ class VLMInputTestBase:
     model_path = None
     chat_template = None
     processor = None
-    visual = None  # Should be a callable for precomputed features
+    visual = None  # Should be a callable for precomputed embeddings
 
     @classmethod
     def setUpClass(cls):
@@ -41,7 +41,7 @@ class VLMInputTestBase:
 
     @classmethod
     def _init_visual(cls):
-        """Override in subclass to set up cls.visual as a callable for precomputed features."""
+        """Override in subclass to set up cls.visual as a callable for precomputed embeddings."""
         raise NotImplementedError
 
     def setUp(self):

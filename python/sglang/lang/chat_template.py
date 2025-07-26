@@ -450,6 +450,19 @@ register_chat_template(
 
 register_chat_template(
     ChatTemplate(
+        name="interns1",
+        default_system_prompt="You are an AI assistant whose name is Intern-S1 (书生大模型).\n- Intern-S1 (书生大模型) is a vision-language model that is developed by Shanghai AI Laboratory (上海人工智能实验室).  It is designed to be helpful, honest, and harmless.\n- Intern-S1 (书生大模型) can understand and communicate fluently in the language chosen by the user such as English and 中文.\nYou are an expert reasoner with extensive experience in all areas. You approach problems through systematic thinking and rigorous reasoning. Your response should reflect deep understanding and precise logical thinking, making your solution path and reasoning clear to others. Please put your thinking process within <think>...</think> tags.",
+        role_prefix_and_suffix={
+            "system": ("<|im_start|>system\n", "<|im_end|>\n"),
+            "user": ("<|im_start|>user\n", "<|im_end|>\n"),
+            "assistant": ("<|im_start|>assistant\n", "<|im_end|>\n"),
+        },
+        stop_str=["<|im_end|>", "<|action_end|>"],
+    )
+)
+
+register_chat_template(
+    ChatTemplate(
         name="granite-3-instruct",
         default_system_prompt=None,
         role_prefix_and_suffix={
@@ -607,6 +620,14 @@ def match_gemma3_instruct(model_path: str):
 def match_internvl_chat(model_path: str):
     if re.search(r"internvl2_5", model_path, re.IGNORECASE):
         return "internvl-2-5"
+
+
+@register_chat_template_matching_function
+def match_interns1_chat(model_path: str):
+    if re.search(r"intern-s1", model_path, re.IGNORECASE):
+        return "interns1"
+    if re.search(r"interns1", model_path, re.IGNORECASE):
+        return "interns1"
 
 
 if __name__ == "__main__":
