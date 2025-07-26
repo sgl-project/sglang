@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.metrics.collector import SchedulerMetricsCollector
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     format_tcp_address,
@@ -137,11 +138,13 @@ class MooncakeKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        scheduler_metrics_collector: Optional[SchedulerMetricsCollector] = None,
     ):
         self.kv_args = args
         self.local_ip = get_local_ip_auto()
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
+        self.scheduler_metrics_collector = scheduler_metrics_collector
         self.init_engine()
         # for p/d multi node infer
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -953,6 +956,11 @@ class MooncakeKVSender(BaseKVSender):
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
+                if (
+                    status == KVPoll.Failed
+                    and self.kv_mgr.scheduler_metrics_collector is not None
+                ):
+                    self.kv_mgr.scheduler_metrics_collector.increment_transfer_failed_reqs()
                 self.conclude_state = status
             elif status == KVPoll.Bootstrapping:
                 if self.init_time is not None:
@@ -969,6 +977,8 @@ class MooncakeKVSender(BaseKVSender):
                             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.Bootstrapping",
                         )
                         self.conclude_state = KVPoll.Failed
+                        if self.kv_mgr.scheduler_metrics_collector is not None:
+                            self.kv_mgr.scheduler_metrics_collector.increment_bootstrap_failed_reqs()
                         return KVPoll.Failed
 
             return status
@@ -1025,6 +1035,8 @@ class MooncakeKVReceiver(BaseKVReceiver):
                     f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
                 )
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                if self.kv_mgr.scheduler_metrics_collector is not None:
+                    self.kv_mgr.scheduler_metrics_collector.increment_bootstrap_failed_reqs()
                 return
             else:
                 logger.debug(
@@ -1134,6 +1146,8 @@ class MooncakeKVReceiver(BaseKVReceiver):
                         f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {self.target_dp_group}",
                     )
                     self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    if self.kv_mgr.scheduler_metrics_collector is not None:
+                        self.kv_mgr.scheduler_metrics_collector.increment_bootstrap_failed_reqs()
                     return
 
             self.bootstrap_infos = bootstrap_infos
