@@ -540,6 +540,10 @@ class CudaGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_paths=lora_paths,
+            # Add dummy request mapping for CUDA graph capture
+            # seq_id should be int type (sequence index within request)
+            request_ids_to_seq_ids={str(i): [0] for i in range(bs)},
+            finished_requests_ids=[],
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -571,6 +575,12 @@ class CudaGraphRunner:
                     {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                 )
 
+            # Add seqlen_agnostic_capture_inputs for models that need it (like MiniMax)
+            if hasattr(self.model_runner.model, "get_seqlen_agnostic_capture_inputs"):
+                kwargs["seqlen_agnostic_capture_inputs"] = (
+                    self.model_runner.model.get_seqlen_agnostic_capture_inputs(bs)
+                )
+
             logits_output_or_pp_proxy_tensors = forward(
                 input_ids,
                 forward_batch.positions,
@@ -590,6 +600,15 @@ class CudaGraphRunner:
             out = run_once()
 
         global_graph_memory_pool = graph.pool()
+
+        # Save seqlen_agnostic_capture_inputs for replay if model supports it
+        if hasattr(self.model_runner.model, "get_seqlen_agnostic_capture_inputs"):
+            if not hasattr(self, "seqlen_agnostic_capture_inputs_by_bs"):
+                self.seqlen_agnostic_capture_inputs_by_bs = {}
+            self.seqlen_agnostic_capture_inputs_by_bs[bs] = (
+                self.model_runner.model.get_seqlen_agnostic_capture_inputs(bs)
+            )
+
         return graph, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
@@ -693,6 +712,34 @@ class CudaGraphRunner:
             forward_batch.spec_info,
             seq_lens_cpu=self.seq_lens_cpu[:bs],
         )
+
+        # Copy inputs for models that need seqlen_agnostic_capture_inputs (like MiniMax)
+        if hasattr(self.model_runner.model, "copy_inputs_before_cuda_graphs"):
+            # Prepare the input_buffers that would contain seqlen_agnostic_capture_inputs
+            input_buffers = {}
+            if (
+                hasattr(self, "seqlen_agnostic_capture_inputs_by_bs")
+                and bs in self.seqlen_agnostic_capture_inputs_by_bs
+            ):
+                input_buffers["seqlen_agnostic_capture_inputs"] = (
+                    self.seqlen_agnostic_capture_inputs_by_bs[bs]
+                )
+
+            # 只使用真实的映射信息，不生成fallback映射
+            kwargs = {
+                "request_ids_to_seq_ids": getattr(
+                    forward_batch, "request_ids_to_seq_ids", None
+                )
+                or {},
+                "finished_requests_ids": getattr(
+                    forward_batch, "finished_requests_ids", None
+                )
+                or [],
+            }
+            if input_buffers:
+                self.model_runner.model.copy_inputs_before_cuda_graphs(
+                    input_buffers, **kwargs
+                )
 
         # Store fields
         self.raw_bs = raw_bs

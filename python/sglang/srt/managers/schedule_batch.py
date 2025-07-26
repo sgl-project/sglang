@@ -37,7 +37,7 @@ import logging
 import threading
 from enum import Enum, auto
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -1736,6 +1736,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
             token_type_ids=self.token_type_ids,
+            # Construct request_ids_to_seq_ids mapping with proper cache isolation
+            # For independent requests (no session), use unique seq_id for each request
+            # For session-based requests, requests in same session share seq_id
+            request_ids_to_seq_ids=self._build_request_seq_mapping(),
+            finished_requests_ids=[],  # Will be populated by scheduler when requests finish
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             hicache_consumer_index=self.hicache_consumer_index,
@@ -1824,6 +1829,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             f"#req={(len(self.reqs))})"
         )
 
+    def _build_request_seq_mapping(self):
+        """构建request_ids_to_seq_ids映射，确保独立请求使用不同的seq_id，避免缓存污染"""
+        request_ids_to_seq_ids = {}
+        session_to_seq_map = {}
+        next_seq_id = 0
+
+        for req in self.reqs:
+            # 检查请求是否有session_id用于缓存共享
+            if hasattr(req, "session_id") and req.session_id:
+                # 基于会话的请求：同一会话内共享seq_id（多轮对话复用缓存）
+                if req.session_id not in session_to_seq_map:
+                    session_to_seq_map[req.session_id] = next_seq_id
+                    next_seq_id += 1
+                seq_id = session_to_seq_map[req.session_id]
+                request_ids_to_seq_ids[req.rid] = [seq_id]
+            else:
+                # 独立请求：使用唯一的seq_id避免缓存污染
+                # 每个独立请求都分配新的seq_id，确保缓存完全隔离
+                request_ids_to_seq_ids[req.rid] = [next_seq_id]
+                next_seq_id += 1
+
+        return request_ids_to_seq_ids
+
 
 @dataclasses.dataclass
 class ModelWorkerBatch:
@@ -1883,6 +1911,10 @@ class ModelWorkerBatch:
 
     # For corss-encoder model
     token_type_ids: Optional[torch.Tensor] = None
+
+    # For MiniMax cache management (carry real request IDs)
+    request_ids_to_seq_ids: Optional[Dict[str, List[int]]] = None
+    finished_requests_ids: Optional[List[str]] = None
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
