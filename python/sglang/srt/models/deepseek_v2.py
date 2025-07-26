@@ -351,6 +351,7 @@ class DeepseekV2MoE(nn.Module):
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
+            print("HACK: shared_experts be DP!!")
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -360,7 +361,8 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if global_server_args_dict["enable_deepep_moe"]
+                    # if global_server_args_dict["enable_deepep_moe"]
+                    if True
                     else {}
                 ),
             )
@@ -490,10 +492,15 @@ class DeepseekV2MoE(nn.Module):
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
-        if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+        # if shared_output is not None:
+        #     final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        print("HACK: move forward_normal shared_output summation place!")
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
+
         return final_hidden_states
 
     def forward_cpu(
