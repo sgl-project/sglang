@@ -14,7 +14,7 @@
 """The baseclass of a backend for grammar-guided constrained decoding."""
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Event
 from typing import Dict, List, Optional, Tuple
@@ -153,7 +153,7 @@ class BaseGrammarBackend:
 
     def get_cached_or_future_value(
         self, key: Tuple[str, str]
-    ) -> Optional[BaseGrammarObject]:
+    ) -> Tuple[Future[BaseGrammarObject], bool]:
         value = self.cache.get(key)
         if value:
             return value.copy(), True
@@ -199,7 +199,8 @@ def create_grammar_backend(
         )
 
         grammar_backend = ReasonerGrammarBackend(
-            grammar_backend, tokenizer.think_end_id
+            grammar_backend,
+            tokenizer.think_end_id,
         )
 
     return grammar_backend
