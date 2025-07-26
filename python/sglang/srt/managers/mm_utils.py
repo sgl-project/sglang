@@ -3,8 +3,9 @@ Multi-modality utils
 """
 
 import hashlib
+import pickle
 from abc import abstractmethod
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
@@ -26,6 +27,130 @@ from sglang.utils import logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
 # propagation that can cause some log messages (like 'server is fired up') to not appear
 # in the console when multimodal support is enabled.
+
+# TODO(mick): nccl
+# cuda_ipc: for intranode tensor sharing
+TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
+
+
+class TransportProxyTensor(torch.Tensor):
+    """
+    A convenient torch.Tensor subclass that carries extra metadata and supports
+    efficient inter-process communications
+    """
+
+    @staticmethod
+    def __new__(
+        cls,
+        data: torch.Tensor,
+        name: Optional[str] = None,
+        fields: Optional[Dict[str, Any]] = None,
+        transport_mode: TensorTransportMode = "default",
+        *args,
+        **kwargs,
+    ):
+
+        if not isinstance(data, torch.Tensor):
+            raise TypeError(
+                f"Input 'data' must be a torch.Tensor, but got {type(data)}"
+            )
+
+        instance = data.as_subclass(cls)
+
+        instance._metadata = {
+            "name": name,
+            "fields": fields if fields is not None else {},
+            "transport_mode": transport_mode,
+        }
+
+        return instance
+
+    def __getstate__(self):
+        """
+        Called during pickling. Implements the serialization logic.
+        """
+        # acquire all serialize metadata from _metadata
+        state = {
+            "metadata": self._metadata,
+            "tensor_data": None,
+            "ipc_extra": None,
+        }
+
+        transport_mode = self._metadata.get("transport_mode", "default")
+
+        if transport_mode == "cuda_ipc" and self.is_cuda:
+            try:
+                storage = self.untyped_storage()
+                handle = storage._share_cuda_()
+
+                state["ipc_extra"] = {
+                    "handle": handle,
+                    "shape": self.shape,
+                    "dtype": self.dtype,
+                    "stride": self.stride(),
+                    "device_index": self.device.index,
+                }
+                state["tensor_data"] = None
+            except Exception as e:
+                print_warning_once(
+                    f"Warning: Failed to get CUDA IPC handle ({e}). Falling back to default transport."
+                )
+                state["metadata"]["transport_mode"] = "default"
+                state["tensor_data"] = self.as_subclass(torch.Tensor)
+        else:
+            state["metadata"]["transport_mode"] = "default"
+            state["tensor_data"] = self.as_subclass(torch.Tensor)
+
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]):
+        """
+        Called during unpickling. Implements the deserialization logic.
+        """
+        self._metadata = state["metadata"]
+
+        transport_mode = self._metadata.get("transport_mode", "default")
+
+        if transport_mode == "cuda_ipc" and state["ipc_extra"] is not None:
+            ipc_extra = state["ipc_extra"]
+            handle, shape, dtype, stride, source_device_index = (
+                ipc_extra["handle"],
+                ipc_extra["shape"],
+                ipc_extra["dtype"],
+                ipc_extra["stride"],
+                ipc_extra["device_index"],
+            )
+
+            try:
+                target_device = torch.device(f"cuda:{source_device_index}")
+                with torch.cuda.device(target_device):
+                    storage = torch.UntypedStorage._new_shared_cuda(*handle)
+                    reconstructed_tensor = torch.empty(
+                        0, dtype=dtype, device=target_device
+                    ).set_(storage, storage_offset=0, size=shape, stride=stride)
+                    self.set_(reconstructed_tensor)
+            except Exception as e:
+                print(f"Error: Failed to deserialize from CUDA IPC handle ({e}).")
+                raise e
+
+        elif state["tensor_data"] is not None:
+            self.set_(state["tensor_data"])
+        else:
+            raise pickle.UnpicklingError(
+                "Invalid state for TransportProxyTensor: no tensor data found."
+            )
+
+    @property
+    def name(self) -> Optional[str]:
+        return self._metadata.get("name")
+
+    @property
+    def fields(self) -> Dict[str, Any]:
+        return self._metadata.get("fields", {})
+
+    @property
+    def transport_mode(self) -> TensorTransportMode:
+        return self._metadata.get("transport_mode", "default")
 
 
 class MultiModalityDataPaddingPattern:
