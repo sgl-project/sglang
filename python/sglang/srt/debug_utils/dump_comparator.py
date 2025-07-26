@@ -40,6 +40,9 @@ def main(args):
                 ],
             )
         )
+        if len(rows_baseline) == 0:
+            print(f"Skip {row['filename']} since no baseline")
+            continue
         assert len(rows_baseline) == 1, f"{rows_baseline=}"
         row_baseline = rows_baseline.to_dicts()[0]
 
