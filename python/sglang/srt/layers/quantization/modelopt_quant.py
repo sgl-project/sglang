@@ -965,17 +965,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # and fp4 quantized weights loaded from the checkpoint
             topk_weights, topk_ids, _ = topk_output
 
-            # def _info(x):
-            #     return f"(dtype={x.dtype}, shape={x.shape})"
-            # print(
-            #     "hi call flashinfer_cutlass_fused_moe "
-            #     f"{_info(x)=} "
-            #     f"{_info(topk_ids)=} "
-            #     f"{_info(topk_weights)=} "
-            #     f"{_info(layer.w13_weight)=} "
-            #     f"{_info(layer.w2_weight)=} "
-            # )
-
             output = flashinfer_cutlass_fused_moe(
                 x,
                 topk_ids.to(torch.int),
