@@ -23,8 +23,8 @@ class HybridAttnBackend(AttentionBackend):
         else:
             self.prefill_backend.init_forward_metadata(forward_batch)
 
-    def init_cuda_graph_state(self, max_bs: int):
-        self.decode_backend.init_cuda_graph_state(max_bs)
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        self.decode_backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
