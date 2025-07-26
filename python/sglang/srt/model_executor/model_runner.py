@@ -109,7 +109,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
-    is_cuda,
     is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
@@ -276,6 +275,7 @@ class ModelRunner:
         self.sampler = Sampler()
         self.load_model()
 
+        # Check if the model is using hybrid SWA
         if (
             not self.server_args.disable_hybrid_swa_memory
             and self.sliding_window_size is not None
@@ -1008,8 +1008,11 @@ class ModelRunner:
                 try:
                     layers = self.model.language_model.model.layers
                 except:
-                    self.is_hybrid = False
-                    return
+                    try:
+                        layers = self.model.language_model.layers
+                    except:
+                        self.is_hybrid = False
+                        return
 
             for layer in layers:
                 if (
@@ -1460,9 +1463,13 @@ class ModelRunner:
         tensor_parallel(self.model, device_mesh)
 
     def forward_decode(
-        self, forward_batch: ForwardBatch, pp_proxy_tensors=None
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool = False,
+        pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
-        self.attn_backend.init_forward_metadata(forward_batch)
+        if not skip_attn_backend_init:
+            self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
@@ -1574,8 +1581,18 @@ class ModelRunner:
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-        elif forward_batch.forward_mode.is_decode():
-            ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+            return ret, can_run_cuda_graph
+
+        # For MLP sync
+        if forward_batch.global_num_tokens_cpu is not None:
+            forward_batch.prepare_mlp_sync_batch(self)
+
+        if forward_batch.forward_mode.is_decode():
+            ret = self.forward_decode(
+                forward_batch,
+                skip_attn_backend_init=skip_attn_backend_init,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
         elif forward_batch.forward_mode.is_extend():
             ret = self.forward_extend(
                 forward_batch,
@@ -1592,6 +1609,9 @@ class ModelRunner:
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+
+        if forward_batch.global_num_tokens_cpu is not None:
+            forward_batch.post_forward_mlp_sync_batch(ret)
 
         return ret, can_run_cuda_graph
 
