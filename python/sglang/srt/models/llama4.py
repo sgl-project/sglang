@@ -403,7 +403,10 @@ class Llama4DecoderLayer(nn.Module):
         )
 
     def _is_moe_layer(self, layer_id: int) -> bool:
-        return (layer_id + 1) % self.config.interleave_moe_layer_step == 0
+        return (
+            self.config.interleave_moe_layer_step > 0
+            and (layer_id + 1) % self.config.interleave_moe_layer_step == 0
+        )
 
     def forward(
         self,
