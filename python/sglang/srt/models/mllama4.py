@@ -257,6 +257,12 @@ class Llama4ForConditionalGeneration(nn.Module):
                     name, loaded_weight
                 )
 
+            # Handle FP8 kv-scale remapping
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+
             if self._handle_scale_remapping(name, params_dict):
                 continue
 

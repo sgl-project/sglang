@@ -1512,6 +1512,7 @@ def crash_on_warnings():
     return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
+@lru_cache
 def print_warning_once(msg: str) -> None:
     # Set the stacklevel to 2 to print the caller's line info
     logger.warning(msg, stacklevel=2)
@@ -1682,6 +1683,17 @@ sglang_lib = Library("sglang", "FRAGMENT")  # noqa
 # support `torch.library.custom_op`.
 def supports_custom_op() -> bool:
     return hasattr(torch.library, "custom_op")
+
+
+def supports_mx() -> bool:
+    """
+    Returns whether the current platform supports MX types.
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx95"])
+    else:
+        return False
 
 
 def direct_register_custom_op(

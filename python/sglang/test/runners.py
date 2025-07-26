@@ -67,9 +67,11 @@ NUM_TOP_LOGPROBS = 5
 
 
 def get_dtype_str(torch_dtype):
-    if torch_dtype is torch.float16:
+    if torch_dtype == "auto":
+        return "auto"
+    elif torch_dtype is torch.float16:
         return "float16"
-    if torch_dtype is torch.float32:
+    elif torch_dtype is torch.float32:
         return "float32"
     else:
         raise NotImplementedError()
@@ -483,7 +485,7 @@ class SRTRunner:
     def __init__(
         self,
         model_path: str,
-        torch_dtype: torch.dtype,
+        torch_dtype: Union[torch.dtype, str],
         model_type: str,
         tp_size: int = 1,
         model_impl: str = "auto",
@@ -513,6 +515,7 @@ class SRTRunner:
         max_lora_rank: Optional[int] = None,
         lora_target_modules: Optional[List[str]] = None,
         enable_lora: Optional[bool] = None,
+        context_length: Optional[int] = None,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -554,6 +557,7 @@ class SRTRunner:
             max_lora_rank=max_lora_rank,
             lora_target_modules=lora_target_modules,
             enable_lora=enable_lora,
+            context_length=context_length,
             **spec_kwargs,
         )
 

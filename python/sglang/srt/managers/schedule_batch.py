@@ -809,7 +809,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     is_hybrid: bool = False
 
     # Batch configs
-    model_config: ModelConfig = None
+    model_config: "ModelConfig" = None
     forward_mode: ForwardMode = None
     enable_overlap: bool = False
     # Tell whether the current running batch is full so that we can skip
@@ -904,7 +904,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tree_cache: BasePrefixCache,
-        model_config: ModelConfig,
+        model_config: "ModelConfig",
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         enable_custom_logit_processor: bool,
