@@ -664,7 +664,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if reasoning_parser and request.separate_reasoning:
                 try:
                     parser = ReasoningParser(
-                        model_type=reasoning_parser, stream_reasoning=False
+                        model_type=reasoning_parser,
+                        stream_reasoning=False,
+                        force_reasoning=self.template_manager.force_reasoning,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
@@ -830,6 +832,7 @@ class OpenAIServingChat(OpenAIServingBase):
             reasoning_parser_dict[index] = ReasoningParser(
                 self.tokenizer_manager.server_args.reasoning_parser,
                 request.stream_reasoning,
+                self.template_manager.force_reasoning,
             )
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)

@@ -5,7 +5,6 @@ from sglang.srt.reasoning_parser import (
     DeepSeekR1Detector,
     KimiDetector,
     Qwen3Detector,
-    Qwen3ThinkingDetector,
     ReasoningParser,
     StreamingParseResult,
 )
@@ -216,19 +215,19 @@ class TestQwen3Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
 
 
-class TestQwen3ThinkingDetector(CustomTestCase):
+class TestQwen3ForcedReasoningDetector(CustomTestCase):
     def setUp(self):
-        self.detector = Qwen3ThinkingDetector()
+        self.detector = Qwen3Detector(force_reasoning=True)
 
     def test_init(self):
-        """Test Qwen3ThinkingDetector initialization."""
+        """Test Qwen3ForcedReasoningDetector initialization."""
         self.assertEqual(self.detector.think_start_token, "<think>")
         self.assertEqual(self.detector.think_end_token, "</think>")
         self.assertTrue(self.detector._in_reasoning)  # force_reasoning=True
         self.assertTrue(self.detector.stream_reasoning)
 
-    def test_detect_and_parse_qwen3_thinking_format(self):
-        """Test parsing Qwen3-Thinking format (no <think> start tag)."""
+    def test_detect_and_parse_qwen3_forced_reasoning_format(self):
+        """Test parsing Qwen3-ForcedReasoning format (no <think> start tag)."""
         text = "I need to think about this step by step.</think>The answer is 42."
         result = self.detector.detect_and_parse(text)
         self.assertEqual(
@@ -237,15 +236,15 @@ class TestQwen3ThinkingDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "The answer is 42.")
 
     def test_detect_and_parse_with_start_token(self):
-        """Test parsing Qwen3-Thinking with optional <think> start tag."""
+        """Test parsing Qwen3-ForcedReasoning with optional <think> start tag."""
         text = "<think>I need to think about this.</think>The answer is 42."
         result = self.detector.detect_and_parse(text)
         # Should work because base class logic handles both force_reasoning=True OR start token
         self.assertEqual(result.reasoning_text, "I need to think about this.")
         self.assertEqual(result.normal_text, "The answer is 42.")
 
-    def test_streaming_qwen3_thinking_format(self):
-        """Test streaming parse of Qwen3-Thinking format."""
+    def test_streaming_qwen3_forced_reasoning_format(self):
+        """Test streaming parse of Qwen3-ForcedReasoning format."""
         # First chunk without <think> start
         result = self.detector.parse_streaming_increment("I need to")
         self.assertEqual(result.reasoning_text, "I need to")
@@ -320,9 +319,6 @@ class TestReasoningParser(CustomTestCase):
         parser = ReasoningParser("qwen3")
         self.assertIsInstance(parser.detector, Qwen3Detector)
 
-        parser = ReasoningParser("qwen3-thinking")
-        self.assertIsInstance(parser.detector, Qwen3ThinkingDetector)
-
         parser = ReasoningParser("kimi")
         self.assertIsInstance(parser.detector, KimiDetector)
 
@@ -370,13 +366,11 @@ class TestReasoningParser(CustomTestCase):
         """Test case insensitive model type matching."""
         parser1 = ReasoningParser("DeepSeek-R1")
         parser2 = ReasoningParser("QWEN3")
-        parser3 = ReasoningParser("QWEN3-THINKING")
-        parser4 = ReasoningParser("Kimi")
+        parser3 = ReasoningParser("Kimi")
 
         self.assertIsInstance(parser1.detector, DeepSeekR1Detector)
         self.assertIsInstance(parser2.detector, Qwen3Detector)
-        self.assertIsInstance(parser3.detector, Qwen3ThinkingDetector)
-        self.assertIsInstance(parser4.detector, KimiDetector)
+        self.assertIsInstance(parser3.detector, KimiDetector)
 
     def test_stream_reasoning_parameter(self):
         """Test stream_reasoning parameter is passed correctly."""
@@ -458,9 +452,9 @@ class TestIntegrationScenarios(CustomTestCase):
         self.assertEqual(reasoning, "")
         self.assertEqual(normal, "Just the answer.")
 
-    def test_qwen3_thinking_complete_response(self):
-        """Test complete Qwen3-Thinking response parsing."""
-        parser = ReasoningParser("qwen3-thinking")
+    def test_qwen3_forced_reasoning_complete_response(self):
+        """Test complete Qwen3-ForcedReasoning response parsing."""
+        parser = ReasoningParser("qwen3", force_reasoning=True)
         text = "Let me solve this step by step. The equation is x + 2 = 5. Subtracting 2 from both sides gives x = 3.</think>The solution is x = 3."
 
         reasoning, normal = parser.parse_non_stream(text)
@@ -468,9 +462,9 @@ class TestIntegrationScenarios(CustomTestCase):
         self.assertIn("x = 3", reasoning)
         self.assertEqual(normal, "The solution is x = 3.")
 
-    def test_qwen3_thinking_streaming_scenario(self):
-        """Test Qwen3-Thinking streaming scenario."""
-        parser = ReasoningParser("qwen3-thinking")
+    def test_qwen3_forced_reasoning_streaming_scenario(self):
+        """Test Qwen3-ForcedReasoning streaming scenario."""
+        parser = ReasoningParser("qwen3", force_reasoning=True)
 
         chunks = [
             "I need to analyze",
