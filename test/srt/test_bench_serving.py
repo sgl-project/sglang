@@ -1,4 +1,9 @@
+import asyncio
+import itertools
 import unittest
+from random import random, uniform
+
+import requests
 
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
@@ -16,7 +21,6 @@ from sglang.test.test_utils import (
 
 
 class TestBenchServing(CustomTestCase):
-
     def test_offline_throughput_default(self):
         res = run_bench_serving(
             model=DEFAULT_MODEL_NAME_FOR_TEST,
@@ -28,7 +32,7 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_offline_throughput_default\n"
-                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+                f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(res["output_throughput"], 3050)
@@ -51,7 +55,7 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_offline_throughput_non_stream_small_batch_size\n"
-                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+                f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
             self.assertGreater(res["output_throughput"], 1050)
 
@@ -66,7 +70,7 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_offline_throughput_without_radix_cache\n"
-                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+                f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(res["output_throughput"], 3050)
@@ -84,7 +88,7 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_offline_throughput_without_chunked_prefill\n"
-                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+                f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
             self.assertGreater(res["output_throughput"], 2600)
 
@@ -104,7 +108,7 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_offline_throughput_with_triton_attention_backend\n"
-                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+                f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(res["output_throughput"], 3500)
@@ -122,7 +126,7 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_offline_throughput_default_fp8\n"
-                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+                f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(res["output_throughput"], 3500)
@@ -140,7 +144,7 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_online_latency_default\n"
-                f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
+                f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
             )
             self.assertLess(res["median_e2e_latency_ms"], 11000)
             if is_in_amd_ci():
@@ -164,7 +168,7 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_vlm_offline_throughput\n"
-                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+                f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(res["output_throughput"], 2000)
@@ -187,7 +191,7 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_vlm_online_latency\n"
-                f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
+                f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
             )
             self.assertLess(res["median_e2e_latency_ms"], 16500)
             if is_in_amd_ci():
@@ -196,6 +200,126 @@ class TestBenchServing(CustomTestCase):
             else:
                 self.assertLess(res["median_ttft_ms"], 100)
             self.assertLess(res["median_itl_ms"], 8)
+
+    def test_lora_online_latency(self):
+        # TODO (lifuhuang): verify LoRA support in AMD.
+        if is_in_amd_ci():
+            pass
+
+        res = self._run_lora_latency_test(enable_background_task=False)
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_lora_online_latency\n"
+                f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
+                f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
+            )
+            self.assertLess(res["median_e2e_latency_ms"], 2400)
+            self.assertLess(res["median_ttft_ms"], 58)
+
+    def test_lora_online_latency_with_concurrent_adapter_updates(self):
+        # TODO (lifuhuang): verify LoRA support in AMD.
+        if is_in_amd_ci():
+            pass
+
+        res = self._run_lora_latency_test(enable_background_task=True)
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_lora_online_latency\n"
+                f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
+                f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
+            )
+            self.assertLess(res["median_e2e_latency_ms"], 4000)
+            # TODO (lifuhuang): This will be fixed by the overlapped LoRA update in a separate PR.
+            self.assertLess(res["median_ttft_ms"], 1600)
+
+    def _run_lora_latency_test(self, enable_background_task: bool):
+        """
+        Run a latency test for LoRA with the specified background task setting.
+        """
+
+        async def lora_loader_unloader_task(
+            base_url: str,
+            start_event: asyncio.Event,
+            stop_event: asyncio.Event,
+        ):
+            """
+            A background task that repeatedly loads and unloads a LoRA adapter.
+            """
+            await start_event.wait()
+
+            path_cycler = itertools.cycle(
+                [
+                    "pbevan11/llama-3.1-8b-ocr-correction",
+                    "faridlazuarda/valadapt-llama-3.1-8B-it-chinese",
+                    "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                ]
+            )
+            load_url = f"{base_url}/load_lora_adapter"
+            unload_url = f"{base_url}/unload_lora_adapter"
+            num_updates = 0
+
+            while not stop_event.is_set():
+                # 1. Load the LoRA adapter
+                lora_path = next(path_cycler)
+                response = await asyncio.to_thread(
+                    requests.post,
+                    load_url,
+                    json={"lora_name": lora_path, "lora_path": lora_path},
+                )
+                self.assertTrue(
+                    response.ok, f"Failed to load LoRA adapter: {response.text}"
+                )
+                num_updates += 1
+
+                if stop_event.is_set():
+                    break
+
+                # Yield control to allow other tasks to run.
+                await asyncio.sleep(1)
+
+                # 2. Unload the LoRA adapter
+                response = await asyncio.to_thread(
+                    requests.post,
+                    unload_url,
+                    json={"lora_name": lora_path},
+                )
+                self.assertTrue(
+                    response.ok, f"Failed to unload LoRA adapter: {response.text}"
+                )
+                num_updates += 1
+
+                # Yield control to allow other tasks to run.
+                await asyncio.sleep(1)
+
+        background_task = lora_loader_unloader_task if enable_background_task else None
+        res = run_bench_serving(
+            model=DEFAULT_MODEL_NAME_FOR_TEST,
+            num_prompts=400,
+            request_rate=8,
+            other_server_args=[
+                "--enable-lora",
+                "--max-loras-per-batch",
+                "1",
+                "--disable-radix-cache",
+                "--random-seed",
+                "42",
+                "--mem-fraction-static",
+                "0.8",
+                "--lora-paths",
+                "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                "--max-lora-rank",
+                "256",
+            ],
+            dataset_name="random",
+            random_input_len=256,
+            random_output_len=256,
+            lora_name=["Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"],
+            background_task=background_task,
+        )
+
+        return res
 
     def test_online_latency_eagle(self):
         res = run_bench_serving(
@@ -226,8 +350,8 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_online_latency_eagle\n"
-                f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
-                f'accept_length: {res["accept_length"]:.2f} \n'
+                f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
+                f"accept_length: {res['accept_length']:.2f} \n"
             )
             if is_in_amd_ci():
                 self.assertLess(res["median_e2e_latency_ms"], 1800)
@@ -246,7 +370,7 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_moe_offline_throughput_default\n"
-                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+                f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(res["output_throughput"], 2100)
@@ -264,7 +388,7 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_moe_offline_throughput_without_radix_cache\n"
-                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+                f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(res["output_throughput"], 2100)
@@ -286,7 +410,7 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_pp_offline_throughput_default_decode\n"
-                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+                f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
             self.assertGreater(res["output_throughput"], 6700)
 
@@ -311,7 +435,7 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_pp_long_context_latency_prefill\n"
-                f'input_throughput: {res["input_throughput"]:.2f} ms\n'
+                f"input_throughput: {res['input_throughput']:.2f} ms\n"
             )
             self.assertGreater(res["input_throughput"], 4000)
 
