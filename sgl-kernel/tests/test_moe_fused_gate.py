@@ -46,7 +46,6 @@ def test_moe_fused_gate_combined(seq_length, params, num_fused_shared_experts):
         renormalize=True,
         num_expert_group=num_expert_group,
         topk_group=topk_group,
-        compiled=False,
         num_fused_shared_experts=num_fused_shared_experts,
         routed_scaling_factor=2.5,
     )
