@@ -167,9 +167,9 @@ class EAGLEWorker(TpModelWorker):
 
         # Load weaker drafter map if provided
         self.weaker_drafter = None
-        if server_args.speculative_weaker_drafter_map is not None:
+        if server_args.speculative_weaker_drafter_probs is not None:
             weaker_drafter_all_vocab = load_tensor_from_path(
-                server_args.speculative_weaker_drafter_map
+                server_args.speculative_weaker_drafter_probs
             ).to(self.device)
 
             if self.hot_token_id is not None:

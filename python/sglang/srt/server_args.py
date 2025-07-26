@@ -164,6 +164,7 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
+    speculative_weaker_drafter_probs: Optional[str] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -1274,6 +1275,12 @@ class ServerArgs:
             type=str,
             help="The path of the draft model's small vocab table.",
             default=ServerArgs.speculative_token_map,
+        )
+        parser.add_argument(
+            "--speculative-weaker-drafter-probs",
+            type=str,
+            help="The path of the weaker drafter probs.",
+            default=ServerArgs.speculative_weaker_drafter_probs,
         )
 
         # Expert parallelism
