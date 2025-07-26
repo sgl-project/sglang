@@ -1896,6 +1896,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         dumper.dump("dpsklayer_after_attn_hidden_states", hidden_states, layer_id=self.layer_id)
         dumper.dump("dpsklayer_after_attn_residual", residual, layer_id=self.layer_id)
 
+        print("HACK: remove residual after self_attn")
+        hidden_states += residual
+        residual[...] = 0
+
+        dumper.dump("dpsklayer_after_hacksum_hidden_states", hidden_states, layer_id=self.layer_id)
+
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
