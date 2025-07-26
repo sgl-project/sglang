@@ -66,6 +66,13 @@ class EBNFComposer:
         "xml": '"<parameter={key}>\\n" {valrule} "\\n</parameter>"',
     }
 
+    # Separators for joining properties in each format
+    PROPERTY_SEPARATOR_MAP = {
+        "pythonic": ' "," ',
+        "json": ' "," ',
+        "xml": ' "\\n" ',
+    }
+
     # Base type mapping - most types are the same across formats
     BASE_TYPE_MAPPING = {
         "string": "basic_string",
@@ -276,10 +283,13 @@ class EBNFComposer:
 
             # Build the combined rule
             rule_parts = []
+            separator = EBNFComposer.PROPERTY_SEPARATOR_MAP.get(
+                function_format, ' "," '
+            )
 
-            # Add required properties joined by commas
+            # Add required properties joined by format-specific separator
             if required:
-                rule_parts.append(' "," '.join(prop_kv_pairs[k] for k in required))
+                rule_parts.append(separator.join(prop_kv_pairs[k] for k in required))
 
             # Add optional properties with flexible ordering
             if optional:
@@ -292,13 +302,15 @@ class EBNFComposer:
                         if j == i:
                             opt_parts.append(prop_kv_pairs[optional[j]])
                         else:
-                            opt_parts.append(f' ( "," {prop_kv_pairs[optional[j]]} )?')
+                            opt_parts.append(
+                                f" ( {separator.strip()} {prop_kv_pairs[optional[j]]} )?"
+                            )
                     opt_alternatives.append("".join(opt_parts))
 
-                # Wrap with appropriate comma handling based on whether we have required properties
+                # Wrap with appropriate separator handling based on whether we have required properties
                 if required:
-                    # Required properties exist, so optional group needs outer comma
-                    rule_parts.append(' ( "," ( ')
+                    # Required properties exist, so optional group needs outer separator
+                    rule_parts.append(f" ( {separator.strip()} ( ")
                     rule_parts.append(" | ".join(opt_alternatives))
                     rule_parts.append(" ) )?")
                 else:
