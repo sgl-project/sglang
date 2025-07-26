@@ -21,6 +21,7 @@ and code completion templates, eliminating global state and improving modularity
 import json
 import logging
 import os
+import re
 from typing import Optional
 
 from sglang.srt.code_completion_parser import (
@@ -88,12 +89,9 @@ class TemplateManager:
         if template is None:
             return False
 
-        # Look for reasoning patterns in the template
-        reasoning_patterns = [
-            "<think>",
-        ]
+        force_reasoning_pattern = r"<\|im_start\|>assistant\\n<think>\\n"
+        has_reasoning = re.search(force_reasoning_pattern, template) is not None
 
-        has_reasoning = any(pattern in template for pattern in reasoning_patterns)
         if has_reasoning:
             logger.info("Detected the force reasoning pattern in chat template.")
 
