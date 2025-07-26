@@ -2169,6 +2169,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        dumper.dump("modelstart_input_ids", input_ids)
+        dumper.dump("modelstart_positions", positions)
         dumper.on_forward_pass_start()
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
