@@ -32,10 +32,12 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
-from sglang.srt.constrained.triton_ops.bitmask_ops import (
-    apply_token_bitmask_inplace_triton,
-)
+from sglang.srt.utils import is_cuda, is_hip
 
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+if _is_cuda or _is_hip:
+    from sgl_kernel import apply_token_bitmask_inplace_cuda
 logger = logging.getLogger(__name__)
 
 
@@ -94,7 +96,7 @@ class XGrammarGrammar(BaseGrammarObject):
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         if logits.device.type == "cuda":
-            apply_token_bitmask_inplace_triton(logits, vocab_mask)
+            apply_token_bitmask_inplace_cuda(logits, vocab_mask)
         elif logits.device.type == "cpu" and self.apply_vocab_mask_cpu:
             self.apply_vocab_mask_cpu(logits, vocab_mask)
         else:
