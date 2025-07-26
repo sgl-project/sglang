@@ -141,9 +141,16 @@ class Glm4MoeDetector(BaseFormatDetector):
     def supports_structural_tag(self) -> bool:
         return False
 
-    #TODO：Need Fix
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()
 
     def build_ebnf(self, tools: List[Tool]):
-        raise NotImplementedError()
+        return EBNFComposer.build_ebnf(
+            tools,
+            individual_call_start_token=self.bot_token,
+            individual_call_end_token=self.eot_token,
+            tool_call_separator="\\n",
+            function_format="xml",
+            call_rule_fmt='"{name}" "\\n" {arguments_rule}',
+            key_value_rule_fmt='"<arg_key>{key}</arg_key>" "\\n" "<arg_value>" {valrule} "</arg_value>"',
+        )
