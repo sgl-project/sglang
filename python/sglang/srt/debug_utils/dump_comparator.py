@@ -91,11 +91,11 @@ def check_tensor_pair(path_baseline, path_target):
         print(f"❌ Shape mismatch")
         return
 
-    raw_abs_diff = (x_target - x_baseline).abs()
+    raw_abs_diff = (x_target.float() - x_baseline.float()).abs()
 
     max_abs_diff = raw_abs_diff.max().item()
     mean_abs_diff = raw_abs_diff.mean().item()
-    rel_diff = _calc_rel_diff(x_target, x_baseline)
+    rel_diff = _calc_rel_diff(x_target.float(), x_baseline.float())
 
     needs_print = max_abs_diff > 1e-3
 
