@@ -360,7 +360,8 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if global_server_args_dict["enable_deepep_moe"]
+                    if True
+                    # if global_server_args_dict["enable_deepep_moe"]
                     else {}
                 ),
             )
@@ -500,9 +501,9 @@ class DeepseekV2MoE(nn.Module):
         # final_hidden_states = final_hidden_states.float()
         # shared_output = shared_output.float()
 
-        if shared_output is not None:
-            # print("HACK: pre-allreduce shared")
-            shared_output = tensor_model_parallel_all_reduce(shared_output)
+        # if shared_output is not None:
+        #     # print("HACK: pre-allreduce shared")
+        #     shared_output = tensor_model_parallel_all_reduce(shared_output)
 
         if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
