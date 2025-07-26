@@ -493,9 +493,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
-                    if not delta:
-                        continue
-
                 # Handle tool calls
                 if request.tool_choice != "none" and request.tools:
                     async for (
@@ -512,7 +509,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         if chunk:
                             yield chunk
                         finish_reason_type = tool_call_finish_reason_type
-
                 else:
                     # Regular content
                     if delta or not (
@@ -942,5 +938,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             yield f"data: {chunk.model_dump_json()}\n\n", finish_reason_type
 
-        if finish_reason_type == "stop":
+        if finish_reason_type == "stop" and any(
+            len(item.detector.prev_tool_call_arr) > 0 for item in parser_dict.values()
+        ):
             yield None, "tool_calls"
