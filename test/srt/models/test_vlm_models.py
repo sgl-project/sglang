@@ -91,6 +91,78 @@ class TestVLMModels(CustomTestCase):
             timeout=3600,
         )
 
+    def _run_vlm_mmmu_test(self, model, output_path, test_name="", custom_env=None):
+        """
+        Common method to run VLM MMMU benchmark test.
+
+        Args:
+            model: Model to test
+            output_path: Path for output logs
+            test_name: Optional test name for logging
+            custom_env: Optional custom environment variables
+        """
+        print(f"\nTesting model: {model.model}{test_name}")
+
+        process = None
+        mmmu_accuracy = 0  # Initialize to handle potential exceptions
+
+        try:
+            # Prepare environment variables
+            process_env = os.environ.copy()
+            if custom_env:
+                process_env.update(custom_env)
+
+            # Launch server for testing
+            process = popen_launch_server(
+                model.model,
+                base_url=self.base_url,
+                timeout=self.time_out,
+                api_key=self.api_key,
+                other_args=[
+                    "--trust-remote-code",
+                    "--cuda-graph-max-bs",
+                    "32",
+                    "--enable-multimodal",
+                    "--mem-fraction-static",
+                    str(self.parsed_args.mem_fraction_static),  # Use class variable
+                ],
+                env=process_env,
+            )
+
+            # Run evaluation
+            self.run_mmmu_eval(model.model, output_path)
+
+            # Get the result file
+            result_file_path = glob.glob(f"{output_path}/*.json")[0]
+
+            with open(result_file_path, "r") as f:
+                result = json.load(f)
+                print(f"Result{test_name}\n: {result}")
+
+            # Process the result
+            mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
+            print(f"Model {model.model} achieved accuracy{test_name}: {mmmu_accuracy:.4f}")
+
+            # Assert performance meets expected threshold
+            self.assertGreaterEqual(
+                mmmu_accuracy,
+                model.mmmu_accuracy,
+                f"Model {model.model} accuracy ({mmmu_accuracy:.4f}) below expected threshold ({model.mmmu_accuracy:.4f}){test_name}",
+            )
+
+        except Exception as e:
+            print(f"Error testing {model.model}{test_name}: {e}")
+            self.fail(f"Test failed for {model.model}{test_name}: {e}")
+
+        finally:
+            # Ensure process cleanup happens regardless of success/failure
+            if process is not None and process.poll() is None:
+                print(f"Cleaning up process {process.pid}")
+                try:
+                    kill_process_tree(process.pid)
+                except Exception as e:
+                    print(f"Error killing process: {e}")
+
     def test_vlm_mmmu_benchmark(self):
         """Test VLM models against MMMU benchmark."""
         models_to_test = MODELS
@@ -99,60 +171,23 @@ class TestVLMModels(CustomTestCase):
             models_to_test = [random.choice(MODELS)]
 
         for model in models_to_test:
-            print(f"\nTesting model: {model.model}")
+            self._run_vlm_mmmu_test(model, "./logs")
 
-            process = None
-            mmmu_accuracy = 0  # Initialize to handle potential exceptions
+    def test_vlm_mmmu_benchmark_with_small_cache(self):
+        """Test VLM models against MMMU benchmark with a small embedding cache to force eviction."""
+        models_to_test = MODELS
 
-            try:
-                # Launch server for testing
-                process = popen_launch_server(
-                    model.model,
-                    base_url=self.base_url,
-                    timeout=self.time_out,
-                    api_key=self.api_key,
-                    other_args=[
-                        "--trust-remote-code",
-                        "--cuda-graph-max-bs",
-                        "32",
-                        "--enable-multimodal",
-                        "--mem-fraction-static",
-                        str(self.parsed_args.mem_fraction_static),  # Use class variable
-                    ],
-                )
+        if is_in_ci():
+            models_to_test = [random.choice(MODELS)]
 
-                # Run evaluation
-                self.run_mmmu_eval(model.model, "./logs")
-
-                # Get the result file
-                result_file_path = glob.glob("./logs/*.json")[0]
-
-                with open(result_file_path, "r") as f:
-                    result = json.load(f)
-                    print(f"Result \n: {result}")
-                # Process the result
-                mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
-                print(f"Model {model.model} achieved accuracy: {mmmu_accuracy:.4f}")
-
-                # Assert performance meets expected threshold
-                self.assertGreaterEqual(
-                    mmmu_accuracy,
-                    model.mmmu_accuracy,
-                    f"Model {model.model} accuracy ({mmmu_accuracy:.4f}) below expected threshold ({model.mmmu_accuracy:.4f})",
-                )
-
-            except Exception as e:
-                print(f"Error testing {model.model}: {e}")
-                self.fail(f"Test failed for {model.model}: {e}")
-
-            finally:
-                # Ensure process cleanup happens regardless of success/failure
-                if process is not None and process.poll() is None:
-                    print(f"Cleaning up process {process.pid}")
-                    try:
-                        kill_process_tree(process.pid)
-                    except Exception as e:
-                        print(f"Error killing process: {e}")
+        for model in models_to_test:
+            custom_env = {"SGLANG_VLM_CACHE_SIZE_MB": "5"}
+            self._run_vlm_mmmu_test(
+                model,
+                "./logs_small_cache",
+                test_name=" with small embedding cache (evict test)",
+                custom_env=custom_env
+            )
 
 
 if __name__ == "__main__":
