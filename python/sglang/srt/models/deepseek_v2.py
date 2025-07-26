@@ -575,6 +575,10 @@ class DeepseekV2MoE(nn.Module):
             topk_weights = torch.empty(
                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
+
+        dumper.dump("dpskmoe_before_dispatch_hidden_states", hidden_states, layer_id=self.layer_id)
+        dumper.dump("dpskmoe_before_dispatch_topk_idx", topk_idx, layer_id=self.layer_id)
+
         if self.ep_size > 1:
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             (
@@ -1888,6 +1892,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
+
+        dumper.dump("dpsklayer_after_attn_hidden_states", hidden_states, layer_id=self.layer_id)
+        dumper.dump("dpsklayer_after_attn_residual", residual, layer_id=self.layer_id)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
