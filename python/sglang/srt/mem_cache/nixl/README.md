@@ -73,8 +73,7 @@ The unified test suite (`test_nixl_unified.py`) covers:
 
 ### File Management Tests (5 tests)
 - Basic file operations
-- NIXL tuple creation with proper offsets and lengths
-- Conversion of 4-element tuples to 3-element tuples for transfer
+- NIXL tuple creation
 - Error handling in file operations
 - File descriptor cleanup on failure
 

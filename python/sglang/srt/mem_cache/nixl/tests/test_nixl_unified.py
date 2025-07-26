@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.nixl.nixl_utils import NixlRegistration, NixlFileManag
 
 class TestNixlUnified(unittest.TestCase):
     """Unified test suite for all NIXL components."""
-    
+
     def setUp(self):
         """Set up test environment."""
         # Create test directories
@@ -20,12 +20,12 @@ class TestNixlUnified(unittest.TestCase):
         self.hicache_test_dir = "/tmp/hicache_nixl_test"
         os.makedirs(self.test_dir, exist_ok=True)
         os.makedirs(self.hicache_test_dir, exist_ok=True)
-        
+
         # Mock NIXL agent for registration tests
         self.mock_agent = MagicMock()
         self.mock_agent.get_reg_descs.return_value = "mock_reg_descs"
         self.mock_agent.register_memory.return_value = "mock_registered_memory"
-        
+
         # Create instances
         self.file_manager = NixlFileManager(self.test_dir)
         self.registration = NixlRegistration(self.mock_agent)
@@ -146,10 +146,10 @@ class TestNixlUnified(unittest.TestCase):
         self.assertTrue(os.path.exists(test_file))
 
         # Test file opening and closing
-        file_tuple = self.file_manager.create_nixl_tuples([(test_file, 0, 1024)])[0]
-        self.assertEqual(len(file_tuple), 4)  # (offset, length, fd, "")
+        file_tuple = self.file_manager.files_to_nixl_tuples([test_file])[0]
+        self.assertEqual(len(file_tuple), 4)  # (offset, length, fd, file_path)
         self.assertIsInstance(file_tuple[2], int)  # fd should be an integer
-        
+
         # Test file descriptor cleanup
         self.assertTrue(self.file_manager.close_file(file_tuple[2]))
 
@@ -160,69 +160,36 @@ class TestNixlUnified(unittest.TestCase):
             os.path.join(self.test_dir, "test1.bin"),
             os.path.join(self.test_dir, "test2.bin")
         ]
-        
+
         # Create files
         for path in file_paths:
             self.assertTrue(self.file_manager.create_file(path))
-        
-        # Test tuple creation with different offsets and lengths
-        file_info = [
-            (file_paths[0], 0, 1024),      # First file: offset 0, length 1024
-            (file_paths[1], 2048, 4096),   # Second file: offset 2048, length 4096
-        ]
-        
-        file_tuples = self.file_manager.create_nixl_tuples(file_info)
+
+        file_tuples = self.file_manager.files_to_nixl_tuples(file_paths)
         self.assertEqual(len(file_tuples), 2)
-        
+
         # Verify tuple structure: (offset, length, fd, "")
-        for i, (file_path, expected_offset, expected_length) in enumerate(file_info):
+        for file_path in file_paths:
             offset, length, fd, meta = file_tuples[i]
-            self.assertEqual(offset, expected_offset)
-            self.assertEqual(length, expected_length)
+            self.assertEqual(offset, 0)
+            self.assertEqual(length, 0)
             self.assertIsInstance(fd, int)
-            self.assertEqual(meta, "")
-        
+            self.assertEqual(meta, file_path)
+
         # Clean up file descriptors
         for file_tuple in file_tuples:
             self.assertTrue(self.file_manager.close_file(file_tuple[2]))
-
-    def test_get_nixl_tuples_for_transfer(self):
-        """Test conversion of 4-element tuples to 3-element tuples for transfer."""
-        # Create test file
-        test_file = os.path.join(self.test_dir, "test.bin")
-        self.assertTrue(self.file_manager.create_file(test_file))
-        
-        # Create 4-element tuples
-        file_info = [(test_file, 0, 1024)]
-        file_tuples = self.file_manager.create_nixl_tuples(file_info)
-        
-        # Test conversion without tensor sizes (use original lengths)
-        transfer_tuples = self.file_manager.get_nixl_tuples_for_transfer(file_tuples)
-        self.assertEqual(len(transfer_tuples), 1)
-        self.assertEqual(len(transfer_tuples[0]), 3)  # (offset, length, fd)
-        self.assertEqual(transfer_tuples[0][0], 0)    # offset
-        self.assertEqual(transfer_tuples[0][1], 1024) # length
-        self.assertEqual(transfer_tuples[0][2], file_tuples[0][2])  # fd
-        
-        # Test conversion with tensor sizes
-        tensor_sizes = [2048]  # Different size than file length
-        transfer_tuples = self.file_manager.get_nixl_tuples_for_transfer(file_tuples, tensor_sizes)
-        self.assertEqual(len(transfer_tuples), 1)
-        self.assertEqual(transfer_tuples[0][1], 2048)  # Should use tensor size
-        
-        # Clean up
-        self.assertTrue(self.file_manager.close_file(file_tuples[0][2]))
 
     def test_error_handling(self):
         """Test error handling in file operations."""
         # Test non-existent file
         non_existent_file = "/nonexistent/file"
-        file_tuples = self.file_manager.create_nixl_tuples([(non_existent_file, 0, 1024)])
+        file_tuples = self.file_manager.files_to_nixl_tuples([non_existent_file])
         self.assertEqual(file_tuples, [])
-        
+
         # Test invalid file path (root directory)
         invalid_file = "/root/test.bin"
-        file_tuples = self.file_manager.create_nixl_tuples([(invalid_file, 0, 1024)])
+        file_tuples = self.file_manager.files_to_nixl_tuples([invalid_file])
         self.assertEqual(file_tuples, [])
 
     def test_file_descriptor_cleanup(self):
@@ -230,15 +197,15 @@ class TestNixlUnified(unittest.TestCase):
         # Create a file
         test_file = os.path.join(self.test_dir, "test3.bin")
         self.assertTrue(self.file_manager.create_file(test_file))
-        
+
         # Create tuples
-        file_tuples = self.file_manager.create_nixl_tuples([(test_file, 0, 1024)])
+        file_tuples = self.file_manager.files_to_nixl_tuples([test_file])
         self.assertEqual(len(file_tuples), 1)
-        
+
         # Simulate a failure scenario
         fd = file_tuples[0][2]
         self.assertTrue(self.file_manager.close_file(fd))
-        
+
         # Try to close again (should fail gracefully)
         self.assertFalse(self.file_manager.close_file(fd))
 
@@ -253,7 +220,7 @@ class TestNixlUnified(unittest.TestCase):
         reg_mem = self.registration.register_buffers(tensor)
         self.assertIsNotNone(reg_mem)
         self.mock_agent.get_reg_descs.assert_called_with([tensor], "DRAM")
-        
+
         # Test list of tensors
         tensors = [torch.randn(2, 3), torch.randn(4, 5)]
         reg_mem = self.registration.register_buffers(tensors)
@@ -267,29 +234,23 @@ class TestNixlUnified(unittest.TestCase):
             os.path.join(self.test_dir, "test1.bin"),
             os.path.join(self.test_dir, "test2.bin")
         ]
-        
-        # Create files and prepare test data
-        file_info = [
-            (file_paths[0], 0, 1024),      # First file: offset 0, length 1024
-            (file_paths[1], 2048, 4096),   # Second file: offset 2048, length 4096
-        ]
-        
+
         # Create the files
         for path in file_paths:
             self.assertTrue(self.file_manager.create_file(path))
-        
+
         # Create NIXL tuples
-        file_tuples = self.file_manager.create_nixl_tuples(file_info)
+        file_tuples = self.file_manager.files_to_nixl_tuples(file_paths)
         self.assertEqual(len(file_tuples), 2)
-        
+
         # Test registration with tuples
         reg_mem = self.registration.register_files(file_tuples)
         self.assertIsNotNone(reg_mem)
-        
+
         # Verify NIXL agent was called correctly
         self.mock_agent.get_reg_descs.assert_called_with(file_tuples, "FILE")
         self.mock_agent.register_memory.assert_called_with("mock_reg_descs")
-        
+
         # Clean up file descriptors
         for file_tuple in file_tuples:
             self.assertTrue(self.file_manager.close_file(file_tuple[2]))
@@ -303,27 +264,27 @@ class TestNixlUnified(unittest.TestCase):
         from sglang.srt.mem_cache.nixl.nixl_utils import NixlBackendSelection
         from nixl._api import nixl_agent, nixl_agent_config
         import uuid
-        
+
         # Create NIXL agent
         agent_config = nixl_agent_config(backends=[])
         agent = nixl_agent(str(uuid.uuid4()), agent_config)
-        
+
         # Test auto backend selection
         backend_selector = NixlBackendSelection("auto")
         result = backend_selector.create_backend(agent)
         self.assertTrue(result, "Auto backend selection should succeed")
-        
+
         # Get available plugins
         plugin_list = agent.get_plugin_list()
         self.assertIsInstance(plugin_list, list, "Plugin list should be a list")
-        
+
         # Check which backend was selected
         self.assertTrue(hasattr(agent, 'backends'), "Agent should have backends attribute")
         self.assertTrue(agent.backends, "Agent should have at least one backend")
-        
+
         selected_backend = list(agent.backends.keys())[0]
         self.assertIsInstance(selected_backend, str, "Selected backend should be a string")
-        
+
         # Verify priority order (3FS > POSIX > GDS_MT > GDS)
         if "3FS" in plugin_list:
             # If 3FS is available, it should be selected first
@@ -337,17 +298,17 @@ class TestNixlUnified(unittest.TestCase):
                 pass  # Only GDS available
             else:
                 self.fail(f"Unexpected backend selected: {selected_backend}")
-        
+
         # Test specific backend selection (if POSIX is available)
         if "POSIX" in plugin_list:
             agent2 = nixl_agent(str(uuid.uuid4()), agent_config)
             backend_selector2 = NixlBackendSelection("POSIX")
             result2 = backend_selector2.create_backend(agent2)
             self.assertTrue(result2, "Specific POSIX backend selection should succeed")
-            
+
             # Verify the specific backend was created
             self.assertIn("POSIX", agent2.backends, "POSIX backend should be created")
 
 
 if __name__ == "__main__":
-    unittest.main() 
+    unittest.main()

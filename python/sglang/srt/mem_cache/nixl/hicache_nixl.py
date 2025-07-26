@@ -50,27 +50,24 @@ class HiCacheNixl(HiCacheStorage):
         self.registration = NixlRegistration(self.agent)
 
 
-    def _is_gpu_tensor(self, tensor: torch.Tensor) -> bool:
-        """Check if tensor is on GPU memory."""
-        return tensor.device.type == 'cuda'
-
-
-
     def _execute_transfer(
         self,
         tensors: List[torch.Tensor],
         file_paths: List[str],
         direction: str,  # "READ" or "WRITE"
     ) -> bool:
+        if len(tensors) != len(file_paths):
+            logger.error("Mismatch between number of tensors and files")
+            return False
+
         """Execute a NIXL transfer operation."""
         reg_mem = self.registration.register_buffers(tensors)
         if not reg_mem:
             logger.error("Failed to register tensors")
             return False
-  
-        file_info = [(path, 0, 0) for path in file_paths]  
-        
-        file_tuples = self.file_manager.create_nixl_tuples(file_info)
+ 
+        # Opening the files and preparing them as nixl tuples
+        file_tuples = self.file_manager.files_to_nixl_tuples(file_paths)
         if not file_tuples:
             logger.error("Failed to create NIXL tuples for files")
             return False
@@ -83,23 +80,20 @@ class HiCacheNixl(HiCacheStorage):
         
         try:
             # Step 3: Create transfer descriptors
-            # Determine memory type based on tensor device
-            memory_type = "VRAM" if tensors[0].device.type == 'cuda' else "DRAM"
-            
-            # For tensors, we can use the tensors directly with explicit memory type
-            tensor_descs = self.agent.get_xfer_descs(tensors, memory_type)
+            tensor_descs = self.agent.get_xfer_descs(tensors)
             if tensor_descs is None:
                 logger.error("Failed to get tensor transfer descriptors")
                 return False
             
-            # Calculate tensor sizes in bytes for file tuple lengths
+            # Extract tensor sizes in bytes to know how much to write/read per file
+            # if they were not contiguous register_buffers would have failed
             tensor_sizes = [tensor.element_size() * tensor.numel() for tensor in tensors]
             
-            # For files, convert 4-element tuples to 3-element tuples for transfer
-            # Use tensor sizes to ensure file tuple lengths match tensor sizes
-            transfer_tuples = self.file_manager.get_nixl_tuples_for_transfer(file_tuples, tensor_sizes)
+            # For transfer to files, after registration only the offset/length/fs is needed 
+            transfer_tuples = [(x[0], s, x[2]) for x,s in zip (file_tuples, tensor_sizes)]
+
             if not transfer_tuples:
-                logger.error("Failed to convert file tuples for transfer")
+                logger.error("Failed to create file tuples for transfer")
                 return False
             
             file_descs = self.agent.get_xfer_descs(transfer_tuples, "FILE")
@@ -110,7 +104,7 @@ class HiCacheNixl(HiCacheStorage):
             # For file plugins: src is always tensors, dst is always files
             # Direction determines whether we're reading from or writing to files
             src_descs = tensor_descs  # Source is always tensors
-            dst_descs = file_descs     # Destination is always files
+            dst_descs = file_descs  # Destination is always files
             
             # Step 4: Create transfer request
             xfer_req = self.agent.initialize_xfer(
@@ -121,9 +115,10 @@ class HiCacheNixl(HiCacheStorage):
             )
 
             if xfer_req is None:
-                logger.error("Failed to initialize transfer")
+                logger.error("Failed to create transfer request")
                 return False
             
+            # Initiate the transfer
             state = self.agent.transfer(xfer_req)
             
             while state != "DONE":
@@ -178,11 +173,10 @@ class HiCacheNixl(HiCacheStorage):
         return dst_tensors if success else [None] * len(keys)
     
    
-    # Modify this to use new NIXL queryMem API 
     def exists(self, key: str) -> bool:
         """
         Check if the key exists in NIXL storage.
         Returns True if the key exists, False otherwise.
         """
         tensor_path = self.file_manager.get_file_path(key)
-        return os.path.exists(tensor_path)
+        return (self.agnet.query_memory(self.file_manager.files_to_nixl_tuples([tensor_path], False)) != None)

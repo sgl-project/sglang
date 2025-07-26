@@ -8,17 +8,17 @@ logger = logging.getLogger(__name__)
 
 class NixlBackendSelection:
     """Handles NIXL backend selection and creation."""
-    
+
     def __init__(self, file_plugin: str = "auto"):
         self.file_plugin = file_plugin
-    
+
     def create_backend(self, agent) -> bool:
         """Create the appropriate NIXL backend based on configuration."""
         try:
             # Get available plugins
             plugin_list = agent.get_plugin_list()
             logger.debug(f"Available NIXL plugins: {plugin_list}")
-            
+
             # Select backend based on file_plugin setting
             if self.file_plugin == "auto":
                 if "3FS" in plugin_list:
@@ -34,7 +34,7 @@ class NixlBackendSelection:
                     backend_name = "POSIX"
             else:
                 backend_name = self.file_plugin
-            
+
             # Create the selected backend
             if backend_name in plugin_list:
                 agent.create_backend(backend_name)
@@ -43,7 +43,7 @@ class NixlBackendSelection:
             else:
                 logger.error(f"Backend {backend_name} not available in plugins: {plugin_list}")
                 return False
-                
+
         except Exception as e:
             logger.error(f"Failed to create NIXL backend: {e}")
             return False
@@ -60,7 +60,7 @@ class NixlRegistration:
         try:
             if isinstance(buffers, torch.Tensor):
                 buffers = [buffers]
-            
+
             if not buffers:
                 logger.debug("No buffers to register")
                 return None
@@ -88,7 +88,7 @@ class NixlRegistration:
             return None
 
     def register_files(self, tuples: List[tuple]) -> Optional[any]:
-        """Register files with NIXL using (0, 0, fd, "") tuples."""
+        """Register files with NIXL using (0, 0, fd, file_path) tuples."""
         try:
             if not tuples:
                 logger.debug("No files to register")
@@ -159,33 +159,37 @@ class NixlFileManager:
             logger.error(f"Failed to close file descriptor {fd}: {e}")
             return False
 
-    def create_nixl_tuples(self, file_info: List[Tuple[str, int, int]]) -> List[Tuple[int, int, int, str]]:
+    def files_to_nixl_tuples(self, file_paths: List[str], open_file: bool = True) -> List[Tuple[int, int, int, str]]:
         """
-        Create NIXL tuples (offset, length, fd, "") for given files.
+        Create NIXL tuples (offset, length, fd, file_path) for given files.
         Args:
-            file_info: List of tuples (file_path, offset, length)
+            file_paths: List of file pathstuples
         Returns:
-            List of NIXL tuples (offset, length, fd, "") or empty list if any operation fails.
+            List of NIXL tuples or empty list if any operation fails.
         """
         try:
             tuples = []
             opened_fds = []
-            
-            for file_path, offset, length in file_info:
-                # Open file and get file descriptor
-                fd = self.open_file(file_path)
-                if fd is None:
-                    # Clean up already opened files
-                    for fd in opened_fds:
-                        self.close_file(fd)
-                    return []
-                
-                opened_fds.append(fd)
-                # Format: (address, length, device_id, meta_info) = (offset, length, fd, "")
-                tuples.append((offset, length, fd, ""))
-            
+
+            if open_file:
+                for file_path in file_paths:
+                    # Open file and get file descriptor
+                    fd = self.open_file(file_path)
+                    if fd is None:
+                        # Clean up already opened files
+                        for fd in opened_fds:
+                            self.close_file(fd)
+                        return []
+
+                    opened_fds.append(fd)
+                    # Format: (address, length, device_id, meta_info) = (offset, length, fd, file_path)
+                    # Can be customized to write multiple entries to the same file based on offset and length
+                    tuples.append((0, 0, fd, file_path))
+            else:
+                tuples = [(0, 0, 0, file_path) for file_path in file_paths]
+
             return tuples
-            
+
         except Exception as e:
             logger.error(f"Failed to create NIXL tuples: {e}")
             # Clean up opened files on exception
@@ -195,34 +199,3 @@ class NixlFileManager:
                 except:
                     pass
             return []
-
-    def get_nixl_tuples_for_transfer(self, file_tuples: List[Tuple[int, int, int, str]], tensor_sizes: List[int] = None) -> List[Tuple[int, int, int]]:
-        """
-        Convert 4-element NIXL tuples to 3-element tuples for transfer.
-        For transfer requests, file tuple lengths must match tensor sizes.
-        Args:
-            file_tuples: List of 4-element tuples (offset, length, fd, "")
-            tensor_sizes: Optional list of tensor sizes in bytes to use instead of file tuple lengths
-        Returns:
-            List of 3-element tuples (offset, length, fd) for transfer
-        """
-        try:
-            if tensor_sizes is None:
-                # Use original lengths if no tensor sizes provided
-                transfer_tuples = [(t[0], t[1], t[2]) for t in file_tuples]
-            else:
-                # Use tensor sizes for file tuple lengths to match tensor descriptors
-                transfer_tuples = []
-                for i, (offset, _, fd, _) in enumerate(file_tuples):
-                    if i < len(tensor_sizes):
-                        # Use tensor size for length, keeping offset and fd
-                        transfer_tuples.append((offset, tensor_sizes[i], fd))
-                    else:
-                        # Fallback to original length if tensor size not provided
-                        transfer_tuples.append((offset, file_tuples[i][1], fd))
-            
-            return transfer_tuples
-            
-        except Exception as e:
-            logger.error(f"Failed to convert NIXL tuples for transfer: {e}")
-            return [] 
