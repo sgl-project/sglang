@@ -26,11 +26,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
-
-from sglang.srt.debug_utils.dumper import dumper
 from transformers import PretrainedConfig
 
+from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     parallel_state,
     tensor_model_parallel_all_reduce,
@@ -394,6 +394,7 @@ class DeepseekV2MoE(nn.Module):
         if global_server_args_dict["enable_deepep_moe"]:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_tensor_model_parallel_world_size()
+            self.ep_rank = get_tensor_model_parallel_rank()
             self.num_experts = (
                 config.n_routed_experts
                 + global_server_args_dict["ep_num_redundant_experts"]
@@ -598,7 +599,8 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 topk_output=TopKOutput(
-                    topk_ids=topk_idx,
+                    topk_ids=topk_idx
+                    + self.experts.num_experts // self.ep_size * self.ep_rank,
                     topk_weights=topk_weights,
                     router_logits=None,
                 ),
