@@ -592,6 +592,15 @@ class TokenizerManager:
                     "Please set `--enable-custom-logits-processor` to enable this feature."
                 )
 
+            if (max_input_id := max(input_ids)) >= len(self.tokenizer):
+                raise ValueError(
+                    f"The maximum input id ({max_input_id}) should be less than num tokens ({len(self.tokenizer)})"
+                )
+            if (min_input_id := min(input_ids)) < 0:
+                raise ValueError(
+                    f"The minimum input id ({min_input_id}) should be non-negative"
+                )
+
     def _validate_input_ids_in_vocab(
         self, input_ids: List[int], vocab_size: int
     ) -> None:
