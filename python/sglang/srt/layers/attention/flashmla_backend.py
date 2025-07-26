@@ -2,9 +2,6 @@ from __future__ import annotations
 
 """
 Support attention backend for FlashMLA.
-
-#TODO
-Enable speculative sampling in FlashMLA
 """
 
 from dataclasses import dataclass
@@ -14,8 +11,6 @@ import torch
 import triton
 from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
-from sglang.global_config import global_config
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -24,7 +19,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpecInfo
 
 
@@ -154,6 +148,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
+        max_num_tokens: int,
         block_kv_indices: Optional[torch.Tensor] = None,
     ):
         if block_kv_indices is None:
@@ -330,7 +325,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return 1024
+        return 1
 
     def forward_decode(
         self,
@@ -464,11 +459,9 @@ class FlashMLAMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
-
         if topk > 1:
             raise ValueError(
-                f"Currently FlashMLA only supports topk=1 for speculative decoding"
+                "Currently FlashMLA only supports topk=1 for speculative decoding"
             )
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
@@ -510,9 +503,11 @@ class FlashMLAMultiStepDraftBackend:
 
         self.common_template(forward_batch, call_fn)
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps):
-            self.attn_backends[i].init_cuda_graph_state(max_bs, block_kv_indices=None)
+            self.attn_backends[i].init_cuda_graph_state(
+                max_bs, max_num_tokens, block_kv_indices=None
+            )
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
         def call_fn(i, forward_batch):

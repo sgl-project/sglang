@@ -14,6 +14,7 @@ To run DeepSeek V3/R1 models, the requirements are as follows:
 | **Full precision FP8**<br>*(recommended)* | 8 x H200 |
 | | 8 x MI300X |
 | | 2 x 8 x H100/800/20 |
+| | Xeon 6980P CPU |
 | **Full precision BF16** | 2 x 8 x H200 |
 | | 2 x 8 x MI300X |
 | | 4 x 8 x H100/800/20 |
@@ -22,6 +23,7 @@ To run DeepSeek V3/R1 models, the requirements are as follows:
 | | 8 x A100/A800 |
 | **Quantized weights (int8)** | 16 x A100/800 |
 | | 32 x L40S |
+| | Xeon 6980P CPU |
 
 <style>
 .md-typeset__table {
@@ -61,6 +63,7 @@ Detailed commands for reference:
 - [8 x A100 (AWQ)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-8-a100a800-with-awq-quantization)
 - [16 x A100 (int8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-16-a100a800-with-int8-quantization)
 - [32 x L40S (int8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-32-l40s-with-int8-quantization)
+- [Xeon 6980P CPU](https://docs.sglang.ai/references/cpu.html#example-running-deepseek-r1)
 
 ### Download Weights
 If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded. Please refer to [DeepSeek V3](https://huggingface.co/deepseek-ai/DeepSeek-V3-Base#61-inference-with-deepseek-infer-demo-example-only) official guide to download the weights.
@@ -174,7 +177,7 @@ See [Separate Reasoning](https://docs.sglang.ai/backend/separate_reasoning.html)
 Add arguments `--tool-call-parser deepseekv3` and `--chat-template ./examples/chat_template/tool_chat_template_deepseekv3.jinja`(recommended) to enable this feature. For example (running on 1 * H20 node):
 
 ```
-python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --port 30000 --host 0.0.0.0 --mem-fraction-static 0.9 --disable-cuda-graph --tool-call-parser deepseekv3 --chat-template ./examples/chat_template/tool_chat_template_deepseekv3.jinja
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --port 30000 --host 0.0.0.0 --mem-fraction-static 0.9 --tool-call-parser deepseekv3 --chat-template ./examples/chat_template/tool_chat_template_deepseekv3.jinja
 ```
 
 Sample Request:

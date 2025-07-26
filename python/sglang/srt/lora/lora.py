@@ -65,7 +65,7 @@ class LoRAAdapter(nn.Module):
         self.layers: List[LoRALayer] = nn.ModuleList(
             [
                 LoRALayer(config, base_hf_config)
-                for i in range(base_hf_config.num_hidden_layers)
+                for _ in range(base_hf_config.num_hidden_layers)
             ]
         )
 
@@ -88,10 +88,9 @@ class LoRAAdapter(nn.Module):
             else:
                 self.weights[name] = loaded_weight.cpu()
 
-        # stack kv_proj and gate_up_proj
-        for i in range(self.base_hf_config.num_hidden_layers):
-            layer = self.layers[i]
-            weight_names = [name for name, _ in layer.weights.items()]
+        # normalize kv_proj and gate_up_proj
+        for layer in self.layers:
+            weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
             self.normalize_gate_up_proj(weight_names, layer.weights)
 
@@ -165,12 +164,17 @@ class LoRAAdapter(nn.Module):
                         self.base_hf_config.hidden_size
                         // self.base_hf_config.num_attention_heads
                     )
-                    weights[q_name], weights[kv_name] = torch.split(
+                    weights[q_name], k_proj_weight, v_proj_weight = torch.split(
                         weights[qkv_name],
                         [
                             head_size * self.base_hf_config.num_attention_heads,
-                            head_size * self.base_hf_config.num_key_value_heads * 2,
+                            head_size * self.base_hf_config.num_key_value_heads,
+                            head_size * self.base_hf_config.num_key_value_heads,
                         ],
+                        dim=0,
+                    )
+                    weights[kv_name] = torch.stack(
+                        [k_proj_weight, v_proj_weight],
                         dim=0,
                     )
 
@@ -182,10 +186,6 @@ class LoRAAdapter(nn.Module):
                 up_name = weight_name.replace("gate_proj", "up_proj")
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
                 if up_name not in weights:
-                    logger.warning(
-                        f"Gate projection {weight_name} does not have a corresponding up projection {up_name}. "
-                        f"Initializing up projection to zero."
-                    )
                     weights[up_name] = torch.zeros_like(weights[weight_name])
                     # FIXME: Add gate-only support for flashinfer in future implementations
                     assert self.lora_backend.name == "triton", (
@@ -209,4 +209,12 @@ class LoRAAdapter(nn.Module):
                 gate_up_name = weight_name
                 if "lora_A" in weight_name:
                     weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
-                # else: "lora_B" is already stacked, no operations is needed.
+                else:
+                    output_dim = weights[gate_up_name].shape[0] // 2
+                    weights[gate_up_name] = torch.stack(
+                        [
+                            weights[gate_up_name][:output_dim, :],
+                            weights[gate_up_name][output_dim:, :],
+                        ],
+                        dim=0,
+                    )

@@ -1,6 +1,5 @@
 """Common utilities"""
 
-import base64
 import importlib
 import json
 import logging
@@ -20,6 +19,7 @@ from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
 import numpy as np
+import pybase64
 import requests
 from IPython.display import HTML, display
 from pydantic import BaseModel
@@ -148,15 +148,15 @@ def encode_image_base64(image_path: Union[str, bytes]):
     if isinstance(image_path, str):
         with open(image_path, "rb") as image_file:
             data = image_file.read()
-            return base64.b64encode(data).decode("utf-8")
+            return pybase64.b64encode(data).decode("utf-8")
     elif isinstance(image_path, bytes):
-        return base64.b64encode(image_path).decode("utf-8")
+        return pybase64.b64encode(image_path).decode("utf-8")
     else:
         # image_path is PIL.WebPImagePlugin.WebPImageFile
         image = image_path
         buffered = BytesIO()
         image.save(buffered, format="PNG")
-        return base64.b64encode(buffered.getvalue()).decode("utf-8")
+        return pybase64.b64encode(buffered.getvalue()).decode("utf-8")
 
 
 def encode_frame(frame):
@@ -223,7 +223,7 @@ def encode_video_base64(video_path: str, num_frames: int = 16):
     video_bytes = b"".join(encoded_frames)
 
     # Encode the concatenated bytes to base64
-    video_base64 = "video:" + base64.b64encode(video_bytes).decode("utf-8")
+    video_base64 = "video:" + pybase64.b64encode(video_bytes).decode("utf-8")
 
     return video_base64
 
@@ -512,3 +512,12 @@ async def async_stream_and_merge(llm, prompt, sampling_params):
         cleaned_chunk = trim_overlap(final_text, chunk_text)
         final_text += cleaned_chunk
         yield cleaned_chunk  # yield the non-overlapping portion
+
+
+def resolve_obj_by_qualname(qualname: str) -> Any:
+    """
+    Resolve an object by its fully qualified name.
+    """
+    module_name, obj_name = qualname.rsplit(".", 1)
+    module = importlib.import_module(module_name)
+    return getattr(module, obj_name)

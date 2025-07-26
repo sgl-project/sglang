@@ -9,9 +9,11 @@ import torch
 
 import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,12 @@ class SamplingBatchInfo:
 
     # Whether all requests use greedy sampling
     is_all_greedy: bool
+
+    # Whether any requests use top_p sampling
+    need_top_p_sampling: bool
+
+    # Whether any requests use top_k sampling
+    need_top_k_sampling: bool
 
     # Whether any request needs min_p sampling
     need_min_p_sampling: bool
@@ -55,6 +63,9 @@ class SamplingBatchInfo:
     # Device
     device: str = "cuda"
 
+    # Handle logit bias
+    logit_bias: Optional[torch.Tensor] = None
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         reqs = batch.reqs
@@ -76,6 +87,14 @@ class SamplingBatchInfo:
         min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs], dtype=torch.float
         ).to(device, non_blocking=True)
+
+        logit_bias = None
+        if any(r.sampling_params.logit_bias is not None for r in reqs):
+            logit_bias = torch.zeros(len(reqs), vocab_size, device=device)
+            for i, r in enumerate(reqs):
+                if r.sampling_params.logit_bias is not None:
+                    for key, value in r.sampling_params.logit_bias.items():
+                        logit_bias[i, int(key)] = value
 
         # Check if any request has custom logit processor
         has_custom_logit_processor = (
@@ -133,6 +152,8 @@ class SamplingBatchInfo:
             top_ks=top_ks,
             min_ps=min_ps,
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
+            need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
+            need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
@@ -140,6 +161,7 @@ class SamplingBatchInfo:
             custom_params=custom_params,
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
+            logit_bias=logit_bias,
         )
         return ret
 
@@ -167,7 +189,7 @@ class SamplingBatchInfo:
 
         # Apply the mask
         for i, grammar in enumerate(self.grammars):
-            if grammar and not grammar.finished:
+            if grammar and not grammar.finished and not grammar.is_terminated():
                 grammar.fill_vocab_mask(self.vocab_mask, i)
 
         # Move the mask to the device if needed
@@ -196,6 +218,9 @@ class SamplingBatchInfo:
         if self.vocab_mask is not None:
             self.apply_mask_func(logits=logits, vocab_mask=self.vocab_mask)
 
+        if self.logit_bias is not None:
+            logits.add_(self.logit_bias)
+
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         self.penalizer_orchestrator.filter(keep_indices_device)
 
@@ -210,6 +235,9 @@ class SamplingBatchInfo:
         ]:
             value = getattr(self, item, None)
             setattr(self, item, value[keep_indices_device])
+
+        if self.logit_bias is not None:
+            self.logit_bias = self.logit_bias[keep_indices_device]
 
     def _filter_batch_custom_logit_processor(
         self, keep_indices: List[int], keep_indices_device: torch.Tensor
@@ -294,6 +322,12 @@ class SamplingBatchInfo:
             # Set the flag to True if any of the two has custom logit processor
             self.has_custom_logit_processor = True
 
+        # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
+        # See note below on len(self) and len(other).
+        self.logit_bias = merge_bias_tensor(
+            self.logit_bias, other.logit_bias, len(self), len(other), self.device, 0.0
+        )
+
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
@@ -308,4 +342,45 @@ class SamplingBatchInfo:
             setattr(self, item, torch.cat([self_val, other_val]))
 
         self.is_all_greedy &= other.is_all_greedy
+        self.need_top_p_sampling |= other.need_top_p_sampling
+        self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+
+
+def merge_bias_tensor(
+    lhs: Optional[torch.Tensor],
+    rhs: Optional[torch.Tensor],
+    bs1: int,
+    bs2: int,
+    device: str,
+    default: float,
+):
+    """Merge two bias tensors for batch merging.
+
+    Args:
+        lhs: Left-hand side tensor
+        rhs: Right-hand side tensor
+        bs1: Batch size of left-hand side tensor
+        bs2: Batch size of right-hand side tensor
+        device: Device to place the merged tensor on
+        default: Default value for missing tensor elements
+
+    Returns:
+        Merged tensor or None if both inputs are None
+    """
+    if lhs is None and rhs is None:
+        return None
+
+    if lhs is not None and rhs is not None:
+        return torch.cat([lhs, rhs])
+    else:
+        if lhs is not None:
+            shape, dtype = lhs.shape[1:], lhs.dtype
+        else:
+            shape, dtype = rhs.shape[1:], rhs.dtype
+
+        if lhs is None:
+            lhs = torch.empty((bs1, *shape), device=device, dtype=dtype).fill_(default)
+        if rhs is None:
+            rhs = torch.empty((bs2, *shape), device=device, dtype=dtype).fill_(default)
+        return torch.cat([lhs, rhs])

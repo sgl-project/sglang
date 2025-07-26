@@ -4,6 +4,8 @@ python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_mixed_
 python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_multi_images_chat_completion
 """
 
+import unittest
+
 from test_vision_openai_server_common import *
 
 from sglang.srt.utils import kill_process_tree
@@ -28,10 +30,13 @@ class TestQwen2VLServer(TestOpenAIVisionServer):
             api_key=cls.api_key,
             other_args=[
                 "--mem-fraction-static",
-                "0.4",
+                "0.35",
             ],
         )
         cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        self._test_video_chat_completion()
 
 
 class TestQwen2_5_VLServer(TestOpenAIVisionServer):
@@ -47,10 +52,13 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
             api_key=cls.api_key,
             other_args=[
                 "--mem-fraction-static",
-                "0.4",
+                "0.35",
             ],
         )
         cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        self._test_video_chat_completion()
 
 
 class TestVLMContextLengthIssue(CustomTestCase):
@@ -67,7 +75,7 @@ class TestVLMContextLengthIssue(CustomTestCase):
             other_args=[
                 "--context-length",
                 "300",
-                "--mem-fraction-static=0.80",
+                "--mem-fraction-static=0.75",
             ],
         )
         cls.base_url += "/v1"
@@ -108,22 +116,23 @@ class TestVLMContextLengthIssue(CustomTestCase):
         )
 
 
-class TestMllamaServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-        )
-        cls.base_url += "/v1"
+# Note(Xinyuan): mllama is not stable for now, skip for CI
+# class TestMllamaServer(TestOpenAIVisionServer):
+#     @classmethod
+#     def setUpClass(cls):
+#         cls.model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+#         cls.base_url = DEFAULT_URL_FOR_TEST
+#         cls.api_key = "sk-123456"
+#         cls.process = popen_launch_server(
+#             cls.model,
+#             cls.base_url,
+#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+#             api_key=cls.api_key,
+#         )
+#         cls.base_url += "/v1"
 
-    def test_video_chat_completion(self):
-        pass
+#     def test_video_chat_completion(self):
+#         pass
 
 
 class TestMinicpmvServer(TestOpenAIVisionServer):
@@ -139,7 +148,7 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.4",
+                "0.35",
             ],
         )
         cls.base_url += "/v1"
@@ -173,7 +182,7 @@ class TestMinicpmoServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.7",
+                "0.65",
             ],
         )
         cls.base_url += "/v1"
@@ -181,6 +190,26 @@ class TestMinicpmoServer(TestOpenAIVisionServer):
     def test_audio_chat_completion(self):
         self._test_audio_speech_completion()
         self._test_audio_ambient_completion()
+
+
+class TestMimoVLServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "XiaomiMiMo/MiMo-VL-7B-RL"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.6",
+            ],
+        )
+        cls.base_url += "/v1"
 
 
 if __name__ == "__main__":

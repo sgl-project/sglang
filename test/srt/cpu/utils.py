@@ -244,3 +244,11 @@ def native_fp8_fused_moe(a, w1, w2, topk_weight, topk_ids, topk):
         .sum(dim=1)
         .to(a.dtype)
     )
+
+
+def make_non_contiguous(x: torch.Tensor) -> torch.Tensor:
+    """
+    Make a tensor non-contiguous by slicing it via last dimension.
+    """
+    last_dim = x.shape[-1]
+    return x[..., : last_dim // 2] if x.is_contiguous() else x
