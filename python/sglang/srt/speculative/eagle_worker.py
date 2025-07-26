@@ -149,15 +149,12 @@ class EAGLEWorker(TpModelWorker):
             if self.hot_token_id is not None:
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
-
                 # Create a boolean mask for hot tokens
                 vocab_size = head.data.shape[0]
                 mask_hot = torch.zeros(vocab_size, dtype=torch.bool, device=head.device)
                 mask_hot[self.hot_token_id] = True
-
                 # Save the number of cold tokens
                 self.num_cold_tokens = torch.sum(~mask_hot).item()
-
                 # Sum up the cold rows of the LM head
                 tail_sum = torch.sum(head.data[~mask_hot], dim=0)
                 # Remove cold rows
@@ -936,8 +933,7 @@ class EAGLEWorker(TpModelWorker):
         )
 
         logits[..., -1] = (
-            torch.log(num_cold_tokens_tensor)
-            + cold_token_logits / self.num_cold_tokens
+            torch.log(num_cold_tokens_tensor) + cold_token_logits / self.num_cold_tokens
         )
         return logits_output
 
