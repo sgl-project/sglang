@@ -404,6 +404,7 @@ class EAGLEWorker(TpModelWorker):
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
         if self.page_size == 1:
+            # TODO: We only need self.speculative_num_steps - 1 * topk cache loc
             out_cache_loc, token_to_kv_pool_state_backup = batch.alloc_token_slots(
                 num_seqs * self.speculative_num_steps * self.topk, backup_state=True
             )
@@ -457,7 +458,6 @@ class EAGLEWorker(TpModelWorker):
         if self.page_size > 1 and self.topk > 1:
             last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
             duplicate_cache_len = torch.sum(last_page_lens).item() * (self.topk - 1)
-            # TODO: Remove device sync here
             target_cache_loc = torch.zeros(
                 duplicate_cache_len, dtype=torch.int32, device=self.device
             )
@@ -493,6 +493,7 @@ class EAGLEWorker(TpModelWorker):
                     target_cache_loc, source_cache_loc
                 )
             # Remove padded slots
+            # TODO: We only need self.speculative_num_steps - 1 cache loc
             out_cache_loc = out_cache_loc[
                 : num_seqs * self.topk * self.speculative_num_steps
             ]
@@ -599,7 +600,7 @@ class EAGLEWorker(TpModelWorker):
         )
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
-
+        # TODO: We only need self.speculative_num_steps - 1 cache loc
         out_cache_loc = out_cache_loc.reshape(
             forward_batch.batch_size, self.topk, self.speculative_num_steps
         )
@@ -623,8 +624,7 @@ class EAGLEWorker(TpModelWorker):
             parents_list.append(tree_info[2])
 
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
-            # TODO(yubowang): confirm on number of steps
-            if i == self.speculative_num_steps:
+            if i == self.speculative_num_steps - 1:
                 break
 
             # Set inputs
