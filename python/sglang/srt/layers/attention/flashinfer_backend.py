@@ -93,12 +93,6 @@ class FlashInferAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
 
-        # track these for 2D mask fill kernel to avoid recompilation
-        # TODO(Wenxuan) shrink down to avoid outliers?
-        self.max_req_input_len = 0
-        self.max_cu_qo_len = 0
-        self.max_cu_kv_len = 0
-        self.mask_p = None
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
