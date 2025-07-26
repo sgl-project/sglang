@@ -313,6 +313,10 @@ class Scheduler(
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
+        self.poller = zmq.Poller()
+        self.poller.register(self.recv_from_tokenizer, zmq.POLLIN)
+        self.poller.register(self.recv_from_rpc, zmq.POLLIN)
+
         if self.current_scheduler_metrics_enabled():
             self.send_metrics_from_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
@@ -1002,19 +1006,24 @@ class Scheduler(
             if self.attn_tp_rank == 0:
                 recv_reqs = []
 
-                while True:
-                    try:
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
+                sockets = dict(self.poller.poll(timeout=2))
 
-                while True:
-                    try:
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
+                if self.recv_from_tokenizer in sockets:
+                    while True:
+                        try:
+                            recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        except zmq.Again:
+                            break
+                        recv_reqs.append(recv_req)
+
+                if self.recv_from_rpc in sockets:
+                    while True:
+                        try:
+                            recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                        except zmq.Again:
+                            break
+                        recv_reqs.append(recv_rpc)
+
             else:
                 recv_reqs = None
         else:
