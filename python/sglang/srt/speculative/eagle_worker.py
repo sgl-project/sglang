@@ -165,8 +165,27 @@ class EAGLEWorker(TpModelWorker):
             # Share the embedding and lm_head
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
-        # TODO: load from a file
+        # Load weaker drafter map if provided
         self.weaker_drafter = None
+        if server_args.speculative_weaker_drafter_map is not None:
+            weaker_drafter_all_vocab = load_tensor_from_path(
+                server_args.speculative_weaker_drafter_map
+            ).to(self.device)
+
+            if self.hot_token_id is not None:
+                # The loaded weaker_drafter is for the full vocabulary.
+                # We need to select the values for the cold tokens.
+                vocab_size = weaker_drafter_all_vocab.shape[0]
+                mask_hot = torch.zeros(vocab_size, dtype=torch.bool, device=self.device)
+                mask_hot[self.hot_token_id.to(self.device)] = True
+                self.weaker_drafter = weaker_drafter_all_vocab[~mask_hot]
+                # Normalize the weaker drafter
+                self.weaker_drafter = self.weaker_drafter / self.weaker_drafter.sum()
+            else:
+                # If there is no hot token map, all tokens are considered cold.
+                # However, the weaker_drafter logic is only triggered when there is
+                # a hot/cold split, so we do nothing here.
+                pass
 
         # Init attention backend and cuda graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (
@@ -975,6 +994,21 @@ class EAGLEWorker(TpModelWorker):
             if torch.any(torch.isnan(logits)):
                 logger.error("Detected errors during sampling! NaN in the logits.")
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
+
+
+def load_tensor_from_path(tensor_path: str) -> torch.Tensor:
+    if not os.path.exists(tensor_path):
+        cache_dir = snapshot_download(
+            os.path.dirname(tensor_path),
+            # Avoid downloading the large model weights
+            ignore_patterns=["*.bin", "*.safetensors"],
+        )
+        tensor_path = os.path.join(cache_dir, os.path.basename(tensor_path))
+    tensor = torch.load(tensor_path, weights_only=True)
+    if not isinstance(tensor, torch.Tensor):
+        # The loaded object could be a list of numbers
+        tensor = torch.tensor(tensor)
+    return tensor
 
 
 def load_token_map(token_map_path: str) -> List[int]:
