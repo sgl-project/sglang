@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
@@ -38,6 +38,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEPMoEMethod
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
+from sglang.srt.layers.quantization.w8a8_int8 import NPU_W8A8EPMoEMethod, W8A8Int8Config
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import (
@@ -192,6 +193,12 @@ class EPMoE(torch.nn.Module):
             self.block_shape = None
             self.activation_scheme = None
             self.use_w4afp8 = False
+        elif _is_npu and isinstance(quant_config, W8A8Int8Config):
+            self.quant_method: Optional[QuantizeMethodBase] = NPU_W8A8EPMoEMethod(
+                quant_config
+            )
+            self.use_block_quant = False
+            params_dtype = torch.int8
         elif isinstance(quant_config, W4AFp8Config):
             self.quant_method: Optional[QuantizeMethodBase] = W4AFp8MoEMethod(
                 quant_config
@@ -1315,8 +1322,189 @@ class DeepEPMoE(EPMoE):
         return down_output
 
 
+class AscendDeepEPMoE(EPMoE):
+    _has_printed = False
+
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_id: int,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        tp_size: Optional[int] = None,
+        prefix: str = "",
+        correction_bias: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+        deepep_mode: DeepEPMode = DeepEPMode.auto,
+    ):
+        super().__init__(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            layer_id=layer_id,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            tp_size=tp_size,
+            prefix=prefix,
+            activation=activation,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+        self.deepep_mode = deepep_mode
+
+    def weight_loader(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> None:
+        physical_expert_ids = (
+            get_global_expert_location_metadata().logical_to_all_physical(
+                self.layer_id, expert_id
+            )
+        )
+        for physical_expert_id in physical_expert_ids:
+            self._weight_loader_physical(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=physical_expert_id,
+            )
+
+    def _weight_loader_physical(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> None:
+        if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
+            return
+        expert_id = expert_id - self.start_expert_id
+
+        if shard_id not in ("w1", "w2", "w3"):
+            raise ValueError(
+                f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
+            )
+
+        # Special case for w8a8 scales.
+        if "scale" in weight_name or "offset" in weight_name:
+            self._load_w8a8_scale(
+                param.data,
+                loaded_weight,
+                weight_name,
+                shard_id,
+                expert_id,
+            )
+            return
+
+        if shard_id == "w2":
+            param.data[expert_id] = loaded_weight
+        elif shard_id == "w1":
+            param.data[expert_id][: self.intermediate_size, :] = loaded_weight
+        elif shard_id == "w3":
+            param.data[expert_id][self.intermediate_size :, :] = loaded_weight
+        else:
+            raise ValueError(f"Expected shard_id w1,w2 or w3 but got {shard_id}")
+
+    def _load_w8a8_scale(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> None:
+        param_data = param.data
+        expert_data = param.data[expert_id]
+        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+        shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
+        if shard_id == "w2":
+            expert_data.copy_(loaded_weight)
+        elif shard_id in ("w1", "w3"):
+            # Index the loaded weight for tp sharding.
+            # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
+            shard_size = expert_data.shape[shard_dim] // 2
+
+            if shard_id == "w1":
+                expert_data = expert_data.narrow(shard_dim, 0, shard_size)
+            # w3, up_proj: Load into second logical weight of w13.
+            else:
+                assert shard_id == "w3"
+                expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+            expert_data.copy_(loaded_weight)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_idx: torch.Tensor,
+        reorder_topk_ids: torch.Tensor,
+        seg_indptr: torch.Tensor,
+        masked_m: torch.Tensor,
+        expected_m: int,
+        num_recv_tokens_per_expert: List[int],
+        forward_batch: ForwardBatch,
+    ):
+        assert self.quant_method is not None
+        assert self.activation == "silu"
+        output_dtype = torch.bfloat16
+
+        pertoken_scale = hidden_states[1]
+        hidden_states = hidden_states[0]
+
+        group_list_type = 1
+        seg_indptr = seg_indptr.to(torch.int64)
+
+        import torch_npu
+
+        # gmm1: gate_up_proj
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[self.w13_weight],
+            scale=[self.w13_weight_scale.to(output_dtype)],
+            per_token_scale=[pertoken_scale],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=seg_indptr,
+            output_dtype=output_dtype,
+        )[0]
+
+        # act_fn: swiglu
+        hidden_states = torch_npu.npu_swiglu(hidden_states)
+
+        hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
+
+        # gmm2: down_proj
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[self.w2_weight],
+            scale=[self.w2_weight_scale.to(output_dtype)],
+            per_token_scale=[swiglu_out_scale],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=seg_indptr,
+            output_dtype=output_dtype,
+        )[0]
+
+        return hidden_states
+
+
 def get_moe_impl_class():
     if global_server_args_dict["enable_deepep_moe"]:
+        if _is_npu:
+            return AscendDeepEPMoE
         return DeepEPMoE
     if global_server_args_dict["enable_flashinfer_moe"]:
         # Must come before EPMoE because FusedMoE also supports enable_ep_moe
