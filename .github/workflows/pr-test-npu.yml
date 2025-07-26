@@ -42,7 +42,7 @@ jobs:
         timeout-minutes: 30
         env:
           SGLANG_USE_MODELSCOPE: true
-          HF_ENDPOINT: https://hf-mirror.com
+          HF_ENDPOINT: https://127.0.0.1 # Set to an inaccessible Huggingface endpoint
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-npu
