@@ -167,8 +167,6 @@ class TestGemma3nServer(TestOpenAIVisionServer):
                 "0.70",
                 "--cuda-graph-max-bs",
                 "1",
-                # "--disable-radix-cache",
-                # "--disable-hybrid-swa-memory"
             ],
         )
         cls.base_url += "/v1"
