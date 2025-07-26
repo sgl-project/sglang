@@ -199,6 +199,7 @@ class ReasoningParser:
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
         "qwen3": Qwen3Detector,
+        "qwen3-thinking": Qwen3Detector,
         "kimi": KimiDetector,
     }
 
@@ -214,6 +215,9 @@ class ReasoningParser:
         detector_class = self.DetectorMap.get(model_type.lower())
         if not detector_class:
             raise ValueError(f"Unsupported model type: {model_type}")
+
+        if model_type.lower() == "qwen3-thinking":
+            force_reasoning = True
 
         self.detector = detector_class(
             stream_reasoning=stream_reasoning, force_reasoning=force_reasoning
