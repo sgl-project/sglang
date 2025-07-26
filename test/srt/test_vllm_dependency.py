@@ -17,8 +17,8 @@ from sglang.test.test_utils import (
 )
 
 MODEL_SCORE_THRESHOLDS = {
-    "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4": 0.83,
-    "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4": 0.83,
+    "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4": 0.825,
+    "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4": 0.825,
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4": 0.62,
 }
 

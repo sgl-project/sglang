@@ -36,15 +36,18 @@ def _get_version():
 operator_namespace = "sgl_kernel"
 include_dirs = [
     root / "include",
+    root / "include" / "impl",
     root / "csrc",
 ]
 
 sources = [
     "csrc/allreduce/custom_all_reduce.hip",
+    "csrc/allreduce/quick_all_reduce.cu",
+    "csrc/elementwise/activation.cu",
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",
-    "csrc/torch_extension_rocm.cc",
     "csrc/speculative/eagle_utils.cu",
+    "csrc/torch_extension_rocm.cc",
 ]
 
 cxx_flags = ["-O3"]
@@ -67,6 +70,7 @@ if amdgpu_target not in ["gfx942", "gfx950"]:
         f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
     )
     sys.exit(1)
+
 
 hipcc_flags = [
     "-DNDEBUG",

@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Callable, NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -39,10 +39,10 @@ from sglang.srt.utils import (
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -54,7 +54,6 @@ if _use_aiter:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
-
 if _is_npu:
     import torch_npu
 
@@ -387,6 +386,7 @@ def grouped_topk_cpu(
     )
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -482,7 +482,6 @@ def biased_grouped_topk_gpu(
     renormalize: bool,
     num_expert_group: int = 0,
     topk_group: int = 0,
-    compiled: bool = not _is_npu,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -535,14 +534,7 @@ def biased_grouped_topk_gpu(
         )
         return topk_weights, topk_ids
     else:
-        biased_grouped_topk_fn = (
-            torch.compile(
-                biased_grouped_topk_impl, dynamic=True, backend=get_compiler_backend()
-            )
-            if compiled
-            else biased_grouped_topk_impl
-        )
-        return biased_grouped_topk_fn(
+        return biased_grouped_topk_impl(
             hidden_states,
             gating_output,
             correction_bias,
