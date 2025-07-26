@@ -59,7 +59,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import (
     DeepEPMoE,
     get_moe_impl_class,
-    use_flashinfer_blockscale_fp8_moe,
+    use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import TopK
@@ -317,7 +317,7 @@ class DeepseekV2MoE(nn.Module):
                 correction_bias=self.gate.e_score_correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
             )
-            if not use_flashinfer_blockscale_fp8_moe
+            if not use_flashinfer_trtllm_moe
             else None
         )
 
@@ -355,7 +355,7 @@ class DeepseekV2MoE(nn.Module):
                     topk_group=config.topk_group,
                     correction_bias=self.gate.e_score_correction_bias,
                 )
-                if use_flashinfer_blockscale_fp8_moe
+                if use_flashinfer_trtllm_moe
                 else {}
             ),
         )
@@ -475,15 +475,12 @@ class DeepseekV2MoE(nn.Module):
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
+            kwargs = {'hidden_states': hidden_states}
             if self.topk is not None:
-                topk_output = self.topk(hidden_states, router_logits)
-                final_hidden_states = self.experts(
-                    hidden_states=hidden_states, topk_output=topk_output
-                )
+                kwargs['topk_output'] = self.topk(hidden_states, router_logits)
             else:
-                final_hidden_states = self.experts(
-                    hidden_states=hidden_states, router_logits=router_logits
-                )
+                kwargs['router_logits'] = router_logits
+            final_hidden_states = self.experts(**kwargs)
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
@@ -503,15 +500,12 @@ class DeepseekV2MoE(nn.Module):
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
+        kwargs = {'hidden_states': hidden_states}
         if self.topk is not None:
-            topk_output = self.topk(hidden_states, router_logits)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, topk_output=topk_output
-            )
+            kwargs['topk_output'] = self.topk(hidden_states, router_logits)
         else:
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=router_logits
-            )
+            kwargs['router_logits'] = router_logits
+        final_hidden_states = self.experts(**kwargs)
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor

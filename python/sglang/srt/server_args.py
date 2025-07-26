@@ -439,6 +439,14 @@ class ServerArgs:
                 f"Flashinfer MoE is enabled. Shared expert fusion is disabled."
             )
 
+        if self.enable_flashinfer_trtllm_moe:
+            assert (
+                self.enable_ep_moe
+            ), "EP MoE is required for Flashinfer TRTLLM MOE"
+            logger.warning(
+                f"Flashinfer TRTLLM MoE is enabled."
+            )
+
         # DeepEP MoE
         if self.enable_deepep_moe:
             if self.deepep_mode == "normal":

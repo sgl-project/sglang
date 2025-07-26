@@ -54,7 +54,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-use_flashinfer_blockscale_fp8_moe = (
+use_flashinfer_trtllm_moe = (
     global_server_args_dict["enable_flashinfer_trtllm_moe"]
     and global_server_args_dict["enable_ep_moe"]
 )
@@ -69,12 +69,12 @@ if _use_aiter:
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
-if use_flashinfer_blockscale_fp8_moe:
+if use_flashinfer_trtllm_moe:
     try:
         import flashinfer.fused_moe as fi_fused_moe
     except ImportError:
         fi_fused_moe = None
-        use_flashinfer_blockscale_fp8_moe = False
+        use_flashinfer_trtllm_moe = False
 
 logger = logging.getLogger(__name__)
 
@@ -799,7 +799,7 @@ class EPMoE(torch.nn.Module):
             return
 
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
-        if use_flashinfer_blockscale_fp8_moe:
+        if use_flashinfer_trtllm_moe:
             actual_shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
         else:
             actual_shard_id = shard_id
@@ -848,7 +848,7 @@ class EPMoE(torch.nn.Module):
         # Weight scales
         elif "weight_scale" in weight_name:
             if self.use_block_quant:
-                if use_flashinfer_blockscale_fp8_moe:
+                if use_flashinfer_trtllm_moe:
                     actual_shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
                 else:
                     actual_shard_id = shard_id
@@ -1368,7 +1368,7 @@ class FlashInferEPMoE(EPMoE):
         self.correction_bias = correction_bias
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        assert use_flashinfer_blockscale_fp8_moe
+        assert use_flashinfer_trtllm_moe
         assert (
             self.activation == "silu"
         ), "Only silu is supported for flashinfer blockscale fp8 moe"
@@ -1384,7 +1384,7 @@ class FlashInferEPMoE(EPMoE):
         assert fi_fused_moe is not None
         return fi_fused_moe.trtllm_fp8_block_scale_moe(
             routing_logits=router_logits.to(torch.float32),
-            routing_bias=self.correction_bias,
+            routing_bias=self.correction_bias.to(hidden_states.dtype),
             hidden_states=a_q,
             hidden_states_scale=a_sf_t,
             gemm1_weights=self.w13_weight,
@@ -1413,7 +1413,7 @@ def get_moe_impl_class():
     if global_server_args_dict["enable_flashinfer_cutlass_moe"]:
         # Must come before EPMoE because FusedMoE also supports enable_ep_moe
         return FusedMoE
-    if use_flashinfer_blockscale_fp8_moe:
+    if use_flashinfer_trtllm_moe:
         # Must come before EPMoE because FusedMoE also supports enable_ep_moe
         return FlashInferEPMoE
     if global_server_args_dict["enable_ep_moe"]:
