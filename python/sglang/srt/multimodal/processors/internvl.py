@@ -16,8 +16,8 @@ from sglang.srt.multimodal.processors.base_processor import (
 class InternVLImageProcessor(BaseMultimodalProcessor):
     models = [InternVLChatModel]
 
-    def __init__(self, hf_config, server_args, _image_processor):
-        super().__init__(hf_config, server_args, _image_processor)
+    def __init__(self, hf_config, server_args, _image_processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _image_processor, *args, **kwargs)
         image_size = hf_config.force_image_size or hf_config.vision_config.image_size
         patch_size = hf_config.vision_config.patch_size
 
