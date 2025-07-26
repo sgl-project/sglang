@@ -67,12 +67,14 @@ class LoRARegistry:
             "Please file an issue if you see this error."
         )
 
-        # A read-write lock to ensure thread-safe access to the registry.
+        # A read-write lock to ensure adapters loading / unloading operations are exclusive.
+        # Please note that the counter increment/decrement operations are not synchronized through this
+        # lock, as they are designed to be non-blocking and can be performed concurrently.
         self._registry_lock = RWLock()
         # A dictionary to hold LoRARef objects, mapping from LoRA name to LoRARef.
         self._registry: Dict[str, LoRARef] = dict(lora_paths or {})
-        # Counters for in-flight requests.
-        self._counters: Dict[str, ConcurrentCounter] = defaultdict(ConcurrentCounter)
+        # Counters for ongoing requests, mapping from LoRA ID to ConcurrentCounter.
+        self._counters: Dict[str, ConcurrentCounter] = {}
 
     async def register(self, lora_ref: LoRARef):
         """
@@ -87,6 +89,7 @@ class LoRARegistry:
                     f"LoRA with name {lora_ref.lora_name} already exists. Loaded LoRAs: {self._registry.keys()}"
                 )
             self._registry[lora_ref.lora_name] = lora_ref
+            self._counters[lora_ref.lora_id] = ConcurrentCounter()
 
     async def unregister(self, lora_name: str) -> str:
         """
@@ -102,6 +105,7 @@ class LoRARegistry:
                     f"LoRA with name {lora_name} does not exist. Loaded LoRAs: {self._registry.keys()}"
                 )
             del self._registry[lora_name]
+            del self._counters[lora_ref.lora_id]
 
         return lora_ref.lora_id
 
@@ -111,23 +115,26 @@ class LoRARegistry:
         by incrementing its counter.
         """
 
-        async def _acquire_single(name: str) -> str:
+        def _lookup(name: str) -> str:
             lora_ref = self._registry.get(name, None)
             if lora_ref is None:
                 raise ValueError(
                     f"The following requested LoRA adapters are not loaded: {name}\n"
                     f"Loaded adapters: {self._registry.keys()}."
                 )
-            await self._counters[lora_ref.lora_id].increment()
             return lora_ref.lora_id
 
         async with self._registry_lock.reader_lock:
             if isinstance(lora_name, str):
-                lora_id = await _acquire_single(lora_name)
+                lora_id = _lookup(lora_name)
+                await self._counters[lora_id].increment(notify_all=False)
                 return lora_id
             elif isinstance(lora_name, list):
-                lora_ids = await asyncio.gather(
-                    *[_acquire_single(name) for name in lora_name]
+                lora_ids = [_lookup(name) for name in lora_name]
+
+                # Increment the counters only after all IDs are looked up.
+                await asyncio.gather(
+                    *[self._counters[id].increment(notify_all=False) for id in lora_ids]
                 )
                 return lora_ids
             else:
@@ -166,14 +173,3 @@ class LoRARegistry:
             # Wait until no requests are using this LoRA adapter.
             await counter.wait_for_zero()
             del self._counters[lora_id]
-
-    async def validate(self, loaded_adapters: Dict[str, LoRARef]):
-        """
-        The adapters registered in the `LoRARegistry` by design should always be a subset of the loaded adapters. This method
-        validates this assertion to ensure program correctness.
-        """
-        async with self._registry_lock.reader_lock:
-            assert self._registry.items() <= loaded_adapters.items(), (
-                "Registry should always be a subset of loaded adapters. Please create a new issue if you see this error."
-                f"Loaded adapters: {loaded_adapters}, registry: {self._registry}"
-            )

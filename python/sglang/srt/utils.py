@@ -2945,27 +2945,45 @@ class ConcurrentCounter:
         """Return an informative string representation of the counter."""
         return f"<ConcurrentCounter value={self.value()}>"
 
-    async def increment(self, n: int = 1):
+    async def increment(self, n: int = 1, notify_all: bool = True):
         """
         Atomically increment the counter by a given amount and notify all waiters.
 
         Args:
             n (int): The amount to increment the counter by. Default is 1.
+            notify_all (bool): Whether to notify all waiters after incrementing. Default is True.
         """
         async with self._condition:
             self._count += n
-            self._condition.notify_all()
+            if notify_all:
+                self._condition.notify_all()
 
-    async def decrement(self, n: int = 1):
+    async def decrement(self, n: int = 1, notify_all: bool = True):
         """
         Atomically decrement the counter by a given amount and notify all waiters.
 
         Args:
             n (int): The amount to decrement the counter by. Default is 1.
+            notify_all (bool): Whether to notify all waiters after decrementing. Default is True.
         """
         async with self._condition:
             self._count -= n
-            self._condition.notify_all()
+            if notify_all:
+                self._condition.notify_all()
+
+    async def wait_for(self, condition: Callable[[int], bool]):
+        """
+        Asynchronously wait until the counter satisfies a given condition.
+
+        This suspends the calling coroutine without blocking the thread, allowing
+        other tasks to run while waiting. When the condition is met, the coroutine resumes.
+
+        Args:
+            condition (Callable[[int], bool]): A function that takes the current counter value
+                and returns True when the condition is satisfied.
+        """
+        async with self._condition:
+            await self._condition.wait_for(lambda: condition(self._count))
 
     async def wait_for_zero(self):
         """
@@ -2974,5 +2992,4 @@ class ConcurrentCounter:
         This suspends the calling coroutine without blocking the thread, allowing
         other tasks to run while waiting. When the counter becomes zero, the coroutine resumes.
         """
-        async with self._condition:
-            await self._condition.wait_for(lambda: self._count == 0)
+        self.wait_for(lambda count: count == 0)
