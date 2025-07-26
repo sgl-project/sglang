@@ -326,14 +326,15 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
             **(
                 dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
-                if global_server_args_dict["enable_deepep_moe"]
+                if global_server_args_dict["enable_deepep_moe"] and (not global_server_args_dict["enable_flashinfer_moe"])
                 else {}
             ),
             # Additional args for FusedMoE
             **(
                 dict(
                     enable_flashinfer_moe=True,
-                    enable_ep_moe=global_server_args_dict["enable_ep_moe"],
+                    # TODO the naming is confusing now, wait for refactor
+                    enable_ep_moe=global_server_args_dict["enable_ep_moe"] or global_server_args_dict["enable_deepep_moe"],
                 )
                 if global_server_args_dict["enable_flashinfer_moe"]
                 else {}
