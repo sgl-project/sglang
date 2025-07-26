@@ -163,16 +163,22 @@ python/sglang/srt/mem_cache/nixl/
 
 The NIXL backend selection follows this priority order:
 1. **3FS** - Highest performance (if available)
-   - Best for high-throughput file operations using Deepseek 3FS APIs
+    - Best for high-throughput file operations using Deepseek 3FS APIs
 2. **POSIX** - Standard file I/O (fallback)
-   - Universal compatibility
-   - Good for development and testing - Levearges both libaio/liburing
+    - Universal compatibility
+    - Good for development and testing - Levearges both libaio/liburing
 3. **GDS_MT** - Multi-threaded GDS (if available)
-   - Optimized for concurrent operations
-   - Supports GPU Direct storage with multiple light weight threads
+    - Optimized for concurrent operations
+    - Supports GPU Direct storage with multiple light weight threads
 4. **GDS** - GPU Direct Storage (if available)
-   - Direct GPU-storage data path
-   - Best for filesystems benefiting from batch operations and smaller IOs.
+    - Direct GPU-storage data path
+    - Best for filesystems benefiting from batch operations and smaller IOs.
 5. **OBJ** - Amazon S3 based Object Storage
-   - Key-value based storage
+    - Key-value based storage
 The system automatically selects the best available backend, with POSIX as the default fallback.
+
+## Note
+
+This is v0 of the NIXL connector. Future versions will focus on further performance optimizations such as memory pre-registration (pre-allocating and registering memory buffers to reduce registration overhead during transfers) and block merging (combining related blocks as offsets within the same file to reduce file operations and improve throughput).
+
+These optimizations require changes at a higher layer, as the current HiCache API doesn't expose information like block relationships or hash patterns that would enable these optimizations.
