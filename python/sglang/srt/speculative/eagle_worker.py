@@ -149,10 +149,19 @@ class EAGLEWorker(TpModelWorker):
             if self.hot_token_id is not None:
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
+
+                # Create a boolean mask for hot tokens
+                vocab_size = head.data.shape[0]
+                mask_hot = torch.zeros(vocab_size, dtype=torch.bool, device=head.device)
+                mask_hot[self.hot_token_id] = True
+
+                # Save the number of cold tokens
+                self.num_cold_tokens = torch.sum(~mask_hot).item()
+
                 # Sum up the cold rows of the LM head
-                tail_sum = torch.sum(head.data[~self.hot_token_id], dim=0)
+                tail_sum = torch.sum(head.data[~mask_hot], dim=0)
                 # Remove cold rows
-                head.data = head.data[self.hot_token_id]
+                head.data = head.data[mask_hot]
                 # Add a row to sum up the cold rows
                 head.data = torch.cat([head.data, tail_sum.unsqueeze(0)], dim=0)
 
@@ -635,6 +644,7 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch, skip_attn_backend_init=True
             )
             self._detect_nan_if_needed(logits_output)
+            self._post_process_draft_logits(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None:
@@ -910,9 +920,18 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info.accept_length = accept_length_backup
         batch.return_logprob = return_logprob_backup
 
+    def _post_process_draft_logits(self, logits_output: LogitsProcessorOutput) -> LogitsProcessorOutput:
+        """Lower bound the ExpSumLog for out-of-vocab tokens."""
+        # Note: The last entry of the logits corresponds to the sum of cold tokens
+        logits_output.next_token_logits[-1] = (
+            torch.log(self.num_cold_tokens) + logits_output.next_token_logits[-1] / self.num_cold_tokens
+        )
+        return logits_output
+
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
+        self._post_process_draft_logits(logits_output)
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
