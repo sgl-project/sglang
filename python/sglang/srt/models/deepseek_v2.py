@@ -254,9 +254,8 @@ class MoEGate(nn.Module):
             and self.weight.shape[0] == 256
             and _device_sm >= 90
         ):
-            logits = dsv3_router_gemm(hidden_states, self.weight).to(
-                hidden_states.dtype
-            )
+            # router gemm output float32
+            logits = dsv3_router_gemm(hidden_states, self.weight)
         else:
             logits = F.linear(hidden_states, self.weight, None)
 
@@ -551,9 +550,8 @@ class DeepseekV2MoE(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        forward_mode = forward_batch.forward_mode
         shared_output = None
-        if is_non_idle_and_non_empty(forward_mode, hidden_states):
+        if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             shared_output = self._forward_shared_experts(hidden_states)

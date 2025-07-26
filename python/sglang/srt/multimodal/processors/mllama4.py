@@ -27,13 +27,13 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         self.image_token_index = hf_config.image_token_index
         self.multimodal_tokens = MultimodalSpecialTokens(
             image_token=_processor.image_token,
+            image_token_id=self.image_token_index,
         ).build(_processor)
 
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
         input_text,
-        max_req_input_len=None,
         *args,
         **kwargs,
     ):
@@ -45,7 +45,6 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         processed_data = self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=self.multimodal_tokens,
-            max_req_input_len=max_req_input_len or 4096,
             image_data=image_data,
             return_text=True,
         )
