@@ -360,8 +360,8 @@ void tree_speculative_sampling_target_only(
     at::Tensor uniform_samples_for_final_sampling,
     at::Tensor target_probs,
     at::Tensor draft_probs,
-    at::Tensor threshold_singles,
-    at::Tensor threshold_accs,
+    double threshold_single = 1,
+    double threshold_acc = 1,
     bool deterministic = true,
     int64_t cuda_stream = 0);
 
