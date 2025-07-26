@@ -165,6 +165,9 @@ class EAGLEWorker(TpModelWorker):
             # Share the embedding and lm_head
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
+        # This will be loaded from a file.
+        self.weaker_drafter = None
+
         # Init attention backend and cuda graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (
             backup_disable_cuda_graph
@@ -643,6 +646,7 @@ class EAGLEWorker(TpModelWorker):
             self._detect_nan_if_needed(logits_output)
             self._post_process_draft_logits(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            probs = self._post_process_draft_probs(probs)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
@@ -917,7 +921,7 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info.accept_length = accept_length_backup
         batch.return_logprob = return_logprob_backup
 
-    def _post_process_draft_logits(self, logits_output: LogitsProcessorOutput) -> None:
+    def _post_process_draft_logits(self, logits_output: LogitsProcessorOutput):
         """Lower bound the ExpSumLog for out-of-vocab tokens."""
         if not hasattr(self, "num_cold_tokens") or self.num_cold_tokens == 0:
             return
@@ -934,11 +938,34 @@ class EAGLEWorker(TpModelWorker):
             torch.log(num_cold_tokens_tensor) + cold_token_logits / self.num_cold_tokens
         )
 
+    def _post_process_draft_probs(self, probs: torch.Tensor) -> torch.Tensor:
+        """Redistribute the probability mass of cold tokens."""
+        if (
+            not hasattr(self, "num_cold_tokens")
+            or self.num_cold_tokens == 0
+            or not hasattr(self, "weaker_drafter")
+            or self.weaker_drafter is None
+        ):
+            return probs
+
+        # Note: The last entry of the probs lower bounds the accumulated probability of cold tokens
+        cold_token_probs = probs[..., -1].unsqueeze(1)
+        hot_token_probs = probs[..., :-1]
+
+        # Reshape weaker_drafter for broadcasting
+        weaker_drafter_reshaped = self.weaker_drafter.unsqueeze(0)
+
+        # Redistribute probabilities
+        redistributed_cold_probs = cold_token_probs * weaker_drafter_reshaped
+
+        return torch.cat([hot_token_probs, redistributed_cold_probs], dim=-1)
+
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
         self._post_process_draft_logits(logits_output)
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+        probs = self._post_process_draft_probs(probs)
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
 
