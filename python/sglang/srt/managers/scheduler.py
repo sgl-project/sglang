@@ -975,7 +975,7 @@ class Scheduler(
                         point_to_point_pyobj(
                             recv_reqs,
                             self.pp_rank * self.tp_size + dp_offset,
-                            self.world_group.device_group,
+                            self.world_group.cpu_group,
                             self.pp_rank * self.tp_size + dp_offset,
                             (self.pp_rank + 1) * self.tp_size + dp_offset,
                         )
@@ -1023,7 +1023,7 @@ class Scheduler(
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
-                    self.world_group.device_group,
+                    self.world_group.cpu_group,
                     (self.pp_rank - 1) * self.tp_size + dp_offset,
                     self.pp_rank * self.tp_size + dp_offset,
                 )
@@ -2502,7 +2502,33 @@ class Scheduler(
         return UpdateWeightsFromDistributedReqOutput(success, message)
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        """Update the online model parameter from tensors."""
+        """Update the online model parameter from tensors.
+           When pp_size is equal to 1, then recv_req.serialized_named_tensors can be a data structure with type of
+             List[Union[LocalSerializedTensor, Tensor]]. For each element is this list, it is serialized by
+             ForkingPickler, and represents the tensor from each tensor parallel rank.
+
+           When pp_size is greater than 1, then recv_req.serialized_named_tensors must a data structure with type of
+             List[List[Union[LocalSerializedTensor, Tensor]]]. The first dimension indicates the pipeline parallelism,
+             and the second dimension indicates the tensor parallelism. Therefore, when this process receives a
+             request of UpdateWeightsFromTensorReqInput, then it must select the serialized_named_tensors according to
+             its pp_rank. Only in this way, we can avoid CUDA OOM issue caused by deserialize a tensor in rank `m` which is
+             ForkingPickler serialized in rank `n`. where `m` is not equal to `n`.
+        """
+        if len(recv_req.serialized_named_tensors) > 0 and isinstance(recv_req.serialized_named_tensors[0], List):
+            if self.pp_size != len(recv_req.serialized_named_tensors):
+                message = (f"The size of serialized_named_tensors in UpdateWeightsFromTensorReqInput must be equal to "
+                           f"the size of pp_size, but got {len(recv_req.serialized_named_tensors)} vs. {self.pp_size}")
+                logger.error(message)
+                barrier(group=self.tp_cpu_group)
+                return UpdateWeightsFromTensorReqOutput(False, message)
+
+            recv_req = UpdateWeightsFromTensorReqInput(
+                serialized_named_tensors=recv_req.serialized_named_tensors[self.pp_rank],
+                load_format=recv_req.load_format,
+                flush_cache=recv_req.flush_cache,
+                abort_all_requests=recv_req.abort_all_requests,
+            )
+
         success, message = self.tp_worker.update_weights_from_tensor(recv_req)
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
