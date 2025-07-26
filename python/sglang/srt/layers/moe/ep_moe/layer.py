@@ -36,8 +36,9 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     sglang_per_token_quant_fp8,
 )
+from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.unquant import UnquantizedEPMoEMethod
-from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
+from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8EPMoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import (
@@ -193,7 +194,7 @@ class EPMoE(torch.nn.Module):
             self.activation_scheme = None
             self.use_w4afp8 = False
         elif isinstance(quant_config, W4AFp8Config):
-            self.quant_method: Optional[QuantizeMethodBase] = W4AFp8MoEMethod(
+            self.quant_method: Optional[QuantizeMethodBase] = W4AFp8EPMoEMethod(
                 quant_config
             )
             self.use_w4afp8 = True
