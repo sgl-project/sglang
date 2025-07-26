@@ -69,7 +69,6 @@ class EagleDraftInput:
     # shape: (b + 1,)
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
-    last_page_lens: torch.Tensor = None
 
     def prepare_for_extend(self, batch: ScheduleBatch):
         if batch.forward_mode.is_idle():

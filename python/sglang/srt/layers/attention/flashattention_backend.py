@@ -617,19 +617,17 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
             if self.topk > 1:
-                if (
-                    forward_batch.forward_mode.is_decode_or_idle()
-                    and forward_batch.spec_info.last_page_lens is not None
-                ):
-                    # The last page is calculated in the second part cascade
-                    last_page_lens = forward_batch.spec_info.last_page_lens.to(
-                        torch.int32
-                    )
+                if forward_batch.forward_mode.is_decode_or_idle():
+                    last_page_lens = forward_batch.seq_lens % self.page_size
+                    # First attention handles prefix - last_page_len part.
                     metadata.cache_seqlens_int32 -= last_page_lens  # Both (B, )
 
-                    # Second part handles last_page_len + decode steps calculation
+                    # Second attention handles last_page_len + decode part.
+                    expanded_last_page_lens = last_page_lens.repeat_interleave(
+                        self.topk
+                    )
                     self.forward_metadata_spec_decode_expand.cache_seqlens_int32 += (
-                        last_page_lens
+                        expanded_last_page_lens
                     )
                     expand_page_table = cache_loc[
                         :, : self.speculative_num_steps
@@ -640,9 +638,7 @@ class FlashAttentionBackend(AttentionBackend):
                         self.page_size,
                         device=self.device,
                     )
-                    last_page_lens_broadcast = last_page_lens.expand(
-                        expand_page_table.shape[0], expand_page_table.shape[1]
-                    )
+                    last_page_lens_broadcast = expanded_last_page_lens.unsqueeze(-1).expand(-1, expand_page_table.shape[1])
                     expand_page_table -= last_page_lens_broadcast
                     expand_page_table = (
                         expand_page_table[:, strided_indices_expand] // self.page_size

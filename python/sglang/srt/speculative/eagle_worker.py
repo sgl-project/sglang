@@ -497,7 +497,6 @@ class EAGLEWorker(TpModelWorker):
             out_cache_loc = out_cache_loc[
                 : num_seqs * self.topk * self.speculative_num_steps
             ]
-            spec_info.last_page_lens = last_page_lens
 
         batch.out_cache_loc = out_cache_loc
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
