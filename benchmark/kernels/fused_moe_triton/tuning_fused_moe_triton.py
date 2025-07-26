@@ -44,6 +44,7 @@ def benchmark_config(
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
+    per_channel_quant: bool,
     block_shape: List[int] = None,
     num_iters: int = 100,
 ) -> float:
@@ -139,6 +140,7 @@ def benchmark_config(
                 use_fp8_w8a8=use_fp8_w8a8,
                 use_int8_w8a8=use_int8_w8a8,
                 use_int8_w8a16=use_int8_w8a16,
+                per_channel_quant=per_channel_quant,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
                 a1_scale=a1_scale,
@@ -249,6 +251,7 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
+        per_channel_quant: bool,
         block_shape: List[int],
     ) -> Tuple[Dict[str, int], float]:
         torch.cuda.manual_seed_all(0)
@@ -286,6 +289,7 @@ class BenchmarkWorker:
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
+            per_channel_quant,
             block_shape,
         )
         return config, kernel_time
@@ -301,6 +305,7 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
+        per_channel_quant: bool,
         block_shape: List[int],
         search_space: List[Dict[str, int]],
     ) -> Dict[str, int]:
@@ -319,6 +324,7 @@ class BenchmarkWorker:
                     use_fp8_w8a8,
                     use_int8_w8a8,
                     use_int8_w8a16,
+                    per_channel_quant,
                     block_shape,
                     num_iters=10,
                 )
@@ -439,6 +445,7 @@ def main(args: argparse.Namespace):
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
+    per_channel_quant = True if args.per_channel_quant else False
     block_shape = None
     if (
         hasattr(config, "quantization_config")
@@ -511,6 +518,7 @@ def main(args: argparse.Namespace):
                     use_fp8_w8a8,
                     use_int8_w8a8,
                     use_int8_w8a16,
+                    per_channel_quant,
                     block_shape,
                     search_space,
                 )
@@ -548,6 +556,7 @@ def main(args: argparse.Namespace):
                     use_fp8_w8a8,
                     use_int8_w8a8,
                     use_int8_w8a16,
+                    per_channel_quant,
                     block_shape,
                 )
                 for batch_size in batch_sizes
@@ -574,6 +583,11 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, required=False)
     parser.add_argument("--tune", action="store_true")
+    parser.add_argument(
+        "--per-channel-quant",
+        action="store_true",
+        help="Per-channel quantization, when using channel-wise INT8, this parameter needs to be set",
+    )
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     args = parser.parse_args()
 
