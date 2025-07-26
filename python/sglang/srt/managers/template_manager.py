@@ -85,6 +85,8 @@ class TemplateManager:
         """
         Detect if the chat template contains reasoning/thinking patterns.
         """
+        if template is None:
+            return False
 
         # Look for reasoning patterns in the template
         reasoning_patterns = [
