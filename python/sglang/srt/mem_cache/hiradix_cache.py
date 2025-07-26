@@ -369,6 +369,9 @@ class HiRadixCache(RadixCache):
                 last_host_node.release_host()
                 self.cache_controller.mem_pool_host.free(host_indices)
                 del self.ongoing_prefetch[req_id]
+            else:
+                # the revoked operation already cleaned up
+                pass
 
     def check_backup_progress(self):
         queue_size = torch.tensor(
@@ -403,6 +406,13 @@ class HiRadixCache(RadixCache):
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
             req_id
         ]
+        if operation.revoked:
+            # operation already revoked, cleaning it up
+            last_host_node.release_host()
+            self.cache_controller.mem_pool_host.free(host_indices)
+            del self.ongoing_prefetch[req_id]
+            return
+
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
