@@ -594,7 +594,6 @@ class DeepseekV2MoE(nn.Module):
             )
         # TODO temporary branching, wait for refactor
         if isinstance(self.experts, FusedMoE):
-            print(f"hi {self.experts.local_num_experts=} {self.experts.ep_rank=}")
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 topk_output=TopKOutput(
@@ -2157,7 +2156,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        dumper.on_forward_pass_start()
+        # dumper.on_forward_pass_start()
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
