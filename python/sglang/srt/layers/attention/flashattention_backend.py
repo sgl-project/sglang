@@ -638,7 +638,9 @@ class FlashAttentionBackend(AttentionBackend):
                         self.page_size,
                         device=self.device,
                     )
-                    last_page_lens_broadcast = expanded_last_page_lens.unsqueeze(-1).expand(-1, expand_page_table.shape[1])
+                    last_page_lens_broadcast = expanded_last_page_lens.unsqueeze(
+                        -1
+                    ).expand(-1, expand_page_table.shape[1])
                     expand_page_table -= last_page_lens_broadcast
                     expand_page_table = (
                         expand_page_table[:, strided_indices_expand] // self.page_size
