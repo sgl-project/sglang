@@ -29,7 +29,7 @@ class TestNixlUnified(unittest.TestCase):
         # Create instances
         self.file_manager = NixlFileManager(self.test_dir)
         self.registration = NixlRegistration(self.mock_agent)
-        self.hicache = HiCacheNixl(file_path=self.hicache_test_dir, file_plugin="POSIX")
+        self.hicache = HiCacheNixl(file_path=self.hicache_test_dir, plugin="POSIX")
 
     def tearDown(self):
         """Clean up test directories."""
@@ -134,6 +134,61 @@ class TestNixlUnified(unittest.TestCase):
         self.assertTrue(self.hicache.batch_set([], []))
         self.assertEqual([], self.hicache.batch_get([], []))
 
+    def test_data_integrity(self):
+        """Test exact data preservation for different tensor types and shapes."""
+        test_cases = [
+            # Test integers
+            (torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32), "int32_1d"),
+            (torch.tensor([[1, 2], [3, 4]], dtype=torch.int64), "int64_2d"),
+
+            # Test floating point
+            (torch.tensor([1.1, 2.2, 3.3], dtype=torch.float32), "float32_1d"),
+            (torch.tensor([[1.1, 2.2], [3.3, 4.4]], dtype=torch.float64), "float64_2d"),
+
+            # Test different shapes
+            (torch.arange(24, dtype=torch.int32).reshape(2, 3, 4), "int32_3d"),
+            (torch.eye(5, dtype=torch.float64), "float64_eye"),
+        ]
+
+        # Test individual set/get
+        for tensor, key in test_cases:
+            dst_tensor = torch.zeros_like(tensor)
+
+            # Write tensor
+            self.assertTrue(self.hicache.set(key, tensor))
+            self.assertTrue(self.hicache.exists(key))
+
+            # Read tensor
+            retrieved = self.hicache.get(key, dst_tensor)
+            self.assertIsNotNone(retrieved)
+
+            # Verify exact equality
+            self.assertTrue(torch.all(retrieved == tensor))
+
+            # Verify metadata
+            self.assertEqual(retrieved.dtype, tensor.dtype)
+            self.assertEqual(retrieved.shape, tensor.shape)
+            self.assertEqual(retrieved.device, tensor.device)
+
+        # Test batch set/get
+        tensors, keys = zip(*test_cases)
+        dst_tensors = [torch.zeros_like(t) for t in tensors]
+
+        # Write tensors
+        self.assertTrue(self.hicache.batch_set(list(keys), list(tensors)))
+        self.assertTrue(all(self.hicache.exists(key) for key in keys))
+
+        # Read tensors
+        retrieved = self.hicache.batch_get(list(keys), dst_tensors)
+        self.assertIsNotNone(retrieved)
+
+        # Verify each tensor
+        for orig, ret in zip(tensors, retrieved):
+            self.assertTrue(torch.all(ret == orig))
+            self.assertEqual(ret.dtype, orig.dtype)
+            self.assertEqual(ret.shape, orig.shape)
+            self.assertEqual(ret.device, orig.device)
+
     # ============================================================================
     # File Management Tests
     # ============================================================================
@@ -169,7 +224,7 @@ class TestNixlUnified(unittest.TestCase):
         self.assertEqual(len(file_tuples), 2)
 
         # Verify tuple structure: (offset, length, fd, "")
-        for file_path in file_paths:
+        for i, file_path in enumerate(file_paths):
             offset, length, fd, meta = file_tuples[i]
             self.assertEqual(offset, 0)
             self.assertEqual(length, 0)

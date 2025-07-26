@@ -1,6 +1,19 @@
 # NIXL Integration for HiCache
 
-This directory contains the NIXL (NVIDIA I/O eXchange Library) integration for HiCache, providing high-performance storage using NIXL file plugins.
+This directory contains the **NIXL (NVIDIA Inference Xfer Library)** integration for **HiCache**, enabling high-performance storage across multiple backends.
+
+NIXL provides a unified API for accessing various storage plugins, including but not limited to:
+
+- **Deepseek's 3FS APIs** for high-throughput file operations
+- **GPU Direct Storage (GDS)** for direct data movement between storage and GPU memory, bypassing CPU memory copies
+- **Amazon S3-compatible object storage** for key-value access patterns
+
+Additional backend integrations are planned for future releases.
+
+## NIXL Resources
+
+- **Project Repository**: [NIXL on GitHub](https://github.com/ai-dynamo/nixl)
+- **Documentation**: [NIXL Documentation](https://github.com/ai-dynamo/nixl/tree/main/docs)
 
 ## Overview
 
@@ -14,24 +27,24 @@ The NIXL integration consists of two main files:
 ### HiCacheNixl
 The main storage connector that provides:
 - Single and batch tensor set/get operations
-- Automatic backend selection (3FS > POSIX > GDS_MT > GDS)
-- High-performance file-based storage using NIXL
+- Automatic backend selection (3FS > POSIX > GDS_MT > GDS > OBJ)
+- High-performance file-based (or) object based storage access using NIXL
 
 ### NixlUtils
 Consolidated utility classes:
 - **NixlBackendSelection** - Handles backend selection and creation
-- **NixlRegistration** - Manages memory registration for tensors and files
+- **NixlRegistration** - Manages memory registration for tensors, files and objects
 - **NixlFileManager** - Handles file system operations and NIXL tuple creation
 
 ## Running Unit Tests
 
 ### Prerequisites
-- NIXL library installed and available
+- NIXL library installed and available (latest main required for supporting object query)
 - PyTorch installed
 - Python 3.8+
 
-### From Project Root
-Navigate to the project root directory (`/path/to/sglang-venkat`) and run:
+### Unit tests from Project root
+Navigate to the project root directory (`/path/to/sglang`) and run:
 
 #### Run all NIXL tests:
 ```bash
@@ -120,16 +133,46 @@ python/sglang/srt/mem_cache/nixl/
 
 ## Dependencies
 
-- **NIXL**: NVIDIA I/O eXchange Library
-- **PyTorch**: For tensor operations
+- **NIXL**: NVIDIA I/O eXchange Library (version 1.0 or later)
+  - Required plugins: POSIX (minimum), 3FS/GDS (optional for better performance)
+  - See [NIXL Installation Guide](https://github.com/ai-dynamo/nixl/blob/main/README.md#installation)
+- **PyTorch**: For tensor operations (version 1.8 or later)
 - **Python 3.8+**: For type hints and modern features
 
-## Backend Priority
+## Supported Features
+
+### Memory Types
+- **FILE**: Standard file-based storage (all backends)
+  - Supports all numeric tensor types (int32, int64, float32, float64)
+  - Supports multi-dimensional tensors
+  - File descriptor management and cleanup
+- **OBJ**: Object-based storage (OBJ backend only)
+  - Key-based storage and retrieval
+  - Direct tensor-to-object mapping
+  - No file system overhead
+
+### Tensor Support
+- **Data Types**:
+  - Integer: int32, int64
+  - Floating Point: float32, float64
+  - Note: boolean, empty tensors, and special values (inf, nan) are not currently supported
+- **Shapes**: Supports all tensor shapes (1D, 2D, 3D, and higher dimensions)
+- **Devices**: CPU tensors (GPU tensor support depends on backend)
+
+### Backend Priority
 
 The NIXL backend selection follows this priority order:
 1. **3FS** - Highest performance (if available)
+   - Best for high-throughput file operations using Deepseek 3FS APIs
 2. **POSIX** - Standard file I/O (fallback)
+   - Universal compatibility
+   - Good for development and testing - Levearges both libaio/liburing
 3. **GDS_MT** - Multi-threaded GDS (if available)
+   - Optimized for concurrent operations
+   - Supports GPU Direct storage with multiple light weight threads
 4. **GDS** - GPU Direct Storage (if available)
-
-The system automatically selects the best available backend, with POSIX as the default fallback. 
+   - Direct GPU-storage data path
+   - Best for filesystems benefiting from batch operations and smaller IOs.
+5. **OBJ** - Amazon S3 based Object Storage
+   - Key-value based storage
+The system automatically selects the best available backend, with POSIX as the default fallback.
