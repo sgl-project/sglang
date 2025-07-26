@@ -208,18 +208,14 @@ class TestBenchServing(CustomTestCase):
 
         res = self._run_lora_latency_test(enable_background_task=False)
 
-        result = (
-            f"### test_lora_online_latency\n"
-            f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
-            f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
-        )
-
-        print(result)
         if is_in_ci():
-            write_github_step_summary(result)
-
-        self.assertLess(res["median_e2e_latency_ms"], 5400)
-        self.assertLess(res["median_ttft_ms"], 88)
+            write_github_step_summary(
+                f"### test_lora_online_latency\n"
+                f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
+                f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
+            )
+            self.assertLess(res["median_e2e_latency_ms"], 5400)
+            self.assertLess(res["median_ttft_ms"], 88)
 
     def test_lora_online_latency_with_concurrent_adapter_updates(self):
         # TODO (lifuhuang): verify LoRA support in AMD.
@@ -228,20 +224,15 @@ class TestBenchServing(CustomTestCase):
 
         res = self._run_lora_latency_test(enable_background_task=True)
 
-        result = (
-            f"### test_lora_latency_with_concurrent_adapter_updates\n"
-            f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
-            f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
-        )
-
-        print(result)
         if is_in_ci():
-            write_github_step_summary(result)
-
-        self.assertLess(res["median_e2e_latency_ms"], 7600)
-
-        # TODO (lifuhuang): This will be fixed by the overlapped LoRA update in a separate PR.
-        self.assertLess(res["median_ttft_ms"], 3300)
+            write_github_step_summary(
+                f"### test_lora_online_latency\n"
+                f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
+                f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
+            )
+            self.assertLess(res["median_e2e_latency_ms"], 7600)
+            # TODO (lifuhuang): This will be fixed by the overlapped LoRA update in a separate PR.
+            self.assertLess(res["median_ttft_ms"], 3300)
 
     def _run_lora_latency_test(self, enable_background_task: bool):
         """
@@ -256,9 +247,7 @@ class TestBenchServing(CustomTestCase):
             """
             A background task that repeatedly loads and unloads a LoRA adapter.
             """
-            print("BACKGROUND: Waiting for start_event...")
             await start_event.wait()
-            print("BACKGROUND: Starting LoRA loader/unloader task...")
 
             path_cycler = itertools.cycle(
                 [
@@ -274,7 +263,6 @@ class TestBenchServing(CustomTestCase):
             while not stop_event.is_set():
                 # 1. Load the LoRA adapter
                 lora_path = next(path_cycler)
-                print(f"BACKGROUND: Loading LoRA '{lora_path}'...")
                 response = await asyncio.to_thread(
                     requests.post,
                     load_url,
@@ -284,8 +272,6 @@ class TestBenchServing(CustomTestCase):
                     response.ok, f"Failed to load LoRA adapter: {response.text}"
                 )
                 num_updates += 1
-                loaded_adapters = set(response.json()["loaded_adapters"])
-                print(f"loaded_adapters: {loaded_adapters}")
 
                 if stop_event.is_set():
                     break
@@ -303,15 +289,9 @@ class TestBenchServing(CustomTestCase):
                     response.ok, f"Failed to unload LoRA adapter: {response.text}"
                 )
                 num_updates += 1
-                loaded_adapters = set(response.json()["loaded_adapters"])
-                print(f"loaded_adapters: {loaded_adapters}")
 
                 # Yield control to allow other tasks to run.
                 await asyncio.sleep(1)
-
-            print(
-                f"BACKGROUND: LoRA loader/unloader task stopped. Total updates: {num_updates}."
-            )
 
         background_task = lora_loader_unloader_task if enable_background_task else None
         res = run_bench_serving(
@@ -332,9 +312,7 @@ class TestBenchServing(CustomTestCase):
                 "--max-lora-rank",
                 "256",
                 "--cuda-graph-max-bs",
-                "8",
-                "--log-level",
-                "warning",
+                "32",
             ],
             dataset_name="random",
             random_input_len=256,
