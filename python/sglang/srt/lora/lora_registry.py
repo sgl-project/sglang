@@ -72,9 +72,14 @@ class LoRARegistry:
         # lock, as they are designed to be non-blocking and can be performed concurrently.
         self._registry_lock = RWLock()
         # A dictionary to hold LoRARef objects, mapping from LoRA name to LoRARef.
-        self._registry: Dict[str, LoRARef] = dict(lora_paths or {})
+        self._registry: Dict[str, LoRARef] = {}
         # Counters for ongoing requests, mapping from LoRA ID to ConcurrentCounter.
         self._counters: Dict[str, ConcurrentCounter] = {}
+
+        # Initialize the registry with provided LoRA paths, if present.
+        if lora_paths:
+            for lora_ref in lora_paths.values():
+                self._register_adapter(lora_ref)
 
     async def register(self, lora_ref: LoRARef):
         """
@@ -84,12 +89,7 @@ class LoRARegistry:
             lora_ref (LoRARef): The LoRARef object to register.
         """
         async with self._registry_lock.writer_lock:
-            if lora_ref.lora_name in self._registry:
-                raise ValueError(
-                    f"LoRA with name {lora_ref.lora_name} already exists. Loaded LoRAs: {self._registry.keys()}"
-                )
-            self._registry[lora_ref.lora_name] = lora_ref
-            self._counters[lora_ref.lora_id] = ConcurrentCounter()
+            self._register_adapter(lora_ref)
 
     async def unregister(self, lora_name: str) -> str:
         """
@@ -173,3 +173,16 @@ class LoRARegistry:
             # Wait until no requests are using this LoRA adapter.
             await counter.wait_for_zero()
             del self._counters[lora_id]
+
+    def _register_adapter(self, lora_ref: LoRARef):
+        """
+        Internal helper method to register a LoRA adapter.
+        """
+
+        if lora_ref.lora_name in self._registry:
+            raise ValueError(
+                f"LoRA with name {lora_ref.lora_name} already exists. Loaded LoRAs: {self._registry.keys()}"
+            )
+        self._registry[lora_ref.lora_name] = lora_ref
+        self._counters[lora_ref.lora_id] = ConcurrentCounter()
+        return lora_ref
