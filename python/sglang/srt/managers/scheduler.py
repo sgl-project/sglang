@@ -423,9 +423,7 @@ class Scheduler(
         # Init running status
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
-        self.running_batch: ScheduleBatch = ScheduleBatch(
-            reqs=[], batch_is_full=False, max_req_input_len=self.max_req_input_len
-        )
+        self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
         # The last forward batch
