@@ -627,6 +627,7 @@ class TestEBNFGeneration(unittest.TestCase):
     def test_glm45_detector_ebnf(self):
         """Test that the Glm4MoeDetector generates valid EBNF."""
         ebnf = self.glm45_detector.build_ebnf(self.tools)
+        print(ebnf)
         self.assertIsNotNone(ebnf)
 
         # Check that the EBNF contains expected patterns
@@ -637,6 +638,7 @@ class TestEBNFGeneration(unittest.TestCase):
     def test_qwen3_coder_detector_ebnf(self):
         """Test that the Qwen3CoderDetector generates valid EBNF."""
         ebnf = self.qwen3_coder_detector.build_ebnf(self.tools)
+        print(ebnf)
         self.assertIsNotNone(ebnf)
         # Check that the EBNF contains expected patterns for XML format
         self.assertIn("<tool_call>", ebnf)

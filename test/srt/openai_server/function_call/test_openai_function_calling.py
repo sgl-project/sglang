@@ -76,11 +76,14 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         messages = [{"role": "user", "content": "Compute (3+5)"}]
         response = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
             stream=False,
             tools=tools,
+            tool_choice={"type": "function", "function": {"name": "add"}},
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}}
         )
 
         tool_calls = response.choices[0].message.tool_calls
@@ -132,6 +135,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
 
         response = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -157,6 +161,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
 
         final_response = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -205,6 +210,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
 
         response_stream = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -281,6 +287,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
 
         response_stream = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.9,
             top_p=0.9,
@@ -357,6 +364,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         ]
         response = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -425,6 +433,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         messages = [{"role": "user", "content": "What is the capital of France?"}]
         response = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -512,13 +521,17 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         messages = [{"role": "user", "content": "What is the capital of France?"}]
         response = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
             stream=False,
             tools=tools,
             tool_choice={"type": "function", "function": {"name": "get_weather"}},
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}}
         )
+
+        print(response)
 
         tool_calls = response.choices[0].message.tool_calls
         self.assertIsNotNone(tool_calls, "No tool_calls in the response")
@@ -620,6 +633,7 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         response = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=self.PYTHONIC_MESSAGES,
             tools=self.PYTHONIC_TOOLS,
             temperature=0.1,
@@ -641,6 +655,7 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         response_stream = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=self.PYTHONIC_MESSAGES,
             tools=self.PYTHONIC_TOOLS,
             temperature=0.1,
@@ -673,33 +688,27 @@ class TestGLM45ServerFunctionCalling(TestOpenAIServerFunctionCalling):
     def setUpClass(cls):
         # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.model = "ZP2HF/GLM-4.5-Air-Test"
-        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.base_url = "http://localhost:30000"
         cls.api_key = "sk-123456"
 
         # Start the local OpenAI Server. If necessary, you can add other parameters such as --enable-tools.
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=[
-                # If your server needs extra parameters to test function calling, please add them here.
-                "--tool-call-parser",
-                "glm45",
-                "--reasoning-parser",
-                "glm45",
-                "--tp-size",
-                "8"
-            ],
-        )
+        # cls.process = popen_launch_server(
+        #     cls.model,
+        #     cls.base_url,
+        #     timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        #     api_key=cls.api_key,
+        #     other_args=[
+        #         # If your server needs extra parameters to test function calling, please add them here.
+        #         "--tool-call-parser",
+        #         "glm45",
+        #         "--reasoning-parser",
+        #         "glm45",
+        #         "--tp-size",
+        #         "8"
+        #     ],
+        # )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
-
-    def test_function_call_specific(self):
-        pass
-
-    def test_function_call_required(self):
-        pass
 
 if __name__ == "__main__":
     unittest.main()
