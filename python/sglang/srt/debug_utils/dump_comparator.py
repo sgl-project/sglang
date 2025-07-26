@@ -91,6 +91,10 @@ def check_tensor_pair(path_baseline, path_target):
         print(f"❌ Shape mismatch")
         return
 
+    if x_baseline.numel() == 0:
+        print("Skip since zero elements")
+        return
+
     raw_abs_diff = (x_target.float() - x_baseline.float()).abs()
 
     max_abs_diff = raw_abs_diff.max().item()
