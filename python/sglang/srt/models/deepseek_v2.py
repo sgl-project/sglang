@@ -436,7 +436,7 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         if not self._enable_deepep_moe:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
-            print("HACK: skip dual stream branch")
+            # print("HACK: skip dual stream branch")
             if (
                 False
                 and self.alt_stream is not None
@@ -501,13 +501,13 @@ class DeepseekV2MoE(nn.Module):
         # shared_output = shared_output.float()
 
         if shared_output is not None:
-            print("HACK: pre-allreduce shared")
+            # print("HACK: pre-allreduce shared")
             shared_output = tensor_model_parallel_all_reduce(shared_output)
 
         if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        print("HACK: move forward_normal shared_output summation place!")
+        # print("HACK: move forward_normal shared_output summation place!")
         if shared_output is not None:
             dumper.dump("dpskmoe_willadd_final_hidden_states", final_hidden_states, layer_id=self.layer_id)
             dumper.dump("dpskmoe_willadd_shared_output", shared_output, layer_id=self.layer_id)

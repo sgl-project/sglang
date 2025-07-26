@@ -969,7 +969,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             dumper.dump("cppmoe_x", x, layer_id=layer.layer_id)
             dumper.dump("cppmoe_topk_ids", topk_ids, layer_id=layer.layer_id)
             dumper.dump("cppmoe_topk_weights", topk_weights, layer_id=layer.layer_id)
-            print(f"{ep_size=} {ep_rank=} {tp_size=} {tp_rank=} {routed_scaling_factor=}")
+            # print(f"{ep_size=} {ep_rank=} {tp_size=} {tp_rank=} {routed_scaling_factor=}")
 
             output = flashinfer_cutlass_fused_moe(
                 x,
