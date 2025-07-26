@@ -1919,6 +1919,8 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         hidden_states = self.mlp(hidden_states, forward_batch, can_fuse_mlp_allreduce)
 
+        dumper.dump("dpsklayer_after_mlp_hidden_states", hidden_states, layer_id=self.layer_id)
+
         if can_fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
 
