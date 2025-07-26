@@ -311,8 +311,6 @@ class TestBenchServing(CustomTestCase):
                 "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
                 "--max-lora-rank",
                 "256",
-                "--cuda-graph-max-bs",
-                "32",
             ],
             dataset_name="random",
             random_input_len=256,
