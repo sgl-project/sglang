@@ -215,16 +215,11 @@ class KimiK2Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=current_text)
 
     def structure_info(self) -> _GetInfoFunc:
-        """Return function that creates StructureInfo for guided generation."""
-
-        def get_info(name: str) -> StructureInfo:
-            return StructureInfo(
-                begin=f"<|tool_calls_section_begin|><|tool_call_begin|>functions.{name}:0 <|tool_call_argument_begin|>",
-                end="<|tool_call_end|><|tool_calls_section_end|>",
-                trigger="<|tool_calls_section_begin|>",
-            )
-
-        return get_info
+        return lambda name: StructureInfo(
+            begin="<|tool_call_begin|>function." + name + ":",
+            end="<|tool_call_end|>",
+            trigger="<|tool_call_begin|>function." + name + ":",
+        )
 
     def build_ebnf(self, tools: List[Tool]) -> str:
         """
