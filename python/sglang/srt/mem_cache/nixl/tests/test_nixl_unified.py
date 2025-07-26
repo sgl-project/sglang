@@ -300,7 +300,7 @@ class TestNixlUnified(unittest.TestCase):
 
     def test_backend_selection(self):
         """Test NixlBackendSelection class."""
-        from sglang.srt.mem_cache.nixl.nixl_backend_selection import NixlBackendSelection
+        from sglang.srt.mem_cache.nixl.nixl_utils import NixlBackendSelection
         from nixl._api import nixl_agent, nixl_agent_config
         import uuid
         
