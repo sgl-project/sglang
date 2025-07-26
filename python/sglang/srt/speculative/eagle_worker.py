@@ -149,7 +149,12 @@ class EAGLEWorker(TpModelWorker):
             if self.hot_token_id is not None:
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
+                # Sum up the cold rows of the LM head
+                tail_sum = torch.sum(head.data[~self.hot_token_id], dim=0)
+                # Remove cold rows
                 head.data = head.data[self.hot_token_id]
+                # Add a row to sum up the cold rows
+                head.data = torch.cat([head.data, tail_sum.unsqueeze(0)], dim=0)
 
             # Share the embedding and lm_head
             self.draft_model_runner.model.set_embed_and_head(embed, head)
