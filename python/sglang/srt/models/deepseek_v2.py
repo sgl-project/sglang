@@ -591,6 +591,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights=topk_weights,
                 forward_batch=forward_batch,
             )
+        # TODO temporary branching, wait for refactor
         if isinstance(self.experts, FusedMoE):
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
