@@ -1,4 +1,3 @@
-
 #ifndef _data_types_cuh
 #define _data_types_cuh
 #include <cuda_bf16.h>
@@ -7,7 +6,7 @@
 #include "marlin.cuh"
 
 #ifndef MARLIN_NAMESPACE_NAME
-#define MARLIN_NAMESPACE_NAME marlin_moe_wna16
+#define MARLIN_NAMESPACE_NAME marlin
 #endif
 
 namespace MARLIN_NAMESPACE_NAME {
