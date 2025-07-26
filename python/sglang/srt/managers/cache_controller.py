@@ -250,7 +250,7 @@ class HiCacheController:
                 # todo: threshold policy for prefetching
                 self.prefetch_threshold = prefetch_threshold
             elif storage_backend == "nixl":
-                from sglang.srt.mem_cache.hicache_nixl import HiCacheNixl
+                from sglang.srt.mem_cache.nixl.hicache_nixl import HiCacheNixl
                 self.storage_backend = HiCacheNixl()
                 self.enable_storage = True
                 # todo: threshold policy for prefetching
