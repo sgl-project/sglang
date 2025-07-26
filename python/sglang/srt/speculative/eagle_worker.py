@@ -165,7 +165,7 @@ class EAGLEWorker(TpModelWorker):
             # Share the embedding and lm_head
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
-        # This will be loaded from a file.
+        # TODO: load from a file
         self.weaker_drafter = None
 
         # Init attention backend and cuda graphs
