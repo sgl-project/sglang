@@ -499,6 +499,8 @@ class DeepseekV2MoE(nn.Module):
 
         print("HACK: move forward_normal shared_output summation place!")
         if shared_output is not None:
+            dumper.dump("dpskmoe_willadd_final_hidden_states", final_hidden_states, layer_id=self.layer_id)
+            dumper.dump("dpskmoe_willadd_shared_output", shared_output, layer_id=self.layer_id)
             final_hidden_states = final_hidden_states + shared_output
 
         return final_hidden_states
@@ -636,6 +638,8 @@ class DeepseekV2MoE(nn.Module):
         # TODO temporary branching, wait for refactor
         if isinstance(self.experts, FusedMoE):
             if shared_output is not None:
+                dumper.dump("dpskmoe_willadd_final_hidden_states", final_hidden_states, layer_id=self.layer_id)
+                dumper.dump("dpskmoe_willadd_shared_output", shared_output, layer_id=self.layer_id)
                 final_hidden_states += shared_output
         else:
             if shared_output is not None:
