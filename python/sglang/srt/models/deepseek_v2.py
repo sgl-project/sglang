@@ -30,7 +30,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     parallel_state,
     tensor_model_parallel_all_reduce,
@@ -394,7 +393,6 @@ class DeepseekV2MoE(nn.Module):
         if global_server_args_dict["enable_deepep_moe"]:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_tensor_model_parallel_world_size()
-            self.ep_rank = get_tensor_model_parallel_rank()
             self.num_experts = (
                 config.n_routed_experts
                 + global_server_args_dict["ep_num_redundant_experts"]
@@ -596,11 +594,11 @@ class DeepseekV2MoE(nn.Module):
             )
         # TODO temporary branching, wait for refactor
         if isinstance(self.experts, FusedMoE):
+            print(f"hi {self.experts.local_num_experts=} {self.experts.ep_rank=}")
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 topk_output=TopKOutput(
-                    topk_ids=topk_idx
-                    + self.experts.num_experts // self.ep_size * self.ep_rank,
+                    topk_ids=topk_idx + self.experts.local_num_experts * self.experts.ep_rank,
                     topk_weights=topk_weights,
                     router_logits=None,
                 ),
