@@ -440,12 +440,8 @@ class ServerArgs:
             )
 
         if self.enable_flashinfer_trtllm_moe:
-            assert (
-                self.enable_ep_moe
-            ), "EP MoE is required for Flashinfer TRTLLM MOE"
-            logger.warning(
-                f"Flashinfer TRTLLM MoE is enabled."
-            )
+            assert self.enable_ep_moe, "EP MoE is required for Flashinfer TRTLLM MOE"
+            logger.warning(f"Flashinfer TRTLLM MoE is enabled.")
 
         # DeepEP MoE
         if self.enable_deepep_moe:

@@ -475,11 +475,11 @@ class DeepseekV2MoE(nn.Module):
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            kwargs = {'hidden_states': hidden_states}
+            kwargs = {"hidden_states": hidden_states}
             if self.topk is not None:
-                kwargs['topk_output'] = self.topk(hidden_states, router_logits)
+                kwargs["topk_output"] = self.topk(hidden_states, router_logits)
             else:
-                kwargs['router_logits'] = router_logits
+                kwargs["router_logits"] = router_logits
             final_hidden_states = self.experts(**kwargs)
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
@@ -500,11 +500,11 @@ class DeepseekV2MoE(nn.Module):
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        kwargs = {'hidden_states': hidden_states}
+        kwargs = {"hidden_states": hidden_states}
         if self.topk is not None:
-            kwargs['topk_output'] = self.topk(hidden_states, router_logits)
+            kwargs["topk_output"] = self.topk(hidden_states, router_logits)
         else:
-            kwargs['router_logits'] = router_logits
+            kwargs["router_logits"] = router_logits
         final_hidden_states = self.experts(**kwargs)
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
