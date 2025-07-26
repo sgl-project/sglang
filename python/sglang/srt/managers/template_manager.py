@@ -184,9 +184,11 @@ class TemplateManager:
         if completion_template:
             self.load_completion_template(completion_template)
 
-        self._force_reasoning = self._detect_reasoning_pattern(
-            tokenizer_manager.tokenizer.chat_template
-        )
+        # Detect reasoning pattern from chat template
+        if tokenizer_manager.tokenizer:
+            self._force_reasoning = self._detect_reasoning_pattern(
+                tokenizer_manager.tokenizer.chat_template
+            )
 
     def _load_jinja_template(self, tokenizer_manager, template_path: str) -> None:
         """Load a Jinja template file."""
