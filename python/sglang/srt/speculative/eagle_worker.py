@@ -75,8 +75,8 @@ class EAGLEWorker(TpModelWorker):
         dp_rank: Optional[int],
         nccl_port: int,
         target_worker: TpModelWorker,
-        think_start_token: Optional[int],
-        think_end_token: Optional[int],
+        think_start_token_id: Optional[int],
+        think_end_token_id: Optional[int],
     ):
         # Parse arguments
         self.server_args = server_args
@@ -177,8 +177,8 @@ class EAGLEWorker(TpModelWorker):
             "speculative_relaxed_thinking", False
         )
         if self.relaxed_thinking:
-            self.think_start_token = think_start_token
-            self.think_end_token = think_end_token
+            self.think_start_token_id = think_start_token_id
+            self.think_end_token_id = think_end_token_id
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -394,9 +394,9 @@ class EAGLEWorker(TpModelWorker):
         if self.relaxed_thinking:
             thinking_states = batch.thinking_states()
             for i, tok in enumerate(next_token_ids):
-                if tok == self.think_start_token:
+                if tok == self.think_start_token_id:
                     thinking_states[i] = True
-                elif tok == self.think_end_token:
+                elif tok == self.think_end_token_id:
                     thinking_states[i] = False
             batch.update_thinking_states(thinking_states)
 

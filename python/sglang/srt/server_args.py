@@ -536,7 +536,7 @@ class ServerArgs:
             if self.speculative_relaxed_thinking:
                 assert (
                     self.speculative_reasoning_parser
-                ), "Must set reasoning parser when using relaxed thinking."
+                ), "Must set speculative reasoning parser when using relaxed thinking."
 
         # GGUF
         if (

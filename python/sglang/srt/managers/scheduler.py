@@ -349,8 +349,8 @@ class Scheduler(
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
         )
-        self.think_start_token = None
-        self.think_end_token = None
+        self.think_start_token_id = None
+        self.think_end_token_id = None
 
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
@@ -364,11 +364,11 @@ class Scheduler(
                     model_type=self.server_args.speculative_reasoning_parser,
                     stream_reasoning=False,
                 )
-                self.think_start_token = self.tokenizer.encode(
+                self.think_start_token_id = self.tokenizer.encode(
                     spec_reasoning_parser.detector.think_start_token,
                     add_special_tokens=False,
                 )[0]
-                self.think_end_token = self.tokenizer.encode(
+                self.think_end_token_id = self.tokenizer.encode(
                     spec_reasoning_parser.detector.think_end_token,
                     add_special_tokens=False,
                 )[0]
@@ -380,8 +380,8 @@ class Scheduler(
                 nccl_port=port_args.nccl_port,
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
-                think_start_token=self.think_start_token,
-                think_end_token=self.think_end_token,
+                think_start_token_id=self.think_start_token_id,
+                think_end_token_id=self.think_end_token_id,
             )
         else:
             self.draft_worker = None
