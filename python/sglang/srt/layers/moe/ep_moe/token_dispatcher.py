@@ -1,4 +1,5 @@
 import logging
+import os
 from dataclasses import dataclass
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -516,7 +517,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
-            use_fp8=True,
+            use_fp8=False if os.getenv("USE_W4A8") == "1" else True,
         )
         return (
             hidden_states,

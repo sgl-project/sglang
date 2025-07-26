@@ -11,6 +11,7 @@ from sgl_kernel import (
 )
 
 from sglang.srt.layers.moe.ep_moe.kernels import (
+    deepep_ll_get_cutlass_w4a8_moe_mm_data,
     post_reorder_triton_kernel,
     pre_reorder_triton_kernel_for_cutlass_moe,
     run_cutlass_moe_ep_preproess,
@@ -43,6 +44,7 @@ def cutlass_w4a8_moe(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     apply_router_weight_on_input: bool = False,
+    ep_mode: str = "ep",
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -83,10 +85,14 @@ def cutlass_w4a8_moe(
     Returns:
     - torch.Tensor: The fp8 output tensor after applying the MoE layer.
     """
-    assert topk_weights.shape == topk_ids_.shape, "topk shape mismatch"
+    assert (
+        topk_weights.shape == topk_ids_.shape if topk_weights is not None else True
+    ), "topk shape mismatch"
     assert w1_q.dtype == torch.int8
     assert w2_q.dtype == torch.int8
-    assert a.shape[1] // 2 == w1_q.shape[2], "Hidden size mismatch w1"
+    assert (
+        a.shape[1] // 2 == w1_q.shape[2] if ep_mode != "deepep_ll" else True
+    ), "Hidden size mismatch w1"
     assert w1_q.shape[2] * 2 == w2_q.shape[1], "Hidden size mismatch w2"
     assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
     assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
@@ -108,52 +114,80 @@ def cutlass_w4a8_moe(
     m = a.size(0)
     k = w1_q.size(2) * 2  # w1_q is transposed and packed
     n = w2_q.size(2) * 2  # w2_q is transposed and packed
-    topk = topk_ids_.size(1)
+    topk = topk_ids_.size(1) if ep_mode == "ep" else 1
 
     if apply_router_weight_on_input:
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
 
     device = a.device
 
-    _, src2dst, _ = run_cutlass_moe_ep_preproess(
-        local_topk_ids,
-        num_experts,
-    )
+    if ep_mode == "ep":
+        _, src2dst, _ = run_cutlass_moe_ep_preproess(
+            local_topk_ids,
+            num_experts,
+        )
 
-    gateup_input = torch.empty(
-        (m * topk, k),
-        device=device,
-        dtype=torch.float8_e4m3fn,
-    )
+        gateup_input = torch.empty(
+            (m * topk, k),
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
 
-    pre_reorder_triton_kernel_for_cutlass_moe[(m,)](
-        a,
-        gateup_input,
-        src2dst,
-        local_topk_ids,
-        a1_scale,
-        total_num_experts,
-        topk,
-        k,
-        BLOCK_SIZE=512,
-    )
+        pre_reorder_triton_kernel_for_cutlass_moe[(m,)](
+            a,
+            gateup_input,
+            src2dst,
+            local_topk_ids,
+            a1_scale,
+            total_num_experts,
+            topk,
+            k,
+            BLOCK_SIZE=512,
+        )
+    elif ep_mode == "deepep_ll":
+        num_tokens = a.size(1)
+
+    else:
+        raise ValueError(f"Invalid ep_mode: {ep_mode}")
 
     # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
     # they are kept to allow for a quick switch of the permutation logic
     # from the current triton kernel implementation to the cutlass-based one if needed.
-    a_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
-    get_cutlass_w4a8_moe_mm_data(
-        local_topk_ids,
-        expert_offsets,
-        problem_sizes1,
-        problem_sizes2,
-        a_map,
-        c_map,
-        num_experts,
-        n,
-        k,
-    )
+    if ep_mode == "deepep_ll":
+        gateup_input_origin, expert_offsets, problem_sizes1, problem_sizes2 = (
+            deepep_ll_get_cutlass_w4a8_moe_mm_data(
+                a,
+                local_topk_ids,
+                expert_offsets,
+                problem_sizes1,
+                problem_sizes2,
+                num_experts,
+                n,
+                k,
+            )
+        )
+        gateup_input = torch.empty(
+            gateup_input_origin.shape, dtype=torch.float8_e4m3fn, device=device
+        )
+        sgl_per_tensor_quant_fp8(
+            gateup_input_origin, gateup_input, a1_scale.float(), True
+        )
+        m = gateup_input_origin.size(0)
+
+    else:
+        a_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
+        c_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
+        get_cutlass_w4a8_moe_mm_data(
+            local_topk_ids,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            a_map,
+            c_map,
+            num_experts,
+            n,
+            k,
+        )
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.half)
     c2 = torch.zeros((m * topk, k), device=device, dtype=torch.half)
@@ -197,19 +231,33 @@ def cutlass_w4a8_moe(
         128,
         topk,
     )
-
-    output = torch.empty_like(a)
-    post_reorder_triton_kernel[(m,)](
-        c2,
-        output,
-        src2dst,
-        topk_ids_,
-        topk_weights,
-        start_expert_id,
-        end_expert_id,
-        topk,
-        k,
-        0,
-        BLOCK_SIZE=512,
-    )
+    if ep_mode == "ep":
+        output = torch.empty_like(a)
+        post_reorder_triton_kernel[(m,)](
+            c2,
+            output,
+            src2dst,
+            local_topk_ids,
+            topk_weights,
+            start_expert_id,
+            end_expert_id,
+            topk,
+            k,
+            0,
+            BLOCK_SIZE=512,
+        )
+    elif ep_mode == "deepep_ll":
+        output = torch.zeros(
+            (len(local_topk_ids), num_tokens, k), device=device, dtype=c2.dtype
+        )
+        non_zero_indices = torch.nonzero(local_topk_ids, as_tuple=True)[0]
+        c2_index = 0
+        for expert_idx in non_zero_indices:
+            num_non_zero_rows = local_topk_ids[expert_idx].item()
+            output[expert_idx, :num_non_zero_rows] = c2[
+                c2_index : c2_index + num_non_zero_rows
+            ]
+            c2_index += num_non_zero_rows
+    else:
+        output = c2
     return output
