@@ -592,7 +592,7 @@ class TokenizerManager:
                     "Please set `--enable-custom-logits-processor` to enable this feature."
                 )
 
-            if (max_input_id := max(input_ids)) >= len(self.tokenizer):
+            if (self.tokenizer is not None) and ((max_input_id := max(input_ids)) >= len(self.tokenizer)):
                 raise ValueError(
                     f"The maximum input id ({max_input_id}) should be less than num tokens ({len(self.tokenizer)})"
                 )
