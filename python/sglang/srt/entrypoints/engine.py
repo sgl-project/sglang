@@ -71,7 +71,6 @@ from sglang.srt.utils import (
     is_cuda,
     kill_process_tree,
     launch_dummy_health_check_server,
-    maybe_set_triton_cache_manager,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )

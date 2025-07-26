@@ -284,9 +284,6 @@ class ServerArgs:
             self.model_path, self.tokenizer_path
         )
 
-        if self.device is None:
-            self.device = get_device()
-
         if self.served_model_name is None:
             self.served_model_name = self.model_path
         if self.device is None:
