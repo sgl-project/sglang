@@ -18,22 +18,22 @@ from sglang.srt.multimodal.processors.base_processor import (
 class Mllama4ImageProcessor(BaseMultimodalProcessor):
     models = [Llama4ForConditionalGeneration]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.vision_config = hf_config.vision_config
         self.text_config = hf_config.text_config
         self.boi_token_index = hf_config.boi_token_index
         self.eoi_token_index = hf_config.eoi_token_index
         self.image_token_index = hf_config.image_token_index
         self.multimodal_tokens = MultimodalSpecialTokens(
-            image_token=_processor.image_token
-        )
+            image_token=_processor.image_token,
+            image_token_id=self.image_token_index,
+        ).build(_processor)
 
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
         input_text,
-        max_req_input_len=None,
         *args,
         **kwargs,
     ):
@@ -45,7 +45,6 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         processed_data = self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=self.multimodal_tokens,
-            max_req_input_len=max_req_input_len or 4096,
             image_data=image_data,
             return_text=True,
         )
@@ -142,7 +141,7 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         # Add metadata for image processing
         processor_output["mm_items"] = [
             MultimodalDataItem(
-                pixel_values=processor_output["pixel_values"],
+                feature=processor_output["pixel_values"],
                 modality=Modality.IMAGE,
                 offsets=image_offsets,
             )

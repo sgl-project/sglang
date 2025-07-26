@@ -14,6 +14,7 @@ from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
+from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ class FunctionCallParser:
         "deepseekv3": DeepSeekV3Detector,
         "pythonic": PythonicDetector,
         "kimi_k2": KimiK2Detector,
+        "qwen3_coder": Qwen3CoderDetector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
@@ -153,9 +155,9 @@ class FunctionCallParser:
             or None if no constraint applies.
         """
         # NOTE: structural_tag only supports JSON-compatible content between the begin and end.
-        # It cannot parse or validate Python syntax like function calls.
+        # It cannot parse or validate function call Pythonic or XML-ish syntax.
         if (
-            not isinstance(self.detector, PythonicDetector)
+            self.detector.supports_structural_tag()
             and tool_choice == "auto"
             and any(tool.function.strict for tool in self.tools)
         ):
