@@ -74,6 +74,7 @@ def read_meta(directory):
     df = df.with_columns(
         pl.col("forward_pass_id").cast(int),
         pl.col("rank").cast(int),
+        pl.col("dump_index").cast(int),
     )
     return df
 
