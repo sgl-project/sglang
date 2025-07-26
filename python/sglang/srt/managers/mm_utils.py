@@ -751,7 +751,7 @@ def tensor_hash(tensor_list) -> int:
         ]
         tensor = torch.concat(tensor_list)
     if tensor.is_cuda:
-        return gpu_tensor_hash(tensor)
+        return gpu_tensor_hash(tensor.cuda())
     tensor = tensor.detach().contiguous()
 
     if tensor.dtype == torch.bfloat16:
