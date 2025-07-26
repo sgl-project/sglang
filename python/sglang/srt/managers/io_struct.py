@@ -911,6 +911,8 @@ class AbortReq:
     rid: str = ""
     # Whether to abort all requests
     abort_all: bool = False
+    # The finished reason data
+    finished_reason: Optional[Dict[str, Any]] = None
 
 
 @dataclass

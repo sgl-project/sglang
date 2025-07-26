@@ -38,7 +38,7 @@ import orjson
 import requests
 import uvicorn
 import uvloop
-from fastapi import Depends, FastAPI, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -172,6 +172,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(HTTPException)
+async def validation_exception_handler(request: Request, exc: HTTPException):
+    """Enrich HTTP exception with status code and other details"""
+    error = ErrorResponse(
+        object="error",
+        message=exc.detail,
+        type=str(exc.status_code),
+        code=exc.status_code,
+    )
+    return ORJSONResponse(content=error.model_dump(), status_code=exc.status_code)
 
 
 # Custom exception handlers to change validation error status codes
