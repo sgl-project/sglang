@@ -75,7 +75,7 @@ class FusedMoE(torch.nn.Module):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
-        enable_flashinfer_moe: Optional[bool] = False,
+        enable_flashinfer_cutlass_moe: Optional[bool] = False,
         enable_ep_moe: Optional[bool] = False,
     ):
         super().__init__()
@@ -92,16 +92,16 @@ class FusedMoE(torch.nn.Module):
         self.num_experts = num_experts
         self.expert_map = None
 
-        if enable_flashinfer_moe and quant_config is None:
+        if enable_flashinfer_cutlass_moe and quant_config is None:
             logger.warning("Disable flashinfer MoE when quantization config is None.")
-            enable_flashinfer_moe = False
+            enable_flashinfer_cutlass_moe = False
             enable_ep_moe = False
 
-        self.enable_flashinfer_moe = enable_flashinfer_moe
+        self.enable_flashinfer_cutlass_moe = enable_flashinfer_cutlass_moe
         if enable_ep_moe:
             assert (
-                self.enable_flashinfer_moe
-            ), "FusedMoE only supports EP with --enable-flashinfer-moe"
+                self.enable_flashinfer_cutlass_moe
+            ), "FusedMoE only supports EP with --enable-flashinfer-cutlass-moe"
             self.ep_size = self.tp_size
             self.ep_rank = self.tp_rank
             self.tp_size = 1
@@ -141,7 +141,9 @@ class FusedMoE(torch.nn.Module):
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod":
-                self.quant_method.enable_flashinfer_moe = self.enable_flashinfer_moe
+                self.quant_method.enable_flashinfer_cutlass_moe = (
+                    self.enable_flashinfer_cutlass_moe
+                )
         assert self.quant_method is not None
 
         self.quant_config = quant_config
