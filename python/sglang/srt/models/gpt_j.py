@@ -217,13 +217,21 @@ class GPTJModel(nn.Module):
         )
         self.ln_f = nn.LayerNorm(embed_dim, eps=config.layer_norm_epsilon)
 
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.wte(input_ids)
+
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = self.wte(input_ids)
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.get_input_embeddings(input_ids)
+
         for layer in self.h:
             hidden_states = layer(positions, hidden_states, forward_batch)
         hidden_states = self.ln_f(hidden_states)
@@ -259,8 +267,11 @@ class GPTJForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = self.transformer(input_ids, positions, forward_batch)
+        hidden_states = self.transformer(
+            input_ids, positions, forward_batch, inputs_embeds
+        )
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
