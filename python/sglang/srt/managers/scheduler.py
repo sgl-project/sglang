@@ -1151,8 +1151,8 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 data_parallel_rank=recv_req.data_parallel_rank,
                 vocab_size=self.model_config.vocab_size,
-                think_start_token_id=self.think_start_token,
-                think_end_token_id=self.think_end_token,
+                think_start_token_id=self.think_start_token_id,
+                think_end_token_id=self.think_end_token_id,
             )
             req.tokenizer = self.tokenizer
 
