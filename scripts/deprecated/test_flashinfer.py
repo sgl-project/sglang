@@ -105,7 +105,7 @@ def test_batch_prefill_with_paged_kv_cache(
 
     flashinfer_prefill_wrapper.end_forward()
 
-    flashinfer_prefill_wrapper.begin_forward(
+    flashinfer_prefill_wrapper.plan(
         qo_indptr,
         kv_indptr,
         kv_indices,
@@ -174,7 +174,7 @@ def test_batch_decode_with_paged_kv_cache(
     )
 
     flashinfer_decode_wrapper.end_forward()
-    flashinfer_decode_wrapper.begin_forward(
+    flashinfer_decode_wrapper.plan(
         kv_indptr,
         kv_indices,
         kv_last_page_len,

@@ -2017,7 +2017,6 @@ class DeepseekV2Model(nn.Module):
             dtype=torch.float32,
             device=device,
         )
-
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:

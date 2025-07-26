@@ -714,7 +714,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
 
         if use_ragged:
             # ragged prefill
-            wrapper_ragged.begin_forward(
+            wrapper_ragged.plan(
                 qo_indptr=qo_indptr,
                 kv_indptr=qo_indptr,
                 num_qo_heads=self.num_local_heads,
