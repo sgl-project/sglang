@@ -497,10 +497,10 @@ class DeepseekV2MoE(nn.Module):
         # if shared_output is not None:
         #     final_hidden_states = final_hidden_states + shared_output
 
-        print("HACK: make final_hidden_states and shared_output double")
+        print("HACK: make final_hidden_states and shared_output float")
         assert final_hidden_states.dtype == shared_output.dtype == torch.bfloat16
-        final_hidden_states = final_hidden_states.double()
-        shared_output = shared_output.double()
+        final_hidden_states = final_hidden_states.float()
+        shared_output = shared_output.float()
 
         if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
