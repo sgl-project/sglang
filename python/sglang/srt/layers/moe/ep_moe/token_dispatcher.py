@@ -255,7 +255,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return hidden_states, topk_idx, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        if global_server_args_dict["enable_flashinfer_moe"] or deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             (
                 hidden_states,
                 topk_idx,
