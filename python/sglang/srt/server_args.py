@@ -2018,15 +2018,17 @@ class PortArgs:
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
+                rpc_port = port_base + 2
             else:
                 scheduler_input_port = port_base + 4 + 1 + dp_rank
+                rpc_port = port_base + 100 + dp_rank
 
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
                 nccl_port=nccl_port,
-                rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
+                rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{port_base + 3}",
             )
 

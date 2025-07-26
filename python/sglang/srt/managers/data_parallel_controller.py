@@ -26,6 +26,7 @@ import zmq
 
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
+    RpcReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
@@ -73,6 +74,10 @@ class DataParallelController:
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
 
+            self.recv_from_rpc = get_zmq_socket(
+                self.context, zmq.DEALER, port_args.rpc_ipc_name, False
+            )
+
         # Dispatch method
         self.round_robin_counter = 0
         dispatch_lookup = {
@@ -84,6 +89,9 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers = [None] * server_args.dp_size
+        self.rpc_workers = [None] * server_args.dp_size
+        self.rpc_results = [None] * server_args.dp_size
+        self.rpc_poller = zmq.Poller()
 
         if server_args.enable_dp_attention:
             dp_port_args = self.launch_dp_attention_schedulers(server_args, port_args)
@@ -101,6 +109,11 @@ class DataParallelController:
                     dp_port_args[dp_rank].scheduler_input_ipc_name,
                     True,
                 )
+
+                self.rpc_workers[dp_rank] = get_zmq_socket(
+                    self.context, zmq.DEALER, dp_port_args[dp_rank].rpc_ipc_name, True
+                )
+                self.rpc_poller.register(self.rpc_workers[dp_rank], zmq.POLLIN)
 
         self.max_req_input_len = None
 
@@ -286,6 +299,44 @@ class DataParallelController:
                     # Send other control messages to first worker of tp group
                     for worker in self.workers[:: self.control_message_step]:
                         worker.send_pyobj(recv_req)
+
+            while True:
+                try:
+                    recv_req = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                except zmq.ZMQError:
+                    break
+
+                for rpc_worker in self.rpc_workers:
+                    rpc_worker.send_pyobj(recv_req)
+
+            while True:
+                socks = dict(self.rpc_poller.poll(timeout=10))
+                if not socks:
+                    break
+
+                for index, worker in enumerate(self.rpc_workers):
+                    if worker in socks:
+                        res = worker.recv_pyobj(zmq.BLOCKY)
+                        assert isinstance(res, RpcReqOutput)
+                        self.rpc_results[index] = res
+
+                        if res.success:
+                            logger.info(f"rpc success for worker{index}: {res.message}")
+                        else:
+                            logger.info(f"rpc failed for worker{index}: {res.message}")
+
+                if all(self.rpc_results):
+                    for res in self.rpc_results:
+                        if not res.success:
+                            self.recv_from_rpc.send_pyobj(
+                                RpcReqOutput(success=False, message=res.message)
+                            )
+                            break
+                    else:
+                        self.recv_from_rpc.send_pyobj(
+                            RpcReqOutput(success=True, message="all rpc call success")
+                        )
+                    self.rpc_results = [None] * self.server_args.dp_size
 
 
 def run_data_parallel_controller_process(
