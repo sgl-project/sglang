@@ -24,7 +24,7 @@ class ModuleOffloader:
         self.enabled = self.group_size > 0
         assert self.mode in ["cpu", "sharded_gpu"]
 
-    def offload_modules(
+    def wrap_modules(
         self,
         all_modules_generator: Generator[torch.nn.Module, None, None],
         submodule_accessor: Callable[[torch.nn.Module], torch.nn.Module],

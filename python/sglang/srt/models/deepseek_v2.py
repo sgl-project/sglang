@@ -2010,7 +2010,7 @@ class DeepseekV2Model(nn.Module):
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
-            module_offloader.offload_modules(
+            module_offloader.wrap_modules(
                 (
                     DeepseekV2DecoderLayer(
                         config,
