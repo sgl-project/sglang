@@ -148,9 +148,7 @@ class TopK(CustomOp):
         self.correction_bias = correction_bias
         self.routed_scaling_factor = routed_scaling_factor
 
-        self.use_triton_kernels = (
-            not _is_cpu and global_server_args_dict["enable_triton_kernel_moe"]
-        )
+        self.use_triton_kernels = global_server_args_dict["enable_triton_kernel_moe"]
 
     def forward_native(
         self,
