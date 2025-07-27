@@ -968,6 +968,7 @@ class EAGLEWorker(TpModelWorker):
 
         # Note: The last entry of the logits corresponds to the sum of cold tokens
         logits = logits_output.next_token_logits
+        logger.debug(f"{logits=}")
         cold_token_logits = logits[..., -1]
         logger.debug(f"{cold_token_logits=}")
         logger.debug(f"{self.log_num_cold_tokens=}")
