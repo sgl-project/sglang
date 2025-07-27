@@ -299,10 +299,6 @@ class TestVLMModels(CustomTestCase):
             # Additional assertion: if eviction was detected, the test passed
             if eviction_detected:
                 print("✅ Eviction logic successfully triggered and detected!")
-            else:
-                print(
-                    "❌ No eviction events detected - cache may be too large or eviction logic not working"
-                )
 
 
 if __name__ == "__main__":
