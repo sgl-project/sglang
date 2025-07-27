@@ -536,7 +536,7 @@ class TorchNativeAttnSinkBackend(TorchNativeAttnBackend):
             layer.tp_k_head_num,
             layer.tp_q_head_num // layer.tp_k_head_num,
             scaling=layer.scaling,
-            sliding_window=layer.sliding_window_size + 1,
+            sliding_window=layer.sliding_window_size + 1, # torch native attn sink uses sliding window without -1
             attention_sinks=layer.attention_sinks,
             enable_gqa=use_gqa,
             causal=causal,
@@ -582,7 +582,7 @@ class TorchNativeAttnSinkBackend(TorchNativeAttnBackend):
             layer.tp_k_head_num,
             layer.tp_q_head_num // layer.tp_k_head_num,
             scaling=layer.scaling,
-            sliding_window=layer.sliding_window_size + 1,
+            sliding_window=layer.sliding_window_size + 1, # torch native attn sink uses sliding window without -1
             attention_sinks=layer.attention_sinks,
             enable_gqa=use_gqa,
             causal=False,

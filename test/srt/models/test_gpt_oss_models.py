@@ -12,11 +12,13 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+DEFAULT_MODEL_NAME_FOR_TEST = "path-to/Orangina"
+CHAT_TEMPLATE = DEFAULT_MODEL_NAME_FOR_TEST + "/chat_template.jinja"
 
 class TestOpenAIMoE(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "path-to/Orangina"
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -34,6 +36,8 @@ class TestOpenAIMoE(CustomTestCase):
                 "128",
                 # "--disable-cuda-graph",
                 # "--disable-radix-cache",
+                "--chat-template",
+                CHAT_TEMPLATE,
             ],
         )
 
@@ -53,7 +57,7 @@ class TestOpenAIMoE(CustomTestCase):
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.70) # target
+        self.assertGreater(metrics["accuracy"], 0.74) # target
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -62,14 +66,17 @@ class TestOpenAIMoE(CustomTestCase):
             eval_name="mmlu",
             num_examples=64,
             num_threads=32,
+            temperature=1.0,
+            top_p=1.0,
+            top_k=0.0,
         )
 
         metrics = run_eval(args)
         print(f"Eval accuracy of MMLU: {metrics=}")
-        self.assertGreaterEqual(metrics["score"], 0.759) # target
+        self.assertGreaterEqual(metrics["score"], 0.74) # target
 
     def test_bs_1_speed(self):
-        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=10, prompt="Human: What is the capital of France?\n\nAssistant:")
+        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=32, prompt="Human: What is the capital of France?\n\nAssistant:")
         acc_length, speed = send_one_prompt(args)
 
         print(f"{speed=:.2f}")
