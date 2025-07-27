@@ -435,7 +435,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter:
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            or global_server_args_dict["enable_flashinfer_moe"]
+            or _use_aiter
+        ):
             output = hidden_states
         else:
             if hidden_states.shape[0] > 0:
