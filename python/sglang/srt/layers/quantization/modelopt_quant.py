@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -953,6 +954,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         tp_size: Optional[int] = None,
     ) -> torch.Tensor:
         assert activation == "silu", "Only SiLU activation is supported."
+
+        if x.shape[0] == 0:
+            return x
 
         if self.enable_flashinfer_moe:
             assert (
