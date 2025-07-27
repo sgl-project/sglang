@@ -592,10 +592,13 @@ class HiCacheController:
                             )
                     if isinstance(self.storage_backend, HiCacheFile):
                         exist_result = self.storage_backend.exists(last_hash)
-                    if isinstance(self.storage_backend, HiCacheFile) and exist_result:
-                        storage_hit_count += self.page_size
-                        hash_value.append(last_hash)
-                        remaining_tokens -= self.page_size
+                    if isinstance(self.storage_backend, HiCacheFile):
+                        if exist_result:
+                            storage_hit_count += self.page_size
+                            hash_value.append(last_hash)
+                            remaining_tokens -= self.page_size
+                        else:
+                            break
                     elif isinstance(self.storage_backend, MooncakeStore):
                         storage_hit_count += self.page_size
                         hash_value.append(last_hash)
