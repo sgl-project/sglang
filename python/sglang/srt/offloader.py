@@ -324,8 +324,23 @@ class NaiveDistributed:
     def get_world_size(self):
         return self._world_size
 
-    def scatter(self, tensor: torch.Tensor, scatter_list: List[torch.Tensor]):
-        TODO
+    def scatter(self, tensor: torch.Tensor, scatter_list: List[torch.Tensor], src: int = 0):
+        if self._rank == src:
+            assert len(scatter_list) == self._world_size
+        else:
+            assert scatter_list is None
+
+        gathered_objects = self.all_gather_object(
+            dict(serialized_scatter_list=[
+                MultiprocessingSerializer.serialize(item)
+                for item in scatter_list
+            ])
+            if self._rank == src
+            else dict()
+        )
+
+        remote_tensor = MultiprocessingSerializer.deserialize(gathered_objects[src]["serialized_scatter_list"][self._rank])
+        tensor.copy_(remote_tensor)
 
     def all_gather_object(self, obj: Any) -> List[Any]:
         return TODO
