@@ -208,7 +208,7 @@ class _ShardedGpuModuleOffloader(_BaseModuleOffloader):
                 output_param_chunks[src_rank].copy_(src_buf)
 
             output_params[name] = output_param
-        return TODO
+        return output_params
 
 
 
