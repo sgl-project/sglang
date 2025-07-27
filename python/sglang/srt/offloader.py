@@ -12,18 +12,21 @@ logger = logging.getLogger(__name__)
 
 # TODO improve
 class ModuleOffloader:
+    def __init__(self):
+        self.group_size = get_int_env_var("SGLANG_OFFLOAD_GROUP_SIZE", -1)
+        self.num_offload_in_group = get_int_env_var("SGLANG_OFFLOAD_NUM_OFFLOAD_IN_GROUP", 1)
+        self.prefetch_step = get_int_env_var("SGLANG_OFFLOAD_PREFETCH_STEP", 1)
+        self.enabled = self.group_size > 0
+
     def offload_modules(
         self,
         all_modules_generator: Generator[torch.nn.Module, None, None],
         submodule_accessor: Callable[[torch.nn.Module], torch.nn.Module],
     ):
-        group_size = get_int_env_var("SGLANG_OFFLOAD_GROUP_SIZE", -1)
-        num_offload_in_group = get_int_env_var("SGLANG_OFFLOAD_NUM_OFFLOAD_IN_GROUP", 1)
-        prefetch_step = get_int_env_var("SGLANG_OFFLOAD_PREFETCH_STEP", 1)
-        if group_size <= 0:
+        if not self.enabled:
             return list(all_modules_generator)
 
-        logger.info(f"offload_module {group_size=} {num_offload_in_group=} {prefetch_step=}")
+        logger.info(f"offload_module {self.group_size=} {self.num_offload_in_group=} {self.prefetch_step=}")
 
         alt_stream = torch.cuda.Stream()
 
@@ -36,7 +39,7 @@ class ModuleOffloader:
                 f"[offload_modules] {module_index=} {torch.cuda.memory_allocated()=}"
             )
             all_modules.append(module)
-            if module_index % group_size >= group_size - num_offload_in_group:
+            if module_index % self.group_size >= self.group_size - self.num_offload_in_group:
                 submodule = submodule_accessor(module)
                 logger.info(
                     f"[offload_modules] move {module_index=} submodule={type(submodule)} to cpu"
@@ -47,13 +50,17 @@ class ModuleOffloader:
         for index, module in enumerate(offload_submodules):
             _hook_module_forward_for_offloader(
                 index=index, module=module, offloaders=self.offloaders,
-                prefetch_step=prefetch_step,
+                prefetch_step=self.prefetch_step,
             )
 
         return all_modules
 
     def on_post_load(self):
-        self.offloaders[0].start_onload()
+        if not self.enabled:
+            return
+
+        for i in range(self.prefetch_step):
+            self.offloaders[i].start_onload()
 
 
 def _parse_config():
