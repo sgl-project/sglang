@@ -398,6 +398,17 @@ class ServerArgs:
             )
             self.page_size = 128
 
+        if self.attention_backend == "trtllm_mla":
+            if self.page_size not in [32, 64]:
+                logger.warning(
+                    f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
+                )
+                self.page_size = 64
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "trtllm_mla backend does not support speculative decoding yet."
+                )
+
         # Set page size
         if self.page_size is None:
             self.page_size = 1
@@ -1204,6 +1215,7 @@ class ServerArgs:
                 "torch_native",
                 "ascend",
                 "triton",
+                "trtllm_mla",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",

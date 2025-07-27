@@ -74,6 +74,7 @@ blackwell = [
     "flashinfer_python==0.2.9rc1",
 ]
 
+
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20250114, not from public vllm whl
 srt_hip = [
