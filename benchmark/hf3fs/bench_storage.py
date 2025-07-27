@@ -102,17 +102,16 @@ def test():
         v = torch.randn((numel,)).to(dtype=dtype)
         values.append(v)
 
-    oks = hicache_hf3fs.batch_set(keys, values)
-    assert all(oks[: hicache_hf3fs.num_pages])
-    assert not all(oks[hicache_hf3fs.num_pages - num_pages :])
+    ok = hicache_hf3fs.batch_set(keys, values)
+    assert not ok
     assert hicache_hf3fs.get("key_8") is None
     assert hicache_hf3fs.get("key_9") is None
 
-    oks = hicache_hf3fs.batch_get(keys[: hicache_hf3fs.num_pages])
-    for ok, key, value in zip(
-        oks, keys[: hicache_hf3fs.num_pages], values[: hicache_hf3fs.num_pages]
+    results = hicache_hf3fs.batch_get(keys[: hicache_hf3fs.num_pages])
+    for result, key, value in zip(
+        results, keys[: hicache_hf3fs.num_pages], values[: hicache_hf3fs.num_pages]
     ):
-        assert torch.allclose(value, ok, atol=1e-3), f"Tensor mismatch for {key}"
+        assert torch.allclose(value, result, atol=1e-3), f"Tensor mismatch for {key}"
 
     hicache_hf3fs.close()
     os.remove(hicache_hf3fs.file_path)
@@ -157,12 +156,12 @@ def bench():
     for i in tqdm(range(warmup + iteration), desc="Benchmarking write (GB/s)"):
         keys = [f"{j}" for j in range(i * num_page, (i + 1) * num_page)]
         tik = time.perf_counter()
-        results = hicache_hf3fs.batch_set(keys, values)
+        ok = hicache_hf3fs.batch_set(keys, values)
         tok = time.perf_counter()
         if i < warmup:
             continue
         w_bw.append(w_size / (tok - tik))
-        assert all(results)
+        assert ok
     print_stats(w_bw)
 
     r_bw = []
@@ -214,8 +213,8 @@ def allclose():
 
     for i in tqdm(range(iteration), desc="Benchmarking write (GB/s)"):
         keys = [f"{j}" for j in range(i * num_page, (i + 1) * num_page)]
-        results = hicache_hf3fs.batch_set(keys, values)
-        assert all(results)
+        ok = hicache_hf3fs.batch_set(keys, values)
+        assert ok
 
     read_keys, read_results = [], []
     for i in tqdm(range(iteration), desc="Benchmarking read (GB/s)"):

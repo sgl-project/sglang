@@ -185,7 +185,7 @@ class HiCacheHF3FS(HiCacheStorage):
         return results
 
     def set(self, key: str, value: torch.Tensor) -> bool:
-        return self.batch_set([key], [value])[0]
+        return self.batch_set([key], [value])
 
     def batch_set(self, keys: List[str], values: List[torch.Tensor]) -> bool:
         indices = self.get_batch_set_indices(keys)
@@ -222,7 +222,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 logger.error(f"HiCacheHF3FS set {key} failed")
                 self.free_pages.append(index)
             results[batch_index] = write_result
-        return results
+        return all(results)
 
     @synchronized()
     def get_batch_set_indices(self, keys: List[str]) -> list:

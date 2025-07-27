@@ -251,7 +251,12 @@ class HiCacheController:
             self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
             if self.tp_world_size > 1:
                 group_ranks = torch.distributed.get_process_group_ranks(tp_group)
-                self.tp_group = torch.distributed.new_group(group_ranks, backend="gloo")
+                self.prefetch_tp_group = torch.distributed.new_group(
+                    group_ranks, backend="gloo"
+                )
+                self.backup_tp_group = torch.distributed.new_group(
+                    group_ranks, backend="gloo"
+                )
 
             if storage_backend == "file":
                 self.storage_backend = HiCacheFile()
@@ -546,7 +551,9 @@ class HiCacheController:
                         break
                     if operation.increment(self.page_size):
                         self.mem_pool_host.set_from_flat_data_page(
-                            operation.host_indices[operation.completed_tokens],
+                            operation.host_indices[
+                                operation.completed_tokens - self.page_size
+                            ],
                             page_data,
                         )
                     else:
@@ -598,7 +605,7 @@ class HiCacheController:
                     torch.distributed.all_reduce(
                         storage_hit_count_tensor,
                         op=torch.distributed.ReduceOp.MIN,
-                        group=self.tp_group,
+                        group=self.prefetch_tp_group,
                     )
                     storage_hit_count = storage_hit_count_tensor.item()
 
@@ -676,7 +683,7 @@ class HiCacheController:
                     torch.distributed.all_reduce(
                         completed_tokens_tensor,
                         op=torch.distributed.ReduceOp.MIN,
-                        group=self.tp_group,
+                        group=self.backup_tp_group,
                     )
                     min_completed_tokens = completed_tokens_tensor.item()
 

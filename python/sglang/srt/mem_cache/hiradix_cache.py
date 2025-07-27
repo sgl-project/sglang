@@ -365,8 +365,7 @@ class HiRadixCache(RadixCache):
                 group=self.tp_group,
             )
         for _ in range(queue_size.item()):
-            operation = self.cache_controller.prefetch_revoke_queue.get()
-            req_id = operation.request_id
+            req_id = self.cache_controller.prefetch_revoke_queue.get()
             if req_id in self.ongoing_prefetch:
                 last_host_node, _, _, _ = self.ongoing_prefetch[req_id]
                 last_host_node.release_host()
@@ -391,10 +390,14 @@ class HiRadixCache(RadixCache):
                 self.cache_controller.ack_backup_queue.get()
             )
             host_node = self.ongoing_backup[ack_id]
-            if completed_tokens < len(host_node.key):
+            if completed_tokens == 0:
+                host_node.hash_value = None
+            elif completed_tokens < len(host_node.key):
                 # backup is only partially successful, split the node
                 new_node = self._split_node(host_node.key, host_node, completed_tokens)
                 new_node.hash_value = hash_value
+            else:
+                host_node.hash_value = hash_value
             host_node.release_host()
             del self.ongoing_backup[ack_id]
 
@@ -504,12 +507,12 @@ class HiRadixCache(RadixCache):
         operation = self.cache_controller.prefetch(
             req_id, host_indices, new_input_tokens, last_hash
         )
-        self.ongoing_prefetch[req_id] = [
+        self.ongoing_prefetch[req_id] = (
             last_host_node,
             new_input_tokens,
             host_indices,
             operation,
-        ]
+        )
 
     def _insert_helper_host(self, node: TreeNode, key: List, host_value, hash_value):
         node.last_access_time = time.monotonic()
