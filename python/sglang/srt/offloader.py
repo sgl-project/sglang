@@ -299,3 +299,10 @@ def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tens
             output_tensors.append(MultiprocessingSerializer.deserialize(object_list[output_rank]["dup_serialized_local_tensor"][self_rank]))
 
     return output_tensors
+
+
+class NaiveDistributed:
+    def __init__(self, rank: int, world_size: int):
+        self._rank = rank
+        self._world_size = world_size
+        assert 0 <= rank < world_size
