@@ -488,7 +488,6 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
         def persistent_attn_forward(
-            self,
             prefill_wrapper_paged: BatchAttention,
             q: torch.Tensor,
             layer: RadixAttention,
