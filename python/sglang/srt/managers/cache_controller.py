@@ -193,6 +193,7 @@ class PrefetchOperation(StorageOperation):
     ):
         self.request_id = request_id
 
+        self.revoked = False
         self._done_flag = False
         self._lock = threading.Lock()
 
@@ -588,6 +589,7 @@ class HiCacheController:
 
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
+                    operation.revoked = True
                     self.prefetch_revoke_queue.put(operation.request_id)
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
