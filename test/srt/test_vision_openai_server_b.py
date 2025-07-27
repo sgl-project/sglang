@@ -23,6 +23,10 @@ class TestPixtralServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--mem-fraction-static",
                 "0.70",
+                "--mm-attention-backend",
+                "fa3",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -45,6 +49,10 @@ class TestMistral3_1Server(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--mem-fraction-static",
                 "0.75",
+                "--mm-attention-backend",
+                "fa3",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -67,7 +75,10 @@ class TestDeepseekVL2Server(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--context-length",
                 "4096",
-                "--disable-cuda-graph",
+                "--mm-attention-backend",
+                "fa3",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -90,6 +101,10 @@ class TestJanusProServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--mem-fraction-static",
                 "0.35",
+                "--mm-attention-backend",
+                "fa3",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -120,6 +135,10 @@ class TestJanusProServer(TestOpenAIVisionServer):
 #                 "0.8",
 #                 "--tp-size=8",
 #                 "--context-length=8192",
+#                 "--mm-attention-backend",
+#                 "fa3",
+#                 "--cuda-graph-max-bs",
+#                 "4",
 #             ],
 #         )
 #         cls.base_url += "/v1"
@@ -143,6 +162,10 @@ class TestGemma3itServer(TestOpenAIVisionServer):
                 "--mem-fraction-static",
                 "0.70",
                 "--enable-multimodal",
+                "--mm-attention-backend",
+                "fa3",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -165,8 +188,10 @@ class TestGemma3nServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--mem-fraction-static",
                 "0.70",
+                "--mm-attention-backend",
+                "fa3",
                 "--cuda-graph-max-bs",
-                "1",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -188,6 +213,10 @@ class TestKimiVLServer(TestOpenAIVisionServer):
                 "4096",
                 "--dtype",
                 "bfloat16",
+                "--mm-attention-backend",
+                "fa3",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -228,6 +257,10 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
                 "--lora-paths",
                 f"vision={constants.HF_HUB_CACHE}/models--microsoft--Phi-4-multimodal-instruct/snapshots/{revision}/vision-lora",
                 f"speech={constants.HF_HUB_CACHE}/models--microsoft--Phi-4-multimodal-instruct/snapshots/{revision}/speech-lora",
+                "--mm-attention-backend",
+                "fa3",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -274,10 +307,15 @@ class TestVILAServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--context-length=65536",
                 f"--revision={cls.revision}",
+                "--mm-attention-backend",
+                "fa3",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
 
 
 if __name__ == "__main__":
+    del TestOpenAIVisionServer
     unittest.main()
