@@ -26,12 +26,6 @@ limitations under the License.
 #define VEC_SIZE 4
 using Vec = int4;
 
-#ifndef __CUDA_ARCH__  // HIP
-#define SHFL_UP(mask, val, delta) __shfl_up_sync((val), (delta))
-#else  // CUDA
-#define SHFL_UP(mask, val, delta) __shfl_up_sync((mask), (val), (delta))
-#endif
-
 template <typename scalar_t>
 __global__ void count_and_sort_expert_tokens_kernel(
     const scalar_t* __restrict__ topk_ids,
@@ -52,7 +46,7 @@ __device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffff
   int original = v;
 #pragma unroll
   for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
-    int n = SHFL_UP(mask, v, offset);
+    int n = __shfl_up_sync(mask, v, offset);
     if ((threadIdx.x & (WARP_SIZE - 1)) >= offset) v += n;
   }
   return v - original;
