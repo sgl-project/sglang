@@ -984,7 +984,11 @@ class EAGLEWorker(TpModelWorker):
         logits[..., -1] = self.log_num_cold_tokens + (
             cold_token_logits / self.num_cold_tokens
         )
-        logger.debug(f"Before clamp: {logits[..., -1]=}")
+        logits.clamp_(min=finfo.min, max=finfo.max)
+        logger.debug(f"Re-clamp: {logits=}")
+        # replace nan values with -inf
+        logits = torch.where(torch.isnan(logits), torch.tensor(-float("inf")), logits)
+        logger.debug(f"After replacing nan -> -inf: {logits=}")
 
     def _post_process_draft_probs(self, probs: torch.Tensor) -> torch.Tensor:
         logger.debug("post_process_draft_probs")
