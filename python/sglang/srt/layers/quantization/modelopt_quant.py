@@ -965,12 +965,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
             topk_weights, topk_ids, _ = topk_output
-
-            dumper.dump("cppmoe_x", x, layer_id=layer.layer_id)
-            dumper.dump("cppmoe_topk_ids", topk_ids, layer_id=layer.layer_id)
-            dumper.dump("cppmoe_topk_weights", topk_weights, layer_id=layer.layer_id)
-            # print(f"{ep_size=} {ep_rank=} {tp_size=} {tp_rank=} {routed_scaling_factor=}")
-
             output = flashinfer_cutlass_fused_moe(
                 x,
                 topk_ids.to(torch.int),
@@ -994,9 +988,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )[0]
             if routed_scaling_factor is not None:
                 output *= routed_scaling_factor
-
-            dumper.dump("cppmoe_output", output, layer_id=layer.layer_id)
-
             return output
 
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4

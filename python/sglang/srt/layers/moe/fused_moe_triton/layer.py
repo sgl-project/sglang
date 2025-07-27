@@ -83,7 +83,6 @@ class FusedMoE(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
-        self.layer_id = layer_id
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.tp_size = (

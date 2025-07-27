@@ -28,7 +28,6 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
-from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     parallel_state,
@@ -360,8 +359,7 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if True
-                    # if global_server_args_dict["enable_deepep_moe"]
+                    if global_server_args_dict["enable_deepep_moe"]
                     else {}
                 ),
             )
@@ -437,10 +435,8 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         if not self._enable_deepep_moe:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
-            # print("HACK: skip dual stream branch")
             if (
-                False
-                and self.alt_stream is not None
+                self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             ):
@@ -493,29 +489,10 @@ class DeepseekV2MoE(nn.Module):
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
-        # if shared_output is not None:
-        #     final_hidden_states = final_hidden_states + shared_output
-
-        # print("HACK: make final_hidden_states and shared_output float")
-        # assert final_hidden_states.dtype == shared_output.dtype == torch.bfloat16
-        # final_hidden_states = final_hidden_states.float()
-        # shared_output = shared_output.float()
-
-        # if shared_output is not None:
-        #     # print("HACK: pre-allreduce shared")
-        #     shared_output = tensor_model_parallel_all_reduce(shared_output)
-
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-
-        # print("HACK: move forward_normal shared_output summation place!")
-        if shared_output is not None:
-            dumper.dump("dpskmoe_willadd_final_hidden_states", final_hidden_states, layer_id=self.layer_id)
-            dumper.dump("dpskmoe_willadd_shared_output", shared_output, layer_id=self.layer_id)
-            final_hidden_states = final_hidden_states + shared_output
-
-        # final_hidden_states = final_hidden_states.to(torch.bfloat16)
-
         return final_hidden_states
 
     def forward_cpu(
@@ -597,10 +574,6 @@ class DeepseekV2MoE(nn.Module):
             topk_weights = torch.empty(
                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
-
-        dumper.dump("dpskmoe_before_dispatch_hidden_states", hidden_states, layer_id=self.layer_id)
-        dumper.dump("dpskmoe_before_dispatch_topk_idx", topk_idx, layer_id=self.layer_id)
-
         if self.ep_size > 1:
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             (
@@ -651,8 +624,6 @@ class DeepseekV2MoE(nn.Module):
         # TODO temporary branching, wait for refactor
         if isinstance(self.experts, FusedMoE):
             if shared_output is not None:
-                dumper.dump("dpskmoe_willadd_final_hidden_states", final_hidden_states, layer_id=self.layer_id)
-                dumper.dump("dpskmoe_willadd_shared_output", shared_output, layer_id=self.layer_id)
                 final_hidden_states += shared_output
         else:
             if shared_output is not None:
@@ -1922,9 +1893,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
         )
 
-        dumper.dump("dpsklayer_after_attn_hidden_states", hidden_states, layer_id=self.layer_id)
-        dumper.dump("dpsklayer_after_attn_residual", residual, layer_id=self.layer_id)
-
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -1936,8 +1904,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         hidden_states = self.mlp(hidden_states, forward_batch, can_fuse_mlp_allreduce)
-
-        dumper.dump("dpsklayer_after_mlp_hidden_states", hidden_states, layer_id=self.layer_id)
 
         if can_fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -2194,10 +2160,6 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        dumper.on_forward_pass_start()
-        dumper.dump("modelstart_input_ids", input_ids)
-        dumper.dump("modelstart_positions", positions)
-
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
         return self.logits_processor(
