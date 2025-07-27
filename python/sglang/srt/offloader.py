@@ -160,6 +160,13 @@ class _ShardedGpuModuleOffloader(_BaseModuleOffloader):
         self.rank = dist.get_rank()
         assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
 
+        if self.rank == 0:
+            _StatelessOffloaderUtil.move_params_to_cpu(module)
+        else:
+            _StatelessOffloaderUtil.move_params_to_meta(module)
+
+
+
 class _StatelessOffloaderUtil:
     @staticmethod
     def move_params_to_cpu(module):
@@ -176,6 +183,11 @@ class _StatelessOffloaderUtil:
             )
             cpu_data.copy_(param.data)
             param.data = cpu_data
+
+    @staticmethod
+    def move_params_to_meta(module):
+        for name, param in module.named_parameters():
+            param.data = param.data.to("meta")
 
     @staticmethod
     def create_device_tensors(module, device):
