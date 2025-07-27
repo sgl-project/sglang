@@ -130,6 +130,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         super().__init__()
         self.use_triton_kernels = use_triton_kernels
 
+        self.triton_kernel_moe_forward = None
+        if torch.cuda.is_available() and has_triton_kernels:
+            from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
+                triton_kernel_moe_forward as _tk_forward,
+            )
+
+            self.triton_kernel_moe_forward = _tk_forward
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -229,16 +237,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     ) -> torch.Tensor:
 
         if self.use_triton_kernels:
-            # TODO(ch-wan): re-enable the Triton kernel
-            raise NotImplementedError("The Triton kernel is temporarily disabled.")
-            # return triton_kernel_moe_forward(
-            #     hidden_states=x,
-            #     w1=layer.w13_weight,
-            #     w2=layer.w2_weight,
-            #     gating_output=router_logits,
-            #     topk=top_k,
-            #     renormalize=renormalize,
-            # )
+            return self.triton_kernel_moe_forward(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_output=topk_output,
+            )
         else:
             if _use_aiter:
                 assert not no_combine, "unsupported"
