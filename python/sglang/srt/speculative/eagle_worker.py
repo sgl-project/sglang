@@ -607,25 +607,29 @@ class EAGLEWorker(TpModelWorker):
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+            input_ids, hidden_states, scores, tree_info, real_parents = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
-
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
             if i == self.speculative_num_steps - 1:
                 break
 
+            # Overwrite the kv cache to keep the causal relationship of branch.
+            if i > 1:
+                src_cache_loc = out_cache_loc[i-1][real_parents]
+                tgt_cache_loc = out_cache_loc[i-1]
+                self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                    tgt_cache_loc, src_cache_loc
+                )
             # Set inputs
             forward_batch.input_ids = input_ids
             forward_batch.out_cache_loc = out_cache_loc[i]
             forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
-
-            # Run forward
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             )
