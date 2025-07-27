@@ -51,7 +51,7 @@ class ModuleOffloader:
                     f"[offload_modules] move {module_index=} submodule={type(submodule)} to cpu"
                 )
                 offload_submodules.append(submodule)
-                self.offloaders.append(_BaseModuleOffloader.create(mode=self.mode, module=submodule, alt_stream=alt_stream))
+                self.offloaders.append(_ModuleOffloader(mode=self.mode, module=submodule, alt_stream=alt_stream))
 
         for index, module in enumerate(offload_submodules):
             _hook_module_forward_for_offloader(
@@ -117,18 +117,13 @@ def _hook_module_forward_raw(
 
 
 # TODO maybe not use subclass, but other abstractions
-class _BaseModuleOffloader(ABC):
-    @staticmethod
-    def create(mode, **kwargs):
-        return {
-            "cpu": _CpuModuleOffloader,
-            "sharded_gpu": _ShardedGpuModuleOffloader,
-        }[mode](**kwargs)
-
-    def __init__(self, module: torch.nn.Module, alt_stream: torch.cuda.Stream):
+class _ModuleOffloader(ABC):
+    def __init__(self, mode: str, module: torch.nn.Module, alt_stream: torch.cuda.Stream):
+        self.mode = mode
         self.module = module
         self.device = next(module.parameters()).device
         self.alt_stream = alt_stream
+
         assert self.device != torch.device(
             "cpu"
         ), "not handled device=cpu case yet (should skip this tensor)"
