@@ -197,9 +197,14 @@ class _ShardedGpuModuleOffloader(_BaseModuleOffloader):
         output_params = {}
         for name, meta_param in self.module.named_parameters():
             output_param = _empty_strided_like(meta_param, device="cuda")
-            chunks = output_param.chunk(self.world_size)
-            for src_rank in range(self.world_size):
-                TODO
+            output_param_chunks = output_param.chunk(self.world_size)
+
+            for index in range(self.world_size):
+                src_rank = (self.rank + index) % self.world_size
+                src_buf = symm_mem.get_buffer(src_rank, output_param.shape, output_param.dtype)
+                output_param_chunks[src_rank].copy_(src_buf)
+
+            output_params[name] = output_param
         return TODO
 
 
