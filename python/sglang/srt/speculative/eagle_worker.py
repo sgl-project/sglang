@@ -1005,6 +1005,7 @@ class EAGLEWorker(TpModelWorker):
         if torch.isnan(probs).any():
             raise ValueError("Detected errors during sampling! NaN in the probs.")
         logger.debug(f"probs: {probs[..., -1].item()}")
+        logger.debug(f"probs.sum(): {probs.sum().item()}")
         return probs
 
     def capture_for_decode(
