@@ -2,6 +2,8 @@ ARG CUDA_VERSION=12.8.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
 
 ARG BUILD_TYPE=blackwell
+ARG DEEPEP_COMMIT=1b14ad661c7640137fcfe93cccb2694ede1220b0
+ARG CMAKE_BUILD_PARALLEL_LEVEL=2
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
@@ -16,7 +18,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     tzdata \
     software-properties-common netcat-openbsd kmod unzip openssh-server \
     curl wget lsof zsh ccache tmux htop git-lfs tree \
-    python3 python3-pip python3-dev libpython3-dev \
+    python3 python3-pip python3-dev libpython3-dev python3-venv \
     build-essential cmake \
     libopenmpi-dev libnuma1 libnuma-dev \
     libibverbs-dev libibverbs1 libibumad3 \
@@ -36,13 +38,8 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
  && rm -rf /var/lib/apt/lists/* \
  && apt-get clean
 
-
-# --- Install SGLang missing package
-RUN pip install netifaces
-
-# --- Install nightly PyTorch ---
-RUN pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128 --force-reinstall
-
+# --- Install SGLang missing package for blackwell build type
+RUN python3 -m pip install openai httpx
 
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
@@ -56,12 +53,12 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
 
 # Clone and install SGLang
-# FIXME: Forcing SGLang to 2a2d3478afe8cdb336888f2e6faa3775ac40254e because sgl-kernel v0.2.5 is missing aarch64 package
+# NOTE: flashinfer v0.2.9rc1 is not installing for aarch64
 WORKDIR /sgl-workspace
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
  && git clone https://github.com/sgl-project/sglang.git \
  && cd sglang \
- && git checkout 2a2d3478afe8cdb336888f2e6faa3775ac40254e \
+ && git checkout a167fd0bcb9ef4b0f4331a109e40c8cdc770b026 \
  && case "$CUDA_VERSION" in \
       12.6.1) CUINDEX=126 ;; \
       12.8.1) CUINDEX=128 ;; \
@@ -70,38 +67,33 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
       python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps ; \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.2.4/sgl_kernel-0.2.4+cu128-cp39-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.2.7/sgl_kernel-0.2.7+cu128-cp39-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
     fi
 
-
-# Build NVSHMEM
-# Build and install NVSHMEM + DeepEP
-RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz \
- && git clone https://github.com/fzyzcjy/DeepEP.git \
- && cd DeepEP \
- && git checkout 1b14ad661c7640137fcfe93cccb2694ede1220b0 \
- && cd .. \
- && tar -xf nvshmem_src_3.2.5-1.txz && mv nvshmem_src nvshmem \
- && cd nvshmem \
- && git apply /sgl-workspace/DeepEP/third-party/nvshmem.patch \
- && sed -i '1i#include <unistd.h>' examples/moe_shuffle.cu \
- && rm -f /sgl-workspace/nvshmem_src_3.2.5-1.txz \
- && NVSHMEM_SHMEM_SUPPORT=0 \
-    NVSHMEM_UCX_SUPPORT=0 \
-    NVSHMEM_USE_NCCL=0 \
-    NVSHMEM_MPI_SUPPORT=0 \
-    NVSHMEM_IBGDA_SUPPORT=1 \
-    NVSHMEM_PMIX_SUPPORT=0 \
-    NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
-    NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES="100;120" \
- && cmake --build build --target install -j \
- && cd /sgl-workspace/DeepEP \
- && NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
+    # Build and install NVSHMEM + DeepEP
+RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
+&& git clone https://github.com/fzyzcjy/DeepEP.git \
+&& cd DeepEP && git checkout ${DEEPEP_COMMIT} && cd .. \
+&& tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && mv nvshmem_src nvshmem \
+&& cd nvshmem \
+&& rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
+&& NVSHMEM_SHMEM_SUPPORT=0 \
+   NVSHMEM_UCX_SUPPORT=0 \
+   NVSHMEM_USE_NCCL=0 \
+   NVSHMEM_MPI_SUPPORT=0 \
+   NVSHMEM_IBGDA_SUPPORT=1 \
+   NVSHMEM_PMIX_SUPPORT=0 \
+   NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
+   NVSHMEM_USE_GDRCOPY=1 \
+   cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES="100;120" \
+&& cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL} \
+&& cd /sgl-workspace/DeepEP \
+&& NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
     datamodel_code_generator \
+    mooncake_transfer_engine==0.3.5 \
     pre-commit \
     pytest \
     black \
@@ -144,9 +136,6 @@ RUN apt update -y \
     && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
     && apt update -y \
     && apt install nsight-systems-cli -y
-
-# --- Install Mooncake ---
-RUN pip install mooncake-transfer-engine==0.3.5
 
 # Set up locale
 RUN locale-gen en_US.UTF-8
