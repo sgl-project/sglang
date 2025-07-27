@@ -243,13 +243,8 @@ def _move_param_to_cpu(param):
     cpu_data.copy_(param.data)
     param.data = cpu_data
 
-def _move_param_to_meta(param):
-    def _print(name, x):
-        print(f"{name=} {x.device=} {x.shape=} {x.stride()=} {x.dtype=}")
-    _print("move_param_to_meta-src", param.data)
-    _print("move_param_to_meta-dst", param.data.to("meta"))
-
-    param.data = param.data.to("meta")
+def _move_param_to_meta(module, param_name):
+    setattr(module, param_name, torch.nn.Parameter(getattr(module, param_name).data.to("meta")))
 
 def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
     return torch.empty_strided(
