@@ -172,12 +172,25 @@ class _ShardedGpuModuleOffloader(_BaseModuleOffloader):
     def __init__(self, module: torch.nn.Module, alt_stream: torch.cuda.Stream):
         super().__init__(module, alt_stream)
         self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
         assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
 
         if self.rank == 0:
             _StatelessOffloaderUtil.move_params_to_cpu(module)
         else:
             _StatelessOffloaderUtil.move_params_to_meta(module)
+
+    def post_init(self):
+        for name, param in self.module.named_parameters():
+            if self.rank == 0:
+                scatter_list = param.data.chunk(self.world_size)
+            else:
+                scatter_list = None
+            output_tensor = torch.empty_like(param.data, device="cuda")
+            dist.scatter(output_tensor, scatter_list, src=0)
+            TODO
+
+        _StatelessOffloaderUtil.move_params_to_meta(self.module)
 
     def start_onload(self):
         TODO
