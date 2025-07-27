@@ -135,8 +135,6 @@ class _ModuleOffloader(ABC):
             for name, param in self.module.named_parameters()
         }
 
-        for name, param in self.module.named_parameters():
-
     def post_init(self):
         pass
 
@@ -162,7 +160,7 @@ class _ModuleOffloader(ABC):
 
 class _BaseParamOffloader(ABC):
     @staticmethod
-    def create(mode: str, **kwargs):
+    def create(mode: str, **kwargs) -> "_BaseParamOffloader":
         return {
             "cpu": _CpuParamOffloader,
             "sharded_gpu": _ShardedGpuParamOffloader,
