@@ -9,15 +9,19 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
     is_hip,
+    is_npu,
     load_json_config,
 )
+
+_is_npu = is_npu()
 
 try:
     from deep_ep import Buffer, Config
 
-    from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
-    )
+    if not _is_npu:
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
 
     use_deepep = True
 except ImportError:
@@ -545,6 +549,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
         reorder_topk_ids = seg_indptr = None
+        if _is_npu:
+            # seg_indptr acts as a token mask for MLP calculation on Ascend
+            seg_indptr = self.handle[1]
 
         return (
             hidden_states,

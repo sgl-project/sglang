@@ -3,7 +3,18 @@ from __future__ import annotations
 import importlib
 import sys
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Union,
+    cast,
+)
 
 import torch
 from torch.nn.parameter import Parameter
@@ -13,6 +24,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.layers.linear import RowParallelLinear, UnquantizedLinearMethod
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
@@ -79,22 +91,16 @@ def npu_wrapper_rmsnorm_forward(func):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if not x.is_contiguous():
             x = x.contiguous()
-        original_dtype = x.dtype
-        x = x.to(torch.float32)
         if residual is not None:
-            x = x + residual.to(torch.float32)
-            residual = x.to(original_dtype)
+            out, _, residual_out = torch_npu.npu_add_rms_norm(
+                residual, x, self.weight.data, self.variance_epsilon
+            )
+            out = out + self.bias
+            return out.to(x.dtype), residual_out
 
-        x = (
-            torch_npu.npu_rms_norm(
-                x, self.weight.to(torch.float32), self.variance_epsilon
-            )[0]
-            + self.bias
-        )
-
-        if residual is None:
-            return x.to(original_dtype)
-        return x.to(original_dtype), residual
+        out = torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
+        out = out + self.bias
+        return out.to(x.dtype)
 
     return _rmsnorm_forward_oot
 
@@ -568,7 +574,6 @@ class NPU_W8A8LinearMethodImpl:
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
-        tp_rank: Optional[int] = 0,
     ) -> torch.Tensor:
         original_dtype = x.dtype
         if original_dtype != torch.int8:
@@ -580,8 +585,12 @@ class NPU_W8A8LinearMethodImpl:
                 -1,
                 True,
             )
-
-        quant_bias = layer.quant_bias if tp_rank == 0 else None
+        # Only fuse bias add into GEMM for rank 0 (this ensures that
+        # bias will not get added more than once in Attention TP>1 case)
+        if isinstance(layer, RowParallelLinear) and layer.tp_rank > 0:
+            quant_bias = None
+        else:
+            quant_bias = layer.quant_bias
         return torch_npu.npu_quant_matmul(
             x,
             layer.weight,
@@ -648,13 +657,18 @@ class NPU_W8A8LinearMethodMTImpl:
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
-        tp_rank: Optional[int] = 0,
     ) -> torch.Tensor:
         original_dtype = x.dtype
         if original_dtype != torch.int8:
             x = quant_per_tensor(x, layer.input_scale, layer.input_offset)
 
-        quant_bias = layer.quant_bias if tp_rank == 0 else None
+        # Only fuse bias add into GEMM for rank 0 (this ensures that
+        # bias will not get added more than once in Attention TP>1 case)
+        if isinstance(layer, RowParallelLinear) and layer.tp_rank > 0:
+            quant_bias = None
+        else:
+            quant_bias = layer.quant_bias
+
         return ops.quant_matmul(
             x=x, weight=layer.weight, deq_scale=layer.deq_scale, deq_bias=quant_bias
         )
@@ -734,11 +748,6 @@ class NPU_W8A8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.linear import RowParallelLinear
-
-        if isinstance(layer, RowParallelLinear):
-            tp_rank = get_tensor_model_parallel_rank()
-            return self.quant_method.apply(layer, x, bias, tp_rank)
         return self.quant_method.apply(layer, x, bias)
 
 
@@ -777,7 +786,6 @@ class NPU_W8A8DynamicLinearMethodImpl:
         tp_rank: Optional[int] = 0,
     ) -> torch.Tensor:
         original_dtype = x.dtype
-        # use ATB quantize
         quant_out, dynamic_scale = torch_npu.npu_dynamic_quant(x)
         return torch_npu.npu_quant_matmul(
             quant_out,
@@ -860,11 +868,6 @@ class NPU_W8A8DynamicLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.linear import RowParallelLinear
-
-        if isinstance(layer, RowParallelLinear):
-            tp_rank = get_tensor_model_parallel_rank()
-            return self.quant_method.apply(layer, x, bias, tp_rank)
         return self.quant_method.apply(layer, x, bias)
 
 
@@ -981,3 +984,45 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
         )
+
+
+class NPU_W8A8EPMoEMethod(NPU_W8A8MoEMethod):
+    """MoE method for W8A8.
+    Args:
+        quant_config: The quantization config.
+    """
+
+    def __init__(self, quant_config: W8A8Int8Config):
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts_per_partition: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: torch.dtype,
+        weight_loader,
+    ):
+        super().create_weights(
+            layer=layer,
+            num_experts=num_experts_per_partition,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            params_dtype=params_dtype,
+            weight_loader=weight_loader,
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError

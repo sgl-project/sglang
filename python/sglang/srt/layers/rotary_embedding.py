@@ -679,7 +679,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         )
 
         # Re-dispatch
-        if _is_hip or _is_npu:
+        if _is_hip:
             self._forward_method = self.forward_native
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
@@ -763,6 +763,46 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             query = query_rot
             key = key_rot
         return query.to(dtype), key.to(dtype)
+
+    def forward_npu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # NOTE: now npu_mrope can only support `numQHeads*headSize <= 4096` pattern,
+        # and generalization to more scenarios will be supported in the future.
+        if query.shape[1] * query.shape[2] > 4096:
+            return self.forward_native(positions, query, key, offsets)
+        num_tokens = query.shape[0]
+        rotary_mode = "half" if self.is_neox_style else "interleave"
+        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
+        query_rot = query[..., : self.rotary_dim]
+        key_rot = key[..., : self.rotary_dim]
+        if self.rotary_dim < self.head_size:
+            query_pass = query[..., self.rotary_dim :]
+            key_pass = key[..., self.rotary_dim :]
+
+        query_rot, key_rot = torch_npu.npu_mrope(
+            torch.add(positions, offsets) if offsets is not None else positions,
+            query_rot.reshape(num_tokens, -1),
+            key_rot.reshape(num_tokens, -1),
+            self.cos_sin_cache,
+            self.rotary_dim,
+            mrope_section=[0, 0, 0],
+            rotary_mode=rotary_mode,
+        )
+        query_rot = query_rot.reshape(num_tokens, -1, self.rotary_dim)
+        key_rot = key_rot.reshape(num_tokens, -1, self.rotary_dim)
+
+        if self.rotary_dim < self.head_size:
+            query = torch.cat((query_rot, query_pass), dim=-1)
+            key = torch.cat((key_rot, key_pass), dim=-1)
+        else:
+            query = query_rot
+            key = key_rot
+        return query, key
 
     def forward_cpu(
         self,
