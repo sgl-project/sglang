@@ -128,6 +128,14 @@ class _BaseModuleOffloader(ABC):
             "cpu"
         ), "not handled device=cpu case yet (should skip this tensor)"
 
+    def start_onload(self):
+        raise NotImplementedError
+
+    def offload(self):
+        raise NotImplementedError
+
+    def wait_and_get_device_tensors(self):
+        raise NotImplementedError
 
 class _CpuModuleOffloader(_BaseModuleOffloader):
     def __init__(self, module: torch.nn.Module, alt_stream: torch.cuda.Stream):
