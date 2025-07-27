@@ -156,7 +156,10 @@ class _ModuleOffloader(ABC):
         return self._device_tensors
 
     def _create_device_tensors(self):
-        raise NotImplementedError
+        return {
+            k: v.create_device_tensor()
+            for k, v in self._param_offloaders.items()
+        }
 
 
 class _BaseParamOffloader(ABC):
@@ -173,14 +176,16 @@ class _BaseParamOffloader(ABC):
     def post_init(self):
         pass
 
+    def create_device_tensor(self):
+        raise NotImplementedError
 
 class _CpuParamOffloader(_BaseParamOffloader):
     def __init__(self, param):
         super().__init__(param)
         _StatelessOffloaderUtil.move_param_to_cpu(param)
 
-    def _create_device_tensors(self):
-        return _StatelessOffloaderUtil.create_device_tensors(self.module, self.device)
+    def create_device_tensor(self):
+        return self._param.to("cuda", non_blocking=True)
 
 class _ShardedGpuParamOffloader(_BaseParamOffloader):
     def __init__(self, param):
@@ -240,13 +245,6 @@ class _StatelessOffloaderUtil:
     @staticmethod
     def move_param_to_meta(param):
         param.data = param.data.to("meta")
-
-    @staticmethod
-    def create_device_tensors(module, device):
-        return {
-            k: v.to(device, non_blocking=True) for k, v in module.state_dict().items()
-        }
-
 
 def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
     return torch.empty_strided(
