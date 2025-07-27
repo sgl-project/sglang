@@ -116,7 +116,9 @@ class DeepEPBuffer:
             and (DeepEPConfig.get_instance().num_sms < total_num_sms // 2)
         ):
             logger.warning(
-                f"Only use {DeepEPConfig.get_instance().num_sms} SMs for DeepEP communication. This may result in highly suboptimal performance."
+                f"Only use {DeepEPConfig.get_instance().num_sms} SMs for DeepEP communication. "
+                f"This may result in highly suboptimal performance. "
+                f"Consider using --deepep-config to change the behavior."
             )
 
         cls._buffer = Buffer(
