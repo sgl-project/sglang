@@ -256,7 +256,7 @@ def _move_param_to_meta(module, param_name):
     # TODO support more types when needed
     # manually checked how `w13_weight` and `w2_weight` are constructed
     new_param = ModelWeightParameter(
-        old_param.data.to("meta"),
+        data=old_param.data.to("meta"),
         **{k: getattr(old_param, k) for k in ["input_dim", "output_dim", "weight_loader"]}
     )
 
