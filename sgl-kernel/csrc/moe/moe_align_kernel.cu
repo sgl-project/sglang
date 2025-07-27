@@ -57,7 +57,7 @@ __device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffff
   }
 #ifndef __CUDA_ARCH__  // HIP
   // Ensure warp synchronization in HIP
-  __syncwarp();
+  __builtin_amdgcn_s_barrier();
 #endif
   return v - original;
 }
