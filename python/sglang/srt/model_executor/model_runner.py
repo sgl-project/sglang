@@ -1308,9 +1308,58 @@ class ModelRunner:
         else:
             self.attn_backend = self._get_attention_backend()
 
-    # TODO unify with 6338
     def _get_attention_backend(self):
-        if self.server_args.attention_backend == "flashinfer":
+        """Init attention kernel backend."""
+        self.decode_attention_backend_str = (
+            self.server_args.decode_attention_backend
+            if self.server_args.decode_attention_backend
+            else self.server_args.attention_backend
+        )
+        self.prefill_attention_backend_str = (
+            self.server_args.prefill_attention_backend
+            if self.server_args.prefill_attention_backend
+            else self.server_args.attention_backend
+        )
+        if self.decode_attention_backend_str != self.prefill_attention_backend_str:
+            assert (
+                self.server_args.speculative_algorithm is None
+            ), "Currently HybridAttentionBackend does not support speculative decoding."
+            from sglang.srt.layers.attention.hybrid_attn_backend import (
+                HybridAttnBackend,
+            )
+
+            attn_backend = HybridAttnBackend(
+                decode_backend=self._get_attention_backend_from_str(
+                    self.decode_attention_backend_str
+                ),
+                prefill_backend=self._get_attention_backend_from_str(
+                    self.prefill_attention_backend_str
+                ),
+            )
+            logger.info(
+                f"Using hybrid attention backend for decode and prefill: "
+                f"decode_backend={self.decode_attention_backend_str}, "
+                f"prefill_backend={self.prefill_attention_backend_str}."
+            )
+            logger.warning(
+                f"Warning: Attention backend specified by --attention-backend or default backend might be overridden."
+                f"The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
+            )
+        else:
+            attn_backend = self._get_attention_backend_from_str(
+                self.server_args.attention_backend
+            )
+
+        global_server_args_dict.update(
+            {
+                "decode_attention_backend": self.decode_attention_backend_str,
+                "prefill_attention_backend": self.prefill_attention_backend_str,
+            }
+        )
+        return attn_backend
+
+    def _get_attention_backend_from_str(self, backend_str: str):
+        if backend_str == "flashinfer":
             if not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (
                     FlashInferAttnBackend,
@@ -1318,7 +1367,11 @@ class ModelRunner:
 
                 # Init streams
                 if self.server_args.speculative_algorithm == "EAGLE":
-                    self.plan_stream_for_flashinfer = torch.cuda.Stream()
+                    if (
+                        not hasattr(self, "plan_stream_for_flashinfer")
+                        or not self.plan_stream_for_flashinfer
+                    ):
+                        self.plan_stream_for_flashinfer = torch.cuda.Stream()
                 return FlashInferAttnBackend(self)
             else:
                 from sglang.srt.layers.attention.flashinfer_mla_backend import (
@@ -1326,15 +1379,15 @@ class ModelRunner:
                 )
 
                 return FlashInferMLAAttnBackend(self)
-        elif self.server_args.attention_backend == "aiter":
+        elif backend_str == "aiter":
             from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
             return AiterAttnBackend(self)
-        elif self.server_args.attention_backend == "ascend":
+        elif backend_str == "ascend":
             from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
 
             return AscendAttnBackend(self)
-        elif self.server_args.attention_backend == "triton":
+        elif backend_str == "triton":
             assert not self.model_config.is_encoder_decoder, (
                 "Cross attention is not supported in the triton attention backend. "
                 "Please use `--attention-backend flashinfer`."
@@ -1349,17 +1402,17 @@ class ModelRunner:
                 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
                 return TritonAttnBackend(self)
-        elif self.server_args.attention_backend == "torch_native":
+        elif backend_str == "torch_native":
             from sglang.srt.layers.attention.torch_native_backend import (
                 TorchNativeAttnBackend,
             )
 
             return TorchNativeAttnBackend(self)
-        elif self.server_args.attention_backend == "flashmla":
+        elif backend_str == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
             return FlashMLABackend(self)
-        elif self.server_args.attention_backend == "fa3":
+        elif backend_str == "fa3":
             assert (
                 torch.cuda.get_device_capability()[0] == 8 and not self.use_mla_backend
             ) or torch.cuda.get_device_capability()[0] == 9, (
@@ -1371,7 +1424,7 @@ class ModelRunner:
             )
 
             return FlashAttentionBackend(self)
-        elif self.server_args.attention_backend == "cutlass_mla":
+        elif backend_str == "cutlass_mla":
             from sglang.srt.layers.attention.cutlass_mla_backend import (
                 CutlassMLABackend,
             )
@@ -1385,9 +1438,7 @@ class ModelRunner:
             logger.info(f"Intel AMX attention backend is enabled.")
             return IntelAMXAttnBackend(self)
         else:
-            raise ValueError(
-                f"Invalid attention backend: {self.server_args.attention_backend}"
-            )
+            raise ValueError(f"Invalid attention backend: {backend_str}")
 
     def init_double_sparsity_channel_config(self, selected_channel):
         selected_channel = "." + selected_channel + "_proj"
@@ -1475,7 +1526,10 @@ class ModelRunner:
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
         return self.model.forward(
-            forward_batch.input_ids, forward_batch.positions, forward_batch, **kwargs
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            **kwargs,
         )
 
     def forward_extend(
