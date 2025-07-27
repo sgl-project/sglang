@@ -50,7 +50,7 @@ class ModuleOffloader:
                 submodule = submodule_accessor(module)
                 whitelist_param_names = whitelist_param_names_creator(submodule)
                 logger.info(
-                    f"[offload_modules] move {module_index=} submodule={type(submodule)} params={whitelist_param_names} to cpu"
+                    f"[offload_modules] offload {module_index=} submodule={type(submodule)} params={whitelist_param_names}"
                 )
                 offload_submodules.append(submodule)
                 self.offloaders.append(_ModuleOffloader(
