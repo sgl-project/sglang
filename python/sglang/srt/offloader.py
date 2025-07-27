@@ -173,9 +173,9 @@ class _BaseParamOffloader(ABC):
 
 
 class _CpuParamOffloader(_BaseParamOffloader):
-    def __init__(self, module: torch.nn.Module, alt_stream: torch.cuda.Stream):
-        super().__init__(module, alt_stream)
-        _StatelessOffloaderUtil.move_params_to_cpu(module)
+    def __init__(self, param):
+        super().__init__(param)
+        _StatelessOffloaderUtil.move_param_to_cpu(param)
 
     def _create_device_tensors(self):
         return _StatelessOffloaderUtil.create_device_tensors(self.module, self.device)
@@ -228,17 +228,14 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
 
 class _StatelessOffloaderUtil:
     @staticmethod
-    def move_params_to_cpu(module):
-        pin_memory = is_pin_memory_available()
-        for name, param in module.named_parameters():
-            # print(f"move_params_to_cpu {name=} {param.nbytes=}")
-            cpu_data = _empty_strided_like(
-                param.data,
-                device="cpu",
-                pin_memory=pin_memory,
-            )
-            cpu_data.copy_(param.data)
-            param.data = cpu_data
+    def move_param_to_cpu(param):
+        cpu_data = _empty_strided_like(
+            param.data,
+            device="cpu",
+            pin_memory=is_pin_memory_available(),
+        )
+        cpu_data.copy_(param.data)
+        param.data = cpu_data
 
     @staticmethod
     def move_params_to_meta(module):
