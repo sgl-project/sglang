@@ -6,11 +6,11 @@ import triton
 import triton.language as tl
 from sgl_kernel import moe_fused_gate
 
-from sglang.srt.layers.moe.topk import biased_grouped_topk
+from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
 
 
 def biased_grouped_topk_org(scores, bias, num_expert_group, topk_group, topk):
-    return biased_grouped_topk(
+    return biased_grouped_topk_impl(
         scores,
         scores,
         bias,
