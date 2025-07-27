@@ -26,7 +26,6 @@ limitations under the License.
 #define VEC_SIZE 4
 using Vec = int4;
 
-
 template <typename scalar_t>
 __global__ void count_and_sort_expert_tokens_kernel(
     const scalar_t* __restrict__ topk_ids,
