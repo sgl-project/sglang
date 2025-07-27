@@ -284,10 +284,8 @@ def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tens
     self_rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    object_list = [None] * world_size
-    dist.all_gather_object(
-        object_list,
-        obj=dict(
+    object_list = NaiveDistributed.instance.all_gather_object(
+        dict(
             dup_serialized_local_tensor=[
                 None
                 if interesting_rank == self_rank
