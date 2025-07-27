@@ -48,8 +48,8 @@ logger = setup_logger()
 class LBArgs:
     host: str = "0.0.0.0"
     port: int = 8000
-    prefill_infos: list = dataclasses.field(default_factory=list)
-    decode_infos: list = dataclasses.field(default_factory=list)
+    prefill_infos: List[Tuple[str, Optional[int]]] = dataclasses.field(default_factory=list)
+    decode_infos: List[str] = dataclasses.field(default_factory=list)
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
