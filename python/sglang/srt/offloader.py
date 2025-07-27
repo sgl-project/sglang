@@ -199,6 +199,9 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         self.sharded_param_handle = None
 
     def post_init(self):
+        # check again since it may be changed
+        assert self._param.data.is_contiguous(), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
+
         scatter_list = self._param.data.chunk(self._world_size)
 
         sharded_param = symm_mem.empty(size=scatter_list[0].shape, dtype=scatter_list[0].dtype, device="cuda")
