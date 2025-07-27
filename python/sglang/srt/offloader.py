@@ -1,4 +1,3 @@
-import torch.distributed as dist
 import logging
 import os
 from abc import ABC
@@ -8,8 +7,8 @@ import torch
 from torch.func import functional_call
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 from sglang.srt.layers.parameter import ModelWeightParameter
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import get_int_env_var, is_pin_memory_available, MultiprocessingSerializer
 
 logger = logging.getLogger(__name__)
@@ -191,8 +190,8 @@ class _CpuParamOffloader(_BaseParamOffloader):
 class _ShardedGpuParamOffloader(_BaseParamOffloader):
     def __init__(self, module, param_name):
         super().__init__(module, param_name)
-        self._rank = dist.get_rank()
-        self._world_size = dist.get_world_size()
+        self._rank = global_server_args_dict["dp_rank"]
+        self._world_size = global_server_args_dict["dp_size"]
         logger.info(f"hi {self._rank=} {self._world_size=}")
 
         assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"

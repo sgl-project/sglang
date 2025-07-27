@@ -350,6 +350,10 @@ class Scheduler(
             nccl_port=port_args.nccl_port,
         )
 
+        # TODO hack
+        global_server_args_dict["dp_rank"] = dp_rank
+        global_server_args_dict["dp_size"] = self.server_args.dp_size
+
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
