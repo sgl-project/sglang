@@ -17,11 +17,11 @@ class ModuleOffloader:
         all_modules_generator: Generator[torch.nn.Module, None, None],
         submodule_accessor: Callable[[torch.nn.Module], torch.nn.Module],
     ):
-        module_interval = os.environ.get("SGLANG_OFFLOAD_MODULE_INTERVAL", "0")
-        if module_interval < 0:
+        group_size, num_offload_in_group = _parse_config()
+        if group_size is None:
             return list(all_modules_generator)
 
-        logger.info(f"offload_module module_interval={module_interval}")
+        logger.info(f"offload_module {group_size=} {num_offload_in_group=}")
 
         alt_stream = torch.cuda.Stream()
 
@@ -57,7 +57,7 @@ def _parse_config():
     # TODO rename env var
     raw = os.environ.get("SGLANG_OFFLOAD_MODULE_INTERVAL")
     if raw is None:
-        return None
+        return None, None
 
     if "/" not in raw:
         raw = f"{raw}/1"
