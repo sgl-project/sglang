@@ -15,10 +15,8 @@
 from __future__ import annotations
 
 import math
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Iterator, NamedTuple, Optional, Tuple
+from typing import Callable, NamedTuple, Optional, Protocol, runtime_checkable
 
 import torch
 import torch.nn.functional as F
@@ -82,14 +80,14 @@ class TopKOutputFormat(Enum):
         return self == TopKOutputFormat.TRITON_KERNEL
 
 
-class TopKOutput(ABC):
-    """Base class for top-k outputs in different formats."""
+@runtime_checkable
+class TopKOutput(Protocol):
+    """Protocol for top-k outputs in different formats."""
 
     @property
-    @abstractmethod
     def format(self) -> TopKOutputFormat:
         """The format of the output."""
-        pass
+        ...
 
 
 class StandardTopKOutput(NamedTuple):
@@ -114,10 +112,6 @@ class TritonKernelTopKOutput(NamedTuple):
     @property
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.TRITON_KERNEL
-
-
-TopKOutput.register(StandardTopKOutput)
-TopKOutput.register(TritonKernelTopKOutput)
 
 
 # -------------------------------- TopK ---------------------------------------
