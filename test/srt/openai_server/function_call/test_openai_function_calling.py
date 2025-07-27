@@ -16,6 +16,20 @@ from sglang.test.test_utils import (
 
 
 class TestOpenAIServerFunctionCalling(CustomTestCase):
+    # NOTE: this system_message is for Llama3.2 system prompt. Without this,
+    # sometimes Llama3.2 gives a different tool call format such as:
+    # '<|python_tag|>{"type": "function", "function": "add", "parameters": {"a": "3", "b": "5"}}'
+    SYSTEM_MESSAGE = (
+        "You are a helpful assistant with tool calling capabilities. "
+        "Only reply with a tool call if the function exists in the library provided by the user. "
+        "If it doesn't exist, just reply directly in natural language. "
+        "When you receive a tool call response, use the output to format an answer to the original user question. "
+        "You have access to the following functions. "
+        "To call a function, please respond with JSON for a function call. "
+        'Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}. '
+        "Do not use variables.\n\n"
+    )
+
     @classmethod
     def setUpClass(cls):
         # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -73,7 +87,10 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             }
         ]
 
-        messages = [{"role": "user", "content": "Compute (3+5)"}]
+        messages = [
+            {"role": "system", "content": self.SYSTEM_MESSAGE},
+            {"role": "user", "content": "Compute (3+5)"},
+        ]
         response = client.chat.completions.create(
             model=self.model,
             max_tokens=2048,
@@ -205,7 +222,8 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         ]
 
         messages = [
-            {"role": "user", "content": "What is the temperature in Paris in celsius?"}
+            {"role": "system", "content": self.SYSTEM_MESSAGE},
+            {"role": "user", "content": "What is the temperature in Paris?"},
         ]
 
         response_stream = client.chat.completions.create(
@@ -350,7 +368,8 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         ]
 
         messages = [
-            {"role": "user", "content": "Please sum 5 and 7, just call the function."}
+            {"role": "system", "content": self.SYSTEM_MESSAGE},
+            {"role": "user", "content": "Please sum 5 and 7, just call the function."},
         ]
 
         response_stream = client.chat.completions.create(
@@ -617,144 +636,6 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         )
         self.assertIn("city", args_obj, "Function arguments should have 'city'")
 
-
-class TestOpenAIPythonicFunctionCalling(CustomTestCase):
-    PYTHONIC_TOOLS = [
-        {
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "description": "Get the current weather for a given location.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "location": {
-                            "type": "string",
-                            "description": "The name of the city or location.",
-                        }
-                    },
-                    "required": ["location"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_tourist_attractions",
-                "description": "Get a list of top tourist attractions for a given city.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "city": {
-                            "type": "string",
-                            "description": "The name of the city to find attractions for.",
-                        }
-                    },
-                    "required": ["city"],
-                },
-            },
-        },
-    ]
-
-    PYTHONIC_MESSAGES = [
-        {
-            "role": "system",
-            "content": (
-                "You are a travel assistant. "
-                "When asked to call functions, ALWAYS respond ONLY with a python list of function calls, "
-                "using this format: [func_name1(param1=value1, param2=value2), func_name2(param=value)]. "
-                "Do NOT use JSON, do NOT use variables, do NOT use any other format. "
-                "Here is an example:\n"
-                '[get_weather(location="Paris"), get_tourist_attractions(city="Paris")]'
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "I'm planning a trip to Tokyo next week. What's the weather like and what are some top tourist attractions? "
-                "Propose parallel tool calls at once, using the python list of function calls format as shown above."
-            ),
-        },
-    ]
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=[
-                "--tool-call-parser",
-                "pythonic",
-            ],
-        )
-        cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(cls.model)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_pythonic_tool_call_prompt(self):
-        """
-        Test: Explicit prompt for pythonic tool call format without chat template.
-        """
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        response = client.chat.completions.create(
-            model=self.model,
-            max_tokens=2048,
-            messages=self.PYTHONIC_MESSAGES,
-            tools=self.PYTHONIC_TOOLS,
-            temperature=0.1,
-            stream=False,
-        )
-        tool_calls = response.choices[0].message.tool_calls
-        self.assertIsInstance(tool_calls, list, "No tool_calls found")
-        self.assertGreaterEqual(len(tool_calls), 1)
-        names = [tc.function.name for tc in tool_calls]
-        self.assertTrue(
-            "get_weather" in names or "get_tourist_attractions" in names,
-            f"Function name '{names}' should container either 'get_weather' or 'get_tourist_attractions'",
-        )
-
-    def test_pythonic_tool_call_streaming(self):
-        """
-        Test: Streaming pythonic tool call format; assert tool_call index is present.
-        """
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        response_stream = client.chat.completions.create(
-            model=self.model,
-            max_tokens=2048,
-            messages=self.PYTHONIC_MESSAGES,
-            tools=self.PYTHONIC_TOOLS,
-            temperature=0.1,
-            stream=True,
-        )
-        found_tool_calls = False
-        found_index = False
-        found_names = set()
-        for chunk in response_stream:
-            choice = chunk.choices[0]
-            if getattr(choice.delta, "tool_calls", None):
-                found_tool_calls = True
-                tool_call = choice.delta.tool_calls[0]
-                if hasattr(tool_call, "index") or (
-                    isinstance(tool_call, dict) and "index" in tool_call
-                ):
-                    found_index = True
-                found_names.add(str(tool_call.function.name))
-
-        self.assertTrue(found_tool_calls, "No tool_calls found in streaming response")
-        self.assertTrue(found_index, "No index field found in any streamed tool_call")
-        self.assertTrue(
-            "get_weather" in found_names or "get_tourist_attractions" in found_names,
-            f"Function name '{found_names}' should container either 'get_weather' or 'get_tourist_attractions'",
-        )
-
     def test_streaming_multiple_choices_finish_reason(self):
         """
         Test: Verify that each choice gets its own finish_reason chunk in streaming mode with n > 1.
@@ -891,6 +772,142 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
                 ["stop", "length"],  # Could be either depending on how model responds
                 f"Expected finish_reason 'stop' or 'length' for index {index}, got {reasons[-1]}",
             )
+
+
+class TestOpenAIPythonicFunctionCalling(CustomTestCase):
+    PYTHONIC_TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the current weather for a given location.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "The name of the city or location.",
+                        }
+                    },
+                    "required": ["location"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_tourist_attractions",
+                "description": "Get a list of top tourist attractions for a given city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {
+                            "type": "string",
+                            "description": "The name of the city to find attractions for.",
+                        }
+                    },
+                    "required": ["city"],
+                },
+            },
+        },
+    ]
+
+    PYTHONIC_MESSAGES = [
+        {
+            "role": "system",
+            "content": (
+                "You are a travel assistant. "
+                "When asked to call functions, ALWAYS respond ONLY with a python list of function calls, "
+                "using this format: [func_name1(param1=value1, param2=value2), func_name2(param=value)]. "
+                "Do NOT use JSON, do NOT use variables, do NOT use any other format. "
+                "Here is an example:\n"
+                '[get_weather(location="Paris"), get_tourist_attractions(city="Paris")]'
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "I'm planning a trip to Tokyo next week. What's the weather like and what are some top tourist attractions? "
+                "Propose parallel tool calls at once, using the python list of function calls format as shown above."
+            ),
+        },
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--tool-call-parser",
+                "pythonic",
+            ],
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_pythonic_tool_call_prompt(self):
+        """
+        Test: Explicit prompt for pythonic tool call format without chat template.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=self.PYTHONIC_MESSAGES,
+            tools=self.PYTHONIC_TOOLS,
+            temperature=0.1,
+            stream=False,
+        )
+        tool_calls = response.choices[0].message.tool_calls
+        self.assertIsInstance(tool_calls, list, "No tool_calls found")
+        self.assertGreaterEqual(len(tool_calls), 1)
+        names = [tc.function.name for tc in tool_calls]
+        self.assertTrue(
+            "get_weather" in names or "get_tourist_attractions" in names,
+            f"Function name '{names}' should container either 'get_weather' or 'get_tourist_attractions'",
+        )
+
+    def test_pythonic_tool_call_streaming(self):
+        """
+        Test: Streaming pythonic tool call format; assert tool_call index is present.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response_stream = client.chat.completions.create(
+            model=self.model,
+            messages=self.PYTHONIC_MESSAGES,
+            tools=self.PYTHONIC_TOOLS,
+            temperature=0.1,
+            stream=True,
+        )
+        found_tool_calls = False
+        found_index = False
+        found_names = set()
+        for chunk in response_stream:
+            choice = chunk.choices[0]
+            if getattr(choice.delta, "tool_calls", None):
+                found_tool_calls = True
+                tool_call = choice.delta.tool_calls[0]
+                if hasattr(tool_call, "index") or (
+                    isinstance(tool_call, dict) and "index" in tool_call
+                ):
+                    found_index = True
+                found_names.add(str(tool_call.function.name))
+
+        self.assertTrue(found_tool_calls, "No tool_calls found in streaming response")
+        self.assertTrue(found_index, "No index field found in any streamed tool_call")
+        self.assertTrue(
+            "get_weather" in found_names or "get_tourist_attractions" in found_names,
+            f"Function name '{found_names}' should container either 'get_weather' or 'get_tourist_attractions'",
+        )
 
 
 if __name__ == "__main__":
