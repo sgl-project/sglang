@@ -41,6 +41,8 @@ impl ConfigValidator {
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
+                prefill_policy,
+                decode_policy,
             } => {
                 // Only require URLs if service discovery is disabled
                 if !has_service_discovery {
@@ -77,6 +79,14 @@ impl ConfigValidator {
                             });
                         }
                     }
+                }
+
+                // Validate optional prefill and decode policies
+                if let Some(p_policy) = prefill_policy {
+                    Self::validate_policy(p_policy)?;
+                }
+                if let Some(d_policy) = decode_policy {
+                    Self::validate_policy(d_policy)?;
                 }
             }
         }
@@ -272,6 +282,35 @@ impl ConfigValidator {
                     });
                 }
             }
+
+            // For PD mode, validate that policies have sufficient workers
+            if let RoutingMode::PrefillDecode {
+                prefill_urls,
+                decode_urls,
+                prefill_policy,
+                decode_policy,
+            } = &config.mode
+            {
+                // Check power-of-two for prefill
+                if let Some(PolicyConfig::PowerOfTwo { .. }) = prefill_policy {
+                    if prefill_urls.len() < 2 {
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason: "Power-of-two policy for prefill requires at least 2 prefill workers".to_string(),
+                        });
+                    }
+                }
+
+                // Check power-of-two for decode
+                if let Some(PolicyConfig::PowerOfTwo { .. }) = decode_policy {
+                    if decode_urls.len() < 2 {
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason:
+                                "Power-of-two policy for decode requires at least 2 decode workers"
+                                    .to_string(),
+                        });
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -430,6 +469,8 @@ mod tests {
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), Some(8081))],
                 decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
             },
             PolicyConfig::Random,
         );
@@ -444,6 +485,8 @@ mod tests {
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
             },
             PolicyConfig::RoundRobin,
         );
@@ -459,6 +502,8 @@ mod tests {
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
             },
             PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
@@ -490,5 +535,61 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_pd_mode_with_separate_policies() {
+        // Test PD mode with different policies for prefill and decode
+        let config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![
+                    ("http://prefill1:8000".to_string(), None),
+                    ("http://prefill2:8000".to_string(), None),
+                ],
+                decode_urls: vec![
+                    "http://decode1:8000".to_string(),
+                    "http://decode2:8000".to_string(),
+                ],
+                prefill_policy: Some(PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                }),
+                decode_policy: Some(PolicyConfig::PowerOfTwo {
+                    load_check_interval_secs: 60,
+                }),
+            },
+            PolicyConfig::Random, // Main policy as fallback
+        );
+
+        let result = ConfigValidator::validate(&config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_pd_mode_power_of_two_insufficient_workers() {
+        // Test that power-of-two policy requires at least 2 workers
+        let config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://prefill1:8000".to_string(), None)], // Only 1 prefill
+                decode_urls: vec![
+                    "http://decode1:8000".to_string(),
+                    "http://decode2:8000".to_string(),
+                ],
+                prefill_policy: Some(PolicyConfig::PowerOfTwo {
+                    load_check_interval_secs: 60,
+                }), // Requires 2+ workers
+                decode_policy: None,
+            },
+            PolicyConfig::Random,
+        );
+
+        let result = ConfigValidator::validate(&config);
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e.to_string().contains("prefill requires at least 2"));
+        }
     }
 }
