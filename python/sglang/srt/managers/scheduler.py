@@ -343,7 +343,10 @@ class Scheduler(
             )[0]
 
         # Check whether overlap can be enabled
-        if not self.is_generation or self.server_args.disaggregation_mode == "embedding":
+        if (
+            not self.is_generation
+            or self.server_args.disaggregation_mode == "embedding"
+        ):
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
 
@@ -565,7 +568,10 @@ class Scheduler(
         server_args = self.server_args
 
         self.model_config = ModelConfig.from_server_args(server_args)
-        self.is_generation = self.model_config.is_generation and self.server_args.disaggregation_mode != "embedding"
+        self.is_generation = (
+            self.model_config.is_generation
+            and self.server_args.disaggregation_mode != "embedding"
+        )
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -805,15 +811,16 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
         elif self.disaggregation_mode == DisaggregationMode.EMBEDDING:
-            buffer_size = int(os.environ.get("SGLANG_EMBEDDING_BUFFER_SIZE", "16"))
+            buffer_size = self.max_running_requests
+            # buffer_size = int(os.environ.get("SGLANG_EMBEDDING_BUFFER_SIZE", "16"))
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
             logger.debug(
-                f"init MultimodalDataBuffers: {buffer_size=};{self.max_prefill_tokens=};{self.model_config.hidden_size=}"
+                f"init MultimodalDataBuffers: {buffer_size=};{self.max_req_len=};{self.model_config.hidden_size=}"
             )
             self.disagg_metadata_buffers = MultimodalDataBuffers(
-                buffer_size, self.max_prefill_tokens, self.model_config.hidden_size
+                buffer_size, self.max_req_len, self.model_config.hidden_size
             )
             self.disagg_embedding_bootstrap_queue = MultimodalEmbeddingBootstrapQueue(
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
@@ -827,15 +834,16 @@ class Scheduler(
             )
             self.disagg_embedding_inflight_queue: List[Req] = []
         elif self.disaggregation_mode == DisaggregationMode.LANGUAGE:
-            buffer_size = int(os.environ.get("SGLANG_LANGUAGE_BUFFER_SIZE", "16"))
+            buffer_size = self.max_running_requests
+            # buffer_size = int(os.environ.get("SGLANG_LANGUAGE_BUFFER_SIZE", "16"))
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
             logger.debug(
-                f"init MultimodalDataBuffers: {buffer_size=};{self.max_prefill_tokens=};{self.model_config.hidden_size=}"
+                f"init MultimodalDataBuffers: {buffer_size=};{self.max_req_len=};{self.model_config.hidden_size=}"
             )
             self.disagg_metadata_buffers = MultimodalDataBuffers(
-                buffer_size, self.max_prefill_tokens, self.model_config.hidden_size
+                buffer_size, self.max_req_len, self.model_config.hidden_size
             )
             self.disagg_language_transfer_queue = MultimodalLanguageTransferQueue(
                 gloo_group=self.attn_tp_cpu_group,
@@ -3043,7 +3051,7 @@ def run_scheduler_process(
             else:
                 scheduler.event_loop_normal_disagg_decode()
         elif disaggregation_mode == DisaggregationMode.EMBEDDING:
-                scheduler.event_loop_normal_disagg_multimodal_embedding()
+            scheduler.event_loop_normal_disagg_multimodal_embedding()
         elif disaggregation_mode == DisaggregationMode.LANGUAGE:
             if scheduler.enable_overlap:
                 scheduler.event_loop_overlap_disagg_multimodal_language()
