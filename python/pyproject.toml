@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.9.post3"
+version = "0.4.9.post4"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -60,7 +60,7 @@ srt = [
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.7.post1",
+    "flashinfer_python==0.2.9rc1",
 ]
 
 blackwell = [
@@ -71,7 +71,7 @@ blackwell = [
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.7.post1",
+    "flashinfer_python==0.2.9rc1",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
