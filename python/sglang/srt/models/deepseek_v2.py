@@ -2027,7 +2027,8 @@ class DeepseekV2Model(nn.Module):
                     else layer.mlp
                 ),
                 whitelist_param_names_creator=lambda module: (
-                    ["TODO"]
+                    # for simplicity, not offload weight_scale
+                    ['w13_weight', 'w2_weight']
                     if isinstance(module, FusedMoE)
                     else []
                 )
