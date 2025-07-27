@@ -416,6 +416,10 @@ class FusedMoE(torch.nn.Module):
                 f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
             )
 
+        # Flashinfer assumes w31 format for w13_weight. Same for the scales.
+        if getattr(self, "use_flashinfer_trtllm_moe", False):
+            shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
+
         WEIGHT_SCALE_SUPPORTED = [e.value for e in FusedMoeWeightScaleSupported]
         # Fetch the dim to shard the parameter/loaded weight
         # based on the shard id. This will be whatever
