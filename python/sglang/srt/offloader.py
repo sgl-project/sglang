@@ -272,10 +272,3 @@ def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
         device=device,
         pin_memory=pin_memory,
     )
-
-def _create_shared_buffer_tensor(size_in_bytes: int) -> List[torch.Tensor]:
-    pointers = CustomAllreduce.create_shared_buffer(size_in_bytes=size_in_bytes)
-    return [_convert_pointer_to_tensor(pointer) for pointer in pointers]
-
-def _convert_pointer_to_tensor(pointer: int) -> torch.Tensor:
-    return TODO
