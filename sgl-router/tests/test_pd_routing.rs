@@ -122,6 +122,8 @@ mod test_pd_routing {
                         "http://decode1:8080".to_string(),
                         "http://decode2:8080".to_string(),
                     ],
+                    prefill_policy: None,
+                    decode_policy: None,
                 },
                 PolicyConfig::Random,
             ),
@@ -129,6 +131,8 @@ mod test_pd_routing {
                 RoutingMode::PrefillDecode {
                     prefill_urls: vec![("http://prefill:8080".to_string(), Some(9000))],
                     decode_urls: vec!["http://decode:8080".to_string()],
+                    prefill_policy: None,
+                    decode_policy: None,
                 },
                 PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5,
@@ -142,6 +146,8 @@ mod test_pd_routing {
                         ("http://p3:8080".to_string(), Some(9002)),
                     ],
                     decode_urls: vec!["http://d1:8080".to_string(), "http://d2:8080".to_string()],
+                    prefill_policy: None,
+                    decode_policy: None,
                 },
                 PolicyConfig::CacheAware {
                     cache_threshold: 0.7,

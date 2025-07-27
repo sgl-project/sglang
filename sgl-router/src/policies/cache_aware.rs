@@ -254,7 +254,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         decode_workers: &[Box<dyn Worker>],
         request_text: Option<&str>,
     ) -> Option<(usize, usize)> {
-        // In PD mode:
+        // DEPRECATED: This method is no longer used when separate policies are configured.
+        // The PD router now uses separate policies for prefill and decode selection.
+        // This implementation remains for backward compatibility when a single policy is used.
+
+        // In PD mode with single policy:
         // - Prefill: Use cache-aware routing for better cache utilization
         // - Decode: Use least-load routing for better load distribution
 
