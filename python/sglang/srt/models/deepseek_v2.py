@@ -87,6 +87,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.offloader import ModuleOffloader
 from sglang.srt.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
     model_forward_maybe_tbo,
@@ -1995,6 +1996,7 @@ class DeepseekV2Model(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        module_offloader=None,
     ) -> None:
         super().__init__()
         self.padding_id = config.pad_token_id
@@ -2008,16 +2010,23 @@ class DeepseekV2Model(nn.Module):
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
-            [
-                DeepseekV2DecoderLayer(
-                    config,
-                    layer_id,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{layer_id}", prefix),
-                    alt_stream=self.alt_stream,
-                )
-                for layer_id in range(config.num_hidden_layers)
-            ]
+            module_offloader.offload_modules(
+                (
+                    DeepseekV2DecoderLayer(
+                        config,
+                        layer_id,
+                        quant_config=quant_config,
+                        prefix=add_prefix(f"layers.{layer_id}", prefix),
+                        alt_stream=self.alt_stream,
+                    )
+                    for layer_id in range(config.num_hidden_layers)
+                ),
+                submodule_accessor=lambda layer: (
+                    layer.mlp.experts
+                    if isinstance(layer.mlp, DeepseekV2MoE)
+                    else layer.mlp
+                ),
+            )
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -2093,8 +2102,12 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
+        self.module_offloader = ModuleOffloader()
         self.model = DeepseekV2Model(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            module_offloader=self.module_offloader,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -2340,6 +2353,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             and self.quant_config.weight_block_size is not None
         ):
             self._weight_requant_ue8m0(is_nextn)
+
+        self.module_offloader.on_post_load()
 
     def _weight_requant_ue8m0(self, is_nextn=False):
         weight_block_size = self.quant_config.weight_block_size
