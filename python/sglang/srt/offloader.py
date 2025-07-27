@@ -173,6 +173,15 @@ class _ShardedGpuModuleOffloader(_BaseModuleOffloader):
         else:
             _StatelessOffloaderUtil.move_params_to_meta(module)
 
+    def start_onload(self):
+        TODO
+
+    def offload(self):
+        TODO
+
+    def wait_and_get_device_tensors(self):
+        TODO
+
 
 
 class _StatelessOffloaderUtil:
