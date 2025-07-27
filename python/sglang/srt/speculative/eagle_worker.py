@@ -971,12 +971,7 @@ class EAGLEWorker(TpModelWorker):
 
     def _post_process_draft_probs(self, probs: torch.Tensor) -> torch.Tensor:
         """Redistribute the probability mass of cold tokens."""
-        if (
-            not hasattr(self, "num_cold_tokens")
-            or self.num_cold_tokens == 0
-            or not hasattr(self, "weaker_drafter")
-            or self.weaker_drafter is None
-        ):
+        if getattr(self, "num_cold_tokens", 0) == 0 or self.weaker_drafter is None:
             return probs
 
         # Note: The last entry of the probs lower bounds the accumulated probability of cold tokens
