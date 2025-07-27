@@ -43,9 +43,9 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
-_is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
@@ -68,35 +68,6 @@ def npu_wrapper_rmsnorm_init(func):
         self.bias = torch.nn.Parameter(torch.zeros(hidden_size), requires_grad=False)
 
     return init
-
-
-# func refers to RMSNorm.forward_oot
-def npu_wrapper_rmsnorm_forward(func):
-    def _rmsnorm_forward_oot(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if not x.is_contiguous():
-            x = x.contiguous()
-        original_dtype = x.dtype
-        x = x.to(torch.float32)
-        if residual is not None:
-            x = x + residual.to(torch.float32)
-            residual = x.to(original_dtype)
-
-        x = (
-            torch_npu.npu_rms_norm(
-                x, self.weight.to(torch.float32), self.variance_epsilon
-            )[0]
-            + self.bias
-        )
-
-        if residual is None:
-            return x.to(original_dtype)
-        return x.to(original_dtype), residual
-
-    return _rmsnorm_forward_oot
 
 
 def npu_fused_experts(
@@ -175,6 +146,10 @@ def npu_fused_experts(
     return final_hidden_states
 
 
+if _is_npu:
+    import torch_npu
+
+
 class W8A8Int8Config(QuantizationConfig):
     """Config class for W8A8 Int8 Quantization.
 
@@ -185,7 +160,10 @@ class W8A8Int8Config(QuantizationConfig):
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
         self.quant_description = quant_config
-        self.is_dynamic = quant_config.get("is_dynamic", False)
+        self.is_dynamic = (
+            quant_config.get("is_dynamic", False)
+            or quant_config.get("model_quant_type", "STATIC") == "W8A8_DYNAMIC"
+        )
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
         packed_modules_mapping = quant_config.get("packed_modules_mapping", {})
@@ -194,6 +172,8 @@ class W8A8Int8Config(QuantizationConfig):
         )
 
         if _is_npu:
+            if self.is_dynamic:
+                return
             # Ascend w8a8_int8 quantization with bias, use wrappers to isolate the effects between models
             for name in self.quant_description.keys():
                 if "norm.bias" in name:
@@ -201,11 +181,6 @@ class W8A8Int8Config(QuantizationConfig):
                         "sglang.srt.layers.layernorm.RMSNorm",
                         "__init__",
                         [npu_wrapper_rmsnorm_init],
-                    )
-                    apply_module_patch(
-                        "sglang.srt.layers.layernorm.RMSNorm",
-                        "forward_npu",
-                        [npu_wrapper_rmsnorm_forward],
                     )
 
     @classmethod
@@ -315,8 +290,11 @@ class W8A8Int8Config(QuantizationConfig):
 
 class W8A8Int8LinearMethod(LinearMethodBase):
 
-    def __init__(self, quantization_config: W8A8Int8Config):
-        self.quantization_config = quantization_config
+    def __init__(self, quantization_config: W8A8Int8Config = None):
+        if quantization_config is None:
+            self.quantization_config = W8A8Int8Config()
+        else:
+            self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu:
@@ -366,7 +344,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
-        if use_intel_amx_backend(layer):
+        if getattr(layer, "use_intel_amx_backend", False):
             return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
                 x,
                 layer.weight,
@@ -376,11 +354,27 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 True,  # is_vnni
             )
 
-        x_q, x_scale = per_token_quant_int8(x)
-
-        return int8_scaled_mm(
-            x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
-        )
+        if _is_npu:
+            x_q, x_scale = torch_npu.npu_dynamic_quant(x)
+            out = torch_npu.npu_quant_matmul(
+                x_q,
+                layer.weight,
+                layer.weight_scale.view(-1),
+                pertoken_scale=x_scale.view(-1),
+                bias=bias,
+                output_dtype=x.dtype,
+            )
+        else:
+            x_q, x_scale = per_token_quant_int8(x)
+            out = int8_scaled_mm(
+                x_q,
+                layer.weight,
+                x_scale,
+                layer.weight_scale,
+                out_dtype=x.dtype,
+                bias=bias,
+            )
+        return out
 
 
 class W8A8Int8MoEMethod(FusedMoEMethodBase):

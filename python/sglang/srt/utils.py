@@ -197,17 +197,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx", "ascend"]
-
-
-try:
-    import sgl_kernel
-
-    is_intel_amx_backend_available = hasattr(
-        torch.ops.sgl_kernel, "convert_weight_packed"
-    )
-except:
-    is_intel_amx_backend_available = False
+    return backend not in ["torch_native", "intel_amx", "ascend", "npumla"]
 
 
 def cpu_has_amx_support():
@@ -1658,12 +1648,15 @@ def get_compiler_backend() -> str:
         try:
             import torchair
             import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
+            from torchair import patch_for_hcom
             from torchair.configs.compiler_config import CompilerConfig
+
+            patch_for_hcom()
         except ImportError as e:
             raise ImportError(
                 "NPU detected, but torchair package is not installed. "
                 "Please install torchair for torch.compile support on NPU."
-            )
+            ) from e
         compiler_config = CompilerConfig()
         predefined_config = get_npu_compiler_config()
         for k, v in predefined_config.items():
@@ -2491,6 +2484,16 @@ def bind_or_assign(target, source):
         return target
     else:
         return source
+
+
+try:
+    import sgl_kernel
+
+    is_intel_amx_backend_available = hasattr(
+        torch.ops.sgl_kernel, "convert_weight_packed"
+    )
+except:
+    is_intel_amx_backend_available = False
 
 
 def prepack_weight_if_needed(weight):

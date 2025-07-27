@@ -28,10 +28,20 @@ import triton
 import triton.language as tl
 
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
-from sglang.srt.utils import get_bool_env_var, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+_is_npu = is_npu()
+
+
+def floor(a, b):
+    return a // b * b
+
+
+def ceil(a, b):
+    return (a + b - 1) // b * b
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -360,6 +370,84 @@ def alloc_extend_kernel(
     )
 
 
+def alloc_extend_kernel_npu(
+    bs,
+    pre_lens_ptr,
+    seq_lens_ptr,
+    last_loc_ptr,
+    free_page_ptr,
+    out_indices,
+    ret_values,
+    bs_upper,
+    page_size,
+    max_num_extend_tokens,
+):
+    pre_lens_ptr = pre_lens_ptr.flatten()
+    seq_lens_ptr = seq_lens_ptr.flatten()
+    last_loc_ptr = last_loc_ptr.flatten()
+    free_page_ptr = free_page_ptr.flatten()
+
+    for pid in range(bs):
+        seq_lens = seq_lens_ptr[: pid + 1]
+        pre_lens = pre_lens_ptr[: pid + 1]
+        extend_lens = seq_lens - pre_lens
+
+        seq_len = seq_lens_ptr[pid]
+        pre_len = pre_lens_ptr[pid]
+        extend_len = seq_len - pre_len
+
+        sum_extend_lens = extend_lens.sum()
+        output_start_loc = sum_extend_lens - extend_len
+
+        num_pages_after = (seq_lens + page_size - 1) // page_size
+        num_pages_before = (pre_lens + page_size - 1) // page_size
+        num_new_pages = num_pages_after - num_pages_before
+
+        num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
+            pre_len + page_size - 1
+        ) // page_size
+        sum_num_new_pages = num_new_pages.sum()
+        new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
+
+        # Return value
+        if pid == bs - 1:
+            merged_value = (
+                sum_num_new_pages.to(torch.int64)
+            ) << 32 | sum_extend_lens.to(torch.int64)
+            ret_values[:] = merged_value
+
+        # Part 1: fill the old partial page
+        last_loc = last_loc_ptr[pid]
+        num_part1 = min(seq_len, ceil(pre_len, page_size)) - pre_len
+        num_part1_ = min(num_part1, page_size)
+
+        out_indices[output_start_loc : output_start_loc + num_part1_] = (
+            last_loc + 1 + torch.arange(num_part1_).to(out_indices.device)
+        )
+        if pre_len + num_part1 == seq_len:
+            return
+
+        # Part 2: fill the new full pages
+        num_part2 = floor(seq_len, page_size) - ceil(pre_len, page_size)
+        num_part2_ = min(num_part2, max_num_extend_tokens)
+        offset_many_page = torch.arange(0, num_part2_).to(out_indices.device)
+        page_start = free_page_ptr[new_page_start_loc + offset_many_page // page_size]
+        out_indices[output_start_loc + num_part1 + offset_many_page] = (
+            page_start * page_size + offset_many_page % page_size
+        )
+        if pre_len + num_part1 + num_part2 == seq_len:
+            return
+
+        # Part 3: fill the new partial page
+        num_part3 = seq_len - floor(seq_len, page_size)
+        num_part3_ = min(num_part3, page_size)
+        start_loc = free_page_ptr[new_page_start_loc + num_page_start_loc_self - 1]
+        offset = output_start_loc + num_part1 + num_part2
+        out_indices[offset : offset + num_part3_] = (
+            start_loc * page_size + torch.arange(0, num_part3_).to(out_indices.device)
+        )
+
+
 @triton.jit
 def alloc_decode_kernel(
     seq_lens_ptr,
@@ -401,6 +489,48 @@ def alloc_decode_kernel(
         tl.store(out_indices + pid, page * page_size)
 
 
+def alloc_decode_kernel_npu(
+    bs,
+    seq_lens_ptr,
+    last_loc_ptr,
+    free_page_ptr,
+    out_indices,
+    ret_values,
+    bs_upper,
+    page_size,
+):
+    seq_lens_ptr = seq_lens_ptr.flatten()
+    last_loc_ptr = last_loc_ptr.flatten()
+    free_page_ptr = free_page_ptr.flatten()
+    for pid in range(bs):
+        seq_lens = seq_lens_ptr[: pid + 1]
+        pre_lens = seq_lens - 1
+
+        seq_len = seq_lens_ptr[pid]
+        pre_len = seq_len - 1
+
+        num_pages_after = (seq_lens + page_size - 1) // page_size
+        num_pages_before = (pre_lens + page_size - 1) // page_size
+        num_new_pages = num_pages_after - num_pages_before
+
+        num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
+            pre_len + page_size - 1
+        ) // page_size
+        sum_num_new_pages = num_new_pages.sum()
+        new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
+
+        # Return value
+        if pid == bs - 1:
+            ret_values[:] = sum_num_new_pages
+
+        if num_page_start_loc_self == 0:
+            last_loc = last_loc_ptr[pid]
+            out_indices[pid] = last_loc + 1
+        else:
+            page = free_page_ptr[new_page_start_loc]
+            out_indices[pid] = page * page_size
+
+
 class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """
     An allocator managing the indices to kv cache data.
@@ -422,7 +552,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
-        self.ret_values = torch.empty((), dtype=torch.int64, device=self.device)
+        self.ret_values = torch.tensor([0], dtype=torch.int64, device=self.device)
         self.clear()
 
     def alloc(self, need_size: int):
@@ -475,17 +605,31 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
-        alloc_extend_kernel[(bs,)](
-            prefix_lens,
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            self.ret_values,
-            next_power_of_2(bs),
-            self.page_size,
-            next_power_of_2(extend_num_tokens),
-        )
+        if _is_npu:
+            alloc_extend_kernel_npu(
+                bs,
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.ret_values,
+                next_power_of_2(bs),
+                self.page_size,
+                next_power_of_2(extend_num_tokens),
+            )
+        else:
+            alloc_extend_kernel[(bs,)](
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.ret_values,
+                next_power_of_2(bs),
+                self.page_size,
+                next_power_of_2(extend_num_tokens),
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
@@ -521,15 +665,27 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         bs = len(seq_lens)
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
-        alloc_decode_kernel[(bs,)](
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            self.ret_values,
-            next_power_of_2(bs),
-            self.page_size,
-        )
+        if _is_npu:
+            alloc_decode_kernel_npu(
+                bs,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.ret_values,
+                next_power_of_2(bs),
+                self.page_size,
+            )
+        else:
+            alloc_decode_kernel[(bs,)](
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.ret_values,
+                next_power_of_2(bs),
+                self.page_size,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)

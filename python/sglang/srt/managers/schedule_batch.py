@@ -64,7 +64,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, support_triton
+from sglang.srt.utils import flatten_nested_list, is_npu, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -1691,14 +1691,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Create seq_lens_cpu when needed
         if (
-            global_server_args_dict["attention_backend"] == "fa3"
+            global_server_args_dict["attention_backend"]
+            in ["fa3", "flashmla", "cutlass_mla", "npumla", "ascend"]
             or (
                 global_server_args_dict["use_mla_backend"]
                 and global_server_args_dict["attention_backend"] == "flashinfer"
             )
-            or global_server_args_dict["attention_backend"] == "flashmla"
-            or global_server_args_dict["attention_backend"] == "cutlass_mla"
-            or global_server_args_dict["attention_backend"] == "ascend"
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
             seq_lens_cpu = (
@@ -1950,7 +1948,7 @@ def get_last_loc(
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
     if (
-        global_server_args_dict["attention_backend"] != "ascend"
+        global_server_args_dict["attention_backend"] not in ["ascend", "npumla"]
         and global_server_args_dict["attention_backend"] != "torch_native"
     ):
         impl = get_last_loc_triton

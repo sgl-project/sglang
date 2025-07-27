@@ -299,6 +299,34 @@ def fused_topk(
     return topk_weights, topk_ids
 
 
+def npu_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    n_routed_experts: int,
+    topk_group: Optional[int] = 0,
+    num_expert_group: Optional[int] = None,
+    routed_scaling_factor: Optional[float] = None,
+):
+    topk_weight, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
+        gating_output,
+        k=topk,
+        bias=torch.zeros(
+            n_routed_experts, device=gating_output.device, dtype=gating_output.dtype
+        ),
+        k_group=topk_group,
+        group_count=num_expert_group,
+        group_select_mode=1,
+        renorm=0,
+        norm_type=1,
+        out_flag=False,
+        routed_scaling_factor=routed_scaling_factor,
+        eps=float(1e-20),
+    )
+    return topk_weight, topk_ids
+
+
 # This is used by the Deepseek V2/V3/R1 series models
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def grouped_topk_gpu(
@@ -605,7 +633,9 @@ def select_experts(
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    n_routed_experts: Optional[int] = None,
 ) -> TopKOutput:
+
     router_logits, correction_bias = (
         expert_location_dispatch.transform_select_experts_inputs(
             router_logits=router_logits,
@@ -667,15 +697,20 @@ def select_experts(
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
     else:
-        assert (
-            num_token_non_padded is None
-        ), "num_token_non_padded is not yet supported in custom_routing_function"
-        assert expert_location_dispatch_info is None
+        if not _is_npu:
+            assert (
+                num_token_non_padded is None
+            ), "num_token_non_padded is not yet supported in custom_routing_function"
+            assert expert_location_dispatch_info is None
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=top_k,
             renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            routed_scaling_factor=routed_scaling_factor,
+            n_routed_experts=n_routed_experts,
         )
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)

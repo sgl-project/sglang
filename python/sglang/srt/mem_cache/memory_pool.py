@@ -44,7 +44,9 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
-if not _is_npu:
+if _is_npu:
+    import torch_npu
+else:
     from sgl_kernel.kvcacheio import transfer_kv_per_layer, transfer_kv_per_layer_mla
 
 
@@ -685,8 +687,6 @@ class AscendTokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        import torch_npu
-
         torch_npu._npu_reshape_and_cache(
             key=cache_k,
             value=cache_v,
@@ -766,6 +766,16 @@ def set_mla_kv_buffer_triton(
     )
 
 
+def set_mla_kv_buffer_npu(
+    kv_buffer: torch.Tensor,
+    loc_tensor: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+):
+    key_states = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
+    torch_npu.npu_scatter_nd_update_(kv_buffer, loc_tensor.view(-1, 1), key_states)
+
+
 class MLATokenToKVPool(KVCache):
     def __init__(
         self,
@@ -814,9 +824,10 @@ class MLATokenToKVPool(KVCache):
                 else nullcontext()
             ):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                size_align = (size + page_size) // 128 * 128
                 self.kv_buffer = [
                     torch.zeros(
-                        (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
+                        (size_align, 1, kv_lora_rank + qk_rope_head_dim),
                         dtype=self.store_dtype,
                         device=device,
                     )
@@ -888,7 +899,14 @@ class MLATokenToKVPool(KVCache):
                 self.store_dtype
             )
         else:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+            if _is_npu and loc.ndim == 1:
+                torch_npu.npu_scatter_nd_update_(
+                    self.kv_buffer[layer_id - self.start_layer],
+                    loc.view(-1, 1),
+                    cache_k,
+                )
+            else:
+                self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
     def set_mla_kv_buffer(
         self,
@@ -905,9 +923,14 @@ class MLATokenToKVPool(KVCache):
             cache_k_nope = cache_k_nope.view(self.store_dtype)
             cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-        set_mla_kv_buffer_triton(
-            self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
-        )
+        if _is_npu:
+            set_mla_kv_buffer_npu(
+                self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
+            )
+        else:
+            set_mla_kv_buffer_triton(
+                self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
+            )
 
     def load_from_host_per_layer(
         self, host_pool, host_indices, device_indices, layer_id, io_backend
@@ -1041,8 +1064,6 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(store_dtype)
-
-        import torch_npu
 
         torch_npu._npu_reshape_and_cache_siso(
             key=cache_k.view(-1, 1, self.kv_lora_rank + self.qk_rope_head_dim),

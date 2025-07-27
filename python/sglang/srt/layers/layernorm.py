@@ -91,12 +91,33 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if residual is not None:
-            out, _, residual_out = torch_npu.npu_add_rms_norm(
-                residual, x, self.weight.data, self.variance_epsilon
+        if hasattr(self, "ignore_anti"):
+            """if w8a8_int8 weights requares adding bias in rmsnorm"""
+            if not x.is_contiguous():
+                x = x.contiguous()
+            original_dtype = x.dtype
+            x = x.to(torch.float32)
+            if residual is not None:
+                x = x + residual.to(torch.float32)
+                residual = x.to(original_dtype)
+
+            x = (
+                torch_npu.npu_rms_norm(
+                    x, self.weight.to(torch.float32), self.variance_epsilon
+                )[0]
+                + self.bias
             )
-            return out, residual_out
-        return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
+
+            if residual is None:
+                return x.to(original_dtype)
+            return x.to(original_dtype), residual
+        else:
+            if residual is not None:
+                out, _, residual_out = torch_npu.npu_add_rms_norm(
+                    residual, x, self.weight.data, self.variance_epsilon
+                )
+                return out, residual_out
+            return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
 
     def forward_aiter(
         self,

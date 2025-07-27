@@ -33,6 +33,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_npu,
     log_info_on_rank0,
     supports_custom_op,
 )
@@ -40,6 +41,7 @@ from sglang.srt.utils import (
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
@@ -1294,7 +1296,7 @@ def _per_token_group_quant_fp8_hopper_moe_mn_major(
         tl.store(sfa_ptrs, inp_amax / 448.0, mask=coord_m < m)
 
 
-if not _is_cpu:
+if not (_is_cpu or _is_npu):
     _per_token_group_quant_fp8_hopper_moe_mn_major = fp8_autotune(
         _per_token_group_quant_fp8_hopper_moe_mn_major
     )
