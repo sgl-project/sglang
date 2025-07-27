@@ -517,7 +517,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     if finish_reason_type is not None and index in parser_dict:
                         parser = parser_dict[index]
                         remaining_chunk = self._check_for_unstreamed_tool_args(
-                            parser, content, request, finish_reason_type, index
+                            parser, content, request, index
                         )
                         if remaining_chunk:
                             yield remaining_chunk
@@ -842,79 +842,6 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
 
-    def _check_for_unstreamed_tool_args(
-        self,
-        parser: FunctionCallParser,
-        content: Dict[str, Any],
-        request: ChatCompletionRequest,
-        finish_reason_type: str,
-        index: int,
-    ) -> Optional[str]:
-        """
-        Check for any remaining tool call arguments that need to be streamed
-        when generation finishes. This ensures tool calls are properly completed
-        even if the model generates the final arguments in the last chunk.
-        """
-        # Only check if we have tool calls and the parser has tracked data
-        if (
-            not hasattr(parser.detector, "prev_tool_call_arr")
-            or not parser.detector.prev_tool_call_arr
-        ):
-            return None
-
-        if (
-            not hasattr(parser.detector, "streamed_args_for_tool")
-            or not parser.detector.streamed_args_for_tool
-        ):
-            return None
-
-        # Get the last tool call that was being processed
-        tool_index = len(parser.detector.prev_tool_call_arr) - 1
-        if tool_index < 0 or tool_index >= len(parser.detector.streamed_args_for_tool):
-            return None
-
-        # Get expected vs actual arguments
-        expected_args = parser.detector.prev_tool_call_arr[tool_index].get(
-            "arguments", {}
-        )
-        expected_call = json.dumps(expected_args, ensure_ascii=False)
-        actual_call = parser.detector.streamed_args_for_tool[tool_index]
-
-        # Check if there are remaining arguments to send
-        remaining_call = (
-            expected_call.replace(actual_call, "", 1)
-            if actual_call in expected_call
-            else ""
-        )
-
-        if remaining_call:
-            # Create tool call chunk with remaining arguments
-            tool_call = ToolCall(
-                id=None,  # No ID for argument deltas
-                index=tool_index,
-                function=FunctionResponse(
-                    name=None,  # No name for argument deltas
-                    arguments=remaining_call,
-                ),
-            )
-
-            choice_data = ChatCompletionResponseStreamChoice(
-                index=index,
-                delta=DeltaMessage(tool_calls=[tool_call]),
-                finish_reason=None,  # Don't send finish_reason with this chunk
-            )
-
-            chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
-                created=int(time.time()),
-                choices=[choice_data],
-                model=request.model,
-            )
-
-            return f"data: {chunk.model_dump_json()}\n\n"
-
-        return None
-
     def _get_enable_thinking_from_request(request: ChatCompletionRequest) -> bool:
         """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
 
@@ -1009,3 +936,75 @@ class OpenAIServingChat(OpenAIServingBase):
                 model=request.model,
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
+
+    def _check_for_unstreamed_tool_args(
+        self,
+        parser: FunctionCallParser,
+        content: Dict[str, Any],
+        request: ChatCompletionRequest,
+        index: int,
+    ) -> Optional[str]:
+        """
+        Check for any remaining tool call arguments that need to be streamed
+        when generation finishes. This ensures tool calls are properly completed
+        even if the model generates the final arguments in the last chunk.
+        """
+        # Only check if we have tool calls and the parser has tracked data
+        if (
+            not hasattr(parser.detector, "prev_tool_call_arr")
+            or not parser.detector.prev_tool_call_arr
+        ):
+            return None
+
+        if (
+            not hasattr(parser.detector, "streamed_args_for_tool")
+            or not parser.detector.streamed_args_for_tool
+        ):
+            return None
+
+        # Get the last tool call that was being processed
+        tool_index = len(parser.detector.prev_tool_call_arr) - 1
+        if tool_index < 0 or tool_index >= len(parser.detector.streamed_args_for_tool):
+            return None
+
+        # Get expected vs actual arguments
+        expected_args = parser.detector.prev_tool_call_arr[tool_index].get(
+            "arguments", {}
+        )
+        expected_call = json.dumps(expected_args, ensure_ascii=False)
+        actual_call = parser.detector.streamed_args_for_tool[tool_index]
+
+        # Check if there are remaining arguments to send
+        remaining_call = (
+            expected_call.replace(actual_call, "", 1)
+            if actual_call in expected_call
+            else ""
+        )
+
+        if remaining_call:
+            # Create tool call chunk with remaining arguments
+            tool_call = ToolCall(
+                id=None,  # No ID for argument deltas
+                index=tool_index,
+                function=FunctionResponse(
+                    name=None,  # No name for argument deltas
+                    arguments=remaining_call,
+                ),
+            )
+
+            choice_data = ChatCompletionResponseStreamChoice(
+                index=index,
+                delta=DeltaMessage(tool_calls=[tool_call]),
+                finish_reason=None,  # Don't send finish_reason with this chunk
+            )
+
+            chunk = ChatCompletionStreamResponse(
+                id=content["meta_info"]["id"],
+                created=int(time.time()),
+                choices=[choice_data],
+                model=request.model,
+            )
+
+            return f"data: {chunk.model_dump_json()}\n\n"
+
+        return None
