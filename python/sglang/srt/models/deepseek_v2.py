@@ -596,7 +596,8 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 topk_output=TopKOutput(
-                    topk_ids=topk_idx + self.experts.local_num_experts * self.experts.ep_rank,
+                    topk_ids=topk_idx
+                    + self.experts.local_num_experts * self.experts.ep_rank,
                     topk_weights=topk_weights,
                     router_logits=None,
                 ),
