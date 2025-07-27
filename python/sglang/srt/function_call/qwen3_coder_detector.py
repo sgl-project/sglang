@@ -9,7 +9,6 @@ from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
-    StructureInfo,
     ToolCallItem,
     _GetInfoFunc,
 )
@@ -29,7 +28,7 @@ def _safe_val(raw: str) -> Any:
             return raw
 
 
-class Qwen3XMLDetector(BaseFormatDetector):
+class Qwen3CoderDetector(BaseFormatDetector):
     """
     Detector for Qwen 3 models.
     Assumes function call format:
@@ -127,24 +126,26 @@ class Qwen3XMLDetector(BaseFormatDetector):
                 params[pname] = _safe_val(pval)
             raw = {"name": fname, "arguments": params}
             try:
+                # TODO: fix idx in function call, the index for a function
+                # call will always be -1 in parse_base_json
                 res.extend(self.parse_base_json(raw, tools))
             except Exception:
                 logger.warning("invalid tool call for %s dropped", fname)
         return res
 
-    def structure_info(self) -> _GetInfoFunc:
-        return lambda n: StructureInfo(
-            begin=f"{self.tool_call_start_token}\n<function={n}>",
-            end=f"</function>\n{self.tool_call_end_token}",
-            trigger=self.tool_call_start_token,
-        )
+    def supports_structural_tag(self) -> bool:
+        return False
 
-    # TODO: fake ebnf for xml + outlines backend
+    def structure_info(self) -> _GetInfoFunc:
+        raise NotImplementedError
+
     def build_ebnf(self, tools: List[Tool]):
         return EBNFComposer.build_ebnf(
             tools,
             individual_call_start_token=self.tool_call_start_token.replace("\n", "\\n"),
             individual_call_end_token=self.tool_call_end_token.replace("\n", "\\n"),
             tool_call_separator="\\n",
-            function_format="json",
+            function_format="xml",
+            call_rule_fmt='"<function={name}>\\n" {arguments_rule} "\\n</function>"',
+            key_value_rule_fmt='"<parameter={key}>\\n" {valrule} "\\n</parameter>"',
         )

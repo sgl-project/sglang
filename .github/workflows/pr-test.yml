@@ -174,6 +174,13 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
 
+      - name: Benchmark online latency (LoRA)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency
+          python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency_with_concurrent_adapter_updates
+
   performance-test-1-gpu-part-2:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
