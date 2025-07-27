@@ -185,18 +185,14 @@ class _ShardedGpuModuleOffloader(_BaseModuleOffloader):
 
     def post_init(self):
         for name, param in self.module.named_parameters():
-            sharded_named_param = symm_mem.empty()
-            symm_mem.rendezvous(sharded_named_param, dist.group.WORLD)
+            scatter_list = param.data.chunk(self.world_size)
 
-            if self.rank == 0:
-                scatter_list = param.data.chunk(self.world_size)
-            else:
-                scatter_list = None
-            output_tensor = torch.empty_like(param.data, device="cuda")
-            dist.scatter(output_tensor, scatter_list, src=0)
+            sharded_param = symm_mem.empty(size=scatter_list[0].shape, dtype=scatter_list[0].dtype, device="cuda")
+            handle = symm_mem.rendezvous(sharded_param, dist.group.WORLD)
 
+            dist.scatter(sharded_param, scatter_list if self.rank == 0 else None, src=0)
 
-            self.sharded_named_params[name] = sharded_named_param
+            self.sharded_named_params[name] = sharded_param
 
         _StatelessOffloaderUtil.move_params_to_meta(self.module)
 
