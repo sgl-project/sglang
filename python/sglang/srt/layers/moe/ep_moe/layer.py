@@ -180,9 +180,9 @@ class EPMoE(FusedMoE):
             params_dtype = torch.get_default_dtype()
 
         self.layer_id = layer_id
-        self.num_experts_per_partition, self.expert_map = self.determine_expert_map()
-        self.start_expert_id = self.ep_rank * self.num_experts_per_partition
-        self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1
+        self.num_local_experts, self.expert_map = self.determine_expert_map()
+        self.start_expert_id = self.ep_rank * self.num_local_experts
+        self.end_expert_id = self.start_expert_id + self.num_local_experts - 1
 
         self.intermediate_size = intermediate_size
         self.use_per_token_if_dynamic = use_per_token_if_dynamic
@@ -229,7 +229,7 @@ class EPMoE(FusedMoE):
         self.quant_config = quant_config
         self.quant_method.create_weights(
             layer=self,
-            num_experts=self.num_experts_per_partition,
+            num_experts=self.num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=self.intermediate_size,
             params_dtype=params_dtype,
@@ -267,7 +267,7 @@ class EPMoE(FusedMoE):
         local_num_experts = global_num_experts // ep_size
 
         expert_map = torch.full(
-            (global_num_experts,), self.num_experts, dtype=torch.int32
+            (global_num_experts,), global_num_experts, dtype=torch.int32
         )
         if ep_rank < (ep_size - 1):
             expert_map[
@@ -463,7 +463,7 @@ class EPMoE(FusedMoE):
 
         # TODO: use ep size
         num_experts = (
-            self.num_experts_per_partition * get_tensor_model_parallel_world_size()
+            self.num_local_experts * get_tensor_model_parallel_world_size()
         )
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
@@ -487,7 +487,7 @@ class EPMoE(FusedMoE):
             else:
                 max_value = (
                     torch.max(hidden_states)
-                    .repeat(self.num_experts_per_partition)
+                    .repeat(self.num_local_experts)
                     .to(torch.float32)
                 )
                 self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
@@ -528,7 +528,7 @@ class EPMoE(FusedMoE):
         seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
             0,
-            self.num_experts_per_partition,
+            self.num_local_experts,
             device=hidden_states_device,
             dtype=torch.int64,
         )
@@ -538,7 +538,7 @@ class EPMoE(FusedMoE):
             b=self.w13_weight,
             c=None,
             c_dtype=hidden_states_dtype,
-            batch_size=self.num_experts_per_partition,
+            batch_size=self.num_local_experts,
             weight_column_major=True,
             seg_indptr=seg_indptr_cur_rank,
             weight_indices=weight_indices_cur_rank,
@@ -601,7 +601,7 @@ class EPMoE(FusedMoE):
                 down_input, self.w2_input_scale = sglang_per_token_quant_fp8(down_input)
             else:
                 self.w2_input_scale = torch.ones(
-                    self.num_experts_per_partition,
+                    self.num_local_experts,
                     dtype=torch.float32,
                     device=hidden_states_device,
                 )
@@ -617,7 +617,7 @@ class EPMoE(FusedMoE):
             a=down_input,
             b=self.w2_weight,
             c=down_output,
-            batch_size=self.num_experts_per_partition,
+            batch_size=self.num_local_experts,
             weight_column_major=True,
             seg_indptr=seg_indptr_cur_rank,
             weight_indices=weight_indices_cur_rank,
@@ -783,13 +783,13 @@ class DeepEPMoE(EPMoE):
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
         if _use_aiter:
-            # expert_mask is of size (self.num_experts_per_partition + 1),
+            # expert_mask is of size (self.num_local_experts + 1),
             # the extra 1 is for invalid rank_id (in original deepep, the invalid rank_id is -1, but aiter does not allow -1, we use a mask to make those ids invalid)
             # for instance, if we have 4 experts on this rank, we would have a expert_mask like:
             #     self.expert_mask = [1, 1, 1, 1, 0]
             # idx from 0-3 is valid and will be processed, while idx == 4 will be masked out
             self.expert_mask = torch.zeros(
-                (self.num_experts_per_partition + 1),
+                (self.num_local_experts + 1),
                 device=torch.cuda.current_device(),
                 dtype=torch.int,
             )
@@ -862,13 +862,13 @@ class DeepEPMoE(EPMoE):
         if self.activation_scheme == "dynamic" and not self.use_block_quant:
             max_value = (
                 torch.max(hidden_states)
-                .repeat(self.num_experts_per_partition)
+                .repeat(self.num_local_experts)
                 .to(torch.float32)
             )
             self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
         weight_indices_cur_rank = torch.arange(
             0,
-            self.num_experts_per_partition,
+            self.num_local_experts,
             device=hidden_states.device,
             dtype=torch.int64,
         )
@@ -880,7 +880,7 @@ class DeepEPMoE(EPMoE):
                 b=self.w13_weight,
                 c=None,
                 c_dtype=hidden_states.dtype,
-                batch_size=self.num_experts_per_partition,
+                batch_size=self.num_local_experts,
                 weight_column_major=True,
                 seg_indptr=seg_indptr,
                 weight_indices=weight_indices_cur_rank,
@@ -914,7 +914,7 @@ class DeepEPMoE(EPMoE):
         )
         if self.w2_input_scale is None and not self.use_block_quant:
             self.w2_input_scale = torch.ones(
-                self.num_experts_per_partition,
+                self.num_local_experts,
                 dtype=torch.float32,
                 device=hidden_states_device,
             )
@@ -927,7 +927,7 @@ class DeepEPMoE(EPMoE):
                 reorder_topk_ids,
                 self.w2_input_scale,
                 0,
-                self.num_experts_per_partition - 1,
+                self.num_local_experts - 1,
                 BLOCK_SIZE=512,
             )
         else:
@@ -947,7 +947,7 @@ class DeepEPMoE(EPMoE):
                 a=down_input,
                 b=self.w2_weight,
                 c=down_output,
-                batch_size=self.num_experts_per_partition,
+                batch_size=self.num_local_experts,
                 weight_column_major=True,
                 seg_indptr=seg_indptr,
                 weight_indices=weight_indices_cur_rank,
@@ -972,9 +972,9 @@ class DeepEPMoE(EPMoE):
             return hidden_states
         # in original deepep, idx == -1 meaning invalid and will not be processed.
         # aiter does not accept -1, we use a expert mask to make these idx invalid
-        # (idx == num_experts_per_partition) meaning not used in aiter fused_moe
+        # (idx == num_local_experts) meaning not used in aiter fused_moe
         topk_idx_copy = topk_idx.to(torch.int32)
-        topk_idx_copy[topk_idx_copy == -1] = self.num_experts_per_partition
+        topk_idx_copy[topk_idx_copy == -1] = self.num_local_experts
 
         return fused_moe(
             hidden_states,

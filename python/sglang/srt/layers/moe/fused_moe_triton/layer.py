@@ -108,16 +108,16 @@ class FusedMoE(torch.nn.Module):
             self.expert_map = torch.full((self.num_experts,), -1, dtype=torch.int32)
             # Create a expert map for the local experts
             assert num_experts % self.ep_size == 0
-            self.local_num_experts = num_experts // self.ep_size
+            self.num_local_experts = num_experts // self.ep_size
             self.expert_map[
                 self.ep_rank
-                * self.local_num_experts : (self.ep_rank + 1)
-                * self.local_num_experts
-            ] = torch.arange(0, self.local_num_experts, dtype=torch.int32, device="cpu")
+                * self.num_local_experts : (self.ep_rank + 1)
+                * self.num_local_experts
+            ] = torch.arange(0, self.num_local_experts, dtype=torch.int32, device="cpu")
         else:
             self.ep_size = 1
             self.ep_rank = 0
-            self.local_num_experts = num_experts
+            self.num_local_experts = num_experts
         self.routed_scaling_factor = routed_scaling_factor
         assert intermediate_size % self.tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
@@ -148,7 +148,7 @@ class FusedMoE(torch.nn.Module):
         self.quant_config = quant_config
         self.quant_method.create_weights(
             layer=self,
-            num_experts=self.local_num_experts,
+            num_experts=self.num_local_experts,
             hidden_size=hidden_size,
             # FIXME: figure out which intermediate_size to use
             intermediate_size=self.intermediate_size_per_partition,
