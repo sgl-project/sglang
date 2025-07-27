@@ -939,7 +939,5 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             yield f"data: {chunk.model_dump_json()}\n\n", finish_reason_type
 
-        if finish_reason_type == "stop" and any(
-            len(item.detector.prev_tool_call_arr) > 0 for item in parser_dict.values()
-        ):
+        if finish_reason_type == "stop":
             yield None, "tool_calls"
