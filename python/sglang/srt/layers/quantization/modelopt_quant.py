@@ -28,7 +28,6 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     requantize_with_max_scale,
 )
-from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import is_cuda, next_power_of_2
 
 if TYPE_CHECKING:
@@ -517,6 +516,7 @@ class ModelOptFp4Config(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.radix_attention import RadixAttention
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.exclude_modules) or self.is_layer_excluded(

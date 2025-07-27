@@ -405,6 +405,7 @@ class EAGLEWorker(TpModelWorker):
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
         if self.page_size == 1:
+            # TODO: We only need self.speculative_num_steps - 1 * topk cache loc
             out_cache_loc, token_to_kv_pool_state_backup = batch.alloc_token_slots(
                 num_seqs * self.speculative_num_steps * self.topk, backup_state=True
             )
@@ -428,21 +429,13 @@ class EAGLEWorker(TpModelWorker):
                 #  "x" means speculative draft tokens
                 #  "." means padded tokens
 
-                # TODO(lmzheng): The current implementation is still a fake support
-                # for page size > 1. In the `assign_draft_cache_locs` below,
-                # we directly move the indices instead of the real kv cache.
-                # This only works when the kernel backend runs with page size = 1.
-                # If the kernel backend runs with page size > 1, we need to
-                # duplicate the real KV cache. The overhead of duplicating KV
-                # cache seems okay because the draft KV cache only has one layer.
-                # see a related copy operation in MHATokenToKVPool::move_kv_cache.
-
                 (
                     prefix_lens,
                     seq_lens,
                     last_loc,
                     self.num_new_pages_per_topk,
                     self.extend_lens,
+                    last_page_lens,
                 ) = get_last_loc_large_page_size_large_top_k(
                     batch.req_to_token_pool.req_to_token,
                     batch.req_pool_indices,
@@ -451,7 +444,6 @@ class EAGLEWorker(TpModelWorker):
                     self.topk,
                     self.page_size,
                 )
-
                 # TODO(lmzheng): remove this device sync
                 extend_num_tokens = torch.sum(self.extend_lens).item()
 
@@ -464,6 +456,19 @@ class EAGLEWorker(TpModelWorker):
                     backup_state=True,
                 )
             )
+        if self.page_size > 1 and self.topk > 1:
+            last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
+            duplicate_cache_len = torch.sum(last_page_lens).item() * (self.topk - 1)
+            target_cache_loc = torch.zeros(
+                duplicate_cache_len, dtype=torch.int32, device=self.device
+            )
+            source_cache_loc = torch.zeros(
+                duplicate_cache_len, dtype=torch.int32, device=self.device
+            )
+        else:
+            # When source_cache_loc is not needed, simply skip
+            duplicate_cache_len = 0
+            source_cache_loc, target_cache_loc, last_page_lens_cumsum = None, None, None
 
         assign_draft_cache_locs[(num_seqs,)](
             batch.req_pool_indices,
@@ -472,6 +477,9 @@ class EAGLEWorker(TpModelWorker):
             self.extend_lens,
             self.num_new_pages_per_topk,
             out_cache_loc,
+            source_cache_loc,
+            target_cache_loc,
+            last_page_lens_cumsum,
             batch.req_to_token_pool.req_to_token.shape[1],
             self.topk,
             self.speculative_num_steps,
@@ -481,7 +489,12 @@ class EAGLEWorker(TpModelWorker):
         )
 
         if self.page_size > 1 and self.topk > 1:
+            if duplicate_cache_len > 0:
+                self.draft_model_runner.token_to_kv_pool.move_kv_cache(
+                    target_cache_loc, source_cache_loc
+                )
             # Remove padded slots
+            # TODO: We only need self.speculative_num_steps - 1 cache loc
             out_cache_loc = out_cache_loc[
                 : num_seqs * self.topk * self.speculative_num_steps
             ]
@@ -591,7 +604,7 @@ class EAGLEWorker(TpModelWorker):
         )
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
-
+        # TODO: We only need self.speculative_num_steps - 1 cache loc
         out_cache_loc = out_cache_loc.reshape(
             forward_batch.batch_size, self.topk, self.speculative_num_steps
         )
@@ -972,4 +985,11 @@ def get_last_loc_large_page_size_large_top_k(
         prefix_lens,
     )
 
-    return prefix_lens, seq_lens, last_loc, num_new_pages_per_topk, extend_lens
+    return (
+        prefix_lens,
+        seq_lens,
+        last_loc,
+        num_new_pages_per_topk,
+        extend_lens,
+        last_page_lens,
+    )
