@@ -62,7 +62,7 @@ if _use_aiter:
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
-logger = logging.getLogger(__name__)\
+logger = logging.getLogger(__name__)
 
 
 class GroupedGemmRunner(torch.nn.Module):
@@ -189,7 +189,9 @@ class EPMoE(FusedMoE):
 
         # TODO(ch-wan): move quant preparation to FusedMoE
         if quant_config is None:
-            self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod()
+            self.quant_method: Optional[QuantizeMethodBase] = (
+                UnquantizedFusedMoEMethod()
+            )
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
             self.block_shape = None
@@ -207,9 +209,7 @@ class EPMoE(FusedMoE):
             self.w2_weight_scale = None
             self.activation_scheme = quant_config.moe_activation_scheme
         elif isinstance(quant_config, Fp8Config):
-            self.quant_method: Optional[QuantizeMethodBase] = Fp8MoEMethod(
-                quant_config
-            )
+            self.quant_method: Optional[QuantizeMethodBase] = Fp8MoEMethod(quant_config)
             self.use_fp8_w8a8 = True
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.block_shape = (
@@ -459,10 +459,13 @@ class EPMoE(FusedMoE):
             )
 
         # TODO: use ep size
-        num_experts = self.num_experts_per_partition * get_tensor_model_parallel_world_size()
+        num_experts = (
+            self.num_experts_per_partition * get_tensor_model_parallel_world_size()
+        )
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
-            topk_ids, num_experts,
+            topk_ids,
+            num_experts,
         )
 
         gateup_input = torch.empty(
@@ -719,7 +722,7 @@ class EPMoE(FusedMoE):
         if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
             return
         expert_id = expert_id - self.start_expert_id
-        
+
         self._weight_loader_impl(
             param=param,
             loaded_weight=loaded_weight,

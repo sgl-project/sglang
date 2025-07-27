@@ -131,7 +131,7 @@ class FusedMoE(torch.nn.Module):
         self.use_triton_kernels = (
             not _is_cpu and global_server_args_dict["enable_triton_kernel_moe"]
         )
-        
+
         if skip_quant:
             return
 
