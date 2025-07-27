@@ -271,15 +271,15 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
         )
-        self.k_data_refs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)]
-        self.v_data_refs = [self.v_buffer[i].data_ptr() for i in range(self.layer_num)]
+        self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
+        self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
         self.k_data_ptrs = torch.tensor(
-            self.k_data_refs,
+            [x.data_ptr() for x in self.k_data_refs],
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
         self.v_data_ptrs = torch.tensor(
-            self.v_data_refs,
+            [x.data_ptr() for x in self.v_data_refs],
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
@@ -458,9 +458,9 @@ class MLATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
         )
-        self.data_refs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
+        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
         self.data_ptrs = torch.tensor(
-            self.data_refs,
+            [x.data_ptr() for x in self.data_refs],
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
