@@ -76,19 +76,6 @@ class ModuleOffloader:
             self.offloaders[i].start_onload()
 
 
-def _parse_config():
-    # TODO rename env var
-    raw = os.environ.get("SGLANG_OFFLOAD_MODULE_INTERVAL")
-    if raw is None:
-        return None, None
-
-    if "/" not in raw:
-        raw = f"{raw}/1"
-
-    group_size, num_offload_in_group = raw.split("/")
-    return int(group_size), int(num_offload_in_group)
-
-
 def _hook_module_forward_for_offloader(index, module, offloaders, prefetch_step):
     def _on_forward_end():
         offloaders[(index + prefetch_step) % len(offloaders)].start_onload()
