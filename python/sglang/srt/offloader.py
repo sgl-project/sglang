@@ -202,7 +202,7 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         # check again since it may be changed
         assert self._param.data.is_contiguous(), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
 
-        scatter_list = self._param.data.chunk(self._world_size)
+        scatter_list = _even_chunk(self._param.data, self._world_size)
 
         sharded_param = symm_mem.empty(scatter_list[0].shape, dtype=scatter_list[0].dtype, device="cuda")
         handle = symm_mem.rendezvous(sharded_param, dist.group.WORLD)
@@ -224,6 +224,9 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
 
         return output
 
+def _even_chunk(x: torch.Tensor, chunks: int):
+    assert x.shape[0] % chunks == 0, f"{x.shape=} {chunks=}"
+    return list(x.chunk(chunks))
 
 def _move_param_to_cpu(param):
     cpu_data = _empty_strided_like(
