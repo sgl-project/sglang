@@ -227,19 +227,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     ) -> torch.Tensor:
 
         if self.use_triton_kernels:
-            topk_weights, _, router_logits, top_k, renormalize = topk_output
             return self.triton_kernel_moe_forward(
                 hidden_states=x,
                 w1=layer.w13_weight,
                 w2=layer.w2_weight,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
+                topk_output=topk_output,
             )
         else:
             if _use_aiter:
                 assert not no_combine, "unsupported"
-                topk_weights, topk_ids, _, _, _ = topk_output
+                topk_weights, topk_ids, _ = topk_output
                 if apply_router_weight_on_input:
                     assert (
                         topk_weights.dim() == 2
@@ -298,7 +295,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         if use_intel_amx_backend(layer) and not apply_router_weight_on_input:
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
-            topk_weights, topk_ids, _, _, _ = topk_output
+            topk_weights, topk_ids, _ = topk_output
             x, topk_weights = apply_topk_weights_cpu(
                 apply_router_weight_on_input, topk_weights, x
             )

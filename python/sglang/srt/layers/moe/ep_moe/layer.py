@@ -302,7 +302,7 @@ class EPMoE(torch.nn.Module):
         hidden_states_dtype = hidden_states.dtype
         hidden_states_device = hidden_states.device
 
-        topk_weights, topk_ids, _, _, _ = topk_output
+        topk_weights, topk_ids, _ = topk_output
 
         if not self.use_block_quant:
             # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm
@@ -436,7 +436,7 @@ class EPMoE(torch.nn.Module):
 
     def forward_normal(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         assert self.quant_method is not None
-        topk_weights, topk_ids, _, _, _ = topk_output
+        topk_weights, topk_ids, _ = topk_output
 
         hidden_states_shape = hidden_states.shape
         hidden_states_dtype = hidden_states.dtype

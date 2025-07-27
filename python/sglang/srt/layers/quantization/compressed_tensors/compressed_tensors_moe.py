@@ -608,7 +608,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
         assert activation == "silu", "Only SiLU activation is supported."
 
-        topk_weights, topk_ids, router_logits, _, _ = topk_output
+        topk_weights, topk_ids, router_logits = topk_output
 
         return torch.ops.vllm.fused_marlin_moe(
             x,

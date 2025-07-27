@@ -15,7 +15,11 @@
 from __future__ import annotations
 
 import math
-from typing import Callable, NamedTuple, Optional
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Tuple
+
 
 import torch
 import torch.nn.functional as F
@@ -37,6 +41,12 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
+        
+try:
+    from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
+except ImportError:
+    pass
+
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -59,17 +69,60 @@ if _is_npu:
     import torch_npu
 
 
-class TopKOutput(NamedTuple):
+class TopKOutputFormat(Enum):
+    STANDARD = "standard"
+    TRITON_KERNEL = "triton_kernel"
+    
+    def is_standard(self) -> bool:
+        return self == TopKOutputFormat.STANDARD
+    
+    def is_triton_kernel(self) -> bool:
+        return self == TopKOutputFormat.TRITON_KERNEL
+
+
+@dataclass(frozen=True)
+class TopKOutput(ABC):
+    """Base class for top-k outputs in different formats."""
+    format: TopKOutputFormat = field(init=False)
+
+    @abstractmethod
+    def unpack(self) -> Tuple[Any, ...]:
+        """Unpack the output into a tuple of its core components for easy consumption."""
+        pass
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self.unpack())
+
+
+@dataclass(frozen=True)
+class StandardTopKOutput(TopKOutput):
+    """Standard top-k output format."""
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
     router_logits: torch.Tensor
-    top_k: int
-    renormalize: bool
+
+    def __post_init__(self):
+        object.__setattr__(self, 'format', TopKOutputFormat.STANDARD)
+
+    def unpack(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (self.topk_weights, self.topk_ids, self.router_logits)
+
+
+@dataclass(frozen=True)
+class TritonKernelTopKOutput(TopKOutput):
+    """Triton kernel top-k output format."""
+    routing_data: RoutingData
+    gather_indx: GatherIndx
+    scatter_indx: ScatterIndx
+
+    def __post_init__(self):
+        object.__setattr__(self, 'format', TopKOutputFormat.TRITON_KERNEL)
+
+    def unpack(self) -> Tuple[RoutingData, GatherIndx, ScatterIndx]:
+        return (self.routing_data, self.gather_indx, self.scatter_indx)
 
 
 class TopK(CustomOp):
-
-    # TODO(ch-wan): support triton_kernels
 
     def __init__(
         self,
@@ -139,13 +192,8 @@ class TopK(CustomOp):
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
         if self.use_triton_kernels:
-            return TopKOutput(
-                None,  # topk_weights
-                None,  # topk_ids
-                router_logits,  # router_logits
-                self.top_k,  # top_k
-                self.renormalize,  # renormalize
-            )
+            routing_data, gather_idx, scatter_idx = routing(router_logits, self.top_k, self.renormalize)
+            return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
         else:
             torch_native = False
             return select_experts(
@@ -696,4 +744,4 @@ def select_experts(
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
-    return TopKOutput(topk_weights, topk_ids, router_logits, top_k, renormalize)
+    return StandardTopKOutput(topk_weights, topk_ids, router_logits)

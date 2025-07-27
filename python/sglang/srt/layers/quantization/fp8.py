@@ -984,7 +984,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
-            topk_weights, topk_ids, _, _, _ = topk_output
+            topk_weights, topk_ids, _ = topk_output
             x, topk_weights = apply_topk_weights_cpu(
                 apply_router_weight_on_input, topk_weights, x
             )
@@ -1025,7 +1025,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
-            topk_weights, topk_ids, _, _, _ = topk_output
+            topk_weights, topk_ids, _ = topk_output
             return cutlass_fused_experts_fp8(
                 x,
                 layer.w13_weight.transpose(1, 2),
@@ -1082,7 +1082,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         activation: str = "silu",
         no_combine: bool = False,
     ) -> Optional[torch.Tensor]:
-        topk_weights, topk_ids, _, _, _ = topk_output
+        topk_weights, topk_ids, _ = topk_output
         if _use_hip_int4:
             # TODO: add triton kernel and add check _use_aiter
             assert not no_combine, f"{no_combine=} is not supported."

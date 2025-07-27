@@ -27,7 +27,7 @@ def fused_moe_forward_native(
     if apply_router_weight_on_input:
         raise NotImplementedError()
 
-    topk_weights, topk_ids, _, _, _ = topk_output
+    topk_weights, topk_ids, _ = topk_output
 
     w13_weights = layer.w13_weight[topk_ids]
     w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
@@ -59,7 +59,7 @@ def moe_forward_native(
     if apply_router_weight_on_input:
         raise NotImplementedError()
 
-    topk_weights, topk_ids, _, _, _ = topk_output
+    topk_weights, topk_ids, _ = topk_output
 
     # Ref code from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/e0828e3cc0a03408724b80c3cc92c8e072db8d01/modeling_deepseek.py#L589
     len_experts = layer.num_experts
