@@ -100,7 +100,6 @@ def test_moe_fused_gate_combined(seq_length, params, num_fused_shared_experts):
     avg_diff = (our_mean_score - ref_mean_score).abs()
     
     # Report quality difference - maintain consistent expectations across implementations
-    # 修改第104-106行
     # Set higher tolerance for single group configuration
     if num_expert_group == 1:
         # Single-group configurations require higher tolerance because implementation differences are more significant.
