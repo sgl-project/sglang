@@ -842,11 +842,11 @@ def suppress_other_loggers():
 def assert_pkg_version(pkg: str, min_version: str, message: str):
     try:
         installed_version = version(pkg)
-        # if pkg_version.parse(installed_version) < pkg_version.parse(min_version):
-        #     raise Exception(
-        #         f"{pkg} is installed with version {installed_version}, which "
-        #         f"is less than the minimum required version {min_version}. " + message
-        #     )
+        if pkg_version.parse(installed_version) < pkg_version.parse(min_version):
+            raise Exception(
+                f"{pkg} is installed with version {installed_version}, which "
+                f"is less than the minimum required version {min_version}. " + message
+            )
     except PackageNotFoundError:
         raise Exception(
             f"{pkg} with minimum required version {min_version} is not installed. "
