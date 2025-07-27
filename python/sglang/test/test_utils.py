@@ -1,6 +1,7 @@
 """Common utilities for testing and benchmarking"""
 
 import argparse
+import asyncio
 import copy
 import json
 import logging
@@ -15,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
-from typing import Callable, List, Optional, Tuple
+from typing import Awaitable, Callable, List, Optional, Tuple
 
 import numpy as np
 import requests
@@ -714,6 +715,7 @@ def get_benchmark_args(
     seed: int = 0,
     device="auto",
     pd_separated: bool = False,
+    lora_name=None,
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -741,7 +743,7 @@ def get_benchmark_args(
         extra_request_body=None,
         apply_chat_template=False,
         profile=None,
-        lora_name=None,
+        lora_name=lora_name,
         prompt_suffix="",
         device=device,
         pd_separated=pd_separated,
@@ -764,6 +766,8 @@ def run_bench_serving(
     need_warmup=False,
     seed: int = 0,
     device="auto",
+    background_task: Optional[Callable[[str, asyncio.Event], Awaitable[None]]] = None,
+    lora_name: Optional[str] = None,
 ):
     if device == "auto":
         device = auto_config_device()
@@ -791,14 +795,35 @@ def run_bench_serving(
         disable_ignore_eos=disable_ignore_eos,
         seed=seed,
         device=device,
+        lora_name=lora_name,
     )
 
-    try:
+    async def _run():
         if need_warmup:
             warmup_args = copy.deepcopy(args)
             warmup_args.num_prompts = 16
-            run_benchmark(warmup_args)
-        res = run_benchmark(args)
+            await asyncio.to_thread(run_benchmark, warmup_args)
+
+        start_event = asyncio.Event()
+        stop_event = asyncio.Event()
+        task_handle = (
+            asyncio.create_task(background_task(base_url, start_event, stop_event))
+            if background_task
+            else None
+        )
+
+        try:
+            start_event.set()
+            result = await asyncio.to_thread(run_benchmark, args)
+        finally:
+            if task_handle:
+                stop_event.set()
+                await task_handle
+
+        return result
+
+    try:
+        res = asyncio.run(_run())
     finally:
         kill_process_tree(process.pid)
 
