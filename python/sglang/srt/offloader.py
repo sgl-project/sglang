@@ -48,13 +48,14 @@ class ModuleOffloader:
             all_modules.append(module)
             if module_index % self.group_size >= self.group_size - self.num_offload_in_group:
                 submodule = submodule_accessor(module)
+                whitelist_param_names = whitelist_param_names_creator(submodule)
                 logger.info(
-                    f"[offload_modules] move {module_index=} submodule={type(submodule)} to cpu"
+                    f"[offload_modules] move {module_index=} submodule={type(submodule)} params={whitelist_param_names} to cpu"
                 )
                 offload_submodules.append(submodule)
                 self.offloaders.append(_ModuleOffloader(
                     mode=self.mode, module=submodule, alt_stream=alt_stream,
-                    whitelist_param_names=whitelist_param_names_creator(submodule),
+                    whitelist_param_names=whitelist_param_names,
                 ))
 
         for index, module in enumerate(offload_submodules):
