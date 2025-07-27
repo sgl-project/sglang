@@ -111,7 +111,7 @@ class DeepEPBuffer:
             device="cuda"
         ).multi_processor_count
         if (
-            (deepep_mode == DeepEPMode.normal)
+            (deepep_mode != DeepEPMode.low_latency)
             and not global_server_args_dict["enable_two_batch_overlap"]
             and (DeepEPConfig.get_instance().num_sms < total_num_sms // 2)
         ):
