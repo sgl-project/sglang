@@ -6,6 +6,7 @@ from typing import Callable, Generator, List
 import torch
 from torch.func import functional_call
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.utils import get_int_env_var, is_pin_memory_available
 
 logger = logging.getLogger(__name__)
@@ -152,6 +153,10 @@ class _CpuModuleOffloader(_BaseModuleOffloader):
         self._load_event.wait()
         return self._device_tensors
 
+class _ShardedGpuModuleOffloader(_BaseModuleOffloader):
+    def __init__(self, module: torch.nn.Module, alt_stream: torch.cuda.Stream):
+        super().__init__(module, alt_stream)
+        assert get_tensor_model_parallel_world_size() == 1
 
 class _StatelessOffloaderUtil:
     @staticmethod
