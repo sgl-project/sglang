@@ -1,7 +1,7 @@
 import logging
 import os
 from abc import ABC
-from typing import Callable, Generator, List
+from typing import Callable, Generator, List, Any
 
 import torch
 from torch.func import functional_call
@@ -302,7 +302,17 @@ def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tens
 
 
 class NaiveDistributed:
+    instance = None
+
+    @staticmethod
+    def initialize(**kwargs):
+        assert NaiveDistributed.instance is None
+        NaiveDistributed.instance = NaiveDistributed(**kwargs)
+
     def __init__(self, rank: int, world_size: int):
         self._rank = rank
         self._world_size = world_size
         assert 0 <= rank < world_size
+
+    def all_gather_object(self, obj: Any) -> List[Any]:
+        return TODO
