@@ -253,6 +253,7 @@ def _move_param_to_meta(module, param_name):
     old_param = getattr(module, param_name)
     assert type(old_param) == ModelWeightParameter, f"{type(old_param)=} {old_param=}"
 
+    # TODO support more types when needed
     # manually checked how `w13_weight` and `w2_weight` are constructed
     new_param = ModelWeightParameter(
         old_param.data.to("meta"),
