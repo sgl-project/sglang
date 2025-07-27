@@ -267,8 +267,11 @@ __device__ void moe_fused_gate_impl(
   else {
     // Add shared memory array to store processing results
     // Only allocate shared memory for the currently processed tile, not the entire VPT
-    __shared__ T shared_sigmoid[WARP_SIZE * 32]; // 32 * 32 = 1024
-    __shared__ T shared_bias[WARP_SIZE * 32];    // 32 * 32 = 1024
+    // __shared__ T shared_sigmoid[WARP_SIZE * 32]; // 32 * 32 = 1024
+    // __shared__ T shared_bias[WARP_SIZE * 32];    // 32 * 32 = 1024
+    __shared__ T shared_sigmoid[WARP_SIZE * (32 + 1)];
+    __shared__ T shared_bias[WARP_SIZE * (32 + 1)];
+
     __shared__ int current_tile_idx;
 
     // Calculate the offset of the current thread in shared memory
@@ -350,7 +353,8 @@ __device__ void moe_fused_gate_impl(
         T val_with_bias = sigmoid_val + bias_chunk[ii];
         
         // Store the result in shared memory
-        int shared_idx = (thread_shared_offset + ii * WARP_SIZE) % (WARP_SIZE * 32);
+        // int shared_idx = (thread_shared_offset + ii * WARP_SIZE) % (WARP_SIZE * 32);
+        int shared_idx = thread_shared_offset + ii * (WARP_SIZE + 1);
         shared_sigmoid[shared_idx] = sigmoid_val;
         shared_bias[shared_idx] = val_with_bias;
         
@@ -691,6 +695,13 @@ std::vector<at::Tensor> moe_fused_gate(
   auto output = torch::empty({num_rows, topk}, options);
   auto indices = torch::empty({num_rows, topk}, options.dtype(torch::kInt32));
 
+  if (num_expert_group == 1 && num_experts > 128) {
+    auto gate = (1.0f / (1.0f + (-input).exp())) + bias;
+    auto topk_result = gate.topk(topk, 1, true, true);
+    output.copy_(std::get<0>(topk_result));
+    indices.copy_(std::get<1>(topk_result));
+    return {output, indices};
+  }
   // Compute grid dimensions based on runtime value for num_expert_group.
   int64_t rows_per_warp = std::max<int64_t>(1, WARP_SIZE / num_expert_group);
   int64_t num_warps = (num_rows + rows_per_warp - 1) / rows_per_warp;
