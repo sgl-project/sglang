@@ -175,8 +175,19 @@ class EAGLEWorker(TpModelWorker):
             if self.hot_token_id is not None:
                 # The loaded weaker_drafter is for the full vocabulary.
                 # We need to select the values for the cold tokens.
-                vocab_size = weaker_drafter_all_vocab.shape[0]
-                mask_hot = torch.zeros(vocab_size, dtype=torch.bool, device=self.device)
+                target_vocab_size = (
+                    self.target_worker.model_runner.model_config.vocab_size
+                )
+                if weaker_drafter_all_vocab.shape[0] != target_vocab_size:
+                    raise ValueError(
+                        "The weaker drafter probabilities tensor should have a size "
+                        f"equal to the target model's vocabulary size. "
+                        f"Expected {target_vocab_size}, but got "
+                        f"{weaker_drafter_all_vocab.shape[0]}."
+                    )
+                mask_hot = torch.zeros(
+                    target_vocab_size, dtype=torch.bool, device=self.device
+                )
                 mask_hot[self.hot_token_id.to(self.device)] = True
                 self.weaker_drafter = weaker_drafter_all_vocab[~mask_hot]
                 # Normalize the weaker drafter
