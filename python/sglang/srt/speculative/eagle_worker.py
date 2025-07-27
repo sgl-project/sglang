@@ -1012,9 +1012,14 @@ class EAGLEWorker(TpModelWorker):
             raise ValueError("Detected errors during sampling! NaN in the probs.")
         logger.debug(f"{probs[..., -1]=}")
         logger.debug(f"Before normalization: {(probs.sum(dim=-1) == 1.0).all()=}")
-        # Normalize the probs
-        probs = probs / probs.sum(dim=-1, keepdim=True)
-        logger.debug(f"After normalization: {(probs.sum(dim=-1) == 1.0).all()=}")
+        # Normalize the probs with L1 norm
+        probs = torch.nn.functional.normalize(probs, p=1, dim=-1)
+        sum_after_norm = probs.sum(dim=-1)
+        logger.debug(f"Sum after normalization: {sum_after_norm=}")
+        logger.debug(
+            f"Checking with allclose after normalization: "
+            f"{torch.allclose(sum_after_norm, torch.ones_like(sum_after_norm))=}"
+        )
         return probs
 
     def capture_for_decode(
