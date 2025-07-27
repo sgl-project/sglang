@@ -2,6 +2,7 @@ import base64
 import logging
 import os
 import pickle
+import time
 from abc import ABC
 from pathlib import Path
 from typing import Callable, Generator, List, Any, Optional
@@ -350,9 +351,18 @@ class NaiveDistributed:
     def all_gather_object(self, obj: Any) -> List[Any]:
         self._operation_index += 1
 
+        text_postfix = "\n"
+
         def _get_path(interesting_rank: int):
             return self._directory / f"rank{interesting_rank}.txt"
 
-        _get_path(self._rank).write_text(base64.b64encode(pickle.dumps(obj)).decode("utf-8") + "\n")
+        _get_path(self._rank).write_text(base64.b64encode(pickle.dumps(obj)).decode("utf-8") + text_postfix)
 
-        return TODO
+        def _read_one(interesting_rank: int):
+            p = _get_path(interesting_rank)
+            while True:
+                if p.exists() and (text := p.read_text()).endswith(text_postfix):
+                    return pickle.loads(base64.b64decode(text[:-len(text_postfix)]))
+                time.sleep(0.001)
+
+        return [_read_one(interesting_rank) for interesting_rank in range(self._world_size)]
