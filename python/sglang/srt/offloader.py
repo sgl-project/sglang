@@ -182,7 +182,7 @@ class _BaseParamOffloader(ABC):
 class _CpuParamOffloader(_BaseParamOffloader):
     def __init__(self, param):
         super().__init__(param)
-        _StatelessOffloaderUtil.move_param_to_cpu(param)
+        _move_param_to_cpu(param)
 
     def create_device_tensor(self):
         return self._param.to("cuda", non_blocking=True)
@@ -197,9 +197,9 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         assert param.data.contiguous(), f"not yet support non-contiguous tensor {param.shape=} {param.stride()=}"
 
         if self._rank == 0:
-            _StatelessOffloaderUtil.move_param_to_cpu(param)
+            _move_param_to_cpu(param)
         else:
-            _StatelessOffloaderUtil.move_param_to_meta(param)
+            _move_param_to_meta(param)
 
         self.sharded_param_handle = None
 
@@ -213,7 +213,7 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
 
         self.sharded_param_handle = handle
 
-        _StatelessOffloaderUtil.move_param_to_meta(self._param)
+        _move_param_to_meta(self._param)
 
     def create_device_tensor(self):
         output = _empty_strided_like(self._param, device="cuda")
@@ -227,20 +227,17 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         return output
 
 
-class _StatelessOffloaderUtil:
-    @staticmethod
-    def move_param_to_cpu(param):
-        cpu_data = _empty_strided_like(
-            param.data,
-            device="cpu",
-            pin_memory=is_pin_memory_available(),
-        )
-        cpu_data.copy_(param.data)
-        param.data = cpu_data
+def _move_param_to_cpu(param):
+    cpu_data = _empty_strided_like(
+        param.data,
+        device="cpu",
+        pin_memory=is_pin_memory_available(),
+    )
+    cpu_data.copy_(param.data)
+    param.data = cpu_data
 
-    @staticmethod
-    def move_param_to_meta(param):
-        param.data = param.data.to("meta")
+def _move_param_to_meta(param):
+    param.data = param.data.to("meta")
 
 def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
     return torch.empty_strided(
