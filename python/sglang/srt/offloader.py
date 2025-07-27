@@ -34,7 +34,7 @@ class ModuleOffloader:
         if not self.enabled:
             return list(all_modules_generator)
 
-        logger.info(f"offload_module {self.group_size=} {self.num_offload_in_group=} {self.prefetch_step=}")
+        logger.info(f"[offloader] {self.group_size=} {self.num_offload_in_group=} {self.prefetch_step=}")
 
         alt_stream = torch.cuda.Stream()
 
@@ -44,14 +44,14 @@ class ModuleOffloader:
         self.offloaders = []
         for module_index, module in enumerate(all_modules_generator):
             logger.info(
-                f"[offload_modules] {module_index=} {torch.cuda.memory_allocated()=}"
+                f"[offloader] {module_index=} {torch.cuda.memory_allocated()=}"
             )
             all_modules.append(module)
             if module_index % self.group_size >= self.group_size - self.num_offload_in_group:
                 submodule = submodule_accessor(module)
                 whitelist_param_names = whitelist_param_names_creator(submodule)
                 logger.info(
-                    f"[offload_modules] offload {module_index=} submodule={type(submodule)} params={whitelist_param_names}"
+                    f"[offloader] offload {module_index=} submodule={type(submodule)} params={whitelist_param_names}"
                 )
                 offload_submodules.append(submodule)
                 self.offloaders.append(_ModuleOffloader(
@@ -207,6 +207,8 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
     def post_init(self):
         # check again since it may be changed
         assert self._param.data.is_contiguous(), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
+
+        logger.info(f"offload_module {self.group_size=} {self.num_offload_in_group=} {self.prefetch_step=}")
 
         scatter_src = self._param.data
         if self._rank == 0:
