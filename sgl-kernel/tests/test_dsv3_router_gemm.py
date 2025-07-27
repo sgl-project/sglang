@@ -5,8 +5,8 @@ from sgl_kernel import dsv3_router_gemm
 
 
 @pytest.mark.parametrize("num_tokens", [i + 1 for i in range(16)])
-def test_dsv3_router_gemm(num_tokens):
-    num_experts = 256
+@pytest.mark.parametrize("num_experts", [256, 384])
+def test_dsv3_router_gemm(num_tokens, num_experts):
     hidden_dim = 7168
 
     mat_a = torch.randn(
