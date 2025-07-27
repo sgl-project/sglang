@@ -316,6 +316,8 @@ class NaiveDistributed:
     def __init__(self, rank: int, world_size: int):
         self._rank = rank
         self._world_size = world_size
+        self._operation_index = 0
+        self._directory = TODO
         assert 0 <= rank < world_size
 
     def get_rank(self):
