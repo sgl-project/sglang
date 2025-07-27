@@ -202,7 +202,12 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         # check again since it may be changed
         assert self._param.data.is_contiguous(), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
 
-        scatter_list = _even_chunk(self._param.data, self._world_size)
+        scatter_src = self._param.data
+        if self._rank == 0:
+            scatter_src = scatter_src.to("cuda")
+        else:
+            assert scatter_src.device.type == "meta", f"{scatter_src.device.type=}"
+        scatter_list = _even_chunk(scatter_src, self._world_size)
 
         sharded_param = symm_mem.empty(scatter_list[0].shape, dtype=scatter_list[0].dtype, device="cuda")
         handle = symm_mem.rendezvous(sharded_param, dist.group.WORLD)
