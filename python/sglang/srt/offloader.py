@@ -196,8 +196,8 @@ class _CpuParamOffloader(_BaseParamOffloader):
 class _ShardedGpuParamOffloader(_BaseParamOffloader):
     def __init__(self, module, param_name):
         super().__init__(module, param_name)
-        self._rank = NaiveDistributed.instance.rank
-        self._world_size = NaiveDistributed.instance.world_size
+        self._rank = NaiveDistributed.instance.get_rank()
+        self._world_size = NaiveDistributed.instance.get_world_size()
         logger.info(f"hi {self._rank=} {self._world_size=}")
 
         assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
@@ -281,8 +281,8 @@ def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
     )
 
 def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tensor]:
-    self_rank = NaiveDistributed.instance.rank
-    world_size = NaiveDistributed.instance.world_size
+    self_rank = NaiveDistributed.instance.get_rank()
+    world_size = NaiveDistributed.instance.get_world_size()
 
     object_list = NaiveDistributed.instance.all_gather_object(
         dict(
@@ -314,9 +314,15 @@ class NaiveDistributed:
         NaiveDistributed.instance = NaiveDistributed(**kwargs)
 
     def __init__(self, rank: int, world_size: int):
-        self.rank = rank
-        self.world_size = world_size
+        self._rank = rank
+        self._world_size = world_size
         assert 0 <= rank < world_size
+
+    def get_rank(self):
+        return self._rank
+
+    def get_world_size(self):
+        return self._world_size
 
     def all_gather_object(self, obj: Any) -> List[Any]:
         return TODO
