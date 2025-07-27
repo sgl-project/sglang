@@ -28,6 +28,7 @@ class ModuleOffloader:
         self,
         all_modules_generator: Generator[torch.nn.Module, None, None],
         submodule_accessor: Callable[[torch.nn.Module], torch.nn.Module],
+        whitelist_param_names_creator: Callable[[torch.nn.Module], List[str]],
     ):
         if not self.enabled:
             return list(all_modules_generator)
@@ -51,7 +52,10 @@ class ModuleOffloader:
                     f"[offload_modules] move {module_index=} submodule={type(submodule)} to cpu"
                 )
                 offload_submodules.append(submodule)
-                self.offloaders.append(_ModuleOffloader(mode=self.mode, module=submodule, alt_stream=alt_stream))
+                self.offloaders.append(_ModuleOffloader(
+                    mode=self.mode, module=submodule, alt_stream=alt_stream,
+                    whitelist_param_names=whitelist_param_names_creator(submodule),
+                ))
 
         for index, module in enumerate(offload_submodules):
             _hook_module_forward_for_offloader(
@@ -117,7 +121,7 @@ def _hook_module_forward_raw(
 
 
 class _ModuleOffloader(ABC):
-    def __init__(self, mode: str, module: torch.nn.Module, alt_stream: torch.cuda.Stream):
+    def __init__(self, mode: str, module: torch.nn.Module, alt_stream: torch.cuda.Stream, whitelist_param_names: List[str]):
         self.mode = mode
         self.module = module
         self.device = next(module.parameters()).device
@@ -130,9 +134,12 @@ class _ModuleOffloader(ABC):
         self._device_tensors = None
         self._load_event = None
 
+        param_dict = dict(self.module.named_parameters())
+        assert all(name in param_dict for name in whitelist_param_names), f"{whitelist_param_names=} {list(param_dict.keys())=}"
+
         self._param_offloaders = {
-            name: _BaseParamOffloader.create(mode, param=param)
-            for name, param in self.module.named_parameters()
+            name: _BaseParamOffloader.create(mode, param=param_dict[name])
+            for name in whitelist_param_names
         }
 
     def post_init(self):

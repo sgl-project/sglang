@@ -2026,6 +2026,11 @@ class DeepseekV2Model(nn.Module):
                     if isinstance(layer.mlp, DeepseekV2MoE)
                     else layer.mlp
                 ),
+                whitelist_param_names_creator=lambda module: (
+                    ["TODO"]
+                    if isinstance(module, FusedMoE)
+                    else []
+                )
             )
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
