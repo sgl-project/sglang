@@ -11,7 +11,7 @@ from torch.func import functional_call
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 from sglang.srt.layers.parameter import ModelWeightParameter
-from sglang.srt.utils import get_int_env_var, is_pin_memory_available
+from sglang.srt.utils import get_int_env_var, is_pin_memory_available, MultiprocessingSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -272,3 +272,29 @@ def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
         device=device,
         pin_memory=pin_memory,
     )
+
+def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tensor]:
+    self_rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    object_list = [None] * world_size
+    dist.all_gather_object(
+        object_list,
+        obj=dict(
+            dup_serialized_local_tensor=[
+                None
+                if interesting_rank == self_rank
+                else MultiprocessingSerializer.serialize(local_tensor)
+                for interesting_rank in range(world_size)
+            ]
+        )
+    )
+
+    output_tensors = []
+    for output_rank in range(world_size):
+        if output_rank == self_rank:
+            output_tensors.append(local_tensor)
+        else:
+            output_tensors.append(MultiprocessingSerializer.deserialize(object_list[output_rank][self_rank]))
+
+    return output_tensors
