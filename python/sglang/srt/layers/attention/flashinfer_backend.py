@@ -501,14 +501,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 if apply_scale(layer.k_scale)
                 else layer.scaling
             )
-            o, _ = prefill_wrapper_paged.run(
+            o, lse = prefill_wrapper_paged.run(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                 logits_soft_cap=logits_soft_cap,
             )
             if apply_scale(layer.v_scale):
                 o = o * layer.v_scale
-            return o
+            return o, lse
 
         logits_soft_cap = layer.logit_cap
 
@@ -521,7 +521,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
             if isinstance(prefill_wrapper_paged, BatchAttention):
-                o = persistent_attn_forward(
+                o, _ = persistent_attn_forward(
                     prefill_wrapper_paged,
                     q,
                     layer,
@@ -568,9 +568,11 @@ class FlashInferAttnBackend(AttentionBackend):
                     logits_soft_cap=logits_soft_cap,
                 )
                 if isinstance(prefill_wrapper_paged, BatchAttention):
-                    o2, s2 = prefill_wrapper_paged.run(
-                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                        forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    o2, s2 = persistent_attn_forward(
+                        prefill_wrapper_paged,
+                        q,
+                        layer,
+                        logits_soft_cap,
                     )
                 else:
                     o2, s2 = prefill_wrapper_paged.forward_return_lse(
