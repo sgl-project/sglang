@@ -66,7 +66,7 @@ class DeepEPNormalOutput(NamedTuple):
     hidden_states: torch.Tensor | Tuple[torch.Tensor, torch.Tensor]
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
-    num_recv_tokens_per_expert_list: List[int]
+    num_recv_tokens_per_expert: List[int]
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -309,12 +309,12 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             hidden_states,
             topk_idx,
             topk_weights,
-            num_recv_tokens_per_expert_list,
+            num_recv_tokens_per_expert,
             event,
         ) = self._dispatch_core(hidden_states, topk_idx, topk_weights, previous_event)
         event.current_stream_wait() if self.async_finish else ()
         return DeepEPNormalOutput(
-            hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert_list
+            hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
         )
 
     def _dispatch_core(
@@ -347,7 +347,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             recv_x,
             recv_topk_idx,
             recv_topk_weights,
-            num_recv_tokens_per_expert_list,
+            num_recv_tokens_per_expert,
             self.handle,
             event,
         ) = buffer.dispatch(
@@ -366,7 +366,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         )
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
-            num_recv_tokens_per_expert_list,
+            num_recv_tokens_per_expert,
             num_tokens_per_rank=num_tokens_per_rank,
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
             num_tokens_per_expert=num_tokens_per_expert,
@@ -376,7 +376,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             recv_x,
             recv_topk_idx,
             recv_topk_weights,
-            num_recv_tokens_per_expert_list,
+            num_recv_tokens_per_expert,
             event,
         )
 
