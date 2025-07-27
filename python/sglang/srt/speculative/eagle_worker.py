@@ -170,6 +170,15 @@ class EAGLEWorker(TpModelWorker):
             # Share the embedding and lm_head
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
+        if (
+            self.hot_token_id is not None
+            and server_args.speculative_weaker_drafter_probs is None
+        ):
+            raise ValueError(
+                "When a `speculative_token_map` or an EAGLE3 model with a built-in "
+                "token map is used, `speculative_weaker_drafter_probs` must also be provided."
+            )
+
         # Load weaker drafter map if provided
         self.weaker_drafter = None
         if server_args.speculative_weaker_drafter_probs is not None:
