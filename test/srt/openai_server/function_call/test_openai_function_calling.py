@@ -755,6 +755,143 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
             f"Function name '{found_names}' should container either 'get_weather' or 'get_tourist_attractions'",
         )
 
+    def test_streaming_multiple_choices_finish_reason(self):
+        """
+        Test: Verify that each choice gets its own finish_reason chunk in streaming mode with n > 1.
+        This tests the fix for the bug where only the last index got a finish_reason chunk.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_weather",
+                    "description": "Get the current weather in a given location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "The city and state, e.g. San Francisco, CA",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+
+        messages = [
+            {"role": "user", "content": "What is the weather like in Los Angeles?"}
+        ]
+
+        # Request with n=2 to get multiple choices
+        response_stream = client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.8,
+            stream=True,
+            tools=tools,
+            tool_choice="required",  # Force tool calls
+            n=2,  # Multiple choices
+        )
+
+        chunks = list(response_stream)
+
+        # Track finish_reason chunks for each index
+        finish_reason_chunks = {}
+        for chunk in chunks:
+            if chunk.choices:
+                for choice in chunk.choices:
+                    if choice.finish_reason is not None:
+                        index = choice.index
+                        if index not in finish_reason_chunks:
+                            finish_reason_chunks[index] = []
+                        finish_reason_chunks[index].append(choice.finish_reason)
+
+        # Verify we got finish_reason chunks for both indices
+        self.assertEqual(
+            len(finish_reason_chunks),
+            2,
+            f"Expected finish_reason chunks for 2 indices, got {len(finish_reason_chunks)}",
+        )
+
+        # Verify both index 0 and 1 have finish_reason
+        self.assertIn(
+            0, finish_reason_chunks, "Missing finish_reason chunk for index 0"
+        )
+        self.assertIn(
+            1, finish_reason_chunks, "Missing finish_reason chunk for index 1"
+        )
+
+        # Verify the finish_reason is "tool_calls" since we forced tool calls
+        for index, reasons in finish_reason_chunks.items():
+            self.assertEqual(
+                reasons[-1],  # Last finish_reason for this index
+                "tool_calls",
+                f"Expected finish_reason 'tool_calls' for index {index}, got {reasons[-1]}",
+            )
+
+    def test_streaming_multiple_choices_without_tools(self):
+        """
+        Test: Verify that each choice gets its own finish_reason chunk without tool calls.
+        This tests the fix for regular content streaming with multiple choices.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        messages = [{"role": "user", "content": "Say hello in one word."}]
+
+        # Request with n=2 to get multiple choices, no tools
+        response_stream = client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.8,
+            stream=True,
+            max_tokens=10,  # Keep it short
+            n=2,  # Multiple choices
+        )
+
+        chunks = list(response_stream)
+
+        # Track finish_reason chunks for each index
+        finish_reason_chunks = {}
+        for chunk in chunks:
+            if chunk.choices:
+                for choice in chunk.choices:
+                    if choice.finish_reason is not None:
+                        index = choice.index
+                        if index not in finish_reason_chunks:
+                            finish_reason_chunks[index] = []
+                        finish_reason_chunks[index].append(choice.finish_reason)
+
+        # Verify we got finish_reason chunks for both indices
+        self.assertEqual(
+            len(finish_reason_chunks),
+            2,
+            f"Expected finish_reason chunks for 2 indices, got {len(finish_reason_chunks)}",
+        )
+
+        # Verify both index 0 and 1 have finish_reason
+        self.assertIn(
+            0, finish_reason_chunks, "Missing finish_reason chunk for index 0"
+        )
+        self.assertIn(
+            1, finish_reason_chunks, "Missing finish_reason chunk for index 1"
+        )
+
+        # Verify the finish_reason is "stop" (regular completion)
+        for index, reasons in finish_reason_chunks.items():
+            self.assertIn(
+                reasons[-1],
+                ["stop", "length"],  # Could be either depending on how model responds
+                f"Expected finish_reason 'stop' or 'length' for index {index}, got {reasons[-1]}",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
