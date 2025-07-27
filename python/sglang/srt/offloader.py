@@ -24,6 +24,12 @@ class ModuleOffloader:
         self.enabled = self.group_size > 0
         assert self.mode in ["cpu", "sharded_gpu"]
 
+        if self.mode == "sharded_gpu":
+            NaiveDistributed.initialize(
+                rank=global_server_args_dict["dp_rank"],
+                world_size=global_server_args_dict["dp_size"],
+            )
+
     def wrap_modules(
         self,
         all_modules_generator: Generator[torch.nn.Module, None, None],
