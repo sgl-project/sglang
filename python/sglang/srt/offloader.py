@@ -117,6 +117,7 @@ class _ModuleOffloader:
         ), "not handled device=cpu case yet (should skip this tensor)"
 
         self._device_tensors = None
+        self._load_event = None
         _StatelessOffloaderUtil.move_params_to_cpu(module)
 
     def start_onload(self):
@@ -130,6 +131,7 @@ class _ModuleOffloader:
 
     def offload(self):
         self._device_tensors = None
+        self._load_event = None
 
     def wait_and_get_device_tensors(self):
         assert self._device_tensors is not None
