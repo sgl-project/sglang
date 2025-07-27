@@ -257,16 +257,12 @@ class HiCacheController:
                 self.storage_backend = HiCacheFile()
                 self.enable_storage = True
                 # todo: threshold policy for prefetching
-                self.storage_zerocopy = False
-                self.storage_batchedio = False
                 self.prefetch_threshold = max(prefetch_threshold, self.page_size)
             elif storage_backend == "mooncake":
                 self.storage_backend = MooncakeStore()
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
                 self.enable_storage = True
                 # todo: threshold policy for prefetching
-                self.storage_zerocopy = True
-                self.storage_batchedio = True
                 self.prefetch_threshold = max(prefetch_threshold, self.page_size)
             else:
                 raise NotImplementedError(
@@ -716,15 +712,12 @@ class HiCacheController:
                     for i in range(0, len(tokens_to_backup), self.page_size):
                         last_hash = hash_value[i // self.page_size]
                         # todo, handle failures in storage backend
-                        if self.storage_zerocopy:
-                            pass
-                        else:
-                            success = self.storage_backend.set(
-                                last_hash,
-                                self.mem_pool_host.get_flat_data_page(
-                                    operation.host_indices[i]
-                                ),
-                            )
+                        success = self.storage_backend.set(
+                            last_hash,
+                            self.mem_pool_host.get_flat_data_page(
+                                operation.host_indices[i]
+                            ),
+                        )
                         if not success:
                             logger.warning(f"Failed to write page {last_hash} to storage.")
                             break
