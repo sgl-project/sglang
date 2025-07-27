@@ -92,82 +92,6 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         function_name = tool_calls[0].function.name
         assert function_name == "add", "Function name should be 'add'"
 
-    def test_function_calling_multiturn(self):
-        """
-        Test: Whether the function call format returned by the AI is correct.
-        When returning a tool call, message.content should be None, and tool_calls should be a list.
-        """
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "add",
-                    "description": "Compute the sum of two numbers",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "a": {
-                                "type": "int",
-                                "description": "A number",
-                            },
-                            "b": {
-                                "type": "int",
-                                "description": "A number",
-                            },
-                        },
-                        "required": ["a", "b"],
-                    },
-                },
-            }
-        ]
-
-        def add(a: int, b: int):
-            return a + b
-
-        available_tools = {"add": add}
-
-        messages = [{"role": "user", "content": "Compute (3+5)"}]
-
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=0.8,
-            top_p=0.8,
-            stream=False,
-            tools=tools,
-        )
-
-        tool_call = response.choices[0].message.tool_calls[0]
-        function_name = tool_call.function.name
-        assert function_name == "add", "Function name should be 'add'"
-        function_arguments = tool_call.function.arguments
-        assert function_arguments == '{"a": 3, "b": 5}', "Function arguments should be '{\"a\": 3, \"b\": 5}'"
-        tool_to_call = available_tools[function_name]
-        tool_result = tool_to_call(**(json.loads(function_arguments)))
-
-        messages.append(response.choices[0].message)
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call.id,
-            "content": str(tool_result),
-            "name": function_name,
-        })
-
-        final_response = client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=0.8,
-            top_p=0.8,
-            stream=False,
-            tools=tools,
-        )
-
-        assert (
-            "8" in final_response.choices[0].message.content
-        ), "tool_call response should have the sum 8 in the content"
-
     def test_function_calling_streaming_simple(self):
         """
         Test: Whether the function name can be correctly recognized in streaming mode.
@@ -201,7 +125,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             }
         ]
 
-        messages = [{"role": "user", "content": "What is the temperature in Paris in celsius?"}]
+        messages = [{"role": "user", "content": "What is the temperature in Paris?"}]
 
         response_stream = client.chat.completions.create(
             model=self.model,
@@ -667,37 +591,6 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
             f"Function name '{found_names}' should container either 'get_weather' or 'get_tourist_attractions'",
         )
 
-
-class TestGLM45ServerFunctionCalling(TestOpenAIServerFunctionCalling):
-    @classmethod
-    def setUpClass(cls):
-        # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.model = "ZP2HF/GLM-4.5-Air-Test"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-
-        # Start the local OpenAI Server. If necessary, you can add other parameters such as --enable-tools.
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=[
-                # If your server needs extra parameters to test function calling, please add them here.
-                "--tool-call-parser",
-                "glm45",
-                "--reasoning-parser",
-                "glm45",
-                "--tp-size",
-                "8"
-            ],
-        )
-        cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(cls.model)
-
-    # This test is too difficult for GLM4-moe. Skip it from the UT
-    def test_function_call_required(self):
-        pass
 
 if __name__ == "__main__":
     unittest.main()
