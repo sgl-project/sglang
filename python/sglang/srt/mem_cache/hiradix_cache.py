@@ -49,6 +49,9 @@ class HiRadixCache(RadixCache):
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
 
+    
+        self.page_size = page_size
+
         self.tp_group = tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.enable_storage = hicache_storage_backend is not None
@@ -584,6 +587,10 @@ class HiRadixCache(RadixCache):
         if child.backuped:
             new_node.host_value = child.host_value[:split_len]
             child.host_value = child.host_value[split_len:]
+
+        if child.hash_value:
+            new_node.hash_value = child.hash_value[:split_len // self.page_size]
+            child.hash_value = child.hash_value[split_len // self.page_size:]
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node

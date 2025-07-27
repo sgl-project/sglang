@@ -17,15 +17,24 @@ import logging
 import math
 import threading
 from queue import Empty, Full, PriorityQueue, Queue
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+    from sglang.srt.mem_cache.memory_pool_host import HostKVCache, MLATokenToKVPoolHost
+
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+    get_world_group
+)
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
+
+from sglang.srt.mem_cache.mooncake_store import MooncakeStore, get_hash_str_mooncake
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +73,6 @@ class LayerDoneCounter:
         with self.conditions[self.producer_index]:
             self.counters[self.producer_index] = 0
 
-
 class CacheOperation:
 
     counter = 0
@@ -75,11 +83,13 @@ class CacheOperation:
         device_indices: torch.Tensor,
         node_id: int,
         priority: Optional[int] = None,
+        page_size: Optional[int] = None,
     ):
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
         self.data = None
+        self.page_size = page_size
 
         self.id = CacheOperation.counter
         CacheOperation.counter += 1
@@ -106,6 +116,7 @@ class CacheOperation:
                     host_indices=self.host_indices[i : i + chunk_size],
                     device_indices=self.device_indices[i : i + chunk_size],
                     node_id=0,
+                    page_size=self.page_size,
                 )
             )
         # Inherit the node_ids on the final chunk
@@ -124,7 +135,7 @@ class TransferBuffer:
     """
 
     def __init__(
-        self, stop_event, buffer_count: int = 3, max_buffer_size: int = 1000
+        self, stop_event, buffer_count: int = 3, max_buffer_size: int = 1024
     ) -> None:
         self.stop_event = stop_event
         self.buffers = Queue(maxsize=buffer_count)
@@ -159,7 +170,6 @@ class TransferBuffer:
 
     def clear(self):
         self.buffers.queue.clear()
-
 
 class StorageOperation:
     counter = 0
@@ -255,6 +265,16 @@ class HiCacheController:
                 self.storage_backend = HiCacheFile()
                 self.enable_storage = True
                 # todo: threshold policy for prefetching
+                self.storage_zerocopy = False
+                self.storage_batchedio = False
+                self.prefetch_threshold = max(prefetch_threshold, self.page_size)
+            elif storage_backend == "mooncake":
+                self.storage_backend = MooncakeStore()
+                self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
+                self.enable_storage = True
+                # todo: threshold policy for prefetching
+                self.storage_zerocopy = True
+                self.storage_batchedio = True
                 self.prefetch_threshold = max(prefetch_threshold, self.page_size)
             else:
                 raise NotImplementedError(
@@ -367,7 +387,13 @@ class HiCacheController:
         self.mem_pool_host.protect_write(host_indices)
         torch.cuda.current_stream().synchronize()
         self.write_queue.put(
-            CacheOperation(host_indices, device_indices, node_id, priority)
+            CacheOperation(
+                host_indices,
+                device_indices,
+                node_id,
+                priority,
+                page_size=self.page_size,
+            )
         )
         return host_indices
 
@@ -521,24 +547,37 @@ class HiCacheController:
         while not self.stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
-                for h in operation.hash_value:
-                    page_data = self.storage_backend.get(h)
-                    if page_data is None:
-                        logger.warning(
-                            f"Prefetch operation {operation.request_id} failed to retrieve page {h}."
-                        )
-                        break
-                    self.mem_pool_host.set_from_flat_data_page(
-                        operation.host_indices[operation.completed_tokens],
-                        page_data,
-                    )
-                    operation.increment(self.page_size)
-                    if operation.is_done():
-                        # operation terminated by controller, release pre-allocated memory
-                        self.mem_pool_host.free(
-                            operation.host_indices[operation.completed_tokens :]
-                        )
-                        break
+                if self.storage_batchedio:
+                    if self.storage_zerocopy:
+                        key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(operation.hash_value,
+                                                                                     operation.host_indices)
+                        self.storage_backend.batch_get(key_strs, buffer_ptrs, buffer_sizes)
+                    else:
+                        pass
+                    operation.increment(len(operation.hash_value) * self.page_size)
+                else:
+                    for h in operation.hash_value:
+                        if self.storage_zerocopy:
+                            #unimplemented
+                            pass
+                        else:
+                            page_data = self.storage_backend.get(h)
+                            if page_data is None:
+                                logger.warning(
+                                    f"Prefetch operation {operation.request_id} failed to retrieve page {h}."
+                                )
+                                break
+                            self.mem_pool_host.set_from_flat_data_page(
+                                operation.host_indices[operation.completed_tokens],
+                                page_data,
+                            )
+                        operation.increment(self.page_size)
+                        if operation.is_done():
+                            # operation terminated by controller, release pre-allocated memory
+                            self.mem_pool_host.free(
+                                operation.host_indices[operation.completed_tokens :]
+                            )
+                            break
             except Empty:
                 continue
 
@@ -562,18 +601,37 @@ class HiCacheController:
                 remaining_tokens = len(tokens_to_fetch)
                 hash_value = []
                 while remaining_tokens >= self.page_size:
-                    last_hash = get_hash_str(
-                        tokens_to_fetch[
-                            storage_hit_count : storage_hit_count + self.page_size
-                        ],
-                        last_hash,
-                    )
-                    if self.storage_backend.exists(last_hash):
+                    if isinstance(self.storage_backend, HiCacheFile):
+                        last_hash = get_hash_str(
+                            tokens_to_fetch[
+                                storage_hit_count : storage_hit_count + self.page_size
+                            ],
+                            last_hash,
+                        )
+                    elif isinstance(self.storage_backend, MooncakeStore):
+                        last_hash = get_hash_str_mooncake(
+                                last_hash, 
+                                tokens_to_fetch[
+                                    storage_hit_count : storage_hit_count + self.page_size
+                                ],
+                            )
+                    if not self.storage_batchedio:
+                        exist_result = self.storage_backend.exists(last_hash)
+                    if (not self.storage_batchedio) and exist_result:
+                        storage_hit_count += self.page_size
+                        hash_value.append(last_hash)
+                        remaining_tokens -= self.page_size
+                    elif self.storage_batchedio:
                         storage_hit_count += self.page_size
                         hash_value.append(last_hash)
                         remaining_tokens -= self.page_size
                     else:
                         break
+                if self.storage_batchedio:
+                    exist_result = self.storage_backend.exists(hash_value)
+                    storage_hit_count = sum(1 for v in exist_result.values() if v != 0) * self.page_size
+                    hit_hash = [k for k, v in exist_result.items() if v != 0]
+                    
 
                 if self.tp_world_size > 1:
                     storage_hit_count_tensor = torch.tensor(
@@ -633,21 +691,66 @@ class HiCacheController:
                 last_hash = operation.last_hash
                 tokens_to_backup = operation.token_ids
 
-                for i in range(0, len(tokens_to_backup), self.page_size):
-                    last_hash = get_hash_str(
-                        tokens_to_backup[i : i + self.page_size], last_hash
-                    )
-                    success = self.storage_backend.set(
-                        last_hash,
-                        self.mem_pool_host.get_flat_data_page(
-                            operation.host_indices[i]
-                        ),
-                    )
-                    if not success:
-                        logger.warning(f"Failed to write page {last_hash} to storage.")
-                        break
-                    operation.completed_tokens += self.page_size
-                    operation.hash_value.append(last_hash)
+                backup_hit_count = 0
+                remaining_tokens = len(tokens_to_backup)
+                hash_value = []
+                while remaining_tokens >= self.page_size:
+                    if isinstance(self.storage_backend, HiCacheFile):
+                        last_hash = get_hash_str(
+                            tokens_to_backup[
+                                backup_hit_count : backup_hit_count + self.page_size
+                            ],
+                            last_hash,
+                        )
+                    elif isinstance(self.storage_backend, MooncakeStore):
+                        last_hash = get_hash_str_mooncake(
+                                last_hash, 
+                                tokens_to_backup[
+                                    backup_hit_count : backup_hit_count + self.page_size
+                                ],
+                            )
+                    backup_hit_count += self.page_size
+                    hash_value.append(last_hash)
+                    remaining_tokens -= self.page_size
+                operation.hash_value = hash_value
+
+                if self.storage_batchedio:
+                    if self.storage_zerocopy:
+                        if len(hash_value):
+                            exist_hashvalues = self.storage_backend.exists(hash_value)
+                            indices = operation.host_indices.tolist()
+                            non_exist_keys = []
+                            non_exist_indices = []
+                            for i in range(len(hash_value)):
+                                if not exist_hashvalues[hash_value[i]]:
+                                    non_exist_keys.append(hash_value[i])
+                                    non_exist_indices.extend(indices[i * self.page_size: (i + 1) * self.page_size])
+                            if len(non_exist_keys) > 0:
+                                key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(non_exist_keys,
+                                                                                                 non_exist_indices)
+                                self.storage_backend.batch_set(key_strs, target_location=buffer_ptrs, target_sizes=buffer_sizes)
+
+                        operation.completed_tokens += len(hash_value) * self.page_size
+                    else:
+                        #unimplemented
+                        pass
+                else:
+                    for i in range(0, len(tokens_to_backup), self.page_size):
+                        last_hash = hash_value[i]
+                        # todo, handle failures in storage backend
+                        if self.storage_zerocopy:
+                            pass
+                        else:
+                            success = self.storage_backend.set(
+                                last_hash,
+                                self.mem_pool_host.get_flat_data_page(
+                                    operation.host_indices[i]
+                                ),
+                            )
+                        if not success:
+                            logger.warning(f"Failed to write page {last_hash} to storage.")
+                            break
+                        operation.completed_tokens += self.page_size
 
                 min_completed_tokens = operation.completed_tokens
                 if self.tp_world_size > 1:
