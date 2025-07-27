@@ -1,3 +1,4 @@
+import torch.distributed._symmetric_memory as symm_mem
 import torch.distributed as dist
 import logging
 import os
@@ -180,15 +181,22 @@ class _ShardedGpuModuleOffloader(_BaseModuleOffloader):
         else:
             _StatelessOffloaderUtil.move_params_to_meta(module)
 
+        self.sharded_named_params = {}
+
     def post_init(self):
         for name, param in self.module.named_parameters():
+            sharded_named_param = symm_mem.empty()
+            symm_mem.rendezvous(sharded_named_param, dist.group.WORLD)
+
             if self.rank == 0:
                 scatter_list = param.data.chunk(self.world_size)
             else:
                 scatter_list = None
             output_tensor = torch.empty_like(param.data, device="cuda")
             dist.scatter(output_tensor, scatter_list, src=0)
-            TODO
+
+
+            self.sharded_named_params[name] = sharded_named_param
 
         _StatelessOffloaderUtil.move_params_to_meta(self.module)
 
