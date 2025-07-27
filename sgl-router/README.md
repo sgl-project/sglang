@@ -120,6 +120,16 @@ python -m sglang_router.launch_router \
     --prefill-selector app=sglang component=prefill \
     --decode-selector app=sglang component=decode \
     --service-discovery-namespace sglang-system
+
+# With separate routing policies:
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --prefill-policy cache_aware \
+    --decode-policy power_of_two \
+    --service-discovery \
+    --prefill-selector app=sglang component=prefill \
+    --decode-selector app=sglang component=decode \
+    --service-discovery-namespace sglang-system
 ```
 
 #### Kubernetes Pod Configuration
@@ -226,7 +236,9 @@ python -m sglang_router.launch_router \
 - `--decode`: Initial decode server URL
 - `--prefill-selector`: Label selector for prefill pods
 - `--decode-selector`: Label selector for decode pods
-- `--policy`: Routing policy (`cache_aware`, `random`, `power_of_two`)
+- `--policy`: Routing policy (`cache_aware`, `random`, `power_of_two`, `round_robin`)
+- `--prefill-policy`: Separate routing policy for prefill nodes (optional, overrides `--policy` for prefill)
+- `--decode-policy`: Separate routing policy for decode nodes (optional, overrides `--policy` for decode)
 
 ## Development
 
