@@ -228,7 +228,7 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         sharded_param = torch.empty(scatter_list[0].shape, dtype=scatter_list[0].dtype, device="cuda")
         self.sharded_param_handles = _create_shared_buffer_tensors(local_tensor=sharded_param)
 
-        dist.scatter(sharded_param, scatter_list if self._rank == 0 else None, src=0)
+        NaiveDistributed.instance.scatter(sharded_param, scatter_list if self._rank == 0 else None)
 
         if self._rank == 0:
             _move_param_to_meta(self._module, self._param_name)
@@ -323,6 +323,9 @@ class NaiveDistributed:
 
     def get_world_size(self):
         return self._world_size
+
+    def scatter(self, output_tensor: torch.Tensor, input_tensors: List[torch.Tensor]):
+        TODO
 
     def all_gather_object(self, obj: Any) -> List[Any]:
         return TODO
