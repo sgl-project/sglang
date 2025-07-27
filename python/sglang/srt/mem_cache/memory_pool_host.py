@@ -119,11 +119,7 @@ class HostKVCache(abc.ABC):
 
     @abc.abstractmethod
     def load_to_device_per_layer(
-        self,
-        device_pool,
-        host_indices,
-        device_indices,
-        layer_id,
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
     ) -> None:
         """
         Load KV data from the host memory pool to the device memory pool for a specific layer.
@@ -132,7 +128,7 @@ class HostKVCache(abc.ABC):
 
     @abc.abstractmethod
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices
+        self, device_pool, host_indices, device_indices, io_backend
     ) -> None:
         """
         Backup KV data from the device memory pool to the host memory pool for all layers.
