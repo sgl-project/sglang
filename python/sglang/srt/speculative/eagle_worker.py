@@ -969,7 +969,13 @@ class EAGLEWorker(TpModelWorker):
 
         # Note: The last entry of the logits corresponds to the sum of cold tokens
         logits = logits_output.next_token_logits
-        logger.debug(f"{logits=}")
+
+        # Clamp inf values to avoid NaN in softmax
+        logger.debug(f"Before clamp: {logits=}")
+        finfo = torch.finfo(logits.dtype)
+        logits.clamp_(min=finfo.min, max=finfo.max)
+        logger.debug(f"After clamp: {logits=}")
+        
         cold_token_logits = logits[..., -1]
         logger.debug(f"{cold_token_logits=}")
         logger.debug(f"{self.num_cold_tokens=}")
@@ -979,10 +985,6 @@ class EAGLEWorker(TpModelWorker):
             cold_token_logits / self.num_cold_tokens
         )
         logger.debug(f"Before clamp: {logits[..., -1]=}")
-
-        finfo = torch.finfo(logits.dtype)
-        logits[..., -1] = torch.clamp(logits[..., -1], min=finfo.min, max=finfo.max)
-        logger.debug(f"After clamp: {logits[..., -1]=}")
 
     def _post_process_draft_probs(self, probs: torch.Tensor) -> torch.Tensor:
         logger.debug("post_process_draft_probs")
@@ -1011,7 +1013,6 @@ class EAGLEWorker(TpModelWorker):
         if torch.isnan(probs).any():
             raise ValueError("Detected errors during sampling! NaN in the probs.")
         logger.debug(f"{probs[..., -1]=}")
-        logger.debug(f"Before normalization: {(probs.sum(dim=-1) == 1.0).all()=}")
         # Normalize the probs with L1 norm
         probs = torch.nn.functional.normalize(probs, p=1, dim=-1)
         sum_after_norm = probs.sum(dim=-1)
