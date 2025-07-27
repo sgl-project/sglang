@@ -92,9 +92,7 @@ class TransportProxyTensor(torch.Tensor):
                 }
                 state["tensor_data"] = None
             except Exception as e:
-                print_warning_once(
-                    f"Warning: Failed to get CUDA IPC handle ({e}). Falling back to default transport."
-                )
+                # Failed to get CUDA IPC handle (possibly tp). Falling back to default transport.
                 state["metadata"]["transport_mode"] = "default"
                 state["tensor_data"] = self.as_subclass(torch.Tensor)
         else:
@@ -751,7 +749,7 @@ def tensor_hash(tensor_list) -> int:
         ]
         tensor = torch.concat(tensor_list)
     if tensor.is_cuda:
-        return gpu_tensor_hash(tensor)
+        return gpu_tensor_hash(tensor.cuda())
     tensor = tensor.detach().contiguous()
 
     if tensor.dtype == torch.bfloat16:
