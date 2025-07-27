@@ -126,7 +126,7 @@ class _ModuleOffloader(ABC):
         assert all(name in param_dict for name in whitelist_param_names), f"{whitelist_param_names=} {list(param_dict.keys())=}"
 
         self._param_offloaders = {
-            name: _BaseParamOffloader.create(mode, param=param_dict[name])
+            name: _BaseParamOffloader.create(mode, module=module, param_name=name)
             for name in whitelist_param_names
         }
 
