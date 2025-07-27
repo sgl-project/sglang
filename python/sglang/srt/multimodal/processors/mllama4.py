@@ -18,8 +18,8 @@ from sglang.srt.multimodal.processors.base_processor import (
 class Mllama4ImageProcessor(BaseMultimodalProcessor):
     models = [Llama4ForConditionalGeneration]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.vision_config = hf_config.vision_config
         self.text_config = hf_config.text_config
         self.boi_token_index = hf_config.boi_token_index
