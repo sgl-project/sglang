@@ -116,6 +116,7 @@ def _hook_module_forward_raw(
     module.forward = forward
 
 
+# TODO maybe not use subclass, but other abstractions
 class _BaseModuleOffloader(ABC):
     @staticmethod
     def create(mode, **kwargs):
@@ -141,9 +142,7 @@ class _BaseModuleOffloader(ABC):
     def start_onload(self):
         self.alt_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.alt_stream):
-            self._device_tensors = _StatelessOffloaderUtil.create_device_tensors(
-                self.module, self.device
-            )
+            self._device_tensors = self._create_device_tensors()
             self._load_event = torch.cuda.Event()
             self._load_event.record()
 
@@ -156,11 +155,16 @@ class _BaseModuleOffloader(ABC):
         self._load_event.wait()
         return self._device_tensors
 
+    def _create_device_tensors(self):
+        raise NotImplementedError
 
 class _CpuModuleOffloader(_BaseModuleOffloader):
     def __init__(self, module: torch.nn.Module, alt_stream: torch.cuda.Stream):
         super().__init__(module, alt_stream)
         _StatelessOffloaderUtil.move_params_to_cpu(module)
+
+    def _create_device_tensors(self):
+        return _StatelessOffloaderUtil.create_device_tensors(self.module, self.device)
 
 class _ShardedGpuModuleOffloader(_BaseModuleOffloader):
     def __init__(self, module: torch.nn.Module, alt_stream: torch.cuda.Stream):
