@@ -1,7 +1,7 @@
 import logging
 import os
 from abc import ABC
-from typing import Callable, Generator, List, Any
+from typing import Callable, Generator, List, Any, Optional
 
 import torch
 from torch.func import functional_call
@@ -196,8 +196,8 @@ class _CpuParamOffloader(_BaseParamOffloader):
 class _ShardedGpuParamOffloader(_BaseParamOffloader):
     def __init__(self, module, param_name):
         super().__init__(module, param_name)
-        self._rank = global_server_args_dict["dp_rank"]
-        self._world_size = global_server_args_dict["dp_size"]
+        self._rank = NaiveDistributed.instance.rank
+        self._world_size = NaiveDistributed.instance.world_size
         logger.info(f"hi {self._rank=} {self._world_size=}")
 
         assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
@@ -308,7 +308,7 @@ def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tens
 
 
 class NaiveDistributed:
-    instance = None
+    instance: Optional["NaiveDistributed"] = None
 
     @staticmethod
     def initialize(**kwargs):
@@ -316,8 +316,8 @@ class NaiveDistributed:
         NaiveDistributed.instance = NaiveDistributed(**kwargs)
 
     def __init__(self, rank: int, world_size: int):
-        self._rank = rank
-        self._world_size = world_size
+        self.rank = rank
+        self.world_size = world_size
         assert 0 <= rank < world_size
 
     def all_gather_object(self, obj: Any) -> List[Any]:
