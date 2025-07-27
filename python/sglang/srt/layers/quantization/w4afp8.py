@@ -95,7 +95,7 @@ class W4AFp8Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, EPMoE):
-            return W4AFp8EPMoEMethod(self)
+            return W4AFp8MoEMethod(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
