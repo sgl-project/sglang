@@ -90,6 +90,7 @@ class EAGLEWorker(TpModelWorker):
             server_args.speculative_algorithm
         )
         self.padded_static_len = -1
+        self.log_num_cold_tokens = None
 
         # Override context length with target model's context length
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -155,6 +156,10 @@ class EAGLEWorker(TpModelWorker):
                 mask_hot[self.hot_token_id] = True
                 # Save the number of cold tokens
                 self.num_cold_tokens = torch.sum(~mask_hot).item()
+                if self.num_cold_tokens > 0:
+                    self.log_num_cold_tokens = torch.log(
+                        torch.tensor(self.num_cold_tokens, device=head.device)
+                    ).item()
                 # Sum up the cold rows of the LM head
                 tail_sum = torch.sum(head.data[~mask_hot], dim=0)
                 # Remove cold rows
@@ -960,12 +965,8 @@ class EAGLEWorker(TpModelWorker):
         logits = logits_output.next_token_logits
         cold_token_logits = logits[..., -1]
 
-        num_cold_tokens_tensor = torch.tensor(
-            self.num_cold_tokens, device=logits.device, dtype=logits.dtype
-        )
-
         logits[..., -1] = (
-            torch.log(num_cold_tokens_tensor) + cold_token_logits / self.num_cold_tokens
+            self.log_num_cold_tokens + cold_token_logits / self.num_cold_tokens
         )
 
     def _post_process_draft_probs(self, probs: torch.Tensor) -> torch.Tensor:
