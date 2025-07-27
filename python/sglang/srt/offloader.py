@@ -194,6 +194,12 @@ class _ShardedGpuModuleOffloader(_BaseModuleOffloader):
         _StatelessOffloaderUtil.move_params_to_meta(self.module)
 
     def _create_device_tensors(self):
+        output_params = {}
+        for name, meta_param in self.module.named_parameters():
+            output_param = _empty_strided_like(meta_param, device="cuda")
+            chunks = output_param.chunk(self.world_size)
+            for src_rank in range(self.world_size):
+                TODO
         return TODO
 
 
@@ -204,11 +210,8 @@ class _StatelessOffloaderUtil:
         pin_memory = is_pin_memory_available()
         for name, param in module.named_parameters():
             # print(f"move_params_to_cpu {name=} {param.nbytes=}")
-            cpu_data = torch.empty_strided(
-                size=param.data.size(),
-                stride=param.data.stride(),
-                dtype=param.data.dtype,
-                layout=param.data.layout,
+            cpu_data = _empty_strided_like(
+                param.data,
                 device="cpu",
                 pin_memory=pin_memory,
             )
@@ -225,3 +228,15 @@ class _StatelessOffloaderUtil:
         return {
             k: v.to(device, non_blocking=True) for k, v in module.state_dict().items()
         }
+
+
+def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
+    return torch.empty_strided(
+        size=x.size(),
+        stride=x.stride(),
+        dtype=x.dtype,
+        layout=x.layout,
+        device=device,
+        pin_memory=pin_memory,
+    )
+
