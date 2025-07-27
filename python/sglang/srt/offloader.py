@@ -1,6 +1,9 @@
+import base64
 import logging
 import os
+import pickle
 from abc import ABC
+from pathlib import Path
 from typing import Callable, Generator, List, Any, Optional
 
 import torch
@@ -317,7 +320,7 @@ class NaiveDistributed:
         self._rank = rank
         self._world_size = world_size
         self._operation_index = 0
-        self._directory = TODO
+        self._directory = Path(TODO)
         assert 0 <= rank < world_size
 
     def get_rank(self):
@@ -345,4 +348,11 @@ class NaiveDistributed:
         tensor.copy_(remote_tensor)
 
     def all_gather_object(self, obj: Any) -> List[Any]:
+        self._operation_index += 1
+
+        def _get_path(interesting_rank: int):
+            return self._directory / f"rank{interesting_rank}.txt"
+
+        _get_path(self._rank).write_text(base64.b64encode(pickle.dumps(obj)).decode("utf-8") + "\n")
+
         return TODO
