@@ -284,7 +284,7 @@ class EBNFComposer:
             # Build the combined rule
             rule_parts = []
             separator = EBNFComposer.PROPERTY_SEPARATOR_MAP.get(
-                function_format, ' "," '
+                function_format, EBNFComposer.PROPERTY_SEPARATOR_MAP["json"]
             )
 
             # Add required properties joined by format-specific separator
