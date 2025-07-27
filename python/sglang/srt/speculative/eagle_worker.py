@@ -975,8 +975,8 @@ class EAGLEWorker(TpModelWorker):
         logger.debug(f"{self.num_cold_tokens=}")
         logger.debug(f"{self.log_num_cold_tokens=}")
 
-        logits[..., -1] = (
-            self.log_num_cold_tokens + (cold_token_logits / self.num_cold_tokens)
+        logits[..., -1] = self.log_num_cold_tokens + (
+            cold_token_logits / self.num_cold_tokens
         )
         logger.debug(f"Before clamp: {logits[..., -1]=}")
 
@@ -1011,7 +1011,10 @@ class EAGLEWorker(TpModelWorker):
         if torch.isnan(probs).any():
             raise ValueError("Detected errors during sampling! NaN in the probs.")
         logger.debug(f"{probs[..., -1]=}")
-        logger.debug(f"{probs.sum(dim=-1)=}")
+        logger.debug(f"Before normalization: {(probs.sum(dim=-1) == 1.0).all()=}")
+        # Normalize the probs
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        logger.debug(f"After normalization: {(probs.sum(dim=-1) == 1.0).all()=}")
         return probs
 
     def capture_for_decode(
