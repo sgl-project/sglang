@@ -16,7 +16,9 @@ class ModuleOffloader:
         self.group_size = get_int_env_var("SGLANG_OFFLOAD_GROUP_SIZE", -1)
         self.num_offload_in_group = get_int_env_var("SGLANG_OFFLOAD_NUM_OFFLOAD_IN_GROUP", 1)
         self.prefetch_step = get_int_env_var("SGLANG_OFFLOAD_PREFETCH_STEP", 1)
+        self.target = os.environ.get("SGLANG_OFFLOAD_TARGET", "cpu")
         self.enabled = self.group_size > 0
+        assert self.target in ["cpu", "gpu"]
 
     def offload_modules(
         self,
