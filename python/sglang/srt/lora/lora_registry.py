@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Union
 from uuid import uuid4
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class LoRARef:
     """
     Reference record for a LoRA model.
