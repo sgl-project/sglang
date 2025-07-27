@@ -23,8 +23,10 @@ import dataclasses
 import logging
 import multiprocessing as mp
 import os
+import random
 import signal
 import threading
+import time
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
@@ -674,6 +676,9 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
+
+    # TODO hack
+    os.environ["SGLANG_NAIVE_DISTRIBUTED_DIRECTORY"] = f"/tmp/{time.time()}_{random.randint(0, 100000000)}"
 
 
 def _launch_subprocesses(

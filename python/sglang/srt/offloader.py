@@ -321,7 +321,8 @@ class NaiveDistributed:
         self._rank = rank
         self._world_size = world_size
         self._operation_index = 0
-        self._directory = Path(TODO)
+        self._directory = Path(os.environ["SGLANG_NAIVE_DISTRIBUTED_DIRECTORY"])
+        self._directory.mkdir(parents=True, exist_ok=True)
         assert 0 <= rank < world_size
 
     def get_rank(self):
