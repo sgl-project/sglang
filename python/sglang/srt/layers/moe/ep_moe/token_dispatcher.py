@@ -380,52 +380,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             event,
         )
 
-    """
-    def _deepep_permute(
-        self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        fp8_dtype: Optional[torch.dtype] = None,
-        use_fp8_w8a8: bool = False,
-        use_block_quant: bool = False,
-    ):
-        if _use_aiter:
-            # skip permutation here as aiter fused_moe has fused inside
-            reorder_topk_ids = torch.empty(
-                (0,), device=hidden_states.device, dtype=torch.int64
-            )
-            seg_indptr = torch.zeros(
-                (self.num_experts + 1,), device=hidden_states.device, dtype=torch.int64
-            )
-            return reorder_topk_ids, seg_indptr, hidden_states
-
-        reorder_topk_ids, self.src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
-            topk_idx, self.num_experts
-        )
-        num_total_tokens = reorder_topk_ids.numel()
-        gateup_input = torch.empty(
-            (int(num_total_tokens), hidden_states.shape[1]),
-            device=hidden_states.device,
-            dtype=(
-                fp8_dtype
-                if (use_fp8_w8a8 and not use_block_quant)
-                else hidden_states.dtype
-            ),
-        )
-        # PreReorder
-        deepep_permute_triton_kernel[(hidden_states.shape[0],)](
-            hidden_states,
-            gateup_input,
-            self.src2dst,
-            topk_idx,
-            None,
-            self.router_topk,
-            hidden_states.shape[1],
-            BLOCK_SIZE=512,
-        )
-        return reorder_topk_ids, seg_indptr, gateup_input
-    """
-
     def combine_a(
         self,
         hidden_states: torch.Tensor,
