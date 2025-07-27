@@ -2,9 +2,11 @@ import argparse
 import glob
 import json
 import os
+import queue
 import random
 import subprocess
 import sys
+import threading
 import unittest
 from types import SimpleNamespace
 
@@ -41,6 +43,21 @@ class TestVLMModels(CustomTestCase):
         # Set OpenAI API key and base URL environment variables. Needed for lmm-evals to work.
         os.environ["OPENAI_API_KEY"] = cls.api_key
         os.environ["OPENAI_API_BASE"] = f"{cls.base_url}/v1"
+
+    def _detect_eviction_in_logs(self, log_output):
+        """Detect if eviction events occurred in the log output."""
+        eviction_keywords = ["Cache eviction: evicted", "evicted", "remaining size"]
+
+        eviction_detected = False
+        eviction_count = 0
+
+        for line in log_output.split("\n"):
+            if any(keyword in line for keyword in eviction_keywords):
+                eviction_detected = True
+                eviction_count += 1
+                print(f"Eviction detected: {line.strip()}")
+
+        return eviction_detected, eviction_count
 
     def run_mmmu_eval(
         self,
@@ -91,7 +108,50 @@ class TestVLMModels(CustomTestCase):
             timeout=3600,
         )
 
-    def _run_vlm_mmmu_test(self, model, output_path, test_name="", custom_env=None):
+    def _capture_output(self, process, timeout=10):
+        def reader(pipe, tag, q):
+            try:
+                for line in iter(pipe.readline, ""):
+                    q.put(f"[{tag}] {line.rstrip()}")
+            finally:
+                pipe.close()
+
+        output_queue = queue.Queue()
+        threads = []
+        for tag, pipe in (("STDOUT", process.stdout), ("STDERR", process.stderr)):
+            if pipe:
+                t = threading.Thread(target=reader, args=(pipe, tag, output_queue))
+                t.daemon = True
+                t.start()
+                threads.append(t)
+
+        output_lines = []
+        try:
+            process.wait(timeout=timeout)
+        except Exception as e:
+            output_lines.append(f"Error waiting for process: {e}")
+            process.kill()
+
+        while not output_queue.empty():
+            try:
+                output_lines.append(output_queue.get_nowait())
+            except queue.Empty:
+                break
+
+        for t in threads:
+            t.join(timeout=1)
+
+        return "\n".join(output_lines)
+
+    def _run_vlm_mmmu_test(
+        self,
+        model,
+        output_path,
+        test_name="",
+        custom_env=None,
+        log_level="info",
+        capture_output=False,
+    ):
         """
         Common method to run VLM MMMU benchmark test.
 
@@ -100,17 +160,27 @@ class TestVLMModels(CustomTestCase):
             output_path: Path for output logs
             test_name: Optional test name for logging
             custom_env: Optional custom environment variables
+            log_level: Log level for server (default: "info")
+            capture_output: Whether to capture server stdout/stderr
         """
         print(f"\nTesting model: {model.model}{test_name}")
 
         process = None
         mmmu_accuracy = 0  # Initialize to handle potential exceptions
+        server_output = ""
 
         try:
             # Prepare environment variables
             process_env = os.environ.copy()
             if custom_env:
                 process_env.update(custom_env)
+
+            # Prepare stdout/stderr capture if needed
+            stdout_pipe = None
+            stderr_pipe = None
+            if capture_output:
+                stdout_pipe = subprocess.PIPE
+                stderr_pipe = subprocess.PIPE
 
             # Launch server for testing
             process = popen_launch_server(
@@ -125,8 +195,13 @@ class TestVLMModels(CustomTestCase):
                     "--enable-multimodal",
                     "--mem-fraction-static",
                     str(self.parsed_args.mem_fraction_static),  # Use class variable
+                    "--log-level",
+                    log_level,
                 ],
                 env=process_env,
+                return_stdout_stderr=(
+                    (stdout_pipe, stderr_pipe) if capture_output else None
+                ),
             )
 
             # Run evaluation
@@ -145,12 +220,18 @@ class TestVLMModels(CustomTestCase):
                 f"Model {model.model} achieved accuracy{test_name}: {mmmu_accuracy:.4f}"
             )
 
+            # Capture server output if requested
+            if capture_output and process:
+                server_output = self._capture_output(process)
+
             # Assert performance meets expected threshold
             self.assertGreaterEqual(
                 mmmu_accuracy,
                 model.mmmu_accuracy,
                 f"Model {model.model} accuracy ({mmmu_accuracy:.4f}) below expected threshold ({model.mmmu_accuracy:.4f}){test_name}",
             )
+
+            return server_output
 
         except Exception as e:
             print(f"Error testing {model.model}{test_name}: {e}")
@@ -184,12 +265,44 @@ class TestVLMModels(CustomTestCase):
 
         for model in models_to_test:
             custom_env = {"SGLANG_VLM_CACHE_SIZE_MB": "5"}
-            self._run_vlm_mmmu_test(
+
+            # Run the test with output capture
+            server_output = self._run_vlm_mmmu_test(
                 model,
                 "./logs_small_cache",
                 test_name=" with small embedding cache (evict test)",
                 custom_env=custom_env,
+                log_level="debug",  # Enable debug logging for eviction detection
+                capture_output=True,  # Capture server output
             )
+
+            # Print server output for debugging
+            print("Server output:\n", server_output)
+
+            # Analyze server output for eviction events
+            eviction_detected, eviction_count = self._detect_eviction_in_logs(
+                server_output
+            )
+
+            # Assert that eviction was detected (since we're using small cache)
+            self.assertTrue(
+                eviction_detected,
+                f"Expected eviction events to be detected with small cache (5MB), but none found. "
+                f"Cache size may be too large for the workload or eviction logic may not be working. "
+                f"Total log content length: {len(server_output)} characters",
+            )
+
+            print(
+                f"Eviction detection summary: {eviction_count} eviction events detected"
+            )
+
+            # Additional assertion: if eviction was detected, the test passed
+            if eviction_detected:
+                print("✅ Eviction logic successfully triggered and detected!")
+            else:
+                print(
+                    "❌ No eviction events detected - cache may be too large or eviction logic not working"
+                )
 
 
 if __name__ == "__main__":

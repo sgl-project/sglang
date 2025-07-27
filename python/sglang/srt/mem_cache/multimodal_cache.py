@@ -1,7 +1,11 @@
+import logging
 from collections import OrderedDict
 from typing import Dict
 
 import torch
+
+# Set up logging for cache behavior
+logger = logging.getLogger(__name__)
 
 
 class MultiModalCache:
@@ -17,9 +21,17 @@ class MultiModalCache:
 
     def _allocate(self, embedding_size: int) -> bool:
         """Allocate space by evicting least recently used entries"""
+        evictions = 0
         while self.current_size + embedding_size > self.max_size and self.mm_cache:
             _, old_embedding = self.mm_cache.popitem(last=False)
-            self.current_size -= self._get_tensor_size(old_embedding)
+            evicted_size = self._get_tensor_size(old_embedding)
+            self.current_size -= evicted_size
+            evictions += evicted_size
+
+        if evictions > 0:
+            logger.debug(
+                f"Cache eviction: evicted {evictions} bytes, remaining size: {self.current_size}/{self.max_size} bytes"
+            )
 
         if self.current_size + embedding_size > self.max_size:
             return False
