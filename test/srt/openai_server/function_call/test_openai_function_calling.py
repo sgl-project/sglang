@@ -731,7 +731,6 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         response_stream = client.chat.completions.create(
             model=self.model,
             messages=messages,
-            max_tokens=2048,
             temperature=0.8,
             stream=True,
             max_tokens=10,  # Keep it short
