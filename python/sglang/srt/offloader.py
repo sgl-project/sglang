@@ -193,6 +193,7 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         super().__init__(module, param_name)
         self._rank = dist.get_rank()
         self._world_size = dist.get_world_size()
+        logger.info(f"hi {self._rank=} {self._world_size=}")
 
         assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
         assert self._param.data.is_contiguous(), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
@@ -211,7 +212,7 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         scatter_src = self._param.data
 
         if self._rank == 0:
-            logger.info(f"[offloader] post_init {scatter_src.nbytes=} {scatter_src.dtype=} {scatter_src.shape=}")
+            logger.info(f"[offloader] post_init {scatter_src.nbytes=} {scatter_src.dtype=} {scatter_src.shape=} {torch.cuda.memory_allocated()=}")
 
         if self._rank == 0:
             scatter_src = scatter_src.to("cuda")
