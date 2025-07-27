@@ -281,8 +281,8 @@ def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
     )
 
 def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tensor]:
-    self_rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    self_rank = NaiveDistributed.instance.rank
+    world_size = NaiveDistributed.instance.world_size
 
     object_list = NaiveDistributed.instance.all_gather_object(
         dict(
