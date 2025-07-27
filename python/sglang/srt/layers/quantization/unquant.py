@@ -24,6 +24,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.ep_moe.layer import EPMoE
     from sglang.srt.layers.moe.topk import TopKOutput
 
 has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
@@ -194,6 +195,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
+
+        from sglang.srt.layers.moe.ep_moe.layer import EPMoE
+
+        if isinstance(layer, EPMoE):
+            return layer.run_moe(
+                hidden_states=x,
+                topk_output=topk_output,
+            )
+
         return self.forward(
             x=x,
             layer=layer,
@@ -354,69 +364,3 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         raise NotImplementedError("The TPU backend currently does not support MoE.")
 
     forward_native = forward_cpu
-
-
-class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        num_experts_per_partition: int,
-        hidden_size: int,
-        intermediate_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        # Fused gate_up_proj (column parallel)
-        w13_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts_per_partition,
-                2 * intermediate_size,
-                hidden_size,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
-
-        # down_proj (row parallel)
-        w2_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts_per_partition,
-                hidden_size,
-                intermediate_size,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
-
-        # scale
-        layer.register_parameter("w13_input_scale", None)
-        layer.register_parameter("w13_weight_scale", None)
-
-        ones_tensor = torch.ones(num_experts_per_partition, dtype=torch.float32)
-
-        w2_input_scale = torch.nn.Parameter(
-            ones_tensor,
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_input_scale", w2_input_scale)
-        set_weight_attrs(w2_input_scale, extra_weight_attrs)
-
-        w2_weight_scale = torch.nn.Parameter(
-            ones_tensor,
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-    ) -> torch.Tensor:
-        raise NotImplementedError
