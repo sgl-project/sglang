@@ -215,20 +215,16 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
 
         _StatelessOffloaderUtil.move_param_to_meta(self._param)
 
-    def _create_device_tensors(self):
-        output_params = {}
-        for name, meta_param in self.module.named_parameters():
-            output_param = _empty_strided_like(meta_param, device="cuda")
-            output_param_chunks = output_param.chunk(self._world_size)
+    def create_device_tensor(self):
+        output = _empty_strided_like(self._param, device="cuda")
+        output_chunks = output.chunk(self._world_size)
 
-            for index in range(self._world_size):
-                src_rank = (self._rank + index) % self._world_size
-                src_buf = symm_mem.get_buffer(src_rank, output_param.shape, output_param.dtype)
-                output_param_chunks[src_rank].copy_(src_buf)
+        for index in range(self._world_size):
+            src_rank = (self._rank + index) % self._world_size
+            src_buf = symm_mem.get_buffer(src_rank, output.shape, output.dtype)
+            output_chunks[src_rank].copy_(src_buf)
 
-            output_params[name] = output_param
-        return output_params
-
+        return output
 
 
 class _StatelessOffloaderUtil:
