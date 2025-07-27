@@ -161,11 +161,11 @@ class EAGLEWorker(TpModelWorker):
                         torch.tensor(self.num_cold_tokens, device=head.device)
                     ).item()
                 # Sum up the cold rows of the LM head
-                tail_sum = torch.sum(head.data[~mask_hot], dim=0)
+                cold_sum = torch.sum(head.data[~mask_hot], dim=0)
                 # Remove cold rows
                 head.data = head.data[mask_hot]
                 # Add a row to sum up the cold rows
-                head.data = torch.cat([head.data, tail_sum.unsqueeze(0)], dim=0)
+                head.data = torch.cat([head.data, cold_sum.unsqueeze(0)], dim=0)
 
             # Share the embedding and lm_head
             self.draft_model_runner.model.set_embed_and_head(embed, head)
