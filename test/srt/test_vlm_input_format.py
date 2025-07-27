@@ -189,7 +189,7 @@ class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCa
         )
 
 
-# commented out before https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/discussions/27
+# commented out before https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/discussions/27 get fixed
 # class TestKimiVLImageUnderstandsImage(
 #     VLMInputTestBase, unittest.IsolatedAsyncioTestCase
 # ):
