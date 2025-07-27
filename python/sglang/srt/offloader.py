@@ -17,11 +17,13 @@ class ModuleOffloader:
         all_modules_generator: Generator[torch.nn.Module, None, None],
         submodule_accessor: Callable[[torch.nn.Module], torch.nn.Module],
     ):
-        group_size, num_offload_in_group = _parse_config()
-        if group_size is None:
+        group_size = get_int_env_var("SGLANG_OFFLOAD_GROUP_SIZE", -1)
+        num_offload_in_group = get_int_env_var("SGLANG_OFFLOAD_NUM_OFFLOAD_IN_GROUP", 1)
+        prefetch_step = get_int_env_var("SGLANG_OFFLOAD_PREFETCH_STEP", 1)
+        if group_size <= 0:
             return list(all_modules_generator)
 
-        logger.info(f"offload_module {group_size=} {num_offload_in_group=}")
+        logger.info(f"offload_module {group_size=} {num_offload_in_group=} {prefetch_step=}")
 
         alt_stream = torch.cuda.Stream()
 
