@@ -555,9 +555,10 @@ class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
 
+        num_layers = 1 if is_nextn else config.num_hidden_layers 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
+            num_layers=num_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
         )
