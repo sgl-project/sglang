@@ -660,7 +660,9 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             archs = auto_model_type._model_mapping.get(config_cls, None)
             if archs is not None:
                 if isinstance(archs, tuple):
-                    mapping[config_cls.__name__] = tuple(arch.__name__ for arch in archs)
+                    mapping[config_cls.__name__] = tuple(
+                        arch.__name__ for arch in archs
+                    )
                 else:
                     mapping[config_cls.__name__] = archs.__name__
         return mapping
