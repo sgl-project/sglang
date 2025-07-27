@@ -173,6 +173,9 @@ class _ShardedGpuModuleOffloader(_BaseModuleOffloader):
         self.world_size = dist.get_world_size()
         assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
 
+        for name, param in self.module.named_parameters():
+            assert param.data.contiguous(), f"not yet support non-contiguous tensor {name=} {param.shape=} {param.stride()=}"
+
         if self.rank == 0:
             _StatelessOffloaderUtil.move_params_to_cpu(module)
         else:
