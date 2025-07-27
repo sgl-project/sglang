@@ -204,7 +204,7 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
 
         scatter_list = self._param.data.chunk(self._world_size)
 
-        sharded_param = symm_mem.empty(size=scatter_list[0].shape, dtype=scatter_list[0].dtype, device="cuda")
+        sharded_param = symm_mem.empty(scatter_list[0].shape, dtype=scatter_list[0].dtype, device="cuda")
         handle = symm_mem.rendezvous(sharded_param, dist.group.WORLD)
 
         dist.scatter(sharded_param, scatter_list if self._rank == 0 else None, src=0)
