@@ -165,8 +165,13 @@ class _BaseParamOffloader(ABC):
             "sharded_gpu": _ShardedGpuParamOffloader,
         }[mode](**kwargs)
 
-    def __init__(self, param):
-        self._param = param
+    def __init__(self, module, param_name):
+        self._module = module
+        self._param_name = param_name
+
+    @property
+    def _param(self):
+        return getattr(self._module, self._param_name)
 
     def post_init(self):
         pass
@@ -175,9 +180,9 @@ class _BaseParamOffloader(ABC):
         raise NotImplementedError
 
 class _CpuParamOffloader(_BaseParamOffloader):
-    def __init__(self, param):
-        super().__init__(param)
-        _move_param_to_cpu(param)
+    def __init__(self, module, param_name):
+        super().__init__(module, param_name)
+        _move_param_to_cpu(self._param)
 
     def create_device_tensor(self):
         return self._param.to("cuda", non_blocking=True)
@@ -194,7 +199,7 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         if self._rank == 0:
             _move_param_to_cpu(param)
         else:
-            _move_param_to_meta(param)
+            _move_param_to_meta(self._module, self._param_name)
 
         self.sharded_param_handle = None
 
@@ -217,7 +222,7 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         self.sharded_param_handle = handle
 
         if self._rank == 0:
-            _move_param_to_meta(self._param)
+            _move_param_to_meta(self._module, self._param_name)
 
     def create_device_tensor(self):
         output = _empty_strided_like(self._param, device="cuda")
