@@ -2,6 +2,7 @@
 Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
+import argparse
 import asyncio
 import dataclasses
 import logging
@@ -41,6 +42,73 @@ def setup_logger():
 
 
 logger = setup_logger()
+
+
+@dataclasses.dataclass
+class LBArgs:
+    host: str = "0.0.0.0"
+    port: int = 8000
+    prefill_infos: list = dataclasses.field(default_factory=list)
+    decode_infos: list = dataclasses.field(default_factory=list)
+
+    @staticmethod
+    def add_cli_args(parser: argparse.ArgumentParser):
+        parser.add_argument(
+            "--host",
+            type=str,
+            default=LBArgs.host,
+            help=f"Host to bind the server (default: {LBArgs.host})",
+        )
+        parser.add_argument(
+            "--port",
+            type=int,
+            default=LBArgs.port,
+            help=f"Port to bind the server (default: {LBArgs.port})",
+        )
+        parser.add_argument(
+            "--prefill",
+            type=str,
+            default=[],
+            nargs="+",
+            help="URLs for prefill servers",
+        )
+        parser.add_argument(
+            "--decode",
+            type=str,
+            default=[],
+            nargs="+",
+            help="URLs for decode servers",
+        )
+        parser.add_argument(
+            "--prefill-bootstrap-ports",
+            type=int,
+            nargs="+",
+            help="Bootstrap ports for prefill servers",
+        )
+
+    @classmethod
+    def from_cli_args(cls, args: argparse.Namespace) -> "LBArgs":
+        bootstrap_ports = args.prefill_bootstrap_ports
+        if bootstrap_ports is None:
+            bootstrap_ports = [None] * len(args.prefill)
+        elif len(bootstrap_ports) == 1:
+            bootstrap_ports = bootstrap_ports * len(args.prefill)
+        else:
+            if len(bootstrap_ports) != len(args.prefill):
+                raise ValueError(
+                    "Number of prefill URLs must match number of bootstrap ports"
+                )
+
+        prefill_infos = [
+            (url, port) for url, port in zip(args.prefill, bootstrap_ports)
+        ]
+
+        return cls(
+            host=args.host,
+            port=args.port,
+            prefill_infos=prefill_infos,
+            decode_infos=args.decode,
+        )
 
 
 @dataclasses.dataclass
@@ -408,7 +476,12 @@ def run(prefill_configs, decode_addrs, host, port):
 
 
 if __name__ == "__main__":
-    # FIXME: remove this, use the unified entry point: sglang.srt.disaggregation.launch_lb
-    from sglang.srt.disaggregation.launch_lb import main
+    parser = argparse.ArgumentParser(
+        description="PD Disaggregation Mini Load Balancer Server"
+    )
+    LBArgs.add_cli_args(parser)
+    args = parser.parse_args()
+    lb_args = LBArgs.from_cli_args(args)
 
-    main()
+    prefill_configs = [PrefillConfig(url, port) for url, port in lb_args.prefill_infos]
+    run(prefill_configs, lb_args.decode_infos, lb_args.host, lb_args.port)
