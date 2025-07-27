@@ -54,7 +54,7 @@ __device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffff
   for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
     int n = SHFL_UP(mask, v, offset);
 #ifdef __HIP_PLATFORM_HCC__
-    __syncwarp();
+    __sync_warp();
 #endif
     if ((threadIdx.x & (WARP_SIZE - 1)) >= offset) v += n;
   }
