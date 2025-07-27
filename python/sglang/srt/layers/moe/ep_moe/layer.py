@@ -196,15 +196,19 @@ class EPMoE(FusedMoE):
             self.use_block_quant = False
             self.block_shape = None
             self.activation_scheme = None
-            self.use_w4afp8 = False
+            self.w13_input_scale = None
+            self.w2_input_scale = None
+            self.w13_weight_scale = None
+            self.w2_weight_scale = None
         elif isinstance(quant_config, W4AFp8Config):
             self.quant_method: Optional[QuantizeMethodBase] = W4AFp8MoEMethod(
                 quant_config
             )
-            self.use_w4afp8 = True
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
             self.fp8_dtype = torch.float8_e4m3fn
+            self.w13_input_scale = None
+            self.w2_input_scale = None
             self.w13_weight_scale = None
             self.w2_weight_scale = None
             self.activation_scheme = quant_config.moe_activation_scheme
@@ -219,7 +223,6 @@ class EPMoE(FusedMoE):
             )
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
-            self.use_w4afp8 = False
         else:
             raise ValueError(f"Unsupported quant_config: {quant_config}")
 
@@ -541,7 +544,7 @@ class EPMoE(FusedMoE):
             weight_indices=weight_indices_cur_rank,
             use_fp8_w8a8=self.use_fp8_w8a8,
             scale_a=self.w13_input_scale,
-            scale_b=self.w13_scale,
+            scale_b=self.w13_weight_scale,
             block_shape=self.block_shape,
         )
         del gateup_input
@@ -620,7 +623,7 @@ class EPMoE(FusedMoE):
             weight_indices=weight_indices_cur_rank,
             use_fp8_w8a8=self.use_fp8_w8a8,
             scale_a=self.w2_input_scale,
-            scale_b=self.w2_scale,
+            scale_b=self.w2_weight_scale,
             block_shape=self.block_shape,
         )
         del down_input
