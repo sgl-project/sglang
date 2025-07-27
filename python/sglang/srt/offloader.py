@@ -185,13 +185,13 @@ class _CpuParamOffloader(_BaseParamOffloader):
 class _ShardedGpuParamOffloader(_BaseParamOffloader):
     def __init__(self, param):
         super().__init__(param)
-        self.rank = dist.get_rank()
-        self.world_size = dist.get_world_size()
+        self._rank = dist.get_rank()
+        self._world_size = dist.get_world_size()
 
         assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
         assert param.data.contiguous(), f"not yet support non-contiguous tensor {param.shape=} {param.stride()=}"
 
-        if self.rank == 0:
+        if self._rank == 0:
             _StatelessOffloaderUtil.move_param_to_cpu(param)
         else:
             _StatelessOffloaderUtil.move_param_to_meta(param)
@@ -200,25 +200,25 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
 
     def post_init(self):
         for name, param in self.module.named_parameters():
-            scatter_list = param.data.chunk(self.world_size)
+            scatter_list = param.data.chunk(self._world_size)
 
             sharded_param = symm_mem.empty(size=scatter_list[0].shape, dtype=scatter_list[0].dtype, device="cuda")
             handle = symm_mem.rendezvous(sharded_param, dist.group.WORLD)
 
-            dist.scatter(sharded_param, scatter_list if self.rank == 0 else None, src=0)
+            dist.scatter(sharded_param, scatter_list if self._rank == 0 else None, src=0)
 
             self.sharded_named_param_handles[name] = handle
 
-        _StatelessOffloaderUtil.move_param_to_meta(self.param)
+        _StatelessOffloaderUtil.move_param_to_meta(self._param)
 
     def _create_device_tensors(self):
         output_params = {}
         for name, meta_param in self.module.named_parameters():
             output_param = _empty_strided_like(meta_param, device="cuda")
-            output_param_chunks = output_param.chunk(self.world_size)
+            output_param_chunks = output_param.chunk(self._world_size)
 
-            for index in range(self.world_size):
-                src_rank = (self.rank + index) % self.world_size
+            for index in range(self._world_size):
+                src_rank = (self._rank + index) % self._world_size
                 src_buf = symm_mem.get_buffer(src_rank, output_param.shape, output_param.dtype)
                 output_param_chunks[src_rank].copy_(src_buf)
 
