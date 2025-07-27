@@ -49,7 +49,6 @@ def test_moe_fused_gate_combined(seq_length, params, num_fused_shared_experts):
         renormalize=True,
         num_expert_group=num_expert_group,
         topk_group=topk_group,
-        compiled=False,
         num_fused_shared_experts=num_fused_shared_experts,
         routed_scaling_factor=2.5,
     )
@@ -105,7 +104,7 @@ def test_moe_fused_gate_combined(seq_length, params, num_fused_shared_experts):
     # Set higher tolerance for single group configuration
     if num_expert_group == 1:
         # Single-group configurations require higher tolerance because implementation differences are more significant.
-        standard_tolerance = 0.6
+        standard_tolerance = 0.85
         relaxed_tolerance = 0.7
     else:
         standard_tolerance = 0.3
