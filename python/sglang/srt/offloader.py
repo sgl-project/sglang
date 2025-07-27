@@ -324,7 +324,7 @@ class NaiveDistributed:
     def get_world_size(self):
         return self._world_size
 
-    def scatter(self, output_tensor: torch.Tensor, input_tensors: List[torch.Tensor]):
+    def scatter(self, tensor: torch.Tensor, scatter_list: List[torch.Tensor]):
         TODO
 
     def all_gather_object(self, obj: Any) -> List[Any]:
