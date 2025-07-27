@@ -107,6 +107,18 @@ class DeepEPBuffer:
         else:
             raise NotImplementedError
 
+        total_num_sms = torch.cuda.get_device_properties(
+            device="cuda"
+        ).multi_processor_count
+        if (
+            (deepep_mode == DeepEPMode.normal)
+            and not global_server_args_dict["enable_two_batch_overlap"]
+            and (DeepEPConfig.get_instance().num_sms < total_num_sms // 2)
+        ):
+            logger.warning(
+                f"Only use {DeepEPConfig.get_instance().num_sms} SMs for DeepEP communication. This may result in highly suboptimal performance."
+            )
+
         cls._buffer = Buffer(
             group,
             num_nvl_bytes,
