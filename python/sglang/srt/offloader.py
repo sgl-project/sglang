@@ -208,9 +208,11 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         # check again since it may be changed
         assert self._param.data.is_contiguous(), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
 
-        logger.info(f"offload_module {self.group_size=} {self.num_offload_in_group=} {self.prefetch_step=}")
-
         scatter_src = self._param.data
+
+        if self._rank == 0:
+            logger.info(f"[offloader] post_init {scatter_src.nbytes=} {scatter_src.dtype=} {scatter_src.shape=}")
+
         if self._rank == 0:
             scatter_src = scatter_src.to("cuda")
         else:
