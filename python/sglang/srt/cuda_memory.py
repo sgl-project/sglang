@@ -2,6 +2,7 @@ from cuda import cuda
 
 # copied from TensorRT-LLM
 def _check_cu_result(cu_func_ret):
+    # TODO optimize code
     if isinstance(cu_func_ret, tuple):
         cu_result, *others = cu_func_ret
         if cu_result != cuda.CUresult.CUDA_SUCCESS:
