@@ -489,7 +489,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=DeltaMessage(reasoning_content=reasoning_text),
-                            finish_reason=finish_reason_type,
+                            finish_reason=None,
                         )
                         chunk = ChatCompletionStreamResponse(
                             id=content["meta_info"]["id"],
@@ -507,7 +507,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         parser_dict,
                         content,
                         request,
-                        finish_reason_type,
                         has_tool_calls,
                     ):
                         if chunk:
@@ -528,7 +527,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=DeltaMessage(content=delta if delta else None),
-                            finish_reason=None,  # Always None, finish_reason sent at the end
+                            finish_reason=None,
                             matched_stop=None,
                             logprobs=choice_logprobs,
                         )
@@ -868,7 +867,6 @@ class OpenAIServingChat(OpenAIServingBase):
         parser_dict: Dict[int, FunctionCallParser],
         content: Dict[str, Any],
         request: ChatCompletionRequest,
-        finish_reason_type: Optional[str],
         has_tool_calls: Dict[int, bool],
     ):
         """Process tool calls in streaming response"""
@@ -886,7 +884,7 @@ class OpenAIServingChat(OpenAIServingBase):
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(content=normal_text),
-                finish_reason=finish_reason_type,
+                finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
                 id=content["meta_info"]["id"],
@@ -923,11 +921,7 @@ class OpenAIServingChat(OpenAIServingBase):
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(tool_calls=[tool_call]),
-                finish_reason=(
-                    None
-                    if request.stream_options and request.stream_options.include_usage
-                    else finish_reason_type
-                ),
+                finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
                 id=content["meta_info"]["id"],
