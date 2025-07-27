@@ -266,8 +266,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             "Final response of function calling should have finish_reason 'tool_calls'",
         )
 
-    # TODO: There is a bug in sglang preventing this UT from passing. We are working on it. Once done, we will add this UT back.
-    def _test_function_calling_streaming_no_tool_call(self):
+    def test_function_calling_streaming_no_tool_call(self):
         """
         Test: Whether the finish_reason is stop in streaming mode when no tool call is given.
         - Expect no function call to be found.
