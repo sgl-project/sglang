@@ -958,7 +958,7 @@ class EAGLEWorker(TpModelWorker):
 
     def _post_process_draft_logits(self, logits_output: LogitsProcessorOutput):
         """Lower bound the ExpSumLog for out-of-vocab tokens."""
-        if not hasattr(self, "num_cold_tokens") or self.num_cold_tokens == 0:
+        if getattr(self, "num_cold_tokens", 0) == 0:
             return
 
         # Note: The last entry of the logits corresponds to the sum of cold tokens
