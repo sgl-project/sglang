@@ -244,7 +244,9 @@ def _move_param_to_cpu(param):
     param.data = cpu_data
 
 def _move_param_to_meta(module, param_name):
-    setattr(module, param_name, torch.nn.Parameter(getattr(module, param_name).data.to("meta")))
+    old_param = getattr(module, param_name)
+    assert type(old_param) == torch.nn.Parameter, f"{type(old_param)=} {old_param=}"
+    setattr(module, param_name, torch.nn.Parameter(old_param.data.to("meta")))
 
 def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
     return torch.empty_strided(
