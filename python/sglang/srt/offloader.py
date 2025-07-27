@@ -295,6 +295,6 @@ def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tens
         if output_rank == self_rank:
             output_tensors.append(local_tensor)
         else:
-            output_tensors.append(MultiprocessingSerializer.deserialize(object_list[output_rank][self_rank]))
+            output_tensors.append(MultiprocessingSerializer.deserialize(object_list[output_rank]["dup_serialized_local_tensor"][self_rank]))
 
     return output_tensors
