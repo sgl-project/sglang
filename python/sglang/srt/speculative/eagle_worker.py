@@ -963,6 +963,7 @@ class EAGLEWorker(TpModelWorker):
 
     def _post_process_draft_logits(self, logits_output: LogitsProcessorOutput):
         """Lower bound the ExpSumLog for out-of-vocab tokens."""
+        logger.debug("post_process_draft_logits")
         if getattr(self, "num_cold_tokens", 0) == 0:
             return
 
@@ -974,11 +975,12 @@ class EAGLEWorker(TpModelWorker):
         logger.debug(f"{self.log_num_cold_tokens=}")
 
         logits[..., -1] = (
-            self.log_num_cold_tokens + cold_token_logits / self.num_cold_tokens
+            self.log_num_cold_tokens + (cold_token_logits / self.num_cold_tokens)
         )
         logger.debug(f"{logits[..., -1]=}")
 
     def _post_process_draft_probs(self, probs: torch.Tensor) -> torch.Tensor:
+        logger.debug("post_process_draft_probs")
         """Redistribute the probability mass of cold tokens."""
         # TODO: Remove this before benchmarking
         if torch.isnan(probs).any():
@@ -997,14 +999,14 @@ class EAGLEWorker(TpModelWorker):
 
         # Redistribute probabilities
         redistributed_cold_probs = cold_token_probs * weaker_drafter_reshaped
-        logger.debug(f"{redistributed_cold_probs.sum()=}")
+        logger.debug(f"{redistributed_cold_probs.sum(dim=-1)=}")
 
         probs = torch.cat([hot_token_probs, redistributed_cold_probs], dim=-1)
         # TODO: Remove this before benchmarking
         if torch.isnan(probs).any():
             raise ValueError("Detected errors during sampling! NaN in the probs.")
         logger.debug(f"{probs[..., -1]=}")
-        logger.debug(f"{probs.sum()=}")
+        logger.debug(f"{probs.sum(dim=-1)=}")
         return probs
 
     def capture_for_decode(
