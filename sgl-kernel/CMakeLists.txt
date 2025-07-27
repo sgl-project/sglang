@@ -45,7 +45,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        e51efbfe18fe4f4cbb66ab814c55bf4aa0185491
+    GIT_TAG        664c4f7b3ed1959414905025728eef5568209479
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
