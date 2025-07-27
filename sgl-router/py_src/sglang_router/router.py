@@ -50,6 +50,10 @@ class Router:
         pd_disaggregation: Enable PD (Prefill-Decode) disaggregated mode. Default: False
         prefill_urls: List of (url, bootstrap_port) tuples for prefill servers (PD mode only)
         decode_urls: List of URLs for decode servers (PD mode only)
+        prefill_policy: Specific load balancing policy for prefill nodes (PD mode only).
+            If not specified, uses the main policy. Default: None
+        decode_policy: Specific load balancing policy for decode nodes (PD mode only).
+            If not specified, uses the main policy. Default: None
     """
 
     def __init__(
@@ -79,6 +83,8 @@ class Router:
         pd_disaggregation: bool = False,
         prefill_urls: Optional[List[tuple]] = None,
         decode_urls: Optional[List[str]] = None,
+        prefill_policy: Optional[PolicyType] = None,
+        decode_policy: Optional[PolicyType] = None,
     ):
         if selector is None:
             selector = {}
@@ -113,6 +119,8 @@ class Router:
             pd_disaggregation=pd_disaggregation,
             prefill_urls=prefill_urls,
             decode_urls=decode_urls,
+            prefill_policy=prefill_policy,
+            decode_policy=decode_policy,
         )
 
     def start(self) -> None:
