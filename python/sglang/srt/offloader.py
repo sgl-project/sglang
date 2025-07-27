@@ -136,7 +136,8 @@ class _ModuleOffloader(ABC):
         }
 
     def post_init(self):
-        pass
+        for name, param_offloader in self._param_offloaders.items():
+            param_offloader.post_init()
 
     def start_onload(self):
         self.alt_stream.wait_stream(torch.cuda.current_stream())
@@ -169,6 +170,9 @@ class _BaseParamOffloader(ABC):
     def __init__(self, param):
         self._param = param
 
+    def post_init(self):
+        pass
+
 
 class _CpuParamOffloader(_BaseParamOffloader):
     def __init__(self, param):
@@ -179,19 +183,18 @@ class _CpuParamOffloader(_BaseParamOffloader):
         return _StatelessOffloaderUtil.create_device_tensors(self.module, self.device)
 
 class _ShardedGpuParamOffloader(_BaseParamOffloader):
-    def __init__(self, module: torch.nn.Module, alt_stream: torch.cuda.Stream):
-        super().__init__(module, alt_stream)
+    def __init__(self, param):
+        super().__init__(param)
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
-        assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
 
-        for name, param in self.module.named_parameters():
-            assert param.data.contiguous(), f"not yet support non-contiguous tensor {name=} {param.shape=} {param.stride()=}"
+        assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
+        assert param.data.contiguous(), f"not yet support non-contiguous tensor {param.shape=} {param.stride()=}"
 
         if self.rank == 0:
-            _StatelessOffloaderUtil.move_params_to_cpu(module)
+            _StatelessOffloaderUtil.move_param_to_cpu(param)
         else:
-            _StatelessOffloaderUtil.move_params_to_meta(module)
+            _StatelessOffloaderUtil.move_param_to_meta(param)
 
         self.sharded_named_param_handles = {}
 
@@ -206,7 +209,7 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
 
             self.sharded_named_param_handles[name] = handle
 
-        _StatelessOffloaderUtil.move_params_to_meta(self.module)
+        _StatelessOffloaderUtil.move_param_to_meta(self.param)
 
     def _create_device_tensors(self):
         output_params = {}
@@ -236,9 +239,8 @@ class _StatelessOffloaderUtil:
         param.data = cpu_data
 
     @staticmethod
-    def move_params_to_meta(module):
-        for name, param in module.named_parameters():
-            param.data = param.data.to("meta")
+    def move_param_to_meta(param):
+        param.data = param.data.to("meta")
 
     @staticmethod
     def create_device_tensors(module, device):
