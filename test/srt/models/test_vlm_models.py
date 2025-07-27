@@ -141,7 +141,9 @@ class TestVLMModels(CustomTestCase):
 
             # Process the result
             mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
-            print(f"Model {model.model} achieved accuracy{test_name}: {mmmu_accuracy:.4f}")
+            print(
+                f"Model {model.model} achieved accuracy{test_name}: {mmmu_accuracy:.4f}"
+            )
 
             # Assert performance meets expected threshold
             self.assertGreaterEqual(
@@ -186,7 +188,7 @@ class TestVLMModels(CustomTestCase):
                 model,
                 "./logs_small_cache",
                 test_name=" with small embedding cache (evict test)",
-                custom_env=custom_env
+                custom_env=custom_env,
             )
 
 
