@@ -199,15 +199,14 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         self.sharded_named_param_handles = {}
 
     def post_init(self):
-        for name, param in self.module.named_parameters():
-            scatter_list = param.data.chunk(self._world_size)
+        scatter_list = self._param.data.chunk(self._world_size)
 
-            sharded_param = symm_mem.empty(size=scatter_list[0].shape, dtype=scatter_list[0].dtype, device="cuda")
-            handle = symm_mem.rendezvous(sharded_param, dist.group.WORLD)
+        sharded_param = symm_mem.empty(size=scatter_list[0].shape, dtype=scatter_list[0].dtype, device="cuda")
+        handle = symm_mem.rendezvous(sharded_param, dist.group.WORLD)
 
-            dist.scatter(sharded_param, scatter_list if self._rank == 0 else None, src=0)
+        dist.scatter(sharded_param, scatter_list if self._rank == 0 else None, src=0)
 
-            self.sharded_named_param_handles[name] = handle
+        self.sharded_named_param_handles[name] = handle
 
         _StatelessOffloaderUtil.move_param_to_meta(self._param)
 
