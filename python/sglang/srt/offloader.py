@@ -1,5 +1,6 @@
 import logging
 import os
+from abc import ABC
 from typing import Callable, Generator, List
 
 import torch
@@ -16,9 +17,9 @@ class ModuleOffloader:
         self.group_size = get_int_env_var("SGLANG_OFFLOAD_GROUP_SIZE", -1)
         self.num_offload_in_group = get_int_env_var("SGLANG_OFFLOAD_NUM_OFFLOAD_IN_GROUP", 1)
         self.prefetch_step = get_int_env_var("SGLANG_OFFLOAD_PREFETCH_STEP", 1)
-        self.target = os.environ.get("SGLANG_OFFLOAD_TARGET", "cpu")
+        self.mode = os.environ.get("SGLANG_OFFLOAD_MODE", "cpu")
         self.enabled = self.group_size > 0
-        assert self.target in ["cpu", "gpu"]
+        assert self.mode in ["cpu", "sharded_gpu"]
 
     def offload_modules(
         self,
@@ -47,7 +48,7 @@ class ModuleOffloader:
                     f"[offload_modules] move {module_index=} submodule={type(submodule)} to cpu"
                 )
                 offload_submodules.append(submodule)
-                self.offloaders.append(_ModuleOffloader(submodule, alt_stream))
+                self.offloaders.append(_BaseModuleOffloader.create(mode=self.mode, module=submodule, alt_stream=alt_stream))
 
         for index, module in enumerate(offload_submodules):
             _hook_module_forward_for_offloader(
@@ -109,7 +110,14 @@ def _hook_module_forward_raw(
     module.forward = forward
 
 
-class _ModuleOffloader:
+class _BaseModuleOffloader(ABC):
+    @staticmethod
+    def create(mode, **kwargs):
+        return {
+            "cpu": _CpuModuleOffloader,
+            "sharded_gpu": _ShardedGpuModuleOffloader,
+        }[mode](**kwargs)
+
     def __init__(self, module: torch.nn.Module, alt_stream: torch.cuda.Stream):
         self.module = module
         self.device = next(module.parameters()).device
@@ -118,6 +126,10 @@ class _ModuleOffloader:
             "cpu"
         ), "not handled device=cpu case yet (should skip this tensor)"
 
+
+class _CpuModuleOffloader(_BaseModuleOffloader):
+    def __init__(self, module: torch.nn.Module, alt_stream: torch.cuda.Stream):
+        super().__init__(module, alt_stream)
         self._device_tensors = None
         self._load_event = None
         _StatelessOffloaderUtil.move_params_to_cpu(module)
