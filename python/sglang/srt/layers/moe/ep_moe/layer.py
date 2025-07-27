@@ -269,6 +269,8 @@ class EPMoE(FusedMoE):
 
         self.grouped_gemm_runner = None
 
+    # Adapted from https://github.com/vllm-project/vllm/blob/9fb52e523abf7bdaf7e60cf2971edb5a1b13dc08/vllm/model_executor/layers/fused_moe/layer.py#L544C1-L586C43
+    # Modifications: use determine_expert_map as a class internal function, set 'global_num_experts' rather than '-1' for experts not assigned to the current rank.
     def determine_expert_map(self) -> Tuple[int, Optional[torch.Tensor]]:
         """
         Calculates how many experts should be assigned to each rank for EP and
@@ -923,10 +925,6 @@ class DeepEPMoE(EPMoE):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
     ):
-        """
-        Adapted from Megatron-Core token_dispatcher MoEFlexTokenDispatcher
-        https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/token_dispatcher.py
-        """
         from sglang.srt.layers.moe.ep_moe.kernels import (
             deepep_permute_triton_kernel,
             deepep_run_moe_deep_preprocess,
