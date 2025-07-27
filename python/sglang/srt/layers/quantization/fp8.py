@@ -794,7 +794,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # merged w13 weights and generate a single scaling factor.
             layer.w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
-                    layer.num_local_experts, dtype=torch.float32, device=w13_weight.device
+                    layer.num_local_experts,
+                    dtype=torch.float32,
+                    device=w13_weight.device,
                 ),
                 requires_grad=False,
             )

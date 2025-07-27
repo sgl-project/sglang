@@ -461,10 +461,7 @@ class EPMoE(FusedMoE):
                 use_per_token_if_dynamic=self.use_per_token_if_dynamic,
             )
 
-        # TODO: use ep size
-        num_experts = (
-            self.num_local_experts * get_tensor_model_parallel_world_size()
-        )
+        num_experts = self.num_experts
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
             topk_ids,
