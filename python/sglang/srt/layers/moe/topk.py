@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import math
-from enum import Enum
+from enum import Enum, auto
 from typing import Callable, NamedTuple, Optional, Protocol, runtime_checkable
 
 import torch
@@ -70,8 +70,8 @@ if _is_npu:
 
 
 class TopKOutputFormat(Enum):
-    STANDARD = "standard"
-    TRITON_KERNEL = "triton_kernel"
+    STANDARD = auto()
+    TRITON_KERNEL = auto()
 
     def is_standard(self) -> bool:
         return self == TopKOutputFormat.STANDARD
