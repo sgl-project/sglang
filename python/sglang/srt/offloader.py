@@ -9,6 +9,7 @@ import torch
 from torch.func import functional_call
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.parameter import ModelWeightParameter
 from sglang.srt.utils import get_int_env_var, is_pin_memory_available
 
 logger = logging.getLogger(__name__)
@@ -250,8 +251,15 @@ def _move_param_to_cpu(param):
 
 def _move_param_to_meta(module, param_name):
     old_param = getattr(module, param_name)
-    assert type(old_param) == torch.nn.Parameter, f"{type(old_param)=} {old_param=}"
-    setattr(module, param_name, torch.nn.Parameter(old_param.data.to("meta")))
+    assert type(old_param) == ModelWeightParameter, f"{type(old_param)=} {old_param=}"
+
+    # manually checked how `w13_weight` and `w2_weight` are constructed
+    new_param = ModelWeightParameter(
+        old_param.data.to("meta"),
+        **{k: getattr(old_param, k) for k in ["input_dim", "output_dim", "weight_loader"]}
+    )
+
+    setattr(module, param_name, new_param)
 
 def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
     return torch.empty_strided(
