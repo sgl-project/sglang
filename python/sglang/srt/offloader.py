@@ -181,7 +181,7 @@ class _ShardedGpuModuleOffloader(_BaseModuleOffloader):
         else:
             _StatelessOffloaderUtil.move_params_to_meta(module)
 
-        self.sharded_named_params = {}
+        self.sharded_named_param_handles = {}
 
     def post_init(self):
         for name, param in self.module.named_parameters():
@@ -192,7 +192,7 @@ class _ShardedGpuModuleOffloader(_BaseModuleOffloader):
 
             dist.scatter(sharded_param, scatter_list if self.rank == 0 else None, src=0)
 
-            self.sharded_named_params[name] = sharded_param
+            self.sharded_named_param_handles[name] = handle
 
         _StatelessOffloaderUtil.move_params_to_meta(self.module)
 
