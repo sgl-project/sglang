@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Callable, Generator, List
 
 import torch
@@ -16,7 +17,7 @@ class ModuleOffloader:
         all_modules_generator: Generator[torch.nn.Module, None, None],
         submodule_accessor: Callable[[torch.nn.Module], torch.nn.Module],
     ):
-        module_interval = get_int_env_var("SGLANG_OFFLOAD_MODULE_INTERVAL", -1)
+        module_interval = os.environ.get("SGLANG_OFFLOAD_MODULE_INTERVAL", "0")
         if module_interval < 0:
             return list(all_modules_generator)
 
@@ -50,6 +51,19 @@ class ModuleOffloader:
 
     def on_post_load(self):
         self.offloaders[0].start_onload()
+
+
+def _parse_config():
+    # TODO rename env var
+    raw = os.environ.get("SGLANG_OFFLOAD_MODULE_INTERVAL")
+    if raw is None:
+        return None
+
+    if "/" not in raw:
+        raw = f"{raw}/1"
+
+    group_size, num_offload_in_group = raw.split("/")
+    return int(group_size), int(num_offload_in_group)
 
 
 def _hook_module_forward_for_offloader(index, module, offloaders):
