@@ -618,7 +618,7 @@ class EAGLEWorker(TpModelWorker):
                 break
 
             # Overwrite the kv cache to keep the causal relationship of branch.
-            if i > 1:
+            if i > 0:
                 src_cache_loc = out_cache_loc[i-1][real_parents]
                 tgt_cache_loc = out_cache_loc[i-1]
                 self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
