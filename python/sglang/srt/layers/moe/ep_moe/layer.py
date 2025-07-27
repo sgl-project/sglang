@@ -893,17 +893,16 @@ class DeepEPMoE(EPMoE):
     def moe_impl(self, dispatch_output: DispatchOutput):
         if _use_aiter:
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
-            hidden_states = self.forward_aiter(dispatch_output)
+            return self.forward_aiter(dispatch_output)
         if dispatch_output.format.is_deepep_normal():
             if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-                hidden_states = self.forward_deepgemm_contiguous(dispatch_output)
+                return self.forward_deepgemm_contiguous(dispatch_output)
             else:
-                hidden_states = self.forward_normal(dispatch_output)
+                return self.forward_normal(dispatch_output)
         elif dispatch_output.format.is_deepep_ll():
-            hidden_states = self.forward_deepgemm_masked(dispatch_output)
+            return self.forward_deepgemm_masked(dispatch_output)
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
-        return hidden_states
 
     def combine(
         self,
