@@ -703,8 +703,8 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         end_new_pages = torch.cumsum(need_new_pages, 0)
         start_new_pages = end_new_pages - need_new_pages
-        if len(self.free_pages) == 0:
-            out_indices = (last_loc + 1) * (1 - need_new_pages)
+        if num_new_pages == 0:
+            out_indices = last_loc + 1
         else:
             out_indices = (last_loc + 1) * (1 - need_new_pages) + self.free_pages[
                 start_new_pages
