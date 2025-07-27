@@ -885,6 +885,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.w13_blockscale_swizzled = Parameter(
             w13_blockscale_swizzled, requires_grad=False
         )
+        print(f"hi {layer.w13_weight_scale.shape=} {layer.w13_weight_scale.dtype=}")
         del layer.w13_weight_scale
 
         # This is for quantization, so we need to invert it.
@@ -921,6 +922,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.w2_blockscale_swizzled = Parameter(
             w2_blockscale_swizzled, requires_grad=False
         )
+        print(f"hi {layer.w2_weight_scale.shape=} {layer.w2_weight_scale.dtype=}")
         del layer.w2_weight_scale
         layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
