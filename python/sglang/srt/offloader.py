@@ -216,7 +216,8 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
 
         self.sharded_param_handle = handle
 
-        _move_param_to_meta(self._param)
+        if self._rank == 0:
+            _move_param_to_meta(self._param)
 
     def create_device_tensor(self):
         output = _empty_strided_like(self._param, device="cuda")
@@ -243,11 +244,6 @@ def _move_param_to_cpu(param):
     param.data = cpu_data
 
 def _move_param_to_meta(param):
-    def _print(name, x):
-        print(f"{name=} {x.device=} {x.shape=} {x.stride()=} {x.dtype=}")
-    _print("move_param_to_meta-src", param.data)
-    _print("move_param_to_meta-dst", param.data.to("meta"))
-
     param.data = param.data.to("meta")
 
 def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
