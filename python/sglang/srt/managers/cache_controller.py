@@ -201,8 +201,9 @@ class PrefetchOperation(StorageOperation):
     def increment(self, num_tokens: int):
         with self._lock:
             if self._done_flag:
-                return
+                return False
             self.completed_tokens += num_tokens
+            return True
 
     def mark_done(self):
         with self._lock:
@@ -528,12 +529,12 @@ class HiCacheController:
                             f"Prefetch operation {operation.request_id} failed to retrieve page {h}."
                         )
                         break
-                    self.mem_pool_host.set_from_flat_data_page(
-                        operation.host_indices[operation.completed_tokens],
-                        page_data,
-                    )
-                    operation.increment(self.page_size)
-                    if operation.is_done():
+                    if operation.increment(self.page_size):
+                        self.mem_pool_host.set_from_flat_data_page(
+                            operation.host_indices[operation.completed_tokens],
+                            page_data,
+                        )
+                    else:
                         # operation terminated by controller, release pre-allocated memory
                         self.mem_pool_host.free(
                             operation.host_indices[operation.completed_tokens :]
@@ -589,6 +590,7 @@ class HiCacheController:
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
+                    self.mem_pool_host.free(operation.host_indices)
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
