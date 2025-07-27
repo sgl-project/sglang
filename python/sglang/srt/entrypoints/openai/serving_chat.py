@@ -456,13 +456,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     choice_data = ChatCompletionResponseStreamChoice(
                         index=index,
                         delta=delta,
-                        finish_reason=finish_reason_type,
-                        matched_stop=(
-                            finish_reason["matched"]
-                            if finish_reason and "matched" in finish_reason
-                            else None
-                        ),
-                        logprobs=choice_logprobs,
+                        finish_reason=None,
+                        logprobs=None,
                     )
                     chunk = ChatCompletionStreamResponse(
                         id=content["meta_info"]["id"],
