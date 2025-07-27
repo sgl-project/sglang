@@ -21,6 +21,9 @@ from sglang.srt.layers.quantization.petit_utils import (
     verify_petit_nvfp4_supported,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
@@ -104,7 +107,7 @@ class PetitNvFp4Config(QuantizationConfig):
     @classmethod
     def is_petit_nvfp4_compatible(cls, quant_config: Dict[str, Any]) -> bool:
         quant_method = quant_config.get("quant_method", "").lower()
-        return quant_method == "modelopt"
+        return _is_hip and quant_method == "modelopt"
 
     def is_layer_excluded(self, prefix: str, exclude_modules: list):
         for pattern in exclude_modules:

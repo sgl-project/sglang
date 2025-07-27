@@ -66,6 +66,7 @@ ALL_MODELS = [
     ),
     ModelCase("openai-community/gpt2"),
     ModelCase("microsoft/phi-1_5", trust_remote_code=True),
+    ModelCase("adept/persimmon-8b-chat"),
     ModelCase("microsoft/Phi-3-small-8k-instruct", trust_remote_code=True),
     ModelCase("allenai/OLMo-2-1124-7B-Instruct", skip_long_prompt=True),
     ModelCase("ibm-granite/granite-3.0-2b-instruct", skip_long_prompt=True),
