@@ -1236,6 +1236,7 @@ class FlashInferEPMoE(EPMoE):
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
         self.correction_bias = correction_bias
+        self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert use_flashinfer_trtllm_moe
