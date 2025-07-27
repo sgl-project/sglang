@@ -417,21 +417,27 @@ class HiCacheController:
         else:
             raise ValueError(f"Unsupported io backend")
 
+    def _get_and_merge_op(
+        self, queue: Queue[CacheOperation]
+    ) -> Optional[CacheOperation]:
+        op = None
+        try:
+            op = queue.get(block=True, timeout=1)
+            while queue.qsize() > 0:
+                op.merge(queue.get(block=False))
+        except Empty:
+            pass
+        except Exception as e:
+            logger.error(e)
+        return op
+
     def write_thread_func_direct(self):
         """
         Directly write through KV caches to host memory without buffering.
         """
         torch.cuda.set_stream(self.write_stream)
         while not self.stop_event.is_set():
-            op = None
-            try:
-                op = self.write_queue.get(block=True, timeout=1)
-                while self.write_queue.qsize() > 0:
-                    op.merge(self.write_queue.get(block=False))
-            except Empty:
-                pass
-            except Exception as e:
-                logger.error(e)
+            op = self._get_and_merge_op(self.write_queue)
             if op is None:
                 continue
             try:
@@ -471,13 +477,7 @@ class HiCacheController:
             self.load_cache_event.clear()
             self.layer_done_counter.update_producer()
 
-            batch_operation = None
-            while self.load_queue.qsize() > 0:
-                op = self.load_queue.get(block=True)
-                if batch_operation is None:
-                    batch_operation = op
-                else:
-                    batch_operation.merge(op)
+            batch_operation = self._get_and_merge_op(self.load_queue)
             if batch_operation is None:
                 continue
 
