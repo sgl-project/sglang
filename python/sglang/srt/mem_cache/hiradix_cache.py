@@ -113,6 +113,7 @@ class HiRadixCache(RadixCache):
             )
         if host_indices is not None:
             node.host_value = host_indices
+            assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
             if not write_back:
                 # no need to lock nodes if write back
