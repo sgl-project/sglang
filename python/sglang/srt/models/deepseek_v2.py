@@ -2060,6 +2060,8 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module):
+    # for quark model load
+    packed_modules_mapping = {}
 
     def __init__(
         self,
@@ -2068,6 +2070,18 @@ class DeepseekV2ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+
+        # for quark model load
+        # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
+        self.fuse_qkv_a_proj = (
+            hasattr(config, "q_lora_rank") and config.q_lora_rank is not None
+        )
+        if self.fuse_qkv_a_proj:
+            self.packed_modules_mapping["fused_qkv_a_proj_with_mqa"] = [
+                "q_a_proj",
+                "kv_a_proj_with_mqa",
+            ]
+
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
