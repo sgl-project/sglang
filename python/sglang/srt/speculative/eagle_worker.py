@@ -976,6 +976,10 @@ class EAGLEWorker(TpModelWorker):
 
     def _post_process_draft_probs(self, probs: torch.Tensor) -> torch.Tensor:
         """Redistribute the probability mass of cold tokens."""
+        # TODO: Remove this before benchmarking
+        if torch.isnan(probs).any():
+            raise ValueError("Detected errors during sampling! NaN in the probs.")
+
         if getattr(self, "num_cold_tokens", 0) == 0 or self.weaker_drafter is None:
             return probs
 
@@ -989,7 +993,11 @@ class EAGLEWorker(TpModelWorker):
         # Redistribute probabilities
         redistributed_cold_probs = cold_token_probs * weaker_drafter_reshaped
 
-        return torch.cat([hot_token_probs, redistributed_cold_probs], dim=-1)
+        probs = torch.cat([hot_token_probs, redistributed_cold_probs], dim=-1)
+        # TODO: Remove this before benchmarking
+        if torch.isnan(probs).any():
+            raise ValueError("Detected errors during sampling! NaN in the probs.")
+        return probs
 
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
