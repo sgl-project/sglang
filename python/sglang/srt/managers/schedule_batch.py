@@ -88,7 +88,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_deepep_moe",
     "deepep_mode",
     "enable_ep_moe",
-    "enable_flashinfer_moe",
+    "enable_flashinfer_cutlass_moe",
+    "enable_flashinfer_trtllm_moe",
     "enable_flashinfer_allreduce_fusion",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
@@ -209,10 +210,11 @@ class MultimodalDataItem:
     hash: int = None
     pad_value: int = None
     offsets: Optional[list] = None
+
     # the raw features returned by processor, e.g. pixel_values or audio_features
     feature: Union[torch.Tensor, np.ndarray] = None
-
-    # the precomputed embeddings for the modality, e.g. image_emb for image, audio_emb for audio
+    # the precomputed embeddings, passed as final encoder embeddings
+    # One and only one of the feature and precomputed_embeddings will be empty
     precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     # Model-specific data stored in a dictionary

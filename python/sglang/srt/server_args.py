@@ -169,7 +169,8 @@ class ServerArgs:
     ep_size: int = 1
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
-    enable_flashinfer_moe: bool = False
+    enable_flashinfer_cutlass_moe: bool = False
+    enable_flashinfer_trtllm_moe: bool = False
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
@@ -428,11 +429,15 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
         # MoE kernel
-        if self.enable_flashinfer_moe:
+        if self.enable_flashinfer_cutlass_moe:
             assert (
                 self.quantization == "modelopt_fp4"
             ), "modelopt_fp4 quantization is required for Flashinfer MOE"
             os.environ["TRTLLM_ENABLE_PDL"] = "1"
+
+        if self.enable_flashinfer_trtllm_moe:
+            assert self.enable_ep_moe, "EP MoE is required for Flashinfer TRTLLM MOE"
+            logger.warning(f"Flashinfer TRTLLM MoE is enabled.")
 
         # DeepEP MoE
         if self.enable_deepep_moe:
@@ -457,6 +462,9 @@ class ServerArgs:
             logger.info(
                 "EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
             )
+
+        if self.enable_eplb:
+            assert self.enable_ep_moe or self.enable_deepep_moe
 
         if self.enable_expert_distribution_metrics and (
             self.expert_distribution_recorder_mode is None
@@ -1290,9 +1298,14 @@ class ServerArgs:
             help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
         )
         parser.add_argument(
-            "--enable-flashinfer-moe",
+            "--enable-flashinfer-cutlass-moe",
             action="store_true",
             help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP with --enable-ep-moe",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-trtllm-moe",
+            action="store_true",
+            help="Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP with --enable-ep-moe",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
