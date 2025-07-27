@@ -34,7 +34,7 @@ class ModuleOffloader:
                 f"[offload_modules] {module_index=} {torch.cuda.memory_allocated()=}"
             )
             all_modules.append(module)
-            if module_index % module_interval == module_interval - 1:
+            if module_index % group_size >= group_size - num_offload_in_group:
                 submodule = submodule_accessor(module)
                 logger.info(
                     f"[offload_modules] move {module_index=} submodule={type(submodule)} to cpu"
