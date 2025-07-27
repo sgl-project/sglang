@@ -25,11 +25,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache, MLATokenToKVPoolHost
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
-    get_world_group
-)
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
@@ -83,13 +78,11 @@ class CacheOperation:
         device_indices: torch.Tensor,
         node_id: int,
         priority: Optional[int] = None,
-        page_size: Optional[int] = None,
     ):
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
         self.data = None
-        self.page_size = page_size
 
         self.id = CacheOperation.counter
         CacheOperation.counter += 1
@@ -116,7 +109,6 @@ class CacheOperation:
                     host_indices=self.host_indices[i : i + chunk_size],
                     device_indices=self.device_indices[i : i + chunk_size],
                     node_id=0,
-                    page_size=self.page_size,
                 )
             )
         # Inherit the node_ids on the final chunk
@@ -392,7 +384,6 @@ class HiCacheController:
                 device_indices,
                 node_id,
                 priority,
-                page_size=self.page_size,
             )
         )
         return host_indices
@@ -728,6 +719,7 @@ class HiCacheController:
                             if len(non_exist_keys) > 0:
                                 key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(non_exist_keys,
                                                                                                  non_exist_indices)
+                                # TODO: check the return value of batch set to see how many tokens are set successfully
                                 self.storage_backend.batch_set(key_strs, target_location=buffer_ptrs, target_sizes=buffer_sizes)
 
                         operation.completed_tokens += len(hash_value) * self.page_size
@@ -736,7 +728,7 @@ class HiCacheController:
                         pass
                 else:
                     for i in range(0, len(tokens_to_backup), self.page_size):
-                        last_hash = hash_value[i]
+                        last_hash = hash_value[i // self.page_size]
                         # todo, handle failures in storage backend
                         if self.storage_zerocopy:
                             pass
