@@ -49,7 +49,11 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
+from sglang.srt.layers.moe.ep_moe.layer import (
+    DeepEPMoE,
+    get_moe_impl_class,
+    use_flashinfer_trtllm_moe,
+)
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -411,15 +415,19 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
             config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
         )
 
-        self.topk = TopK(
-            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
-            renormalize=config.norm_topk_prob,
-            use_grouped_topk=True,
-            num_expert_group=config.n_group,
-            num_fused_shared_experts=self.num_fused_shared_experts,
-            topk_group=config.topk_group,
-            correction_bias=self.gate.e_score_correction_bias,
-            routed_scaling_factor=self.routed_scaling_factor,
+        self.topk = (
+            TopK(
+                top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+                renormalize=config.norm_topk_prob,
+                use_grouped_topk=True,
+                num_expert_group=config.n_group,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                topk_group=config.topk_group,
+                correction_bias=self.gate.e_score_correction_bias,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+            if not use_flashinfer_trtllm_moe
+            else None
         )
 
         self.experts = get_moe_impl_class()(
@@ -441,10 +449,22 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
             # Additional args for FusedMoE
             **(
                 dict(
-                    enable_flashinfer_moe=True,
+                    enable_flashinfer_cutlass_moe=True,
                     enable_ep_moe=global_server_args_dict["enable_ep_moe"],
                 )
-                if global_server_args_dict["enable_flashinfer_moe"]
+                if global_server_args_dict["enable_flashinfer_cutlass_moe"]
+                else {}
+            ),
+            **(
+                dict(
+                    renormalize=config.norm_topk_prob,
+                    use_grouped_topk=True,
+                    num_expert_group=config.n_group,
+                    num_fused_shared_experts=self.num_fused_shared_experts,
+                    topk_group=config.topk_group,
+                    correction_bias=self.gate.e_score_correction_bias,
+                )
+                if use_flashinfer_trtllm_moe
                 else {}
             ),
         )
@@ -467,7 +487,9 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                     else {}
                 ),
             )
-            is_packed_weight = hasattr(self.shared_experts.gate_up_proj.quant_method, "quant_config")
+            is_packed_weight = hasattr(
+                self.shared_experts.gate_up_proj.quant_method, "quant_config"
+            )
             self.shared_experts_is_int8 = (
                 not is_packed_weight
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
@@ -555,7 +577,7 @@ class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
 
-        num_layers = 1 if is_nextn else config.num_hidden_layers 
+        num_layers = 1 if is_nextn else config.num_hidden_layers
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=num_layers,

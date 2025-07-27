@@ -31,10 +31,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.glm4_moe import (
-    Glm4MoeForCausalLM,
-    Glm4MoeDecoderLayer,
-)
+from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
 from sglang.srt.utils import BumpAllocator, add_prefix
 
 logger = logging.getLogger(__name__)

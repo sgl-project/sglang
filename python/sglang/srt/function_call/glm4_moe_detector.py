@@ -1,7 +1,7 @@
+import ast
 import json
 import logging
 import re
-import ast
 from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -37,7 +37,6 @@ def parse_arguments(json_value):
         return json_value, False
 
 
-
 class Glm4MoeDetector(BaseFormatDetector):
     """
     Detector for GLM-4.5 models.
@@ -49,9 +48,9 @@ class Glm4MoeDetector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
-        self.func_call_regex = r'<tool_call>.*?</tool_call>'
-        self.func_detail_regex = r'<tool_call>([^\n]*)\n(.*)</tool_call>'
-        self.func_arg_regex = r'<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>'
+        self.func_call_regex = r"<tool_call>.*?</tool_call>"
+        self.func_detail_regex = r"<tool_call>([^\n]*)\n(.*)</tool_call>"
+        self.func_arg_regex = r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>"
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 format tool call."""
@@ -77,13 +76,17 @@ class Glm4MoeDetector(BaseFormatDetector):
                 func_detail = re.search(self.func_detail_regex, match_result, re.DOTALL)
                 func_name = func_detail.group(1)
                 func_args = func_detail.group(2)
-                pairs = re.findall(r'<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>', func_args, re.DOTALL)
+                pairs = re.findall(
+                    r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+                    func_args,
+                    re.DOTALL,
+                )
                 arguments = {}
                 for arg_key, arg_value in pairs:
                     arg_key = arg_key.strip()
                     arg_value = arg_value.strip()
                     arg_type = get_argument_type(func_name, arg_key, tools)
-                    if arg_type != 'string':
+                    if arg_type != "string":
                         arg_value, is_good_json = parse_arguments(arg_value)
                     arguments[arg_key] = arg_value
                 # construct match_result for parse_base_json
@@ -123,16 +126,20 @@ class Glm4MoeDetector(BaseFormatDetector):
                 self.prev_tool_call_arr.append({})
             while len(self.streamed_args_for_tool) <= self.current_tool_id:
                 self.streamed_args_for_tool.append("")
-            result = self.detect_and_parse(current_text[:end+len(self.eot_token)], tools=tools)
+            result = self.detect_and_parse(
+                current_text[: end + len(self.eot_token)], tools=tools
+            )
             if result.calls:
                 self.prev_tool_call_arr[self.current_tool_id] = {
                     "name": result.calls[0].name,
-                    "arguments": json.loads(result.calls[0].parameters)
+                    "arguments": json.loads(result.calls[0].parameters),
                 }
-                self.streamed_args_for_tool[self.current_tool_id] = result.calls[0].parameters
+                self.streamed_args_for_tool[self.current_tool_id] = result.calls[
+                    0
+                ].parameters
                 result.calls[0].tool_index = self.current_tool_id
                 self.current_tool_id += 1
-            self._buffer = current_text[end + len(self.eot_token):]
+            self._buffer = current_text[end + len(self.eot_token) :]
             return result
         normal_text = current_text[:start]
         self._buffer = current_text[start:]
@@ -154,5 +161,5 @@ class Glm4MoeDetector(BaseFormatDetector):
             function_format="xml",
             call_rule_fmt='"{name}" "\\n" {arguments_rule} "\\n"',
             key_value_rule_fmt='"<arg_key>{key}</arg_key>" "\\n" "<arg_value>" {valrule} "</arg_value>"',
-            key_value_separator="\\n"
+            key_value_separator="\\n",
         )
