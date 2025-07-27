@@ -132,24 +132,11 @@ class _BaseModuleOffloader(ABC):
             "cpu"
         ), "not handled device=cpu case yet (should skip this tensor)"
 
-    def post_init(self):
-        pass
-
-    def start_onload(self):
-        raise NotImplementedError
-
-    def offload(self):
-        raise NotImplementedError
-
-    def wait_and_get_device_tensors(self):
-        raise NotImplementedError
-
-class _CpuModuleOffloader(_BaseModuleOffloader):
-    def __init__(self, module: torch.nn.Module, alt_stream: torch.cuda.Stream):
-        super().__init__(module, alt_stream)
         self._device_tensors = None
         self._load_event = None
-        _StatelessOffloaderUtil.move_params_to_cpu(module)
+
+    def post_init(self):
+        pass
 
     def start_onload(self):
         self.alt_stream.wait_stream(torch.cuda.current_stream())
@@ -168,6 +155,12 @@ class _CpuModuleOffloader(_BaseModuleOffloader):
         assert self._device_tensors is not None
         self._load_event.wait()
         return self._device_tensors
+
+
+class _CpuModuleOffloader(_BaseModuleOffloader):
+    def __init__(self, module: torch.nn.Module, alt_stream: torch.cuda.Stream):
+        super().__init__(module, alt_stream)
+        _StatelessOffloaderUtil.move_params_to_cpu(module)
 
 class _ShardedGpuModuleOffloader(_BaseModuleOffloader):
     def __init__(self, module: torch.nn.Module, alt_stream: torch.cuda.Stream):
