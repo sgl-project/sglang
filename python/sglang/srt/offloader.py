@@ -130,6 +130,13 @@ class _ModuleOffloader(ABC):
         self._device_tensors = None
         self._load_event = None
 
+        self._param_offloaders = {
+            name: _BaseParamOffloader.create(mode, param=param)
+            for name, param in self.module.named_parameters()
+        }
+
+        for name, param in self.module.named_parameters():
+
     def post_init(self):
         pass
 
@@ -154,7 +161,15 @@ class _ModuleOffloader(ABC):
 
 
 class _BaseParamOffloader(ABC):
-    TODO
+    @staticmethod
+    def create(mode: str, **kwargs):
+        return {
+            "cpu": _CpuParamOffloader,
+            "sharded_gpu": _ShardedGpuParamOffloader,
+        }[mode](**kwargs)
+
+    def __init__(self, param):
+        self._param = param
 
 
 class _CpuParamOffloader(_BaseParamOffloader):
