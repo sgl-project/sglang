@@ -110,10 +110,10 @@ class MooncakeStore(HiCacheStorage):
 
         try:
             self.store = MooncakeDistributedStore()
-            self.config = MooncakeStoreConfig.from_file()
+            self.config = MooncakeStoreConfig.load_from_env()
             logger.info("Mooncake Configuration loaded from env successfully.")
 
-            setup_code = self.store.setup(
+            ret_code = self.store.setup(
                 self.config.local_hostname,
                 self.config.metadata_server,
                 self.config.global_segment_size,
@@ -122,7 +122,9 @@ class MooncakeStore(HiCacheStorage):
                 self.config.device_name,
                 self.config.master_server_address,
             )
-            assert setup_code == 0
+            if ret_code:
+                logger.error(f"failed to setup mooncake store, error code: {ret_code}")
+            
             logger.info("Connect to Mooncake store successfully.")
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
@@ -150,7 +152,9 @@ class MooncakeStore(HiCacheStorage):
         try:
             buffer_ptr = buffer.data_ptr()
             buffer_size = buffer.numel() * buffer.element_size()
-            self.store.register_buffer(buffer_ptr, buffer_size)
+            ret_code = self.store.register_buffer(buffer_ptr, buffer_size)
+            if ret_code:
+                logger.error(f"failed to register buffer, error code: {ret_code}")
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
