@@ -46,7 +46,8 @@ class ModuleOffloader:
 
         for index, module in enumerate(offload_submodules):
             _hook_module_forward_for_offloader(
-                index=index, module=module, offloaders=self.offloaders
+                index=index, module=module, offloaders=self.offloaders,
+                prefetch_step=prefetch_step,
             )
 
         return all_modules
@@ -68,13 +69,14 @@ def _parse_config():
     return int(group_size), int(num_offload_in_group)
 
 
-def _hook_module_forward_for_offloader(index, module, offloaders):
+def _hook_module_forward_for_offloader(index, module, offloaders, prefetch_step):
+    def _on_forward_end():
+        offloaders[(index + prefetch_step) % len(offloaders)].start_onload()
+        offloaders[index].offload()
+
     _hook_module_forward_raw(
         module,
-        on_forward_start=lambda: offloaders[
-            (index + 1) % len(offloaders)
-        ].start_onload(),
-        on_forward_end=lambda: offloaders[index].offload(),
+        on_forward_end=_on_forward_end,
         get_parameter_and_buffer_dicts=lambda: offloaders[
             index
         ].wait_and_get_device_tensors(),
@@ -82,13 +84,12 @@ def _hook_module_forward_for_offloader(index, module, offloaders):
 
 
 def _hook_module_forward_raw(
-    module, on_forward_start, on_forward_end, get_parameter_and_buffer_dicts
+    module, on_forward_end, get_parameter_and_buffer_dicts
 ):
     original_forward = module.forward
 
     def forward(*args, **kwargs):
         module.forward = original_forward
-        on_forward_start()
         output = functional_call(
             module, get_parameter_and_buffer_dicts(), args=args, kwargs=kwargs
         )
