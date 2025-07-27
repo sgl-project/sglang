@@ -85,6 +85,8 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager
 
+from sglang.srt.metrics.func_timer import enable_func_timer
+
 logger = logging.getLogger(__name__)
 
 show_time_cost = False
@@ -744,9 +746,13 @@ def load_image(
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, stream=True, timeout=timeout).raw
-        image = Image.open(response)
-        response.close()
+        response = requests.get(image_file, stream=True, timeout=timeout)
+        try:
+            response.raise_for_status()
+            image = Image.open(response.raw)
+            image.load()  # Force loading to avoid issues after closing the stream
+        finally:
+            response.close()
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
@@ -931,71 +937,6 @@ def monkey_patch_vllm_gguf_config():
         return None
 
     setattr(GGUFConfig, "get_quant_method", get_quant_method_with_embedding_replaced)
-
-
-def maybe_set_triton_cache_manager() -> None:
-    """Set environment variable to tell Triton to use a
-    custom cache manager"""
-    cache_manger = os.environ.get("TRITON_CACHE_MANAGER", None)
-    if cache_manger is None:
-        manager = "sglang.srt.utils:CustomCacheManager"
-        logger.debug("Setting Triton cache manager to: %s", manager)
-        os.environ["TRITON_CACHE_MANAGER"] = manager
-
-
-class CustomCacheManager(FileCacheManager):
-    # Adapted from: https://github.com/tdoublep/vllm/blob/3307522289fdfefe323b6c00d0db696651989a2f/vllm/triton_utils/custom_cache_manager.py
-    def __init__(self, key, override=False, dump=False):
-        from sglang.srt.distributed.parallel_state import get_tp_group
-
-        self.key = key
-        self.lock_path = None
-
-        try:
-            module_path = "triton.runtime.cache"
-            cache_module = importlib.import_module(module_path)
-
-            default_cache_dir = getattr(cache_module, "default_cache_dir", None)
-            default_dump_dir = getattr(cache_module, "default_dump_dir", None)
-            default_override_dir = getattr(cache_module, "default_override_dir", None)
-        except (ModuleNotFoundError, AttributeError) as e:
-            default_cache_dir = None
-            default_dump_dir = None
-            default_override_dir = None
-
-        if dump:
-            self.cache_dir = (
-                default_dump_dir()
-                if default_dump_dir is not None
-                else os.path.join(Path.home(), ".triton", "dump")
-            )
-            self.cache_dir = os.path.join(self.cache_dir, self.key)
-            self.lock_path = os.path.join(self.cache_dir, "lock")
-            os.makedirs(self.cache_dir, exist_ok=True)
-        elif override:
-            self.cache_dir = (
-                default_override_dir()
-                if default_override_dir is not None
-                else os.path.join(Path.home(), ".triton", "override")
-            )
-            self.cache_dir = os.path.join(self.cache_dir, self.key)
-        else:
-            # create cache directory if it doesn't exist
-            self.cache_dir = os.getenv("TRITON_CACHE_DIR", "").strip() or (
-                default_cache_dir()
-                if default_cache_dir is not None
-                else os.path.join(Path.home(), ".triton", "cache")
-            )
-            if self.cache_dir:
-                try:
-                    self.cache_dir = f"{self.cache_dir}_{get_tp_group().local_rank}"
-                except:
-                    self.cache_dir = f"{self.cache_dir}_{os.getpid()}"
-                self.cache_dir = os.path.join(self.cache_dir, self.key)
-                self.lock_path = os.path.join(self.cache_dir, "lock")
-                os.makedirs(self.cache_dir, exist_ok=True)
-            else:
-                raise RuntimeError("Could not create or locate cache dir")
 
 
 def set_ulimit(target_soft_limit=65535):
@@ -2061,6 +2002,16 @@ def is_valid_ipv6_address(address: str) -> bool:
         return False
 
 
+def maybe_wrap_ipv6_address(address: str) -> str:
+    if is_valid_ipv6_address(address):
+        return f"[{address}]"
+    return address
+
+
+def format_tcp_address(ip: str, port: int) -> str:
+    return f"tcp://{maybe_wrap_ipv6_address(ip)}:{port}"
+
+
 def configure_ipv6(dist_init_addr):
     addr = dist_init_addr
     end = addr.find("]")
@@ -2100,7 +2051,7 @@ def rank0_log(msg: str):
         logger.info(msg)
 
 
-def launch_dummy_health_check_server(host, port):
+def launch_dummy_health_check_server(host, port, enable_metrics):
     import asyncio
 
     import uvicorn
@@ -2117,6 +2068,11 @@ def launch_dummy_health_check_server(host, port):
     async def health_generate():
         """Check the health of the http server."""
         return Response(status_code=200)
+
+    # Add prometheus middleware
+    if enable_metrics:
+        add_prometheus_middleware(app)
+        enable_func_timer()
 
     config = uvicorn.Config(
         app,
