@@ -188,8 +188,8 @@ class _CpuParamOffloader(_BaseParamOffloader):
         return self._param.to("cuda", non_blocking=True)
 
 class _ShardedGpuParamOffloader(_BaseParamOffloader):
-    def __init__(self, param):
-        super().__init__(param)
+    def __init__(self, module, param_name):
+        super().__init__(module, param_name)
         self._rank = dist.get_rank()
         self._world_size = dist.get_world_size()
 
