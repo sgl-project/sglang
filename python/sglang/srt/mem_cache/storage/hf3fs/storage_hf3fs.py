@@ -269,7 +269,7 @@ class HiCacheHF3FS(HiCacheStorage):
         self.key_to_index.clear()
 
     def close(self) -> None:
-        logger.info("close HiCacheHF3FS")
         for c in self.clients:
             c.close()
         self.executor.shutdown(wait=True)
+        logger.info("close HiCacheHF3FS")

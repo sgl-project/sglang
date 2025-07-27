@@ -522,9 +522,6 @@ class HiCacheController:
         self.prefetch_queue.put(operation)
         return operation
 
-    def prefetch_done(self, operation):
-        return operation.completed_tokens == len(operation.token_ids)
-
     def terminate_prefetch(self, operation):
         operation.mark_done()
         return operation.completed_tokens, operation.hash_value
@@ -566,16 +563,6 @@ class HiCacheController:
         aux_thread.start()
         while (not self.stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
-                queue_size = torch.tensor(self.prefetch_queue.qsize(), dtype=torch.int)
-                if torch.distributed.get_world_size(group=self.tp_group) > 1:
-                    torch.distributed.all_reduce(
-                        queue_size,
-                        op=torch.distributed.ReduceOp.MIN,
-                        group=self.tp_group,
-                    )
-                if queue_size.item() == 0:
-                    continue
-
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue

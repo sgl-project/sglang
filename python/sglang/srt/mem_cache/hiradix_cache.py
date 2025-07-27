@@ -81,7 +81,6 @@ class HiRadixCache(RadixCache):
         self.write_through_threshold_storage = (
             1 if hicache_write_policy == "write_through" else 3
         )
-        self.max_prefetch_retries = 3
         self.load_back_threshold = 10
         super().__init__(
             req_to_token_pool, token_to_kv_pool_allocator, page_size, disable=False
@@ -368,7 +367,7 @@ class HiRadixCache(RadixCache):
             operation = self.cache_controller.prefetch_revoke_queue.get()
             req_id = operation.request_id
             if req_id in self.ongoing_prefetch:
-                last_host_node, _, host_indices, _, _ = self.ongoing_prefetch[req_id]
+                last_host_node, _, host_indices, _ = self.ongoing_prefetch[req_id]
                 last_host_node.release_host()
                 self.cache_controller.mem_pool_host.free(host_indices)
                 del self.ongoing_prefetch[req_id]
@@ -398,36 +397,13 @@ class HiRadixCache(RadixCache):
     def check_prefetch_progress(self, req_id: str):
         if req_id not in self.ongoing_prefetch:
             # there is no ongoing prefetch for this request or it has been revoked
-            return True
+            return
 
         # todo: more policies for prefetch progress such as timeout
         # the current policy is to prefetch with best effort and terminate when queuing is over
-        last_host_node, token_ids, host_indices, operation, _ = self.ongoing_prefetch[
+        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
             req_id
         ]
-
-        # retry if prefetch has not been done
-        prefetch_done = torch.tensor(
-            self.cache_controller.prefetch_done(operation), dtype=torch.int
-        )
-        retries = torch.tensor(self.ongoing_prefetch[req_id][4], dtype=torch.int)
-        if torch.distributed.get_world_size(group=self.tp_group) > 1:
-            torch.distributed.all_reduce(
-                prefetch_done,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            torch.distributed.all_reduce(
-                retries,
-                op=torch.distributed.ReduceOp.MAX,
-                group=self.tp_group,
-            )
-        prefetch_done = prefetch_done.item()
-        retries = retries.item()
-        if (prefetch_done == 0) and (retries > 0):
-            self.ongoing_prefetch[req_id][4] = retries - 1
-            return False
-
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
@@ -459,7 +435,6 @@ class HiRadixCache(RadixCache):
         )
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
-        return True
 
     def match_prefix(self, key: List[int], **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -523,7 +498,6 @@ class HiRadixCache(RadixCache):
             new_input_tokens,
             host_indices,
             operation,
-            self.max_prefetch_retries,
         ]
 
     def _insert_helper_host(self, node: TreeNode, key: List, host_value, hash_value):
