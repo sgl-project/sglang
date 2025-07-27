@@ -1,3 +1,4 @@
+import torch.distributed as dist
 import logging
 import os
 from abc import ABC
@@ -156,6 +157,7 @@ class _CpuModuleOffloader(_BaseModuleOffloader):
 class _ShardedGpuModuleOffloader(_BaseModuleOffloader):
     def __init__(self, module: torch.nn.Module, alt_stream: torch.cuda.Stream):
         super().__init__(module, alt_stream)
+        self.rank = dist.get_rank()
         assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
 
 class _StatelessOffloaderUtil:
