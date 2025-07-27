@@ -60,9 +60,12 @@ class ModuleOffloader:
 
         return all_modules
 
-    def on_post_load(self):
+    def post_init(self):
         if not self.enabled:
             return
+
+        for offloader in self.offloaders:
+            offloader.post_init()
 
         for i in range(self.prefetch_step):
             self.offloaders[i].start_onload()
@@ -127,6 +130,9 @@ class _BaseModuleOffloader(ABC):
         assert self.device != torch.device(
             "cpu"
         ), "not handled device=cpu case yet (should skip this tensor)"
+
+    def post_init(self):
+        pass
 
     def start_onload(self):
         raise NotImplementedError
