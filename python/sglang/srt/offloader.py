@@ -1,4 +1,3 @@
-import torch.distributed._symmetric_memory as symm_mem
 import torch.distributed as dist
 import logging
 import os
@@ -203,7 +202,7 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         else:
             _move_param_to_meta(self._module, self._param_name)
 
-        self.sharded_param_handle = None
+        self.sharded_param_handles = None
 
     def post_init(self):
         # check again since it may be changed
@@ -216,12 +215,10 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
             assert scatter_src.device.type == "meta", f"{scatter_src.device.type=}"
         scatter_list = _even_chunk(scatter_src, self._world_size)
 
-        sharded_param = symm_mem.empty(scatter_list[0].shape, dtype=scatter_list[0].dtype, device="cuda")
-        handle = symm_mem.rendezvous(sharded_param, dist.group.WORLD)
+        sharded_param = torch.empty(scatter_list[0].shape, dtype=scatter_list[0].dtype, device="cuda")
+        self.sharded_param_handles = _create_shared_buffer_tensors(local_tensor=sharded_param)
 
         dist.scatter(sharded_param, scatter_list if self._rank == 0 else None, src=0)
-
-        self.sharded_param_handle = handle
 
         if self._rank == 0:
             _move_param_to_meta(self._module, self._param_name)
@@ -232,7 +229,7 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
 
         for index in range(self._world_size):
             src_rank = (self._rank + index) % self._world_size
-            src_buf = symm_mem.get_buffer(src_rank, output.shape, output.dtype)
+            src_buf = self.sharded_param_handles[src_rank]
             output_chunks[src_rank].copy_(src_buf)
 
         return output
