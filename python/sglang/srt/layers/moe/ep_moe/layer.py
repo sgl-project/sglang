@@ -1409,8 +1409,8 @@ class AscendDeepEPMoE(EPMoE):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
         topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
         reorder_topk_ids: torch.Tensor,
         seg_indptr: torch.Tensor,
         masked_m: torch.Tensor,
