@@ -249,7 +249,8 @@ class _ShmCpuParamOffloader(_BaseParamOffloader):
 
     def post_init(self):
         if self._rank == 0:
-            assert self.shm_cpu_data is self._param.data, f"{self.shm_cpu_data=} {self._param.data=}"
+            assert self.shm_cpu_data.data_ptr() == self._param.data.data_ptr(), \
+                f"{self.shm_cpu_data.data_ptr()=} {self._param.data.data_ptr()=} {self.shm_cpu_data=} {self._param.data=}"
 
         _move_param_to_meta(self._module, self._param_name)
 
