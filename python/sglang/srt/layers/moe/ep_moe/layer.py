@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -54,6 +55,9 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+# Check if FP8 should be disabled for EP mode to improve accuracy
+_DISABLE_EP_FP8 = os.environ.get("SGL_DISABLE_EP_FP8", "false").lower() == "true"
 use_flashinfer_trtllm_moe = (
     global_server_args_dict["enable_flashinfer_trtllm_moe"]
     and global_server_args_dict["enable_ep_moe"]
@@ -304,7 +308,7 @@ class EPMoE(FusedMoE):
         return (local_num_experts, expert_map)
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8 and not _DISABLE_EP_FP8:
             return self.forward_deepgemm(hidden_states, topk_output)
         else:
             return self.forward_normal(hidden_states, topk_output)
@@ -791,10 +795,11 @@ class DeepEPMoE(EPMoE):
             routed_scaling_factor=routed_scaling_factor,
         )
         self.deepep_mode = deepep_mode
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not _DISABLE_EP_FP8:
             assert self.use_fp8_w8a8, (
                 "DeepGEMM requires an fp8_w8a8 model; "
-                "alternatively, you can disable DeepGEMM by turning off the ENABLE_JIT_DEEPGEMM environment variable."
+                "alternatively, you can disable DeepGEMM by turning off the ENABLE_JIT_DEEPGEMM environment variable "
+                "or set SGL_DISABLE_EP_FP8=true to disable FP8 in EP mode."
             )
 
         if self.deepep_mode.enable_low_latency():
@@ -851,7 +856,7 @@ class DeepEPMoE(EPMoE):
             forward_batch.is_extend_in_batch
         )
         if resolved_deepep_mode == DeepEPMode.normal:
-            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not _DISABLE_EP_FP8:
                 return self.forward_deepgemm_contiguous(
                     hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
                 )
