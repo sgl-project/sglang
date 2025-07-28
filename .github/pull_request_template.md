@@ -8,6 +8,14 @@
 
 <!-- Describe the changes made in this PR. -->
 
+## Accuracy Test
+
+<!-- Provide accuracy test results for this PR. Ref: https://docs.sglang.ai/references/accuracy_evaluation.html -->
+
+## Benchmark & Profiling
+
+<!-- Provide performance benchmark and profiling results for this PR. Ref: https://docs.sglang.ai/references/benchmark_and_profiling.html -->
+
 ## Checklist
 
 - [ ] Format your code according to the [Code Formatting with Pre-Commit](https://docs.sglang.ai/references/contribution_guide.html#code-formatting-with-pre-commit).
