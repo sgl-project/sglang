@@ -252,17 +252,17 @@ void topk_softmax_kernel_impl(
   });
 }
 
-template <typename param_t, int SIZE>
+template <typename scalar_t, typename param_t, int SIZE>
 inline void
 apply_bias(float* __restrict__ scores2, const float* __restrict__ scores, const param_t* __restrict__ bias) {
   using fVec = at::vec::Vectorized<float>;
-  using bVec = at::vec::Vectorized<param_t>;
-  auto vec_size = fVec::size() * 2 == bVec::size() ? bVec::size() : fVec::size() * 2;
+  using bVec = at::vec::Vectorized<scalar_t>;
+  auto vec_size = bVec::size();
   int d = 0;
   for (; d <= SIZE - vec_size; d += vec_size) {
     fVec bias0, bias1, x0, x1;
-    std::tie(bias0, bias1) = load_float_vec2<param_t>(bias + d);
-    std::tie(x0, x1) = load_float_vec2<float>(scores + d);
+    std::tie(bias0, bias1) = load_float_vec2(bias + d);
+    std::tie(x0, x1) = load_float_vec2(scores + d);
     x0 = x0 + bias0;
     x1 = x1 + bias1;
     x0.store(scores2 + d);
@@ -300,7 +300,7 @@ void biased_grouped_topk_kernel_impl(
       // do sigmoid to get scores
       sigmoid<scalar_t, NUM_EXPERTS>(scores, gating_output + i * NUM_EXPERTS);
 
-      apply_bias<param_t, NUM_EXPERTS>(scores2, scores, bias);
+      apply_bias<scalar_t, param_t, NUM_EXPERTS>(scores2, scores, bias);
 
       for (int64_t g = 0; g < num_groups; ++g) {
         // find the max

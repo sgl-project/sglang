@@ -47,11 +47,9 @@ namespace {
     }                                                            \
   }()
 
-// dispatch mixed precision of TYPE2 with TYPE1:
-// TYPE2: float32
-//    with TYPE1: bfloat16, float16
-// TYPE2: bfloat16, float16
-//    with TYPE1: same as TYPE2
+// dispatch with mixed dtypes (TYPE1, TYPE2):
+//   TYPE1: the primary dtype (input, output, weight);
+//   TYPE2: the secondary dtype (bias, etc.).
 #define CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(TYPE1, TYPE2, ...) \
   [&] {                                                            \
     if (TYPE2 == at::kFloat) {                                     \

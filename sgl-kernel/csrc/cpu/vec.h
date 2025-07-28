@@ -16,10 +16,8 @@ inline Vectorized<scalar_t> convert_from_float_ext(const Vectorized<float>& a, c
   return at::vec::convert_from_float<scalar_t>(a, b);
 }
 
-// base type /* allow only f32, f16, bf16*/
-template <
-    typename scalar_t,
-    typename std::enable_if_t<is_reduced_floating_point_v<scalar_t> || std::is_same_v<scalar_t, float>, int> = 1>
+// allow f16, bf16
+template <typename scalar_t, typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 1>
 inline std::tuple<Vectorized<float>, Vectorized<float>> load_float_vec2(const scalar_t* __restrict__ data) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
@@ -29,9 +27,8 @@ inline std::tuple<Vectorized<float>, Vectorized<float>> load_float_vec2(const sc
   return std::make_tuple(x0, x1);
 }
 
-// specification for `float`
-template <>
-inline std::tuple<Vectorized<float>, Vectorized<float>> load_float_vec2<float>(const float* __restrict__ data) {
+// allow  f32
+inline std::tuple<Vectorized<float>, Vectorized<float>> load_float_vec2(const float* __restrict__ data) {
   using fVec = at::vec::Vectorized<float>;
   fVec x0 = fVec::loadu(data);
   fVec x1 = fVec::loadu(data + fVec::size());
