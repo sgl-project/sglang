@@ -63,8 +63,8 @@ class FusedMoE(torch.nn.Module):
         num_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        layer_id: int,
         top_k: Optional[int] = None,
-        layer_id: Optional[int] = None,
         params_dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
@@ -377,15 +377,11 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        try:
-            physical_expert_ids = (
-                get_global_expert_location_metadata().logical_to_all_physical(
-                    self.layer_id, expert_id
-                )
+        physical_expert_ids = (
+            get_global_expert_location_metadata().logical_to_all_physical(
+                self.layer_id, expert_id
             )
-        except Exception as e:
-            # TODO: temporary fix for mixtral
-            physical_expert_ids = [expert_id]
+        )
 
         for physical_expert_id in physical_expert_ids:
             self._weight_loader_physical(

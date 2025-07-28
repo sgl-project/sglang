@@ -70,6 +70,7 @@ class MixtralMoE(nn.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
+        layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
@@ -98,6 +99,7 @@ class MixtralMoE(nn.Module):
         self.experts = MoEImpl(
             num_experts=num_experts,
             top_k=top_k,
+            layer_id=layer_id,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             params_dtype=params_dtype,
@@ -227,6 +229,7 @@ class MixtralDecoderLayer(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
+            layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("block_sparse_moe", prefix),
         )
@@ -476,14 +479,13 @@ class MixtralForCausalLM(nn.Module):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
     
-    # FIXME: mixtral is not compatible with EPLB now
-    # @classmethod
-    # def get_model_config_for_expert_location(cls, config):
-    #     return ModelConfigForExpertLocation(
-    #         num_layers=config.num_hidden_layers,
-    #         num_logical_experts=config.num_local_experts,
-    #         num_groups=None,
-    #     )
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_local_experts,
+            num_groups=None,
+        )
 
 
 EntryClass = MixtralForCausalLM
