@@ -184,6 +184,7 @@ class _BaseParamOffloader(ABC):
         return {
             "meta": _MetaParamOffloader,
             "cpu": _CpuParamOffloader,
+            "shm_cpu": _ShmCpuParamOffloader,
             "sharded_gpu": _ShardedGpuParamOffloader,
         }[mode](**kwargs)
 
@@ -214,6 +215,14 @@ class _CpuParamOffloader(_BaseParamOffloader):
     def __init__(self, module, param_name):
         super().__init__(module, param_name)
         _move_param_to_cpu(self._param)
+
+    def create_device_tensor(self):
+        return self._param.to("cuda", non_blocking=True)
+
+class _ShmCpuParamOffloader(_BaseParamOffloader):
+    def __init__(self, module, param_name):
+        super().__init__(module, param_name)
+        _move_param_to_shm_cpu(self._param)
 
     def create_device_tensor(self):
         return self._param.to("cuda", non_blocking=True)
@@ -275,6 +284,15 @@ def _move_param_to_cpu(param):
         pin_memory=is_pin_memory_available(),
     )
     cpu_data.copy_(param.data)
+    param.data = cpu_data
+
+def _move_param_to_shm_cpu(param):
+    cpu_data = TODO
+
+    if NaiveDistributed.instance.get_rank() == 0:
+        cpu_data.copy_(param.data)
+    NaiveDistributed.instance.barrier()
+
     param.data = cpu_data
 
 def _move_param_to_meta(module, param_name):
