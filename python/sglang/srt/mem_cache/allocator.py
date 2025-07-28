@@ -188,7 +188,7 @@ class ElasticTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free(self, free_index: torch.Tensor):
         if self.is_not_in_free_group:
-            return self.kvcached_allocator.free(free_index.cpu().numpy())
+            return self.kvcached_allocator.free(free_index.cpu().numpy().tolist())
         else:
             self.free_group.append(free_index)
 
