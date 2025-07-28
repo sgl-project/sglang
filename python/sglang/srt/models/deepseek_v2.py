@@ -2360,6 +2360,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         ):
             self._weight_requant_ue8m0(is_nextn)
 
+    def post_init(self):
         self.module_offloader.post_init()
 
     def _weight_requant_ue8m0(self, is_nextn=False):
