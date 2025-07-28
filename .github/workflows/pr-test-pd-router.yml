@@ -254,7 +254,7 @@ jobs:
           # Run genai-bench benchmark
           echo "Running genai-bench for $policy..."
           genai-bench benchmark \
-            --api-backend sglang \
+            --api-backend openai \
             --api-base "http://127.0.0.9:8000" \
             --api-model-name "/raid/models/meta-llama/Llama-3.1-8B-Instruct" \
             --model-tokenizer /raid/models/meta-llama/Llama-3.1-8B-Instruct \
