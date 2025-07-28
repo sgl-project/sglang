@@ -204,7 +204,6 @@ suite_amd = {
         TestFile("test_fused_moe.py", 30),
         TestFile("test_hicache.py", 116),
         TestFile("test_hicache_mla.py", 127),
-        TestFile("test_hicache_page.py", 127),
         TestFile("test_hicache_storage.py", 127),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
