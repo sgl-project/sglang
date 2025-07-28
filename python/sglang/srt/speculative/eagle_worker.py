@@ -666,6 +666,14 @@ class EAGLEWorker(TpModelWorker):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
+            if torch.isnan(hidden_states).any():
+                raise ValueError(
+                    f"Detected NaN values: {hidden_states[torch.isnan(hidden_states)]=}"
+                )
+            if torch.isnan(scores).any():
+                raise ValueError(
+                    f"Detected NaN values: {scores[torch.isnan(scores)]=}"
+                )
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])

@@ -230,6 +230,10 @@ class LlamaDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             bias=attention_bias,
         )
+        if torch.isnan(self.self_attn.qkv_proj.weight).any():
+            raise ValueError(
+                f"Detected NaN values: {self.self_attn.qkv_proj.weight[torch.isnan(self.self_attn.qkv_proj.weight)]=}"
+            )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -237,10 +241,26 @@ class LlamaDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
+        if torch.isnan(self.mlp.gate_up_proj.weight).any():
+            raise ValueError(
+                f"Detected NaN values: {self.mlp.gate_up_proj.weight[torch.isnan(self.mlp.gate_up_proj.weight)]=}"
+            )
+        if torch.isnan(self.mlp.down_proj.weight).any():
+            raise ValueError(
+                f"Detected NaN values: {self.mlp.down_proj.weight[torch.isnan(self.mlp.down_proj.weight)]=}"
+            )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if torch.isnan(self.input_layernorm.weight).any():
+            raise ValueError(
+                f"Detected NaN values: {self.input_layernorm.weight[torch.isnan(self.input_layernorm.weight)]=}"
+            )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        if torch.isnan(self.post_attention_layernorm.weight).any():
+            raise ValueError(
+                f"Detected NaN values: {self.post_attention_layernorm.weight[torch.isnan(self.post_attention_layernorm.weight)]=}"
+            )
 
     def forward(
         self,
@@ -255,15 +275,38 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if torch.isnan(hidden_states).any():
+            raise ValueError(
+                f"Detected NaN values: {hidden_states[torch.isnan(hidden_states)]=}"
+            )
+        if torch.isnan(residual).any():
+            raise ValueError(
+                f"Detected NaN values: {residual[torch.isnan(residual)]=}"
+            )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-
+        if torch.isnan(hidden_states).any():
+            raise ValueError(
+                f"Detected NaN values: {hidden_states[torch.isnan(hidden_states)]=}"
+            )
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if torch.isnan(hidden_states).any():
+            raise ValueError(
+                f"Detected NaN values: {hidden_states[torch.isnan(hidden_states)]=}"
+            )
+        if torch.isnan(residual).any():
+            raise ValueError(
+                f"Detected NaN values: {residual[torch.isnan(residual)]=}"
+            )
         hidden_states = self.mlp(hidden_states)
+        if torch.isnan(hidden_states).any():
+            raise ValueError(
+                f"Detected NaN values: {hidden_states[torch.isnan(hidden_states)]=}"
+            )
         return hidden_states, residual
 
 

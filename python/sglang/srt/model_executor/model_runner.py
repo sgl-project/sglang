@@ -1587,6 +1587,7 @@ class ModelRunner:
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
 
+        logger.debug(f"{forward_batch.forward_mode=}")
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,
