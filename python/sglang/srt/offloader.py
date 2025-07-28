@@ -365,6 +365,9 @@ class NaiveDistributed:
         remote_tensor = MultiprocessingSerializer.deserialize(gathered_objects[src]["serialized_scatter_list"][self._rank])
         tensor.copy_(remote_tensor)
 
+        # avoid src tensor be deleted too early
+        self.barrier()
+
     def all_gather_object(self, obj: Any) -> List[Any]:
         self._operation_index += 1
 
