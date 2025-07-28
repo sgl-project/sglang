@@ -29,7 +29,7 @@ from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
 
-from python.sglang.srt.mem_cache.mooncake_store.mooncake_store import MooncakeStore, get_hash_str_mooncake
+from sglang.srt.mem_cache.mooncake_store.mooncake_store import MooncakeStore, get_hash_str_mooncake
 
 logger = logging.getLogger(__name__)
 
