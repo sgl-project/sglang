@@ -246,17 +246,20 @@ class _ShmCpuParamOffloader(_BaseParamOffloader):
         self.shm_cpu_data: Optional[torch.Tensor] = None
 
     def post_init(self):
-        # check again since it may be changed
-        assert self._param.data.is_contiguous(), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
-
-        assert self._param.is_contiguous()
-        self.shm_cpu_data = _shared_memory_manager.malloc(shape=self._param.shape, dtype=self._param.dtype)
-
-        if self._rank == 0:
-            self.shm_cpu_data.copy_(self._param.data.to("cpu"))
-        NaiveDistributed.instance.barrier()
-
+        logger.info(f"hack post_init: only do move to meta {self._param_name} {psutil.Process().memory_info().rss=}")
         _move_param_to_meta(self._module, self._param_name)
+
+        # check again since it may be changed
+        # assert self._param.data.is_contiguous(), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
+        #
+        # assert self._param.is_contiguous()
+        # self.shm_cpu_data = _shared_memory_manager.malloc(shape=self._param.shape, dtype=self._param.dtype)
+        #
+        # if self._rank == 0:
+        #     self.shm_cpu_data.copy_(self._param.data.to("cpu"))
+        # NaiveDistributed.instance.barrier()
+        #
+        # _move_param_to_meta(self._module, self._param_name)
 
 
     def create_device_tensor(self):
