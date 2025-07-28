@@ -800,11 +800,6 @@ class DeepEPMoE(EPMoE):
             routed_scaling_factor=routed_scaling_factor,
         )
         self.deepep_mode = deepep_mode
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            assert self.use_fp8_w8a8, (
-                "DeepGEMM requires an fp8_w8a8 model; "
-                "alternatively, you can disable DeepGEMM by turning off the ENABLE_JIT_DEEPGEMM environment variable."
-            )
 
         # TODO: move to the beginning of the file
         from sglang.srt.distributed.parallel_state import get_tp_group
@@ -897,7 +892,7 @@ class DeepEPMoE(EPMoE):
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
             return self.forward_aiter(dispatch_output)
         if dispatch_output.format.is_deepep_normal():
-            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
                 return self.forward_deepgemm_contiguous(dispatch_output)
             else:
                 return self.forward_normal(dispatch_output)
