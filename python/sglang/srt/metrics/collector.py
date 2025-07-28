@@ -301,8 +301,6 @@ class SchedulerMetricsCollector:
                 60,
                 80,
                 100,
-                200,
-                400,
             ]
 
         self.histogram_kvcache_transfer_latency = Histogram(
