@@ -227,31 +227,8 @@ class ConstantSizeCache(ABC):
         if orphaned_req_ids:
             self._release_finished_requests(orphaned_req_ids)
 
-            # Verify cleanup results
             remaining_orphans = [
                 req_id
                 for req_id in orphaned_req_ids
                 if req_id in self.cache_indices_mapping
             ]
-
-    def get_cache_stats(self) -> dict:
-        """Get cache statistics for monitoring and debugging"""
-        total_slots = len(self.free_cache_indices) + len(
-            [
-                slot_id
-                for req_mapping in self.cache_indices_mapping.values()
-                for slot_id in req_mapping.values()
-            ]
-        )
-
-        return {
-            "total_cache_slots": total_slots,
-            "free_cache_slots": len(self.free_cache_indices),
-            "active_requests": len(self.cache_indices_mapping),
-            "cache_utilization": (
-                1.0 - (len(self.free_cache_indices) / total_slots)
-                if total_slots > 0
-                else 0.0
-            ),
-            "active_request_ids": list(self.cache_indices_mapping.keys()),
-        }

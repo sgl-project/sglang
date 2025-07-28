@@ -1821,7 +1821,6 @@ class Scheduler(
         initial_bs = batch.batch_size()
 
         batch.filter_batch()
-
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
