@@ -177,9 +177,6 @@ suite_amd = {
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
-        TestFile("test_hicache.py", 116),
-        TestFile("test_hicache_mla.py", 127),
-        TestFile("test_hicache_storage.py", 127),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_mla.py", 242),
         TestFile("test_mla_deepseek_v3.py", 221),
@@ -208,6 +205,13 @@ suite_amd = {
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_patch_torch.py", 19),
+        TestFile("test_hicache.py", 116),  # 1-gpu test for larger host memory budget
+        TestFile(
+            "test_hicache_mla.py", 127
+        ),  # 1-gpu test for larger host memory budget
+        TestFile(
+            "test_hicache_storage.py", 127
+        ),  # 1-gpu test for larger host memory budget
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
