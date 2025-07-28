@@ -227,11 +227,37 @@ class _CpuParamOffloader(_BaseParamOffloader):
 class _ShmCpuParamOffloader(_BaseParamOffloader):
     def __init__(self, module, param_name):
         super().__init__(module, param_name)
-        _move_param_to_shm_cpu(self._param)
+        self._rank = NaiveDistributed.instance.get_rank()
+        self._world_size = NaiveDistributed.instance.get_world_size()
+
+        assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
+        assert self._param.data.is_contiguous(), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
+
+        if self._rank == 0:
+            _move_param_to_cpu(self._param)
+        else:
+            _move_param_to_meta(self._module, self._param_name)
+
+        self.shm_cpu_param: Optional[torch.Tensor] = None
+
+    def post_init(self):
+        # check again since it may be changed
+        assert self._param.data.is_contiguous(), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
+
+        assert self._param.is_contiguous()
+        self.shm_cpu_param = _shared_memory_manager.malloc(shape=self._param.shape, dtype=self._param.dtype)
+
+        if self._rank == 0:
+            self.shm_cpu_param.copy_(self._param.data.to("cpu"))
+        NaiveDistributed.instance.barrier()
+
+        _move_param_to_meta(self._module, self._param_name)
+
 
     def create_device_tensor(self):
         return self._param.to("cuda", non_blocking=True)
 
+# TODO unify with ShmCpu mode
 class _ShardedGpuParamOffloader(_BaseParamOffloader):
     def __init__(self, module, param_name):
         super().__init__(module, param_name)
@@ -289,17 +315,6 @@ def _move_param_to_cpu(param):
         pin_memory=is_pin_memory_available(),
     )
     cpu_data.copy_(param.data)
-    param.data = cpu_data
-
-def _move_param_to_shm_cpu(param: torch.Tensor):
-    assert param.is_contiguous()
-    cpu_data = _shared_memory_manager.malloc(shape=param.shape, dtype=param.dtype)
-
-    if NaiveDistributed.instance.get_rank() == 0:
-        cpu_data.copy_(param.data.to("cpu"))
-
-    NaiveDistributed.instance.barrier()
-
     param.data = cpu_data
 
 def _move_param_to_meta(module, param_name):
