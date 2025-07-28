@@ -306,6 +306,7 @@ def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tens
             ]
         )
     )
+    logger.info(f"hi {object_list=}")
 
     output_tensors = []
     for output_rank in range(world_size):
