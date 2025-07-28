@@ -350,7 +350,7 @@ class AnthropicServingMessages(OpenAIServingBase):
     ) -> Union[AnthropicMessagesResponse, StreamingResponse, ORJSONResponse]:
         """Handle Anthropic Messages API request"""
         
-        request_id = self._generate_request_id()
+        request_id = self._generate_request_id_base()
         
         try:
             # Convert to internal format
