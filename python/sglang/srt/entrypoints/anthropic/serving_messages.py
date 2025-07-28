@@ -146,7 +146,7 @@ class AnthropicServingMessages(OpenAIServingBase):
             messages=openai_messages,
             model_path=self.tokenizer_manager.model_path,
             tokenizer=self.tokenizer_manager.tokenizer,
-            chat_template=self.template_manager.get_chat_template(),
+            chat_template=self.template_manager.load_chat_template(),
         )
         
         prompt = conversation.get_prompt()
