@@ -263,7 +263,10 @@ class _ShmCpuParamOffloader(_BaseParamOffloader):
 
 
     def create_device_tensor(self):
-        return self.shm_cpu_data.to("cuda", non_blocking=True)
+        print("hi create_device_tensor sleep forever...", flush=True)
+        time.sleep(1000)
+
+        # return self.shm_cpu_data.to("cuda", non_blocking=True)
 
 # TODO unify with ShmCpu mode
 class _ShardedGpuParamOffloader(_BaseParamOffloader):
