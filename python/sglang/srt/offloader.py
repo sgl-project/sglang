@@ -13,7 +13,7 @@ from torch.func import functional_call
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.parameter import ModelWeightParameter
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import get_int_env_var, is_pin_memory_available, MultiprocessingSerializer
+from sglang.srt.utils import get_int_env_var, is_pin_memory_available, MultiprocessingSerializer, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ class ModuleOffloader:
             memory_profile_path = os.path.join(
                 "/data/numa0/tom/temp_sglang_server2local",
                 str(time.time())
-                + f"-DP-{self.dp_rank}-memory"
+                + f"-DP-{NaiveDistributed.instance.get_rank()}-memory"
                 + ".pickle",
                 )
             torch.cuda.memory._dump_snapshot(memory_profile_path)
