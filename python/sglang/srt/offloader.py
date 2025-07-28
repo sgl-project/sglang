@@ -244,8 +244,7 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
 
         NaiveDistributed.instance.scatter(sharded_param, scatter_list if self._rank == 0 else None)
 
-        if self._rank == 0:
-            _move_param_to_meta(self._module, self._param_name)
+        _move_param_to_meta(self._module, self._param_name)
 
     def create_device_tensor(self):
         output = _empty_strided_like(self._param, device="cuda")
