@@ -180,21 +180,21 @@ class MooncakeStore(HiCacheStorage):
 
     def batch_set(
         self, 
-        key, 
+        keys: List[str], 
         value: Optional[Any] = None, 
         target_location: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None) -> bool:
-        assert len(key) == len(target_location) == len(target_sizes)
-        if len(key) == 0:
+        assert len(keys) == len(target_location) == len(target_sizes)
+        if len(keys) == 0:
             return
 
-        for i in range(len(key)):
-            if (key[i] is None
+        for i in range(len(keys)):
+            if (keys[i] is None
                 or target_location[i] is None
                 or target_sizes[i] is None):
                 return
 
-        self._put_batch_zero_copy_impl(key, target_location, target_sizes)
+        self._put_batch_zero_copy_impl(keys, target_location, target_sizes)
 
     def get(
         self, 
@@ -216,21 +216,21 @@ class MooncakeStore(HiCacheStorage):
     
     def batch_get(
         self, 
-        key, 
+        keys: List[str], 
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None
     ) -> torch.Tensor | None:
-        assert len(key) == len(target_location) == len(target_sizes)
-        if len(key) == 0:
+        assert len(keys) == len(target_location) == len(target_sizes)
+        if len(keys) == 0:
             return
 
-        for i in range(len(key)):
-            if (key[i] is None
+        for i in range(len(keys)):
+            if (keys[i] is None
                 or target_location[i] is None
                 or target_sizes[i] is None):
                 return
 
-        return self._get_batch_zero_copy_impl(key, target_location, target_sizes)
+        return self._get_batch_zero_copy_impl(keys, target_location, target_sizes)
 
     def exists(self, keys) -> bool | dict:
         _keys = []

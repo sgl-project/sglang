@@ -56,7 +56,7 @@ class HiCacheStorage(ABC):
     @abstractmethod
     def batch_get(
         self,
-        keys,
+        keys: List[str],
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None
     ) -> List[torch.Tensor | None]:
@@ -80,7 +80,7 @@ class HiCacheStorage(ABC):
 
     @abstractmethod
     def batch_set(self,
-                  keys,
+                  keys: List[str],
                   values: Optional[Any] = None,
                   target_locations: Optional[Any] = None,
                   target_sizes: Optional[Any] = None) -> bool:
@@ -134,7 +134,7 @@ class HiCacheFile(HiCacheStorage):
 
     def batch_get(
         self,
-        keys,
+        keys: List[str],
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None
     ) -> List[torch.Tensor | None]:
@@ -162,7 +162,7 @@ class HiCacheFile(HiCacheStorage):
             return False
 
     def batch_set(self,
-                  keys,
+                  keys: List[str],
                   values: Optional[Any] = None,
                   target_locations: Optional[Any] = None,
                   target_sizes: Optional[Any] = None) -> bool:
