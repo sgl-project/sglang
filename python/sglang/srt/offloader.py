@@ -324,6 +324,9 @@ class NaiveDistributed:
         self._directory = Path(os.environ["SGLANG_NAIVE_DISTRIBUTED_DIRECTORY"])
         self._directory.mkdir(parents=True, exist_ok=True)
         assert 0 <= rank < world_size
+        
+        # both barrier to be safe, and as a sanity check
+        self.barrier()
 
     def get_rank(self):
         return self._rank
@@ -367,3 +370,7 @@ class NaiveDistributed:
                 time.sleep(0.001)
 
         return [_read_one(interesting_rank) for interesting_rank in range(self._world_size)]
+
+    def barrier(self):
+        actual_objs = self.all_gather_object(self._rank)
+        assert actual_objs == list(range(self._world_size)), f"{actual_objs=}"
