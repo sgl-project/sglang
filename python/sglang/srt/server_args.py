@@ -591,6 +591,15 @@ class ServerArgs:
             "1" if self.disable_outlines_disk_cache else "0"
         )
 
+        # Special Model Arch Constraints
+        # https://github.com/sgl-project/sglang/issues/8454
+        quantization_config = self.get_hf_config().quantization_config
+        if quantization_config is not None and model_arch == "Glm4MoeForCausalLM":
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "Shared Experts Fusion is not supported for FP8 Glm4MoeForCausalLM."
+            )
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and tokenizer
