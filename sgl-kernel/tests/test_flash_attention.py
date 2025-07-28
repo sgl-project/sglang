@@ -31,7 +31,7 @@ def is_fa3_supported(device=None) -> bool:
     ) and (torch.version.cuda >= "12.3")
 
 
-DISABLE_BACKWARD = True
+DISABLE_BACKWARD = False
 # For CI test, we close them to True.
 # DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 # DISABLE_PAGEDKV = os.getenv("FLASH_ATTENTION_DISABLE_PAGEDKV", "FALSE") == "TRUE"
@@ -45,14 +45,14 @@ DISABLE_BACKWARD = True
 #     or torch.cuda.get_device_capability("cuda")[0] < 9
 # )
 
-DISABLE_SPLIT = True
-DISABLE_PAGEDKV = True
-DISABLE_APPENDKV = True
-DISABLE_LOCAL = True
-DISABLE_SOFTCAP = True
-DISABLE_PACKGQA = True
-DISABLE_FP16 = True
-DISABLE_FP8 = True
+DISABLE_SPLIT = False
+DISABLE_PAGEDKV = False
+DISABLE_APPENDKV = False
+DISABLE_LOCAL = False
+DISABLE_SOFTCAP = False
+DISABLE_PACKGQA = False
+DISABLE_FP16 = False
+DISABLE_FP8 = False
 
 
 # Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/hopper/padding.py

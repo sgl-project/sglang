@@ -86,12 +86,19 @@ class TestFlashMLAAttnLatency(unittest.TestCase):
 class TestFlashMLAMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "lmsys/sglang-ci-dsv3-test"
+        # cls.model = "lmsys/sglang-ci-dsv3-test"
+        cls.model = "nvidia/DeepSeek-R1-FP4"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
             other_args.extend(
                 [
+                    "--quantization",
+                    "modelopt_fp4",
+                    "--load-format",
+                    "dummy",
+                    "--tp-size",
+                    "4",
                     "--cuda-graph-max-bs",
                     "4",
                     "--disable-radix",
@@ -101,7 +108,8 @@ class TestFlashMLAMTP(CustomTestCase):
                     "--speculative-algorithm",
                     "EAGLE",
                     "--speculative-draft",
-                    "lmsys/sglang-ci-dsv3-test-NextN",
+                    # "lmsys/sglang-ci-dsv3-test-NextN",
+                    "nvidia/DeepSeek-R1-FP4",
                     "--speculative-num-steps",
                     "1",
                     "--speculative-eagle-topk",
