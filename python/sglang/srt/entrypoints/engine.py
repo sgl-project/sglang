@@ -677,8 +677,10 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set mp start method
     mp.set_start_method("spawn", force=True)
 
-    # TODO hack
-    os.environ["SGLANG_NAIVE_DISTRIBUTED_DIRECTORY"] = f"/tmp/{time.time()}_{random.randint(0, 100000000)}"
+    # TODO maybe only expose run_id
+    run_id = f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
+    os.environ["SGLANG_NAIVE_DISTRIBUTED_DIRECTORY"] = f"/tmp/{run_id}"
+    os.environ["SGLANG_SHARED_MEMORY_MANAGER_BASE_NAME"] = run_id
 
 
 def _launch_subprocesses(
