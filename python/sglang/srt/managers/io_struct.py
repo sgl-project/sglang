@@ -1141,3 +1141,8 @@ class LoRAUpdateResult:
     loaded_adapters: Dict[str, LoRARef] = field(default_factory=dict)
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
+
+@dataclass
+class MultiTokenizerRegisterReq:
+    rids: Optional[Union[List[str], str]] = None
+    ipc_name: Optional[str] = None

@@ -108,6 +108,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    MultiTokenizerRegisterReq,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
@@ -529,6 +530,7 @@ class Scheduler(
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (MultiTokenizerRegisterReq, self.register_multi_tokenizer),
             ]
         )
 
@@ -2552,6 +2554,10 @@ class Scheduler(
 
         return ResumeMemoryOccupationReqOutput()
 
+    def register_multi_tokenizer(self, recv_req: MultiTokenizerRegisterReq):
+        self.send_to_detokenizer.send_pyobj(recv_req)
+        return recv_req
+    
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time
         if t is not None and t <= 0:

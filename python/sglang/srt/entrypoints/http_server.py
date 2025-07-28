@@ -296,13 +296,6 @@ async def lifespan(fast_api_app: FastAPI):
             f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
         )
 
-        # Use a shared lock to update the tokenizer_ipc_name mapping
-        tokenizer_mapping_shm, mapping_len = update_tokenizer_mapping(
-            pid,
-            port_args.tokenizer_ipc_name,
-            f"tokenizer_mapping_{main_pid}",
-            lock_value,
-        )
 
         # Launch tokenizer process
         tokenizer_manager = TokenizerManager(server_args, port_args, False)
@@ -313,6 +306,8 @@ async def lifespan(fast_api_app: FastAPI):
             chat_template=server_args.chat_template,
             completion_template=server_args.completion_template,
         )
+        # register multi tokenizer
+        tokenizer_manager.register_to_main_tokenizer_manager()  
 
         tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
         set_global_state(
@@ -339,8 +334,7 @@ async def lifespan(fast_api_app: FastAPI):
             _global_state.tokenizer_manager
         )
 
-        logger.info(f"mapping_length={mapping_len},tokenizer_worker_num={server_args.tokenizer_worker_num}")
-        # Check if all workers have registered
+        
 
         if server_args.warmups is not None:
             logger.info("Warmup started")
@@ -350,8 +344,7 @@ async def lifespan(fast_api_app: FastAPI):
                 _global_state.tokenizer_manager,
             )
             logger.info("Warmup ended")
-        # wait for detokenizer manager to register zmq
-        time.sleep(12)
+
         logger.info("warmup_thread start")
 
         # Create a warmup thread for each worker
@@ -377,17 +370,6 @@ async def lifespan(fast_api_app: FastAPI):
             try:
                 if "warmup_thread" in locals() and warmup_thread.is_alive():
                     warmup_thread.join()
-                with lock_value.get_lock():  # Use a shared lock to ensure inter-process synchronization during cleanup
-                    tokenizer_mapping_shm.close()
-                    # Check if other workers are still using this mapping
-                    try:
-                        mapping = deserialize_tokenizer_mapping(
-                            read_from_shared_memory(f"tokenizer_mapping_{main_pid}")
-                        )
-                        if len(mapping) <= 1:  # If only the current worker is using it
-                            tokenizer_mapping_shm.unlink()
-                    except FileNotFoundError:
-                        pass
             except Exception as e:
                 logger.error(f"Error when cleaning up shared memory: {e}")
             logger.info(f"worker {pid} ended")
