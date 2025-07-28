@@ -303,7 +303,7 @@ jobs:
                 # These can be adjusted based on your performance requirements
                 ttft_threshold=2.5          # Max 2.5 seconds for first token
                 e2e_latency_threshold=8  # Max 8 seconds for end-to-end
-                input_throughput_threshold=11000   # Min 11000 tokens/s input throughput
+                input_throughput_threshold=11000   # Min 10000 tokens/s input throughput
                 output_throughput_threshold=100   # Min 100 tokens/s output throughput
 
 
