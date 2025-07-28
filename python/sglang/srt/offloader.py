@@ -1,3 +1,4 @@
+import gc
 from dataclasses import dataclass
 import ctypes
 
@@ -344,6 +345,10 @@ def _move_param_to_meta(module, param_name):
     setattr(module, param_name, new_param)
 
     dispose_tensor(old_param)
+
+    # TODO do not call it *per* param
+    gc.collect()
+    trim_memory()
 
 def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
     return torch.empty_strided(
