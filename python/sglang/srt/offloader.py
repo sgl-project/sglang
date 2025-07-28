@@ -294,7 +294,8 @@ def _move_param_to_shm_cpu(param: torch.Tensor):
     cpu_data = _shared_memory_manager.malloc(shape=param.shape, dtype=param.dtype)
 
     if NaiveDistributed.instance.get_rank() == 0:
-        cpu_data.copy_(param.data)
+        cpu_data.copy_(param.data.to("cpu"))
+
     NaiveDistributed.instance.barrier()
 
     param.data = cpu_data
@@ -452,7 +453,10 @@ class _SharedMemoryManager:
         # TODO handle dispose
         if NaiveDistributed.instance.get_rank() == 0:
             shm = shared_memory.SharedMemory(name=shm_name, create=True, size=num_bytes)
-        else:
+
+        NaiveDistributed.instance.barrier()
+
+        if NaiveDistributed.instance.get_rank() != 0:
             shm = shared_memory.SharedMemory(name=shm_name)
 
         tensor = torch.from_numpy(np.ndarray((num_bytes,), dtype=np.uint8, buffer=shm.buf))
