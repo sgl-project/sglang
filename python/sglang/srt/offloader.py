@@ -238,35 +238,23 @@ class _ShmCpuParamOffloader(_BaseParamOffloader):
         assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
         assert self._param.data.is_contiguous(), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
 
+        self.shm_cpu_data = _shared_memory_manager.malloc(shape=self._param.shape, dtype=self._param.dtype)
+
         if self._rank == 0:
-            _move_param_to_cpu(self._param, pin_memory=False)
+            self.shm_cpu_data.copy_(self._param.data.to("cpu"))
+            self._param.data = self.shm_cpu_data
         else:
             _move_param_to_meta(self._module, self._param_name)
-
-        self.shm_cpu_data: Optional[torch.Tensor] = None
+        NaiveDistributed.instance.barrier()
 
     def post_init(self):
-        logger.info(f"hack post_init: only do move to meta {self._param_name} {psutil.Process().memory_info().rss=}")
+        if self._rank == 0:
+            assert self.shm_cpu_data is self._param.data, f"{self.shm_cpu_data=} {self._param.data=}"
+
         _move_param_to_meta(self._module, self._param_name)
 
-        # check again since it may be changed
-        # assert self._param.data.is_contiguous(), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
-        #
-        # assert self._param.is_contiguous()
-        # self.shm_cpu_data = _shared_memory_manager.malloc(shape=self._param.shape, dtype=self._param.dtype)
-        #
-        # if self._rank == 0:
-        #     self.shm_cpu_data.copy_(self._param.data.to("cpu"))
-        # NaiveDistributed.instance.barrier()
-        #
-        # _move_param_to_meta(self._module, self._param_name)
-
-
     def create_device_tensor(self):
-        print("hi create_device_tensor sleep forever...", flush=True)
-        time.sleep(1000)
-
-        # return self.shm_cpu_data.to("cuda", non_blocking=True)
+        return self.shm_cpu_data.to("cuda", non_blocking=True)
 
 # TODO unify with ShmCpu mode
 class _ShardedGpuParamOffloader(_BaseParamOffloader):
@@ -351,12 +339,12 @@ def _move_param_to_meta(module, param_name):
 
     setattr(module, param_name, new_param)
 
-    logger.info(f"hi move_param_to_meta {old_param.device=} {old_param.dtype=} {old_param.shape=}")
-    dispose_tensor(old_param)
-
-    # TODO do not call it *per* param
-    gc.collect()
-    trim_memory()
+    # logger.info(f"hi move_param_to_meta {old_param.device=} {old_param.dtype=} {old_param.shape=}")
+    # dispose_tensor(old_param)
+    #
+    # # TODO do not call it *per* param
+    # gc.collect()
+    # trim_memory()
 
 def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
     return torch.empty_strided(
