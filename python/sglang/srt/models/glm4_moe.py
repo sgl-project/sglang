@@ -795,6 +795,7 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
                 elif (
                     self.quant_config.get_name() == "fp8"
                     or self.quant_config.get_name() == "blockwise_int8"
+                    or self.quant_config.get_name() == "compressed_tensors"
                 ):
                     suffix_list = [
                         "down_proj.weight",
