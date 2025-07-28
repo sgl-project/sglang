@@ -348,6 +348,7 @@ def _move_param_to_meta(module, param_name):
 
     setattr(module, param_name, new_param)
 
+    logger.info(f"hi move_param_to_meta {old_param.device=} {old_param.dtype=} {old_param.shape=}")
     dispose_tensor(old_param)
 
     # TODO do not call it *per* param
