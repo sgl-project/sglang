@@ -32,7 +32,7 @@ class BaseReasoningFormatDetector:
         One-time parsing: Detects and parses reasoning sections in the provided text.
         Returns both reasoning content and normal text separately.
         """
-        in_reasoning = self._in_reasoning or text.startswith(self.think_start_token)
+        in_reasoning = self._in_reasoning or self.think_start_token in text
 
         if not in_reasoning:
             return StreamingParseResult(normal_text=text)
@@ -118,6 +118,14 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
     Returns all the text before the </think> tag as `reasoning_text`
     and the rest of the text as `normal_text`.
 
+    Supported models:
+      - DeepSeek-R1: Always generates thinking content without <think> start tag
+      - DeepSeek-R1-0528: Generates thinking content with <think> start tag
+
+    Format patterns:
+      - DeepSeek-R1: "I need to think about this...</think>The answer is 42."
+      - DeepSeek-R1-0528: "<think>I need to think about this...</think>The answer is 42."
+
     Args:
         stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
             If True, streams reasoning content as it arrives.
@@ -136,11 +144,20 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
 
 class Qwen3Detector(BaseReasoningFormatDetector):
     """
-    Detector for Qwen3 model.
+    Detector for standard Qwen3 models (e.g., Qwen/Qwen3-235B-A22B).
     Assumes reasoning format:
       (<think>)*(.*)</think>
-    Returns all the text before the </think> tag as `reasoning_text`
-    and the rest of the text as `normal_text`.
+
+    Qwen3 models released before 07/2025 supports switching between thinking mode and normal
+    mode using `enable_thinking` parameter in the request parameter.
+      - enable_thinking=True: "<think>reasoning content</think>The answer is 42."
+      - enable_thinking=False: "The answer is 42." (no thinking tokens)
+
+    This detector handles both cases.
+
+    NOTE: Do NOT use this detector for Qwen3-Thinking models (e.g., Qwen3-Thinking-2507).
+    Those models always generate thinking content without <think> start tags.
+    Use "qwen3-thinking" parser type for those models instead.
 
     Args:
         stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
@@ -148,11 +165,35 @@ class Qwen3Detector(BaseReasoningFormatDetector):
     """
 
     def __init__(self, stream_reasoning: bool = True):
-        # Qwen3 won't be in reasoning mode when user passes `enable_thinking=False`
         super().__init__(
             "<think>",
             "</think>",
             force_reasoning=False,
+            stream_reasoning=stream_reasoning,
+        )
+
+
+class Qwen3ThinkingDetector(BaseReasoningFormatDetector):
+    """
+    Detector for Qwen3-Thinking models (e.g., Qwen3-Thinking-2507).
+    Assumes reasoning format:
+      *(.*)</think>
+
+    These models always generate thinking content without <think> start tag.
+    They do not support the enable_thinking parameter and always think.
+
+    Format: "I need to think about this...</think>The answer is 42."
+
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+
+    def __init__(self, stream_reasoning: bool = True):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=True,
             stream_reasoning=stream_reasoning,
         )
 
@@ -189,6 +230,7 @@ class ReasoningParser:
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
         "qwen3": Qwen3Detector,
+        "qwen3-thinking": Qwen3ThinkingDetector,
         "kimi": KimiDetector,
     }
 
