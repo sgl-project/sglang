@@ -513,7 +513,7 @@ class ServerArgs:
                 )
 
             model_arch = self.get_hf_config().architectures[0]
-            if model_arch == "DeepseekV3ForCausalLM":
+            if model_arch in ["DeepseekV3ForCausalLM", "Glm4MoeForCausalLM"]:
                 # Auto set draft_model_path DeepSeek-V3/R1
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
@@ -1108,6 +1108,7 @@ class ServerArgs:
                 "pythonic",
                 "kimi_k2",
                 "qwen3_coder",
+                "glm45",
             ],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', and 'qwen3_coder'.",
