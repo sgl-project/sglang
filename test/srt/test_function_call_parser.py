@@ -2068,7 +2068,7 @@ class TestGlm4MoeDetector(unittest.TestCase):
             tool_calls[1]["parameters"], '{"city": "Shanghai", "date": "2024-06-28"}'
         )
 
-    def test_tool_call_completion(self):
+    def test_tool_call_id(self):
         """Test that the buffer and state are reset after a tool call is completed."""
         chunks = [
             "<tool_call>get_weather\n",
