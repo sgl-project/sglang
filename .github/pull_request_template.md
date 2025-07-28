@@ -8,9 +8,7 @@
 
 <!-- Describe the changes made in this PR. -->
 
-## Accuracy Test
-
-<!-- Provide accuracy test results for this PR. Ref: https://docs.sglang.ai/references/accuracy_evaluation.html -->
+<!-- If this PR affects model-side code (e.g., kernels, model architecture), please provide accuracy test results. Ref: https://docs.sglang.ai/references/accuracy_evaluation.html -->
 
 ## Benchmark & Profiling
 
