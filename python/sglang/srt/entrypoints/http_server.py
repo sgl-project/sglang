@@ -355,7 +355,6 @@ async def lifespan(fast_api_app: FastAPI):
             args=(
                 server_args,
                 None,  # pipe_finish_writer not needed in worker
-                _global_state.tokenizer_manager.image_token_id,
                 None,  # launch_callback not needed in worker
             ),
         )
@@ -1185,7 +1184,6 @@ def launch_server(
             args=(
                 server_args,
                 pipe_finish_writer,
-                _global_state.tokenizer_manager.image_token_id,
                 launch_callback,
             ),
         )
