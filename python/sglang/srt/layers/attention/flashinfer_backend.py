@@ -117,7 +117,7 @@ class FlashInferAttnBackend(AttentionBackend):
             or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
             or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
         ):
-            global_config.flashinfer_workspace_size = 512 * 1024 * 1024
+            global_config.flashinfer_workspace_size = 1024 * 1024 * 1024
 
         # Allocate buffers
         global global_workspace_buffer
