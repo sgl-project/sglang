@@ -1613,9 +1613,9 @@ class ModelRunner:
 
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.post_forward_mlp_sync_batch(ret)
-        if torch.isnan(ret).any():
+        if torch.isnan(ret.next_token_logits).any():
             raise ValueError(
-                f"Detected NaN values: {ret[torch.isnan(ret)]=}"
+                f"Detected NaN values: {ret.next_token_logits[torch.isnan(ret.next_token_logits)]=}"
             )
         return ret, can_run_cuda_graph
 
