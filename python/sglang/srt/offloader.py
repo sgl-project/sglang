@@ -1,3 +1,5 @@
+import cuda.bindings.runtime as cuda_rt
+import numpy as np
 import base64
 import logging
 import os
@@ -6,6 +8,7 @@ import time
 from abc import ABC
 from pathlib import Path
 from typing import Callable, Generator, List, Any, Optional
+from multiprocessing import shared_memory
 
 import torch
 from torch.func import functional_call
@@ -443,6 +446,27 @@ class _SharedMemoryManager:
         return raw.view(dtype).view(*shape)
 
     def _malloc_raw(self, *, num_bytes: int) -> torch.Tensor:
-        return TODO
+        self._operation_index += 1
+        shm_name = f"{self._base_name}_op{self._operation_index}"
+
+        # TODO handle dispose
+        if NaiveDistributed.instance.get_rank() == 0:
+            shm = shared_memory.SharedMemory(name=shm_name, create=True, size=num_bytes)
+        else:
+            shm = shared_memory.SharedMemory(name=shm_name)
+
+        tensor = torch.from_numpy(np.ndarray((num_bytes,), dtype=np.uint8, buffer=shm.buf))
+
+        check_cuda_result(cuda_rt.cudaHostRegister(tensor.data_ptr(), num_bytes, cuda_rt.cudaHostRegisterPortable))
+
+        NaiveDistributed.instance.barrier()
+
+        return tensor
 
 _shared_memory_manager = _SharedMemoryManager()
+
+def check_cuda_result(raw_output):
+    err, *results = raw_output
+    if err != cuda_rt.cudaError_t.cudaSuccess:
+        raise Exception(f"CUDA error: {err}")
+    return results
