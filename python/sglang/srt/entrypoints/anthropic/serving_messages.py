@@ -16,7 +16,6 @@
 import json
 import logging
 import time
-import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 import orjson
@@ -33,6 +32,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
     AnthropicStreamEvent,
+    AnthropicTool,
     AnthropicUsage,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase

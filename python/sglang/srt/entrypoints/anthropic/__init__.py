@@ -21,6 +21,7 @@ from .protocol import (
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
     AnthropicStreamEvent,
+    AnthropicTool,
     AnthropicUsage,
 )
 
@@ -35,5 +36,6 @@ __all__ = [
     "AnthropicMessagesResponse",
     "AnthropicServingMessages",
     "AnthropicStreamEvent",
+    "AnthropicTool",
     "AnthropicUsage",
 ]
