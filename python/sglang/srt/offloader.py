@@ -34,6 +34,8 @@ class ModuleOffloader:
                 world_size=global_server_args_dict["dp_size"],
             )
 
+        print(f"hi {os.environ.get('CUDA_VISIBLE_DEVICES')=}")
+
     def wrap_modules(
         self,
         all_modules_generator: Generator[torch.nn.Module, None, None],
