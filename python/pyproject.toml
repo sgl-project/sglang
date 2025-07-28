@@ -72,6 +72,7 @@ blackwell = [
     "cuda-python",
     "einops",
     "flashinfer_python==0.2.9rc2",
+    "tiktoken",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
