@@ -1046,6 +1046,11 @@ def safe_softmax(logits: torch.Tensor, dim: Optional[int] = -1) -> torch.Tensor:
     A numerically stable softmax implementation with aggressive clamping
     at each intermediate step to prevent NaN generation from inf values.
     """
+    if torch.isnan(logits).any():
+        raise ValueError(
+            f"Detected NaN values: {logits[torch.isnan(logits)]=}"
+        )
+
     finfo = torch.finfo(logits.dtype)
 
     # 0. Clamp the logits.
