@@ -273,7 +273,7 @@ class WhisperEncoder(torch.nn.Module):
         inputs_embeds = torch.nn.functional.gelu(self.conv1(input_features))
         inputs_embeds = torch.nn.functional.gelu(self.conv2(inputs_embeds))
 
-        inputs_embeds = inputs_embeds.permute(0, 2, 1)
+        inputs_embeds = inputs_embeds.mT
         all_positions = torch.arange(
             self.embed_positions.num_embeddings, device=inputs_embeds.device
         )
