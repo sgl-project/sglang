@@ -461,6 +461,7 @@ class _SharedMemoryManager:
 
         tensor = torch.from_numpy(np.ndarray((num_bytes,), dtype=np.uint8, buffer=shm.buf))
 
+        logger.info(f"cudaHostRegister({tensor.data_ptr()=})")
         check_cuda_result(cuda_rt.cudaHostRegister(tensor.data_ptr(), num_bytes, cuda_rt.cudaHostRegisterPortable))
 
         NaiveDistributed.instance.barrier()
