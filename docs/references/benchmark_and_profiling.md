@@ -10,7 +10,7 @@
     ```
   - With a server (please use `sglang.launch_server` to launch a server first and run the following command.)
     ```bash
-    python -m sglang.bench_one_batch_server --base-url http://127.0.0.1:8000 --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch 32 --input-len 256 --output-len 32
+    python -m sglang.bench_one_batch_server --base-url http://127.0.0.1:30000 --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
     ```
 
 
