@@ -526,10 +526,6 @@ class LlamaForCausalLM(nn.Module):
             raise ValueError(
                 f"Detected NaN values: {input_embeds[torch.isnan(input_embeds)]=}"
             )
-        if torch.isnan(pp_proxy_tensors).any():
-            raise ValueError(
-                f"Detected NaN values: {pp_proxy_tensors[torch.isnan(pp_proxy_tensors)]=}"
-            )
 
         hidden_states = self.model(
             input_ids,
