@@ -1268,7 +1268,7 @@ class FlashInferEPMoE(EPMoE):
             topk_group=self.topk_group,
             intermediate_size=self.w2_weight.shape[2],
             local_expert_offset=self.start_expert_id,
-            local_num_experts=self.num_experts_per_partition,
+            local_num_experts=self.num_local_experts,
             routed_scaling_factor=self.routed_scaling_factor,
             tile_tokens_dim=_get_tile_tokens_dim(
                 hidden_states.shape[0], self.top_k, self.num_experts
