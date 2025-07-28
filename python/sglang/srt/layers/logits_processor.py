@@ -302,13 +302,13 @@ class LogitsProcessor(nn.Module):
             pruned_states = hidden_states[last_index]
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
+                if torch.isnan(aux_pruned_states).any():
+                    raise ValueError(
+                        f"Detected NaN values: {aux_pruned_states[torch.isnan(aux_pruned_states)]=}"
+                    )
             if torch.isnan(pruned_states).any():
                 raise ValueError(
                     f"Detected NaN values: {pruned_states[torch.isnan(pruned_states)]=}"
-                )
-            if torch.isnan(aux_pruned_states).any():
-                raise ValueError(
-                    f"Detected NaN values: {aux_pruned_states[torch.isnan(aux_pruned_states)]=}"
                 )
             sample_indices = None
             input_logprob_indices = None
