@@ -244,7 +244,7 @@ class LogitsProcessor(nn.Module):
             raise ValueError(
                 f"Detected NaN values: {hidden_states[torch.isnan(hidden_states)]=}"
             )
-        if torch.isnan(aux_hidden_states).any():
+        if aux_hidden_states is not None and torch.isnan(aux_hidden_states).any():
             raise ValueError(
                 f"Detected NaN values: {aux_hidden_states[torch.isnan(aux_hidden_states)]=}"
             )
@@ -295,7 +295,7 @@ class LogitsProcessor(nn.Module):
                 raise ValueError(
                     f"Detected NaN values: {hidden_states[torch.isnan(hidden_states)]=}"
                 )
-            if torch.isnan(aux_hidden_states).any():
+            if aux_hidden_states is not None and torch.isnan(aux_hidden_states).any():
                 raise ValueError(
                     f"Detected NaN values: {aux_hidden_states[torch.isnan(aux_hidden_states)]=}"
                 )
@@ -353,7 +353,7 @@ class LogitsProcessor(nn.Module):
                 raise ValueError(
                     f"Detected NaN values: {pruned_states[torch.isnan(pruned_states)]=}"
                 )
-            if torch.isnan(aux_pruned_states).any():
+            if aux_hidden_states is not None and torch.isnan(aux_pruned_states).any():
                 raise ValueError(
                     f"Detected NaN values: {aux_pruned_states[torch.isnan(aux_pruned_states)]=}"
                 )
