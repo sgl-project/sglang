@@ -277,21 +277,28 @@ class GemmaRMSNorm(CustomOp):
         return x if residual is None else (x, residual)
 
 
-class Gemma3RMSNorm(nn.Module):
+class Gemma3RMSNorm(CustomOp):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
+        # Re-dispatch
+        if not _is_npu:
+            self._forward_method = self.forward_native
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    def forward(self, x):
+    def forward_native(self, x):
         output = self._norm(x.float())
         # Llama does x.to(float16) * w whilst Gemma3 is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
         output = output * (1.0 + self.weight.float())
         return output.type_as(x)
+
+    def forward_npu(self, x):
+        output, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.eps)
+        return output
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
