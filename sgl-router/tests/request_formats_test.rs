@@ -46,6 +46,7 @@ impl RequestTestContext {
             metrics: None,
             log_dir: None,
             log_level: None,
+            request_id_headers: None,
         };
 
         let client = Client::builder()
