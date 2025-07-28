@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import PDRegistryRequest
+from sglang.srt.utils import maybe_wrap_ipv6_address
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64
@@ -271,7 +272,7 @@ async def handle_generate_request(request_data: dict):
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
-    hostname = parsed_url.hostname
+    hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
     modified_request = request_data.copy()
 
     batch_size = _get_request_batch_size(modified_request)
@@ -309,7 +310,7 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
-    hostname = parsed_url.hostname
+    hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
     modified_request = request_data.copy()
     modified_request.update(
         {
