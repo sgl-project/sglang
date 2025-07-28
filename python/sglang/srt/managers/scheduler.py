@@ -1990,6 +1990,7 @@ class Scheduler(
             deepep_mode=DeepEPMode[self.server_args.deepep_mode],
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
+            enable_dp_attention=self.server_args.enable_dp_attention,
         )
 
     @staticmethod
@@ -2007,6 +2008,7 @@ class Scheduler(
         deepep_mode: DeepEPMode,
         require_mlp_tp_gather: bool,
         disable_overlap_schedule: bool,
+        enable_dp_attention: bool,
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -2061,7 +2063,7 @@ class Scheduler(
             device=device,
         )
         global_info = torch.empty(
-            (dp_size, attn_tp_size, 6),
+            (dp_size if enable_dp_attention else 1, attn_tp_size, 6),
             dtype=torch.int64,
             device=device,
         )
