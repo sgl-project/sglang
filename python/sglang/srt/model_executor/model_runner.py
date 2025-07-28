@@ -619,15 +619,25 @@ class ModelRunner:
         monkey_patch_isinstance_for_vllm_base_layer()
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
-            import memray
-            p = f"/data/numa0/tom/temp/memray_{time.time()}.bin"
-            print(f"memray tracker start {p=}")
-            with memray.Tracker(p):
-                self.model = get_model(
-                    model_config=self.model_config,
-                    load_config=self.load_config,
-                    device_config=DeviceConfig(self.device),
-                )
+            # import memray
+            # p = f"/data/numa0/tom/temp/memray_{time.time()}.bin"
+            # print(f"memray tracker start {p=}")
+            # with memray.Tracker(p):
+
+            import tracemalloc
+            tracemalloc.start()
+
+            self.model = get_model(
+                model_config=self.model_config,
+                load_config=self.load_config,
+                device_config=DeviceConfig(self.device),
+            )
+
+            snapshot = tracemalloc.take_snapshot()
+            top_stats = snapshot.statistics('lineno')
+            logger.info("[TRACEMALLOC RESULTS]")
+            for stat in top_stats[:30]:
+                logger.info(stat)
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
