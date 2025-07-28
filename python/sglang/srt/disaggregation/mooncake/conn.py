@@ -902,7 +902,7 @@ class MooncakeKVManager(BaseKVManager):
     def _collect_kv_transfer_timestamp(
         self, req: TransferInfo, before_transfer: bool, ret: int = 0
     ):
-        if self.scheduler_metrics_collector is not None:
+        if self.scheduler_metrics_collector is None:
             return
 
         if before_transfer:
