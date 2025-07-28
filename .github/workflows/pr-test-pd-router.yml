@@ -307,7 +307,7 @@ jobs:
                 output_throughput_threshold=100    # Min 100 tokens/s for mean output throughput
 
 
-                                # Validate mean thresholds
+                # Validate mean thresholds
                 validation_passed=true
 
                 if (( $(echo "$ttft_mean > $ttft_threshold" | bc -l) )); then
@@ -423,7 +423,7 @@ jobs:
 
         for policy in random round_robin cache_aware power_of_two; do
           # Find genai-bench result folders for this policy
-          result_folder=$(find . -maxdepth 1 -name "benchmark_${policy}_*" -type d | head -1)
+          result_folder=$(find . -maxdepth 1 -name "benchmark_${policy}" -type d | head -1)
 
           if [ -n "$result_folder" ] && [ -d "$result_folder" ]; then
             excel_file=$(find "$result_folder" -name "*_summary.xlsx" | head -1)
