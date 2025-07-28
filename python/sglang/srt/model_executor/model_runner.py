@@ -1490,6 +1490,7 @@ class ModelRunner:
             raise ValueError(
                 f"Detected NaN values: {forward_batch.positions[torch.isnan(forward_batch.positions)]=}"
             )
+        logger.debug(f"{self.model.forward=}")
         return self.model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch, **kwargs
         )
