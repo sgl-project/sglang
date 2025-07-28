@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 import torch
 from sgl_kernel.utils import _get_cache_buf, get_cuda_stream
 
-from sglang.srt.layers.quantization.scalar_type import ScalarType
+from sgl_kernel.scalar_type import ScalarType
 
 
 def awq_dequantize(
