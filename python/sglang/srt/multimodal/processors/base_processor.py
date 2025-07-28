@@ -623,19 +623,4 @@ class BaseMultimodalProcessor(ABC):
                 mm_token_id=mm_token_id,
             )
 
-        # post-process
-        for item in all_collected_items:
-            # replace the feature tensor with a proxy
-            if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                item.feature = TransportProxyTensor(
-                    transport_mode=self.transport_mode, data=item.feature
-                )
-            elif (
-                isinstance(item.precomputed_embeddings, torch.Tensor)
-                and item.precomputed_embeddings.is_cuda
-            ):
-                item.precomputed_embeddings = TransportProxyTensor(
-                    transport_mode=self.transport_mode, data=item.precomputed_embeddings
-                )
-
         return all_collected_items, input_ids, ret
