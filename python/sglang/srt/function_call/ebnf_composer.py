@@ -280,7 +280,11 @@ class EBNFComposer:
 
             # Add required properties joined by commas
             if required:
-                rule_parts.append(f' "{key_value_separator}" '.join(prop_kv_pairs[k] for k in required))
+                rule_parts.append(
+                    f' "{key_value_separator}" '.join(
+                        prop_kv_pairs[k] for k in required
+                    )
+                )
 
             # Add optional properties with flexible ordering
             if optional:
@@ -293,7 +297,9 @@ class EBNFComposer:
                         if j == i:
                             opt_parts.append(prop_kv_pairs[optional[j]])
                         else:
-                            opt_parts.append(f' ( "{key_value_separator}" {prop_kv_pairs[optional[j]]} )?')
+                            opt_parts.append(
+                                f' ( "{key_value_separator}" {prop_kv_pairs[optional[j]]} )?'
+                            )
                     opt_alternatives.append("".join(opt_parts))
 
                 # Wrap with appropriate comma handling based on whether we have required properties

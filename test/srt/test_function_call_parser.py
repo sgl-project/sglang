@@ -631,9 +631,15 @@ class TestEBNFGeneration(unittest.TestCase):
         # Check that the EBNF contains expected patterns for XML format
         self.assertIn('"<tool_call>" function_call "</tool_call>"', ebnf)
         self.assertIn('"get_weather" "\\n" arguments_get_weather', ebnf)
-        self.assertIn('"<arg_key>location</arg_key>" "\\n" "<arg_value>" xml_text "</arg_value>" ( "\\n" ( "<arg_key>unit</arg_key>" "\\n" "<arg_value>" ("celsius" | "fahrenheit") "</arg_value>" ) )?', ebnf)
+        self.assertIn(
+            '"<arg_key>location</arg_key>" "\\n" "<arg_value>" xml_text "</arg_value>" ( "\\n" ( "<arg_key>unit</arg_key>" "\\n" "<arg_value>" ("celsius" | "fahrenheit") "</arg_value>" ) )?',
+            ebnf,
+        )
         self.assertIn('"search" "\\n" arguments_search', ebnf)
-        self.assertIn('"<arg_key>query</arg_key>" "\\n" "<arg_value>" xml_text "</arg_value>"', ebnf)
+        self.assertIn(
+            '"<arg_key>query</arg_key>" "\\n" "<arg_value>" xml_text "</arg_value>"',
+            ebnf,
+        )
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
             ctx = self.grammar_compiler.compile_grammar(ebnf)
@@ -1937,6 +1943,7 @@ circle
         self.assertEqual(params2["shape"], "circle")
         self.assertEqual(params2["dimensions"], {"radius": 5})
 
+
 class TestGlm4MoeDetector(unittest.TestCase):
     def setUp(self):
         self.tools = [
@@ -1968,7 +1975,9 @@ class TestGlm4MoeDetector(unittest.TestCase):
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}')
+        self.assertEqual(
+            result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
+        )
         self.assertEqual(result.normal_text, "")
 
     def test_multiple_tool_calls(self):
@@ -1985,9 +1994,13 @@ class TestGlm4MoeDetector(unittest.TestCase):
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 2)
         self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}')
+        self.assertEqual(
+            result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
+        )
         self.assertEqual(result.calls[1].name, "get_weather")
-        self.assertEqual(result.calls[1].parameters, '{"city": "Shanghai", "date": "2024-06-28"}')
+        self.assertEqual(
+            result.calls[1].parameters, '{"city": "Shanghai", "date": "2024-06-28"}'
+        )
         self.assertEqual(result.normal_text, "")
 
     def test_streaming_tool_call(self):
@@ -2002,7 +2015,10 @@ class TestGlm4MoeDetector(unittest.TestCase):
         for chunk in chunks:
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for tool_call_chunk in result.calls:
-                if hasattr(tool_call_chunk, "tool_index") and tool_call_chunk.tool_index is not None:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
                     while len(tool_calls) <= tool_call_chunk.tool_index:
                         tool_calls.append({"name": "", "parameters": {}})
                     tc = tool_calls[tool_call_chunk.tool_index]
@@ -2012,7 +2028,9 @@ class TestGlm4MoeDetector(unittest.TestCase):
                         tc["parameters"] = tool_call_chunk.parameters
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0]["name"], "get_weather")
-        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}')
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
 
     def test_streaming_multiple_tool_calls(self):
         """Test streaming incremental parsing of multiple tool calls."""
@@ -2029,7 +2047,10 @@ class TestGlm4MoeDetector(unittest.TestCase):
         for chunk in chunks:
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for tool_call_chunk in result.calls:
-                if hasattr(tool_call_chunk, "tool_index") and tool_call_chunk.tool_index is not None:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
                     while len(tool_calls) <= tool_call_chunk.tool_index:
                         tool_calls.append({"name": "", "parameters": {}})
                     tc = tool_calls[tool_call_chunk.tool_index]
@@ -2039,9 +2060,13 @@ class TestGlm4MoeDetector(unittest.TestCase):
                         tc["parameters"] = tool_call_chunk.parameters
         self.assertEqual(len(tool_calls), 2)
         self.assertEqual(tool_calls[0]["name"], "get_weather")
-        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}')
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
         self.assertEqual(tool_calls[1]["name"], "get_weather")
-        self.assertEqual(tool_calls[1]["parameters"], '{"city": "Shanghai", "date": "2024-06-28"}')
+        self.assertEqual(
+            tool_calls[1]["parameters"], '{"city": "Shanghai", "date": "2024-06-28"}'
+        )
 
     def test_tool_call_completion(self):
         """Test that the buffer and state are reset after a tool call is completed."""
@@ -2057,7 +2082,7 @@ class TestGlm4MoeDetector(unittest.TestCase):
 
     def test_invalid_tool_call(self):
         """Test that invalid tool calls are handled correctly."""
-        text = '<tool_call>invalid_func\n<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n</tool_call>'
+        text = "<tool_call>invalid_func\n<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n</tool_call>"
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 0)
 
@@ -2072,8 +2097,11 @@ class TestGlm4MoeDetector(unittest.TestCase):
         result2 = self.detector.parse_streaming_increment(text2, self.tools)
         self.assertEqual(len(result2.calls), 1)
         self.assertEqual(result2.calls[0].name, "get_weather")
-        self.assertEqual(result2.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}')
+        self.assertEqual(
+            result2.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
+        )
         self.assertEqual(self.detector._buffer, "")
+
 
 if __name__ == "__main__":
     unittest.main()

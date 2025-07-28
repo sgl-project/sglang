@@ -60,7 +60,7 @@ class TestEnableThinking(CustomTestCase):
                 "temperature": 0,
                 "separate_reasoning": True,
                 "chat_template_kwargs": {"enable_thinking": True},
-                **self.additional_chat_kwargs
+                **self.additional_chat_kwargs,
             },
         )
 
@@ -84,7 +84,7 @@ class TestEnableThinking(CustomTestCase):
                 "temperature": 0,
                 "separate_reasoning": True,
                 "chat_template_kwargs": {"enable_thinking": False},
-                **self.additional_chat_kwargs
+                **self.additional_chat_kwargs,
             },
         )
 
@@ -110,7 +110,7 @@ class TestEnableThinking(CustomTestCase):
                 "separate_reasoning": True,
                 "stream": True,
                 "chat_template_kwargs": {"enable_thinking": True},
-                **self.additional_chat_kwargs
+                **self.additional_chat_kwargs,
             },
             stream=True,
         )
@@ -155,7 +155,7 @@ class TestEnableThinking(CustomTestCase):
                 "separate_reasoning": True,
                 "stream": True,
                 "chat_template_kwargs": {"enable_thinking": False},
-                **self.additional_chat_kwargs
+                **self.additional_chat_kwargs,
             },
             stream=True,
         )
@@ -187,6 +187,7 @@ class TestEnableThinking(CustomTestCase):
         self.assertTrue(
             has_content, "The stream response does not contain normal content"
         )
+
 
 ## Skip for ci test
 # class TestGLM45EnableThinking(TestEnableThinking):

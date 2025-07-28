@@ -223,7 +223,10 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
 
         messages = [
             {"role": "system", "content": self.SYSTEM_MESSAGE},
-            {"role": "user", "content": "What is the temperature in Paris in celsius??"},
+            {
+                "role": "user",
+                "content": "What is the temperature in Paris in celsius??",
+            },
         ]
 
         response_stream = client.chat.completions.create(
