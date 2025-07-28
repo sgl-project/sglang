@@ -443,10 +443,6 @@ class ServerArgs:
                     f"Flashinfer cutlass MoE and EP MoE are enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
                 )
 
-        if self.enable_flashinfer_trtllm_moe:
-            assert self.enable_ep_moe, "EP MoE is required for Flashinfer TRTLLM MOE"
-            logger.warning(f"Flashinfer TRTLLM MoE is enabled.")
-
         # DeepEP MoE
         if self.enable_deepep_moe:
             if self.deepep_mode == "normal":
