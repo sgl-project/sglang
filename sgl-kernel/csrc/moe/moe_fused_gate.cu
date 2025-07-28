@@ -101,11 +101,11 @@ __device__ void moe_fused_gate_impl(
     T* bias_thread_read_ptr = bias_ptr + first_elt_read_by_thread;
     AccessType<T> const* vec_bias_thread_read_ptr = reinterpret_cast<AccessType<T> const*>(bias_thread_read_ptr);
     
-    // QQ NOTE: doing the follow will be slower than loop assign and more importantly
-    // have misaligned address issue when params.VPT < 8 and mismatch with MAX_VPT
-    // AccessType<T>* row_chunk_vec_ptr = reinterpret_cast<AccessType<T>*>(&row_chunk);
-    // row_chunk_vec_ptr[0] = vec_thread_read_ptr[0];
-    #pragma unroll
+// QQ NOTE: doing the follow will be slower than loop assign and more importantly
+// have misaligned address issue when params.VPT < 8 and mismatch with MAX_VPT
+// AccessType<T>* row_chunk_vec_ptr = reinterpret_cast<AccessType<T>*>(&row_chunk);
+// row_chunk_vec_ptr[0] = vec_thread_read_ptr[0];
+#pragma unroll
     for (int ii = 0; ii < params.VPT; ++ii) {
       row_chunk[ii] = vec_thread_read_ptr[0][ii];
       bias_chunk[ii] = vec_bias_thread_read_ptr[0][ii];
@@ -113,28 +113,28 @@ __device__ void moe_fused_gate_impl(
 
     __syncthreads();
 
-    ////////////////////// Sigmoid //////////////////////
-    #pragma unroll
+////////////////////// Sigmoid //////////////////////
+#pragma unroll
     for (int ii = 0; ii < params.VPT; ++ii) {
       row_chunk[ii] = static_cast<T>(1.0f / (1.0f + expf(-float(row_chunk[ii]))));
     }
     __syncthreads();
 
-    ////////////////////// Add Bias //////////////////////
-    #pragma unroll
+////////////////////// Add Bias //////////////////////
+#pragma unroll
     for (int ii = 0; ii < params.VPT; ++ii) {
       bias_chunk[ii] = row_chunk[ii] + bias_chunk[ii];
     }
 
-    ////////////////////// Exclude Groups //////////////////////
-    #pragma unroll
+////////////////////// Exclude Groups //////////////////////
+#pragma unroll
     for (int k_idx = 0; k_idx < params.THREADS_PER_ROW - topk_group;
-        ++k_idx) {  // QQ NOTE Here params.THREADS_PER_ROW = num_expert_group
+         ++k_idx) {  // QQ NOTE Here params.THREADS_PER_ROW = num_expert_group
       int expert = first_elt_read_by_thread;
       // local argmax
       T max_val = static_cast<T>(-FLT_MAX);
       T max_val_second = static_cast<T>(-FLT_MAX);
-    #pragma unroll
+#pragma unroll
       for (int ii = 0; ii < params.VPT; ++ii) {
         T val = bias_chunk[ii];
 
@@ -146,12 +146,12 @@ __device__ void moe_fused_gate_impl(
         }
       }
 
-      // QQ NOTE: currently fixed to pick top2 sigmoid weight value in each expert group and sum them as the group weight
-      // to select expert groups
+      // QQ NOTE: currently fixed to pick top2 sigmoid weight value in each expert group and sum them as the group
+      // weight to select expert groups
       T max_sum = max_val + max_val_second;
 
-    // argmin reduce
-    #pragma unroll
+// argmin reduce
+#pragma unroll
       for (int mask = params.THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
         T other_max_sum =
             static_cast<T>(__shfl_xor_sync(0xFFFFFFFF, static_cast<float>(max_sum), mask, params.THREADS_PER_ROW));
@@ -169,7 +169,7 @@ __device__ void moe_fused_gate_impl(
         int const thread_to_clear_in_group = expert / params.VPT;
 
         if (thread_group_idx == thread_to_clear_in_group) {
-    #pragma unroll
+#pragma unroll
           for (int ii = 0; ii < params.VPT; ++ii) {
             bias_chunk[ii] = static_cast<T>(FLT_MAX);
           }
@@ -187,7 +187,7 @@ __device__ void moe_fused_gate_impl(
       int expert = first_elt_read_by_thread;
 
       if (!cmp_eq(max_val, static_cast<T>(FLT_MAX))) {
-    #pragma unroll
+#pragma unroll
         for (int ii = 1; ii < params.VPT; ++ii) {
           T val = bias_chunk[ii];
           if (cmp_gt(val, max_val)) {
@@ -200,7 +200,7 @@ __device__ void moe_fused_gate_impl(
       }
 
       // argmax reduce
-    #pragma unroll
+#pragma unroll
       for (int mask = params.THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
         T other_max =
             static_cast<T>(__shfl_xor_sync(0xFFFFFFFF, static_cast<float>(max_val), mask, params.THREADS_PER_ROW));
@@ -257,14 +257,13 @@ __device__ void moe_fused_gate_impl(
 
     ////////////////////// Rescale Output //////////////////////
     if (thread_group_idx == 0) {
-    #pragma unroll
+#pragma unroll
       for (int ii = 0; ii < topk; ++ii) {
         int64_t const idx = topk * thread_row + ii;
         output_ptr[idx] = output_ptr[idx] / output_sum;
       }
     }
-  }
-  else {
+  } else {
     // Add shared memory array to store processing results
     // Only allocate shared memory for the currently processed tile, not the entire VPT
     // __shared__ T shared_sigmoid[WARP_SIZE * 32]; // 32 * 32 = 1024
@@ -279,8 +278,8 @@ __device__ void moe_fused_gate_impl(
     // Calculate the offset of the current thread in the warp
     int thread_shared_offset = tidx % WARP_SIZE;
 
-    // Create local arrays for the row chunk and bias chunk and then reinterpret the address of row_chunk as a pointer to
-    // AccessType.
+    // Create local arrays for the row chunk and bias chunk and then reinterpret the address of row_chunk as a pointer
+    // to AccessType.
     T* thread_read_ptr = thread_row_ptr + first_elt_read_by_thread;
     Array<T, 32> row_chunk;
     AccessType<T> const* vec_thread_read_ptr = reinterpret_cast<AccessType<T> const*>(thread_read_ptr);
@@ -289,10 +288,10 @@ __device__ void moe_fused_gate_impl(
     Array<T, 32> bias_chunk;
     AccessType<T> const* vec_bias_thread_read_ptr = reinterpret_cast<AccessType<T> const*>(bias_thread_read_ptr);
 
-  // QQ NOTE: doing the follow will be slower than loop assign and more importantly
-  // have misaligned address issue when params.VPT < 8 and mismatch with MAX_VPT
-  // AccessType<T>* row_chunk_vec_ptr = reinterpret_cast<AccessType<T>*>(&row_chunk);
-  // row_chunk_vec_ptr[0] = vec_thread_read_ptr[0];
+    // QQ NOTE: doing the follow will be slower than loop assign and more importantly
+    // have misaligned address issue when params.VPT < 8 and mismatch with MAX_VPT
+    // AccessType<T>* row_chunk_vec_ptr = reinterpret_cast<AccessType<T>*>(&row_chunk);
+    // row_chunk_vec_ptr[0] = vec_thread_read_ptr[0];
     // Processing logic: Use a loop to process each tile (32 elements)
     // Find the maximum and second largest values in each tile, then merge the results after processing all tiles.
     T global_max_val = static_cast<T>(-FLT_MAX);
@@ -300,50 +299,48 @@ __device__ void moe_fused_gate_impl(
     int global_max_idx = -1;
     int global_max_second_idx = -1;
 
-  #pragma unroll
+#pragma unroll
     for (int tile = 0; tile < (params.VPT + 31) / 32; ++tile) {
-        // Synchronize threads to ensure all threads are ready for the next tile
-        if (tidx == 0 && threadIdx.y == 0) {
-          current_tile_idx = tile;
-        }
-        __syncthreads();
-        
-        int tile_offset = tile * 32;
-        int tile_size = min(32, params.VPT - tile_offset);
-        if (tile_size <= 0) break;
+      // Synchronize threads to ensure all threads are ready for the next tile
+      if (tidx == 0 && threadIdx.y == 0) {
+        current_tile_idx = tile;
+      }
+      __syncthreads();
+      
+      int tile_offset = tile * 32;
+      int tile_size = min(32, params.VPT - tile_offset);
+      if (tile_size <= 0) break;
 
       // Prefetch the data of the next tile before processing the current one
       if (tile + 1 < (params.VPT + 31) / 32) {
-        int next_offset = (tile+1)*32;
+        int next_offset = (tile + 1) * 32;
         int prefetch_size = min(32, params.VPT - next_offset);
         if (prefetch_size > 0) {
-          #pragma unroll
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < prefetch_size; i += 8) {
             if (std::is_same<T, float32_t>::value) {
               // Prefetching using __ldg for float32 type
               volatile float dummy = __ldg(reinterpret_cast<const float*>(&thread_read_ptr[next_offset + i]));
               volatile float dummy2 = __ldg(reinterpret_cast<const float*>(&bias_thread_read_ptr[next_offset + i]));
-            }
-            else {
+            } else {
               // For other types, use volatile to ensure prefetching
               volatile T dummy = thread_read_ptr[next_offset + i];
-              volatile T dummy2 = bias_thread_read_ptr[next_offset + i]; 
+              volatile T dummy2 = bias_thread_read_ptr[next_offset + i];
             }
           }
         }
       }
 
-      // Read row_chunk and bias_chunk
-      #pragma unroll
+// Read row_chunk and bias_chunk
+#pragma unroll
       for (int ii = 0; ii < tile_size; ++ii) {
         int global_idx = tile_offset + ii;
         row_chunk[ii] = vec_thread_read_ptr[0][global_idx];
         bias_chunk[ii] = vec_bias_thread_read_ptr[0][global_idx];
       }
 
-      // Calculate the maximum and second maximum values in the current tile
-      #pragma unroll
+// Calculate the maximum and second maximum values in the current tile
+#pragma unroll
       for (int ii = 0; ii < tile_size; ++ii) {
         int global_idx = tile_offset + ii;
         
@@ -371,21 +368,21 @@ __device__ void moe_fused_gate_impl(
       __syncthreads();
     }
 
-  ////////////////////// Exclude Groups //////////////////////
-  #pragma unroll
+////////////////////// Exclude Groups //////////////////////
+#pragma unroll
     for (int k_idx = 0; k_idx < params.THREADS_PER_ROW - topk_group;
-        ++k_idx) {  // QQ NOTE Here params.THREADS_PER_ROW = num_expert_group
+         ++k_idx) {  // QQ NOTE Here params.THREADS_PER_ROW = num_expert_group
       int expert = first_elt_read_by_thread;
       // Use the global maximum instead of recalculating it here
       T max_val = global_max_val;
       T max_val_second = global_max_val_second;
 
-      // QQ NOTE: currently fixed to pick top2 sigmoid weight value in each expert group and sum them as the group weight
-      // to select expert groups
+      // QQ NOTE: currently fixed to pick top2 sigmoid weight value in each expert group and sum them as the group
+      // weight to select expert groups
       T max_sum = max_val + max_val_second;
 
-  // argmin reduce
-  #pragma unroll
+// argmin reduce
+#pragma unroll
       for (int mask = params.THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
         T other_max_sum =
             static_cast<T>(__shfl_xor_sync(0xFFFFFFFF, static_cast<float>(max_sum), mask, params.THREADS_PER_ROW));
@@ -417,12 +414,12 @@ __device__ void moe_fused_gate_impl(
           global_max_idx = -1;
           global_max_second_idx = -1;
           
-          // Recalculate the maximum and second maximum values in the current tile
-          #pragma unroll
+// Recalculate the maximum and second maximum values in the current tile
+#pragma unroll
           for (int i = 0; i < params.VPT; ++i) {
             int tile_idx = i / 32;
             int local_idx = i % 32;
-            
+
             T val;
             if (tile_idx == current_tile_idx) {
               int shared_idx = (thread_shared_offset + local_idx * WARP_SIZE) % (WARP_SIZE * 32);
@@ -431,7 +428,7 @@ __device__ void moe_fused_gate_impl(
               // Recalculate the value for the current tile
               val = recalculate_sigmoid(i, thread_read_ptr) + bias_thread_read_ptr[i];
             }
-            
+
             if (cmp_gt(val, global_max_val) && !cmp_eq(val, static_cast<T>(FLT_MAX))) {
               global_max_val_second = global_max_val;
               global_max_second_idx = global_max_idx;
@@ -456,8 +453,8 @@ __device__ void moe_fused_gate_impl(
       int local_max_idx = -1;
       int expert = first_elt_read_by_thread;
 
-      // Determine the current tile index
-      #pragma unroll
+// Determine the current tile index
+#pragma unroll
       for (int i = 0; i < params.VPT; ++i) {
         int tile_idx = i / 32;
         int local_idx = i % 32;
@@ -472,8 +469,8 @@ __device__ void moe_fused_gate_impl(
           int global_offset = i;
           val = recalculate_sigmoid(global_offset, thread_read_ptr) + bias_thread_read_ptr[global_offset];
         }
-        
-        if (cmp_gt(val, local_max_val) && !cmp_eq(val, static_cast<T>(FLT_MAX)) && 
+
+        if (cmp_gt(val, local_max_val) && !cmp_eq(val, static_cast<T>(FLT_MAX)) &&
             !cmp_eq(val, static_cast<T>(-FLT_MAX))) {
           local_max_val = val;
           local_max_idx = i;
@@ -489,10 +486,10 @@ __device__ void moe_fused_gate_impl(
       }
 
       // argmax reduce
-  #pragma unroll
+#pragma unroll
       for (int mask = params.THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
-        T other_max =
-            static_cast<T>(__shfl_xor_sync(0xFFFFFFFF, static_cast<float>(local_max_val), mask, params.THREADS_PER_ROW));
+        T other_max = static_cast<T>(
+            __shfl_xor_sync(0xFFFFFFFF, static_cast<float>(local_max_val), mask, params.THREADS_PER_ROW));
         int other_expert = __shfl_xor_sync(0xFFFFFFFF, expert, mask, params.THREADS_PER_ROW);
 
         // lower indices to win
@@ -509,7 +506,7 @@ __device__ void moe_fused_gate_impl(
         int expert_to_clear_in_thread = expert % params.VPT;
         int tile_idx = expert_to_clear_in_thread / 32;
         int local_idx = expert_to_clear_in_thread % 32;
-        
+
         // If the current thread is responsible for clearing the expert
         if (tile_idx == current_tile_idx) {
           int shared_idx = (thread_shared_offset + local_idx * WARP_SIZE) % (WARP_SIZE * 32);
@@ -517,11 +514,9 @@ __device__ void moe_fused_gate_impl(
           output_ptr[idx] = static_cast<float>(shared_sigmoid[shared_idx]);
         } else {
           // Recalculate the sigmoid value for the expert
-          output_ptr[idx] = static_cast<float>(recalculate_sigmoid(
-            expert_to_clear_in_thread, 
-            thread_read_ptr));
+          output_ptr[idx] = static_cast<float>(recalculate_sigmoid(expert_to_clear_in_thread, thread_read_ptr));
         }
-        
+
         indices_ptr[idx] = static_cast<int32_t>(expert);
       }
 
@@ -555,7 +550,7 @@ __device__ void moe_fused_gate_impl(
 
     ////////////////////// Rescale Output //////////////////////
     if (thread_group_idx == 0) {
-  #pragma unroll
+#pragma unroll
       for (int ii = 0; ii < topk; ++ii) {
         int64_t const idx = topk * thread_row + ii;
         output_ptr[idx] = output_ptr[idx] / output_sum;
@@ -616,8 +611,8 @@ __global__ void moe_fused_gate_kernel(
     /* If EXPERT_GROUP > WARP_SIZE, fall back to 1 row per warp */                                       \
     constexpr int ROWS_PER_WARP = ((EXPERT_GROUP) <= WARP_SIZE) ? (WARP_SIZE / (EXPERT_GROUP)) : 1;      \
     constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;                                          \
-    /* Calculate shared memory size */                                                                               \
-    size_t shared_mem_size = (VPT <= 32) ? 0 : (2 * WARP_SIZE * 32 * sizeof(T) + sizeof(int));                       \
+    /* Calculate shared memory size */                                                                   \
+    size_t shared_mem_size = (VPT <= 32) ? 0 : (2 * WARP_SIZE * 32 * sizeof(T) + sizeof(int));           \
     moe_fused_gate_kernel<T, VPT, (EXPERTS), (EXPERT_GROUP), ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA> \
         <<<num_blocks, block_dim, shared_mem_size, stream>>>(                                            \
             input.data_ptr(),                                                                            \
@@ -711,8 +706,9 @@ std::vector<at::Tensor> moe_fused_gate(
 
   // Check 1: Ensure that num_experts is a power of 2, or 384 for Kimi K2.
   TORCH_CHECK(
-    (num_experts & (num_experts - 1)) == 0 || num_experts == 384,
-    "num_experts must be a power of 2 or 384, but got ", num_experts);
+      (num_experts & (num_experts - 1)) == 0 || num_experts == 384,
+      "num_experts must be a power of 2 or 384, but got ",
+      num_experts);
 
   // Check 2: Ensure that num_experts is divisible by num_expert_group. (this also means num_expert_group is power of 2)
   TORCH_CHECK(
