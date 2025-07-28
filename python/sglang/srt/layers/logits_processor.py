@@ -192,9 +192,11 @@ class LogitsProcessor(nn.Module):
         self, config, skip_all_gather: bool = False, logit_scale: Optional[float] = None
     ):
         super().__init__()
+        logger.debug(f"args: {config=} {skip_all_gather=} {logit_scale=}")
         self.config = config
         self.logit_scale = logit_scale
         self.use_attn_tp_group = global_server_args_dict["enable_dp_lm_head"]
+        logger.debug(f"args: {self.use_attn_tp_group=}")
         if self.use_attn_tp_group:
             self.attn_tp_size = get_attention_tp_size()
             self.do_tensor_parallel_all_gather = (
@@ -208,6 +210,7 @@ class LogitsProcessor(nn.Module):
             self.do_tensor_parallel_all_gather_dp_attn = (
                 self.do_tensor_parallel_all_gather and get_attention_dp_size() != 1
             )
+        logger.debug(f"args: {self.do_tensor_parallel_all_gather=} {self.do_tensor_parallel_all_gather_dp_attn=}")
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -232,10 +235,24 @@ class LogitsProcessor(nn.Module):
         if isinstance(logits_metadata, ForwardBatch):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
         # Get the last hidden states and last logits for the next token prediction
+        logger.debug(f"all args: {input_ids=} {hidden_states=} {lm_head=} {logits_metadata=} {aux_hidden_states=}")
+        if torch.isnan(input_ids).any():
+            raise ValueError(
+                f"Detected NaN values: {input_ids[torch.isnan(input_ids)]=}"
+            )
+        if torch.isnan(hidden_states).any():
+            raise ValueError(
+                f"Detected NaN values: {hidden_states[torch.isnan(hidden_states)]=}"
+            )
+        if torch.isnan(aux_hidden_states).any():
+            raise ValueError(
+                f"Detected NaN values: {aux_hidden_states[torch.isnan(aux_hidden_states)]=}"
+            )
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
         ):
+            logger.debug(f"decode or idle or target verify")
             pruned_states = hidden_states
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden for hidden in aux_hidden_states]
@@ -246,8 +263,13 @@ class LogitsProcessor(nn.Module):
             and not logits_metadata.extend_return_logprob
         ):
             # Prefill without input logprobs.
+            logger.debug("extend and not extend_return_logprob")
             if logits_metadata.padded_static_len < 0:
                 last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+                if torch.isnan(last_index).any():
+                    raise ValueError(
+                        f"Detected NaN values: {last_index[torch.isnan(last_index)]=}"
+                    )
             else:
                 # If padding_static length is 5 and extended_seq_lens is [2, 3],
                 # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
@@ -256,18 +278,43 @@ class LogitsProcessor(nn.Module):
                     len(logits_metadata.extend_seq_lens),
                     device=logits_metadata.extend_seq_lens.device,
                 )
+                if torch.isnan(idx).any():
+                    raise ValueError(
+                        f"Detected NaN values: {idx[torch.isnan(idx)]=}"
+                    )
                 last_index = (
                     idx * logits_metadata.padded_static_len
                     + logits_metadata.extend_seq_lens
                     - 1
                 )
+                if torch.isnan(last_index).any():
+                    raise ValueError(
+                        f"Detected NaN values: {last_index[torch.isnan(last_index)]=}"
+                    )
+            if torch.isnan(hidden_states).any():
+                raise ValueError(
+                    f"Detected NaN values: {hidden_states[torch.isnan(hidden_states)]=}"
+                )
+            if torch.isnan(aux_hidden_states).any():
+                raise ValueError(
+                    f"Detected NaN values: {aux_hidden_states[torch.isnan(aux_hidden_states)]=}"
+                )
             pruned_states = hidden_states[last_index]
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
+            if torch.isnan(pruned_states).any():
+                raise ValueError(
+                    f"Detected NaN values: {pruned_states[torch.isnan(pruned_states)]=}"
+                )
+            if torch.isnan(aux_pruned_states).any():
+                raise ValueError(
+                    f"Detected NaN values: {aux_pruned_states[torch.isnan(aux_pruned_states)]=}"
+                )
             sample_indices = None
             input_logprob_indices = None
         else:
             # Input logprobs are required.
+            logger.debug("extend and extend_return_logprob")
             # Find 3 different indices.
             # 1. pruned_states: hidden states that we want logprobs from.
             # 2. sample_indices: Indices that have sampled tokens.
@@ -302,20 +349,55 @@ class LogitsProcessor(nn.Module):
                     ]
                 )
                 input_logprob_indices_pt += extend_len - start_len
-
+            if torch.isnan(pruned_states).any():
+                raise ValueError(
+                    f"Detected NaN values: {pruned_states[torch.isnan(pruned_states)]=}"
+                )
+            if torch.isnan(aux_pruned_states).any():
+                raise ValueError(
+                    f"Detected NaN values: {aux_pruned_states[torch.isnan(aux_pruned_states)]=}"
+                )
             pruned_states = torch.cat(pruned_states)
+            if torch.isnan(pruned_states).any():
+                raise ValueError(
+                    f"Detected NaN values: {pruned_states[torch.isnan(pruned_states)]=}"
+                )
             sample_indices = torch.tensor(
                 sample_indices, device=pruned_states.device, dtype=torch.int64
             )
+            if torch.isnan(sample_indices).any():
+                raise ValueError(
+                    f"Detected NaN values: {sample_indices[torch.isnan(sample_indices)]=}"
+                )
             input_logprob_indices = torch.tensor(
                 input_logprob_indices, device=pruned_states.device, dtype=torch.int64
             )
+            if torch.isnan(input_logprob_indices).any():
+                raise ValueError(
+                    f"Detected NaN values: {input_logprob_indices[torch.isnan(input_logprob_indices)]=}"
+                )
 
         # Compute logits for both input and sampled tokens.
+        if torch.isnan(pruned_states).any():
+            raise ValueError(
+                f"Detected NaN values: {pruned_states[torch.isnan(pruned_states)]=}"
+            )
+        if torch.isnan(lm_head.weight).any():
+            raise ValueError(
+                f"Detected NaN values: {lm_head.weight[torch.isnan(lm_head.weight)]=}"
+            )
         logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+        if torch.isnan(logits).any():
+            raise ValueError(
+                f"Detected NaN values: {logits[torch.isnan(logits)]=}"
+            )
         sampled_logits = (
             logits[sample_indices] if sample_indices is not None else logits
         )
+        if torch.isnan(sampled_logits).any():
+            raise ValueError(
+                f"Detected NaN values: {sampled_logits[torch.isnan(sampled_logits)]=}"
+            )
 
         if self.debug_tensor_dump_output_folder:
             assert (
@@ -427,16 +509,30 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
+        logger.debug(f"_get_logits received hidden_states: {hidden_states.shape}")
+        if torch.isnan(hidden_states).any():
+            raise ValueError(f"_get_logits initial hidden_states has NaN")
+
         if self.do_tensor_parallel_all_gather_dp_attn:
+            logger.debug("Running dp_gather_replicate")
             logits_metadata.compute_dp_attention_metadata()
             hidden_states, local_hidden_states = (
                 torch.empty_like(logits_metadata.gathered_buffer),
                 hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+            logger.debug(
+                f"After dp_gather_replicate, hidden_states: {hidden_states.shape}"
+            )
+            if torch.isnan(hidden_states).any():
+                raise ValueError(f"hidden_states has NaN after dp_gather_replicate")
 
         if hasattr(lm_head, "weight"):
+            logger.debug("Calculating logits with lm_head.weight")
+            if torch.isnan(lm_head.weight).any():
+                raise ValueError("lm_head.weight has NaN before matmul")
             if use_intel_amx_backend(lm_head):
+                logger.debug("Using intel amx backend")
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),
                     lm_head.weight,
@@ -444,18 +540,31 @@ class LogitsProcessor(nn.Module):
                     True,  # is_vnni
                 )
             else:
+                logger.debug("Using torch.matmul")
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
                 )
+            logger.debug(f"After matmul, logits: {logits.shape}")
+            if torch.isnan(logits).any():
+                raise ValueError("Logits have NaN after matmul")
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
+            logger.debug("Calculating logits with GGUF quant_method")
             logits = lm_head.quant_method.apply(lm_head, hidden_states, embedding_bias)
+            logger.debug(f"After GGUF apply, logits: {logits.shape}")
+            if torch.isnan(logits).any():
+                raise ValueError("Logits have NaN after GGUF apply")
 
         if self.logit_scale is not None:
+            logger.debug(f"Applying logit_scale: {self.logit_scale}")
             logits.mul_(self.logit_scale)
+            logger.debug("After applying logit_scale")
+            if torch.isnan(logits).any():
+                raise ValueError("Logits have NaN after logit_scale")
 
         if self.do_tensor_parallel_all_gather:
+            logger.debug("Running tensor_model_parallel_all_gather")
             if self.use_attn_tp_group:
                 if self.config.vocab_size % self.attn_tp_size == 0:
                     global_logits = torch.empty(
@@ -485,8 +594,12 @@ class LogitsProcessor(nn.Module):
                 logits = global_logits
             else:
                 logits = tensor_model_parallel_all_gather(logits)
+            logger.debug(f"After all_gather, logits shape: {logits.shape}")
+            if torch.isnan(logits).any():
+                raise ValueError("Logits have NaN after all_gather")
 
         if self.do_tensor_parallel_all_gather_dp_attn:
+            logger.debug("Running dp_scatter")
             logits, global_logits = (
                 torch.empty(
                     (local_hidden_states.shape[0], logits.shape[1]),
@@ -496,12 +609,26 @@ class LogitsProcessor(nn.Module):
                 logits,
             )
             dp_scatter(logits, global_logits, logits_metadata)
+            logger.debug(f"After dp_scatter, logits shape: {logits.shape}")
+            if torch.isnan(logits).any():
+                raise ValueError("Logits have NaN after dp_scatter")
 
+        logger.debug("Slicing logits to vocab_size")
         logits = logits[:, : self.config.vocab_size].float()
+        logger.debug(f"After slicing, logits shape: {logits.shape}")
+        if torch.isnan(logits).any():
+            raise ValueError("Logits have NaN after slicing to vocab_size")
 
         if self.final_logit_softcapping:
+            logger.debug(
+                f"Applying final_logit_softcapping: {self.final_logit_softcapping}"
+            )
             fused_softcap(logits, self.final_logit_softcapping)
+            logger.debug("After final_logit_softcapping")
+            if torch.isnan(logits).any():
+                raise ValueError("Logits have NaN after final_logit_softcapping")
 
+        logger.debug("_get_logits returning")
         return logits
 
     @staticmethod
