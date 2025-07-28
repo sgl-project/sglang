@@ -310,10 +310,12 @@ def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tens
 
     output_tensors = []
     for output_rank in range(world_size):
+        remote_serialized_tensor = object_list[output_rank]["dup_serialized_local_tensor"][self_rank]
         if output_rank == self_rank:
+            assert remote_serialized_tensor is None
             output_tensors.append(local_tensor)
         else:
-            output_tensors.append(MultiprocessingSerializer.deserialize(object_list[output_rank]["dup_serialized_local_tensor"][self_rank]))
+            output_tensors.append(MultiprocessingSerializer.deserialize(remote_serialized_tensor))
 
     return output_tensors
 
