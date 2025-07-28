@@ -1,3 +1,4 @@
+import psutil
 import gc
 from dataclasses import dataclass
 import ctypes
@@ -522,6 +523,11 @@ def check_cuda_result(raw_output):
     return results
 
 def trim_memory():
+    rss_before = psutil.Process().memory_info().rss
+
     libc = ctypes.CDLL("libc.so.6")
     ret = libc.malloc_trim(0)
-    logger.info(f"trim_memory {ret=}")
+
+    rss_after = psutil.Process().memory_info().rss
+
+    logger.info(f"trim_memory {ret=} {rss_after=} {rss_before=} reduced={rss_before - rss_after}")
