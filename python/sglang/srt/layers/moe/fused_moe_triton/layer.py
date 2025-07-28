@@ -377,17 +377,12 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        if expert_id == 0:
-            print(expert_id)
-        assert expert_id < 256
         physical_expert_ids = (
             get_global_expert_location_metadata().logical_to_all_physical(
                 self.layer_id, expert_id
             )
         )
-        # print(f"expert_id: {expert_id}, physical_expert_ids: {physical_expert_ids}")
         for physical_expert_id in physical_expert_ids:
-            assert physical_expert_id == expert_id
             self._weight_loader_physical(
                 param=param,
                 loaded_weight=loaded_weight,
