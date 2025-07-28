@@ -235,8 +235,6 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
 
         if self._rank == 0:
             scatter_src = scatter_src.to("cuda")
-        else:
-            assert scatter_src.device.type == "meta", f"{scatter_src.device.type=}"
         scatter_list = _even_chunk(scatter_src, self._world_size)
 
         sharded_param = torch.empty(scatter_list[0].shape, dtype=scatter_list[0].dtype, device="cuda")
