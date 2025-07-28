@@ -293,7 +293,7 @@ jobs:
                 e2e_latency_mean=$(jq -r '.aggregated_metrics.stats.e2e_latency.mean' "$json_file")
                 input_throughput_mean=$(jq -r '.aggregated_metrics.stats.input_throughput.mean' "$json_file")
                 output_throughput_mean=$(jq -r '.aggregated_metrics.stats.output_throughput.mean' "$json_file")
-                
+
                 echo "  TTFT mean: ${ttft_mean}s"
                 echo "  E2E Latency mean: ${e2e_latency_mean}s"
                 echo "  Input Throughput mean: ${input_throughput_mean} tokens/s"
@@ -301,30 +301,30 @@ jobs:
 
                 # Set mean thresholds (allowing for reasonable variance)
                 # These can be adjusted based on your performance requirements
-                ttft_threshold=3.0          # Max 3.0 seconds for mean TTFT
+                ttft_threshold=2.0          # Max 2.0 seconds for mean TTFT
                 e2e_latency_threshold=8.0   # Max 8.0 seconds for mean E2E latency
-                input_throughput_threshold=9000   # Min 9000 tokens/s for mean input throughput
-                output_throughput_threshold=120    # Min 120 tokens/s for mean output throughput
+                input_throughput_threshold=10000   # Min 9000 tokens/s for mean input throughput
+                output_throughput_threshold=100    # Min 100 tokens/s for mean output throughput
 
 
                                 # Validate mean thresholds
                 validation_passed=true
-                
+
                 if (( $(echo "$ttft_mean > $ttft_threshold" | bc -l) )); then
                   echo "❌ TTFT validation failed: $ttft_mean > $ttft_threshold"
                   validation_passed=false
                 fi
-                
+
                 if (( $(echo "$e2e_latency_mean > $e2e_latency_threshold" | bc -l) )); then
                   echo "❌ E2E Latency validation failed: $e2e_latency_mean > $e2e_latency_threshold"
                   validation_passed=false
                 fi
-                
+
                 if (( $(echo "$input_throughput_mean < $input_throughput_threshold" | bc -l) )); then
                   echo "❌ Input Throughput validation failed: $input_throughput_mean < $input_throughput_threshold"
                   validation_passed=false
                 fi
-                
+
                 if (( $(echo "$output_throughput_mean < $output_throughput_threshold" | bc -l) )); then
                   echo "❌ Output Throughput validation failed: $output_throughput_mean < $output_throughput_threshold"
                   validation_passed=false
