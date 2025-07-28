@@ -145,6 +145,7 @@ def cutlass_w4a8_moe(
             BLOCK_SIZE=512,
         )
     elif ep_mode == "deepep_ll":
+        # total_m=torch.sum(local_topk_ids).item()
         num_tokens = a.size(1)
 
     else:
@@ -154,9 +155,10 @@ def cutlass_w4a8_moe(
     # they are kept to allow for a quick switch of the permutation logic
     # from the current triton kernel implementation to the cutlass-based one if needed.
     if ep_mode == "deepep_ll":
-        gateup_input_origin, expert_offsets, problem_sizes1, problem_sizes2 = (
+
+        expert_offsets, problem_sizes1, problem_sizes2 = (
             deepep_ll_get_cutlass_w4a8_moe_mm_data(
-                a,
+                # a,
                 local_topk_ids,
                 expert_offsets,
                 problem_sizes1,
@@ -166,13 +168,14 @@ def cutlass_w4a8_moe(
                 k,
             )
         )
-        gateup_input = torch.empty(
-            gateup_input_origin.shape, dtype=torch.float8_e4m3fn, device=device
-        )
-        sgl_per_tensor_quant_fp8(
-            gateup_input_origin, gateup_input, a1_scale.float(), True
-        )
-        m = gateup_input_origin.size(0)
+
+        gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=device)
+        sgl_per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
+
+        c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.half)
+        c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.half)
+        intermediate = torch.empty((num_experts, m, n), device=device, dtype=torch.half)
+        expert_offsets[:-1] = local_topk_ids
 
     else:
         a_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
