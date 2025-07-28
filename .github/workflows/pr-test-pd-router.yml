@@ -301,9 +301,9 @@ jobs:
                 
                 # Set loose thresholds (allowing for reasonable variance)
                 # These can be adjusted based on your performance requirements
-                ttft_threshold=3.0          # Max 3 seconds for first token
-                e2e_latency_threshold=10.0  # Max 10 seconds for end-to-end
-                input_throughput_threshold=5000   # Min 5K tokens/s input throughput
+                ttft_threshold=1.75          # Max 1.75 seconds for first token
+                e2e_latency_threshold=8  # Max 8 seconds for end-to-end
+                input_throughput_threshold=11000   # Min 11000 tokens/s input throughput
                 output_throughput_threshold=100   # Min 100 tokens/s output throughput
                 
                 # Validate thresholds
