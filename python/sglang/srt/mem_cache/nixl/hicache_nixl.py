@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class HiCacheNixl(HiCacheStorage):
     """HiCacheNixl provides high-performance storage using NIXL plugins."""
 
-    def __init__(self, file_path: str = "/tmp/hicache_nixl", plugin: str = "auto"):
+    def __init__(self, file_path: str = "", plugin: str = "auto"):
         """Initialize NIXL storage connector."""
         self.file_manager = NixlFileManager(file_path) if plugin not in NixlBackendSelection.OBJ_PLUGINS else None
 

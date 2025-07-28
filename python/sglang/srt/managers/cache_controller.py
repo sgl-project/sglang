@@ -224,7 +224,7 @@ class HiCacheController:
         io_backend: str = "",
         storage_backend: Optional[str] = None,
         prefetch_threshold: int = 256,
-        file_storage_path: str = "sglang_storage",
+        file_storage_path: str = "/tmp/hicache_storage",
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
