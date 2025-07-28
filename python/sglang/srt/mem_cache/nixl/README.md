@@ -142,22 +142,11 @@ python/sglang/srt/mem_cache/nixl/
 ## Supported Features
 
 ### Memory Types
-- **FILE**: Standard file-based storage (all backends)
-  - Supports all numeric tensor types (int32, int64, float32, float64)
-  - Supports multi-dimensional tensors
-  - File descriptor management and cleanup
-- **OBJ**: Object-based storage (OBJ backend only)
-  - Key-based storage and retrieval
-  - Direct tensor-to-object mapping
-  - No file system overhead
+- **Tensor side**: multi-dimensional tensors of all numeric types (int32, int64, float32, float64) are supported.
+  - Tensors can be on CPU or GPU (as long as a GPU capable backend such as GDS_MT is available).
+  - Currently each tensor is mapped to a file or key, but it can be extended to support multiple keys per file or key.
 
-### Tensor Support
-- **Data Types**:
-  - Integer: int32, int64
-  - Floating Point: float32, float64
-  - Note: boolean, empty tensors, and special values (inf, nan) are not currently supported
-- **Shapes**: Supports all tensor shapes (1D, 2D, 3D, and higher dimensions)
-- **Devices**: CPU tensors (GPU tensor support depends on backend)
+- **Storage side**: file and object are suppoted through their relevant backends (e.g., 3FS or OBJ).
 
 ### Backend Priority
 
