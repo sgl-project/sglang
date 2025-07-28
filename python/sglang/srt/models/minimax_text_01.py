@@ -1081,7 +1081,6 @@ class MiniMaxText01Model(nn.Module):
             slots_tensor = torch.tensor(
                 slots_to_clear, device=minimax_cache_tensors.device, dtype=torch.long
             )
-            # 清零对应的缓存槽位
             minimax_cache_tensors[:, slots_tensor, ...] = 0
 
     def get_input_embeddings(
