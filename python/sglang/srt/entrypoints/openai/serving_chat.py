@@ -296,6 +296,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt = prompt[: -len(conv.sep2)]
         else:
             prompt = conv.get_prompt()
+            if self._get_enable_thinking_from_request(request):
+                prompt += "<think>"  # Note(Xinyuan): hard code for interns1
 
         image_data = conv.image_data if conv.image_data else None
         video_data = conv.video_data if conv.video_data else None
