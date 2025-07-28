@@ -93,6 +93,7 @@ from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    ServerStatus,
     add_api_key_middleware,
     add_prometheus_middleware,
     delete_directory,
@@ -230,18 +231,18 @@ async def validate_json_request(raw_request: Request):
 
 
 @app.get("/health")
-async def health() -> Response:
-    """Check the health of the http server."""
-    return Response(status_code=200)
-
-
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
-    """Check the health of the inference server by generating one token."""
+    """Two Step Check the health of the server."""
+    """Step1: Check the health of the server."""
     if _global_state.tokenizer_manager.gracefully_exit:
         logger.info("Health check request received during shutdown. Returning 503.")
         return Response(status_code=503)
 
+    if not _global_state.tokenizer_manager.server_status.is_healthy():
+        return Response(status_code=503)
+
+    """Step2: Check the health of the inference server by generating one token."""
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     rid = f"HEALTH_CHECK_{time.time()}"
 
@@ -1032,8 +1033,10 @@ def _execute_server_warmup(
                 timeout=600,
             )
             assert res.status_code == 200, f"{res}"
+            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+
         else:
-            logger.info(f"Start of prefill warmup ...")
+            logger.info(f"Start of pd disaggregation warmup ...")
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
@@ -1055,9 +1058,18 @@ def _execute_server_warmup(
                 headers=headers,
                 timeout=1800,  # because of deep gemm precache is very long if not precache.
             )
-            logger.info(
-                f"End of prefill warmup with status {res.status_code}, resp: {res.json()}"
-            )
+            if res.status_code == 200:
+                logger.info(
+                    f"End of prefill disaggregation mode warmup with status {res.status_code}, resp: {res.json()}"
+                )
+                _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            else:
+                logger.info(
+                    "Prefill disaggregation mode warm Up Failed, status code: {}".format(
+                        res.status_code
+                    )
+                )
+                _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
 
     except Exception:
         last_traceback = get_exception_traceback()

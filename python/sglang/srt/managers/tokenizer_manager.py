@@ -121,6 +121,7 @@ from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    ServerStatus,
     dataclass_to_string_truncated,
     get_bool_env_var,
     get_zmq_socket,
@@ -178,6 +179,7 @@ class TokenizerManager:
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        self.server_status = ServerStatus.Starting
         # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
