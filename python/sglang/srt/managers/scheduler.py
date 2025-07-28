@@ -520,13 +520,6 @@ class Scheduler(
             ]
         )
 
-    def current_scheduler_metrics_enabled(self):
-        return self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
-
-    def maybe_sleep_on_idle(self):
-        if self.idle_sleeper is not None:
-            self.idle_sleeper.maybe_sleep()
-
     def init_tokenizer(self):
         server_args = self.server_args
 
@@ -742,10 +735,7 @@ class Scheduler(
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.check_tree_cache()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
 
@@ -788,10 +778,7 @@ class Scheduler(
                 )
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.check_tree_cache()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
 
@@ -925,10 +912,8 @@ class Scheduler(
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
-                self.check_memory()
-                self.check_tree_cache()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                # When the server is idle, do self-check and re-init some states
+                self.self_check_during_idle()
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
@@ -1273,6 +1258,12 @@ class Scheduler(
         # Copy more attributes
         req.logprob_start_len = len(req.origin_input_ids) - 1
         self._add_request_to_queue(req)
+
+    def self_check_during_idle(self):
+        self.check_memory()
+        self.check_tree_cache()
+        self.new_token_ratio = self.init_new_token_ratio
+        self.maybe_sleep_on_idle()
 
     def check_memory(self):
         if self.is_hybrid:
@@ -2319,6 +2310,13 @@ class Scheduler(
         if self.pp_size > 1:
             prefix += f" PP{self.pp_rank}"
         return prefix
+
+    def current_scheduler_metrics_enabled(self):
+        return self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
+
+    def maybe_sleep_on_idle(self):
+        if self.idle_sleeper is not None:
+            self.idle_sleeper.maybe_sleep()
 
 
 class IdleSleeper:
