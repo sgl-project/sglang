@@ -286,8 +286,9 @@ def _move_param_to_cpu(param):
     cpu_data.copy_(param.data)
     param.data = cpu_data
 
-def _move_param_to_shm_cpu(param):
-    cpu_data = TODO
+def _move_param_to_shm_cpu(param: torch.Tensor):
+    assert param.is_contiguous()
+    cpu_data = _shared_memory_manager.malloc(shape=param.shape, dtype=param.dtype)
 
     if NaiveDistributed.instance.get_rank() == 0:
         cpu_data.copy_(param.data)
@@ -435,5 +436,8 @@ class _SharedMemoryManager:
     def __init__(self):
         self._base_name = Path(os.environ["SGLANG_SHARED_MEMORY_MANAGER_BASE_NAME"])
         self._operation_index = 0
+
+    def malloc(self, *, shape, dtype):
+        return TODO
 
 _shared_memory_manager = _SharedMemoryManager()
