@@ -975,7 +975,7 @@ class EAGLEWorker(TpModelWorker):
         finfo = torch.finfo(logits.dtype)
         logits.clamp_(min=finfo.min, max=finfo.max)
         logger.debug(f"After clamp: {logits=}")
-        
+
         cold_token_logits = logits[..., -1]
         logger.debug(f"{cold_token_logits=}")
         logger.debug(f"{self.num_cold_tokens=}")
@@ -984,37 +984,6 @@ class EAGLEWorker(TpModelWorker):
         logits[..., -1] = self.log_num_cold_tokens + (
             cold_token_logits / self.num_cold_tokens
         )
-
-
-def safe_softmax(logits: torch.Tensor, dim: Optional[int] = -1) -> torch.Tensor:
-    """
-    A numerically stable softmax implementation with aggressive clamping
-    at each intermediate step to prevent NaN generation from inf values.
-    """
-    finfo = torch.finfo(logits.dtype)
-
-    # 1. Find the maximum and clamp it.
-    max_val = torch.max(logits, dim=dim, keepdim=True)[0]
-    max_val = torch.clamp(max_val, min=finfo.min, max=finfo.max)
-
-    # 2. Shift the logits and clamp. This is where `inf - inf` -> NaN is prevented.
-    shifted_logits = logits - max_val
-    shifted_logits = torch.clamp(shifted_logits, min=finfo.min, max=finfo.max)
-
-    # 3. Exponentiate and clamp.
-    exp_logits = torch.exp(shifted_logits)
-    exp_logits = torch.clamp(exp_logits, min=finfo.min, max=finfo.max)
-
-    # 4. Sum the exponentiated values and clamp.
-    sum_exp_logits = torch.sum(exp_logits, dim=dim, keepdim=True)
-    sum_exp_logits = torch.clamp(sum_exp_logits, min=finfo.eps, max=finfo.max)
-
-    # 5. Normalize and perform a final clamp.
-    probs = exp_logits / sum_exp_logits
-    probs = torch.clamp(probs, min=finfo.min, max=finfo.max)
-
-    return probs
-
 
     def _post_process_draft_probs(self, probs: torch.Tensor) -> torch.Tensor:
         logger.debug("post_process_draft_probs")
@@ -1068,6 +1037,36 @@ def safe_softmax(logits: torch.Tensor, dim: Optional[int] = -1) -> torch.Tensor:
             if torch.any(torch.isnan(logits)):
                 logger.error("Detected errors during sampling! NaN in the logits.")
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
+
+
+def safe_softmax(logits: torch.Tensor, dim: Optional[int] = -1) -> torch.Tensor:
+    """
+    A numerically stable softmax implementation with aggressive clamping
+    at each intermediate step to prevent NaN generation from inf values.
+    """
+    finfo = torch.finfo(logits.dtype)
+
+    # 1. Find the maximum and clamp it.
+    max_val = torch.max(logits, dim=dim, keepdim=True)[0]
+    max_val = torch.clamp(max_val, min=finfo.min, max=finfo.max)
+
+    # 2. Shift the logits and clamp. This is where `inf - inf` -> NaN is prevented.
+    shifted_logits = logits - max_val
+    shifted_logits = torch.clamp(shifted_logits, min=finfo.min, max=finfo.max)
+
+    # 3. Exponentiate and clamp.
+    exp_logits = torch.exp(shifted_logits)
+    exp_logits = torch.clamp(exp_logits, min=finfo.min, max=finfo.max)
+
+    # 4. Sum the exponentiated values and clamp.
+    sum_exp_logits = torch.sum(exp_logits, dim=dim, keepdim=True)
+    sum_exp_logits = torch.clamp(sum_exp_logits, min=finfo.eps, max=finfo.max)
+
+    # 5. Normalize and perform a final clamp.
+    probs = exp_logits / sum_exp_logits
+    probs = torch.clamp(probs, min=finfo.min, max=finfo.max)
+
+    return probs
 
 
 def load_tensor_from_path(tensor_path: str) -> torch.Tensor:
