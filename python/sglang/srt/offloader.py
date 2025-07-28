@@ -430,3 +430,10 @@ class NaiveDistributed:
     def barrier(self):
         actual_objs = self.all_gather_object(self._rank)
         assert actual_objs == list(range(self._world_size)), f"{actual_objs=}"
+
+class _SharedMemoryManager:
+    def __init__(self):
+        self._base_name = Path(os.environ["SGLANG_SHARED_MEMORY_MANAGER_BASE_NAME"])
+        self._operation_index = 0
+
+_shared_memory_manager = _SharedMemoryManager()
