@@ -143,10 +143,7 @@ class AnthropicServingMessages(OpenAIServingBase):
         
         # Generate prompt using template manager
         conversation = generate_chat_conv(
-            messages=openai_messages,
-            model_path=self.tokenizer_manager.model_path,
-            tokenizer=self.tokenizer_manager.tokenizer,
-            chat_template=self.template_manager.load_chat_template(),
+            request, self.template_manager.chat_template_name
         )
         
         prompt = conversation.get_prompt()
