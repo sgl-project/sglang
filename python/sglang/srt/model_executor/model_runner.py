@@ -624,8 +624,8 @@ class ModelRunner:
             # print(f"memray tracker start {p=}")
             # with memray.Tracker(p):
 
-            import tracemalloc
-            tracemalloc.start()
+            # import tracemalloc
+            # tracemalloc.start()
 
             self.model = get_model(
                 model_config=self.model_config,
@@ -633,11 +633,11 @@ class ModelRunner:
                 device_config=DeviceConfig(self.device),
             )
 
-            snapshot = tracemalloc.take_snapshot()
-            top_stats = snapshot.statistics('lineno')
-            logger.info("[TRACEMALLOC RESULTS]")
-            for stat in top_stats[:30]:
-                logger.info(stat)
+            # snapshot = tracemalloc.take_snapshot()
+            # top_stats = snapshot.statistics('lineno')
+            # logger.info("[TRACEMALLOC RESULTS]")
+            # for stat in top_stats[:30]:
+            #     logger.info(stat)
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
