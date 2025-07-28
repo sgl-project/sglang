@@ -324,7 +324,7 @@ class NaiveDistributed:
         self._directory = Path(os.environ["SGLANG_NAIVE_DISTRIBUTED_DIRECTORY"])
         self._directory.mkdir(parents=True, exist_ok=True)
         assert 0 <= rank < world_size
-        
+
         # both barrier to be safe, and as a sanity check
         self.barrier()
 
