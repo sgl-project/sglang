@@ -33,6 +33,8 @@ pub struct RouterConfig {
     pub log_dir: Option<String>,
     /// Log level (None = info)
     pub log_level: Option<String>,
+    /// Custom request ID headers to check (defaults to common headers)
+    pub request_id_headers: Option<Vec<String>>,
 }
 
 /// Routing mode configuration
@@ -213,6 +215,7 @@ impl Default for RouterConfig {
             metrics: None,
             log_dir: None,
             log_level: None,
+            request_id_headers: None,
         }
     }
 }
@@ -320,6 +323,7 @@ mod tests {
             metrics: Some(MetricsConfig::default()),
             log_dir: Some("/var/log".to_string()),
             log_level: Some("debug".to_string()),
+            request_id_headers: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -744,6 +748,7 @@ mod tests {
             }),
             log_dir: Some("/var/log/sglang".to_string()),
             log_level: Some("info".to_string()),
+            request_id_headers: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -792,6 +797,7 @@ mod tests {
             metrics: Some(MetricsConfig::default()),
             log_dir: None,
             log_level: Some("debug".to_string()),
+            request_id_headers: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -836,6 +842,7 @@ mod tests {
             }),
             log_dir: Some("/opt/logs/sglang".to_string()),
             log_level: Some("trace".to_string()),
+            request_id_headers: None,
         };
 
         assert!(config.has_service_discovery());

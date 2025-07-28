@@ -1,5 +1,6 @@
 use crate::core::{HealthChecker, Worker, WorkerFactory};
 use crate::metrics::RouterMetrics;
+use crate::middleware::get_request_id;
 use crate::policies::LoadBalancingPolicy;
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
@@ -148,32 +149,26 @@ impl Router {
                 match sync_client.get(&format!("{}/health", url)).send() {
                     Ok(res) => {
                         if !res.status().is_success() {
-                            let msg = format!(
-                                "Worker heatlh check is pending with status {}",
-                                res.status()
-                            );
-                            info!("{}", msg);
                             all_healthy = false;
-                            unhealthy_workers.push((url, msg));
+                            unhealthy_workers.push((url, format!("status: {}", res.status())));
                         }
                     }
                     Err(_) => {
-                        let msg = format!("Worker is not ready yet");
-                        info!("{}", msg);
                         all_healthy = false;
-                        unhealthy_workers.push((url, msg));
+                        unhealthy_workers.push((url, "not ready".to_string()));
                     }
                 }
             }
 
             if all_healthy {
-                info!("All workers are healthy");
+                info!("All {} workers are healthy", worker_urls.len());
                 return Ok(());
             } else {
-                info!("Initializing workers:");
-                for (url, reason) in &unhealthy_workers {
-                    info!("  {} - {}", url, reason);
-                }
+                debug!(
+                    "Waiting for {} workers to become healthy ({} unhealthy)",
+                    worker_urls.len(),
+                    unhealthy_workers.len()
+                );
                 thread::sleep(Duration::from_secs(interval_secs));
             }
         }
@@ -251,6 +246,7 @@ impl Router {
         route: &str,
         req: &HttpRequest,
     ) -> HttpResponse {
+        let request_id = get_request_id(req);
         let start = Instant::now();
 
         let worker_url = if self.dp_aware {
@@ -287,14 +283,32 @@ impl Router {
 
                 match res.bytes().await {
                     Ok(body) => HttpResponse::build(status).body(body.to_vec()),
-                    Err(e) => HttpResponse::InternalServerError()
-                        .body(format!("Failed to read response body: {}", e)),
+                    Err(e) => {
+                        error!(
+                            request_id = %request_id,
+                            worker_url = %worker_url,
+                            route = %route,
+                            error = %e,
+                            "Failed to read response body"
+                        );
+                        HttpResponse::InternalServerError()
+                            .body(format!("Failed to read response body: {}", e))
+                    }
                 }
             }
-            Err(e) => HttpResponse::InternalServerError().body(format!(
-                "Failed to send request to worker {}: {}",
-                worker_url, e
-            )),
+            Err(e) => {
+                error!(
+                    request_id = %request_id,
+                    worker_url = %worker_url,
+                    route = %route,
+                    error = %e,
+                    "Failed to send request to worker"
+                );
+                HttpResponse::InternalServerError().body(format!(
+                    "Failed to send request to worker {}: {}",
+                    worker_url, e
+                ))
+            }
         };
 
         // Record request metrics
@@ -316,6 +330,7 @@ impl Router {
         route: &str,
         req: &HttpRequest,
     ) -> HttpResponse {
+        let request_id = get_request_id(req);
         const MAX_REQUEST_RETRIES: u32 = 3;
         const MAX_TOTAL_RETRIES: u32 = 6;
         let mut total_retries = 0;
@@ -345,17 +360,23 @@ impl Router {
                         }
 
                         warn!(
-                            "Request to {} failed (attempt {}/{})",
-                            worker_url,
-                            request_retries + 1,
-                            MAX_REQUEST_RETRIES
+                            request_id = %request_id,
+                            route = %route,
+                            worker_url = %worker_url,
+                            attempt = request_retries + 1,
+                            max_attempts = MAX_REQUEST_RETRIES,
+                            "Request failed"
                         );
 
                         request_retries += 1;
                         total_retries += 1;
 
                         if request_retries == MAX_REQUEST_RETRIES {
-                            warn!("Removing failed worker: {}", worker_url);
+                            warn!(
+                                request_id = %request_id,
+                                worker_url = %worker_url,
+                                "Removing failed worker"
+                            );
                             self.remove_failed_worker(&worker_url);
                             break;
                         }
@@ -378,6 +399,7 @@ impl Router {
         typed_req: &T,
         route: &str,
     ) -> HttpResponse {
+        let request_id = get_request_id(req);
         // Handle retries like the original implementation
         let start = Instant::now();
         const MAX_REQUEST_RETRIES: u32 = 3;
@@ -442,17 +464,19 @@ impl Router {
                 }
 
                 warn!(
-                    "Generate request to {} failed (attempt {}/{})",
-                    worker_url,
-                    request_retries + 1,
-                    MAX_REQUEST_RETRIES
+                    request_id = %request_id,
+                    "Generate request failed route={} worker_url={} attempt={} max_attempts={}",
+                    route, worker_url, request_retries + 1, MAX_REQUEST_RETRIES
                 );
 
                 request_retries += 1;
                 total_retries += 1;
 
                 if request_retries == MAX_REQUEST_RETRIES {
-                    warn!("Removing failed worker: {}", worker_url);
+                    warn!(
+                        request_id = %request_id,
+                        "Removing failed worker after typed request failures worker_url={}", worker_url
+                    );
                     self.remove_failed_worker(&worker_url);
                     break;
                 }
@@ -504,12 +528,8 @@ impl Router {
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
     ) -> HttpResponse {
+        let request_id = get_request_id(req);
         let start = Instant::now();
-
-        // Debug: Log what we're sending
-        if let Ok(json_str) = serde_json::to_string_pretty(typed_req) {
-            debug!("Sending request to {}: {}", route, json_str);
-        }
 
         let mut request_builder = if self.dp_aware {
             let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
@@ -564,7 +584,11 @@ impl Router {
         let res = match request_builder.send().await {
             Ok(res) => res,
             Err(e) => {
-                error!("Failed to send request to {}: {}", worker_url, e);
+                error!(
+                    request_id = %request_id,
+                    "Failed to send typed request worker_url={} route={} error={}",
+                    worker_url, route, e
+                );
 
                 // Decrement load on error if it was incremented
                 if load_incremented {
@@ -637,7 +661,6 @@ impl Router {
                                                 &worker_url,
                                                 worker.load(),
                                             );
-                                            debug!("Streaming is done!!")
                                         }
                                     }
                                 }
@@ -676,7 +699,6 @@ impl Router {
             match client.get(&format!("{}/health", worker_url)).send().await {
                 Ok(res) => {
                     if res.status().is_success() {
-                        info!("Worker {} health check passed", worker_url);
                         let mut workers_guard = self.workers.write().unwrap();
                         if self.dp_aware {
                             // Need to contact the worker to extract the dp_size,
@@ -723,8 +745,8 @@ impl Router {
 
                         return Ok(format!("Successfully added worker: {}", worker_url));
                     } else {
-                        info!(
-                            "Worker {} health check is pending with status: {}.",
+                        debug!(
+                            "Worker {} health check pending - status: {}",
                             worker_url,
                             res.status()
                         );
@@ -739,10 +761,7 @@ impl Router {
                     }
                 }
                 Err(e) => {
-                    info!(
-                        "Worker {} health check is pending with error: {}",
-                        worker_url, e
-                    );
+                    debug!("Worker {} health check pending - error: {}", worker_url, e);
 
                     // if the url does not have http or https prefix, warn users
                     if !worker_url.starts_with("http://") && !worker_url.starts_with("https://") {
@@ -844,7 +863,6 @@ impl Router {
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
         {
             cache_aware.remove_worker(worker_url);
-            info!("Removed failed worker from tree: {}", worker_url);
         }
     }
 
@@ -922,7 +940,6 @@ impl Router {
             for url in &worker_urls {
                 if let Some(load) = Self::get_worker_load_static(&client, url).await {
                     loads.insert(url.clone(), load);
-                    debug!("Worker {} load: {}", url, load);
                 }
             }
 

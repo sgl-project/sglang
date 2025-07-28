@@ -433,7 +433,7 @@ pub fn start_health_checker(
 
             // Check for shutdown signal
             if shutdown_clone.load(Ordering::Acquire) {
-                tracing::info!("Health checker shutting down");
+                tracing::debug!("Health checker shutting down");
                 break;
             }
 
@@ -461,6 +461,9 @@ pub fn start_health_checker(
                         Err(e) => {
                             if was_healthy {
                                 tracing::warn!("Worker {} health check failed: {}", worker_url, e);
+                            } else {
+                                // Worker was already unhealthy, log at debug level
+                                tracing::debug!("Worker {} remains unhealthy: {}", worker_url, e);
                             }
                         }
                     }
