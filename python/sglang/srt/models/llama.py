@@ -380,6 +380,14 @@ class LlamaModel(nn.Module):
                 forward_batch,
                 residual,
             )
+            if torch.isnan(hidden_states).any():
+                raise ValueError(
+                    f"Detected NaN values: {hidden_states[torch.isnan(hidden_states)]=}"
+                )
+            if torch.isnan(residual).any():
+                raise ValueError(
+                    f"Detected NaN values: {residual[torch.isnan(residual)]=}"
+                )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -393,6 +401,15 @@ class LlamaModel(nn.Module):
 
         if len(aux_hidden_states) == 0:
             return hidden_states
+
+        if torch.isnan(hidden_states).any():
+            raise ValueError(
+                f"Detected NaN values: {hidden_states[torch.isnan(hidden_states)]=}"
+            )
+        if torch.isnan(aux_hidden_states).any():
+            raise ValueError(
+                f"Detected NaN values: {aux_hidden_states[torch.isnan(aux_hidden_states)]=}"
+            )
 
         return hidden_states, aux_hidden_states
 
