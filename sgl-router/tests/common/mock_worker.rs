@@ -1,5 +1,4 @@
 use actix_web::{middleware, web, App, HttpRequest, HttpResponse, HttpServer};
-use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,14 +18,18 @@ pub struct MockWorkerConfig {
 #[derive(Clone, Debug)]
 pub enum WorkerType {
     Regular,
+    /// Prefill worker type - used in PD routing tests
     Prefill,
+    /// Decode worker type - used in PD routing tests
     Decode,
 }
 
 #[derive(Clone, Debug)]
 pub enum HealthStatus {
     Healthy,
+    /// Unhealthy status - simulates worker failures in tests
     Unhealthy,
+    /// Degraded status - simulates partially available workers
     Degraded,
 }
 
@@ -80,14 +83,13 @@ impl MockWorker {
     /// Stop the mock worker server
     pub async fn stop(&mut self) {
         if let Some(handle) = self.server_handle.take() {
-            // First try graceful stop with short timeout
-            handle.stop(false);
-            // Give it a moment to stop gracefully
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Stop the server gracefully
+            let _ = handle.stop(false).await;
         }
     }
 
     /// Update the mock worker configuration
+    /// Used in tests to simulate dynamic worker state changes
     pub async fn update_config<F>(&self, updater: F)
     where
         F: FnOnce(&mut MockWorkerConfig),
@@ -257,6 +259,7 @@ async fn generate_handler(
         let (tx, rx) = tokio::sync::mpsc::channel(10);
         let stream_delay = config.response_delay_ms;
         let request_id = format!("mock-req-{}", rand::random::<u32>());
+        let worker_port = config.port;
 
         tokio::spawn(async move {
             let tokens = vec!["This ", "is ", "a ", "mock ", "response."];
@@ -270,6 +273,7 @@ async fn generate_handler(
                     "text": token,
                     "meta_info": {
                         "id": &request_id,
+                        "worker_id": format!("worker_{}", worker_port),
                         "finish_reason": if i == tokens.len() - 1 {
                             json!({"type": "stop", "matched_stop": null})
                         } else {
@@ -301,7 +305,10 @@ async fn generate_handler(
             let _ = tx.send("data: [DONE]\n\n".to_string()).await;
         });
 
-        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        use futures_util::stream::StreamExt as FuturesStreamExt;
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
 
         HttpResponse::Ok()
             .content_type("text/event-stream")
@@ -315,6 +322,7 @@ async fn generate_handler(
             "text": "Mock generated response for the input",
             "meta_info": {
                 "id": request_id,
+                "worker_id": format!("worker_{}", config.port),
                 "finish_reason": {
                     "type": "stop",
                     "matched_stop": null
@@ -448,7 +456,10 @@ async fn chat_completions_handler(
             let _ = tx.send("data: [DONE]\n\n".to_string()).await;
         });
 
-        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        use futures_util::stream::StreamExt as FuturesStreamExt;
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
 
         HttpResponse::Ok()
             .content_type("text/event-stream")
@@ -574,7 +585,10 @@ async fn completions_handler(
             let _ = tx.send("data: [DONE]\n\n".to_string()).await;
         });
 
-        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        use futures_util::stream::StreamExt as FuturesStreamExt;
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
 
         HttpResponse::Ok()
             .content_type("text/event-stream")
@@ -663,6 +677,7 @@ async fn v1_models_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> 
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     #[tokio::test]

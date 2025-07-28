@@ -1,7 +1,7 @@
 # SGLang Router Makefile
 # Provides convenient shortcuts for common development tasks
 
-.PHONY: help bench bench-quick bench-baseline bench-compare test build clean
+.PHONY: help bench bench-quick bench-baseline bench-compare bench-load bench-policies test build clean
 
 help: ## Show this help message
 	@echo "SGLang Router Development Commands"
@@ -20,11 +20,11 @@ test: ## Run all tests
 
 bench: ## Run full benchmark suite
 	@echo "Running full benchmarks..."
-	@python3 scripts/run_benchmarks.py
+	@cargo bench
 
 bench-quick: ## Run quick benchmarks only
 	@echo "Running quick benchmarks..."
-	@python3 scripts/run_benchmarks.py --quick
+	@cargo bench -- --sample-size 10 --measurement-time 2
 
 bench-baseline: ## Save current performance as baseline
 	@echo "Saving performance baseline..."
@@ -36,7 +36,18 @@ bench-compare: ## Compare with saved baseline
 
 bench-ci: ## Run benchmarks suitable for CI (quick mode)
 	@echo "Running CI benchmarks..."
-	@python3 scripts/run_benchmarks.py --quick
+	@cargo bench -- --sample-size 10 --measurement-time 2
+
+bench-load: ## Run load test benchmarks
+	@echo "Running load test benchmarks..."
+	@cargo run --release --bin load_test -- 1000 4 50 --no-stream
+
+bench-policies: ## Test different load balancing policies
+	@echo "Testing load balancing policies..."
+	@cargo run --release --bin load_test -- 1000 4 50 --policy random --no-stream
+	@cargo run --release --bin load_test -- 1000 4 50 --policy round_robin --no-stream
+	@cargo run --release --bin load_test -- 1000 4 50 --policy power_of_two --no-stream
+	@cargo run --release --bin load_test -- 1000 4 50 --policy cache_aware --no-stream
 
 clean: ## Clean build artifacts
 	@echo "Cleaning build artifacts..."
@@ -65,14 +76,14 @@ pre-commit: fmt check test bench-quick ## Run pre-commit checks
 
 # Benchmark analysis shortcuts
 bench-report: ## Open benchmark HTML report
-	@if [ -f "target/criterion/request_processing/report/index.html" ]; then \
+	@if [ -d "target/criterion" ]; then \
 		echo "Opening benchmark report..."; \
 		if command -v xdg-open >/dev/null 2>&1; then \
-			xdg-open target/criterion/request_processing/report/index.html; \
+			xdg-open target/criterion/report/index.html 2>/dev/null || xdg-open target/criterion/; \
 		elif command -v open >/dev/null 2>&1; then \
-			open target/criterion/request_processing/report/index.html; \
+			open target/criterion/report/index.html 2>/dev/null || open target/criterion/; \
 		else \
-			echo "Please open target/criterion/request_processing/report/index.html in your browser"; \
+			echo "Please open target/criterion/ in your browser"; \
 		fi \
 	else \
 		echo "No benchmark report found. Run 'make bench' first."; \
