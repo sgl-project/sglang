@@ -697,6 +697,8 @@ class EAGLEWorker(TpModelWorker):
             vocab_mask,
         )
 
+        print(f"The number of accepted drafts per request: {res.accept_length_per_req_cpu}")
+
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
         logits_output.next_token_logits = logits_output.next_token_logits[
