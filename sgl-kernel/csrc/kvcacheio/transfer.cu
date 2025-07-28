@@ -4,11 +4,12 @@
 
 #include <cstdint>
 
-#include "utils.h"  // WARP_SIZE
 #ifndef USE_ROCM
+#define WARP_SIZE 32
 #include "pytorch_extension_utils.h"
 #else
 #include "pytorch_extension_utils_rocm.h"
+#include "utils.h"  // WARP_SIZE
 #endif
 
 __device__ __forceinline__ void
@@ -87,8 +88,8 @@ __global__ void transfer_kernel_impl(
     const uintptr_t* __restrict__ src_v_layer_tbl,
     const uintptr_t* __restrict__ dst_v_layer_tbl) {
   int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int32_t lane_id = tid % 32;
-  int32_t warp_id = tid / 32;
+  int32_t lane_id = tid % WARP_SIZE;
+  int32_t warp_id = tid / WARP_SIZE;
 
   for (int i = 0; i < items_per_warp; ++i) {
     int64_t item_id = warp_id * items_per_warp + i;
@@ -148,7 +149,7 @@ void transfer_kv_launcher(
   const int64_t items_per_warp = div_up(num_items, block_quota * num_warps_per_block);
   const int32_t num_blocks = div_up(num_items, items_per_warp * num_warps_per_block);
   dim3 grid_dim(num_blocks, 1, 1);
-  const int32_t threads_per_block = num_warps_per_block * 32;
+  const int32_t threads_per_block = num_warps_per_block * WARP_SIZE;
 
   const void* src_k_ptr = src_k.defined() ? src_k.data_ptr() : nullptr;
   void* dst_k_ptr = dst_k.defined() ? dst_k.data_ptr() : nullptr;
