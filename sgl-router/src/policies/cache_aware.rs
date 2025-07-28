@@ -66,7 +66,7 @@ use crate::tree::Tree;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Cache-aware routing policy
 ///
@@ -164,10 +164,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 .map(|w| (w.url().to_string(), w.load()))
                 .collect();
 
-            info!(
-                "Load balancing triggered due to workload imbalance:\n\
-                Max load: {}, Min load: {}\n\
-                Current worker loads: {:?}",
+            debug!(
+                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
                 max_load, min_load, worker_loads
             );
 
