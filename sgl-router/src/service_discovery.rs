@@ -209,7 +209,7 @@ pub async fn start_service_discovery(
             .join(",");
 
         info!(
-            "Starting Kubernetes service discovery in PD mode with prefill_selector: '{}', decode_selector: '{}'",
+            "Starting K8s service discovery | PD mode | prefill: '{}' | decode: '{}'",
             prefill_selector, decode_selector
         );
     } else {
@@ -221,7 +221,7 @@ pub async fn start_service_discovery(
             .join(",");
 
         info!(
-            "Starting Kubernetes service discovery with selector: '{}'",
+            "Starting K8s service discovery | selector: '{}'",
             label_selector
         );
     }
@@ -238,7 +238,7 @@ pub async fn start_service_discovery(
             Api::all(client)
         };
 
-        info!("Kubernetes service discovery initialized successfully");
+        debug!("K8s service discovery initialized");
 
         // Create Arcs for configuration data
         let config_arc = Arc::new(config.clone());
@@ -375,7 +375,7 @@ async fn handle_pod_event(
 
         if should_add {
             info!(
-                "Healthy pod found: {} (type: {:?}). Adding worker: {}",
+                "Adding pod: {} | type: {:?} | url: {}",
                 pod_info.name, pod_info.pod_type, worker_url
             );
 
@@ -409,8 +409,8 @@ async fn handle_pod_event(
             };
 
             match result {
-                Ok(msg) => {
-                    info!("Successfully added worker: {}", msg);
+                Ok(_) => {
+                    debug!("Worker added: {}", worker_url);
                 }
                 Err(e) => {
                     error!("Failed to add worker {} to router: {}", worker_url, e);
@@ -446,7 +446,7 @@ async fn handle_pod_deletion(
 
     if was_tracked {
         info!(
-            "Pod deleted: {} (type: {:?}). Removing worker: {}",
+            "Removing pod: {} | type: {:?} | url: {}",
             pod_info.name, pod_info.pod_type, worker_url
         );
 
