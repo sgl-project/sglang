@@ -224,7 +224,7 @@ class _MetaParamOffloader(_BaseParamOffloader):
 class _CpuParamOffloader(_BaseParamOffloader):
     def __init__(self, module, param_name):
         super().__init__(module, param_name)
-        _move_param_to_cpu(self._param)
+        _move_param_to_cpu(self._param, pin_memory=True)
 
     def create_device_tensor(self):
         return self._param.to("cuda", non_blocking=True)
@@ -239,7 +239,7 @@ class _ShmCpuParamOffloader(_BaseParamOffloader):
         assert self._param.data.is_contiguous(), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
 
         if self._rank == 0:
-            _move_param_to_cpu(self._param)
+            _move_param_to_cpu(self._param, pin_memory=False)
         else:
             _move_param_to_meta(self._module, self._param_name)
 
@@ -276,7 +276,7 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         assert self._param.data.is_contiguous(), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
 
         if self._rank == 0:
-            _move_param_to_cpu(self._param)
+            _move_param_to_cpu(self._param, pin_memory=True)
         else:
             _move_param_to_meta(self._module, self._param_name)
 
@@ -316,11 +316,11 @@ def _even_chunk(x: torch.Tensor, chunks: int):
     assert x.shape[0] % chunks == 0, f"{x.shape=} {chunks=}"
     return list(x.chunk(chunks))
 
-def _move_param_to_cpu(param):
+def _move_param_to_cpu(param, pin_memory: bool):
     cpu_data = _empty_strided_like(
         param.data,
         device="cpu",
-        pin_memory=is_pin_memory_available(),
+        pin_memory=pin_memory,
     )
     cpu_data.copy_(param.data)
     param.data = cpu_data
