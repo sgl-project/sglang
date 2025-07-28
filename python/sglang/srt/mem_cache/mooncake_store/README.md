@@ -1,9 +1,13 @@
 # Mooncake L3 store
 
+### Directly install mooncake client
 
+```bash
+pip install mooncake
+```
 
 ### Mooncake build steps
-
+Building mooncake client and server from source code.
 1. Clone mooncake source code 
 
 ```bash
