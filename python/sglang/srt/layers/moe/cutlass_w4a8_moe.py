@@ -106,7 +106,7 @@ def cutlass_w4a8_moe(
     m = a.size(0)
     k = w1_q.size(2) * 2  # w1_q is transposed and packed
     n = w2_q.size(2) * 2  # w2_q is transposed and packed
-    topk = topk_ids_.size(1) if ep_mode == "ep" else 1
+    topk = topk_ids_.size(1) if ep_mode == "ep" else 8
 
     if apply_router_weight_on_input:
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
@@ -136,35 +136,27 @@ def cutlass_w4a8_moe(
             k,
             BLOCK_SIZE=512,
         )
-    elif ep_mode == "deepep_ll":
-        num_tokens = a.size(1)
-
-    else:
-        raise ValueError(f"Invalid ep_mode: {ep_mode}")
 
     # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
     # they are kept to allow for a quick switch of the permutation logic
     # from the current triton kernel implementation to the cutlass-based one if needed.
     if ep_mode == "deepep_ll":
-        gateup_input_origin, expert_offsets, problem_sizes1, problem_sizes2 = (
-            deepep_ll_get_cutlass_w4a8_moe_mm_data(
-                a,
-                local_topk_ids,
-                expert_offsets,
-                problem_sizes1,
-                problem_sizes2,
-                num_experts,
-                n,
-                k,
-            )
+
+        problem_sizes1, problem_sizes2 = deepep_ll_get_cutlass_w4a8_moe_mm_data(
+            local_topk_ids,
+            problem_sizes1,
+            problem_sizes2,
+            num_experts,
+            n,
+            k,
         )
-        gateup_input = torch.empty(
-            gateup_input_origin.shape, dtype=torch.float8_e4m3fn, device=device
-        )
-        sgl_per_tensor_quant_fp8(
-            gateup_input_origin, gateup_input, a1_scale.float(), True
-        )
-        m = gateup_input_origin.size(0)
+
+        gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=device)
+        sgl_per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
+
+        c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.half)
+        c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.half)
+        intermediate = torch.empty((num_experts, m, n), device=device, dtype=torch.half)
 
     else:
         a_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
@@ -181,8 +173,9 @@ def cutlass_w4a8_moe(
             k,
         )
 
-    c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.half)
-    c2 = torch.zeros((m * topk, k), device=device, dtype=torch.half)
+        c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.half)
+        c2 = torch.zeros((m * topk, k), device=device, dtype=torch.half)
+        intermediate = torch.empty((m * topk, n), device=device, dtype=torch.half)
 
     cutlass_w4a8_moe_mm(
         c1,
@@ -200,7 +193,6 @@ def cutlass_w4a8_moe(
         topk,
     )
 
-    intermediate = torch.empty((m * topk, n), device=device, dtype=torch.half)
     silu_and_mul(c1, intermediate)
 
     intermediate_q = torch.empty(
@@ -238,18 +230,6 @@ def cutlass_w4a8_moe(
             0,
             BLOCK_SIZE=512,
         )
-    elif ep_mode == "deepep_ll":
-        output = torch.zeros(
-            (len(local_topk_ids), num_tokens, k), device=device, dtype=c2.dtype
-        )
-        non_zero_indices = torch.nonzero(local_topk_ids, as_tuple=True)[0]
-        c2_index = 0
-        for expert_idx in non_zero_indices:
-            num_non_zero_rows = local_topk_ids[expert_idx].item()
-            output[expert_idx, :num_non_zero_rows] = c2[
-                c2_index : c2_index + num_non_zero_rows
-            ]
-            c2_index += num_non_zero_rows
     else:
         output = c2
-    return output
+    return output.to(torch.bfloat16)
