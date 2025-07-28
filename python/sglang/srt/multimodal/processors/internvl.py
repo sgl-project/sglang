@@ -16,8 +16,8 @@ from sglang.srt.multimodal.processors.base_processor import (
 class InternVLImageProcessor(BaseMultimodalProcessor):
     models = [InternVLChatModel]
 
-    def __init__(self, hf_config, server_args, _image_processor):
-        super().__init__(hf_config, server_args, _image_processor)
+    def __init__(self, hf_config, server_args, _image_processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _image_processor, *args, **kwargs)
         image_size = hf_config.force_image_size or hf_config.vision_config.image_size
         patch_size = hf_config.vision_config.patch_size
 
@@ -170,13 +170,12 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         return pixel_values, num_patches_list
 
     async def process_mm_data_async(
-        self, image_data, input_text, request_obj, max_req_input_len, **kwargs
+        self, image_data, input_text, request_obj, **kwargs
     ):
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
-            max_req_input_len=max_req_input_len,
             discard_alpha_channel=True,
         )
 

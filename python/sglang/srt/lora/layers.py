@@ -49,24 +49,7 @@ class BaseLayerWithLoRA(nn.Module):
         pass
 
 
-class EmbeddingLayerWithLoRA(BaseLayerWithLoRA):
-    def __init__(
-        self,
-        base_layer: VocabParallelEmbedding,
-        lora_backend: BaseLoRABackend,
-    ) -> None:
-        super().__init__(base_layer, lora_backend)
-
-    def set_lora_info(self, *args):
-        pass
-
-    def _get_token_weight_indices(
-        self, input_: torch.Tensor, batch_info: LoRABatchInfo
-    ):
-        pass
-
-
-class VocabParallelEmbeddingWithLoRA(EmbeddingLayerWithLoRA):
+class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     """
     Vocab parallel embedding layer with support for LoRA (Low-Rank Adaptation).
 
@@ -202,23 +185,6 @@ class VocabParallelEmbeddingWithLoRA(EmbeddingLayerWithLoRA):
         end_idx = (tp_rank + 1) * shard_size
         B = B[start_idx:end_idx, :]
         return B
-
-
-class ParallelLMHeadWithLoRA(EmbeddingLayerWithLoRA):
-    """
-    Parallel LM head with support for LoRA (Low-Rank Adaptation).
-
-    Note: The current version does not yet implement the LoRA functionality.
-    This class behaves exactly the same as the base ParallelLMHead.
-    Future versions will integrate LoRA functionality to support efficient parameter fine-tuning.
-    """
-
-    def __init__(
-        self,
-        base_layer: ParallelLMHead,
-        lora_backend: BaseLoRABackend,
-    ) -> None:
-        super().__init__(base_layer, lora_backend)
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):

@@ -28,7 +28,7 @@ class LoRAMemoryPool:
         dtype: torch.dtype,
         tp_size: int,
         tp_rank: int,
-        max_extra_vocab_size: int,
+        lora_extra_vocab_size: int,
         max_lora_rank: int,
         lora_weight_names: Tuple[Set[str], Set[str]],
         base_model: torch.nn.Module,
@@ -40,7 +40,7 @@ class LoRAMemoryPool:
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
 
-        self.max_extra_vocab_size: int = max_extra_vocab_size
+        self.max_extra_vocab_size: int = lora_extra_vocab_size
         self.max_lora_rank: int = max_lora_rank
 
         # lora weight names for LoRA A and B respectively.
@@ -220,7 +220,7 @@ class LoRAMemoryPool:
         self,
         cur_uids: Set[Optional[str]],
         lora_adapters: Dict[str, LoRAAdapter],
-        lora_modules: Dict[int, Dict[str, BaseLayerWithLoRA]],
+        lora_modules: List[Dict[str, BaseLayerWithLoRA]],
         lora_embeddings_modules: Dict[str, BaseLayerWithLoRA],
     ):
         def get_available_buffer_slot():
@@ -254,7 +254,7 @@ class LoRAMemoryPool:
         uid: str,
         buffer_id: int,
         lora_adapter: LoRAAdapter,
-        lora_modules: Dict[int, Dict[str, BaseLayerWithLoRA]],
+        lora_modules: List[Dict[str, BaseLayerWithLoRA]],
         lora_embeddings_modules: Dict[str, BaseLayerWithLoRA],
     ):
         def load_lora_weight_tensor(
