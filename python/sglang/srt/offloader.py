@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+import ctypes
+
 
 import cuda.bindings.runtime as cuda_rt
 import numpy as np
@@ -513,3 +515,8 @@ def check_cuda_result(raw_output):
     if err != cuda_rt.cudaError_t.cudaSuccess:
         raise Exception(f"CUDA error: {err}")
     return results
+
+def trim_memory():
+    libc = ctypes.CDLL("libc.so.6")
+    ret = libc.malloc_trim(0)
+    logger.info(f"trim_memory {ret=}")
