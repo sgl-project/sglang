@@ -479,4 +479,5 @@ class MixtralForCausalLM(nn.Module):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
+
 EntryClass = MixtralForCausalLM
