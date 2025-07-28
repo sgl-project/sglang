@@ -891,9 +891,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         ), "Weight Blockscale must be represented as FP8-E4M3"
         w13_blockscale_swizzled = self.swizzle_blockscale(layer.w13_weight_scale)
 
-        layer.w13_blockscale_swizzled = Parameter(
-            w13_blockscale_swizzled, requires_grad=False
-        )
+        layer.w13_blockscale_swizzled.data[...] = w13_blockscale_swizzled
         dispose_tensor(layer.w13_weight_scale.data)
         del layer.w13_weight_scale
 
@@ -928,9 +926,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         ), "Weight Blockscale must be represented as FP8-E4M3"
         w2_blockscale_swizzled = self.swizzle_blockscale(layer.w2_weight_scale)
 
-        layer.w2_blockscale_swizzled = Parameter(
-            w2_blockscale_swizzled, requires_grad=False
-        )
+        layer.w2_blockscale_swizzled.data[...] = w2_blockscale_swizzled
         dispose_tensor(layer.w2_weight_scale.data)
         del layer.w2_weight_scale
         layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
