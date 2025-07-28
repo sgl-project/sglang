@@ -36,6 +36,7 @@ class HiRadixCache(RadixCache):
         hicache_write_policy: str,
         hicache_io_backend: str,
         hicache_storage_backend: Optional[str] = None,
+        file_storage_path: str = "sglang_storage",
     ):
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
@@ -64,6 +65,7 @@ class HiRadixCache(RadixCache):
             io_backend=hicache_io_backend,
             storage_backend=hicache_storage_backend,
             prefetch_threshold=self.prefetch_threshold,
+            file_storage_path=file_storage_path,
         )
 
         # record the nodes with ongoing write through

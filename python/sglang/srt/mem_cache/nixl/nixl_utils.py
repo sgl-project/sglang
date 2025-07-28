@@ -108,7 +108,6 @@ class NixlRegistration:
         """
         try:
             if not items:
-                logger.debug(f"No {desc} to register")
                 return None
 
             reg_descs = self.agent.get_reg_descs(items, mem_type)
@@ -118,7 +117,6 @@ class NixlRegistration:
 
             registered_memory = self.agent.register_memory(reg_descs)
             if registered_memory:
-                logger.debug(f"Registered {len(items)} {desc}")
                 return registered_memory
             else:
                 logger.error("Failed to register with NIXL")
@@ -138,7 +136,6 @@ class NixlRegistration:
 
         # Determine memory type based on tensor device
         mem_type = "VRAM" if buffers[0].device.type == 'cuda' else "DRAM"
-        logger.debug(f"Registering buffers with memory type: {mem_type}")
         return self._register_memory(buffers, mem_type, "buffers")
 
     def register_files(self, tuples: List[tuple]) -> Optional[any]:

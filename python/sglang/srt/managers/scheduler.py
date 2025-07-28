@@ -616,6 +616,7 @@ class Scheduler(
                         else server_args.hicache_io_backend
                     ),
                     hicache_storage_backend=server_args.hicache_storage_backend,
+                    file_storage_path=server_args.file_storage_path,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter

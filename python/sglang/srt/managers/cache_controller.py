@@ -20,6 +20,7 @@ from queue import Empty, Full, PriorityQueue, Queue
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import os
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -224,12 +225,14 @@ class HiCacheController:
         io_backend: str = "",
         storage_backend: Optional[str] = None,
         prefetch_threshold: int = 256,
+        file_storage_path: str = "sglang_storage",
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         self.mem_pool_host = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
+        self.file_storage_path = file_storage_path
         # using kernel for small page KV cache transfer and DMA for large pages
         if not io_backend:
             IO_BACKEND_PAGE_SIZE_THRESHOLD = 64
@@ -251,7 +254,10 @@ class HiCacheController:
                 self.prefetch_threshold = prefetch_threshold
             elif storage_backend == "nixl":
                 from sglang.srt.mem_cache.nixl.hicache_nixl import HiCacheNixl
-                self.storage_backend = HiCacheNixl()
+                # Use the configured file storage path
+                nixl_dir = os.path.join(os.path.expanduser(self.file_storage_path), "hicache_nixl")
+                os.makedirs(nixl_dir, exist_ok=True)
+                self.storage_backend = HiCacheNixl(file_path=nixl_dir)
                 self.enable_storage = True
                 # todo: threshold policy for prefetching
                 self.prefetch_threshold = prefetch_threshold
@@ -520,7 +526,9 @@ class HiCacheController:
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 for h in operation.hash_value:
-                    page_data = self.storage_backend.get(h)
+                    # Create a destination tensor with the same shape as a page
+                    dst_tensor = self.mem_pool_host.get_flat_data_page(operation.host_indices[operation.completed_tokens])
+                    page_data = self.storage_backend.get(h, dst_tensor)
                     if page_data is None:
                         logger.warning(
                             f"Prefetch operation {operation.request_id} failed to retrieve page {h}."

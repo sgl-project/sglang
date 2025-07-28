@@ -128,4 +128,11 @@ class HiCacheNixl(HiCacheStorage):
         )
         if not tuples:
             return False
+
+        # For FILE backend, also check if the file physically exists
+        if self.backend_selector.mem_type == "FILE":
+            file_path = self.file_manager.get_file_path(key)
+            if not os.path.exists(file_path):
+                return False
+
         return self.agent.query_memory(tuples, self.backend_selector.backend_name, mem_type=self.backend_selector.mem_type) is not None
