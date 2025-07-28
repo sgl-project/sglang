@@ -219,8 +219,7 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
 
         scatter_src = self._param.data
 
-        if self._rank == 0:
-            logger.info(f"[offloader] post_init {scatter_src.nbytes=} {scatter_src.dtype=} {scatter_src.shape=} {torch.cuda.memory_allocated()=}")
+        logger.info(f"[offloader] post_init {scatter_src.nbytes=} {scatter_src.dtype=} {scatter_src.shape=} {torch.cuda.memory_allocated()=}")
 
         if self._rank == 0:
             scatter_src = scatter_src.to("cuda")
