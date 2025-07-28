@@ -27,7 +27,7 @@ class ModuleOffloader:
         self.mode = os.environ.get("SGLANG_OFFLOAD_MODE", "cpu")
         self.enabled = self.group_size > 0
 
-        if self.mode == "sharded_gpu":
+        if self.mode in {"sharded_gpu", "shm_cpu"}:
             NaiveDistributed.initialize(
                 rank=global_server_args_dict["dp_rank"],
                 world_size=global_server_args_dict["dp_size"],
