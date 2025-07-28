@@ -69,6 +69,11 @@ def completion_template_exists(template_name: str) -> bool:
     return template_name in completion_templates
 
 
+def set_completion_template_name(template_name: str):
+    global completion_template_name
+    completion_template_name = template_name
+
+
 def is_completion_template_defined() -> bool:
     global completion_template_name
     return completion_template_name is not None
