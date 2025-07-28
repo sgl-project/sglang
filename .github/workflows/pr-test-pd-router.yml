@@ -279,56 +279,57 @@ jobs:
 
             # Extract mean values and validate performance thresholds
             echo "📊 Extracting performance metrics for $policy..."
-            
+
             # Find JSON files excluding experiment metadata
             json_files=$(find "$actual_folder" -name "*.json" | grep -v experiment_metadata)
-            
+
             if [ -n "$json_files" ]; then
               # Extract metrics using jq and validate against loose thresholds
               for json_file in $json_files; do
                 echo "Processing: $(basename "$json_file")"
-                
+
                 # Extract mean values
                 ttft_mean=$(jq -r '.aggregated_metrics.stats.ttft.mean' "$json_file")
                 e2e_latency_mean=$(jq -r '.aggregated_metrics.stats.e2e_latency.mean' "$json_file")
                 input_throughput_mean=$(jq -r '.aggregated_metrics.stats.input_throughput.mean' "$json_file")
                 output_throughput_mean=$(jq -r '.aggregated_metrics.stats.output_throughput.mean' "$json_file")
-                
+
                 echo "  TTFT mean: ${ttft_mean}s"
                 echo "  E2E Latency mean: ${e2e_latency_mean}s"
                 echo "  Input Throughput mean: ${input_throughput_mean} tokens/s"
                 echo "  Output Throughput mean: ${output_throughput_mean} tokens/s"
-                
+
                 # Set loose thresholds (allowing for reasonable variance)
                 # These can be adjusted based on your performance requirements
                 ttft_threshold=2.5          # Max 2.5 seconds for first token
                 e2e_latency_threshold=8  # Max 8 seconds for end-to-end
                 input_throughput_threshold=11000   # Min 11000 tokens/s input throughput
                 output_throughput_threshold=100   # Min 100 tokens/s output throughput
-                
+
+
                 # Validate thresholds
                 validation_passed=true
-                
+
                 if (( $(echo "$ttft_mean > $ttft_threshold" | bc -l) )); then
                   echo "❌ TTFT validation failed: $ttft_mean > $ttft_threshold"
                   validation_passed=false
                 fi
-                
+
                 if (( $(echo "$e2e_latency_mean > $e2e_latency_threshold" | bc -l) )); then
                   echo "❌ E2E Latency validation failed: $e2e_latency_mean > $e2e_latency_threshold"
                   validation_passed=false
                 fi
-                
+
                 if (( $(echo "$input_throughput_mean < $input_throughput_threshold" | bc -l) )); then
                   echo "❌ Input Throughput validation failed: $input_throughput_mean < $input_throughput_threshold"
                   validation_passed=false
                 fi
-                
+
                 if (( $(echo "$output_throughput_mean < $output_throughput_threshold" | bc -l) )); then
                   echo "❌ Output Throughput validation failed: $output_throughput_mean < $output_throughput_threshold"
                   validation_passed=false
                 fi
-                
+
                 if [ "$validation_passed" = true ]; then
                   echo "✅ Performance validation passed for $policy"
                 else
@@ -337,7 +338,7 @@ jobs:
                   exit 1
                 fi
               done
-              
+
               echo "✓ Genai-bench completed successfully for $policy"
               echo "📊 Detailed metrics and plots available in: $actual_folder"
             else
