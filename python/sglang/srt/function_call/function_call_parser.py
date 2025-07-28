@@ -10,6 +10,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
+from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
@@ -37,6 +38,7 @@ class FunctionCallParser:
         "pythonic": PythonicDetector,
         "kimi_k2": KimiK2Detector,
         "qwen3_coder": Qwen3CoderDetector,
+        "glm45": Glm4MoeDetector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
