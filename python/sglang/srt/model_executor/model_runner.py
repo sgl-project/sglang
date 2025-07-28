@@ -1468,12 +1468,28 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
+        if torch.isnan(forward_batch.input_ids).any():
+            raise ValueError(
+                f"Detected NaN values: {forward_batch.input_ids[torch.isnan(forward_batch.input_ids)]=}"
+            )
+        if torch.isnan(forward_batch.positions).any():
+            raise ValueError(
+                f"Detected NaN values: {forward_batch.positions[torch.isnan(forward_batch.positions)]=}"
+            )
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+        if torch.isnan(forward_batch.input_ids).any():
+            raise ValueError(
+                f"Detected NaN values: {forward_batch.input_ids[torch.isnan(forward_batch.input_ids)]=}"
+            )
+        if torch.isnan(forward_batch.positions).any():
+            raise ValueError(
+                f"Detected NaN values: {forward_batch.positions[torch.isnan(forward_batch.positions)]=}"
+            )
         return self.model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch, **kwargs
         )
@@ -1594,6 +1610,10 @@ class ModelRunner:
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if torch.isnan(ret.next_token_logits).any():
+                raise ValueError(
+                    f"Detected NaN values: {ret.next_token_logits[torch.isnan(ret.next_token_logits)]=}"
+                )
         elif forward_batch.forward_mode.is_extend():
             ret = self.forward_extend(
                 forward_batch,
