@@ -231,6 +231,7 @@ class ReasoningParser:
         "deepseek-r1": DeepSeekR1Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3ThinkingDetector,
+        "glm45": Qwen3Detector,
         "kimi": KimiDetector,
     }
 
