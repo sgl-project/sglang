@@ -483,7 +483,8 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if global_server_args_dict["enable_deepep_moe"] or global_server_args_dict["enable_ep_moe"]
+                    if global_server_args_dict["enable_deepep_moe"]
+                    or global_server_args_dict["enable_ep_moe"]
                     else {}
                 ),
             )
@@ -531,7 +532,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
             )
 
         self._enable_deepep_moe = global_server_args_dict["enable_deepep_moe"]
-    
+
     def forward_normal_dual_stream(
         self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False
     ) -> torch.Tensor:
@@ -552,15 +553,22 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
-        
-        if global_server_args_dict["enable_ep_moe"] and not global_server_args_dict["enable_deepep_moe"]:
+
+        if (
+            global_server_args_dict["enable_ep_moe"]
+            and not global_server_args_dict["enable_deepep_moe"]
+        ):
             if self.tp_size > 1 and not can_fuse_mlp_allreduce:
-                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
             final_hidden_states = final_hidden_states + shared_output
         else:
             final_hidden_states = final_hidden_states + shared_output
             if self.tp_size > 1 and not can_fuse_mlp_allreduce:
-                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
         return final_hidden_states
 
     def forward_normal(
@@ -583,16 +591,23 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
-        if global_server_args_dict["enable_ep_moe"] and not global_server_args_dict["enable_deepep_moe"]:
+        if (
+            global_server_args_dict["enable_ep_moe"]
+            and not global_server_args_dict["enable_deepep_moe"]
+        ):
             if self.tp_size > 1 and not can_fuse_mlp_allreduce:
-                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
             if shared_output is not None:
                 final_hidden_states = final_hidden_states + shared_output
         else:
             if shared_output is not None:
                 final_hidden_states = final_hidden_states + shared_output
             if self.tp_size > 1 and not can_fuse_mlp_allreduce:
-                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
         return final_hidden_states
 
 
