@@ -353,20 +353,32 @@ class NaiveDistributed:
         else:
             assert scatter_list is None
 
+        logger.info("hi scatter stage 1")
         gathered_objects = self.all_gather_object(
             dict(serialized_scatter_list=[
-                MultiprocessingSerializer.serialize(item)
-                for item in scatter_list
+                None
+                if item_rank == src
+                else MultiprocessingSerializer.serialize(item)
+                for item_rank, item in enumerate(scatter_list)
             ])
             if self._rank == src
             else dict()
         )
 
-        remote_tensor = MultiprocessingSerializer.deserialize(gathered_objects[src]["serialized_scatter_list"][self._rank])
+        logger.info("hi scatter stage 2")
+        remote_serialized_tensor = gathered_objects[src]["serialized_scatter_list"][self._rank]
+        if self._rank == src:
+            assert remote_serialized_tensor is None
+            remote_tensor = scatter_list[self._rank]
+        else:
+            remote_tensor = MultiprocessingSerializer.deserialize(remote_serialized_tensor)
         tensor.copy_(remote_tensor)
 
+        logger.info("hi scatter stage 3")
         # avoid src tensor be deleted too early
         self.barrier()
+
+        logger.info("hi scatter stage 4")
 
     def all_gather_object(self, obj: Any) -> List[Any]:
         self._operation_index += 1
