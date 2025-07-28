@@ -67,7 +67,6 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.data_parallel_meta import DPBalanceMeta
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -129,7 +128,7 @@ from sglang.srt.managers.scheduler_output_processor_mixin import (
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.managers.utils import validate_input_length
+from sglang.srt.managers.utils import DPBalanceMeta, validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -2011,8 +2010,9 @@ class Scheduler(
                 "The number of requests received this round is too large. "
                 "Please increase gather_tensor_size and onfly_info_size."
             )
-
+            # The maximum size of the tensor used for gathering data from all workers.
             gather_tensor_size = 512
+
             # recv_tensor: | holding_tokens | len(recv_dp_balance_id) | recv_dp_balance_ids
             recv_tensor = torch.zeros(gather_tensor_size, dtype=torch.int32)
             recv_tensor[0] = holding_tokens_list

@@ -29,13 +29,13 @@ import setproctitle
 import zmq
 
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
-from sglang.srt.managers.data_parallel_meta import DPBalanceMeta
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.utils import DPBalanceMeta
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
@@ -284,6 +284,8 @@ class DataParallelController:
         raise NotImplementedError()
 
     def minimum_tokens_scheduler(self, req):
+        # This variable corresponds to the balance_id in TokenizedGenerateReqInput.
+        # We use it to to control the number of onfly tokens (requests dispatched to workers but not yet received).
         def get_next_global_balance_id() -> int:
             INT32_MAX = 2147483647
             current_id = self.global_balance_id
