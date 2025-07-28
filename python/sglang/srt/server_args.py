@@ -593,7 +593,8 @@ class ServerArgs:
 
         # Special Model Arch Constraints
         # https://github.com/sgl-project/sglang/issues/8454
-        quantization_config = self.get_hf_config().quantization_config
+        quantization_config = getattr(self.get_hf_config(), "quantization_config", None)
+        model_arch = self.get_hf_config().architectures[0]
         if quantization_config is not None and model_arch == "Glm4MoeForCausalLM":
             self.disable_shared_experts_fusion = True
             logger.warning(
