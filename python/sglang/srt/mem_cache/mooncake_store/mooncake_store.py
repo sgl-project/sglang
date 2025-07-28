@@ -13,8 +13,8 @@ from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
-DEFAULT_GLOBAL_SEGMENT_SIZE = 0  # 3.125 GiB
-DEFAULT_LOCAL_BUFFER_SIZE = 8 * 1024 * 1024 * 1024  # 8.0 GiB
+DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
+DEFAULT_LOCAL_BUFFER_SIZE = 128 * 1024 * 1024  # 128 MB
 
 logger = logging.getLogger(__name__)
 
