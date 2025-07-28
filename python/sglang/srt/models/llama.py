@@ -514,6 +514,23 @@ class LlamaForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> LogitsProcessorOutput:
+        if torch.isnan(input_ids).any():
+            raise ValueError(
+                f"Detected NaN values: {input_ids[torch.isnan(input_ids)]=}"
+            )
+        if torch.isnan(positions).any():
+            raise ValueError(
+                f"Detected NaN values: {positions[torch.isnan(positions)]=}"
+            )
+        if torch.isnan(input_embeds).any():
+            raise ValueError(
+                f"Detected NaN values: {input_embeds[torch.isnan(input_embeds)]=}"
+            )
+        if torch.isnan(pp_proxy_tensors).any():
+            raise ValueError(
+                f"Detected NaN values: {pp_proxy_tensors[torch.isnan(pp_proxy_tensors)]=}"
+            )
+
         hidden_states = self.model(
             input_ids,
             positions,
@@ -521,13 +538,24 @@ class LlamaForCausalLM(nn.Module):
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-
+        if torch.isnan(hidden_states).any():
+            raise ValueError(
+                f"Detected NaN values: {hidden_states[torch.isnan(hidden_states)]=}"
+            )
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
-
+            if torch.isnan(hidden_states).any():
+                raise ValueError(
+                    f"Detected NaN values: {hidden_states[torch.isnan(hidden_states)]=}"
+                )
+            if torch.isnan(aux_hidden_states).any():
+                raise ValueError(
+                    f"Detected NaN values: {aux_hidden_states[torch.isnan(aux_hidden_states)]=}"
+                )
         if self.pp_group.is_last_rank:
             if not get_embedding:
+                logger.debug(f"{self.logits_processor=}")
                 return self.logits_processor(
                     input_ids,
                     hidden_states,
@@ -536,6 +564,7 @@ class LlamaForCausalLM(nn.Module):
                     aux_hidden_states,
                 )
             else:
+                logger.debug(f"{self.pooler=}")
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
