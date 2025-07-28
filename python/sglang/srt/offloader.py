@@ -369,7 +369,7 @@ class NaiveDistributed:
         text_postfix = "\n"
 
         def _get_path(interesting_rank: int):
-            return self._directory / f"rank{interesting_rank}.txt"
+            return self._directory / f"rank{interesting_rank}_op{self._operation_index}.txt"
 
         _get_path(self._rank).write_text(base64.b64encode(pickle.dumps(obj)).decode("utf-8") + text_postfix)
 
