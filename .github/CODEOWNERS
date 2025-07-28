@@ -1,3 +1,7 @@
+# All files
+* @sgl-codeowner
+
+# Individual folders
 /3rdparty/amd @HaiShaw
 /docker @zhyncs @HaiShaw @ByronHsu
 /docs @zhaochenyang20
