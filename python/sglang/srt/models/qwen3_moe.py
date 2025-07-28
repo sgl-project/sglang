@@ -120,10 +120,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             # Additional args for FusedMoE
             **(
                 dict(
-                    enable_flashinfer_moe=True,
+                    enable_flashinfer_cutlass_moe=True,
                     enable_ep_moe=global_server_args_dict["enable_ep_moe"],
                 )
-                if global_server_args_dict["enable_flashinfer_moe"]
+                if global_server_args_dict["enable_flashinfer_cutlass_moe"]
                 else {}
             ),
         )
@@ -706,6 +706,9 @@ class Qwen3MoeForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
     @torch.no_grad()
     def forward(
