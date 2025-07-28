@@ -38,10 +38,6 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
-    attn_tp_all_gather,
-    attn_tp_reduce_scatter,
-    dp_gather_partial,
-    dp_scatter,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_local_attention_dp_size,
@@ -124,10 +120,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             # Additional args for FusedMoE
             **(
                 dict(
-                    enable_flashinfer_moe=True,
+                    enable_flashinfer_cutlass_moe=True,
                     enable_ep_moe=global_server_args_dict["enable_ep_moe"],
                 )
-                if global_server_args_dict["enable_flashinfer_moe"]
+                if global_server_args_dict["enable_flashinfer_cutlass_moe"]
                 else {}
             ),
         )
@@ -147,19 +143,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 config.num_experts + global_server_args_dict["ep_num_redundant_experts"]
             )
             self.top_k = config.num_experts_per_tok
-
-            self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
-                group=parallel_state.get_tp_group().device_group,
-                router_topk=self.top_k,
-                permute_fusion=True,
-                num_experts=self.num_experts,
-                num_local_experts=config.num_experts // self.tp_size,
-                hidden_size=config.hidden_size,
-                params_dtype=config.torch_dtype,
-                deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
-                async_finish=True,  # TODO
-                return_recv_hook=True,
-            )
 
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
@@ -193,8 +176,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        forward_mode = forward_batch.forward_mode
-        if is_non_idle_and_non_empty(forward_mode, hidden_states):
+        if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
             topk_weights, topk_idx, _ = self.topk(
@@ -212,41 +194,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             topk_weights = torch.empty(
                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
-        if self.ep_size > 1:
-            # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
-            (
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                reorder_topk_ids,
-                num_recv_tokens_per_expert,
-                seg_indptr,
-                masked_m,
-                expected_m,
-            ) = self.deepep_dispatcher.dispatch(
-                hidden_states=hidden_states,
-                topk_idx=topk_idx,
-                topk_weights=topk_weights,
-                forward_batch=forward_batch,
-            )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
-            reorder_topk_ids=reorder_topk_ids,
-            seg_indptr=seg_indptr,
-            masked_m=masked_m,
-            expected_m=expected_m,
-            num_recv_tokens_per_expert=num_recv_tokens_per_expert,
             forward_batch=forward_batch,
         )
-        if self.ep_size > 1:
-            final_hidden_states = self.deepep_dispatcher.combine(
-                hidden_states=final_hidden_states,
-                topk_idx=topk_idx,
-                topk_weights=topk_weights,
-                forward_batch=forward_batch,
-            )
         return final_hidden_states
 
     def op_gate(self, state):
@@ -283,8 +236,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
-            # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
-            self.deepep_dispatcher.dispatch_a(
+            self.experts.deepep_dispatcher.dispatch_a(
                 hidden_states=state.pop("hidden_states_mlp_input"),
                 topk_idx=state.pop("topk_idx_local"),
                 topk_weights=state.pop("topk_weights_local"),
@@ -297,46 +249,32 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
-                (
-                    state.hidden_states_experts_input,
-                    state.topk_idx_dispatched,
-                    state.topk_weights_dispatched,
-                    state.reorder_topk_ids,
-                    state.num_recv_tokens_per_expert,
-                    state.seg_indptr,
-                    state.masked_m,
-                    state.expected_m,
-                ) = self.deepep_dispatcher.dispatch_b(
+                state.dispatch_output = self.experts.deepep_dispatcher.dispatch_b(
                     tbo_subbatch_index=state.get("tbo_subbatch_index"),
                 )
 
     def op_experts(self, state):
-        state.hidden_states_experts_output = self.experts(
-            hidden_states=state.pop("hidden_states_experts_input"),
-            topk_idx=state.topk_idx_dispatched,
-            topk_weights=state.topk_weights_dispatched,
-            reorder_topk_ids=state.pop("reorder_topk_ids"),
-            seg_indptr=state.pop("seg_indptr"),
-            masked_m=state.pop("masked_m"),
-            expected_m=state.pop("expected_m"),
-            num_recv_tokens_per_expert=state.pop("num_recv_tokens_per_expert"),
-            forward_batch=state.forward_batch,
+        state.hidden_states_experts_output = self.experts.moe_impl(
+            dispatch_output=state.dispatch_output,
         )
 
     def op_combine_a(self, state):
         if self.ep_size > 1:
-            self.deepep_dispatcher.combine_a(
+            self.experts.deepep_dispatcher.combine_a(
                 hidden_states=state.pop("hidden_states_experts_output"),
-                topk_idx=state.pop("topk_idx_dispatched"),
-                topk_weights=state.pop("topk_weights_dispatched"),
+                topk_idx=state.dispatch_output.topk_idx,
+                topk_weights=state.dispatch_output.topk_weights,
                 forward_batch=state.forward_batch,
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
+            state.pop("dispatch_output")
 
     def op_combine_b(self, state):
         if self.ep_size > 1:
-            state.hidden_states_after_combine = self.deepep_dispatcher.combine_b(
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
+            state.hidden_states_after_combine = (
+                self.experts.deepep_dispatcher.combine_b(
+                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
+                )
             )
 
     def op_output(self, state):
@@ -711,6 +649,9 @@ class Qwen3MoeForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
     @torch.no_grad()
     def forward(

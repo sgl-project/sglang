@@ -20,7 +20,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
@@ -28,14 +28,6 @@ if TYPE_CHECKING:
         CompressedTensorsConfig,
     )
 
-_is_cuda = is_cuda()
-_is_npu = is_npu()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu = is_cpu()
-
-if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
-    from vllm import _custom_ops as vllm_ops
-    from vllm._custom_ops import scaled_fp8_quant
 
 try:
     import vllm
@@ -566,6 +558,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 torch.empty((num_experts, 0), dtype=torch.int32, device=device),
                 requires_grad=False,
             )
+
+        from vllm import _custom_ops as vllm_ops
 
         marlin_w13_qweight = vllm_ops.gptq_marlin_moe_repack(
             layer.w13_weight_packed,

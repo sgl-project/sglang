@@ -89,7 +89,7 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
         ),
     }[provider]
     bench_fn = lambda: fn(
-        x=x.clone(), group_size=group_size, dst_dtype=dst_dtype, **flags
+        x=x, group_size=group_size, dst_dtype=dst_dtype, **flags
     )
 
     time_s = bench_kineto(bench_fn, kernel_names=kernel_names)

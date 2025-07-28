@@ -1,16 +1,3 @@
-//! Comprehensive tests for PrefillDecode (PD) routing functionality
-//!
-//! This test suite covers:
-//! - Phase 1: Basic PD router creation and configuration
-//! - Phase 2: Bootstrap injection and request handling
-//! - Phase 3: Cache-aware selection (when implemented)
-//!
-//! Note: PD mode is enabled via the pd_disaggregation flag, not as a policy type.
-//! The policy type (Random, PowerOfTwo, CacheAware) determines the selection algorithm within PD mode.
-
-// TODO: This test file needs to be updated for the new configuration structure
-// where RoutingMode and PolicyConfig are separate
-
 #[cfg(test)]
 mod test_pd_routing {
     use rand::Rng;
@@ -135,6 +122,8 @@ mod test_pd_routing {
                         "http://decode1:8080".to_string(),
                         "http://decode2:8080".to_string(),
                     ],
+                    prefill_policy: None,
+                    decode_policy: None,
                 },
                 PolicyConfig::Random,
             ),
@@ -142,6 +131,8 @@ mod test_pd_routing {
                 RoutingMode::PrefillDecode {
                     prefill_urls: vec![("http://prefill:8080".to_string(), Some(9000))],
                     decode_urls: vec!["http://decode:8080".to_string()],
+                    prefill_policy: None,
+                    decode_policy: None,
                 },
                 PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5,
@@ -155,6 +146,8 @@ mod test_pd_routing {
                         ("http://p3:8080".to_string(), Some(9002)),
                     ],
                     decode_urls: vec!["http://d1:8080".to_string(), "http://d2:8080".to_string()],
+                    prefill_policy: None,
+                    decode_policy: None,
                 },
                 PolicyConfig::CacheAware {
                     cache_threshold: 0.7,
@@ -180,6 +173,7 @@ mod test_pd_routing {
                 metrics: None,
                 log_dir: None,
                 log_level: None,
+                request_id_headers: None,
             };
 
             // Router creation will fail due to health checks, but config should be valid
@@ -921,14 +915,6 @@ mod test_pd_routing {
 
     #[test]
     fn test_policy_type_to_pd_selection_policy_mapping() {
-        // Document the mapping from PolicyType to PDSelectionPolicy
-        // This mapping happens in lib.rs when pd_disaggregation=true
-
-        // PolicyType::Random -> PDSelectionPolicy::Random
-        // PolicyType::PowerOfTwo -> PDSelectionPolicy::PowerOfTwo
-        // PolicyType::CacheAware -> PDSelectionPolicy::CacheAware { ... }
-        // PolicyType::RoundRobin -> ERROR (not supported in PD mode)
-
         // Test that PDSelectionPolicy doesn't include RoundRobin
         let pd_policy_count = 3; // Random, PowerOfTwo, CacheAware
         assert_eq!(

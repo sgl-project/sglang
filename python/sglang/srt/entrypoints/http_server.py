@@ -38,7 +38,7 @@ import orjson
 import requests
 import uvicorn
 import uvloop
-from fastapi import Depends, FastAPI, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -77,7 +77,6 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
-    ReportHealthInput,
     ResumeMemoryOccupationReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
@@ -94,7 +93,6 @@ from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
-    ServerStatus,
     add_api_key_middleware,
     add_prometheus_middleware,
     delete_directory,
@@ -108,6 +106,8 @@ from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 
 
 # Store global states
@@ -174,6 +174,18 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(HTTPException)
+async def validation_exception_handler(request: Request, exc: HTTPException):
+    """Enrich HTTP exception with status code and other details"""
+    error = ErrorResponse(
+        object="error",
+        message=exc.detail,
+        type=str(exc.status_code),
+        code=exc.status_code,
+    )
+    return ORJSONResponse(content=error.model_dump(), status_code=exc.status_code)
+
+
 # Custom exception handlers to change validation error status codes
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -214,39 +226,13 @@ async def validate_json_request(raw_request: Request):
         )
 
 
-HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
-
-
 ##### Native API endpoints #####
 
 
 @app.get("/health")
 async def health() -> Response:
-    """Check the status of the http server."""
-    code = HTTPStatus.SERVICE_UNAVAILABLE.value
-    if _global_state.tokenizer_manager.server_status == ServerStatus.Up:
-        code = HTTPStatus.OK.value
-    return Response(
-        status_code=code,
-        content=json.dumps(
-            {"status": _global_state.tokenizer_manager.server_status.value}
-        ),
-    )
-
-
-@app.post("/health")
-async def health_update(obj: ReportHealthInput, request: Request) -> Response:
-    """Update the Status of the http server."""
-    try:
-        server_status = ServerStatus(obj.status)
-        _global_state.tokenizer_manager.server_status = server_status
-        if server_status != ServerStatus.Up:
-            return Response(
-                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, content=obj.msg
-            )
-    except Exception as e:
-        logger.error(e)
-        return Response(status_code=HTTPStatus.SERVICE_UNAVAILABLE.value)
+    """Check the health of the http server."""
+    return Response(status_code=200)
 
 
 @app.get("/health_generate")
@@ -281,7 +267,7 @@ async def health_generate(request: Request) -> Response:
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
             _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            _global_state.tokenizer_manager.health_check_failed = False
             return Response(status_code=200)
 
     task.cancel()
@@ -295,7 +281,7 @@ async def health_generate(request: Request) -> Response:
         f"last_heartbeat time: {last_receive_time}"
     )
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-    _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+    _global_state.tokenizer_manager.health_check_failed = True
     return Response(status_code=503)
 
 
@@ -832,6 +818,24 @@ async def retrieve_model(model: str):
     )
 
 
+@app.post("/v1/score", dependencies=[Depends(validate_json_request)])
+async def v1_score_request(request: ScoringRequest, raw_request: Request):
+    """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
+    return await raw_request.app.state.openai_serving_score.handle_request(
+        request, raw_request
+    )
+
+
+@app.api_route(
+    "/v1/rerank", methods=["POST", "PUT"], dependencies=[Depends(validate_json_request)]
+)
+async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
+    """Endpoint for reranking documents based on query relevance."""
+    return await raw_request.app.state.openai_serving_rerank.handle_request(
+        request, raw_request
+    )
+
+
 ## SageMaker API
 @app.get("/ping")
 async def sagemaker_health() -> Response:
@@ -875,24 +879,6 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     if isinstance(ret, Response):
         return ret
     return ORJSONResponse({"predictions": ret})
-
-
-@app.post("/v1/score", dependencies=[Depends(validate_json_request)])
-async def v1_score_request(request: ScoringRequest, raw_request: Request):
-    """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
-    return await raw_request.app.state.openai_serving_score.handle_request(
-        request, raw_request
-    )
-
-
-@app.api_route(
-    "/v1/rerank", methods=["POST", "PUT"], dependencies=[Depends(validate_json_request)]
-)
-async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
-    """Endpoint for reranking documents based on query relevance."""
-    return await raw_request.app.state.openai_serving_rerank.handle_request(
-        request, raw_request
-    )
 
 
 def _create_error_response(e):
@@ -941,15 +927,6 @@ def launch_server(
         add_prometheus_middleware(app)
         enable_func_timer()
 
-    image_token_text = None
-    if (
-        tokenizer_manager.image_token_id is not None
-        and not server_args.skip_tokenizer_init
-    ):
-        image_token_text = tokenizer_manager.tokenizer.decode(
-            [tokenizer_manager.image_token_id]
-        )
-
     # Send a warmup request - we will create the thread launch it
     # in the lifespan after all other warmups have fired.
     warmup_thread = threading.Thread(
@@ -957,7 +934,6 @@ def launch_server(
         args=(
             server_args,
             pipe_finish_writer,
-            image_token_text,
             launch_callback,
         ),
     )
@@ -1047,13 +1023,9 @@ def _execute_server_warmup(
                 headers=headers,
                 timeout=600,
             )
-            if res.status_code == 200:
-                _global_state.tokenizer_manager.server_status = ServerStatus.Up
-            else:
-                _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
-            logger.info(f"{res}")
+            assert res.status_code == 200, f"{res}"
         else:
-            logger.info(f"Start of prefill/decode warmup ...")
+            logger.info(f"Start of prefill warmup ...")
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
@@ -1075,25 +1047,15 @@ def _execute_server_warmup(
                 headers=headers,
                 timeout=1800,  # because of deep gemm precache is very long if not precache.
             )
-            if res.status_code == 200:
-                logger.info(
-                    f"End of prefill disaggregation mode warmup with status {res.status_code}, resp: {res.json()}"
-                )
-                _global_state.tokenizer_manager.server_status = ServerStatus.Up
-            else:
-                logger.info(
-                    "Prefill disaggregation mode warm Up Failed, status code: {}".format(
-                        res.status_code
-                    )
-                )
-                _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+            logger.info(
+                f"End of prefill warmup with status {res.status_code}, resp: {res.json()}"
+            )
 
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        _global_state.tokenizer_manager.server_status = ServerStatus.Crashed
         kill_process_tree(os.getpid())
         return False
 
@@ -1105,7 +1067,6 @@ def _execute_server_warmup(
 def _wait_and_warmup(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
-    image_token_text: str,
     launch_callback: Optional[Callable[[], None]] = None,
 ):
     if not server_args.skip_server_warmup:
