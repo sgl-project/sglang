@@ -115,6 +115,7 @@ jobs:
         echo "Installing SGLang with all extras..."
         python3 -m pip --no-cache-dir install -e "python[all]" --break-system-packages
         python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.5
+        python3 -m pip --no-cache-dir install genai-bench==0.0.1
 
     - name: Build and install sgl-router
       run: |
@@ -250,27 +251,6 @@ jobs:
             exit 1
           fi
 
-          # Install genai-bench
-          echo "Installing genai-bench..."
-          pip install genai-bench
-
-          # Create simple dataset config for benchmarking
-          cat > dataset_config_${policy}.json << EOF
-          {
-            "source": {
-              "type": "synthetic",
-              "num_samples": 50
-            },
-            "prompt_column": "prompt",
-            "synthetic_config": {
-              "input_length_mean": 4096,
-              "input_length_std": 100,
-              "output_length_mean": 5,
-              "output_length_std": 1
-            }
-          }
-          EOF
-
           # Run genai-bench benchmark
           echo "Running genai-bench for $policy..."
           genai-bench benchmark \
@@ -281,7 +261,6 @@ jobs:
             --task text-to-text \
             --num-concurrency 64 \
             --traffic-scenario "D(2000,200)" \
-            --dataset-config dataset_config_${policy}.json \
             --max-time-per-run 2 \
             --experiment-folder-name "benchmark_${policy}" \
             --experiment-base-dir "."
