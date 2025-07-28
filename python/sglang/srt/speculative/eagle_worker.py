@@ -687,7 +687,7 @@ class EAGLEWorker(TpModelWorker):
             )
             self._detect_nan_if_needed(logits_output)
             self._post_process_draft_logits(logits_output)
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            probs = safe_softmax(logits_output.next_token_logits)
             probs = self._post_process_draft_probs(probs)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             hidden_states = logits_output.hidden_states
@@ -984,11 +984,37 @@ class EAGLEWorker(TpModelWorker):
         logits[..., -1] = self.log_num_cold_tokens + (
             cold_token_logits / self.num_cold_tokens
         )
-        logits.clamp_(min=finfo.min, max=finfo.max)
-        logger.debug(f"Re-clamp: {logits=}")
-        # replace nan values with -inf
-        logits = torch.where(torch.isnan(logits), torch.tensor(-float("inf")), logits)
-        logger.debug(f"After replacing nan -> -inf: {logits=}")
+
+
+def safe_softmax(logits: torch.Tensor, dim: Optional[int] = -1) -> torch.Tensor:
+    """
+    A numerically stable softmax implementation with aggressive clamping
+    at each intermediate step to prevent NaN generation from inf values.
+    """
+    finfo = torch.finfo(logits.dtype)
+
+    # 1. Find the maximum and clamp it.
+    max_val = torch.max(logits, dim=dim, keepdim=True)[0]
+    max_val = torch.clamp(max_val, min=finfo.min, max=finfo.max)
+
+    # 2. Shift the logits and clamp. This is where `inf - inf` -> NaN is prevented.
+    shifted_logits = logits - max_val
+    shifted_logits = torch.clamp(shifted_logits, min=finfo.min, max=finfo.max)
+
+    # 3. Exponentiate and clamp.
+    exp_logits = torch.exp(shifted_logits)
+    exp_logits = torch.clamp(exp_logits, min=finfo.min, max=finfo.max)
+
+    # 4. Sum the exponentiated values and clamp.
+    sum_exp_logits = torch.sum(exp_logits, dim=dim, keepdim=True)
+    sum_exp_logits = torch.clamp(sum_exp_logits, min=finfo.eps, max=finfo.max)
+
+    # 5. Normalize and perform a final clamp.
+    probs = exp_logits / sum_exp_logits
+    probs = torch.clamp(probs, min=finfo.min, max=finfo.max)
+
+    return probs
+
 
     def _post_process_draft_probs(self, probs: torch.Tensor) -> torch.Tensor:
         logger.debug("post_process_draft_probs")
@@ -1031,7 +1057,7 @@ class EAGLEWorker(TpModelWorker):
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
         self._post_process_draft_logits(logits_output)
-        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+        probs = safe_softmax(logits_output.next_token_logits)
         probs = self._post_process_draft_probs(probs)
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
