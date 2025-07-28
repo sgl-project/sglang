@@ -268,17 +268,15 @@ class WhisperEncoder(torch.nn.Module):
     def forward(
         self,
         input_features: torch.Tensor,
+        position_ids: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
         inputs_embeds = torch.nn.functional.gelu(self.conv1(input_features))
         inputs_embeds = torch.nn.functional.gelu(self.conv2(inputs_embeds))
 
         inputs_embeds = inputs_embeds.mT
-        all_positions = torch.arange(
-            self.embed_positions.num_embeddings, device=inputs_embeds.device
-        )
 
-        hidden_states = inputs_embeds + self.embed_positions(all_positions)
+        hidden_states = inputs_embeds + self.embed_positions(position_ids)
 
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(hidden_states, forward_batch)
@@ -319,8 +317,6 @@ class WhisperDecoder(torch.nn.Module):
         position_ids=None,
     ):
 
-        input_shape = input_ids.size()
-        input_ids = input_ids.view(-1, input_shape[-1])
         inputs_embeds = self.embed_tokens(input_ids)
 
         # embed positions
@@ -401,6 +397,7 @@ class WhisperForConditionalGeneration(torch.nn.Module):
                 weight_loader(param, loaded_weight)
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+        image_inputs.num_image_tokens = image_inputs.mm_items[0].feature.shape[1] // 2
         # Whisper models handle text/audio separately, so we don't need to pad input ids
         return input_ids
 
@@ -417,7 +414,13 @@ class WhisperForConditionalGeneration(torch.nn.Module):
         features = mm_inputs.mm_items[0].feature
         dtype = self.encoder.conv1.weight.dtype
 
-        encoder_outputs = self.encoder(features.to(dtype), forward_batch)
+        encoder_position_ids = torch.cat(
+            [torch.arange(length) for length in forward_batch.encoder_lens_cpu]
+        ).to(features.device, non_blocking=True)
+
+        encoder_outputs = self.encoder(
+            features.to(dtype), encoder_position_ids, forward_batch
+        )
         decoder_outputs = self.decoder(
             input_ids, encoder_outputs, forward_batch, positions
         )
@@ -425,7 +428,7 @@ class WhisperForConditionalGeneration(torch.nn.Module):
         logits = self.logits_processor(
             input_ids=input_ids,
             lm_head=self.proj_out,
-            hidden_states=decoder_outputs[:, -1, :],
+            hidden_states=decoder_outputs,
             logits_metadata=forward_batch,
         )
 

@@ -20,10 +20,17 @@ class WhisperProcessor(BaseMultimodalProcessor):
     ) -> Optional[Dict[str, Any]]:
         audios = [load_audio(audio) for audio in audio_data]
 
-        processor_output = self.process_mm_data(input_text=input_text, audio=audios)
+        processor_output = self.process_mm_data(
+            input_text=input_text,
+            audio=audios,
+            return_attention_mask=True,
+            pad_to_multiple_of=320,
+        )
+        input_ids = processor_output["labels"][0]
+        input_ids_mask = input_ids != self._processor.tokenizer.pad_token_id
         output = {}
         output["data_hashes"] = [hash(audio_data) for audio_data in audio_data]
-        output["input_ids"] = processor_output["labels"][0].tolist()
+        output["input_ids"] = input_ids[input_ids_mask].tolist()
         output["mm_items"] = [
             MultimodalDataItem(
                 feature=processor_output["input_features"][0],
