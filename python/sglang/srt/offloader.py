@@ -86,6 +86,16 @@ class ModuleOffloader:
         for i in range(self.prefetch_step):
             self.offloaders[i].start_onload()
 
+        if get_bool_env_var("SGLANG_HACK_MEM_PROFILE_STARTUP"):
+            memory_profile_path = os.path.join(
+                "/data/numa0/tom/temp_sglang_server2local",
+                str(time.time())
+                + f"-DP-{self.dp_rank}-memory"
+                + ".pickle",
+                )
+            torch.cuda.memory._dump_snapshot(memory_profile_path)
+            torch.cuda.memory._record_memory_history(enabled=None)
+
 
 def _hook_module_forward_for_offloader(index, module, offloaders, prefetch_step):
     def _on_forward_end():

@@ -357,16 +357,6 @@ class Scheduler(
             nccl_port=port_args.nccl_port,
         )
 
-        if get_bool_env_var("SGLANG_HACK_MEM_PROFILE_STARTUP"):
-            memory_profile_path = os.path.join(
-                "/data/numa0/tom/temp_sglang_server2local",
-                str(time.time())
-                + f"-DP-{self.dp_rank}-memory"
-                + ".pickle",
-            )
-            torch.cuda.memory._dump_snapshot(memory_profile_path)
-            torch.cuda.memory._record_memory_history(enabled=None)
-
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
