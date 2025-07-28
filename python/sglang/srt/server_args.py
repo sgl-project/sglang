@@ -91,6 +91,7 @@ class ServerArgs:
     device: Optional[str] = None
     tp_size: int = 1
     pp_size: int = 1
+    pp_async_batch_depth: int = 0
     max_micro_batch_size: Optional[int] = None
     stream_interval: int = 1
     stream_output: bool = False
@@ -902,6 +903,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.pp_size,
             help="The pipeline parallelism size.",
+        )
+        parser.add_argument(
+            "--pp-async-batch-depth",
+            type=int,
+            default=ServerArgs.pp_async_batch_depth,
+            help="The async batch depth in pipeline parallelism.",
         )
         parser.add_argument(
             "--max-micro-batch-size",

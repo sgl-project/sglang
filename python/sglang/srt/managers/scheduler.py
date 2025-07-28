@@ -935,7 +935,7 @@ class Scheduler(
 
     def _pp_send_reqs_to_next_stage(self, reqs: List[Req]):
         # send out reqs to the next stage
-        dp_offset = self.dp_rank * self.attn_tp_size
+        dp_offset = self.attn_dp_rank * self.attn_tp_size
         if self.attn_tp_rank == 0:
             point_to_point_pyobj(
                 reqs,
@@ -1034,10 +1034,6 @@ class Scheduler(
                                 result.pp_hidden_states_proxy_tensors
                             )
 
-                if self.delayed_weight_sync_fn:
-                    self.delayed_weight_sync_fn()
-                    self.delayed_weight_sync_fn = None
-
                 pp_outputs = next_pp_outputs
 
             # When the server is idle, self-check and re-init some states
@@ -1070,7 +1066,7 @@ class Scheduler(
                 recv_reqs = None
         else:
             if self.attn_tp_rank == 0:
-                dp_offset = self.dp_rank * self.attn_tp_size
+                dp_offset = self.attn_dp_rank * self.attn_tp_size
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
@@ -1402,7 +1398,9 @@ class Scheduler(
         kv_metrics.num_requests_waiting = self.stats.num_queue_reqs
         kv_metrics.gpu_cache_usage_perc = self.stats.token_usage
         kv_metrics.gpu_prefix_cache_hit_rate = self.stats.cache_hit_rate
-        kv_metrics.data_parallel_rank = self.dp_rank if self.dp_rank is not None else 0
+        kv_metrics.data_parallel_rank = (
+            self.attn_dp_rank if self.attn_dp_rank is not None else 0
+        )
 
         if not self.send_metrics_from_scheduler.closed:
             self.send_metrics_from_scheduler.send_pyobj(kv_metrics)
