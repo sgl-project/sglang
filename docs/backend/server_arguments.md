@@ -188,6 +188,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--attention-backend` | Choose the kernels for attention layers. | None |
+| `decode_attention_backend` | (Experimental) This argument specifies the backend for decode attention computation. Note that this argument has priority over `attention_backend`. | None |
+| `prefill_attention_backend` | (Experimental) This argument specifies the backend for prefill attention computation. Note that this argument has priority over `attention_backend`. | None |
 | `--sampling-backend` | Choose the kernels for sampling layers. | None |
 | `--grammar-backend` | Choose the backend for grammar-guided decoding. | None |
 | `--mm-attention-backend` | Set multimodal attention backend. | None |
