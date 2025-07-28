@@ -82,8 +82,8 @@ class WhisperAttention(torch.nn.Module):
         """Input shape: Batch x Time x Channel"""
 
         if self.is_cross_attention:
-            q = self.q_proj(hidden_states)
-            kv = self.kv_proj(cross_hidden_states)
+            q, _ = self.q_proj(hidden_states)
+            kv, _ = self.kv_proj(cross_hidden_states)
             k, v = kv.chunk(chunks=2, dim=-1)
         else:
             qkv, _ = self.qkv_proj(hidden_states)
