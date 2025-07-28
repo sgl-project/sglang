@@ -541,8 +541,20 @@ class LogitsProcessor(nn.Module):
                 )
             else:
                 logger.debug("Using torch.matmul")
+                # Extended debugging for NaN investigation
+                hs_dtype = hidden_states.dtype
+                w_dtype = lm_head.weight.dtype
+                logger.debug(f"dtypes: hidden_states={hs_dtype}, lm_head.weight={w_dtype}")
+                if torch.isinf(hidden_states).any():
+                    logger.warning("Infinity found in hidden_states before matmul.")
+                if torch.isinf(lm_head.weight).any():
+                    logger.warning("Infinity found in lm_head.weight before matmul.")
+                logger.debug(f"max(abs(hidden_states)): {hidden_states.abs().max().item()}")
+                logger.debug(f"max(abs(lm_head.weight)): {lm_head.weight.abs().max().item()}")
+
+                # To prevent overflow with low-precision dtypes, cast to float64 for matmul
                 logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                    hidden_states.to(torch.float64), lm_head.weight.to(torch.float64).T
                 )
             logger.debug(f"After matmul, logits: {logits.shape}")
             if torch.isnan(logits).any():
