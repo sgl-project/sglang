@@ -65,6 +65,7 @@ class FusedMoE(torch.nn.Module):
         intermediate_size: int,
         layer_id: int,
         top_k: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
         params_dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
@@ -93,6 +94,7 @@ class FusedMoE(torch.nn.Module):
         )
         self.tp_rank = get_tensor_model_parallel_rank()
         self.num_experts = num_experts
+        self.num_fused_shared_experts = num_fused_shared_experts
         self.expert_map = None
 
         if enable_flashinfer_cutlass_moe and quant_config is None:
@@ -389,9 +391,15 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-        physical_expert_ids = global_expert_location_metadata.logical_to_all_physical(
-            self.layer_id, expert_id
-        )
+        if expert_id >= self.num_experts - self.num_fused_shared_experts:
+            # This is a shared expert.
+            physical_expert_ids = [expert_id]
+        else:
+            physical_expert_ids = (
+                global_expert_location_metadata.logical_to_all_physical(
+                    self.layer_id, expert_id
+                )
+            )
 
         for physical_expert_id in physical_expert_ids:
             self._weight_loader_physical(
