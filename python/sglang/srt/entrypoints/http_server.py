@@ -242,6 +242,9 @@ async def health_generate(request: Request) -> Response:
     if not _global_state.tokenizer_manager.server_status.is_healthy():
         return Response(status_code=503)
 
+    if _global_state.tokenizer_manager.is_image_gen:
+        return Response(status_code=200)
+
     """Step2: Check the health of the inference server by generating one token."""
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     rid = f"HEALTH_CHECK_{time.time()}"
