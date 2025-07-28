@@ -1,26 +1,32 @@
-# Mooncake L3 store
+# Mooncake as L3 KV Cache
 
-### Directly install mooncake client
+This document describes how to use Mooncake as the L3 KV cache for SGLang.
+For more details about Mooncake, please refer to: https://kvcache-ai.github.io/
+
+## Install Mooncake
+
+### Method 1: with pip
 
 ```bash
-pip install mooncake
+pip install mooncake-transfer-engine
 ```
 
-### Mooncake build steps
-Building mooncake client and server from source code.
-1. Clone mooncake source code 
+### Method 2: from source
+
+Clone Mooncake project:
 
 ```bash
-git clone https://github.com/kvcache-ai/Mooncake
+git clone https://github.com/kvcache-ai/Mooncake --recursive
 ```
 
-2. Install dependencies, stable Internet connection is required:
+Install dependencies:
 
 ```bash
+cd Mooncake
 bash dependencies.sh
 ```
 
-3. In the root directory of this project, run the following commands:
+Build the project. For additional build options, please refer to [the official guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html).
 
 ```bash
 mkdir build
@@ -29,44 +35,37 @@ cmake ..
 make -j
 ```
 
-4. Install Mooncake python package and mooncake_master executable
+Install Mooncake:
 
 ```bash
 sudo make install
 ```
 
-Please refer to https://kvcache-ai.github.io/Mooncake/ as more detailed guide.
+## Use Mooncake
 
-### Launch Mooncake master and meta server
-
-Launch mooncake master server:
+Launch Mooncake master server:
 
 ```bash
-./build/mooncake-store/src/mooncake_master
+mooncake_master
 ```
 
- Launch mooncake meta server:
+Launch Mooncake meta server:
 
 ```bash
-python ./mooncake-transter-engine/example/http-metadata-server-python/bootstrap_server.py
+python -m mooncake.http_metadata_server
 ```
 
-### Mooncake config in SGLang
-
-Mooncake config can be loaded from environment arguments, for example:
+Start the SGLang server with Mooncake enabled. Mooncake configuration can be provided via environment variables:
 
 ```bash
-export MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata"
-export MOONCAKE_GLOBAL_SEGMENT_SIZE=0
-export MOONCAKE_LOCAL_BUFFER_SIZE=268435456
-export MOONCAKE_PROTOCOL="rdma"
-export MOONCAKE_DEVICE="erdma_0,erdma_1"
-export MOONCAKE_MASTER=127.0.0.1:50051
+MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
+MOONCAKE_GLOBAL_SEGMENT_SIZE=8589934592 \
+MOONCAKE_LOCAL_BUFFER_SIZE=268435456 \
+MOONCAKE_PROTOCOL="rdma" \
+MOONCAKE_DEVICE="erdma_0,erdma_1" \
+MOONCAKE_MASTER=127.0.0.1:50051 \
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake\
+    --model-path [model_path]
 ```
-
-Then launch the sglang server with argument --hicache-storage-backend mooncake
-
-```bash
-python -m sglang.launch_server --enable-hierarchical-cache --hicache-storage-backend mooncake
-```
-
