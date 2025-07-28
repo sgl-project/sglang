@@ -438,6 +438,11 @@ class _SharedMemoryManager:
         self._operation_index = 0
 
     def malloc(self, *, shape, dtype):
+        meta_tensor = torch.empty(size=shape, dtype=dtype, device="meta")
+        raw = self._malloc_raw(num_bytes=meta_tensor.nbytes)
+        return raw.view(dtype).view(*shape)
+
+    def _malloc_raw(self, *, num_bytes: int) -> torch.Tensor:
         return TODO
 
 _shared_memory_manager = _SharedMemoryManager()
