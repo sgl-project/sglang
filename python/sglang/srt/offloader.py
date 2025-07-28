@@ -26,7 +26,6 @@ class ModuleOffloader:
         self.prefetch_step = get_int_env_var("SGLANG_OFFLOAD_PREFETCH_STEP", 1)
         self.mode = os.environ.get("SGLANG_OFFLOAD_MODE", "cpu")
         self.enabled = self.group_size > 0
-        assert self.mode in ["cpu", "sharded_gpu"]
 
         if self.mode == "sharded_gpu":
             NaiveDistributed.initialize(
@@ -183,6 +182,7 @@ class _BaseParamOffloader(ABC):
     @staticmethod
     def create(mode: str, **kwargs) -> "_BaseParamOffloader":
         return {
+            "meta": _MetaParamOffloader,
             "cpu": _CpuParamOffloader,
             "sharded_gpu": _ShardedGpuParamOffloader,
         }[mode](**kwargs)
@@ -200,6 +200,15 @@ class _BaseParamOffloader(ABC):
 
     def create_device_tensor(self):
         raise NotImplementedError
+
+class _MetaParamOffloader(_BaseParamOffloader):
+    def __init__(self, module, param_name):
+        super().__init__(module, param_name)
+        _move_param_to_meta(module, param_name)
+
+    def create_device_tensor(self):
+        return torch.empty_like(self._param.data, device="cuda")
+
 
 class _CpuParamOffloader(_BaseParamOffloader):
     def __init__(self, module, param_name):
