@@ -719,10 +719,19 @@ class EPMoE(FusedMoE):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        physical_expert_ids = (
-            get_global_expert_location_metadata().logical_to_all_physical(
-                self.layer_id, expert_id
+        global_expert_location_metadata = get_global_expert_location_metadata()
+        if global_expert_location_metadata is None:
+            self._weight_loader_impl(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=expert_id,
             )
+            return
+
+        physical_expert_ids = global_expert_location_metadata.logical_to_all_physical(
+            self.layer_id, expert_id
         )
         for physical_expert_id in physical_expert_ids:
             self._weight_loader_physical(

@@ -478,14 +478,5 @@ class MixtralForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-    
-    @classmethod
-    def get_model_config_for_expert_location(cls, config):
-        return ModelConfigForExpertLocation(
-            num_layers=config.num_hidden_layers,
-            num_logical_experts=config.num_local_experts,
-            num_groups=None,
-        )
-
 
 EntryClass = MixtralForCausalLM
