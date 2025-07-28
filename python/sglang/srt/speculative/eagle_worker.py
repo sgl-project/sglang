@@ -687,6 +687,7 @@ class EAGLEWorker(TpModelWorker):
             )
             self._detect_nan_if_needed(logits_output)
             self._post_process_draft_logits(logits_output)
+            self._detect_nan_if_needed(logits_output)
             probs = safe_softmax(logits_output.next_token_logits)
             probs = self._post_process_draft_probs(probs)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
@@ -1047,25 +1048,63 @@ def safe_softmax(logits: torch.Tensor, dim: Optional[int] = -1) -> torch.Tensor:
     """
     finfo = torch.finfo(logits.dtype)
 
-    # 1. Find the maximum and clamp it.
-    max_val = torch.max(logits, dim=dim, keepdim=True)[0]
-    max_val = torch.clamp(max_val, min=finfo.min, max=finfo.max)
+    # 0. Clamp the logits.
+    logits = torch.clamp(logits, min=finfo.min, max=finfo.max)
+    if torch.isnan(logits).any():
+        raise ValueError(
+            f"Detected NaN values: {logits[torch.isnan(logits)]=}"
+        )
 
+    # 1. Find the maximum.
+    max_val = torch.max(logits, dim=dim, keepdim=True)[0]
+    
     # 2. Shift the logits and clamp. This is where `inf - inf` -> NaN is prevented.
     shifted_logits = logits - max_val
+    if torch.isnan(shifted_logits).any():
+        raise ValueError(
+            f"Detected NaN values: {shifted_logits[torch.isnan(shifted_logits)]=}"
+        )
     shifted_logits = torch.clamp(shifted_logits, min=finfo.min, max=finfo.max)
+    if torch.isnan(shifted_logits).any():
+        raise ValueError(
+            f"Detected NaN values: {shifted_logits[torch.isnan(shifted_logits)]=}"
+        )
 
     # 3. Exponentiate and clamp.
     exp_logits = torch.exp(shifted_logits)
+    if torch.isnan(exp_logits).any():
+        raise ValueError(
+            f"Detected NaN values: {exp_logits[torch.isnan(exp_logits)]=}"
+        )
     exp_logits = torch.clamp(exp_logits, min=finfo.min, max=finfo.max)
+    if torch.isnan(exp_logits).any():
+        raise ValueError(
+            f"Detected NaN values: {exp_logits[torch.isnan(exp_logits)]=}"
+        )
 
     # 4. Sum the exponentiated values and clamp.
     sum_exp_logits = torch.sum(exp_logits, dim=dim, keepdim=True)
+    if torch.isnan(sum_exp_logits).any():
+        raise ValueError(
+            f"Detected NaN values: {sum_exp_logits[torch.isnan(sum_exp_logits)]=}"
+        )
     sum_exp_logits = torch.clamp(sum_exp_logits, min=finfo.eps, max=finfo.max)
+    if torch.isnan(sum_exp_logits).any():
+        raise ValueError(
+            f"Detected NaN values: {sum_exp_logits[torch.isnan(sum_exp_logits)]=}"
+        )
 
     # 5. Normalize and perform a final clamp.
     probs = exp_logits / sum_exp_logits
+    if torch.isnan(probs).any():
+        raise ValueError(
+            f"Detected NaN values: {probs[torch.isnan(probs)]=}"
+        )
     probs = torch.clamp(probs, min=finfo.min, max=finfo.max)
+    if torch.isnan(probs).any():
+        raise ValueError(
+            f"Detected NaN values: {probs[torch.isnan(probs)]=}"
+        )
 
     return probs
 
