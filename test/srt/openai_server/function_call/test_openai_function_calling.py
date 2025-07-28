@@ -913,7 +913,7 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
         )
 
 
-## Skip for ci test
+# Skip for ci test
 # class TestGLM45ServerFunctionCalling(TestOpenAIServerFunctionCalling):
 #     @classmethod
 #     def setUpClass(cls):
