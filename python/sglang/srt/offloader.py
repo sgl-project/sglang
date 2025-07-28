@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import cuda.bindings.runtime as cuda_rt
 import numpy as np
 import base64
@@ -440,6 +442,7 @@ class _SharedMemoryManager:
     def __init__(self):
         self._base_name = Path(os.environ["SGLANG_SHARED_MEMORY_MANAGER_BASE_NAME"])
         self._operation_index = 0
+        self._records: List[_SharedMemoryRecord] = []
 
     def malloc(self, *, shape, dtype):
         meta_tensor = torch.empty(size=shape, dtype=dtype, device="meta")
@@ -459,14 +462,26 @@ class _SharedMemoryManager:
         if NaiveDistributed.instance.get_rank() != 0:
             shm = shared_memory.SharedMemory(name=shm_name)
 
-        tensor = torch.from_numpy(np.ndarray((num_bytes,), dtype=np.uint8, buffer=shm.buf))
+        np_array = np.ndarray((num_bytes,), dtype=np.uint8, buffer=shm.buf)
+        tensor = torch.from_numpy(np_array)
 
         logger.info(f"cudaHostRegister({tensor.data_ptr()=})")
         check_cuda_result(cuda_rt.cudaHostRegister(tensor.data_ptr(), num_bytes, cuda_rt.cudaHostRegisterPortable))
 
         NaiveDistributed.instance.barrier()
 
+        self._records.append(_SharedMemoryRecord(
+            shm=shm,
+            np_array=np_array,
+            tensor=tensor,
+        ))
         return tensor
+
+@dataclass
+class _SharedMemoryRecord:
+    shm: shared_memory.SharedMemory
+    np_array: np.ndarray
+    tensor: torch.Tensor
 
 _shared_memory_manager = _SharedMemoryManager()
 
