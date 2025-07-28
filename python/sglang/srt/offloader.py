@@ -238,24 +238,24 @@ class _ShmCpuParamOffloader(_BaseParamOffloader):
         else:
             _move_param_to_meta(self._module, self._param_name)
 
-        self.shm_cpu_param: Optional[torch.Tensor] = None
+        self.shm_cpu_data: Optional[torch.Tensor] = None
 
     def post_init(self):
         # check again since it may be changed
         assert self._param.data.is_contiguous(), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
 
         assert self._param.is_contiguous()
-        self.shm_cpu_param = _shared_memory_manager.malloc(shape=self._param.shape, dtype=self._param.dtype)
+        self.shm_cpu_data = _shared_memory_manager.malloc(shape=self._param.shape, dtype=self._param.dtype)
 
         if self._rank == 0:
-            self.shm_cpu_param.copy_(self._param.data.to("cpu"))
+            self.shm_cpu_data.copy_(self._param.data.to("cpu"))
         NaiveDistributed.instance.barrier()
 
         _move_param_to_meta(self._module, self._param_name)
 
 
     def create_device_tensor(self):
-        return self._param.to("cuda", non_blocking=True)
+        return self.shm_cpu_data.to("cuda", non_blocking=True)
 
 # TODO unify with ShmCpu mode
 class _ShardedGpuParamOffloader(_BaseParamOffloader):
