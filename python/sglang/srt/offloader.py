@@ -18,7 +18,8 @@ from torch.func import functional_call
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.parameter import ModelWeightParameter
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import get_int_env_var, is_pin_memory_available, MultiprocessingSerializer, get_bool_env_var
+from sglang.srt.utils import get_int_env_var, is_pin_memory_available, MultiprocessingSerializer, get_bool_env_var, \
+    dispose_tensor
 
 logger = logging.getLogger(__name__)
 
@@ -340,6 +341,8 @@ def _move_param_to_meta(module, param_name):
 
     setattr(module, param_name, new_param)
 
+    dispose_tensor(old_param)
+
 def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
     return torch.empty_strided(
         size=x.size(),
@@ -480,8 +483,13 @@ class _SharedMemoryManager:
         np_array = np.ndarray((num_bytes,), dtype=np.uint8, buffer=shm.buf)
         tensor = torch.from_numpy(np_array)
 
-        logger.info(f"cudaHostRegister({tensor.data_ptr()=})")
-        check_cuda_result(cuda_rt.cudaHostRegister(tensor.data_ptr(), num_bytes, cuda_rt.cudaHostRegisterPortable))
+        # TODO
+        # TODO
+        # TODO temp
+        # TODO
+        # TODO
+        # logger.info(f"cudaHostRegister({tensor.data_ptr()=})")
+        # check_cuda_result(cuda_rt.cudaHostRegister(tensor.data_ptr(), num_bytes, cuda_rt.cudaHostRegisterPortable))
 
         NaiveDistributed.instance.barrier()
 
