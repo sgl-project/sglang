@@ -281,7 +281,6 @@ def _move_param_to_meta(module, param_name):
         # manually checked how `w13_weight` and `w2_weight` are constructed
         new_param = ModelWeightParameter(
             data=new_data,
-            requires_grad=False,
             **{k: getattr(old_param, k) for k in ["input_dim", "output_dim", "weight_loader"]}
         )
     elif old_param_type == torch.nn.Parameter:
