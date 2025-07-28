@@ -163,8 +163,11 @@ class NixlFileManager:
             base_dir: Base directory for storing tensor files
         """
         self.base_dir = base_dir
-        os.makedirs(base_dir, exist_ok=True)
-        logger.debug(f"Initialized file manager with base directory: {base_dir}")
+        if base_dir == "":
+            logger.debug(f"Initialized file manager without a base directory")
+        else:
+            os.makedirs(base_dir, exist_ok=True)
+            logger.debug(f"Initialized file manager with base directory: {base_dir}")
 
     def get_file_path(self, key: str) -> str:
         """Get full file path for a given key."""

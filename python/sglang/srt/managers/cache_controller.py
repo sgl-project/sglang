@@ -20,7 +20,6 @@ from queue import Empty, Full, PriorityQueue, Queue
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
-import os
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -246,20 +245,16 @@ class HiCacheController:
 
         self.enable_storage = False
         # todo: move backend initialization to storage backend module
+        # todo: threshold policy for prefetching
         if storage_backend is not None:
             if storage_backend == "file":
                 self.storage_backend = HiCacheFile()
                 self.enable_storage = True
-                # todo: threshold policy for prefetching
                 self.prefetch_threshold = prefetch_threshold
             elif storage_backend == "nixl":
                 from sglang.srt.mem_cache.nixl.hicache_nixl import HiCacheNixl
-                # Use the configured file storage path
-                nixl_dir = os.path.join(os.path.expanduser(self.file_storage_path), "hicache_nixl")
-                os.makedirs(nixl_dir, exist_ok=True)
-                self.storage_backend = HiCacheNixl(file_path=nixl_dir)
+                self.storage_backend = HiCacheNixl(file_path=self.file_storage_path)
                 self.enable_storage = True
-                # todo: threshold policy for prefetching
                 self.prefetch_threshold = prefetch_threshold
             else:
                 raise NotImplementedError(
