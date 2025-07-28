@@ -17,6 +17,7 @@ import json
 import logging
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+import uuid
 
 import orjson
 from fastapi import Request
@@ -349,9 +350,9 @@ class AnthropicServingMessages(OpenAIServingBase):
         self, request: AnthropicMessagesRequest, raw_request: Request
     ) -> Union[AnthropicMessagesResponse, StreamingResponse, ORJSONResponse]:
         """Handle Anthropic Messages API request"""
-        
-        request_id = self._generate_request_id_base()
-        
+
+        request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
+
         try:
             # Convert to internal format
             internal_request = self._convert_to_internal_request(request)
