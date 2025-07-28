@@ -522,7 +522,7 @@ class LlamaForCausalLM(nn.Module):
             raise ValueError(
                 f"Detected NaN values: {positions[torch.isnan(positions)]=}"
             )
-        if torch.isnan(input_embeds).any():
+        if input_embeds is not None and torch.isnan(input_embeds).any():
             raise ValueError(
                 f"Detected NaN values: {input_embeds[torch.isnan(input_embeds)]=}"
             )
