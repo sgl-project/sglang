@@ -1,9 +1,9 @@
-use actix_web::{
-    dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
-    Error, HttpMessage, HttpRequest,
-};
-use futures_util::future::LocalBoxFuture;
-use std::future::{ready, Ready};
+use axum::{extract::Request, http::HeaderValue, response::Response};
+use std::sync::Arc;
+use std::time::Instant;
+use tower::{Layer, Service};
+use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
+use tracing::{field::Empty, info_span, Span};
 
 /// Generate OpenAI-compatible request ID based on endpoint
 fn generate_request_id(path: &str) -> String {
@@ -31,67 +31,67 @@ fn generate_request_id(path: &str) -> String {
     format!("{}{}", prefix, random_part)
 }
 
-/// Extract request ID from request extensions or generate a new one
-pub fn get_request_id(req: &HttpRequest) -> String {
-    req.extensions()
-        .get::<String>()
-        .cloned()
-        .unwrap_or_else(|| generate_request_id(req.path()))
+/// Extension type for storing request ID
+#[derive(Clone, Debug)]
+pub struct RequestId(pub String);
+
+/// Tower Layer for request ID middleware
+#[derive(Clone)]
+pub struct RequestIdLayer {
+    headers: Arc<Vec<String>>,
 }
 
-/// Middleware for injecting request ID into request extensions
-pub struct RequestIdMiddleware {
-    headers: Vec<String>,
-}
-
-impl RequestIdMiddleware {
+impl RequestIdLayer {
     pub fn new(headers: Vec<String>) -> Self {
-        Self { headers }
+        Self {
+            headers: Arc::new(headers),
+        }
     }
 }
 
-impl<S, B> Transform<S, ServiceRequest> for RequestIdMiddleware
-where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
-    S::Future: 'static,
-    B: 'static,
-{
-    type Response = ServiceResponse<B>;
-    type Error = Error;
-    type InitError = ();
-    type Transform = RequestIdMiddlewareService<S>;
-    type Future = Ready<Result<Self::Transform, Self::InitError>>;
+impl<S> Layer<S> for RequestIdLayer {
+    type Service = RequestIdMiddleware<S>;
 
-    fn new_transform(&self, service: S) -> Self::Future {
-        ready(Ok(RequestIdMiddlewareService {
-            service,
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestIdMiddleware {
+            inner,
             headers: self.headers.clone(),
-        }))
+        }
     }
 }
 
-pub struct RequestIdMiddlewareService<S> {
-    service: S,
-    headers: Vec<String>,
+/// Tower Service for request ID middleware
+#[derive(Clone)]
+pub struct RequestIdMiddleware<S> {
+    inner: S,
+    headers: Arc<Vec<String>>,
 }
 
-impl<S, B> Service<ServiceRequest> for RequestIdMiddlewareService<S>
+impl<S> Service<Request> for RequestIdMiddleware<S>
 where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
-    S::Future: 'static,
-    B: 'static,
+    S: Service<Request, Response = Response> + Send + 'static,
+    S::Future: Send + 'static,
 {
-    type Response = ServiceResponse<B>;
-    type Error = Error;
-    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
 
-    forward_ready!(service);
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
 
-    fn call(&self, req: ServiceRequest) -> Self::Future {
+    fn call(&mut self, mut req: Request) -> Self::Future {
+        let headers = self.headers.clone();
+
         // Extract request ID from headers or generate new one
         let mut request_id = None;
 
-        for header_name in &self.headers {
+        for header_name in headers.iter() {
             if let Some(header_value) = req.headers().get(header_name) {
                 if let Ok(value) = header_value.to_str() {
                     request_id = Some(value.to_string());
@@ -100,12 +100,184 @@ where
             }
         }
 
-        let request_id = request_id.unwrap_or_else(|| generate_request_id(req.path()));
+        let request_id = request_id.unwrap_or_else(|| generate_request_id(req.uri().path()));
 
         // Insert request ID into request extensions
-        req.extensions_mut().insert(request_id);
+        req.extensions_mut().insert(RequestId(request_id.clone()));
 
-        let fut = self.service.call(req);
-        Box::pin(async move { fut.await })
+        // Call the inner service
+        let future = self.inner.call(req);
+
+        Box::pin(async move {
+            let mut response = future.await?;
+
+            // Add request ID to response headers
+            response.headers_mut().insert(
+                "x-request-id",
+                HeaderValue::from_str(&request_id)
+                    .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id")),
+            );
+
+            Ok(response)
+        })
+    }
+}
+
+// ============= Logging Middleware =============
+
+/// Custom span maker that includes request ID
+#[derive(Clone, Debug)]
+pub struct RequestSpan;
+
+impl<B> MakeSpan<B> for RequestSpan {
+    fn make_span(&mut self, request: &Request<B>) -> Span {
+        // Extract request ID from extensions
+        let request_id = request
+            .extensions()
+            .get::<RequestId>()
+            .map(|id| id.0.as_str())
+            .unwrap_or("unknown");
+
+        info_span!(
+            "http_request",
+            method = %request.method(),
+            uri = %request.uri(),
+            version = ?request.version(),
+            request_id = %request_id,
+            status_code = Empty,
+            latency = Empty,
+            error = Empty,
+        )
+    }
+}
+
+/// Custom on_request handler
+#[derive(Clone, Debug)]
+pub struct RequestLogger;
+
+impl<B> OnRequest<B> for RequestLogger {
+    fn on_request(&mut self, _request: &Request<B>, span: &Span) {
+        let _enter = span.enter();
+        tracing::info!(
+            target: "sglang_router_rs::request",
+            "started processing request"
+        );
+    }
+}
+
+/// Custom on_response handler
+#[derive(Clone, Debug)]
+pub struct ResponseLogger {
+    _start_time: Instant,
+}
+
+impl Default for ResponseLogger {
+    fn default() -> Self {
+        Self {
+            _start_time: Instant::now(),
+        }
+    }
+}
+
+impl<B> OnResponse<B> for ResponseLogger {
+    fn on_response(self, response: &Response<B>, latency: std::time::Duration, span: &Span) {
+        let status = response.status();
+
+        span.record("status_code", status.as_u16());
+        span.record("latency", format!("{:?}", latency));
+
+        let _enter = span.enter();
+
+        if status.is_server_error() {
+            tracing::error!(
+                target: "sglang_router_rs::response",
+                status = %status,
+                latency = ?latency,
+                "request failed with server error"
+            );
+        } else if status.is_client_error() {
+            tracing::warn!(
+                target: "sglang_router_rs::response",
+                status = %status,
+                latency = ?latency,
+                "request failed with client error"
+            );
+        } else {
+            tracing::info!(
+                target: "sglang_router_rs::response",
+                status = %status,
+                latency = ?latency,
+                "finished processing request"
+            );
+        }
+    }
+}
+
+/// Create a configured TraceLayer for HTTP logging with request ID support
+pub fn create_logging_layer() -> TraceLayer<
+    tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
+    RequestSpan,
+    RequestLogger,
+    ResponseLogger,
+> {
+    TraceLayer::new_for_http()
+        .make_span_with(RequestSpan)
+        .on_request(RequestLogger)
+        .on_response(ResponseLogger::default())
+}
+
+/// Structured logging data for requests
+#[derive(Debug, serde::Serialize)]
+pub struct RequestLogEntry {
+    pub timestamp: String,
+    pub request_id: String,
+    pub method: String,
+    pub uri: String,
+    pub status: u16,
+    pub latency_ms: u64,
+    pub user_agent: Option<String>,
+    pub remote_addr: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Log a request with structured data
+pub fn log_request(entry: RequestLogEntry) {
+    if entry.status >= 500 {
+        tracing::error!(
+            target: "sglang_router_rs::http",
+            request_id = %entry.request_id,
+            method = %entry.method,
+            uri = %entry.uri,
+            status = entry.status,
+            latency_ms = entry.latency_ms,
+            user_agent = ?entry.user_agent,
+            remote_addr = ?entry.remote_addr,
+            error = ?entry.error,
+            "HTTP request failed"
+        );
+    } else if entry.status >= 400 {
+        tracing::warn!(
+            target: "sglang_router_rs::http",
+            request_id = %entry.request_id,
+            method = %entry.method,
+            uri = %entry.uri,
+            status = entry.status,
+            latency_ms = entry.latency_ms,
+            user_agent = ?entry.user_agent,
+            remote_addr = ?entry.remote_addr,
+            "HTTP request client error"
+        );
+    } else {
+        tracing::info!(
+            target: "sglang_router_rs::http",
+            request_id = %entry.request_id,
+            method = %entry.method,
+            uri = %entry.uri,
+            status = entry.status,
+            latency_ms = entry.latency_ms,
+            user_agent = ?entry.user_agent,
+            remote_addr = ?entry.remote_addr,
+            "HTTP request completed"
+        );
     }
 }
