@@ -33,7 +33,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
+from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket, get_int_env_var
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -252,10 +252,14 @@ class DataParallelController:
                 logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
                 self.workers[req.data_parallel_rank].send_pyobj(req)
             else:
-                self.workers[self.round_robin_counter].send_pyobj(req)
-                self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                    self.workers
-                )
+                if (x := get_int_env_var("SGLANG_HACK_FORCE_TARGET_RANK", -1)) != -1:
+                    print(f"hack: send to workers[{x}]")
+                    self.workers[x].send_pyobj(req)
+                else:
+                    self.workers[self.round_robin_counter].send_pyobj(req)
+                    self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                        self.workers
+                    )
         else:
             if req.data_parallel_rank is not None:
                 logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
