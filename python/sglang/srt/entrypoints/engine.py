@@ -652,13 +652,7 @@ def _set_envs_and_config(server_args: ServerArgs):
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
-    if server_args.custom_sigquit_handler is not None:
-        # This is only set from the RL driver to enable crash dump
-        logger.error(
-            f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
-        )
-        signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
-    else:
+    if True:  # Keep this check for internal code compatibility
         # Register the signal handler.
         # The child processes will send SIGQUIT to this process when any error happens
         # This process then clean up the whole process tree
