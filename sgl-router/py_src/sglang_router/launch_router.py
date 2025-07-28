@@ -64,6 +64,8 @@ class RouterArgs:
     # Prometheus configuration
     prometheus_port: Optional[int] = None
     prometheus_host: Optional[str] = None
+    # Request ID headers configuration
+    request_id_headers: Optional[List[str]] = None
 
     @staticmethod
     def add_cli_args(
@@ -255,6 +257,12 @@ class RouterArgs:
             default="127.0.0.1",
             help="Host address to bind the Prometheus metrics server",
         )
+        parser.add_argument(
+            f"--{prefix}request-id-headers",
+            type=str,
+            nargs="*",
+            help="Custom HTTP headers to check for request IDs (e.g., x-request-id x-trace-id). If not specified, uses common defaults.",
+        )
 
     @classmethod
     def from_cli_args(
@@ -313,6 +321,7 @@ class RouterArgs:
             bootstrap_port_annotation="sglang.ai/bootstrap-port",  # Mooncake-specific annotation
             prometheus_port=getattr(args, f"{prefix}prometheus_port", None),
             prometheus_host=getattr(args, f"{prefix}prometheus_host", None),
+            request_id_headers=getattr(args, f"{prefix}request_id_headers", None),
         )
 
     @staticmethod
@@ -481,6 +490,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
                 if router_args.decode_policy
                 else None
             ),
+            request_id_headers=router_args.request_id_headers,
         )
 
         router.start()

@@ -458,7 +458,10 @@ class Scheduler(
         self.grammar_queue: List[Req] = []
         if not server_args.skip_tokenizer_init:
             self.grammar_backend = create_grammar_backend(
-                server_args, self.tokenizer, self.model_config.vocab_size
+                server_args,
+                self.tokenizer,
+                self.model_config.vocab_size,
+                self.model_config.hf_eos_token_id,
             )
         else:
             self.grammar_backend = None
