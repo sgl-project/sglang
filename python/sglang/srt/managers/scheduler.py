@@ -482,7 +482,10 @@ class Scheduler(
         self.grammar_queue: List[Req] = []
         if not server_args.skip_tokenizer_init:
             self.grammar_backend = create_grammar_backend(
-                server_args, self.tokenizer, self.model_config.vocab_size
+                server_args,
+                self.tokenizer,
+                self.model_config.vocab_size,
+                self.model_config.hf_eos_token_id,
             )
         else:
             self.grammar_backend = None
@@ -676,6 +679,9 @@ class Scheduler(
                 )
             )
         )
+
+        embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
+        init_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     def init_profier(self):
         self.torch_profiler = None
@@ -1150,6 +1156,7 @@ class Scheduler(
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
                 data_parallel_rank=recv_req.data_parallel_rank,
+                vocab_size=self.model_config.vocab_size,
             )
             req.tokenizer = self.tokenizer
 
@@ -1416,8 +1423,10 @@ class Scheduler(
         logger.info(f)
 
         if self.enable_metrics:
-            cache_hit_rate = adder.log_hit_tokens / (
-                adder.log_input_tokens + adder.log_hit_tokens
+            total_tokens = adder.log_input_tokens + adder.log_hit_tokens
+
+            cache_hit_rate = (
+                adder.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
             )
             self.stats.num_running_reqs = running_bs
             self.stats.num_used_tokens = num_used
@@ -2923,9 +2932,9 @@ def run_scheduler_process(
         prefix += f" PP{pp_rank}"
 
     # Config the process
-    kill_itself_when_parent_died()
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
+    kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
     # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
@@ -2940,10 +2949,6 @@ def run_scheduler_process(
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
 
-    embedding_cache_size = 100
-    if "SGLANG_VLM_CACHE_SIZE_MB" in os.environ:
-        embedding_cache_size = int(os.environ["SGLANG_VLM_CACHE_SIZE_MB"])
-    init_embedding_cache(embedding_cache_size * 1024 * 1024)
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, pp_rank, dp_rank)
@@ -2954,8 +2959,8 @@ def run_scheduler_process(
                 "max_req_input_len": scheduler.max_req_input_len,
             }
         )
-        disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
 
+        disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
             if scheduler.enable_pdmux:
                 scheduler.event_loop_pdmux()

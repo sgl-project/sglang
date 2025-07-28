@@ -5,6 +5,7 @@ from sglang.srt.reasoning_parser import (
     DeepSeekR1Detector,
     KimiDetector,
     Qwen3Detector,
+    Qwen3ThinkingDetector,
     ReasoningParser,
     StreamingParseResult,
 )
@@ -180,6 +181,14 @@ class TestDeepSeekR1Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "I think this is the answer")
         self.assertEqual(result.normal_text, "The final answer is 42.")
 
+    def test_detect_and_parse_with_start_token(self):
+        """Test parsing deepseek-ai/DeepSeek-R1-0528 format, which generates the <think> token."""
+        text = "<think>I need to think about this.</think>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        # Should be treated as reasoning because force_reasoning=True
+        self.assertEqual(result.reasoning_text, "I need to think about this.")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
 
 class TestQwen3Detector(CustomTestCase):
     def setUp(self):
@@ -205,6 +214,52 @@ class TestQwen3Detector(CustomTestCase):
         result = self.detector.detect_and_parse(text)
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.reasoning_text, "")
+
+
+class TestQwen3ThinkingDetector(CustomTestCase):
+    def setUp(self):
+        self.detector = Qwen3ThinkingDetector()
+
+    def test_init(self):
+        """Test Qwen3ThinkingDetector initialization."""
+        self.assertEqual(self.detector.think_start_token, "<think>")
+        self.assertEqual(self.detector.think_end_token, "</think>")
+        self.assertTrue(self.detector._in_reasoning)  # force_reasoning=True
+        self.assertTrue(self.detector.stream_reasoning)
+
+    def test_detect_and_parse_qwen3_thinking_format(self):
+        """Test parsing Qwen3-Thinking format (no <think> start tag)."""
+        text = "I need to think about this step by step.</think>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(
+            result.reasoning_text, "I need to think about this step by step."
+        )
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_detect_and_parse_with_start_token(self):
+        """Test parsing Qwen3-Thinking with optional <think> start tag."""
+        text = "<think>I need to think about this.</think>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        # Should work because base class logic handles both force_reasoning=True OR start token
+        self.assertEqual(result.reasoning_text, "I need to think about this.")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_streaming_qwen3_thinking_format(self):
+        """Test streaming parse of Qwen3-Thinking format."""
+        # First chunk without <think> start
+        result = self.detector.parse_streaming_increment("I need to")
+        self.assertEqual(result.reasoning_text, "I need to")
+        self.assertEqual(result.normal_text, "")
+
+        # More reasoning content
+        result = self.detector.parse_streaming_increment(" think about this.")
+        self.assertEqual(result.reasoning_text, " think about this.")
+        self.assertEqual(result.normal_text, "")
+
+        # End token with normal text
+        result = self.detector.parse_streaming_increment("</think>The answer is 42.")
+        self.assertEqual(result.reasoning_text, "")  # Buffer cleared
+        self.assertEqual(result.normal_text, "The answer is 42.")
 
 
 class TestKimiDetector(CustomTestCase):
@@ -265,6 +320,9 @@ class TestReasoningParser(CustomTestCase):
         parser = ReasoningParser("qwen3")
         self.assertIsInstance(parser.detector, Qwen3Detector)
 
+        parser = ReasoningParser("qwen3-thinking")
+        self.assertIsInstance(parser.detector, Qwen3ThinkingDetector)
+
         parser = ReasoningParser("kimi")
         self.assertIsInstance(parser.detector, KimiDetector)
 
@@ -312,11 +370,13 @@ class TestReasoningParser(CustomTestCase):
         """Test case insensitive model type matching."""
         parser1 = ReasoningParser("DeepSeek-R1")
         parser2 = ReasoningParser("QWEN3")
-        parser3 = ReasoningParser("Kimi")
+        parser3 = ReasoningParser("QWEN3-THINKING")
+        parser4 = ReasoningParser("Kimi")
 
         self.assertIsInstance(parser1.detector, DeepSeekR1Detector)
         self.assertIsInstance(parser2.detector, Qwen3Detector)
-        self.assertIsInstance(parser3.detector, KimiDetector)
+        self.assertIsInstance(parser3.detector, Qwen3ThinkingDetector)
+        self.assertIsInstance(parser4.detector, KimiDetector)
 
     def test_stream_reasoning_parameter(self):
         """Test stream_reasoning parameter is passed correctly."""
@@ -397,6 +457,40 @@ class TestIntegrationScenarios(CustomTestCase):
         reasoning, normal = parser.parse_non_stream(text)
         self.assertEqual(reasoning, "")
         self.assertEqual(normal, "Just the answer.")
+
+    def test_qwen3_thinking_complete_response(self):
+        """Test complete Qwen3-Thinking response parsing."""
+        parser = ReasoningParser("qwen3-thinking")
+        text = "Let me solve this step by step. The equation is x + 2 = 5. Subtracting 2 from both sides gives x = 3.</think>The solution is x = 3."
+
+        reasoning, normal = parser.parse_non_stream(text)
+        self.assertIn("step by step", reasoning)
+        self.assertIn("x = 3", reasoning)
+        self.assertEqual(normal, "The solution is x = 3.")
+
+    def test_qwen3_thinking_streaming_scenario(self):
+        """Test Qwen3-Thinking streaming scenario."""
+        parser = ReasoningParser("qwen3-thinking")
+
+        chunks = [
+            "I need to analyze",
+            " this problem carefully.",
+            " Let me break it down.",
+            "</think>",
+            "The final answer is 42.",
+        ]
+
+        all_reasoning = ""
+        all_normal = ""
+
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            all_reasoning += reasoning
+            all_normal += normal
+
+        self.assertIn("analyze", all_reasoning)
+        self.assertIn("break it down", all_reasoning)
+        self.assertIn("final answer", all_normal)
 
 
 if __name__ == "__main__":
