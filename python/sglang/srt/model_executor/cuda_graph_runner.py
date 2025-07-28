@@ -540,9 +540,6 @@ class CudaGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_paths=lora_paths,
-            # 注意：在CUDA graph capture阶段使用虚拟数据是必要的，
-            # 因为capture时不知道真实的request映射关系。
-            # 真实数据会在replay阶段通过copy_inputs_before_cuda_graphs传递。
             request_ids_to_seq_ids={str(i): [0] for i in range(bs)},
             finished_requests_ids=[],
         )
@@ -726,8 +723,6 @@ class CudaGraphRunner:
                     self.seqlen_agnostic_capture_inputs_by_bs[bs]
                 )
 
-            # 确保使用真实的映射信息，而不是虚拟的capture数据
-            # 首先尝试从forward_batch获取真实数据
             real_request_ids_to_seq_ids = getattr(
                 forward_batch, "request_ids_to_seq_ids", None
             )
@@ -735,7 +730,6 @@ class CudaGraphRunner:
                 forward_batch, "finished_requests_ids", None
             )
 
-            # 如果forward_batch没有这些数据，尝试使用helper函数生成
             if (
                 real_request_ids_to_seq_ids is None
                 or real_finished_requests_ids is None

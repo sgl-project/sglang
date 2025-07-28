@@ -33,6 +33,7 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 
 import copy
 import dataclasses
+import itertools
 import logging
 import threading
 from enum import Enum, auto
@@ -782,25 +783,12 @@ class Req:
         )
 
 
-# Thread-safe seq_id generator to avoid conflicts in concurrent scenarios
 class ThreadSafeSeqIdGenerator:
-    """Thread-safe global sequence ID generator for cache management."""
-
     def __init__(self):
-        self._counter = 0
-        self._lock = threading.Lock()
+        self._counter = itertools.count()
 
     def next(self) -> int:
-        """Get next unique sequence ID in a thread-safe manner."""
-        with self._lock:
-            seq_id = self._counter
-            self._counter += 1
-            return seq_id
-
-    def reset(self):
-        """Reset counter (mainly for testing purposes)."""
-        with self._lock:
-            self._counter = 0
+        return next(self._counter)
 
 
 # Global seq_id generator instance
@@ -916,7 +904,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = 0
 
-    # Pre-allocated request to sequence ID mapping (vLLM-style approach)
     # This avoids seq_id conflicts in concurrent scenarios
     request_ids_to_seq_ids: Optional[Dict[str, List[int]]] = None
     finished_requests_ids: Optional[List[str]] = None
@@ -943,8 +930,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid = True
 
-        # Pre-allocate seq_ids for each request (vLLM-style approach)
-        # This ensures thread-safe seq_id allocation and avoids conflicts
         request_ids_to_seq_ids = {}
         session_to_seq_map = {}
 
@@ -1828,7 +1813,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
             token_type_ids=self.token_type_ids,
-            # Use pre-allocated request_ids_to_seq_ids mapping (vLLM-style)
             request_ids_to_seq_ids=self.request_ids_to_seq_ids,
             finished_requests_ids=self.finished_requests_ids or [],
             spec_algorithm=self.spec_algorithm,
@@ -1920,8 +1904,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def _build_request_seq_mapping(self):
-        # vLLM-style approach: return pre-allocated mapping
-        # This avoids seq_id conflicts in concurrent scenarios
         assert (
             self.request_ids_to_seq_ids is not None
         ), "request_ids_to_seq_ids must be pre-allocated in init_new"

@@ -1820,20 +1820,7 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
-        # Record finished request IDs before filtering
-        finished_request_ids_before = (
-            batch.finished_requests_ids.copy() if batch.finished_requests_ids else []
-        )
-
         batch.filter_batch()
-
-        # Check for newly finished requests
-        if batch.finished_requests_ids:
-            new_finished_ids = [
-                rid
-                for rid in batch.finished_requests_ids
-                if rid not in finished_request_ids_before
-            ]
 
         if batch.is_empty():
             batch.batch_is_full = False
