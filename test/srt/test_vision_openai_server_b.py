@@ -22,7 +22,7 @@ class TestPixtralServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.73",
+                "0.70",
             ],
         )
         cls.base_url += "/v1"
@@ -44,7 +44,7 @@ class TestMistral3_1Server(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.8",
+                "0.75",
             ],
         )
         cls.base_url += "/v1"
@@ -67,6 +67,7 @@ class TestDeepseekVL2Server(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--context-length",
                 "4096",
+                "--disable-cuda-graph",
             ],
         )
         cls.base_url += "/v1"
@@ -88,12 +89,12 @@ class TestJanusProServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.4",
+                "0.35",
             ],
         )
         cls.base_url += "/v1"
 
-    def test_video_chat_completion(self):
+    def test_video_images_chat_completion(self):
         pass
 
     def test_single_image_chat_completion(self):
@@ -140,7 +141,7 @@ class TestGemma3itServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.75",
+                "0.70",
                 "--enable-multimodal",
             ],
         )
@@ -150,10 +151,10 @@ class TestGemma3itServer(TestOpenAIVisionServer):
         pass
 
 
-class TestKimiVLServer(TestOpenAIVisionServer):
+class TestGemma3nServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
-        cls.model = "moonshotai/Kimi-VL-A3B-Instruct"
+        cls.model = "google/gemma-3n-E2B-it"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
@@ -162,16 +163,38 @@ class TestKimiVLServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--context-length",
-                "4096",
-                "--dtype",
-                "bfloat16",
+                "--mem-fraction-static",
+                "0.70",
+                "--cuda-graph-max-bs",
+                "1",
             ],
         )
         cls.base_url += "/v1"
 
-    def test_video_chat_completion(self):
-        pass
+
+# commented out before https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/discussions/27 get fixed
+# class TestKimiVLServer(TestOpenAIVisionServer):
+#     @classmethod
+#     def setUpClass(cls):
+#         cls.model = "moonshotai/Kimi-VL-A3B-Instruct"
+#         cls.base_url = DEFAULT_URL_FOR_TEST
+#         cls.api_key = "sk-123456"
+#         cls.process = popen_launch_server(
+#             cls.model,
+#             cls.base_url,
+#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+#             other_args=[
+#                 "--trust-remote-code",
+#                 "--context-length",
+#                 "4096",
+#                 "--dtype",
+#                 "bfloat16",
+#             ],
+#         )
+#         cls.base_url += "/v1"
+
+#     def test_video_images_chat_completion(self):
+#         pass
 
 
 class TestPhi4MMServer(TestOpenAIVisionServer):
@@ -197,19 +220,20 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.75",
+                "0.70",
                 "--disable-radix-cache",
                 "--max-loras-per-batch",
-                "1",
+                "2",
                 "--revision",
                 revision,
                 "--lora-paths",
                 f"vision={constants.HF_HUB_CACHE}/models--microsoft--Phi-4-multimodal-instruct/snapshots/{revision}/vision-lora",
+                f"speech={constants.HF_HUB_CACHE}/models--microsoft--Phi-4-multimodal-instruct/snapshots/{revision}/speech-lora",
             ],
         )
         cls.base_url += "/v1"
 
-    def get_request_kwargs(self):
+    def get_vision_request_kwargs(self):
         return {
             "extra_body": {
                 "lora_path": "vision",
@@ -218,16 +242,30 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
             }
         }
 
-    def test_video_chat_completion(self):
-        pass
+    def get_audio_request_kwargs(self):
+        return {
+            "extra_body": {
+                "lora_path": "speech",
+                "top_k": 1,
+                "top_p": 1.0,
+            }
+        }
+
+    def test_audio_chat_completion(self):
+        self._test_audio_speech_completion()
+        # TODO: currently phi4-mm cannot pass this test.
+        # We are investigating this issue.
+        # Response: La ciudad está situada en la costa este de la isla, en la desembocadura del río St. Lawrence.
+        # self._test_audio_ambient_completion()
 
 
 class TestVILAServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
-        cls.model = "AndyZijianZhang/NVILA-Lite-2B"
+        cls.model = "Efficient-Large-Model/NVILA-Lite-2B-hf-0626"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
+        cls.revision = "6bde1de5964b40e61c802b375fff419edc867506"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -236,6 +274,7 @@ class TestVILAServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--context-length=65536",
+                f"--revision={cls.revision}",
             ],
         )
         cls.base_url += "/v1"

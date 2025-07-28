@@ -25,6 +25,7 @@ from transformers import PretrainedConfig
 from sglang.srt.hf_transformers_utils import (
     get_config,
     get_context_length,
+    get_generation_config,
     get_hf_text_config,
 )
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
@@ -52,20 +53,21 @@ class ModelConfig:
         trust_remote_code: bool = True,
         revision: Optional[str] = None,
         context_length: Optional[int] = None,
-        model_override_args: Optional[str] = None,
+        model_override_args: str = "{}",
         is_embedding: Optional[bool] = None,
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
-        impl: Union[str, ModelImpl] = ModelImpl.AUTO,
+        hybrid_kvcache_ratio: Optional[float] = None,
+        model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
     ) -> None:
 
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
-        self.impl = impl
+        self.model_impl = model_impl
 
         # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
@@ -82,10 +84,29 @@ class ModelConfig:
             **kwargs,
         )
 
+        self.hf_generation_config = get_generation_config(
+            self.model_path,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
+
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
+        self.is_hybrid = is_hybrid_model(
+            self.hf_config.architectures,
+            hybrid_kvcache_ratio=hybrid_kvcache_ratio,
+            context_length=context_length,
+            attention_chunk_size=self.attention_chunk_size,
+        )
+        if self.is_hybrid is not None:
+            self.swa_attention_layer_ids, self.full_attention_layer_ids = (
+                get_hybrid_layer_ids(
+                    self.hf_config.architectures, self.hf_text_config.num_hidden_layers
+                )
+            )
 
         if enable_multimodal is None:
             mm_disabled_models = [
@@ -105,6 +126,9 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
         ):
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+
+        if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
+            self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
@@ -264,7 +288,8 @@ class ModelConfig:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
-            impl=server_args.impl,
+            hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
+            model_impl=server_args.model_impl,
             **kwargs,
         )
 
@@ -345,7 +370,17 @@ class ModelConfig:
                 if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
                     quant_cfg = modelopt_quant_config
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
-                quant_cfg = modelopt_quant_config
+                quant_config_file = os.path.join(
+                    self.model_path, "hf_quant_config.json"
+                )
+                with open(quant_config_file) as f:
+                    quant_config_dict = json.load(f)
+                json_quant_configs = quant_config_dict["quantization"]
+                quant_algo = json_quant_configs.get("quant_algo", None)
+                if quant_algo == "MIXED_PRECISION":
+                    quant_cfg = {"quant_method": "w4afp8"}
+                else:
+                    quant_cfg = modelopt_quant_config
         return quant_cfg
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
@@ -359,6 +394,7 @@ class ModelConfig:
             "compressed-tensors",
             "fbgemm_fp8",
             "w8a8_fp8",
+            "petit_nvfp4",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -375,9 +411,12 @@ class ModelConfig:
             "w8a8_fp8",
             "moe_wna16",
             "qoq",
+            "w4afp8",
+            "petit_nvfp4",
         ]
         compatible_quantization_methods = {
             "modelopt_fp4": ["modelopt"],
+            "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
@@ -388,7 +427,9 @@ class ModelConfig:
         quant_cfg = self._parse_quant_hf_config()
 
         if quant_cfg is not None:
-            quant_method = quant_cfg.get("quant_method", "").lower()
+            quant_method = quant_cfg.get(
+                "quant_method", "" if not self.quantization else self.quantization
+            ).lower()
 
             # Detect which checkpoint is it
             for _, method in QUANTIZATION_METHODS.items():
@@ -437,9 +478,22 @@ class ModelConfig:
 
     def get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
-        if eos_ids:
+        if eos_ids is not None:
             # it can be either int or list of int
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
+        if eos_ids is None:
+            eos_ids = set()
+        if self.hf_generation_config:
+            generation_eos_ids = getattr(
+                self.hf_generation_config, "eos_token_id", None
+            )
+            if generation_eos_ids:
+                generation_eos_ids = (
+                    {generation_eos_ids}
+                    if isinstance(generation_eos_ids, int)
+                    else set(generation_eos_ids)
+                )
+                eos_ids = eos_ids | generation_eos_ids
         return eos_ids
 
     def maybe_pull_model_tokenizer_from_remote(self) -> None:
@@ -579,10 +633,12 @@ multimodal_model_archs = [
     "Mistral3ForConditionalGeneration",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
+    "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
+    "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
 ]
@@ -633,3 +689,35 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def is_hybrid_model(
+    model_architectures: List[str],
+    hybrid_kvcache_ratio: Optional[float],
+    context_length: Optional[int],
+    attention_chunk_size: Optional[int],
+):
+    if hybrid_kvcache_ratio is None:
+        return None
+    elif (
+        hybrid_kvcache_ratio > 0
+        and model_architectures[0] == "Llama4ForConditionalGeneration"
+        and context_length > attention_chunk_size
+    ):
+        return hybrid_kvcache_ratio
+    else:
+        return None
+
+
+def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int):
+    if "Llama4ForConditionalGeneration" in model_architectures:
+        swa_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if (i + 1) % 4 != 0
+        ]
+        full_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
+        ]
+    else:
+        swa_attention_layer_ids = None
+        full_attention_layer_ids = None
+    return swa_attention_layer_ids, full_attention_layer_ids

@@ -6,7 +6,7 @@ use sglang_router_rs::openai_api_types::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
     SamplingParams, StringOrArray, UserMessageContent,
 };
-use sglang_router_rs::request_adapter::{RouteableRequest, ToPdRequest};
+use sglang_router_rs::routers::request_adapter::{RouteableRequest, ToPdRequest};
 
 // Sample request data for benchmarks
 fn create_sample_generate_request() -> GenerateRequest {
@@ -59,6 +59,7 @@ fn create_sample_chat_completion_request() -> ChatCompletionRequest {
         top_p: Some(1.0),
         n: Some(1),
         stream: false,
+        stream_options: None,
         stop: None,
         presence_penalty: Some(0.0),
         frequency_penalty: Some(0.0),
@@ -86,6 +87,7 @@ fn create_sample_completion_request() -> CompletionRequest {
         top_p: Some(1.0),
         n: Some(1),
         stream: false,
+        stream_options: None,
         logprobs: None,
         echo: false,
         stop: None,
@@ -95,6 +97,7 @@ fn create_sample_completion_request() -> CompletionRequest {
         logit_bias: None,
         user: None,
         seed: None,
+        other: serde_json::Map::new(),
     }
 }
 
@@ -130,6 +133,7 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
         top_p: Some(0.95),
         n: Some(1),
         stream: false,
+        stream_options: None,
         stop: None,
         presence_penalty: Some(0.1),
         frequency_penalty: Some(0.1),
