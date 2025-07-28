@@ -34,8 +34,6 @@ class ModuleOffloader:
                 world_size=global_server_args_dict["dp_size"],
             )
 
-        print(f"hi {os.environ.get('CUDA_VISIBLE_DEVICES')=}")
-
     def wrap_modules(
         self,
         all_modules_generator: Generator[torch.nn.Module, None, None],
@@ -308,7 +306,6 @@ def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tens
             ]
         )
     )
-    logger.info(f"hi {object_list=}")
 
     output_tensors = []
     for output_rank in range(world_size):
@@ -353,7 +350,6 @@ class NaiveDistributed:
         else:
             assert scatter_list is None
 
-        logger.info("hi scatter stage 1")
         gathered_objects = self.all_gather_object(
             dict(serialized_scatter_list=[
                 None
@@ -365,7 +361,6 @@ class NaiveDistributed:
             else dict()
         )
 
-        logger.info("hi scatter stage 2")
         remote_serialized_tensor = gathered_objects[src]["serialized_scatter_list"][self._rank]
         if self._rank == src:
             assert remote_serialized_tensor is None
@@ -374,11 +369,8 @@ class NaiveDistributed:
             remote_tensor = MultiprocessingSerializer.deserialize(remote_serialized_tensor)
         tensor.copy_(remote_tensor)
 
-        logger.info("hi scatter stage 3")
         # avoid src tensor be deleted too early
         self.barrier()
-
-        logger.info("hi scatter stage 4")
 
     def all_gather_object(self, obj: Any) -> List[Any]:
         self._operation_index += 1
