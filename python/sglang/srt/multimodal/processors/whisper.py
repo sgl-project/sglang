@@ -23,10 +23,10 @@ class WhisperProcessor(BaseMultimodalProcessor):
         processor_output = self.process_mm_data(input_text=input_text, audio=audios)
         output = {}
         output["data_hashes"] = [hash(audio_data) for audio_data in audio_data]
-        output["input_ids"] = processor_output["labels"].tolist()
+        output["input_ids"] = processor_output["labels"][0].tolist()
         output["mm_items"] = [
             MultimodalDataItem(
-                feature=processor_output["input_features"],
+                feature=processor_output["input_features"][0],
                 modality=Modality.AUDIO,
             )
         ]
