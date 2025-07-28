@@ -35,6 +35,7 @@ impl TestContext {
             metrics: None,
             log_dir: None,
             log_level: None,
+            request_id_headers: None,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -953,6 +954,7 @@ mod error_tests {
                 metrics: None,
                 log_dir: None,
                 log_level: None,
+                request_id_headers: None,
             };
 
             let ctx = TestContext::new_with_config(
