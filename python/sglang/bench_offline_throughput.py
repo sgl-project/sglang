@@ -426,6 +426,7 @@ if __name__ == "__main__":
         else:
             try:
                 from modelscope import snapshot_download
+
                 print(f"Using ModelScope to download model: {args.model_path}")
 
                 # download the model and replace args.model_path
