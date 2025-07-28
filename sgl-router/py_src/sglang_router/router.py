@@ -54,6 +54,9 @@ class Router:
             If not specified, uses the main policy. Default: None
         decode_policy: Specific load balancing policy for decode nodes (PD mode only).
             If not specified, uses the main policy. Default: None
+        request_id_headers: List of HTTP headers to check for request IDs. If not specified,
+            uses common defaults: ['x-request-id', 'x-correlation-id', 'x-trace-id', 'request-id'].
+            Example: ['x-my-request-id', 'x-custom-trace-id']. Default: None
     """
 
     def __init__(
@@ -85,6 +88,7 @@ class Router:
         decode_urls: Optional[List[str]] = None,
         prefill_policy: Optional[PolicyType] = None,
         decode_policy: Optional[PolicyType] = None,
+        request_id_headers: Optional[List[str]] = None,
     ):
         if selector is None:
             selector = {}
@@ -121,6 +125,7 @@ class Router:
             decode_urls=decode_urls,
             prefill_policy=prefill_policy,
             decode_policy=decode_policy,
+            request_id_headers=request_id_headers,
         )
 
     def start(self) -> None:

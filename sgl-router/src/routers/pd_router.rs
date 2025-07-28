@@ -5,6 +5,7 @@ use super::pd_types::{api_path, Bootstrap, ChatReqInput, GenerateReqInput, PDRou
 use super::request_adapter::ToPdRequest;
 use crate::core::{HealthChecker, Worker, WorkerFactory, WorkerLoadGuard};
 use crate::metrics::RouterMetrics;
+use crate::middleware::get_request_id;
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::policies::LoadBalancingPolicy;
 use crate::tree::Tree;
@@ -16,7 +17,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 #[derive(Debug)]
 pub struct PDRouter {
@@ -307,8 +307,8 @@ impl PDRouter {
         mut typed_req: GenerateReqInput,
         route: &str,
     ) -> HttpResponse {
+        let request_id = get_request_id(req);
         let start = Instant::now();
-        let _request_id = Uuid::new_v4();
 
         // Get stream flag and return_logprob flag before moving the request
         let is_stream = typed_req.stream;
@@ -328,7 +328,10 @@ impl PDRouter {
         let (prefill, decode) = match self.select_pd_pair(client, request_text).await {
             Ok(pair) => pair,
             Err(e) => {
-                error!("Failed to select PD pair: {}", e);
+                error!(
+                    request_id = %request_id,
+                    "Failed to select PD pair error={}", e
+                );
                 RouterMetrics::record_pd_error("server_selection");
                 return HttpResponse::ServiceUnavailable()
                     .body(format!("No available servers: {}", e));
@@ -337,15 +340,17 @@ impl PDRouter {
 
         // Log routing decision
         info!(
-            "PD routing: {} -> prefill={}, decode={}",
-            route,
-            prefill.url(),
-            decode.url()
+            request_id = %request_id,
+            "PD routing decision route={} prefill_url={} decode_url={}",
+            route, prefill.url(), decode.url()
         );
 
         // Add bootstrap info using the trait method
         if let Err(e) = typed_req.add_bootstrap_info(prefill.as_ref()) {
-            error!("Failed to add bootstrap info: {}", e);
+            error!(
+                request_id = %request_id,
+                "Failed to add bootstrap info error={}", e
+            );
             RouterMetrics::record_pd_error("bootstrap_injection");
             return HttpResponse::InternalServerError()
                 .body(format!("Bootstrap injection failed: {}", e));
@@ -355,7 +360,10 @@ impl PDRouter {
         let json_with_bootstrap = match serde_json::to_value(&typed_req) {
             Ok(json) => json,
             Err(e) => {
-                error!("Failed to serialize request: {}", e);
+                error!(
+                    request_id = %request_id,
+                    "Failed to serialize request error={}", e
+                );
                 return HttpResponse::InternalServerError().body("Failed to serialize request");
             }
         };
@@ -383,6 +391,7 @@ impl PDRouter {
         mut typed_req: ChatReqInput,
         route: &str,
     ) -> HttpResponse {
+        let request_id = get_request_id(req);
         let start = Instant::now();
 
         // Get stream flag and return_logprob flag before moving the request
@@ -406,7 +415,10 @@ impl PDRouter {
         let (prefill, decode) = match self.select_pd_pair(client, request_text).await {
             Ok(pair) => pair,
             Err(e) => {
-                error!("Failed to select PD pair: {}", e);
+                error!(
+                    request_id = %request_id,
+                    "Failed to select PD pair error={}", e
+                );
                 RouterMetrics::record_pd_error("server_selection");
                 return HttpResponse::ServiceUnavailable()
                     .body(format!("No available servers: {}", e));
@@ -415,15 +427,17 @@ impl PDRouter {
 
         // Log routing decision
         info!(
-            "PD routing: {} -> prefill={}, decode={}",
-            route,
-            prefill.url(),
-            decode.url()
+            request_id = %request_id,
+            "PD routing decision route={} prefill_url={} decode_url={}",
+            route, prefill.url(), decode.url()
         );
 
         // Add bootstrap info using the trait method
         if let Err(e) = typed_req.add_bootstrap_info(prefill.as_ref()) {
-            error!("Failed to add bootstrap info: {}", e);
+            error!(
+                request_id = %request_id,
+                "Failed to add bootstrap info error={}", e
+            );
             RouterMetrics::record_pd_error("bootstrap_injection");
             return HttpResponse::InternalServerError()
                 .body(format!("Bootstrap injection failed: {}", e));
@@ -433,7 +447,10 @@ impl PDRouter {
         let json_with_bootstrap = match serde_json::to_value(&typed_req) {
             Ok(json) => json,
             Err(e) => {
-                error!("Failed to serialize request: {}", e);
+                error!(
+                    request_id = %request_id,
+                    "Failed to serialize request error={}", e
+                );
                 return HttpResponse::InternalServerError().body("Failed to serialize request");
             }
         };
@@ -461,6 +478,7 @@ impl PDRouter {
         mut typed_req: CompletionRequest,
         route: &str,
     ) -> HttpResponse {
+        let request_id = get_request_id(req);
         let start = Instant::now();
 
         // Get stream flag and return_logprob flag before moving the request
@@ -477,7 +495,10 @@ impl PDRouter {
         let (prefill, decode) = match self.select_pd_pair(client, request_text).await {
             Ok(pair) => pair,
             Err(e) => {
-                error!("Failed to select PD pair: {}", e);
+                error!(
+                    request_id = %request_id,
+                    "Failed to select PD pair error={}", e
+                );
                 RouterMetrics::record_pd_error("server_selection");
                 return HttpResponse::ServiceUnavailable()
                     .body(format!("No available servers: {}", e));
@@ -486,15 +507,17 @@ impl PDRouter {
 
         // Log routing decision
         info!(
-            "PD routing: {} -> prefill={}, decode={}",
-            route,
-            prefill.url(),
-            decode.url()
+            request_id = %request_id,
+            "PD routing decision route={} prefill_url={} decode_url={}",
+            route, prefill.url(), decode.url()
         );
 
         // Add bootstrap info using the trait method
         if let Err(e) = typed_req.add_bootstrap_info(prefill.as_ref()) {
-            error!("Failed to add bootstrap info: {}", e);
+            error!(
+                request_id = %request_id,
+                "Failed to add bootstrap info error={}", e
+            );
             RouterMetrics::record_pd_error("bootstrap_injection");
             return HttpResponse::InternalServerError()
                 .body(format!("Bootstrap injection failed: {}", e));
@@ -504,7 +527,10 @@ impl PDRouter {
         let json_with_bootstrap = match serde_json::to_value(&typed_req) {
             Ok(json) => json,
             Err(e) => {
-                error!("Failed to serialize request: {}", e);
+                error!(
+                    request_id = %request_id,
+                    "Failed to serialize request error={}", e
+                );
                 return HttpResponse::InternalServerError().body("Failed to serialize request");
             }
         };
@@ -538,6 +564,7 @@ impl PDRouter {
         return_logprob: bool,
         start_time: Instant,
     ) -> HttpResponse {
+        let request_id = get_request_id(req);
         // Update load tracking for both workers
         let _guard = WorkerLoadGuard::new_multi(vec![prefill, decode]);
 
@@ -578,9 +605,9 @@ impl PDRouter {
                 if !status.is_success() {
                     RouterMetrics::record_pd_decode_error(decode.url());
                     error!(
-                        "Decode server {} returned error status: {}",
-                        decode.url(),
-                        status
+                        request_id = %request_id,
+                        "Decode server returned error status decode_url={} status={}",
+                        decode.url(), status
                     );
 
                     // Return the error response from decode server
@@ -598,9 +625,9 @@ impl PDRouter {
                 // Log prefill errors for debugging
                 if let Err(e) = &prefill_result {
                     error!(
-                        "Prefill server {} failed (non-critical): {}",
-                        prefill.url(),
-                        e
+                        request_id = %request_id,
+                        "Prefill server failed (non-critical) prefill_url={} error={}",
+                        prefill.url(), e
                     );
                     RouterMetrics::record_pd_prefill_error(prefill.url());
                 }
@@ -684,7 +711,12 @@ impl PDRouter {
                 }
             }
             Err(e) => {
-                error!("Decode request failed: {}", e);
+                error!(
+                    request_id = %request_id,
+                    decode_url = %decode.url(),
+                    error = %e,
+                    "Decode request failed"
+                );
                 RouterMetrics::record_pd_decode_error(decode.url());
                 HttpResponse::BadGateway().body(format!("Decode server error: {}", e))
             }

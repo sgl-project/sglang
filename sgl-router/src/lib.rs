@@ -4,6 +4,7 @@ pub mod logging;
 use std::collections::HashMap;
 pub mod core;
 pub mod metrics;
+pub mod middleware;
 pub mod openai_api_types;
 pub mod policies;
 pub mod routers;
@@ -49,6 +50,7 @@ struct Router {
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
     request_timeout_secs: u64,
+    request_id_headers: Option<Vec<String>>,
     // PD mode flag
     pd_disaggregation: bool,
     // PD-specific fields (only used when pd_disaggregation is true)
@@ -138,6 +140,7 @@ impl Router {
             metrics,
             log_dir: self.log_dir.clone(),
             log_level: self.log_level.clone(),
+            request_id_headers: self.request_id_headers.clone(),
         })
     }
 }
@@ -170,6 +173,7 @@ impl Router {
         prometheus_port = None,
         prometheus_host = None,
         request_timeout_secs = 600,  // Add configurable request timeout
+        request_id_headers = None,  // Custom request ID headers
         pd_disaggregation = false,  // New flag for PD mode
         prefill_urls = None,
         decode_urls = None,
@@ -201,6 +205,7 @@ impl Router {
         prometheus_port: Option<u16>,
         prometheus_host: Option<String>,
         request_timeout_secs: u64,
+        request_id_headers: Option<Vec<String>>,
         pd_disaggregation: bool,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
@@ -232,6 +237,7 @@ impl Router {
             prometheus_port,
             prometheus_host,
             request_timeout_secs,
+            request_id_headers,
             pd_disaggregation,
             prefill_urls,
             decode_urls,
@@ -297,6 +303,7 @@ impl Router {
                 service_discovery_config,
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
+                request_id_headers: self.request_id_headers.clone(),
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
