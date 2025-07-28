@@ -339,6 +339,9 @@ class Scheduler(
         global_server_args_dict["dp_rank"] = dp_rank
         global_server_args_dict["dp_size"] = self.server_args.dp_size
 
+        if get_bool_env_var("SGLANG_HACK_MEM_PROFILE_STARTUP"):
+            torch.cuda.memory._record_memory_history(max_entries=10000000)
+
         # Launch a tensor parallel worker
         if self.enable_overlap:
             TpWorkerClass = TpModelWorkerClient
@@ -353,6 +356,16 @@ class Scheduler(
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
         )
+
+        if get_bool_env_var("SGLANG_HACK_MEM_PROFILE_STARTUP"):
+            memory_profile_path = os.path.join(
+                "/data/numa0/tom/temp_sglang_server2local",
+                str(time.time())
+                + f"-DP-{self.dp_rank}-memory"
+                + ".pickle",
+            )
+            torch.cuda.memory._dump_snapshot(memory_profile_path)
+            torch.cuda.memory._record_memory_history(enabled=None)
 
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
