@@ -10,9 +10,7 @@
 
 <!-- If this PR affects model-side code (e.g., kernels, model architecture), please provide accuracy test results. Ref: https://docs.sglang.ai/references/accuracy_evaluation.html -->
 
-## Benchmark & Profiling
-
-<!-- Provide performance benchmark and profiling results for this PR. Ref: https://docs.sglang.ai/references/benchmark_and_profiling.html -->
+<!-- If this PR is expected to impact performance, please provide benchmark and profiling results. Ref: https://docs.sglang.ai/references/benchmark_and_profiling.html -->
 
 ## Checklist
 
