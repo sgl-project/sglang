@@ -84,7 +84,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "qoq": QoQConfig,
     "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
-    "quark_mxfp4": MxFp4Config,
+    "quark": MxFp4Config,  # FIXIT(AMD): refer to modelopt with quark_quant.py
     "mxfp4": MxFp4Config,
 }
 
