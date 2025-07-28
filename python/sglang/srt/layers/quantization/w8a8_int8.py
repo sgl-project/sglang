@@ -998,7 +998,7 @@ class NPU_W8A8EPMoEMethod(NPU_W8A8MoEMethod):
     def create_weights(
         self,
         layer: torch.nn.Module,
-        num_experts_per_partition: int,
+        num_experts: int,
         hidden_size: int,
         intermediate_size: int,
         params_dtype: torch.dtype,
@@ -1006,7 +1006,7 @@ class NPU_W8A8EPMoEMethod(NPU_W8A8MoEMethod):
     ):
         super().create_weights(
             layer=layer,
-            num_experts=num_experts_per_partition,
+            num_experts=num_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             params_dtype=params_dtype,
