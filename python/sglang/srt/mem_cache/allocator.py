@@ -284,79 +284,191 @@ def alloc_extend_kernel(
     page_size: tl.constexpr,
     max_num_extend_tokens: tl.constexpr,
 ):
+    """
+    Triton kernel for efficient page-aligned token location allocation during sequence extension.
+    
+    This kernel handles the complex task of allocating token locations for extending sequences
+    while maintaining page alignment. It implements a three-part allocation strategy to handle
+    different scenarios efficiently:
+    
+    1. **Part 1 - Partial Page Continuation**: Reuses existing page space for tokens that
+       fit within the current page boundary
+    2. **Part 2 - Full Page Allocation**: Allocates complete new pages for tokens that
+       span multiple pages
+    3. **Part 3 - Final Partial Page**: Allocates one additional page for remaining tokens
+       that don't fill a complete page
+    
+    The kernel processes each request in parallel and ensures that:
+    - Token locations are page-aligned for efficient memory access
+    - Memory fragmentation is minimized by reusing existing page space
+    - Allocation is atomic and thread-safe across multiple requests
+    
+    Args:
+        pre_lens_ptr: Pointer to array containing prefix lengths for each request.
+                     Shape: [batch_size]
+                     pre_lens[i] = number of existing tokens for request i
+        seq_lens_ptr: Pointer to array containing new sequence lengths for each request.
+                     Shape: [batch_size]
+                     seq_lens[i] = total number of tokens for request i after extension
+        last_loc_ptr: Pointer to array containing the last allocated token location for each request.
+                     Shape: [batch_size]
+                     last_loc[i] = last token location allocated for request i
+        free_page_ptr: Pointer to array of available page indices in the free page pool.
+                      Shape: [num_free_pages]
+                      Contains page indices that can be allocated
+        out_indices: Pointer to output array where allocated token locations will be stored.
+                    Shape: [total_extend_tokens]
+                    Output: flat list of allocated token locations
+        ret_values: Pointer to return value array for communication with host.
+                   Shape: [1]
+                   Stores: (num_new_pages << 32) | total_extend_tokens
+        bs_upper: Upper bound for batch size (next power of 2 for efficient processing)
+        page_size: Number of tokens per page (e.g., 64 for FlashMLA, 128 for CutlassMLA)
+        max_num_extend_tokens: Maximum number of tokens being extended (next power of 2)
+    
+    Example:
+        If we have:
+        - pre_lens = [5, 3] (request 0 has 5 existing tokens, request 1 has 3)
+        - seq_lens = [8, 6] (request 0 needs 8 total tokens, request 1 needs 6)
+        - page_size = 4
+        - last_loc = [19, 11] (last allocated locations)
+        
+        The kernel will:
+        1. For request 0: reuse locations [20, 21] from existing page, allocate new page for [24, 25, 26, 27]
+        2. For request 1: reuse location [12] from existing page, allocate new page for [16, 17, 18]
+        
+        Output: out_indices = [20, 21, 24, 25, 26, 27, 12, 16, 17, 18]
+    """
+    # Get the program ID - each program processes one request in the batch
     pid = tl.program_id(0)
 
+    # Step 1: Load sequence information for all requests up to current one
+    # This is needed to calculate cumulative offsets for output positioning
     load_offset = tl.arange(0, bs_upper)
     seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
     pre_lens = tl.load(pre_lens_ptr + load_offset, mask=load_offset <= pid)
-    extend_lens = seq_lens - pre_lens
+    extend_lens = seq_lens - pre_lens  # Calculate how many new tokens each request needs
 
-    seq_len = tl.load(seq_lens_ptr + pid)
-    pre_len = tl.load(pre_lens_ptr + pid)
-    extend_len = seq_len - pre_len
+    # Step 2: Load current request's specific information
+    seq_len = tl.load(seq_lens_ptr + pid)  # Total tokens needed for this request
+    pre_len = tl.load(pre_lens_ptr + pid)  # Existing tokens for this request
+    extend_len = seq_len - pre_len         # New tokens needed for this request
 
-    sum_extend_lens = tl.sum(extend_lens)
-    output_start_loc = sum_extend_lens - extend_len
+    # Step 3: Calculate output positioning for this request
+    # We need to know where in the output array to write this request's token locations
+    sum_extend_lens = tl.sum(extend_lens)  # Total tokens being extended across all requests
+    output_start_loc = sum_extend_lens - extend_len  # Start position for this request's output
 
-    num_pages_after = (seq_lens + page_size - 1) // page_size
-    num_pages_before = (pre_lens + page_size - 1) // page_size
-    num_new_pages = num_pages_after - num_pages_before
+    # Step 4: Calculate page requirements for all requests
+    # This determines how many new pages need to be allocated
+    num_pages_after = (seq_lens + page_size - 1) // page_size   # Pages needed after extension
+    num_pages_before = (pre_lens + page_size - 1) // page_size  # Pages needed before extension
+    num_new_pages = num_pages_after - num_pages_before          # New pages needed
 
+    # Step 5: Calculate page allocation positioning for this specific request
     num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
         pre_len + page_size - 1
-    ) // page_size
-    sum_num_new_pages = tl.sum(num_new_pages)
-    new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
+    ) // page_size  # New pages needed for this request
+    sum_num_new_pages = tl.sum(num_new_pages)  # Total new pages needed across all requests
+    new_page_start_loc = sum_num_new_pages - num_page_start_loc_self  # Start position in free page pool
 
-    # Return value
+    # Step 6: Return aggregated information to host
+    # Only the last program writes the return value to avoid race conditions
     if pid == tl.num_programs(0) - 1:
+        # Pack two values into one: (num_new_pages << 32) | total_extend_tokens
         merged_value = (sum_num_new_pages.to(tl.int64)) << 32 | sum_extend_lens.to(
             tl.int64
         )
         tl.store(ret_values, merged_value)
 
-    # Part 1: fill the old partial page
-    last_loc = tl.load(last_loc_ptr + pid)
+    # ============================================================================
+    # PART 1: Fill the old partial page (reuse existing page space)
+    # ============================================================================
+    # This handles tokens that can fit within the existing page boundary
+    # We reuse the page that was already allocated for the previous tokens
+    
+    last_loc = tl.load(last_loc_ptr + pid)  # Get the last allocated location for this request
+    
+    # Calculate how many tokens can fit in the existing page
+    # This is the minimum of:
+    # 1. Total tokens needed (seq_len)
+    # 2. End of current page boundary ((pre_len + page_size - 1) // page_size * page_size)
+    # Minus the existing tokens (pre_len)
     num_part1 = (
         min(seq_len, (pre_len + page_size - 1) // page_size * page_size) - pre_len
     )
+    
+    # Create offsets within the page [0, 1, 2, ..., page_size-1]
     offset_one_page = tl.arange(0, page_size)
+    
+    # Store token locations by continuing from the last allocated location
+    # Each token gets location: last_loc + 1 + offset
     tl.store(
         out_indices + output_start_loc + offset_one_page,
         last_loc + 1 + offset_one_page,
-        mask=offset_one_page < num_part1,
+        mask=offset_one_page < num_part1,  # Only store valid tokens
     )
+    
+    # Early exit if all tokens fit in the existing page
     if pre_len + num_part1 == seq_len:
         return
 
-    # Part 2: fill the new full pages
+    # ============================================================================
+    # PART 2: Fill the new full pages (allocate complete new pages)
+    # ============================================================================
+    # This handles tokens that span multiple complete pages
+    # We allocate new pages from the free page pool
+    
+    # Calculate how many tokens need complete new pages
+    # This is the number of tokens from the end of the first page to the start of the last page
     num_part2 = (
         seq_len // page_size * page_size
         - (pre_len + page_size - 1) // page_size * page_size
     )
 
+    # Create offsets for all potential tokens [0, 1, 2, ..., max_num_extend_tokens-1]
     offset_many_page = tl.arange(0, max_num_extend_tokens)
+    
+    # Load page indices from the free page pool
+    # Each token needs a page index: new_page_start_loc + (token_offset // page_size)
     page_start = tl.load(
         free_page_ptr + new_page_start_loc + offset_many_page // page_size,
-        mask=offset_many_page < num_part2,
+        mask=offset_many_page < num_part2,  # Only load for valid tokens
     )
+    
+    # Store token locations for complete pages
+    # Each token gets location: page_index * page_size + offset_within_page
     tl.store(
         out_indices + output_start_loc + num_part1 + offset_many_page,
         page_start * page_size + offset_many_page % page_size,
-        mask=offset_many_page < num_part2,
+        mask=offset_many_page < num_part2,  # Only store valid tokens
     )
+    
+    # Early exit if all remaining tokens fit in complete pages
     if pre_len + num_part1 + num_part2 == seq_len:
         return
 
-    # Part 3: fill the new partial page
+    # ============================================================================
+    # PART 3: Fill the new partial page (allocate one more page for remaining tokens)
+    # ============================================================================
+    # This handles the final tokens that don't fill a complete page
+    # We allocate one additional page for these remaining tokens
+    
+    # Calculate how many tokens remain (those that don't fill complete pages)
     num_part3 = seq_len - seq_len // page_size * page_size
+    
+    # Load the page index for the final partial page
+    # This is the last page we need to allocate for this request
     start_loc = tl.load(
         free_page_ptr + new_page_start_loc + num_page_start_loc_self - 1
     )
+    
+    # Store token locations for the final partial page
+    # Each token gets location: page_index * page_size + offset_within_page
     tl.store(
         out_indices + output_start_loc + num_part1 + num_part2 + offset_one_page,
         start_loc * page_size + offset_one_page,
-        mask=offset_one_page < num_part3,
+        mask=offset_one_page < num_part3,  # Only store valid tokens
     )
 
 

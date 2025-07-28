@@ -652,29 +652,64 @@ def set_mla_kv_buffer_kernel(
     rope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    pid_loc = tl.program_id(0)
-    pid_blk = tl.program_id(1)
+    """
+    Triton kernel to efficiently copy and concatenate MLA (Multi-Head Latent Attention) 
+    key cache data from separate nope (non-positional) and rope (rotary positional) 
+    tensors into a unified KV buffer.
+    
+    This kernel handles the specialized memory layout for MLA attention where:
+    - Key cache is split into two parts: nope (non-positional embeddings) and rope (rotary positional embeddings)
+    - These need to be concatenated and stored in a single contiguous buffer
+    - The operation is parallelized across both location indices and feature dimensions
+    
+    Args:
+        kv_buffer_ptr: Pointer to destination KV buffer [num_locations, total_dim]
+        cache_k_nope_ptr: Pointer to source nope key cache [num_locations, nope_dim] 
+        cache_k_rope_ptr: Pointer to source rope key cache [num_locations, rope_dim]
+        loc_ptr: Pointer to location indices [num_locations]
+        buffer_stride: Stride of destination buffer (total_dim)
+        nope_stride: Stride of nope source tensor (nope_dim)
+        rope_stride: Stride of rope source tensor (rope_dim)
+        nope_dim: Number of non-positional embedding dimensions
+        rope_dim: Number of rotary positional embedding dimensions
+        BLOCK: Block size for parallel processing (typically 128)
+    
+    Grid dimensions:
+        - pid_loc: Parallelizes over location indices
+        - pid_blk: Parallelizes over feature dimension blocks
+    """
+    # Get program IDs for 2D grid parallelization
+    pid_loc = tl.program_id(0)  # Location index (which token position to process)
+    pid_blk = tl.program_id(1)  # Block index (which feature block to process)
 
-    base = pid_blk * BLOCK
-    offs = base + tl.arange(0, BLOCK)
-    total_dim = nope_dim + rope_dim
-    mask = offs < total_dim
+    # Calculate the base offset and range for this block
+    base = pid_blk * BLOCK  # Starting position of this feature block
+    offs = base + tl.arange(0, BLOCK)  # All offsets within this block
+    total_dim = nope_dim + rope_dim  # Total concatenated dimension
+    mask = offs < total_dim  # Mask to handle boundary conditions
 
-    loc = tl.load(loc_ptr + pid_loc)
-    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+    # Get the destination location and calculate destination pointer
+    loc = tl.load(loc_ptr + pid_loc)  # Which position in kv_buffer to write to
+    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs  # Destination memory address
 
+    # Determine which source tensor to read from based on the feature block position
     if base + BLOCK <= nope_dim:
+        # This block is entirely within the nope (non-positional) region
+        # Read from cache_k_nope and copy directly
         src = tl.load(
             cache_k_nope_ptr + pid_loc * nope_stride + offs,
             mask=mask,
         )
     else:
-        offs_rope = offs - nope_dim
+        # This block overlaps with or is entirely within the rope (positional) region
+        # Adjust offsets to read from cache_k_rope
+        offs_rope = offs - nope_dim  # Convert to rope tensor indices
         src = tl.load(
             cache_k_rope_ptr + pid_loc * rope_stride + offs_rope,
             mask=mask,
         )
 
+    # Store the loaded data to the destination
     tl.store(dst_ptr, src, mask=mask)
 
 
@@ -684,21 +719,57 @@ def set_mla_kv_buffer_triton(
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
 ):
-    nope_dim = cache_k_nope.shape[-1]
-    rope_dim = cache_k_rope.shape[-1]
-    total_dim = nope_dim + rope_dim
-    BLOCK = 128
-    n_loc = loc.numel()
-    grid = (n_loc, triton.cdiv(total_dim, BLOCK))
+    """
+    Efficiently copy and concatenate MLA (Multi-Head Latent Attention) key cache data
+    from separate nope and rope tensors into a unified KV buffer using Triton kernels.
+    
+    This function handles the specialized memory layout for MLA attention where the key
+    cache is split into two components that need to be concatenated:
+    - cache_k_nope: Non-positional embeddings (e.g., LoRA components)
+    - cache_k_rope: Rotary positional embeddings (RoPE components)
+    
+    The function uses a 2D grid of Triton blocks to parallelize the operation:
+    - First dimension: Parallelizes over location indices
+    - Second dimension: Parallelizes over feature dimension blocks
+    
+    Args:
+        kv_buffer: Destination KV buffer tensor [num_locations, total_dim]
+                  where total_dim = nope_dim + rope_dim
+        loc: Location indices tensor [num_locations] indicating which positions
+             in kv_buffer to write to
+        cache_k_nope: Source nope key cache tensor [num_locations, nope_dim]
+                     containing non-positional embedding components
+        cache_k_rope: Source rope key cache tensor [num_locations, rope_dim] 
+                     containing rotary positional embedding components
+    
+    Shapes:
+        - kv_buffer: [num_locations, nope_dim + rope_dim]
+        - loc: [num_locations] 
+        - cache_k_nope: [num_locations, nope_dim]
+        - cache_k_rope: [num_locations, rope_dim]
+    
+    The kernel concatenates the nope and rope components along the feature dimension
+    and stores the result in the specified locations of kv_buffer.
+    """
+    # Extract dimensions from input tensors
+    nope_dim = cache_k_nope.shape[-1]  # Number of non-positional embedding dimensions
+    rope_dim = cache_k_rope.shape[-1]  # Number of rotary positional embedding dimensions
+    total_dim = nope_dim + rope_dim    # Total concatenated dimension
+    
+    # Kernel configuration
+    BLOCK = 128  # Block size for parallel processing
+    n_loc = loc.numel()  # Number of locations to process
+    grid = (n_loc, triton.cdiv(total_dim, BLOCK))  # 2D grid: (locations, feature_blocks)
 
+    # Launch the Triton kernel with the computed grid
     set_mla_kv_buffer_kernel[grid](
         kv_buffer,
         cache_k_nope,
         cache_k_rope,
         loc,
-        kv_buffer.stride(0),
-        cache_k_nope.stride(0),
-        cache_k_rope.stride(0),
+        kv_buffer.stride(0),      # Stride for destination buffer
+        cache_k_nope.stride(0),   # Stride for nope source tensor
+        cache_k_rope.stride(0),   # Stride for rope source tensor
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,

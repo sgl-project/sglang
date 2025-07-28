@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -16,9 +17,12 @@ class TestCreateKvIndices(CustomTestCase):
         torch.set_default_device("cuda")
 
     def _run_test(self, batch, max_batch, max_context_len):
+        
         req_to_token = torch.arange(
             max_batch * max_context_len, dtype=torch.int32, device="cuda"
         ).reshape((max_batch, max_context_len))
+        
+        # the block table
         req_pool_indices = torch.tensor(
             torch.from_numpy(
                 np.random.choice(range(max_batch), size=batch, replace=False)
@@ -59,12 +63,24 @@ class TestCreateKvIndices(CustomTestCase):
             kv_indices_triton,
             req_to_token.size(1),
         )
-
+        page_size = 64
+        max_pages = max_context_len // page_size
+        kv_indices_flashmla = torch.empty(kv_indptr[-1])
+        create_flashmla_kv_indices_triton[(batch,)](
+            req_to_token,
+            req_pool_indices,
+            paged_kernel_lens,
+            None,
+            kv_indices_flashmla,
+            req_to_token.size(1),
+            max_pages,   
+            page_size
+        )
         # Check
         self.assertTrue(torch.equal(kv_indices_ref, kv_indices_triton))
 
     def test_create_kvindices(self):
-        BATCH = [1, 37, 1786]
+        BATCH = [4, 37, 1786]
         MAX_BATCH = 4096
         MAX_CONTEXT_LEN = 4096
         for batch in BATCH:

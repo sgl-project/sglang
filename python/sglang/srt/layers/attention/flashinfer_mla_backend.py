@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import triton
+
 """
 Support attention backend for flashinfer MLA.
 The flashinfer_mla_disable_ragged flag controls whether to use ragged prefill wrapper and defaults to be false.
@@ -15,10 +17,11 @@ from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
+import triton
 
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
-
+    
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
 
@@ -72,7 +75,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
     ):
         super().__init__()
-
+        self.num_update_calls = 0
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
@@ -140,13 +143,25 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.indices_updater_decode = FlashInferMLAIndicesUpdaterDecode(
             model_runner, self
         )
-
+    
+        
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if forward_batch.seq_lens.device == torch.device("cuda:3"):
+            print(f"num_update_calls: {self.num_update_calls}")
+            self.num_update_calls += 1
+            print(f"forward_batch: {forward_batch}")
+            print(f"forward_batch.forward_mode: {forward_batch.forward_mode}")
+            print(f"forward_batch.spec_info: {forward_batch.spec_info}")
+            print(f"forward_batch.req_pool_indices: {forward_batch.req_pool_indices}")
+            print(f"forward_batch.seq_lens: {forward_batch.seq_lens}")
+            print(f"forward_batch.seq_lens_sum: {forward_batch.seq_lens_sum}")
+            print(f"forward_batch.extend_prefix_lens: {forward_batch.extend_prefix_lens}")
+            print(f"forward_batch.extend_prefix_lens_cpu: {forward_batch.extend_prefix_lens_cpu}")
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -239,6 +254,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
+      
         if forward_mode.is_decode_or_idle():
             decode_wrapper = BatchMLAPagedAttentionWrapper(
                 self.workspace_buffer,
@@ -390,17 +406,22 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
+                    if k.device == torch.device("cuda:3"):
+                        print(f"Extend writing to mla kv cache: {k.shape}, {k_rope.shape}")
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer, cache_loc, k, k_rope
                     )
                 else:
+                    if k.device == torch.device("cuda:3"):
+                        print(f"Extend writing to kv cache: {k.shape}, {v.shape}")
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
         if q_rope is not None:
             q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-
+        if q.device == torch.device("cuda:3"):
+            print(f"forward_metadata.use_ragged: {self.forward_metadata.use_ragged}, for layer: {layer.layer_id}")
         if self.forward_metadata.use_ragged:
             # ragged prefill
             if q_rope is not None:
@@ -457,6 +478,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
+                    if k.device == torch.device("cuda:3") and layer.layer_id == 8:
+                        print(f"Decode writing to mla kv cache: {k.shape}, {k_rope.shape}")
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
@@ -464,6 +487,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                         k_rope,
                     )
                 else:
+                    if k.device == torch.device("cuda:3") and layer.layer_id == 8:
+                        print(f"Decode writing to kv cache: {k.shape}, {v.shape}")
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer,
                         cache_loc,
@@ -511,7 +536,8 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.scaling = model_runner.model_config.scaling
         self.data_type = model_runner.dtype
         self.attn_backend = attn_backend
-
+        self.page_size = model_runner.page_size
+        # print(f"FlashInferMLAIndicesUpdaterDecode: {self.page_size=}")
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -564,6 +590,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 if not init_metadata_replay
                 else fast_decode_kwargs["kv_indices"]
             )
+           
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
@@ -573,38 +600,49 @@ class FlashInferMLAIndicesUpdaterDecode:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+            if kv_indices.device == torch.device("cuda:3"):
+                print(f"After kv_indptr update:")
+                print(f"kv_indptr: {kv_indptr}")
+                print(f"After kv_indices update:")
+                print(f"kv_indices: {kv_indices}")
+                print(f"After kv_indptr update:")
+                print(f"kv_indptr: {kv_indptr}")
         else:
+            
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
-
+        # print(f"before plan: {self.page_size=}")
+        # print(f"kv_indptr: {kv_indptr}")
+        # print(f"kv_indices: {kv_indices}")
+        # print(f"kv_lens: {kv_lens}")
         if not init_metadata_replay:
             wrapper.plan(
-                q_indptr,
-                kv_indptr,
-                kv_indices,
-                kv_lens,
-                self.num_local_heads,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-                1,
-                False,
-                sm_scale,
-                self.data_type,
-                self.data_type,
+                qo_indptr=q_indptr,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                kv_len_arr=kv_lens,
+                num_heads=self.num_local_heads,
+                head_dim_ckv=self.kv_lora_rank,
+                head_dim_kpe=self.qk_rope_head_dim,
+                page_size=self.page_size,
+                causal=False,
+                sm_scale=sm_scale,
+                q_data_type=self.data_type,
+                kv_data_type=self.data_type,
             )
         else:
             wrapper.plan(
-                fast_decode_kwargs["qo_indptr_cpu"],
-                fast_decode_kwargs["kv_indptr_cpu"],
-                kv_indices,
-                fast_decode_kwargs["kv_len_arr_cpu"],
-                self.num_local_heads,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-                1,
-                False,
-                sm_scale,
-                self.data_type,
-                self.data_type,
+                qo_indptr=fast_decode_kwargs["qo_indptr_cpu"],
+                kv_indptr=fast_decode_kwargs["kv_indptr_cpu"],
+                kv_indices=kv_indices,
+                kv_len_arr=fast_decode_kwargs["kv_len_arr_cpu"],
+                num_heads=self.num_local_heads,
+                head_dim_ckv=self.kv_lora_rank,
+                head_dim_kpe=self.qk_rope_head_dim,
+                page_size=self.page_size,
+                causal=False,
+                sm_scale=sm_scale,
+                q_data_type=self.data_type,
+                kv_data_type=self.data_type,
             )
 
 
@@ -645,7 +683,8 @@ class FlashInferMLAIndicesUpdaterPrefill:
         else:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
-
+        if seq_lens.device == torch.device("cuda:3"):
+            print(f"seq_lens: {seq_lens}") 
         self.call_begin_forward(
             self.prefill_wrapper_ragged,
             prefill_wrapper_paged,
@@ -658,6 +697,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             self.qo_indptr,
             use_ragged,
             spec_info,
+
         )
 
     def call_begin_forward(
@@ -679,8 +719,16 @@ class FlashInferMLAIndicesUpdaterPrefill:
 
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
+               
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
+            if seq_lens.device == torch.device("cuda:3"):
+                print(f"seq_lens: {seq_lens}")
+                print(f"paged_kernel_lens: {paged_kernel_lens}")
+                print(f"paged_kernel_lens_sum: {paged_kernel_lens_sum}")
+                print(f"After kv_indptr update:")
+                print(f"kv_indptr: {kv_indptr}")
+             
             kv_indices = torch.empty(
                 paged_kernel_lens_sum,
                 dtype=torch.int32,
@@ -695,6 +743,12 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+            if seq_lens.device == torch.device("cuda:3"):
+                print(f"After kv_indices update:")
+                print(f"kv_indices: {kv_indices}")
+                print(f"After qo_indptr update:")
+                print(f"qo_indptr: {qo_indptr}")
+                
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
@@ -727,18 +781,18 @@ class FlashInferMLAIndicesUpdaterPrefill:
             # mla paged prefill
             kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
             wrapper_paged.plan(
-                qo_indptr,
-                kv_indptr,
-                kv_indices,
-                kv_len_arr,
-                self.num_local_heads,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-                1,
-                True,
-                sm_scale,
-                self.q_data_type,
-                self.data_type,
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                kv_len_arr=kv_len_arr,
+                num_heads=self.num_local_heads,
+                head_dim_ckv=self.kv_lora_rank,
+                head_dim_kpe=self.qk_rope_head_dim,
+                page_size=1,
+                causal=True,
+                sm_scale=sm_scale,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
             )
 
 
