@@ -2145,6 +2145,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         if disable_reason is not None:
             global_server_args_dict["disable_shared_experts_fusion"] = True
+            self.num_fused_shared_experts = 0
             log_info_on_rank0(
                 logger,
                 f"{disable_reason} Shared experts fusion optimization is disabled.",

@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var, is_cpu, is_hip
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -84,6 +85,7 @@ class FusedMoE(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
+        self.layer_id = layer_id
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.tp_size = (
@@ -368,6 +370,33 @@ class FusedMoE(torch.nn.Module):
         return self.expert_map[expert_id].item()
 
     def weight_loader(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> None:
+        if expert_id == 0:
+            print(expert_id)
+        assert expert_id < 256
+        physical_expert_ids = (
+            get_global_expert_location_metadata().logical_to_all_physical(
+                self.layer_id, expert_id
+            )
+        )
+        # print(f"expert_id: {expert_id}, physical_expert_ids: {physical_expert_ids}")
+        for physical_expert_id in physical_expert_ids:
+            assert physical_expert_id == expert_id
+            self._weight_loader_physical(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=physical_expert_id,
+            )
+
+    def _weight_loader_physical(
         self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
