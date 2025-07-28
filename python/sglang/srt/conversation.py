@@ -623,7 +623,7 @@ def generate_chat_conv(
                         real_content += content.text
                     elif content.type == "image_url":
                         # NOTE: works for llava and intervl2_5
-                        if conv.name == "internvl-2-5":
+                        if conv.name in ["internvl-2-5", "interns1"]:
                             real_content = image_token + real_content
                         else:
                             real_content += image_token
@@ -729,6 +729,7 @@ register_conv_template(
         sep="<|end|>",
         stop_str="<|end|>",
         image_token="<|endoftext10|>",
+        audio_token="<|endoftext11|>",
     )
 )
 
@@ -808,6 +809,19 @@ register_conv_template(
         name="internvl-2-5",
         system_template="<|im_start|>system\n{system_message}",
         system_message="你是书生·万象，英文名是InternVL，是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型。",
+        roles=("<|im_start|>user\n", "<|im_start|>assistant\n"),
+        sep_style=SeparatorStyle.MPT,
+        sep="<|im_end|>\n",
+        stop_str=["<|im_end|>", "<|action_end|>"],
+        image_token="<image>",
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="interns1",
+        system_template="<|im_start|>system\n{system_message}",
+        system_message="You are an AI assistant whose name is Intern-S1 (书生大模型).\n- Intern-S1 (书生大模型) is a vision-language model that is developed by Shanghai AI Laboratory (上海人工智能实验室).  It is designed to be helpful, honest, and harmless.\n- Intern-S1 (书生大模型) can understand and communicate fluently in the language chosen by the user such as English and 中文.\nYou are an expert reasoner with extensive experience in all areas. You approach problems through systematic thinking and rigorous reasoning. Your response should reflect deep understanding and precise logical thinking, making your solution path and reasoning clear to others. Please put your thinking process within <think>...</think> tags.",
         roles=("<|im_start|>user\n", "<|im_start|>assistant\n"),
         sep_style=SeparatorStyle.MPT,
         sep="<|im_end|>\n",
@@ -983,8 +997,10 @@ register_conv_template(
 
 @register_conv_template_matching_function
 def match_internvl(model_path: str):
-    if re.search(r"internvl2_5", model_path, re.IGNORECASE):
+    if re.search(r"internvl", model_path, re.IGNORECASE):
         return "internvl-2-5"
+    if re.search(r"intern.*s1", model_path, re.IGNORECASE):
+        return "interns1"
 
 
 @register_conv_template_matching_function
