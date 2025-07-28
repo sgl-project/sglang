@@ -11,6 +11,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -20,7 +21,6 @@ from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var, is_cpu, is_hip
-from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
