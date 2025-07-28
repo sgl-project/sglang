@@ -89,12 +89,30 @@ class ConstantSizeCache(ABC):
         if request_ids_to_seq_ids is None:
             request_ids_to_seq_ids = {}
 
-        self._release_finished_requests(finished_requests_ids)
-        state_indices = self._prepare_current_run_cache(
-            request_ids_to_seq_ids, finished_requests_ids
-        )
+        try:
+            from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+            is_capture = get_is_capture_mode()
+        except ImportError:
+            is_capture = False
+
+        if not is_capture:
+            # Only modify cache state in non-capture mode
+            # Release finished requests first
+            if finished_requests_ids:
+                self._release_finished_requests(finished_requests_ids)
+
+            # Prepare current run cache state
+            state_indices = self._prepare_current_run_cache(
+                request_ids_to_seq_ids, finished_requests_ids
+            )
+        else:
+            # In capture mode, use padding to maintain tensor shape without modifying real state
+            state_indices = [PAD_SLOT_ID] * input_state_indices_buffer.shape[0]
+
         cuda_graph_pad_len = input_state_indices_buffer.shape[0] - len(state_indices)
-        state_indices.extend([PAD_SLOT_ID] * cuda_graph_pad_len)
+        if cuda_graph_pad_len > 0:
+            state_indices.extend([PAD_SLOT_ID] * cuda_graph_pad_len)
 
         # Use direct indexing to avoid creating any tensors during replay
         # Copy the state indices one by one to the buffer
@@ -200,6 +218,7 @@ class ConstantSizeCache(ABC):
                 self.cache_indices_mapping.pop(req_id)
 
     def cleanup_orphaned_cache_entries(self, active_request_ids: set[str]):
+        """Clean up orphaned cache entries to ensure cache state consistency"""
         orphaned_req_ids = []
         for req_id in list(self.cache_indices_mapping.keys()):
             if req_id not in active_request_ids:
@@ -207,3 +226,32 @@ class ConstantSizeCache(ABC):
 
         if orphaned_req_ids:
             self._release_finished_requests(orphaned_req_ids)
+
+            # Verify cleanup results
+            remaining_orphans = [
+                req_id
+                for req_id in orphaned_req_ids
+                if req_id in self.cache_indices_mapping
+            ]
+
+    def get_cache_stats(self) -> dict:
+        """Get cache statistics for monitoring and debugging"""
+        total_slots = len(self.free_cache_indices) + len(
+            [
+                slot_id
+                for req_mapping in self.cache_indices_mapping.values()
+                for slot_id in req_mapping.values()
+            ]
+        )
+
+        return {
+            "total_cache_slots": total_slots,
+            "free_cache_slots": len(self.free_cache_indices),
+            "active_requests": len(self.cache_indices_mapping),
+            "cache_utilization": (
+                1.0 - (len(self.free_cache_indices) / total_slots)
+                if total_slots > 0
+                else 0.0
+            ),
+            "active_request_ids": list(self.cache_indices_mapping.keys()),
+        }

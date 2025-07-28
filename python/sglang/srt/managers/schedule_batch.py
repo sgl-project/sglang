@@ -782,6 +782,36 @@ class Req:
         )
 
 
+# Thread-safe seq_id generator to avoid conflicts in concurrent scenarios
+class ThreadSafeSeqIdGenerator:
+    """Thread-safe global sequence ID generator for cache management."""
+
+    def __init__(self):
+        self._counter = 0
+        self._lock = threading.Lock()
+
+    def next(self) -> int:
+        """Get next unique sequence ID in a thread-safe manner."""
+        with self._lock:
+            seq_id = self._counter
+            self._counter += 1
+            return seq_id
+
+    def reset(self):
+        """Reset counter (mainly for testing purposes)."""
+        with self._lock:
+            self._counter = 0
+
+
+# Global seq_id generator instance
+_global_seq_id_generator = ThreadSafeSeqIdGenerator()
+
+
+def get_next_seq_id() -> int:
+    """Get next global sequence ID."""
+    return _global_seq_id_generator.next()
+
+
 # Batch id
 bid = 0
 
@@ -886,6 +916,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = 0
 
+    # Pre-allocated request to sequence ID mapping (vLLM-style approach)
+    # This avoids seq_id conflicts in concurrent scenarios
+    request_ids_to_seq_ids: Optional[Dict[str, List[int]]] = None
+    finished_requests_ids: Optional[List[str]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -908,6 +943,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid = True
 
+        # Pre-allocate seq_ids for each request (vLLM-style approach)
+        # This ensures thread-safe seq_id allocation and avoids conflicts
+        request_ids_to_seq_ids = {}
+        session_to_seq_map = {}
+
+        for req in reqs:
+            # Check if request has session_id for cache sharing
+            if hasattr(req, "session_id") and req.session_id:
+                # Session-based requests: share seq_id within same session
+                if req.session_id not in session_to_seq_map:
+                    session_to_seq_map[req.session_id] = get_next_seq_id()
+                seq_id = session_to_seq_map[req.session_id]
+                request_ids_to_seq_ids[req.rid] = [seq_id]
+            else:
+                # Independent requests: use unique seq_id to avoid cache pollution
+                request_ids_to_seq_ids[req.rid] = [get_next_seq_id()]
+
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
@@ -924,6 +976,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             enable_custom_logit_processor=enable_custom_logit_processor,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             chunked_req=chunked_req,
+            request_ids_to_seq_ids=request_ids_to_seq_ids,
+            finished_requests_ids=[],
         )
 
     def batch_size(self):
@@ -1576,17 +1630,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
+        # Collect finished request IDs
+        finished_request_ids = []
+
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
             elif chunked_req_to_exclude is None:
                 chunked_req_to_exclude = []
-            keep_indices = [
-                i
-                for i in range(len(self.reqs))
-                if not self.reqs[i].finished()
-                and self.reqs[i] not in chunked_req_to_exclude
-            ]
+
+            keep_indices = []
+            for i in range(len(self.reqs)):
+                req = self.reqs[i]
+                if req.finished():
+                    # Collect finished request IDs
+                    finished_request_ids.append(req.rid)
+                elif req not in chunked_req_to_exclude:
+                    keep_indices.append(i)
+        else:
+            # Collect finished requests not included in keep_indices
+            for i in range(len(self.reqs)):
+                if i not in keep_indices and self.reqs[i].finished():
+                    finished_request_ids.append(self.reqs[i].rid)
+
+        # Update finished_requests_ids
+        if finished_request_ids:
+            if self.finished_requests_ids is None:
+                self.finished_requests_ids = []
+            self.finished_requests_ids.extend(finished_request_ids)
 
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
@@ -1623,6 +1694,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.has_stream = any(req.stream for req in self.reqs)
         self.has_grammar = any(req.grammar for req in self.reqs)
+
+        # Update request_ids_to_seq_ids mapping to only include remaining requests
+        if self.request_ids_to_seq_ids is not None:
+            remaining_request_ids = {req.rid for req in self.reqs}
+            self.request_ids_to_seq_ids = {
+                rid: seq_ids
+                for rid, seq_ids in self.request_ids_to_seq_ids.items()
+                if rid in remaining_request_ids
+            }
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         if self.spec_info:
@@ -1663,6 +1743,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
+
+        # Merge request_ids_to_seq_ids mappings
+        if self.request_ids_to_seq_ids is None:
+            self.request_ids_to_seq_ids = other.request_ids_to_seq_ids
+        elif other.request_ids_to_seq_ids is not None:
+            self.request_ids_to_seq_ids.update(other.request_ids_to_seq_ids)
+
+        # Merge finished_requests_ids
+        if self.finished_requests_ids is None:
+            self.finished_requests_ids = other.finished_requests_ids or []
+        elif other.finished_requests_ids is not None:
+            self.finished_requests_ids.extend(other.finished_requests_ids)
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
@@ -1736,11 +1828,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
             token_type_ids=self.token_type_ids,
-            # Construct request_ids_to_seq_ids mapping with proper cache isolation
-            # For independent requests (no session), use unique seq_id for each request
-            # For session-based requests, requests in same session share seq_id
-            request_ids_to_seq_ids=self._build_request_seq_mapping(),
-            finished_requests_ids=[],  # Will be populated by scheduler when requests finish
+            # Use pre-allocated request_ids_to_seq_ids mapping (vLLM-style)
+            request_ids_to_seq_ids=self.request_ids_to_seq_ids,
+            finished_requests_ids=self.finished_requests_ids or [],
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             hicache_consumer_index=self.hicache_consumer_index,
@@ -1830,27 +1920,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def _build_request_seq_mapping(self):
-        """构建request_ids_to_seq_ids映射，确保独立请求使用不同的seq_id，避免缓存污染"""
-        request_ids_to_seq_ids = {}
-        session_to_seq_map = {}
-        next_seq_id = 0
-
-        for req in self.reqs:
-            # 检查请求是否有session_id用于缓存共享
-            if hasattr(req, "session_id") and req.session_id:
-                # 基于会话的请求：同一会话内共享seq_id（多轮对话复用缓存）
-                if req.session_id not in session_to_seq_map:
-                    session_to_seq_map[req.session_id] = next_seq_id
-                    next_seq_id += 1
-                seq_id = session_to_seq_map[req.session_id]
-                request_ids_to_seq_ids[req.rid] = [seq_id]
-            else:
-                # 独立请求：使用唯一的seq_id避免缓存污染
-                # 每个独立请求都分配新的seq_id，确保缓存完全隔离
-                request_ids_to_seq_ids[req.rid] = [next_seq_id]
-                next_seq_id += 1
-
-        return request_ids_to_seq_ids
+        # vLLM-style approach: return pre-allocated mapping
+        # This avoids seq_id conflicts in concurrent scenarios
+        assert (
+            self.request_ids_to_seq_ids is not None
+        ), "request_ids_to_seq_ids must be pre-allocated in init_new"
+        return self.request_ids_to_seq_ids
 
 
 @dataclasses.dataclass

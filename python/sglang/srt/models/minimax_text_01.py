@@ -1024,6 +1024,11 @@ class MiniMaxText01Model(nn.Module):
     def _clear_prefill_cache(
         self, forward_batch, minimax_cache_tensors: torch.Tensor, **kwargs
     ):
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        if get_is_capture_mode():
+            return
+
         request_ids_to_seq_ids = kwargs.get("request_ids_to_seq_ids", {})
         if not request_ids_to_seq_ids:
             return
@@ -1094,6 +1099,7 @@ class MiniMaxText01Model(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         **kwargs,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        # Get request mapping info using improved logic
         if "request_ids_to_seq_ids" not in kwargs:
             kwargs["request_ids_to_seq_ids"] = get_request_ids_to_seq_ids(
                 forward_batch, **kwargs
@@ -1104,9 +1110,25 @@ class MiniMaxText01Model(nn.Module):
             )
 
         request_ids_to_seq_ids = kwargs["request_ids_to_seq_ids"]
+        finished_requests_ids = kwargs["finished_requests_ids"]
 
-        active_request_ids = set(request_ids_to_seq_ids.keys())
-        self.minimax_cache.cleanup_orphaned_cache_entries(active_request_ids)
+        # Validate data integrity
+        if request_ids_to_seq_ids is None:
+            request_ids_to_seq_ids = {}
+            kwargs["request_ids_to_seq_ids"] = request_ids_to_seq_ids
+
+        if finished_requests_ids is None:
+            finished_requests_ids = []
+            kwargs["finished_requests_ids"] = finished_requests_ids
+
+        # Skip orphaned cache cleanup during CUDA graph capture to avoid deleting real cache with virtual data
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        if not get_is_capture_mode():
+            active_request_ids = set(request_ids_to_seq_ids.keys())
+
+            # Clean up orphaned cache entries
+            self.minimax_cache.cleanup_orphaned_cache_entries(active_request_ids)
 
         (
             minimax_cache_tensors,
@@ -1494,32 +1516,52 @@ def get_request_mapping_info(forward_batch: ForwardBatch, **kwargs):
     Returns:
         tuple: (request_ids_to_seq_ids, finished_requests_ids)
     """
+    request_ids_to_seq_ids = {}
+    finished_requests_ids = []
+
+    # Priority 1: Get latest data from forward_batch
     if (
         hasattr(forward_batch, "request_ids_to_seq_ids")
         and forward_batch.request_ids_to_seq_ids is not None
     ):
         request_ids_to_seq_ids = forward_batch.request_ids_to_seq_ids
-        finished_requests_ids = (
-            forward_batch.finished_requests_ids
-            if hasattr(forward_batch, "finished_requests_ids")
-            else []
-        )
-        return request_ids_to_seq_ids, finished_requests_ids
+    else:
+        # Fallback: Get from kwargs
+        request_ids_to_seq_ids = kwargs.get("request_ids_to_seq_ids", {})
 
-    request_ids_to_seq_ids = kwargs.get("request_ids_to_seq_ids", {})
-    finished_requests_ids = kwargs.get("finished_requests_ids", [])
+    # Multiple checks for finished_requests_ids
+    # Priority 1: Get latest finished requests from forward_batch
+    if (
+        hasattr(forward_batch, "finished_requests_ids")
+        and forward_batch.finished_requests_ids is not None
+        and len(forward_batch.finished_requests_ids) > 0
+    ):
+        finished_requests_ids = forward_batch.finished_requests_ids
+    else:
+        # Priority 2: Get from kwargs
+        finished_requests_ids = kwargs.get("finished_requests_ids", [])
 
-    if not request_ids_to_seq_ids:
-        pass
+        # Priority 3: Dynamic detection through request status
+        if not finished_requests_ids and hasattr(forward_batch, "reqs"):
+            for req in forward_batch.reqs:
+                if (
+                    hasattr(req, "finished")
+                    and callable(req.finished)
+                    and req.finished()
+                ):
+                    if hasattr(req, "rid"):
+                        finished_requests_ids.append(req.rid)
 
-    if not finished_requests_ids:
-        if (
-            hasattr(forward_batch, "finished_requests_ids")
-            and forward_batch.finished_requests_ids
-        ):
-            finished_requests_ids = forward_batch.finished_requests_ids
-        else:
-            finished_requests_ids = []
+        # Priority 4: Check for orphaned request mappings
+        if request_ids_to_seq_ids:
+            # Additional heuristic checks can be added here
+            pass
+
+    # Ensure return values are not None
+    if finished_requests_ids is None:
+        finished_requests_ids = []
+    if request_ids_to_seq_ids is None:
+        request_ids_to_seq_ids = {}
 
     return request_ids_to_seq_ids, finished_requests_ids
 
