@@ -51,7 +51,8 @@ class ModelCase:
 # Popular models that run on the CI
 CI_MODELS = [
     ModelCase("meta-llama/Llama-3.1-8B-Instruct"),
-    ModelCase("google/gemma-2-2b"),
+    # TODO: Gemma is broken by the bug introduced in the latest transformers version, we should restore once its fixed: https://github.com/huggingface/transformers/issues/39711
+    # ModelCase("google/gemma-2-2b"),
 ]
 
 # the complete set of models to test sglang's generation model
@@ -66,6 +67,7 @@ ALL_MODELS = [
     ),
     ModelCase("openai-community/gpt2"),
     ModelCase("microsoft/phi-1_5", trust_remote_code=True),
+    ModelCase("adept/persimmon-8b-chat"),
     ModelCase("microsoft/Phi-3-small-8k-instruct", trust_remote_code=True),
     ModelCase("allenai/OLMo-2-1124-7B-Instruct", skip_long_prompt=True),
     ModelCase("ibm-granite/granite-3.0-2b-instruct", skip_long_prompt=True),

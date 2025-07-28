@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
@@ -31,11 +31,24 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import is_cuda, next_power_of_2
 
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import TopKOutput
+
 if is_cuda():
-    from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
+    from sgl_kernel import scaled_fp4_quant
 
 try:
-    from flashinfer import fp4_quantize as fp4_quantize
+    from flashinfer import mm_fp4 as fp4_gemm
+
+    enable_flashinfer_fp4_gemm = True
+except ImportError:
+    if is_cuda():
+        from sgl_kernel import cutlass_scaled_fp4_mm as fp4_gemm
+    else:
+        fp4_gemm = None
+    enable_flashinfer_fp4_gemm = False
+
+try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
 except ImportError:
     flashinfer_cutlass_fused_moe = None
@@ -402,15 +415,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: Optional[int] = None,
-        custom_routing_function: Optional[Callable] = None,
-        correction_bias: Optional[torch.Tensor] = None,
+        topk_output: TopKOutput,
+        *,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         inplace: bool = True,
@@ -418,29 +424,12 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-        from sglang.srt.layers.moe.topk import select_experts
-
-        # Expert selection
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
 
         return fused_experts(
             x,
             layer.w13_weight,
             layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
+            topk_output=topk_output,
             inplace=inplace,
             activation=activation,
             use_fp8_w8a8=True,
@@ -704,11 +693,16 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         assert layer.weight_scale_interleaved.dtype == torch.float8_e4m3fn
         assert layer.alpha.dtype == torch.float32
 
-        out = cutlass_scaled_fp4_mm(
+        w = layer.weight
+        w_scale_interleaved = layer.weight_scale_interleaved
+        if enable_flashinfer_fp4_gemm:
+            w = layer.weight.T
+            w_scale_interleaved = layer.weight_scale_interleaved.T
+        out = fp4_gemm(
             x_fp4,
-            layer.weight,
+            w,
             x_scale_interleaved,
-            layer.weight_scale_interleaved,
+            w_scale_interleaved,
             layer.alpha,
             output_dtype,
         )
@@ -732,7 +726,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 " quantization. Please use Blackwell and"
                 " above."
             )
-        self.enable_flashinfer_moe = False
+        self.enable_flashinfer_cutlass_moe = False
 
     def create_weights(
         self,
@@ -886,7 +880,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
         layer.w13_weight_scale_2 = Parameter(w13_weight_scale_2, requires_grad=False)
 
-        if self.enable_flashinfer_moe:
+        if self.enable_flashinfer_cutlass_moe:
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
         else:
             w13_input_scale = layer.w13_input_scale.max(dim=1).values.to(torch.float32)
@@ -915,7 +909,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
 
         # GEMM 2
-        if self.enable_flashinfer_moe:
+        if self.enable_flashinfer_cutlass_moe:
             w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
         else:
             w2_input_scale = layer.w2_input_scale
@@ -955,21 +949,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     @property
     def load_up_proj_weight_first(self) -> bool:
         # FlashInfer CUTLASS kernel assumes [Up, Gate] Proj as W13
-        return self.enable_flashinfer_moe
+        return self.enable_flashinfer_cutlass_moe
 
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: Optional[int] = None,
-        custom_routing_function: Optional[Callable] = None,
-        correction_bias: Optional[torch.Tensor] = None,
+        topk_output: TopKOutput,
+        *,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         inplace: bool = True,
@@ -980,30 +967,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
     ) -> torch.Tensor:
-
         assert activation == "silu", "Only SiLU activation is supported."
-        from sglang.srt.layers.moe.topk import select_experts
 
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
-
-        if self.enable_flashinfer_moe:
+        if self.enable_flashinfer_cutlass_moe:
             assert (
                 not apply_router_weight_on_input
             ), "apply_router_weight_on_input is not supported for Flashinfer"
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
+            topk_weights, topk_ids, _ = topk_output
             output = flashinfer_cutlass_fused_moe(
                 x,
                 topk_ids.to(torch.int),
@@ -1024,12 +996,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_size=tp_size,
                 tp_rank=tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
-            )
-            return output[0]
+            )[0]
+            if routed_scaling_factor is not None:
+                output *= routed_scaling_factor
+            return output
 
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 
-        return cutlass_moe_fp4(
+        topk_weights, topk_ids, _ = topk_output
+        output = cutlass_moe_fp4(
             a=x,
             a1_gscale=layer.w13_input_scale_quant,
             w1_fp4=layer.w13_weight,
@@ -1044,3 +1019,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             params=layer.cutlass_moe_params,
             apply_router_weight_on_input=apply_router_weight_on_input,
         ).to(x.dtype)
+        if routed_scaling_factor is not None:
+            output *= routed_scaling_factor
+        return output

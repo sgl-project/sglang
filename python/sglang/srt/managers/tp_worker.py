@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 
@@ -144,7 +145,6 @@ class TpModelWorker:
             self.tp_size * self.pp_rank + tp_rank,
             self.world_group.cpu_group,
             src=self.world_group.ranks[0],
-            device=self.device,
         )[0]
         set_random_seed(self.random_seed)
 
@@ -279,6 +279,8 @@ class TpModelWorker:
         return success, message
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+
+        monkey_patch_torch_reductions()
         success, message = self.model_runner.update_weights_from_tensor(
             named_tensors=MultiprocessingSerializer.deserialize(
                 recv_req.serialized_named_tensors[self.tp_rank]
@@ -294,11 +296,9 @@ class TpModelWorker:
         return parameter
 
     def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
-        result = self.model_runner.load_lora_adapter(
-            recv_req.lora_name, recv_req.lora_path
-        )
+        result = self.model_runner.load_lora_adapter(recv_req.to_ref())
         return result
 
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
-        result = self.model_runner.unload_lora_adapter(recv_req.lora_name)
+        result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
