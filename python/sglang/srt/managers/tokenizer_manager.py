@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from contextlib import nullcontext
 from datetime import datetime
 from http import HTTPStatus
 from typing import (
@@ -69,6 +70,7 @@ from sglang.srt.managers.io_struct import (
     BatchMultimodalOut,
     BatchStrOut,
     BatchTokenIDOut,
+    BlockReqType,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
@@ -114,6 +116,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -830,12 +833,21 @@ class TokenizerManager:
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
-                for i in range(batch_size):
-                    tmp_obj = obj[i]
-                    tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, state, request))
-                    rids.append(tmp_obj.rid)
+                with (
+                    input_blocker_guard_region(send_to_scheduler=self.send_to_scheduler)
+                    if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
+                    else nullcontext()
+                ):
+                    for i in range(batch_size):
+                        tmp_obj = obj[i]
+                        tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                        state = self._send_one_request(
+                            tmp_obj, tokenized_obj, created_time
+                        )
+                        generators.append(
+                            self._wait_one_response(tmp_obj, state, request)
+                        )
+                        rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
             if batch_size > 128:

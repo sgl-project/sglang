@@ -123,6 +123,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
@@ -503,6 +504,12 @@ class Scheduler(
             enable=server_args.enable_memory_saver
         )
         self.init_profier()
+
+        self.input_blocker = (
+            SchedulerInputBlocker(noop=self.attn_tp_rank != 0)
+            if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
+            else None
+        )
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
@@ -1034,6 +1041,9 @@ class Scheduler(
                 )
             else:
                 recv_reqs = None
+
+        if self.input_blocker is not None:
+            recv_reqs = self.input_blocker.handle(recv_reqs)
 
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0:
