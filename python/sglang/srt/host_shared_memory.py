@@ -3,7 +3,7 @@ import os
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import cuda.bindings.runtime as cuda_rt
 import numpy as np
@@ -16,7 +16,7 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
-class _HostSharedMemoryManager:
+class HostSharedMemoryManager:
     def __init__(self, base_name: str):
         self._base_name = Path(base_name)
         self._operation_index = 0
@@ -68,5 +68,14 @@ class _Record:
     np_array: np.ndarray
     tensor: torch.Tensor
 
+# Can have multi instances if needed
+_instance: Optional[HostSharedMemoryManager] = None
 
-_shared_memory_manager = _HostSharedMemoryManager()
+def get_host_shared_memory_manager():
+    assert _instance is not None
+    return _instance
+
+def set_host_shared_memory_manager(instance: HostSharedMemoryManager):
+    global _instance
+    assert _instance is None
+    _instance = instance
