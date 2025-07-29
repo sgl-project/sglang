@@ -509,8 +509,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale_float,
             )
         else:
-            if layer.attn_type == AttentionType.ENCODER_ONLY:
-                save_kv_cache = False
+            save_kv_cache = layer.attn_type != AttentionType.ENCODER_ONLY
 
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions

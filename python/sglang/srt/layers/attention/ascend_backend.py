@@ -322,6 +322,7 @@ class AscendAttnBackend(AttentionBackend):
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
             else:
+<<<<<<< HEAD
                 actual_seq_len_kv = (
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
@@ -337,6 +338,35 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
+=======
+                o = torch.empty_like(q)
+
+            use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+
+            q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+            causal = not (
+                layer.is_cross_attention
+                or layer.attn_type == AttentionType.ENCODER_ONLY
+            )
+
+            self.native_attn._run_sdpa_forward_extend(
+                q_,
+                o_,
+                k_cache.view(
+                    -1, layer.tp_k_head_num, (self.kv_lora_rank + self.qk_rope_head_dim)
+                ),
+                v_cache.view(-1, layer.tp_v_head_num, self.kv_lora_rank),
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.extend_prefix_lens,
+                forward_batch.extend_seq_lens,
+                scaling=layer.scaling,
+                enable_gqa=use_gqa,
+                causal=causal,
+>>>>>>> a7048bb4b (unify causality)
             )
             output = torch.empty(
                 (num_tokens, 1, layer.tp_q_head_num * layer.v_head_dim),
