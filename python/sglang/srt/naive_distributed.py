@@ -7,7 +7,6 @@ from typing import Any, List, Optional
 
 import torch
 
-from sglang.srt.utils import MultiprocessingSerializer
 
 
 class NaiveDistributed:
@@ -31,6 +30,8 @@ class NaiveDistributed:
     def scatter(
         self, tensor: torch.Tensor, scatter_list: List[torch.Tensor], src: int = 0
     ):
+        from sglang.srt.utils import MultiprocessingSerializer
+
         if self._rank == src:
             assert len(scatter_list) == self._world_size
         else:
