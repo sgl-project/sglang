@@ -726,17 +726,9 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-<<<<<<< HEAD
-        logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
-
-        causal = True
-        if layer.attn_type == AttentionType.ENCODER_ONLY:
-            causal = False
-=======
         causal = not (
             layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY
         )
->>>>>>> a7048bb4b (unify causality)
 
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             sliding_window_size = (
