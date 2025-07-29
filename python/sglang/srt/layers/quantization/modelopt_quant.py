@@ -29,7 +29,7 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import dispose_tensor, is_cuda, next_power_of_2
+from sglang.srt.utils import is_cuda, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
@@ -907,7 +907,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w13_blockscale_swizzled = self.swizzle_blockscale(layer.w13_weight_scale)
 
         layer.w13_blockscale_swizzled.data.copy_(w13_blockscale_swizzled)
-        dispose_tensor(layer.w13_weight_scale.data)  # TODO remove?
         del layer.w13_weight_scale
 
         # This is for quantization, so we need to invert it.
@@ -942,7 +941,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_blockscale_swizzled = self.swizzle_blockscale(layer.w2_weight_scale)
 
         layer.w2_blockscale_swizzled.data.copy_(w2_blockscale_swizzled)
-        dispose_tensor(layer.w2_weight_scale.data)  # TODO remove?
         del layer.w2_weight_scale
         layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
