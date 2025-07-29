@@ -326,6 +326,10 @@ class ModelConfig:
                 "kv_n_heads",
                 self.hf_config.num_attention_heads,
             )
+        
+        # For Step3v
+        if self.hf_config.model_type in ["step3v"]:
+            return getattr(self.hf_text_config, "num_attention_groups", 1)
 
         attributes = [
             # For Falcon:
