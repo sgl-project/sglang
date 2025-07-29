@@ -410,6 +410,8 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         self._rank = get_naive_distributed().get_rank()
         self._world_size = get_naive_distributed().get_world_size()
 
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
         assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
         assert (
             self._param.data.is_contiguous()
