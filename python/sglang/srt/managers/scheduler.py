@@ -335,10 +335,6 @@ class Scheduler(
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
 
-        # TODO hack
-        global_server_args_dict["dp_rank"] = dp_rank
-        global_server_args_dict["dp_size"] = self.server_args.dp_size
-
         # Launch a tensor parallel worker
         if self.enable_overlap:
             TpWorkerClass = TpModelWorkerClient

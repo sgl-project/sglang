@@ -160,10 +160,11 @@ class OffloaderV2(BaseOffloader):
 
         # Temporarily init inside Offloader, can move if other modules also need this
         if self.mode in {"sharded_gpu", "shm_cpu"}:
+            assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
             set_naive_distributed(
                 NaiveDistributed(
-                    rank=global_server_args_dict["dp_rank"],
-                    world_size=global_server_args_dict["dp_size"],
+                    rank=dp_rank,
+                    world_size=dp_size,
                     rendezvous=f"/tmp/{run_id}",
                 )
             )
