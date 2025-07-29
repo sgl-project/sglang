@@ -21,7 +21,7 @@ import os
 import random
 import sys
 import tempfile
-from typing import List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
@@ -132,6 +132,11 @@ class ServerArgs:
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
+    dtype: str = "auto"
+    kv_cache_dtype: str = "auto"
+    quantization: Optional[str] = None
+    modelopt_quant: Optional[Union[str, Dict]] = None
+    quantization_param_path: Optional[str] = None
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
@@ -909,11 +914,8 @@ class ServerArgs:
                 "awq_marlin",
                 "bitsandbytes",
                 "gguf",
-                "modelopt_fp8",  # TODO: set default for fp8 quantization, use fp8_e4m3
+                "modelopt_fp8",  # TODO: set default for modelopt quantization,
                 "modelopt_fp4",
-                "modelopt_int4_awq",  # TODO: add support in sglang runtime
-                "modelopt_w4a8_awq",  # TODO: add support in sglang runtime
-                "modelopt_fp4_awq",  # TODO: add support in sglang runtime
                 "w8a8_int8",
                 "w8a8_fp8",
                 "moe_wna16",
