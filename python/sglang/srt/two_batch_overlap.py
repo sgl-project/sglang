@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import dataclasses
 import logging
 from dataclasses import replace
-from typing import Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
 
 import torch
 
@@ -19,6 +21,9 @@ from sglang.srt.operations import execute_operations, execute_overlapped_operati
 from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import BumpAllocator, DeepEPMode, get_bool_env_var
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.ep_moe.token_dispatcher import DispatchOutput
 
 _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 
@@ -802,7 +807,7 @@ class MaybeTboDeepEPDispatcher:
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):
         return getattr(self._inners[tbo_subbatch_index or 0], name)(**kwargs)
 
-    def dispatch(self, **kwargs):
+    def dispatch(self, **kwargs) -> DispatchOutput:
         return self._execute("dispatch", **kwargs)
 
     def dispatch_a(self, **kwargs):
@@ -811,7 +816,7 @@ class MaybeTboDeepEPDispatcher:
     def dispatch_b(self, **kwargs):
         return self._execute("dispatch_b", **kwargs)
 
-    def combine(self, **kwargs):
+    def combine(self, **kwargs) -> torch.Tensor:
         return self._execute("combine", **kwargs)
 
     def combine_a(self, **kwargs):

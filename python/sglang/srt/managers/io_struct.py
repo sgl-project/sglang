@@ -926,7 +926,11 @@ class AbortReq:
     rid: str = ""
     # Whether to abort all requests
     abort_all: bool = False
+
     rids: Optional[Union[List[str], str]] = None
+
+    finished_reason: Optional[Dict[str, Any]] = None
+
 
     def __post_init__(self):
         self.rids = self.rid
@@ -1142,7 +1146,19 @@ class LoRAUpdateResult:
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
 
+
 @dataclass
 class MultiTokenizerRegisterReq:
     rids: Optional[Union[List[str], str]] = None
     ipc_name: Optional[str] = None
+
+
+class BlockReqType(Enum):
+    BLOCK = 1
+    UNBLOCK = 2
+
+
+@dataclass
+class BlockReqInput:
+    type: BlockReqType
+
