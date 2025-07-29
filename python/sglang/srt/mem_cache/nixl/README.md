@@ -48,31 +48,29 @@ Navigate to the project root directory (`/path/to/sglang`) and run:
 
 #### Run all NIXL tests:
 ```bash
-PYTHONPATH=python python -m sglang.srt.mem_cache.nixl.tests.test_nixl_unified
+PYTHONPATH=. python -m pytest test/srt/test_hicache_nixl_storage.py -o asyncio_mode=strict
 ```
 
 #### Run with verbose output:
 ```bash
-PYTHONPATH=python python -m unittest sglang.srt.mem_cache.nixl.tests.test_nixl_unified.TestNixlUnified -v
+PYTHONPATH=. python -m pytest test/srt/test_hicache_nixl_storage.py -v -o asyncio_mode=strict
 ```
+
+Note: The `-v` flag provides more detailed output, showing each test case name and its result.
 
 #### Run a specific test:
 ```bash
-PYTHONPATH=python python -m unittest sglang.srt.mem_cache.nixl.tests.test_nixl_unified.TestNixlUnified.test_single_set_get -v
-```
-
-#### Run all tests in the nixl directory:
-```bash
-PYTHONPATH=python python -m unittest discover sglang.srt.mem_cache.nixl.tests -p "test_*.py" -v
+PYTHONPATH=. python -m pytest test/srt/test_hicache_nixl_storage.py -v -k test_single_set_get -o asyncio_mode=strict
 ```
 
 ### From Tests Directory
 Navigate to the tests directory and run:
 
 ```bash
-cd python/sglang/srt/mem_cache/nixl/tests
-PYTHONPATH=../../../../.. python test_nixl_unified.py
+cd test/srt
+PYTHONPATH=../.. python -m pytest test_hicache_nixl_storage.py -o asyncio_mode=strict
 ```
+Note: The `-o asyncio_mode=strict` flag is added to suppress warnings about asyncio configuration. This is not required for test functionality but provides cleaner output.
 
 ## Test Coverage
 
@@ -133,7 +131,7 @@ python/sglang/srt/mem_cache/nixl/
 
 ## Dependencies
 
-- **NIXL**: NVIDIA I/O eXchange Library (version 1.0 or later)
+- **NIXL**: NVIDIA Inference Xfer Library (version 0.4 or later)
   - Required plugins: POSIX (minimum), 3FS/GDS (optional for better performance)
   - See [NIXL Installation Guide](https://github.com/ai-dynamo/nixl/blob/main/README.md#installation)
 - **PyTorch**: For tensor operations (version 1.8 or later)
@@ -168,6 +166,4 @@ The system automatically selects the best available backend, with POSIX as the d
 
 ## Note
 
-This is v0 of the NIXL connector. Future versions will focus on further performance optimizations such as memory pre-registration (pre-allocating and registering memory buffers to reduce registration overhead during transfers) and block merging (combining related blocks as offsets within the same file to reduce file operations and improve throughput).
-
-These optimizations require changes at a higher layer, as the current HiCache API doesn't expose information like block relationships or hash patterns that would enable these optimizations.
+This is v0 of the NIXL connector. Future versions will focus on further performance optimizations such as memory pre-registration (pre-allocating and registering memory buffers to reduce registration overhead during transfers) and block merging (combining related blocks as offsets within the same file to reduce file operations and improve throughput). These optimizations require changes at a higher layer, as the current HiCache API doesn't expose information like block relationships or hash patterns that would enable these optimizations.

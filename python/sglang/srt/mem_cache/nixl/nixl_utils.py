@@ -14,7 +14,7 @@ class NixlBackendSelection:
     # Object-based plugins (add more as needed)
     OBJ_PLUGINS = {"OBJ"}  # Based on Amazon S3 SDK
     # Priority order for auto selection
-    AUTO_PRIORITY = ["3FS", "POSIX", "GDS_MT", "GDS"]
+    AUTO_PRIORITY = ["3FS", "POSIX", "GDS_MT", "GDS", "OBJ"]
 
     def __init__(self, plugin: str = "auto"):
         """Initialize backend selection.
@@ -27,21 +27,50 @@ class NixlBackendSelection:
         self.backend_name = None
         self.mem_type = None
 
+
+    def set_bucket(self, bucket_name: str) -> None:
+        """Set AWS bucket name in environment variable.
+        """
+        os.environ["AWS_DEFAULT_BUCKET"] = bucket_name
+        logger.debug(f"Set AWS bucket name to: {bucket_name}")
+
     def create_backend(self, agent) -> bool:
         """Create the appropriate NIXL backend based on configuration."""
         try:
             plugin_list = agent.get_plugin_list()
             logger.debug(f"Available NIXL plugins: {plugin_list}")
 
-            # Select backend based on plugin setting or auto priority
-            self.backend_name = next((p for p in self.AUTO_PRIORITY if p in plugin_list), "POSIX") if self.plugin == "auto" else self.plugin
+            # Handle explicit plugin selection or auto priority
+            if self.plugin == "auto":
+                # Try all file plugins first
+                for plugin in self.FILE_PLUGINS:
+                    if plugin in plugin_list:
+                        self.backend_name = plugin
+                        break
+                # If no file plugin found, try object plugins
+                if not self.backend_name:
+                    for plugin in self.OBJ_PLUGINS:
+                        if plugin in plugin_list:
+                            self.backend_name = plugin
+                            break
+            else:
+                # Use explicitly requested plugin
+                self.backend_name = self.plugin
 
             if self.backend_name not in plugin_list:
                 logger.error(f"Backend {self.backend_name} not available in plugins: {plugin_list}")
                 return False
 
             # Create backend and set memory type
-            agent.create_backend(self.backend_name)
+            if self.backend_name in self.OBJ_PLUGINS:
+                bucket = os.environ.get("AWS_DEFAULT_BUCKET")
+                if not bucket:
+                    logger.error("AWS_DEFAULT_BUCKET environment variable must be set for object storage")
+                    return False
+                agent.create_backend(self.backend_name, {"bucket": bucket})
+            else:
+                agent.create_backend(self.backend_name)
+
             self.mem_type = "OBJ" if self.backend_name in self.OBJ_PLUGINS else "FILE"
             logger.debug(f"Created NIXL backend: {self.backend_name} with memory type: {self.mem_type}")
             return True
@@ -73,31 +102,6 @@ class NixlRegistration:
             return [(0, 0, 0, file_manager.get_file_path(key))]
         else:  # OBJ
             return [(0, 0, key)]
-
-    def create_transfer_tuples(self, keys: List[str], tensors: Optional[List[torch.Tensor]] = None, mem_type: str = "FILE", file_manager=None) -> List[Tuple[int, int, Union[int, str]]]:
-        """Create NIXL tuples for transfer operations.
-        Args:
-            keys: List of keys (file paths for FILE, object keys for OBJ)
-            tensors: Optional list of tensors to get sizes from
-            mem_type: Memory type ("FILE" or "OBJ")
-            file_manager: Optional file manager for FILE operations
-        Returns:
-            List of (addr, len, id) tuples for transfer operations
-        """
-        if mem_type == "FILE":
-            if not file_manager:
-                logger.error("file_manager required for FILE operations")
-                return []
-            file_tuples = file_manager.files_to_nixl_tuples(keys)
-            if not file_tuples:
-                return []
-            # Extract (offset, length, fd) from file tuples
-            return [(x[0], tensor.element_size() * tensor.numel() if tensors else x[1], x[2])
-                   for x, tensor in zip(file_tuples, tensors or [None] * len(file_tuples))]
-        else:  # OBJ
-            # Create object tuples with proper sizes
-            return [(0, tensor.element_size() * tensor.numel() if tensor else 0, key)
-                   for key, tensor in zip(keys, tensors or [None] * len(keys))]
 
     def _register_memory(self, items: Union[List[tuple], List[torch.Tensor]], mem_type: str, desc: str) -> Optional[any]:
         """Common registration logic for files, objects, and buffers.

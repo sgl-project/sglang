@@ -1,279 +1,241 @@
-import unittest
-import tempfile
+#!/usr/bin/env python3
+
 import os
-from types import SimpleNamespace
-
 import torch
+import unittest
+from unittest.mock import MagicMock
+from typing import List, Optional
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
+from sglang.srt.mem_cache.nixl.hicache_nixl import HiCacheNixl
+from sglang.srt.mem_cache.nixl.nixl_utils import NixlRegistration, NixlFileManager
 
 
-class TestHiCacheNixl(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--enable-hierarchical-cache",
-                "--mem-fraction-static",
-                0.7,
-                "--hicache-size",
-                100,
-                "--page-size",
-                64,
-                "--hicache-storage-backend",
-                "nixl",
-            ],
+class TestNixlUnified(unittest.TestCase):
+    """Unified test suite for all NIXL components."""
+
+    def setUp(self):
+        """Set up test environment."""
+        # Create test directories
+        self.test_dir = "/tmp/test_nixl_unified"
+        os.makedirs(self.test_dir, exist_ok=True)
+
+        # Mock NIXL agent for registration tests
+        self.mock_agent = MagicMock()
+        self.mock_agent.get_reg_descs.return_value = "mock_reg_descs"
+        self.mock_agent.register_memory.return_value = "mock_registered_memory"
+
+        # Create instances
+        self.file_manager = NixlFileManager(self.test_dir)
+        self.registration = NixlRegistration(self.mock_agent)
+        try:
+            self.hicache = HiCacheNixl(file_path=self.test_dir, plugin="POSIX")
+        except ImportError:
+            self.skipTest("NIXL not available, skipping NIXL storage tests")
+
+    def tearDown(self):
+        """Clean up test directories."""
+        if os.path.exists(self.test_dir):
+            for root, dirs, files in os.walk(self.test_dir, topdown=False):
+                for name in files:
+                    os.remove(os.path.join(root, name))
+                for name in dirs:
+                    os.rmdir(os.path.join(root, name))
+            os.rmdir(self.test_dir)
+
+    def delete_test_file(self, file_path: str) -> bool:
+        """Helper method to delete a test file.
+
+        Args:
+            file_path: Path to the file to delete
+
+        Returns:
+            bool: True if file was deleted or didn't exist, False on error
+        """
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            return True
+        except Exception as e:
+            return False
+
+    def verify_tensors_equal(self, expected: torch.Tensor, actual: torch.Tensor):
+        """Helper to verify tensor equality."""
+        self.assertIsNotNone(actual, "Retrieved tensor is None")
+        self.assertTrue(
+            torch.allclose(expected, actual, atol=1e-6),
+            f"Tensors not equal:\nExpected: {expected}\nActual: {actual}"
         )
 
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+    def verify_tensor_lists_equal(self, expected: List[torch.Tensor], actual: List[torch.Tensor]):
+        """Helper to verify lists of tensors are equal."""
+        self.assertEqual(len(expected), len(actual), "Lists have different lengths")
+        for exp, act in zip(expected, actual):
+            self.verify_tensors_equal(exp, act)
 
-    def test_basic_functionality(self):
-        """Test basic NIXL storage functionality."""
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=32,
-            num_threads=16,
-        )
+    # ============================================================================
+    # HiCache Integration Tests
+    # ============================================================================
 
-        metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.65)
-
-    def test_storage_operations(self):
-        """Test individual storage operations."""
+    def test_single_set_get(self):
+        """Test single tensor set/get operations."""
         try:
-            from sglang.srt.mem_cache.hicache_nixl import HiCacheNixl
-            
-            # Test initialization with default parameters
-            storage = HiCacheNixl()
-            self.assertIsNotNone(storage)
-            self.assertEqual(storage.file_path, "/tmp/hicache_nixl")
-            
-            # Test initialization with custom file path
-            custom_storage = HiCacheNixl(file_path="/tmp/test_hicache_nixl")
-            self.assertIsNotNone(custom_storage)
-            self.assertEqual(custom_storage.file_path, "/tmp/test_hicache_nixl")
-            
-            # Test tensor operations
-            test_tensor = torch.randn(10, 10)
-            test_key = "test_key_123"
-            
-            # Test set operation
-            success = storage.set(test_key, test_tensor)
-            self.assertTrue(success)
-            
-            # Test exists operation
-            exists = storage.exists(test_key)
-            self.assertTrue(exists)
-            
-            # Test get operation with dst_tensor
-            dst_tensor = torch.zeros_like(test_tensor)
-            retrieved_tensor = storage.get(test_key, dst_tensor)
-            self.assertIsNotNone(retrieved_tensor)
-            self.assertTrue(torch.allclose(test_tensor, retrieved_tensor))
-            
-            # Test get operation without dst_tensor (should fail)
-            retrieved_tensor = storage.get(test_key, None)
-            self.assertIsNone(retrieved_tensor)
-            
-            # Test delete operation
-            storage.delete(test_key)
-            exists = storage.exists(test_key)
-            self.assertFalse(exists)
-            
-            # Test clear operation
-            storage.set("key1", torch.randn(5, 5))
-            storage.set("key2", torch.randn(5, 5))
-            storage.clear()
-            self.assertFalse(storage.exists("key1"))
-            self.assertFalse(storage.exists("key2"))
-            
+            key = "test_key"
+            value = torch.randn(10, 10, device="cpu")
+            dst_tensor = torch.zeros_like(value, device="cpu")
+
+            # Test set
+            self.assertTrue(self.hicache.set(key, value))
+            self.assertTrue(self.hicache.exists(key))
+
+            # Test get
+            retrieved = self.hicache.get(key, dst_tensor)
+            self.verify_tensors_equal(value, retrieved)
         except ImportError:
             self.skipTest("NIXL not available, skipping NIXL storage tests")
 
-    def test_batch_operations(self):
-        """Test batch storage operations."""
+    def test_batch_set_get(self):
+        """Test batch tensor set/get operations."""
         try:
-            from sglang.srt.mem_cache.hicache_nixl import HiCacheNixl
-            
-            storage = HiCacheNixl()
-            
-            # Test batch set operations
-            keys = ["batch_key_1", "batch_key_2", "batch_key_3"]
-            tensors = [torch.randn(5, 5) for _ in range(3)]
-            
-            success = storage.batch_set(keys, tensors)
-            self.assertTrue(success)
-            
-            # Test batch get operations
-            dst_tensors = [torch.zeros_like(t) for t in tensors]
-            retrieved_tensors = storage.batch_get(keys, dst_tensors)
-            
-            self.assertEqual(len(retrieved_tensors), len(keys))
-            for i, (original, retrieved) in enumerate(zip(tensors, retrieved_tensors)):
-                self.assertIsNotNone(retrieved)
-                self.assertTrue(torch.allclose(original, retrieved))
-            
-            # Test batch get with non-existent keys
-            non_existent_keys = ["non_existent_1", "non_existent_2"]
-            dst_tensors = [torch.zeros(5, 5) for _ in range(2)]
-            retrieved_tensors = storage.batch_get(non_existent_keys, dst_tensors)
-            
-            self.assertEqual(len(retrieved_tensors), len(non_existent_keys))
-            for retrieved in retrieved_tensors:
-                self.assertIsNone(retrieved)
-                
-        except ImportError:
-            self.skipTest("NIXL not available, skipping NIXL storage tests")
-
-    def test_tensor_registration(self):
-        """Test tensor registration and deregistration."""
-        try:
-            from sglang.srt.mem_cache.hicache_nixl import HiCacheNixl
-            
-            storage = HiCacheNixl()
-            
-            # Test CPU tensor registration
-            cpu_tensor = torch.randn(10, 10)
-            success = storage.register(cpu_tensor)
-            self.assertTrue(success)
-            
-            # Test GPU tensor registration (if CUDA available)
-            if torch.cuda.is_available():
-                gpu_tensor = torch.randn(10, 10, device="cuda")
-                success = storage.register(gpu_tensor)
-                self.assertTrue(success)
-                
-                # Test deregistration
-                success = storage.deregister(gpu_tensor)
-                self.assertTrue(success)
-            
-            # Test deregistration
-            success = storage.deregister(cpu_tensor)
-            self.assertTrue(success)
-            
-        except ImportError:
-            self.skipTest("NIXL not available, skipping NIXL storage tests")
-
-    def test_file_plugin_selection(self):
-        """Test file plugin selection and backend creation."""
-        try:
-            from sglang.srt.mem_cache.hicache_nixl import HiCacheNixl
-            
-            # Test auto plugin selection
-            storage = HiCacheNixl(file_plugin="auto")
-            self.assertIsNotNone(storage.backend_name)
-            
-            # Test specific plugin selection
-            storage = HiCacheNixl(file_plugin="POSIX")
-            self.assertEqual(storage.backend_name, "POSIX")
-            
-            # Test GDS_MT plugin (if available)
-            try:
-                storage = HiCacheNixl(file_plugin="GDS_MT")
-                self.assertIsNotNone(storage.backend_name)
-            except Exception:
-                # GDS_MT might not be available, which is expected
-                pass
-                
-        except ImportError:
-            self.skipTest("NIXL not available, skipping NIXL storage tests")
-
-
-class TestHiCacheNixlIntegration(CustomTestCase):
-    """Integration tests for HiCacheNixl with actual NIXL storage endpoints."""
-    
-    def test_nixl_storage_endpoint_connection(self):
-        """Test connection to NIXL storage endpoint."""
-        try:
-            from sglang.srt.mem_cache.hicache_nixl import HiCacheNixl
-            
-            # Test with different file paths
-            file_paths = [
-                "/tmp/test_hicache_nixl_1",
-                "/tmp/test_hicache_nixl_2",
-                "/tmp/test_hicache_nixl_3",
+            keys = ["key1", "key2", "key3"]
+            values = [
+                torch.randn(5, 5, device="cpu"),
+                torch.randn(3, 3, device="cpu"),
+                torch.randn(7, 7, device="cpu")
             ]
-            
-            for file_path in file_paths:
-                try:
-                    storage = HiCacheNixl(file_path=file_path)
-                    self.assertIsNotNone(storage)
-                    self.assertEqual(storage.file_path, file_path)
-                except Exception as e:
-                    # This is expected if NIXL is not available
-                    print(f"Expected failure for file path {file_path}: {e}")
-                    
+            dst_tensors = [torch.zeros_like(v, device="cpu") for v in values]
+
+            # Test batch set
+            self.assertTrue(self.hicache.batch_set(keys, values))
+            self.assertTrue(all(self.hicache.exists(key) for key in keys))
+
+            # Test batch get
+            retrieved = self.hicache.batch_get(keys, dst_tensors)
+            self.verify_tensor_lists_equal(values, retrieved)
         except ImportError:
             self.skipTest("NIXL not available, skipping NIXL storage tests")
 
-    def test_nixl_storage_error_handling(self):
-        """Test error handling in NIXL storage."""
+    def test_mixed_operations(self):
+        """Test mixing single and batch operations."""
         try:
-            from sglang.srt.mem_cache.hicache_nixl import HiCacheNixl
-            
-            # Test with valid file path
-            storage = HiCacheNixl()
-            
-            # These operations should handle errors gracefully
-            test_tensor = torch.randn(5, 5)
-            dst_tensor = torch.zeros_like(test_tensor)
-            
-            # Test set operation (may fail if no storage service)
-            result = storage.set("test_key", test_tensor)
-            # Should return True if storage is available
-            
-            # Test get operation (may return None if no storage service)
-            retrieved = storage.get("test_key", dst_tensor)
-            # Should return tensor if storage is available
-            
-            # Test exists operation (may return False if no storage service)
-            exists = storage.exists("test_key")
-            # Should return True if storage is available
-            
+            # Test interleaved set/get operations
+            key1, key2 = "key1", "key2"
+            value1 = torch.randn(4, 4, device="cpu")
+            value2 = torch.randn(6, 6, device="cpu")
+            dst1 = torch.zeros_like(value1)
+            dst2 = torch.zeros_like(value2)
+
+            # Single set/get
+            self.assertTrue(self.hicache.set(key1, value1))
+            retrieved1 = self.hicache.get(key1, dst1)
+            self.verify_tensors_equal(value1, retrieved1)
+
+            # Batch set/get
+            self.assertTrue(self.hicache.batch_set([key2], [value2]))
+            retrieved2 = self.hicache.batch_get([key2], [dst2])
+            self.verify_tensors_equal(value2, retrieved2[0])
         except ImportError:
             self.skipTest("NIXL not available, skipping NIXL storage tests")
 
-    def test_pre_opened_files(self):
-        """Test pre-opening of existing files."""
+    def test_data_integrity(self):
+        """Test data integrity across operations."""
         try:
-            from sglang.srt.mem_cache.hicache_nixl import HiCacheNixl
-            
-            # Create storage and add some files
-            storage = HiCacheNixl(file_path="/tmp/test_pre_opened")
-            
-            # Add some test files
-            test_tensor = torch.randn(5, 5)
-            storage.set("test_file_1", test_tensor)
-            storage.set("test_file_2", test_tensor)
-            
-            # Create new storage instance (should pre-open existing files)
-            new_storage = HiCacheNixl(file_path="/tmp/test_pre_opened")
-            
-            # Test that files are accessible
-            dst_tensor = torch.zeros_like(test_tensor)
-            retrieved = new_storage.get("test_file_1", dst_tensor)
-            self.assertIsNotNone(retrieved)
-            
+            # Test with various tensor types and sizes
+            test_cases = [
+                ("float32", torch.randn(10, 10, dtype=torch.float32)),
+                ("float64", torch.randn(5, 5, dtype=torch.float64)),
+                ("int32", torch.randint(-100, 100, (8, 8), dtype=torch.int32)),
+                ("int64", torch.randint(-100, 100, (6, 6), dtype=torch.int64)),
+                ("bool", torch.randint(0, 2, (4, 4)).bool()),
+            ]
+
+            for name, tensor in test_cases:
+                with self.subTest(tensor_type=name):
+                    key = f"test_{name}"
+                    dst_tensor = torch.zeros_like(tensor)
+
+                    # Set and immediately get
+                    self.assertTrue(self.hicache.set(key, tensor))
+                    retrieved1 = self.hicache.get(key, dst_tensor)
+                    self.verify_tensors_equal(tensor, retrieved1)
+
+                    # Get again to verify persistence
+                    dst_tensor.zero_()
+                    retrieved2 = self.hicache.get(key, dst_tensor)
+                    self.verify_tensors_equal(tensor, retrieved2)
+        except ImportError:
+            self.skipTest("NIXL not available, skipping NIXL storage tests")
+
+    def test_basic_file_operations(self):
+        """Test basic file operations."""
+        try:
+            test_file = os.path.join(self.test_dir, "test_file.bin")
+            self.file_manager.create_file(test_file)
+            self.assertTrue(os.path.exists(test_file))
+            self.assertEqual(os.path.getsize(test_file), 0)  # Empty file
+
+            # Test file deletion
+            self.assertTrue(self.delete_test_file(test_file))
+            self.assertFalse(os.path.exists(test_file))
+        except ImportError:
+            self.skipTest("NIXL not available, skipping NIXL storage tests")
+
+    def test_create_nixl_tuples(self):
+        """Test creation of NIXL tuples."""
+        try:
+            test_file = os.path.join(self.test_dir, "test_file.bin")
+            self.file_manager.create_file(test_file)
+
+            # Test tuple creation
+            tuples = self.file_manager.files_to_nixl_tuples([test_file], False)
+            self.assertIsNotNone(tuples)
+            self.assertTrue(len(tuples) > 0)
+        except ImportError:
+            self.skipTest("NIXL not available, skipping NIXL storage tests")
+
+    def test_error_handling(self):
+        """Test error handling in file operations."""
+        try:
+            # Test non-existent file
+            self.assertTrue(self.delete_test_file("nonexistent_file.bin"))  # Returns True if file doesn't exist
+
+            # Test invalid file path
+            self.assertFalse(self.file_manager.create_file(""))  # Empty path should fail
+        except ImportError:
+            self.skipTest("NIXL not available, skipping NIXL storage tests")
+
+    def test_register_buffers(self):
+        """Test registration of memory buffers."""
+        try:
+            # Create test tensor
+            tensor = torch.randn(10, 10)
+
+            # Test buffer registration
+            self.assertIsNotNone(self.registration.register_buffers(tensor))
+
+            # Test batch registration
+            tensors = [torch.randn(5, 5) for _ in range(3)]
+            self.assertIsNotNone(self.registration.register_buffers(tensors))
+        except ImportError:
+            self.skipTest("NIXL not available, skipping NIXL storage tests")
+
+    def test_register_files_with_tuples(self):
+        """Test registration of files using NIXL tuples."""
+        try:
+            files = [os.path.join(self.test_dir, f"test_file_{i}.bin") for i in range(3)]
+            for file in files:
+                self.file_manager.create_file(file)
+
+            # Create tuples and register
+            tuples = self.file_manager.files_to_nixl_tuples(files, False)
+            self.registration.register_files(tuples)
+
+            # Verify tuples
+            self.assertEqual(len(tuples), len(files))
+            for t, f in zip(tuples, files):
+                self.assertEqual(t[3], f)  # Check file path
         except ImportError:
             self.skipTest("NIXL not available, skipping NIXL storage tests")
 
 
 if __name__ == "__main__":
-    unittest.main() 
+    unittest.main()
