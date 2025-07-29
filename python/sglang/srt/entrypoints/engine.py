@@ -126,6 +126,8 @@ class Engine(EngineBase):
         self.port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
+        print(f"Launching subprocesses with {server_args=}")
+
         # Launch subprocesses
         tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args,
