@@ -55,14 +55,17 @@ def gpu_tensor_hash(tensor: torch.Tensor) -> int:
 
     intermediate_hashes = torch.empty(n, dtype=torch.int64, device=tensor.device)
 
-    hash_kernel[grid](
-        tensor,
-        intermediate_hashes,
-        n,
-        BLOCK_SIZE=BLOCK_SIZE,
-        PRIME=PRIME_1,
-        XCONST=PRIME_2,
-    )
+    # Set cuda device to prevent ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
+    # Solution from Tri: https://github.com/Dao-AILab/flash-attention/issues/523#issuecomment-1707611579
+    with torch.cuda.device(tensor.device):
+        hash_kernel[grid](
+            tensor,
+            intermediate_hashes,
+            n,
+            BLOCK_SIZE=BLOCK_SIZE,
+            PRIME=PRIME_1,
+            XCONST=PRIME_2,
+        )
 
     # TODO: threads can't be synced on triton kernel
     final_hash = intermediate_hashes.sum().item()

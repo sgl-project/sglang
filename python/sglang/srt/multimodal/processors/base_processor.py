@@ -12,6 +12,7 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
+from sglang.srt.managers.mm_utils import TransportProxyTensor
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import load_audio, load_image, load_video, logger
 
@@ -101,6 +102,14 @@ class MultimodalSpecialTokens:
 
         return None
 
+    def get_token_id_by_modality(self, modality: Modality) -> Optional[int]:
+        return {
+            Modality.IMAGE: self.image_token_id,
+            Modality.MULTI_IMAGES: self.image_token_id,
+            Modality.VIDEO: self.video_token_id,
+            Modality.AUDIO: self.audio_token_id,
+        }.get(modality)
+
     def parse_regex(self):
         if self.image_token_regex is None and self.image_token is not None:
             self.image_token_regex = re.compile(re.escape(self.image_token))
@@ -134,11 +143,14 @@ class MultimodalSpecialTokens:
 class BaseMultimodalProcessor(ABC):
     models = []
 
-    def __init__(self, hf_config, server_args, _processor):
+    def __init__(
+        self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
+    ):
         self.hf_config = hf_config
         self._processor = _processor
         self.arch = hf_config.architectures[0]
         self.server_args = server_args
+        self.transport_mode = transport_mode
 
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
@@ -209,10 +221,6 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        if "pixel_values" in result and isinstance(
-            result["pixel_values"], torch.Tensor
-        ):
-            result["pixel_values"] = result["pixel_values"].to("cpu")
         return result
 
     @abstractmethod
@@ -492,7 +500,6 @@ class BaseMultimodalProcessor(ABC):
     ) -> List[MultimodalDataItem]:
         """Create mm_items directly from processor output."""
         items: dict[Modality, MultimodalDataItem] = {}
-
         for attr_name, value in data_dict.items():
             if attr_name == "input_ids":
                 continue
@@ -608,14 +615,27 @@ class BaseMultimodalProcessor(ABC):
 
         # Add offsets to all items
         for mm_item in all_collected_items:
+            mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
+            if mm_token_id is None:
+                raise ValueError(f"No token id found for modality: {mm_item.modality}")
             mm_item.offsets = self.get_mm_items_offset(
                 input_ids=input_ids,
-                mm_token_id={
-                    Modality.IMAGE: mm_tokens.image_token_id,
-                    Modality.MULTI_IMAGES: mm_tokens.image_token_id,
-                    Modality.VIDEO: mm_tokens.video_token_id,
-                    Modality.AUDIO: mm_tokens.audio_token_id,
-                }.get(mm_item.modality, None),
+                mm_token_id=mm_token_id,
             )
+
+        # post-process
+        for item in all_collected_items:
+            # replace the feature tensor with a proxy
+            if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
+                item.feature = TransportProxyTensor(
+                    transport_mode=self.transport_mode, data=item.feature
+                )
+            elif (
+                isinstance(item.precomputed_embeddings, torch.Tensor)
+                and item.precomputed_embeddings.is_cuda
+            ):
+                item.precomputed_embeddings = TransportProxyTensor(
+                    transport_mode=self.transport_mode, data=item.precomputed_embeddings
+                )
 
         return all_collected_items, input_ids, ret
