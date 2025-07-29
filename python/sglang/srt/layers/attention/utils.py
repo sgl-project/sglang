@@ -28,7 +28,8 @@ def create_flashinfer_kv_indices_triton(
     
     The kernel processes each request in parallel and converts the req_to_token
     lookup table into a flat list of token indices that can be used by attention kernels.
-    
+    blocktables = [batch_size, max_pages] max_pages = max_context_len / PAGED_SIZE
+    kv_indices_ptr will store the flat list of the token locations 
     Args:
         req_to_token_ptr: Pointer to the req_to_token lookup table.
                          Shape: [max_batch, max_context_len]
@@ -54,10 +55,12 @@ def create_flashinfer_kv_indices_triton(
         If we have:
         - req_pool_indices = [0, 1] (request 0 uses pool 0, request 1 uses pool 1)
         - page_kernel_lens = [3, 2] (request 0 has 3 tokens, request 1 has 2 tokens)
-        - req_to_token = [[10, 11, 12, -1], [20, 21, -1, -1]]
+        - req_to_token = [[10, 11, 12, -1], [20, 21, -1, -1]] (tokens are the elements
+         in radix tree, use them as a pointer to the token location in the kv_indices_ptr)
         
         The kernel will output:
-        - kv_indices = [10, 11, 12, 20, 21] (flat list of token locations)
+        - kv_indices = [10, 11, 12, 20, 21] (flat list of token locations) (page_size = 1)
+        - kv_indptr = needs to represent the sequence lengths of each request
         
         This allows attention kernels to directly access the correct KV cache
         entries for each request's tokens.
