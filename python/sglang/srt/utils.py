@@ -64,6 +64,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from sglang.srt.offloader import get_offloader
 
 import numpy as np
 import psutil
