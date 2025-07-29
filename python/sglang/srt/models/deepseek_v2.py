@@ -58,8 +58,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.topk import TopK, TopKOutput
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -87,7 +86,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.offloader import ModuleOffloader
 from sglang.srt.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
     model_forward_maybe_tbo,
@@ -329,16 +327,13 @@ class DeepseekV2MoE(nn.Module):
             **(
                 dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
                 if global_server_args_dict["enable_deepep_moe"]
-                and (not global_server_args_dict["enable_flashinfer_moe"])
                 else {}
             ),
             # Additional args for FusedMoE
             **(
                 dict(
                     enable_flashinfer_moe=True,
-                    # TODO the naming is confusing now, wait for refactor
-                    enable_ep_moe=global_server_args_dict["enable_ep_moe"]
-                    or global_server_args_dict["enable_deepep_moe"],
+                    enable_ep_moe=global_server_args_dict["enable_ep_moe"],
                 )
                 if global_server_args_dict["enable_flashinfer_moe"]
                 else {}
@@ -592,29 +587,17 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights=topk_weights,
                 forward_batch=forward_batch,
             )
-        # TODO temporary branching, wait for refactor
-        if isinstance(self.experts, FusedMoE):
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                topk_output=TopKOutput(
-                    topk_ids=topk_idx
-                    + self.experts.local_num_experts * self.experts.ep_rank,
-                    topk_weights=topk_weights,
-                    router_logits=None,
-                ),
-            )
-        else:
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                topk_idx=topk_idx,
-                topk_weights=topk_weights,
-                reorder_topk_ids=reorder_topk_ids,
-                seg_indptr=seg_indptr,
-                masked_m=masked_m,
-                expected_m=expected_m,
-                num_recv_tokens_per_expert=num_recv_tokens_per_expert,
-                forward_batch=forward_batch,
-            )
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            reorder_topk_ids=reorder_topk_ids,
+            seg_indptr=seg_indptr,
+            masked_m=masked_m,
+            expected_m=expected_m,
+            num_recv_tokens_per_expert=num_recv_tokens_per_expert,
+            forward_batch=forward_batch,
+        )
         if self.ep_size > 1:
             final_hidden_states = self.deepep_dispatcher.combine(
                 hidden_states=final_hidden_states,
@@ -623,17 +606,12 @@ class DeepseekV2MoE(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        # TODO temporary branching, wait for refactor
-        if isinstance(self.experts, FusedMoE):
-            if shared_output is not None:
-                final_hidden_states += shared_output
+        if shared_output is not None:
+            x = shared_output
+            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = x
         else:
-            if shared_output is not None:
-                x = shared_output
-                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-                final_hidden_states = x
-            else:
-                final_hidden_states *= self.routed_scaling_factor
+            final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
 
@@ -2009,34 +1987,16 @@ class DeepseekV2Model(nn.Module):
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
-            module_offloader.wrap_modules(
-                (
-                    DeepseekV2DecoderLayer(
-                        config,
-                        layer_id,
-                        quant_config=quant_config,
-                        prefix=add_prefix(f"layers.{layer_id}", prefix),
-                        alt_stream=self.alt_stream,
-                    )
-                    for layer_id in range(config.num_hidden_layers)
-                ),
-                submodule_accessor=lambda layer: (
-                    layer.mlp.experts
-                    if isinstance(layer.mlp, DeepseekV2MoE)
-                    else layer.mlp
-                ),
-                whitelist_param_names_creator=lambda module: (
-                    # for simplicity, not offload weight_scale
-                    [
-                        "w13_weight",
-                        "w2_weight",
-                        "w13_blockscale_swizzled",
-                        "w2_blockscale_swizzled",
-                    ]
-                    if isinstance(module, FusedMoE)
-                    else []
-                ),
-            )
+            [
+                DeepseekV2DecoderLayer(
+                    config,
+                    layer_id,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{layer_id}", prefix),
+                    alt_stream=self.alt_stream,
+                )
+                for layer_id in range(config.num_hidden_layers)
+            ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -2113,9 +2073,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         self.model = DeepseekV2Model(
-            config,
-            quant_config,
-            prefix=add_prefix("model", prefix),
+            config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
