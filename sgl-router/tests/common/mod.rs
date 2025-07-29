@@ -20,6 +20,7 @@ pub fn create_test_config(worker_urls: Vec<String>) -> RouterConfig {
         metrics: None,
         log_dir: None,
         log_level: None,
+        request_id_headers: None,
     }
 }
 
@@ -40,6 +41,7 @@ pub fn create_test_config_no_workers() -> RouterConfig {
         metrics: None,
         log_dir: None,
         log_level: None,
+        request_id_headers: None,
     }
 }
 

@@ -1,6 +1,7 @@
 use crate::config::RouterConfig;
 use crate::logging::{self, LoggingConfig};
 use crate::metrics::{self, PrometheusConfig};
+use crate::middleware::{get_request_id, RequestIdMiddleware};
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::routers::{RouterFactory, RouterTrait};
 use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
@@ -46,13 +47,13 @@ async fn sink_handler(_req: HttpRequest, mut payload: web::Payload) -> Result<Ht
 }
 
 // Custom error handler for JSON payload errors.
-fn json_error_handler(err: error::JsonPayloadError, _req: &HttpRequest) -> Error {
-    error!("JSON payload error: {:?}", err);
+fn json_error_handler(err: error::JsonPayloadError, req: &HttpRequest) -> Error {
+    let request_id = get_request_id(req);
     match &err {
         error::JsonPayloadError::OverflowKnownLength { length, limit } => {
             error!(
-                "Payload too large: {} bytes exceeds limit of {} bytes",
-                length, limit
+                request_id = %request_id,
+                "Payload too large length={} limit={}", length, limit
             );
             error::ErrorPayloadTooLarge(format!(
                 "Payload too large: {} bytes exceeds limit of {} bytes",
@@ -60,10 +61,19 @@ fn json_error_handler(err: error::JsonPayloadError, _req: &HttpRequest) -> Error
             ))
         }
         error::JsonPayloadError::Overflow { limit } => {
-            error!("Payload overflow: exceeds limit of {} bytes", limit);
+            error!(
+                request_id = %request_id,
+                "Payload overflow limit={}", limit
+            );
             error::ErrorPayloadTooLarge(format!("Payload exceeds limit of {} bytes", limit))
         }
-        _ => error::ErrorBadRequest(format!("Invalid JSON payload: {}", err)),
+        _ => {
+            error!(
+                request_id = %request_id,
+                "Invalid JSON payload error={}", err
+            );
+            error::ErrorBadRequest(format!("Invalid JSON payload: {}", err))
+        }
     }
 }
 
@@ -108,8 +118,20 @@ async fn generate(
     body: web::Json<GenerateRequest>,
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
-    let json_body = serde_json::to_value(body.into_inner())
-        .map_err(|e| error::ErrorBadRequest(format!("Invalid JSON: {}", e)))?;
+    let request_id = get_request_id(&req);
+    info!(
+        request_id = %request_id,
+        "Received generate request method=\"POST\" path=\"/generate\""
+    );
+
+    let json_body = serde_json::to_value(body.into_inner()).map_err(|e| {
+        error!(
+            request_id = %request_id,
+            "Failed to parse generate request body error={}", e
+        );
+        error::ErrorBadRequest(format!("Invalid JSON: {}", e))
+    })?;
+
     Ok(state
         .router
         .route_generate(&state.client, &req, json_body)
@@ -122,8 +144,20 @@ async fn v1_chat_completions(
     body: web::Json<ChatCompletionRequest>,
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
-    let json_body = serde_json::to_value(body.into_inner())
-        .map_err(|e| error::ErrorBadRequest(format!("Invalid JSON: {}", e)))?;
+    let request_id = get_request_id(&req);
+    info!(
+        request_id = %request_id,
+        "Received chat completion request method=\"POST\" path=\"/v1/chat/completions\""
+    );
+
+    let json_body = serde_json::to_value(body.into_inner()).map_err(|e| {
+        error!(
+            request_id = %request_id,
+            "Failed to parse chat completion request body error={}", e
+        );
+        error::ErrorBadRequest(format!("Invalid JSON: {}", e))
+    })?;
+
     Ok(state
         .router
         .route_chat(&state.client, &req, json_body)
@@ -136,8 +170,20 @@ async fn v1_completions(
     body: web::Json<CompletionRequest>,
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
-    let json_body = serde_json::to_value(body.into_inner())
-        .map_err(|e| error::ErrorBadRequest(format!("Invalid JSON: {}", e)))?;
+    let request_id = get_request_id(&req);
+    info!(
+        request_id = %request_id,
+        "Received completion request method=\"POST\" path=\"/v1/completions\""
+    );
+
+    let json_body = serde_json::to_value(body.into_inner()).map_err(|e| {
+        error!(
+            request_id = %request_id,
+            "Failed to parse completion request body error={}", e
+        );
+        error::ErrorBadRequest(format!("Invalid JSON: {}", e))
+    })?;
+
     Ok(state
         .router
         .route_completion(&state.client, &req, json_body)
@@ -146,20 +192,48 @@ async fn v1_completions(
 
 #[post("/add_worker")]
 async fn add_worker(
+    req: HttpRequest,
     query: web::Query<HashMap<String, String>>,
     data: web::Data<AppState>,
 ) -> impl Responder {
+    let request_id = get_request_id(&req);
+
     let worker_url = match query.get("url") {
         Some(url) => url.to_string(),
         None => {
+            warn!(
+                request_id = %request_id,
+                "Add worker request missing URL parameter"
+            );
             return HttpResponse::BadRequest()
-                .body("Worker URL required. Provide 'url' query parameter")
+                .body("Worker URL required. Provide 'url' query parameter");
         }
     };
 
+    info!(
+        request_id = %request_id,
+        worker_url = %worker_url,
+        "Adding worker"
+    );
+
     match data.router.add_worker(&worker_url).await {
-        Ok(message) => HttpResponse::Ok().body(message),
-        Err(error) => HttpResponse::BadRequest().body(error),
+        Ok(message) => {
+            info!(
+                request_id = %request_id,
+                worker_url = %worker_url,
+                "Successfully added worker"
+            );
+            HttpResponse::Ok().body(message)
+        }
+        Err(error) => {
+            error!(
+                request_id = %request_id,
+                worker_url = %worker_url,
+                error = %error,
+                "Failed to add worker"
+            );
+            HttpResponse::BadRequest().body(error)
+        }
     }
 }
 
@@ -171,13 +245,29 @@ async fn list_workers(data: web::Data<AppState>) -> impl Responder {
 
 #[post("/remove_worker")]
 async fn remove_worker(
+    req: HttpRequest,
     query: web::Query<HashMap<String, String>>,
     data: web::Data<AppState>,
 ) -> impl Responder {
+    let request_id = get_request_id(&req);
+
     let worker_url = match query.get("url") {
         Some(url) => url.to_string(),
-        None => return HttpResponse::BadRequest().finish(),
+        None => {
+            warn!(
+                request_id = %request_id,
+                "Remove worker request missing URL parameter"
+            );
+            return HttpResponse::BadRequest().finish();
+        }
     };
+
+    info!(
+        request_id = %request_id,
+        worker_url = %worker_url,
+        "Removing worker"
+    );
+
     data.router.remove_worker(&worker_url);
     HttpResponse::Ok().body(format!("Successfully removed worker: {}", worker_url))
 }
@@ -202,6 +292,7 @@ pub struct ServerConfig {
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
+    pub request_id_headers: Option<Vec<String>>,
 }
 
 pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
@@ -233,30 +324,17 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
 
     // Initialize prometheus metrics exporter
     if let Some(prometheus_config) = config.prometheus_config {
-        info!(
-            "🚧 Initializing Prometheus metrics on {}:{}",
-            prometheus_config.host, prometheus_config.port
-        );
         metrics::start_prometheus(prometheus_config);
-    } else {
-        info!("🚧 Prometheus metrics disabled");
     }
 
-    info!("🚧 Initializing router on {}:{}", config.host, config.port);
-    info!("🚧 Router mode: {:?}", config.router_config.mode);
-    info!("🚧 Policy: {:?}", config.router_config.policy);
     info!(
-        "🚧 Max payload size: {} MB",
+        "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
+        config.host,
+        config.port,
+        config.router_config.mode,
+        config.router_config.policy,
         config.max_payload_size / (1024 * 1024)
     );
-
-    // Log service discovery status
-    if let Some(service_discovery_config) = &config.service_discovery_config {
-        info!("🚧 Service discovery enabled");
-        info!("🚧 Selector: {:?}", service_discovery_config.selector);
-    } else {
-        info!("🚧 Service discovery disabled");
-    }
 
     let client = Client::builder()
         .pool_idle_timeout(Some(Duration::from_secs(50)))
@@ -272,11 +350,9 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     // Start the service discovery if enabled
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {
-            info!("🚧 Initializing Kubernetes service discovery");
-            // Pass the Arc<Router> directly
             match start_service_discovery(service_discovery_config, router_arc).await {
                 Ok(handle) => {
-                    info!("✅ Service discovery started successfully");
+                    info!("Service discovery started");
                     // Spawn a task to handle the service discovery thread
                     spawn(async move {
                         if let Err(e) = handle.await {
@@ -292,14 +368,26 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         }
     }
 
-    info!("✅ Serving router on {}:{}", config.host, config.port);
     info!(
-        "✅ Serving workers on {:?}",
+        "Router ready | workers: {:?}",
         app_state.router.get_worker_urls()
     );
 
+    // Configure request ID headers
+    let request_id_headers = config.request_id_headers.clone().unwrap_or_else(|| {
+        vec![
+            "x-request-id".to_string(),
+            "x-correlation-id".to_string(),
+            "x-trace-id".to_string(),
+            "request-id".to_string(),
+        ]
+    });
+
     HttpServer::new(move || {
+        let request_id_middleware = RequestIdMiddleware::new(request_id_headers.clone());
+
         App::new()
+            .wrap(request_id_middleware)
             .app_data(app_state.clone())
             .app_data(
                 web::JsonConfig::default()

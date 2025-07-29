@@ -15,9 +15,11 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Awaitable, Callable, List, Optional, Tuple
 
+import aiohttp
 import numpy as np
 import requests
 import torch
@@ -27,6 +29,7 @@ from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+from sglang.lang.interpreter import ProgramState
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
@@ -348,6 +351,7 @@ def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
         help="Device type (auto/cuda/rocm/cpu). Auto will detect available platforms",
     )
     parser.add_argument("--result-file", type=str, default="result.jsonl")
+    parser.add_argument("--raw-result-file", type=str)
     args = parser.parse_args()
 
     return args
@@ -1300,6 +1304,58 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                                 raise
 
 
+def send_generate_requests(base_url: str, num_requests: int) -> List[str]:
+    """Sends generate request serially and returns status codes. Max concurrency is 1."""
+
+    def generate():
+        prompt = """
+        System: You are a helpful assistant.
+        User: What is the capital of France?
+        Assistant: The capital of France is
+        """
+        response = requests.post(
+            f"{base_url}/generate",
+            json={
+                "text": prompt,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 50,
+                },
+            },
+        )
+        return response.status_code
+
+    return [generate() for _ in range(num_requests)]
+
+
+async def send_concurrent_generate_requests(
+    base_url: str, num_requests: int
+) -> List[str]:
+    """Sends generate request concurrently and returns status codes. Max concurrency is num_requests."""
+
+    async def async_generate():
+        async with aiohttp.ClientSession() as session:
+            prompt = """
+            System: You are a helpful assistant.
+            User: What is the capital of France?
+            Assistant: The capital of France is
+            """
+            async with session.post(
+                f"{base_url}/generate",
+                json={
+                    "text": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 50,
+                    },
+                },
+            ) as response:
+                return response.status
+
+    tasks = [asyncio.create_task(async_generate()) for _ in range(num_requests)]
+    return await asyncio.gather(*tasks)
+
+
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
         max_retry = int(
@@ -1309,3 +1365,35 @@ class CustomTestCase(unittest.TestCase):
             lambda: super(CustomTestCase, self)._callTestMethod(method),
             max_retry=max_retry,
         )
+
+
+def dump_bench_raw_result(
+    path: str,
+    states,
+    preds,
+    labels,
+):
+    if not path:
+        return
+
+    rows = []
+    for i in range(len(states)):
+        state = states[i]
+        output = state["answer"]
+        prompt = _ensure_remove_suffix(state.text(), output)
+        rows.append(
+            dict(
+                prompt_id=i,
+                prompt=prompt,
+                output=output,
+                correct=bool(preds[i] == labels[i]),
+            )
+        )
+
+    print(f"BenchRawResultDumper save results to {path}")
+    Path(path).write_text("\n".join(json.dumps(row) for row in rows))
+
+
+def _ensure_remove_suffix(text: str, suffix: str):
+    assert text.endswith(suffix)
+    return text.removesuffix(suffix)
