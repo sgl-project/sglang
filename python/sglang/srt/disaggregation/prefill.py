@@ -425,7 +425,19 @@ class SchedulerDisaggregationPrefillMixin:
                 self.send_kv_chunk(req, last_chunk=True)
 
                 if req.grammar is not None:
-                    req.grammar.accept_token(next_token_id)
+                    # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                    try:
+                        req.grammar.accept_token(next_token_id)
+                    except ValueError as e:
+                        # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                        # This can happen if the grammar is not set correctly or the token is invalid.
+                        error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                        self.tree_cache.cache_finished_req(req)
+                        prepare_abort(
+                            req,
+                            error_message,
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
                     req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished

@@ -112,6 +112,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -166,6 +167,16 @@ class ReqState:
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
 
 
+def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
+    is_cross_node = server_args.dist_init_addr
+
+    if is_cross_node:
+        # Fallback to default CPU transport for multi-node
+        return "default"
+    else:
+        return "cuda_ipc"
+
+
 class TokenizerManager:
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -216,12 +227,13 @@ class TokenizerManager:
                 revision=server_args.revision,
                 use_fast=not server_args.disable_fast_image_processor,
             )
+            transport_mode = _determine_tensor_transport_mode(self.server_args)
 
             # We want to parallelize the image pre-processing so we create an executor for it
             # We create mm_processor for any skip_tokenizer_init to make sure we still encode
             # images even with skip_tokenizer_init=False.
             self.mm_processor = get_mm_processor(
-                self.model_config.hf_config, server_args, _processor
+                self.model_config.hf_config, server_args, _processor, transport_mode
             )
 
             if server_args.skip_tokenizer_init:
@@ -269,6 +281,11 @@ class TokenizerManager:
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
             None
         )
+
+        # Lock to serialize LoRA update operations.
+        # Please note that, unlike `model_update_lock`, this does not block inference, allowing
+        # LoRA updates and inference to overlap.
+        self.lora_update_lock = asyncio.Lock()
 
         # For pd disaggregtion
         self.disaggregation_mode = DisaggregationMode(
@@ -525,7 +542,8 @@ class TokenizerManager:
             mm_inputs = None
 
         if self.server_args.enable_lora and obj.lora_path:
-            # Replace the user-friendly LoRA names in `lora_path` with their corresponding unique LoRA IDs.
+            # Start tracking ongoing requests for LoRA adapters and replace the user-friendly LoRA names in
+            # `lora_path` with their corresponding unique LoRA IDs, as required for internal processing.
             obj.lora_path = await self.lora_registry.acquire(obj.lora_path)
 
         self._validate_one_request(obj, input_ids)
@@ -735,6 +753,10 @@ class TokenizerManager:
                         msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
                     logger.info(msg)
 
+                # Mark ongoing LoRA request as finished.
+                if self.server_args.enable_lora and obj.lora_path:
+                    await self.lora_registry.release(obj.lora_path)
+
                 # Check if this was an abort/error created by scheduler
                 if isinstance(out["meta_info"].get("finish_reason"), dict):
                     finish_reason = out["meta_info"]["finish_reason"]
@@ -744,6 +766,19 @@ class TokenizerManager:
                     ):
                         raise ValueError(finish_reason["message"])
 
+                    if (
+                        finish_reason.get("type") == "abort"
+                        and finish_reason.get("status_code")
+                        == HTTPStatus.SERVICE_UNAVAILABLE
+                    ):
+                        # This is an abort request initiated by scheduler.
+                        # Delete the key to prevent resending abort request to the scheduler and
+                        # to ensure aborted request state is cleaned up.
+                        del self.rid_to_state[state.obj.rid]
+                        raise fastapi.HTTPException(
+                            status_code=finish_reason["status_code"],
+                            detail=finish_reason["message"],
+                        )
                 yield out
                 break
 
@@ -1041,16 +1076,18 @@ class TokenizerManager:
             obj.lora_path,
         )
 
-        async with self.model_update_lock.writer_lock:
+        async with self.lora_update_lock:
             # Generate new uniquely identifiable LoRARef object.
             new_adapter = LoRARef(
                 lora_name=obj.lora_name,
                 lora_path=obj.lora_path,
             )
 
-            # Register the new adapter in the registry.
+            # Trigger the actual loading operation at the backend processes.
             obj.lora_id = new_adapter.lora_id
             result = (await self.update_lora_adapter_communicator(obj))[0]
+
+            # Register the LoRA adapter only after loading is successful.
             if result.success:
                 await self.lora_registry.register(new_adapter)
 
@@ -1081,8 +1118,15 @@ class TokenizerManager:
             obj.lora_name,
         )
 
-        async with self.model_update_lock.writer_lock:
-            obj.lora_id = await self.lora_registry.unregister(obj.lora_name)
+        async with self.lora_update_lock:
+            # Unregister the LoRA adapter from the registry to stop new requests for this adapter
+            # from being started.
+            lora_id = await self.lora_registry.unregister(obj.lora_name)
+            obj.lora_id = lora_id
+
+            # Initiate the actual unloading operation at the backend processes only after all
+            # ongoing requests using this LoRA adapter are finished.
+            await self.lora_registry.wait_for_unload(lora_id)
             result = (await self.update_lora_adapter_communicator(obj))[0]
 
             return result
@@ -1674,8 +1718,15 @@ class TokenizerManager:
     def _handle_abort_req(self, recv_obj):
         state = self.rid_to_state[recv_obj.rid]
         state.finished = True
-        state.out_list.append(
-            {
+        if recv_obj.finished_reason:
+            out = {
+                "meta_info": {
+                    "id": recv_obj.rid,
+                    "finish_reason": recv_obj.finished_reason,
+                },
+            }
+        else:
+            out = {
                 "text": "",
                 "meta_info": {
                     "id": recv_obj.rid,
@@ -1687,7 +1738,7 @@ class TokenizerManager:
                     "completion_tokens": 0,
                 },
             }
-        )
+        state.out_list.append(out)
         state.event.set()
 
     def _handle_open_session_req_output(self, recv_obj):
@@ -1879,8 +1930,10 @@ class _Communicator(Generic[T]):
 #
 # | entrypoint | is_streaming | status          | abort engine    | cancel asyncio task   | rid_to_state                |
 # | ---------- | ------------ | --------------- | --------------- | --------------------- | --------------------------- |
+# | http       | yes          | validation      | background task | fast api              | del in _handle_abort_req    |
 # | http       | yes          | waiting queue   | background task | fast api              | del in _handle_abort_req    |
 # | http       | yes          | running         | background task | fast api              | del in _handle_batch_output |
+# | http       | no           | validation      | http exception  | http exception        | del in _handle_abort_req    |
 # | http       | no           | waiting queue   | type 1          | type 1 exception      | del in _handle_abort_req    |
 # | http       | no           | running         | type 3          | type 3 exception      | del in _handle_batch_output |
 #
