@@ -71,6 +71,7 @@ class ModelConfig:
         self.revision = revision
         self.quantization = quantization
         self.model_impl = model_impl
+        self.modelopt_quant = modelopt_quant
 
         self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
