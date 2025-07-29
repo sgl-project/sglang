@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import random
+import sys
 import tempfile
 from typing import List, Literal, Optional, Union
 
@@ -74,6 +75,7 @@ class ServerArgs:
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
+    max_queued_requests: Optional[int] = sys.maxsize
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
@@ -513,7 +515,7 @@ class ServerArgs:
                 )
 
             model_arch = self.get_hf_config().architectures[0]
-            if model_arch == "DeepseekV3ForCausalLM":
+            if model_arch in ["DeepseekV3ForCausalLM", "Glm4MoeForCausalLM"]:
                 # Auto set draft_model_path DeepSeek-V3/R1
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
@@ -804,6 +806,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_running_requests,
             help="The maximum number of running requests.",
+        )
+        parser.add_argument(
+            "--max-queued-requests",
+            type=int,
+            default=ServerArgs.max_queued_requests,
+            help="The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
         )
         parser.add_argument(
             "--max-total-tokens",
@@ -1108,6 +1116,7 @@ class ServerArgs:
                 "pythonic",
                 "kimi_k2",
                 "qwen3_coder",
+                "glm45",
             ],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', and 'qwen3_coder'.",
