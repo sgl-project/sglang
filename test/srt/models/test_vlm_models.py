@@ -2,11 +2,9 @@ import argparse
 import glob
 import json
 import os
-import queue
 import random
 import subprocess
 import sys
-import threading
 import unittest
 from types import SimpleNamespace
 
@@ -46,7 +44,7 @@ class TestVLMModels(CustomTestCase):
 
     def _detect_eviction_in_logs(self, log_output):
         """Detect if eviction events occurred in the log output."""
-        eviction_keywords = ["Cache eviction: evicted", "evicted", "remaining size"]
+        eviction_keywords = ["Cache eviction: evicted"]
 
         eviction_detected = False
         eviction_count = 0
