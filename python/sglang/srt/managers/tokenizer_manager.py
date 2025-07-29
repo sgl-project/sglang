@@ -766,6 +766,19 @@ class TokenizerManager:
                     ):
                         raise ValueError(finish_reason["message"])
 
+                    if (
+                        finish_reason.get("type") == "abort"
+                        and finish_reason.get("status_code")
+                        == HTTPStatus.SERVICE_UNAVAILABLE
+                    ):
+                        # This is an abort request initiated by scheduler.
+                        # Delete the key to prevent resending abort request to the scheduler and
+                        # to ensure aborted request state is cleaned up.
+                        del self.rid_to_state[state.obj.rid]
+                        raise fastapi.HTTPException(
+                            status_code=finish_reason["status_code"],
+                            detail=finish_reason["message"],
+                        )
                 yield out
                 break
 
@@ -1705,8 +1718,15 @@ class TokenizerManager:
     def _handle_abort_req(self, recv_obj):
         state = self.rid_to_state[recv_obj.rid]
         state.finished = True
-        state.out_list.append(
-            {
+        if recv_obj.finished_reason:
+            out = {
+                "meta_info": {
+                    "id": recv_obj.rid,
+                    "finish_reason": recv_obj.finished_reason,
+                },
+            }
+        else:
+            out = {
                 "text": "",
                 "meta_info": {
                     "id": recv_obj.rid,
@@ -1718,7 +1738,7 @@ class TokenizerManager:
                     "completion_tokens": 0,
                 },
             }
-        )
+        state.out_list.append(out)
         state.event.set()
 
     def _handle_open_session_req_output(self, recv_obj):
@@ -1910,8 +1930,10 @@ class _Communicator(Generic[T]):
 #
 # | entrypoint | is_streaming | status          | abort engine    | cancel asyncio task   | rid_to_state                |
 # | ---------- | ------------ | --------------- | --------------- | --------------------- | --------------------------- |
+# | http       | yes          | validation      | background task | fast api              | del in _handle_abort_req    |
 # | http       | yes          | waiting queue   | background task | fast api              | del in _handle_abort_req    |
 # | http       | yes          | running         | background task | fast api              | del in _handle_batch_output |
+# | http       | no           | validation      | http exception  | http exception        | del in _handle_abort_req    |
 # | http       | no           | waiting queue   | type 1          | type 1 exception      | del in _handle_abort_req    |
 # | http       | no           | running         | type 3          | type 3 exception      | del in _handle_batch_output |
 #

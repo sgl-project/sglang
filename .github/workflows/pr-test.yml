@@ -352,7 +352,7 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-deepep
 
-  finish:
+  pr-test-finish:
     if: always()
     needs: [
       unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu, unit-test-backend-4-gpu,
