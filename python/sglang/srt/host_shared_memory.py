@@ -14,11 +14,11 @@ from sglang.srt.utils import (
 )
 
 
-class _SharedMemoryManager:
+class _HostSharedMemoryManager:
     def __init__(self):
         self._base_name = Path(os.environ["SGLANG_SHARED_MEMORY_MANAGER_BASE_NAME"])
         self._operation_index = 0
-        self._records: List[_SharedMemoryRecord] = []
+        self._records: List[_Record] = []
 
     def malloc(self, *, shape, dtype):
         meta_tensor = torch.empty(size=shape, dtype=dtype, device="meta")
@@ -51,7 +51,7 @@ class _SharedMemoryManager:
         NaiveDistributed.instance.barrier()
 
         self._records.append(
-            _SharedMemoryRecord(
+            _Record(
                 shm=shm,
                 np_array=np_array,
                 tensor=tensor,
@@ -61,10 +61,10 @@ class _SharedMemoryManager:
 
 
 @dataclass
-class _SharedMemoryRecord:
+class _Record:
     shm: shared_memory.SharedMemory
     np_array: np.ndarray
     tensor: torch.Tensor
 
 
-_shared_memory_manager = _SharedMemoryManager()
+_shared_memory_manager = _HostSharedMemoryManager()
