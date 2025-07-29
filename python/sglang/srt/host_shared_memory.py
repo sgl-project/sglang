@@ -1,20 +1,20 @@
-import psutil
-import cuda.bindings.runtime as cuda_rt
-import gc
-from dataclasses import dataclass
-import ctypes
-
-import numpy as np
 import base64
+import ctypes
+import gc
 import logging
 import os
 import pickle
+import sys
 import time
 from abc import ABC
-from pathlib import Path
-from typing import Callable, Generator, List, Any, Optional
+from dataclasses import dataclass
 from multiprocessing import shared_memory
+from pathlib import Path
+from typing import Any, Callable, Generator, List, Optional
 
+import cuda.bindings.runtime as cuda_rt
+import numpy as np
+import psutil
 import torch
 from torch.func import functional_call
 
@@ -22,9 +22,14 @@ from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.parameter import ModelWeightParameter
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.naive_distributed import NaiveDistributed
-from sglang.srt.utils import get_int_env_var, is_pin_memory_available, MultiprocessingSerializer, get_bool_env_var, \
-    dispose_tensor, check_cuda_result
-import sys
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    check_cuda_result,
+    dispose_tensor,
+    get_bool_env_var,
+    get_int_env_var,
+    is_pin_memory_available,
+)
 
 
 class _SharedMemoryManager:
@@ -55,16 +60,23 @@ class _SharedMemoryManager:
         tensor = torch.from_numpy(np_array)
 
         logger.info(f"cudaHostRegister({tensor.data_ptr()=})")
-        check_cuda_result(cuda_rt.cudaHostRegister(tensor.data_ptr(), num_bytes, cuda_rt.cudaHostRegisterPortable))
+        check_cuda_result(
+            cuda_rt.cudaHostRegister(
+                tensor.data_ptr(), num_bytes, cuda_rt.cudaHostRegisterPortable
+            )
+        )
 
         NaiveDistributed.instance.barrier()
 
-        self._records.append(_SharedMemoryRecord(
-            shm=shm,
-            np_array=np_array,
-            tensor=tensor,
-        ))
+        self._records.append(
+            _SharedMemoryRecord(
+                shm=shm,
+                np_array=np_array,
+                tensor=tensor,
+            )
+        )
         return tensor
+
 
 @dataclass
 class _SharedMemoryRecord:
@@ -72,5 +84,5 @@ class _SharedMemoryRecord:
     np_array: np.ndarray
     tensor: torch.Tensor
 
-_shared_memory_manager = _SharedMemoryManager()
 
+_shared_memory_manager = _SharedMemoryManager()

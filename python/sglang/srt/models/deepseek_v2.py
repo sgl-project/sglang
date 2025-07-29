@@ -2028,10 +2028,15 @@ class DeepseekV2Model(nn.Module):
                 ),
                 whitelist_param_names_creator=lambda module: (
                     # for simplicity, not offload weight_scale
-                    ['w13_weight', 'w2_weight', 'w13_blockscale_swizzled', 'w2_blockscale_swizzled']
+                    [
+                        "w13_weight",
+                        "w2_weight",
+                        "w13_blockscale_swizzled",
+                        "w2_blockscale_swizzled",
+                    ]
                     if isinstance(module, FusedMoE)
                     else []
-                )
+                ),
             )
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

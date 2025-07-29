@@ -467,6 +467,7 @@ class DefaultModelLoader(BaseModelLoader):
         if hasattr(model, "post_init"):
             model.post_init()
 
+
 class LayeredModelLoader(DefaultModelLoader):
     """Model loader that loads weights layer by layer so that one can quantize a
     layer before loading another to make the peak memory envelope smaller."""

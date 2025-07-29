@@ -33,7 +33,12 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket, get_int_env_var
+from sglang.srt.utils import (
+    bind_port,
+    configure_logger,
+    get_int_env_var,
+    get_zmq_socket,
+)
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
