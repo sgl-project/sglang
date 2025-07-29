@@ -409,7 +409,7 @@ class ModelConfig:
             # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
             is_local = os.path.exists(self.model_path)
-            modelopt_quant_config = {"quant_method": "modelopt"}
+            modelopt_quant_config = {"quant_method": "modelopt_fp8"}
             if not is_local:
                 from huggingface_hub import HfApi
 
@@ -448,7 +448,7 @@ class ModelConfig:
         optimized_quantization_methods = [
             "fp8",
             "marlin",
-            "modelopt",
+            "modelopt_fp8",
             "gptq_marlin_24",
             "gptq_marlin",
             "awq_marlin",
