@@ -185,7 +185,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
       constexpr int THREADS = TOKENS_PER_CTA * kWarpSize;  // 256
       dim3 grid((num_tokens + TOKENS_PER_CTA - 1) / TOKENS_PER_CTA);
       dim3 block(THREADS);
-      
+
       if (use_vec16) {
         per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 16><<<grid, block, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
@@ -206,7 +206,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
       constexpr int THREADS = 256;
       dim3 grid(num_tokens);
       dim3 block(THREADS);
-      
+
       if (use_vec16) {
         per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 16><<<grid, block, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
