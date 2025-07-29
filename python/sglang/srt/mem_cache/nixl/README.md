@@ -144,7 +144,7 @@ python/sglang/srt/mem_cache/nixl/
   - Tensors can be on CPU or GPU (as long as a GPU capable backend such as GDS_MT is available).
   - Currently each tensor is mapped to a file or key, but it can be extended to support multiple keys per file or key.
 
-- **Storage side**: file and object are suppoted through their relevant backends (e.g., 3FS or OBJ).
+- **Storage side**: file and object are supported through their relevant backends (e.g., 3FS or OBJ).
 
 ### Backend Priority
 

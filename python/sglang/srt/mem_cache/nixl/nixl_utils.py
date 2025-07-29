@@ -1,7 +1,8 @@
-import os
 import logging
+import os
+from typing import Dict, List, Optional, Tuple, Union
+
 import torch
-from typing import Dict, Tuple, Optional, List, Union
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +28,8 @@ class NixlBackendSelection:
         self.backend_name = None
         self.mem_type = None
 
-
     def set_bucket(self, bucket_name: str) -> None:
-        """Set AWS bucket name in environment variable.
-        """
+        """Set AWS bucket name in environment variable."""
         os.environ["AWS_DEFAULT_BUCKET"] = bucket_name
         logger.debug(f"Set AWS bucket name to: {bucket_name}")
 
@@ -58,21 +57,27 @@ class NixlBackendSelection:
                 self.backend_name = self.plugin
 
             if self.backend_name not in plugin_list:
-                logger.error(f"Backend {self.backend_name} not available in plugins: {plugin_list}")
+                logger.error(
+                    f"Backend {self.backend_name} not available in plugins: {plugin_list}"
+                )
                 return False
 
             # Create backend and set memory type
             if self.backend_name in self.OBJ_PLUGINS:
                 bucket = os.environ.get("AWS_DEFAULT_BUCKET")
                 if not bucket:
-                    logger.error("AWS_DEFAULT_BUCKET environment variable must be set for object storage")
+                    logger.error(
+                        "AWS_DEFAULT_BUCKET environment variable must be set for object storage"
+                    )
                     return False
                 agent.create_backend(self.backend_name, {"bucket": bucket})
             else:
                 agent.create_backend(self.backend_name)
 
             self.mem_type = "OBJ" if self.backend_name in self.OBJ_PLUGINS else "FILE"
-            logger.debug(f"Created NIXL backend: {self.backend_name} with memory type: {self.mem_type}")
+            logger.debug(
+                f"Created NIXL backend: {self.backend_name} with memory type: {self.mem_type}"
+            )
             return True
 
         except Exception as e:
@@ -86,7 +91,9 @@ class NixlRegistration:
     def __init__(self, agent):
         self.agent = agent
 
-    def create_query_tuples(self, key: str, mem_type: str, file_manager=None) -> List[Tuple]:
+    def create_query_tuples(
+        self, key: str, mem_type: str, file_manager=None
+    ) -> List[Tuple]:
         """Create NIXL tuples for querying memory.
         Args:
             key: Key to query (file path for FILE or object key for OBJ)
@@ -103,7 +110,9 @@ class NixlRegistration:
         else:  # OBJ
             return [(0, 0, key)]
 
-    def _register_memory(self, items: Union[List[tuple], List[torch.Tensor]], mem_type: str, desc: str) -> Optional[any]:
+    def _register_memory(
+        self, items: Union[List[tuple], List[torch.Tensor]], mem_type: str, desc: str
+    ) -> Optional[any]:
         """Common registration logic for files, objects, and buffers.
         Args:
             items: List of tuples or tensors to register
@@ -130,7 +139,9 @@ class NixlRegistration:
             logger.error(f"Failed to register {desc}: {e}")
             return None
 
-    def register_buffers(self, buffers: Union[torch.Tensor, List[torch.Tensor]]) -> Optional[any]:
+    def register_buffers(
+        self, buffers: Union[torch.Tensor, List[torch.Tensor]]
+    ) -> Optional[any]:
         """Register tensors/buffers with NIXL."""
         if isinstance(buffers, torch.Tensor):
             buffers = [buffers]
@@ -139,21 +150,25 @@ class NixlRegistration:
             return None
 
         # Determine memory type based on tensor device
-        mem_type = "VRAM" if buffers[0].device.type == 'cuda' else "DRAM"
+        mem_type = "VRAM" if buffers[0].device.type == "cuda" else "DRAM"
         return self._register_memory(buffers, mem_type, "buffers")
 
     def register_files(self, tuples: List[tuple]) -> Optional[any]:
         """Register files with NIXL using (0, 0, fd, file_path) tuples."""
         return self._register_memory(tuples, "FILE", "files")
 
-    def register_objects(self, keys: List[str], tensors: Optional[List[torch.Tensor]] = None) -> Optional[any]:
+    def register_objects(
+        self, keys: List[str], tensors: Optional[List[torch.Tensor]] = None
+    ) -> Optional[any]:
         """Register objects with NIXL."""
         if not keys:
             return None
 
         # Create object tuples with proper sizes
-        tuples = [(0, tensor.element_size() * tensor.numel() if tensor else 0, key)
-                 for key, tensor in zip(keys, tensors or [None] * len(keys))]
+        tuples = [
+            (0, tensor.element_size() * tensor.numel() if tensor else 0, key)
+            for key, tensor in zip(keys, tensors or [None] * len(keys))
+        ]
         return self._register_memory(tuples, "OBJ", "objects")
 
 
@@ -182,7 +197,7 @@ class NixlFileManager:
         try:
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             if not os.path.exists(file_path):
-                with open(file_path, 'wb') as f:
+                with open(file_path, "wb") as f:
                     pass  # Create empty file
             return True
         except Exception as e:
@@ -207,7 +222,9 @@ class NixlFileManager:
             logger.error(f"Failed to close file descriptor {fd}: {e}")
             return False
 
-    def files_to_nixl_tuples(self, file_paths: List[str], open_file: bool = True) -> List[Tuple[int, int, int, str]]:
+    def files_to_nixl_tuples(
+        self, file_paths: List[str], open_file: bool = True
+    ) -> List[Tuple[int, int, int, str]]:
         """Create NIXL tuples (offset, length, fd, file_path) for given files."""
         if not open_file:
             return [(0, 0, 0, path) for path in file_paths]

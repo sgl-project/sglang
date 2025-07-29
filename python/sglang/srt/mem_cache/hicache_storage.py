@@ -91,8 +91,12 @@ class HiCacheFile(HiCacheStorage):
         try:
             if target_location is not None:
                 # Load directly into target_location's memory buffer
-                with open(tensor_path, 'rb') as f:
-                    target_location.set_(torch.frombuffer(f.read(), dtype=target_location.dtype).reshape(target_location.shape).storage())
+                with open(tensor_path, "rb") as f:
+                    target_location.set_(
+                        torch.frombuffer(f.read(), dtype=target_location.dtype)
+                        .reshape(target_location.shape)
+                        .storage()
+                    )
                 return None
             else:
                 loaded_tensor = torch.load(tensor_path)

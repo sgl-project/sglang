@@ -253,6 +253,7 @@ class HiCacheController:
                 self.prefetch_threshold = prefetch_threshold
             elif storage_backend == "nixl":
                 from sglang.srt.mem_cache.nixl.hicache_nixl import HiCacheNixl
+
                 self.storage_backend = HiCacheNixl(file_path=self.file_storage_path)
                 self.enable_storage = True
                 self.prefetch_threshold = prefetch_threshold
@@ -523,7 +524,9 @@ class HiCacheController:
                 for h in operation.hash_value:
                     # Create a destination tensor with the same shape as a page
                     # Returns a tensor with pre-allocated memory in a specific layout
-                    dst_tensor = self.mem_pool_host.get_flat_data_page(operation.host_indices[operation.completed_tokens])
+                    dst_tensor = self.mem_pool_host.get_flat_data_page(
+                        operation.host_indices[operation.completed_tokens]
+                    )
                     # dst_tensor.zero_() - Optionally can zero out the destination tensor to avoid uninitialized memory.
                     page_data = self.storage_backend.get(h, dst_tensor)
                     if page_data is None:

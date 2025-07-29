@@ -2,12 +2,13 @@ import hashlib
 import logging
 import os
 import uuid
-from typing import List, Optional, Union, Dict, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
-from .nixl_utils import NixlRegistration, NixlFileManager, NixlBackendSelection
+
+from .nixl_utils import NixlBackendSelection, NixlFileManager, NixlRegistration
 
 try:
     from nixl._api import nixl_agent, nixl_agent_config
@@ -20,12 +21,17 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
+
 class HiCacheNixl(HiCacheStorage):
     """HiCacheNixl provides high-performance storage using NIXL plugins."""
 
     def __init__(self, file_path: str = "", plugin: str = "auto"):
         """Initialize NIXL storage connector."""
-        self.file_manager = NixlFileManager(file_path) if plugin not in NixlBackendSelection.OBJ_PLUGINS else None
+        self.file_manager = (
+            NixlFileManager(file_path)
+            if plugin not in NixlBackendSelection.OBJ_PLUGINS
+            else None
+        )
 
         agent_config = nixl_agent_config(backends=[])
         self.agent_name = f"hicache_nixl_{str(uuid.uuid4())}"
@@ -37,7 +43,9 @@ class HiCacheNixl(HiCacheStorage):
 
         self.registration = NixlRegistration(self.agent)
 
-    def _execute_transfer(self, tensors: List[torch.Tensor], keys: List[str], direction: str) -> bool:
+    def _execute_transfer(
+        self, tensors: List[torch.Tensor], keys: List[str], direction: str
+    ) -> bool:
         if len(tensors) != len(keys):
             logger.error("Mismatch between number of tensors and files/objects")
             return False
@@ -53,7 +61,9 @@ class HiCacheNixl(HiCacheStorage):
             if not file_tuples or not self.registration.register_files(file_tuples):
                 logger.error("Failed to prepare files for transfer")
                 return False
-            transfer_tuples = [(x[0], s, x[2]) for x,s in zip(file_tuples, tensor_sizes)]
+            transfer_tuples = [
+                (x[0], s, x[2]) for x, s in zip(file_tuples, tensor_sizes)
+            ]
         else:
             if not self.registration.register_objects(keys, tensors):
                 logger.error("Failed to register objects")
@@ -62,13 +72,20 @@ class HiCacheNixl(HiCacheStorage):
 
         try:
             # Get transfer descriptors
-            if (tensor_descs := self.agent.get_xfer_descs(tensors)) is None or \
-               (file_descs := self.agent.get_xfer_descs(transfer_tuples, self.backend_selector.mem_type)) is None:
+            if (tensor_descs := self.agent.get_xfer_descs(tensors)) is None or (
+                file_descs := self.agent.get_xfer_descs(
+                    transfer_tuples, self.backend_selector.mem_type
+                )
+            ) is None:
                 logger.error("Failed to get transfer descriptors")
                 return False
 
             # Initialize and execute transfer
-            if (xfer_req := self.agent.initialize_xfer(direction, tensor_descs, file_descs, self.agent_name)) is None:
+            if (
+                xfer_req := self.agent.initialize_xfer(
+                    direction, tensor_descs, file_descs, self.agent_name
+                )
+            ) is None:
                 logger.error("Failed to create transfer request")
                 return False
 
@@ -83,6 +100,7 @@ class HiCacheNixl(HiCacheStorage):
         except Exception as e:
             logger.error(f"Failed to execute transfer: {e}")
             import traceback
+
             logger.error(f"Traceback: {traceback.format_exc()}")
             return False
 
@@ -109,7 +127,9 @@ class HiCacheNixl(HiCacheStorage):
         result = self.batch_get([key], [dst_tensor])
         return result[0] if result else None
 
-    def batch_get(self, keys: List[str], dst_tensors: List[torch.Tensor]) -> List[Optional[torch.Tensor]]:
+    def batch_get(
+        self, keys: List[str], dst_tensors: List[torch.Tensor]
+    ) -> List[Optional[torch.Tensor]]:
         if not keys:
             return []
 
@@ -124,10 +144,14 @@ class HiCacheNixl(HiCacheStorage):
         tuples = self.registration.create_query_tuples(
             key,
             self.backend_selector.mem_type,
-            self.file_manager if self.backend_selector.mem_type == "FILE" else None
+            self.file_manager if self.backend_selector.mem_type == "FILE" else None,
         )
         if not tuples:
             return False
 
-        query_res = self.agent.query_memory(tuples, self.backend_selector.backend_name, mem_type=self.backend_selector.mem_type)
-        return query_res[0] is not None # can be expanded to multiple keys
+        query_res = self.agent.query_memory(
+            tuples,
+            self.backend_selector.backend_name,
+            mem_type=self.backend_selector.mem_type,
+        )
+        return query_res[0] is not None  # can be expanded to multiple keys

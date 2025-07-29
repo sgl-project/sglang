@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
 import os
-import torch
 import unittest
-from unittest.mock import MagicMock
 from typing import List, Optional
+from unittest.mock import MagicMock
+
+import torch
 
 from sglang.srt.mem_cache.nixl.hicache_nixl import HiCacheNixl
-from sglang.srt.mem_cache.nixl.nixl_utils import NixlRegistration, NixlFileManager
+from sglang.srt.mem_cache.nixl.nixl_utils import NixlFileManager, NixlRegistration
 
 
 class TestNixlUnified(unittest.TestCase):
@@ -63,10 +64,12 @@ class TestNixlUnified(unittest.TestCase):
         self.assertIsNotNone(actual, "Retrieved tensor is None")
         self.assertTrue(
             torch.allclose(expected, actual, atol=1e-6),
-            f"Tensors not equal:\nExpected: {expected}\nActual: {actual}"
+            f"Tensors not equal:\nExpected: {expected}\nActual: {actual}",
         )
 
-    def verify_tensor_lists_equal(self, expected: List[torch.Tensor], actual: List[torch.Tensor]):
+    def verify_tensor_lists_equal(
+        self, expected: List[torch.Tensor], actual: List[torch.Tensor]
+    ):
         """Helper to verify lists of tensors are equal."""
         self.assertEqual(len(expected), len(actual), "Lists have different lengths")
         for exp, act in zip(expected, actual):
@@ -100,7 +103,7 @@ class TestNixlUnified(unittest.TestCase):
             values = [
                 torch.randn(5, 5, device="cpu"),
                 torch.randn(3, 3, device="cpu"),
-                torch.randn(7, 7, device="cpu")
+                torch.randn(7, 7, device="cpu"),
             ]
             dst_tensors = [torch.zeros_like(v, device="cpu") for v in values]
 
@@ -196,10 +199,14 @@ class TestNixlUnified(unittest.TestCase):
         """Test error handling in file operations."""
         try:
             # Test non-existent file
-            self.assertTrue(self.delete_test_file("nonexistent_file.bin"))  # Returns True if file doesn't exist
+            self.assertTrue(
+                self.delete_test_file("nonexistent_file.bin")
+            )  # Returns True if file doesn't exist
 
             # Test invalid file path
-            self.assertFalse(self.file_manager.create_file(""))  # Empty path should fail
+            self.assertFalse(
+                self.file_manager.create_file("")
+            )  # Empty path should fail
         except ImportError:
             self.skipTest("NIXL not available, skipping NIXL storage tests")
 
@@ -221,7 +228,9 @@ class TestNixlUnified(unittest.TestCase):
     def test_register_files_with_tuples(self):
         """Test registration of files using NIXL tuples."""
         try:
-            files = [os.path.join(self.test_dir, f"test_file_{i}.bin") for i in range(3)]
+            files = [
+                os.path.join(self.test_dir, f"test_file_{i}.bin") for i in range(3)
+            ]
             for file in files:
                 self.file_manager.create_file(file)
 
