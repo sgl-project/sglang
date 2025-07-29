@@ -150,7 +150,9 @@ int moe_align_block_size(
     int32_t* __restrict__ local_cnts = T_INDEX(tid + 1);
 
     for (int i = begin; i < end; ++i) {
-      local_cnts[topk_ids[i]]++;
+      if (topk_ids[i] >= 0) {
+        local_cnts[topk_ids[i]]++;
+      }
     }
   });
 
@@ -181,6 +183,9 @@ int moe_align_block_size(
 
     for (int i = begin; i < end; ++i) {
       int32_t expert_id = topk_ids[i];
+      if (expert_id < 0) {
+        continue;
+      }
       int32_t b_offset = cumsums[expert_id];
       int32_t t_offset = offsets[expert_id];
       sorted_ids[b_offset + t_offset] = i;
