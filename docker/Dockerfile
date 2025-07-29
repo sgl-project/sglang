@@ -171,6 +171,9 @@ RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1
     && cp -r cmake-3.31.1-linux-x86_64/share/* /usr/local/share/ \
     && rm -rf cmake-3.31.1-linux-x86_64 cmake-3.31.1-linux-x86_64.tar.gz
 
+# Upgrade cuDNN to support FP4 quantization (requires version >= 9.1.002)
+RUN python3 -m pip install --upgrade --force-reinstall nvidia-cudnn-cu12
+
 # Add yank script
 COPY --chown=root:root <<-"EOF" /usr/local/bin/yank
 #!/bin/bash
