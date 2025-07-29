@@ -39,6 +39,20 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
+_SubmoduleAccessor = Callable[[torch.nn.Module], torch.nn.Module]
+_WhitelistParamNamesCreator = Callable[[torch.nn.Module], List[str]]
+
+class BaseOffloader(ABC):
+    def wrap_modules(
+        self,
+        all_modules_generator: Generator[torch.nn.Module, None, None],
+        submodule_accessor: Optional[_SubmoduleAccessor] = None,
+        whitelist_param_names_creator: Optional[_WhitelistParamNamesCreator] = None,
+    ):
+        raise NotImplementedError
+
+class OffloaderV1(BaseOffloader):
+
 
 # TODO improve
 class ModuleOffloader:
