@@ -632,7 +632,9 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
     # Can also be passed as argument
-    os.environ["SGLANG_RUN_ID"] = f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
+    os.environ["SGLANG_RUN_ID"] = (
+        f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
+    )
 
     # Set prometheus env vars
     if server_args.enable_metrics:

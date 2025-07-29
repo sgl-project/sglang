@@ -1,5 +1,4 @@
 import logging
-import logging
 import os
 from abc import ABC
 from typing import Callable, Generator, List, Optional
@@ -32,6 +31,7 @@ logger = logging.getLogger(__name__)
 _SubmoduleAccessor = Callable[[torch.nn.Module], torch.nn.Module]
 _WhitelistParamNamesCreator = Callable[[torch.nn.Module], List[str]]
 
+
 class BaseOffloader(ABC):
     def wrap_modules(
         self,
@@ -48,6 +48,7 @@ class BaseOffloader(ABC):
 class NoopOffloader(BaseOffloader):
     pass
 
+
 # For simplicity use singleton, but can surely support multi instance
 _instance: Optional[BaseOffloader] = NoopOffloader()
 
@@ -61,11 +62,16 @@ def set_offloader(instance: BaseOffloader):
     global _instance
     _instance = instance
 
+
 def create_offloader_from_server_args(server_args: ServerArgs, dp_rank: int):
     if server_args.cpu_offload_gb > 0:
-        return OffloaderV1(cpu_offload_max_bytes=int(server_args.cpu_offload_gb * 1024**3))
+        return OffloaderV1(
+            cpu_offload_max_bytes=int(server_args.cpu_offload_gb * 1024**3)
+        )
     if server_args.offload_group_size > 0:
-        assert server_args.cpu_offload_gb == 0, "V2 offload does not support cpu_offload_gb yet"
+        assert (
+            server_args.cpu_offload_gb == 0
+        ), "V2 offload does not support cpu_offload_gb yet"
         return OffloaderV2(
             group_size=server_args.offload_group_size,
             num_in_group=server_args.offload_num_in_group,
@@ -76,21 +82,19 @@ def create_offloader_from_server_args(server_args: ServerArgs, dp_rank: int):
         )
     return NoopOffloader()
 
+
 class OffloaderV1(BaseOffloader):
     def __init__(self, cpu_offload_max_bytes: int):
         self._cpu_offload_bytes = 0
         self._cpu_offload_max_bytes = cpu_offload_max_bytes
 
     def wrap_modules(
-            self,
-            all_modules_generator: Generator[torch.nn.Module, None, None],
-            submodule_accessor: Optional[_SubmoduleAccessor] = None,
-            whitelist_param_names_creator: Optional[_WhitelistParamNamesCreator] = None,
+        self,
+        all_modules_generator: Generator[torch.nn.Module, None, None],
+        submodule_accessor: Optional[_SubmoduleAccessor] = None,
+        whitelist_param_names_creator: Optional[_WhitelistParamNamesCreator] = None,
     ):
-        return [
-            self.maybe_offload_to_cpu(module)
-            for module in all_modules_generator
-        ]
+        return [self.maybe_offload_to_cpu(module) for module in all_modules_generator]
 
     def maybe_offload_to_cpu(self, module: torch.nn.Module) -> torch.nn.Module:
         device = next(module.parameters()).device
@@ -164,7 +168,9 @@ class OffloaderV2(BaseOffloader):
 
         # Temporarily init inside Offloader, can move if other modules also need this
         if self.mode in {"sharded_gpu", "shm_cpu"}:
-            assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
+            assert (
+                get_tensor_model_parallel_world_size() == 1
+            ), "not yet support tp_size!=1"
             set_naive_distributed(
                 NaiveDistributed(
                     rank=dp_rank,
@@ -200,10 +206,7 @@ class OffloaderV2(BaseOffloader):
         for module_index, module in enumerate(all_modules_generator):
             logger.info(f"[offloader] {module_index=} {torch.cuda.memory_allocated()=}")
             all_modules.append(module)
-            if (
-                module_index % self.group_size
-                >= self.group_size - self.num_in_group
-            ):
+            if module_index % self.group_size >= self.group_size - self.num_in_group:
                 submodule = submodule_accessor(module)
                 whitelist_param_names = whitelist_param_names_creator(submodule)
                 logger.info(
