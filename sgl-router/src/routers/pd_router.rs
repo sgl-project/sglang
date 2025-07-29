@@ -1165,10 +1165,7 @@ impl PDRouter {
                     let status = StatusCode::from_u16(res.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     match res.bytes().await {
-                        Ok(body) => Response::builder()
-                            .status(status)
-                            .body(Body::from(body.to_vec()))
-                            .unwrap(),
+                        Ok(body) => (status, body).into_response(),
                         Err(e) => (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             format!("Failed to read response body: {}", e),
@@ -1262,10 +1259,7 @@ impl PDRouter {
                     let status = StatusCode::from_u16(res.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     match res.bytes().await {
-                        Ok(body) => Response::builder()
-                            .status(status)
-                            .body(Body::from(body.to_vec()))
-                            .unwrap(),
+                        Ok(body) => (status, body).into_response(),
                         Err(e) => (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             format!("Failed to read response body: {}", e),
@@ -1540,25 +1534,22 @@ impl RouterTrait for PDRouter {
                 reasons.push("no healthy decode workers");
             }
 
-            Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header("Content-Type", "application/json")
-                .body(Body::from(
-                    serde_json::to_string(&serde_json::json!({
-                        "status": "not_ready",
-                        "reason": reasons.join(", "),
-                        "prefill": {
-                            "healthy": healthy_prefill_count,
-                            "total": total_prefill
-                        },
-                        "decode": {
-                            "healthy": healthy_decode_count,
-                            "total": total_decode
-                        }
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap()
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "not_ready",
+                    "reason": reasons.join(", "),
+                    "prefill": {
+                        "healthy": healthy_prefill_count,
+                        "total": total_prefill
+                    },
+                    "decode": {
+                        "healthy": healthy_decode_count,
+                        "total": total_decode
+                    }
+                })),
+            )
+                .into_response()
         }
     }
 }

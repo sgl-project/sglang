@@ -105,14 +105,27 @@ where
         // Insert request ID into request extensions
         req.extensions_mut().insert(RequestId(request_id.clone()));
 
-        // Log the request with the request ID now that it's available
-        tracing::info!(
-            target: "sglang_router_rs::request",
+        // Create a span with the request ID for this request
+        let span = tracing::info_span!(
+            "http_request",
             method = %req.method(),
             uri = %req.uri(),
-            request_id = %request_id,
+            version = ?req.version(),
+            request_id = %request_id
+        );
+
+        // Log within the span
+        let _enter = span.enter();
+        tracing::info!(
+            target: "sglang_router_rs::request",
             "started processing request"
         );
+        drop(_enter);
+
+        // Capture values we need in the async block
+        let method = req.method().clone();
+        let uri = req.uri().clone();
+        let version = req.version();
 
         // Call the inner service
         let future = self.inner.call(req);
@@ -129,30 +142,32 @@ where
                     .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id")),
             );
 
-            // Log the response with proper request ID
+            // Log the response with proper request ID in span
             let status = response.status();
+            let span = tracing::info_span!(
+                "http_request",
+                method = %method,
+                uri = %uri,
+                version = ?version,
+                request_id = %request_id,
+                status = %status,
+                latency = ?latency
+            );
+
+            let _enter = span.enter();
             if status.is_server_error() {
                 tracing::error!(
                     target: "sglang_router_rs::response",
-                    request_id = %request_id,
-                    status = %status,
-                    latency = ?latency,
                     "request failed with server error"
                 );
             } else if status.is_client_error() {
                 tracing::warn!(
                     target: "sglang_router_rs::response",
-                    request_id = %request_id,
-                    status = %status,
-                    latency = ?latency,
                     "request failed with client error"
                 );
             } else {
                 tracing::info!(
                     target: "sglang_router_rs::response",
-                    request_id = %request_id,
-                    status = %status,
-                    latency = ?latency,
                     "finished processing request"
                 );
             }
