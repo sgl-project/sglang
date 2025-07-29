@@ -93,6 +93,19 @@ python -m sglang_router.launch_router \
     --prometheus-port 9000
 ```
 
+### Request ID Tracking
+
+Track requests across distributed systems with configurable headers:
+
+```bash
+# Use custom request ID headers
+python -m sglang_router.launch_router \
+    --worker-urls http://localhost:8080 \
+    --request-id-headers x-trace-id x-request-id
+```
+
+Default headers: `x-request-id`, `x-correlation-id`, `x-trace-id`, `request-id`
+
 ## Advanced Features
 
 ### Kubernetes Service Discovery
