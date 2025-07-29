@@ -1551,11 +1551,6 @@ def get_request_mapping_info(forward_batch: ForwardBatch, **kwargs):
                     if hasattr(req, "rid"):
                         finished_requests_ids.append(req.rid)
 
-        # Priority 4: Check for orphaned request mappings
-        if request_ids_to_seq_ids:
-            # Additional heuristic checks can be added here
-            pass
-
     # Ensure return values are not None
     if finished_requests_ids is None:
         finished_requests_ids = []
