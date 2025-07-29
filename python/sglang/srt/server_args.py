@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import random
+import sys
 import tempfile
 from typing import List, Literal, Optional, Union
 
@@ -74,6 +75,7 @@ class ServerArgs:
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
+    max_queued_requests: Optional[int] = sys.maxsize
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
@@ -150,6 +152,8 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: Optional[str] = None
+    decode_attention_backend: Optional[str] = None
+    prefill_attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
@@ -168,7 +172,8 @@ class ServerArgs:
     ep_size: int = 1
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
-    enable_flashinfer_moe: bool = False
+    enable_flashinfer_cutlass_moe: bool = False
+    enable_flashinfer_trtllm_moe: bool = False
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
@@ -392,13 +397,19 @@ class ServerArgs:
             )
             self.page_size = 128
 
-        if self.attention_backend == "flashmla":
+        if (
+            self.attention_backend == "flashmla"
+            or self.decode_attention_backend == "flashmla"
+        ):
             logger.warning(
                 "FlashMLA only supports a page_size of 64, change page_size to 64."
             )
             self.page_size = 64
 
-        if self.attention_backend == "cutlass_mla":
+        if (
+            self.attention_backend == "cutlass_mla"
+            or self.decode_attention_backend == "cutlass_mla"
+        ):
             logger.warning(
                 "Cutlass MLA only supports a page_size of 128, change page_size to 128."
             )
@@ -434,11 +445,15 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
         # MoE kernel
-        if self.enable_flashinfer_moe:
+        if self.enable_flashinfer_cutlass_moe:
             assert (
                 self.quantization == "modelopt_fp4"
             ), "modelopt_fp4 quantization is required for Flashinfer MOE"
             os.environ["TRTLLM_ENABLE_PDL"] = "1"
+
+        if self.enable_flashinfer_trtllm_moe:
+            assert self.enable_ep_moe, "EP MoE is required for Flashinfer TRTLLM MOE"
+            logger.warning(f"Flashinfer TRTLLM MoE is enabled.")
 
         # DeepEP MoE
         if self.enable_deepep_moe:
@@ -506,7 +521,7 @@ class ServerArgs:
                 )
 
             model_arch = self.get_hf_config().architectures[0]
-            if model_arch == "DeepseekV3ForCausalLM":
+            if model_arch in ["DeepseekV3ForCausalLM", "Glm4MoeForCausalLM"]:
                 # Auto set draft_model_path DeepSeek-V3/R1
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
@@ -797,6 +812,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_running_requests,
             help="The maximum number of running requests.",
+        )
+        parser.add_argument(
+            "--max-queued-requests",
+            type=int,
+            default=ServerArgs.max_queued_requests,
+            help="The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
         )
         parser.add_argument(
             "--max-total-tokens",
@@ -1095,6 +1116,7 @@ class ServerArgs:
                 "pythonic",
                 "kimi_k2",
                 "qwen3_coder",
+                "glm45",
             ],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', and 'qwen3_coder'.",
@@ -1209,6 +1231,35 @@ class ServerArgs:
             help="Choose the kernels for attention layers.",
         )
         parser.add_argument(
+            "--decode-attention-backend",
+            type=str,
+            choices=[
+                "flashinfer",
+                "triton",
+                "torch_native",
+                "fa3",
+                "flashmla",
+                "cutlass_mla",
+            ],
+            default=ServerArgs.decode_attention_backend,
+            help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
+        )
+
+        parser.add_argument(
+            "--prefill-attention-backend",
+            type=str,
+            choices=[
+                "flashinfer",
+                "triton",
+                "torch_native",
+                "fa3",
+                "flashmla",
+                "cutlass_mla",
+            ],
+            default=ServerArgs.prefill_attention_backend,
+            help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
+        )
+        parser.add_argument(
             "--sampling-backend",
             type=str,
             choices=["flashinfer", "pytorch"],
@@ -1293,9 +1344,14 @@ class ServerArgs:
             help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
         )
         parser.add_argument(
-            "--enable-flashinfer-moe",
+            "--enable-flashinfer-cutlass-moe",
             action="store_true",
             help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP with --enable-ep-moe",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-trtllm-moe",
+            action="store_true",
+            help="Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP with --enable-ep-moe",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
