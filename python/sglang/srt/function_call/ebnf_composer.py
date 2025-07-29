@@ -165,6 +165,7 @@ class EBNFComposer:
         tool_call_separator: Optional[str] = None,
         call_rule_fmt: Optional[str] = None,
         key_value_rule_fmt: Optional[str] = None,
+        key_value_separator: str = ",",
     ):
         """
         Generalized EBNF builder for all detectors.
@@ -279,7 +280,11 @@ class EBNFComposer:
 
             # Add required properties joined by commas
             if required:
-                rule_parts.append(' "," '.join(prop_kv_pairs[k] for k in required))
+                rule_parts.append(
+                    f' "{key_value_separator}" '.join(
+                        prop_kv_pairs[k] for k in required
+                    )
+                )
 
             # Add optional properties with flexible ordering
             if optional:
@@ -292,13 +297,15 @@ class EBNFComposer:
                         if j == i:
                             opt_parts.append(prop_kv_pairs[optional[j]])
                         else:
-                            opt_parts.append(f' ( "," {prop_kv_pairs[optional[j]]} )?')
+                            opt_parts.append(
+                                f' ( "{key_value_separator}" {prop_kv_pairs[optional[j]]} )?'
+                            )
                     opt_alternatives.append("".join(opt_parts))
 
                 # Wrap with appropriate comma handling based on whether we have required properties
                 if required:
                     # Required properties exist, so optional group needs outer comma
-                    rule_parts.append(' ( "," ( ')
+                    rule_parts.append(f' ( "{key_value_separator}" ( ')
                     rule_parts.append(" | ".join(opt_alternatives))
                     rule_parts.append(" ) )?")
                 else:
