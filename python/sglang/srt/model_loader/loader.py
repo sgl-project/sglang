@@ -84,7 +84,6 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
     # Store original device states and move parameters to GPU if they're on CPU
     for name, p in module.named_parameters():
         if p.device.type == "cpu":
-            print(f"hi device_loading_context handle one {p}")
             original_data = p.data
             device_data = p.data.to(target_device)
             original_infos[name] = dict(
