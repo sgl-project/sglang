@@ -1420,6 +1420,7 @@ class Scheduler(
         else:
             f += f"#running-req: {running_bs}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
+            f += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
 
         logger.info(f)
 

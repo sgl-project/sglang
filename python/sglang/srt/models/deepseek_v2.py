@@ -62,6 +62,7 @@ from sglang.srt.layers.moe.ep_moe.layer import (
     use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -110,6 +111,7 @@ from sglang.srt.utils import (
     is_hip,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
+    make_layers,
     use_intel_amx_backend,
 )
 
@@ -1977,17 +1979,33 @@ class DeepseekV2Model(nn.Module):
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
-        self.layers = nn.ModuleList(
-            [
-                DeepseekV2DecoderLayer(
-                    config,
-                    layer_id,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{layer_id}", prefix),
-                    alt_stream=self.alt_stream,
-                )
-                for layer_id in range(config.num_hidden_layers)
-            ]
+        self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: DeepseekV2DecoderLayer(
+                config,
+                layer_id=idx,
+                quant_config=quant_config,
+                prefix=prefix,
+                alt_stream=self.alt_stream,
+            ),
+            prefix=add_prefix("layers", prefix),
+            offloader_kwargs=dict(
+                submodule_accessor=lambda layer: (
+                    layer.mlp.experts
+                    if isinstance(layer.mlp, DeepseekV2MoE)
+                    else layer.mlp
+                ),
+                whitelist_param_names_creator=lambda module: (
+                    [
+                        "w13_weight",
+                        "w2_weight",
+                        "w13_blockscale_swizzled",
+                        "w2_blockscale_swizzled",
+                    ]
+                    if isinstance(module, FusedMoE)
+                    else []
+                ),
+            ),
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

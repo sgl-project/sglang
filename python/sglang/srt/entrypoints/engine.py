@@ -23,8 +23,10 @@ import dataclasses
 import logging
 import multiprocessing as mp
 import os
+import random
 import signal
 import threading
+import time
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
@@ -628,6 +630,11 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+
+    # Can also be passed as argument
+    os.environ["SGLANG_RUN_ID"] = (
+        f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
+    )
 
     # Set prometheus env vars
     if server_args.enable_metrics:

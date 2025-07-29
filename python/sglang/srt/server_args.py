@@ -81,7 +81,6 @@ class ServerArgs:
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
-    cpu_offload_gb: int = 0
     page_size: Optional[int] = None
     hybrid_kvcache_ratio: Optional[float] = None
     swa_full_tokens_ratio: float = 0.8
@@ -207,6 +206,13 @@ class ServerArgs:
     ds_heavy_token_num: int = 256
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
+
+    # Offloading
+    cpu_offload_gb: int = 0
+    offload_group_size: int = -1
+    offload_num_in_group: int = 1
+    offload_prefetch_step: int = 1
+    offload_mode: str = "cpu"
 
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -844,12 +850,6 @@ class ServerArgs:
             type=float,
             default=ServerArgs.schedule_conservativeness,
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
-        )
-        parser.add_argument(
-            "--cpu-offload-gb",
-            type=int,
-            default=ServerArgs.cpu_offload_gb,
-            help="How many GBs of RAM to reserve for CPU offloading.",
         )
         parser.add_argument(
             "--page-size",
@@ -1516,6 +1516,38 @@ class ServerArgs:
             type=int,
             default=ServerArgs.ds_sparse_decode_threshold,
             help="The type of heavy channels in double sparsity attention",
+        )
+
+        # Offloading
+        parser.add_argument(
+            "--cpu-offload-gb",
+            type=int,
+            default=ServerArgs.cpu_offload_gb,
+            help="How many GBs of RAM to reserve for CPU offloading.",
+        )
+        parser.add_argument(
+            "--offload-group-size",
+            type=int,
+            default=ServerArgs.offload_group_size,
+            help="Number of layers per group in offloading.",
+        )
+        parser.add_argument(
+            "--offload-num-in-group",
+            type=int,
+            default=ServerArgs.offload_num_in_group,
+            help="Number of layers to be offloaded within a group.",
+        )
+        parser.add_argument(
+            "--offload-prefetch-step",
+            type=int,
+            default=ServerArgs.offload_prefetch_step,
+            help="Steps to prefetch in offloading.",
+        )
+        parser.add_argument(
+            "--offload-mode",
+            type=str,
+            default=ServerArgs.offload_mode,
+            help="Mode of offloading.",
         )
 
         # Optimization/debug options
