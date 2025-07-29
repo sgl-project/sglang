@@ -12,7 +12,6 @@ from sglang.srt.host_shared_memory import (
     set_host_shared_memory_manager,
 )
 from sglang.srt.layers.parameter import ModelWeightParameter
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.naive_distributed import (
     NaiveDistributed,
     get_naive_distributed,
@@ -21,7 +20,6 @@ from sglang.srt.naive_distributed import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
-    get_int_env_var,
     is_pin_memory_available,
 )
 
