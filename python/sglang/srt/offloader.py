@@ -18,10 +18,7 @@ from sglang.srt.naive_distributed import (
     set_naive_distributed,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    MultiprocessingSerializer,
-    is_pin_memory_available,
-)
+from sglang.srt.utils import MultiprocessingSerializer, is_pin_memory_available
 
 logger = logging.getLogger(__name__)
 
@@ -324,7 +321,7 @@ class _BaseParamOffloader(ABC):
             "meta": _MetaParamOffloader,
             "cpu": _CpuParamOffloader,
             "shm_cpu": _ShmCpuParamOffloader,
-            "sharded_gpu": _ShardedGpuParamOffloader,
+            # "sharded_gpu": _ShardedGpuParamOffloader,
         }[mode](**kwargs)
 
     def __init__(self, module, param_name):
@@ -398,6 +395,56 @@ class _ShmCpuParamOffloader(_BaseParamOffloader):
         return self.shm_cpu_data.to("cuda", non_blocking=True)
 
 
+def _move_param_to_cpu(param, pin_memory: bool):
+    cpu_data = _empty_strided_like(
+        param.data,
+        device="cpu",
+        pin_memory=pin_memory,
+    )
+    cpu_data.copy_(param.data)
+    param.data = cpu_data
+
+
+def _move_param_to_meta(module, param_name):
+    old_param = getattr(module, param_name)
+    old_param_type = type(old_param)
+
+    new_data = old_param.data.to("meta")
+
+    if old_param_type == ModelWeightParameter:
+        # manually checked how `w13_weight` and `w2_weight` are constructed
+        new_param = ModelWeightParameter(
+            data=new_data,
+            **{
+                k: getattr(old_param, k)
+                for k in ["input_dim", "output_dim", "weight_loader"]
+            },
+        )
+    elif old_param_type == torch.nn.Parameter:
+        new_param = torch.nn.Parameter(
+            data=new_data,
+            requires_grad=False,
+        )
+    else:
+        raise ValueError(f"Unknown {old_param_type=} {old_param=}")
+
+    setattr(module, param_name, new_param)
+
+
+def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
+    return torch.empty_strided(
+        size=x.size(),
+        stride=x.stride(),
+        dtype=x.dtype,
+        layout=x.layout,
+        device=device,
+        pin_memory=pin_memory,
+    )
+
+
+# ----------------------------------------- ShardedGpu ------------------------------------------------------
+
+
 # TODO unify with ShmCpu mode
 class _ShardedGpuParamOffloader(_BaseParamOffloader):
     def __init__(self, module, param_name):
@@ -463,53 +510,6 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
 def _even_chunk(x: torch.Tensor, chunks: int):
     assert x.shape[0] % chunks == 0, f"{x.shape=} {chunks=}"
     return list(x.chunk(chunks))
-
-
-def _move_param_to_cpu(param, pin_memory: bool):
-    cpu_data = _empty_strided_like(
-        param.data,
-        device="cpu",
-        pin_memory=pin_memory,
-    )
-    cpu_data.copy_(param.data)
-    param.data = cpu_data
-
-
-def _move_param_to_meta(module, param_name):
-    old_param = getattr(module, param_name)
-    old_param_type = type(old_param)
-
-    new_data = old_param.data.to("meta")
-
-    if old_param_type == ModelWeightParameter:
-        # manually checked how `w13_weight` and `w2_weight` are constructed
-        new_param = ModelWeightParameter(
-            data=new_data,
-            **{
-                k: getattr(old_param, k)
-                for k in ["input_dim", "output_dim", "weight_loader"]
-            },
-        )
-    elif old_param_type == torch.nn.Parameter:
-        new_param = torch.nn.Parameter(
-            data=new_data,
-            requires_grad=False,
-        )
-    else:
-        raise ValueError(f"Unknown {old_param_type=} {old_param=}")
-
-    setattr(module, param_name, new_param)
-
-
-def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
-    return torch.empty_strided(
-        size=x.size(),
-        stride=x.stride(),
-        dtype=x.dtype,
-        layout=x.layout,
-        device=device,
-        pin_memory=pin_memory,
-    )
 
 
 def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tensor]:
