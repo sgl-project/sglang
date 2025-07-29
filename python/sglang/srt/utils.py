@@ -442,6 +442,7 @@ def make_layers(
     pp_size: Optional[int] = None,
     prefix: str = "",
     return_tuple: bool = False,
+    offloader_kwargs: Dict[str, Any] = {},
 ) -> Tuple[int, int, torch.nn.ModuleList]:
     """Make a list of layers with the given layer function"""
     # circula imports
@@ -464,7 +465,8 @@ def make_layers(
             (
                 layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
                 for idx in range(start_layer, end_layer)
-            )
+            ),
+            **offloader_kwargs,
         )
         + [
             PPMissingLayer(return_tuple=return_tuple)

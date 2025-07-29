@@ -1995,6 +1995,24 @@ class DeepseekV2Model(nn.Module):
                 prefix=add_prefix(f"layers.{idx}", prefix),
                 alt_stream=self.alt_stream,
             ),
+            offloader_kwargs=dict(
+                submodule_accessor=lambda layer: (
+                    layer.mlp.experts
+                    if isinstance(layer.mlp, DeepseekV2MoE)
+                    else layer.mlp
+                ),
+                whitelist_param_names_creator=lambda module: (
+                    # for simplicity, not offload weight_scale
+                    [
+                        "w13_weight",
+                        "w2_weight",
+                        "w13_blockscale_swizzled",
+                        "w2_blockscale_swizzled",
+                    ]
+                    if isinstance(module, FusedMoE)
+                    else []
+                ),
+            ),
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
