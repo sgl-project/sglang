@@ -85,7 +85,6 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager
 
-
 logger = logging.getLogger(__name__)
 
 show_time_cost = False

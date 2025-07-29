@@ -220,15 +220,15 @@ class ModelRunner:
             }
         )
 
-        # CPU offload
-        set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
-
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
             self.init_threads_binding()
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
+
+        # CPU offload
+        set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
 
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
