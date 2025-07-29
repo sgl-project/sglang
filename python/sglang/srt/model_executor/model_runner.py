@@ -122,7 +122,6 @@ from sglang.srt.utils import (
     is_npu,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
-    set_cpu_offload_max_bytes,
     set_cuda_arch,
 )
 
