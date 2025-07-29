@@ -14,8 +14,8 @@ from sglang.test.test_utils import (
 )
 
 TEST_MODEL_MATRIX = {
-    "vllm-ascend/DeepSeek-V2-Lite-W8A8": {
-        "accuracy": 0.36,
+    "/root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-V2-Lite-W8A8": {
+        "accuracy": 0.35,
         "latency": 1000,
         "output_throughput": 6,
     },
