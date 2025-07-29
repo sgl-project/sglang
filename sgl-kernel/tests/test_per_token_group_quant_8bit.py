@@ -10,6 +10,8 @@ from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_qua
 from sglang.srt.layers.quantization.utils import assert_fp8_all_close
 from sglang.srt.utils import is_hip
 
+from python.sglang.srt.layers.quantization import deep_gemm_wrapper
+
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
@@ -57,6 +59,9 @@ def test_per_token_group_quant_with_column_major(
 ):
     if flags["scale_ue8m0"] and ((group_size != 128) or (hidden_dim % 512 != 0)):
         pytest.skip()
+        return
+    if flags["scale_ue8m0"] and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL:
+        pytest.skip("scale_ue8m0 only supported on Blackwell")
         return
 
     x = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)
