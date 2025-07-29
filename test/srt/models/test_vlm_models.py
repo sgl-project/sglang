@@ -108,41 +108,6 @@ class TestVLMModels(CustomTestCase):
             timeout=3600,
         )
 
-    def _capture_output(self, process, timeout=10):
-        def reader(pipe, tag, q):
-            try:
-                for line in iter(pipe.readline, ""):
-                    q.put(f"[{tag}] {line.rstrip()}")
-            finally:
-                pipe.close()
-
-        output_queue = queue.Queue()
-        threads = []
-        for tag, pipe in (("STDOUT", process.stdout), ("STDERR", process.stderr)):
-            if pipe:
-                t = threading.Thread(target=reader, args=(pipe, tag, output_queue))
-                t.daemon = True
-                t.start()
-                threads.append(t)
-
-        output_lines = []
-        try:
-            process.wait(timeout=timeout)
-        except Exception as e:
-            output_lines.append(f"Error waiting for process: {e}")
-            process.kill()
-
-        while not output_queue.empty():
-            try:
-                output_lines.append(output_queue.get_nowait())
-            except queue.Empty:
-                break
-
-        for t in threads:
-            t.join(timeout=1)
-
-        return "\n".join(output_lines)
-
     def _run_vlm_mmmu_test(
         self,
         model,
@@ -175,12 +140,12 @@ class TestVLMModels(CustomTestCase):
             if custom_env:
                 process_env.update(custom_env)
 
-            # Prepare stdout/stderr capture if needed
-            stdout_pipe = None
-            stderr_pipe = None
+            # Prepare stdout/stderr redirection if needed
+            stdout_file = None
+            stderr_file = None
             if capture_output:
-                stdout_pipe = subprocess.PIPE
-                stderr_pipe = subprocess.PIPE
+                stdout_file = open("/tmp/server_stdout.log", "w")
+                stderr_file = open("/tmp/server_stderr.log", "w")
 
             # Launch server for testing
             process = popen_launch_server(
@@ -200,7 +165,7 @@ class TestVLMModels(CustomTestCase):
                 ],
                 env=process_env,
                 return_stdout_stderr=(
-                    (stdout_pipe, stderr_pipe) if capture_output else None
+                    (stdout_file, stderr_file) if capture_output else None
                 ),
             )
 
@@ -222,7 +187,7 @@ class TestVLMModels(CustomTestCase):
 
             # Capture server output if requested
             if capture_output and process:
-                server_output = self._capture_output(process)
+                server_output = self._read_output_from_files()
 
             # Assert performance meets expected threshold
             self.assertGreaterEqual(
@@ -245,6 +210,37 @@ class TestVLMModels(CustomTestCase):
                     kill_process_tree(process.pid)
                 except Exception as e:
                     print(f"Error killing process: {e}")
+
+            # clean up temporary files
+            if capture_output:
+                if stdout_file:
+                    stdout_file.close()
+                if stderr_file:
+                    stderr_file.close()
+                for filename in ["/tmp/server_stdout.log", "/tmp/server_stderr.log"]:
+                    try:
+                        if os.path.exists(filename):
+                            os.remove(filename)
+                    except Exception as e:
+                        print(f"Error removing {filename}: {e}")
+
+    def _read_output_from_files(self):
+        output_lines = []
+
+        log_files = [
+            ("/tmp/server_stdout.log", "[STDOUT]"),
+            ("/tmp/server_stderr.log", "[STDERR]"),
+        ]
+        for filename, tag in log_files:
+            try:
+                if os.path.exists(filename):
+                    with open(filename, "r") as f:
+                        for line in f:
+                            output_lines.append(f"{tag} {line.rstrip()}")
+            except Exception as e:
+                print(f"Error reading {tag.lower()} file: {e}")
+
+        return "\n".join(output_lines)
 
     def test_vlm_mmmu_benchmark(self):
         """Test VLM models against MMMU benchmark."""
