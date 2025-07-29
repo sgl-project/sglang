@@ -189,7 +189,6 @@ class OffloaderV2(BaseOffloader):
 
         alt_stream = torch.cuda.Stream()
 
-        # TODO maybe improve
         all_modules = []
         offload_submodules = []
         for module_index, module in enumerate(all_modules_generator):
