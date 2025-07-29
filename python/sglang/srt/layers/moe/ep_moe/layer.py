@@ -195,14 +195,15 @@ class EPMoE(FusedMoE):
             num_experts=num_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            top_k=top_k,
             num_fused_shared_experts=num_fused_shared_experts,
             layer_id=layer_id,
+            top_k=top_k,
             params_dtype=params_dtype,
             quant_config=quant_config,
             tp_size=tp_size,
             prefix=prefix,
             activation=activation,
+            # apply_router_weight_on_input=apply_router_weight_on_input,
             routed_scaling_factor=routed_scaling_factor,
             enable_ep_moe=True,
         )
@@ -226,10 +227,6 @@ class EPMoE(FusedMoE):
             self.use_block_quant = False
             self.block_shape = None
             self.activation_scheme = None
-            self.w13_input_scale = None
-            self.w2_input_scale = None
-            self.w13_weight_scale = None
-            self.w2_weight_scale = None
 
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
