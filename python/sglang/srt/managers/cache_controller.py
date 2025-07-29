@@ -260,9 +260,6 @@ class HiCacheController:
 
             if storage_backend == "file":
                 self.storage_backend = HiCacheFile()
-                self.enable_storage = True
-                # todo: threshold policy for prefetching
-                self.prefetch_threshold = max(prefetch_threshold, self.page_size)
             elif storage_backend == "hf3fs":
                 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
@@ -274,13 +271,13 @@ class HiCacheController:
                 self.storage_backend = HiCacheHF3FS.from_env_config(
                     rank, bytes_per_page, dtype
                 )
-                self.enable_storage = True
-                # todo: threshold policy for prefetching
-                self.prefetch_threshold = max(prefetch_threshold, self.page_size)
             else:
                 raise NotImplementedError(
                     f"Unsupported storage backend: {storage_backend}"
                 )
+            self.enable_storage = True
+            # todo: threshold policy for prefetching
+            self.prefetch_threshold = max(prefetch_threshold, self.page_size)
 
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
