@@ -221,33 +221,11 @@ impl<B> OnResponse<B> for ResponseLogger {
     fn on_response(self, response: &Response<B>, latency: std::time::Duration, span: &Span) {
         let status = response.status();
 
+        // Record these in the span for structured logging/observability tools
         span.record("status_code", status.as_u16());
         span.record("latency", format!("{:?}", latency));
 
-        let _enter = span.enter();
-
-        if status.is_server_error() {
-            tracing::error!(
-                target: "sglang_router_rs::response",
-                status = %status,
-                latency = ?latency,
-                "request failed with server error"
-            );
-        } else if status.is_client_error() {
-            tracing::warn!(
-                target: "sglang_router_rs::response",
-                status = %status,
-                latency = ?latency,
-                "request failed with client error"
-            );
-        } else {
-            tracing::info!(
-                target: "sglang_router_rs::response",
-                status = %status,
-                latency = ?latency,
-                "finished processing request"
-            );
-        }
+        // Don't log here - RequestIdService handles all logging with proper request IDs
     }
 }
 
