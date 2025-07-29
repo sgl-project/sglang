@@ -52,6 +52,23 @@ class BaseOffloader(ABC):
         return list(all_modules_generator)
 
 
+
+class NoopOffloader(BaseOffloader):
+    pass
+
+# For simplicity use singleton, but can surely support multi instance
+_instance: Optional[BaseOffloader] = NoopOffloader()
+
+
+def get_offloader():
+    assert _instance is not None
+    return _instance
+
+
+def set_offloader(instance: BaseOffloader):
+    global _instance
+    _instance = instance
+
 class OffloaderV1(BaseOffloader):
     def __init__(self):
         self._cpu_offload_bytes = 0
