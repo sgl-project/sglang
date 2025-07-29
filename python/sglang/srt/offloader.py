@@ -486,7 +486,6 @@ def _move_param_to_meta(module, param_name):
 
     new_data = old_param.data.to("meta")
 
-    # TODO improve
     if old_param_type == ModelWeightParameter:
         # manually checked how `w13_weight` and `w2_weight` are constructed
         new_param = ModelWeightParameter(
