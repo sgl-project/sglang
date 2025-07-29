@@ -42,7 +42,6 @@ class HostSharedMemoryManager:
         np_array = np.ndarray((num_bytes,), dtype=np.uint8, buffer=shm.buf)
         tensor = torch.from_numpy(np_array)
 
-        logger.info(f"cudaHostRegister({tensor.data_ptr()=})")
         check_cuda_result(
             cuda_rt.cudaHostRegister(
                 tensor.data_ptr(), num_bytes, cuda_rt.cudaHostRegisterPortable
