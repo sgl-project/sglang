@@ -436,7 +436,7 @@ class EAGLEWorker(TpModelWorker):
             all_verified_id,
             accept_length,
             verified_id,
-            next_power_of_2(max(self.num_steps + 1, bs)),
+            self.num_draft_tokens,
         )
 
         # Batch 2: Draft extend

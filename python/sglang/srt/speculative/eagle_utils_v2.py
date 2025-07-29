@@ -357,20 +357,15 @@ def fill_new_verified_id(
     verified_id,
     accept_lens,
     new_verified_id,
-    bs_upper: tl.constexpr,
+    num_draft_tokens: tl.constexpr,
 ):
     # NOTE: we cannot fuse any in-place operations of `accept_lens` inside this kernel
     # because this kernel reads accept_lens
     pid = tl.program_id(axis=0)
-    offsets = tl.arange(0, bs_upper)
     accept_length = tl.load(accept_lens + pid)
 
-    accept_len_cumsum = tl.sum(
-        tl.load(accept_lens + offsets, mask=offsets < pid, other=0)
-    )
-
-    accept_len_cumsum += accept_length - 1
-    verified_id_data = tl.load(verified_id + accept_len_cumsum)
+    verified_id_idx = num_draft_tokens * pid + accept_length - 1
+    verified_id_data = tl.load(verified_id + verified_id_idx)
     tl.store(new_verified_id + pid, verified_id_data)
 
 
