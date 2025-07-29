@@ -13,6 +13,7 @@
 # ==============================================================================
 """Anthropic Messages API serving handler"""
 
+import copy
 import json
 import logging
 import time
@@ -36,7 +37,10 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicTool,
     AnthropicUsage,
 )
+from sglang.srt.entrypoints.openai.protocol import MessageProcessingResult
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.jinja_template_utils import process_content_for_template_format
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -135,20 +139,12 @@ class AnthropicServingMessages(OpenAIServingBase):
         self, request: AnthropicMessagesRequest
     ) -> GenerateReqInput:
         """Convert Anthropic request to SGLang internal format"""
-        
-        # Convert messages to OpenAI format for compatibility
-        openai_messages = self._convert_anthropic_to_openai_messages(
-            request.messages, request.system
-        )
-        request.messages = openai_messages
-        
-        # Generate prompt using template manager
-        conversation = generate_chat_conv(
-            request, self.template_manager.chat_template_name
-        )
-        
-        prompt = conversation.get_prompt()
-        
+
+        is_multimodal = self.tokenizer_manager.model_config.is_multimodal
+
+        # Process messages and apply chat template
+        processed_messages = self._process_messages(request, is_multimodal)
+
         # Build sampling parameters
         sampling_params = {
             "max_new_tokens": request.max_tokens,
@@ -161,20 +157,232 @@ class AnthropicServingMessages(OpenAIServingBase):
         
         if request.stop_sequences:
             sampling_params["stop"] = request.stop_sequences
-        
-        # Handle tools if provided
-        tools_info = None
-        if request.tools:
-            tools_info = self._convert_anthropic_tools_to_openai(request.tools, request.tool_choice)
+
+        # Handle single vs multiple requests
+        if is_multimodal:
+            prompt_kwargs = {"text": processed_messages.prompt}
+        else:
+            if isinstance(processed_messages.prompt_ids, str):
+                prompt_kwargs = {"text": processed_messages.prompt_ids}
+            else:
+                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
         return GenerateReqInput(
-            text=prompt,
+            **prompt_kwargs,
+            image_data=processed_messages.image_data,
+            video_data=processed_messages.video_data,
+            audio_data=processed_messages.audio_data,
             sampling_params=sampling_params,
             stream=request.stream or False,
             return_logprob=False,
             rid=f"anthropic_{int(time.time() * 1000)}",
-            # Add tools support if available in SGLang
-            **tools_info if tools_info else {}
+        )
+
+    def _process_messages(
+        self, request: AnthropicMessagesRequest, is_multimodal: bool
+    ) -> MessageProcessingResult:
+        """Process chat messages and apply chat template"""
+        tool_call_constraint = None
+
+        # Apply chat template and its stop strings
+        tools = None
+        if request.tools and request.tool_choice != "none":
+            request.skip_special_tokens = False
+            if not isinstance(request.tool_choice, str):
+                tools = [
+                    item.model_dump()
+                    for item in request.tools
+                    if item.function.name == request.tool_choice.function.name
+                ]
+            else:
+                tools = [item.model_dump() for item in request.tools]
+
+            tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
+            parser = FunctionCallParser(request.tools, tool_call_parser)
+            tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
+
+        # Use chat template
+        if self.template_manager.chat_template_name is None:
+            result = self._apply_jinja_template(request, tools, is_multimodal)
+        else:
+            result = self._apply_conversation_template(request, is_multimodal)
+
+        result.tool_call_constraint = tool_call_constraint
+        return result
+
+    def _apply_jinja_template(
+        self,
+        request: AnthropicMessagesRequest,
+        tools: Optional[List[Dict]],
+        is_multimodal: bool,
+    ) -> MessageProcessingResult:
+        """Apply Jinja chat template"""
+        prompt = ""
+        prompt_ids = []
+        openai_compatible_messages = []
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+
+        template_content_format = self.template_manager.jinja_template_content_format
+
+        for message in request.messages:
+            if message.content is None:
+                message.content = ""
+            msg_dict = message.model_dump()
+
+            # Process content based on detected template format
+            processed_msg = process_content_for_template_format(
+                msg_dict,
+                template_content_format,
+                image_data,
+                video_data,
+                audio_data,
+                modalities,
+            )
+
+            if "tool_calls" in processed_msg and isinstance(
+                processed_msg.get("tool_calls"), list
+            ):
+                for call in processed_msg["tool_calls"]:
+                    try:
+                        if "arguments" in call["function"] and isinstance(
+                            call["function"]["arguments"], str
+                        ):
+                            call["function"]["arguments"] = json.loads(
+                                call["function"]["arguments"]
+                            )
+                    except json.JSONDecodeError as e:
+                        # Log a warning or error if JSON parsing fails for arguments
+                        logger.warning(
+                            f"Failed to parse tool call arguments as JSON: {e}"
+                        )
+                        # Decide whether to continue or raise the exception based on desired behavior
+                        continue  # Or raise e if strict parsing is required
+            openai_compatible_messages.append(processed_msg)
+
+        # Handle assistant prefix for continue_final_message
+        assistant_prefix = None
+        if (
+            openai_compatible_messages
+            and openai_compatible_messages[-1]["role"] == "assistant"
+        ):
+            if request.continue_final_message:
+                assistant_prefix = openai_compatible_messages[-1]["content"]
+                openai_compatible_messages = openai_compatible_messages[:-1]
+
+        try:
+            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                openai_compatible_messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                tools=tools,
+                **(
+                    request.chat_template_kwargs if request.chat_template_kwargs else {}
+                ),
+            )
+        except Exception:
+            #  This except branch will be triggered when the chosen model
+            #  has a different tools input format that is not compatible
+            #  with openAI's apply_chat_template tool_call format, like Mistral.
+            tools = (
+                [t if "function" in t else {"function": t} for t in tools]
+                if tools
+                else None
+            )
+            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                openai_compatible_messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                tools=tools,
+                **(
+                    request.chat_template_kwargs if request.chat_template_kwargs else {}
+                ),
+            )
+
+        if assistant_prefix:
+            encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
+            if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
+                encoded = encoded[1:]
+            prompt_ids += encoded
+
+        if is_multimodal:
+            prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+
+        stop = request.stop
+        image_data = image_data if image_data else None
+        audio_data = audio_data if audio_data else None
+        video_data = video_data if video_data else None
+        modalities = modalities if modalities else []
+        return MessageProcessingResult(
+            prompt=prompt,
+            prompt_ids=prompt_ids,
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
+            modalities=modalities,
+            stop=stop,
+        )
+
+    def _apply_conversation_template(
+        self,
+        request: AnthropicMessagesRequest,
+        is_multimodal: bool,
+    ) -> MessageProcessingResult:
+        """Apply conversation template"""
+        prompt = ""
+        prompt_ids = []
+        conv = generate_chat_conv(request, self.template_manager.chat_template_name)
+
+        # If we should continue the final assistant message, adjust the conversation.
+        if (
+            request.continue_final_message
+            and request.messages
+            and request.messages[-1].role == "assistant"
+        ):
+            # Remove the auto-added blank assistant turn, if present.
+            if conv.messages and conv.messages[-1][1] is None:
+                conv.messages.pop()
+            # Rebuild the prompt from the conversation.
+            prompt = conv.get_prompt()
+            # Strip trailing stop tokens or separators that indicate end-of-assistant.
+            if isinstance(conv.stop_str, list):
+                for stop_token in conv.stop_str:
+                    if prompt.endswith(stop_token):
+                        prompt = prompt[: -len(stop_token)]
+            elif isinstance(conv.stop_str, str) and prompt.endswith(conv.stop_str):
+                prompt = prompt[: -len(conv.stop_str)]
+            if conv.sep and prompt.endswith(conv.sep):
+                prompt = prompt[: -len(conv.sep)]
+            if getattr(conv, "sep2", None) and prompt.endswith(conv.sep2):
+                prompt = prompt[: -len(conv.sep2)]
+        else:
+            prompt = conv.get_prompt()
+
+        image_data = conv.image_data if conv.image_data else None
+        video_data = conv.video_data if conv.video_data else None
+        audio_data = conv.audio_data if conv.audio_data else None
+        modalities = conv.modalities if conv.modalities else []
+        stop = copy.copy(conv.stop_str or [] if not request.ignore_eos else [])
+
+        if request.stop:
+            if isinstance(request.stop, str):
+                stop.append(request.stop)
+            else:
+                stop.extend(request.stop)
+
+        if not is_multimodal:
+            prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
+
+        return MessageProcessingResult(
+            prompt=prompt,
+            prompt_ids=prompt_ids,
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
+            modalities=modalities,
+            stop=stop,
         )
 
     def _create_anthropic_content_block(self, text: str) -> AnthropicContentBlock:
