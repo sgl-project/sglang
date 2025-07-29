@@ -1424,9 +1424,6 @@ def fused_experts_impl(
     else:
         out_hidden_states = torch.empty_like(hidden_states)
     
-    intermediate_cache1.zero_()
-    intermediate_cache2.zero_()
-
     for chunk in range((num_tokens // CHUNK_SIZE) + 1):
         begin_chunk_idx, end_chunk_idx = (
             chunk * CHUNK_SIZE,
@@ -1496,9 +1493,6 @@ def fused_experts_impl(
                 )
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
-
-        intermediate_cache3.zero_()
-        out_hidden_states.zero_()
 
         invoke_fused_moe_kernel(
             intermediate_cache2,
