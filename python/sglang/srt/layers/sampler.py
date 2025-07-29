@@ -59,6 +59,8 @@ class Sampler(nn.Module):
                 performs sampling in draft workers.
         """
         logits = logits_output.next_token_logits
+
+        # Temperature rescales logits (logits / temperature); only temperature = 1.0 leaves the model’s “true” log‑probs unchanged.
         is_temperatures_one = torch.all(sampling_info.temperatures == 1.0)
 
         # Apply the custom logit processors if registered in the sampling info.
@@ -78,20 +80,12 @@ class Sampler(nn.Module):
             batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
-                if not is_temperatures_one:
-                    original_logprobs = torch.softmax(
-                        logits_output.next_token_logits, dim=-1
-                    )
-                else:
-                    original_logprobs = logprobs
+                original_logprobs = logprobs
 
         else:
-            # Post process original logits
+            # Post process original logits. if temperatures are all 1.0, no need to rescale
             if not is_temperatures_one:
-                original_logits = logits.clone()
-                original_logits[:] = torch.softmax(original_logits, dim=-1)
-                original_logprobs = original_logits
-                del original_logits
+                original_logprobs = torch.softmax(logits, dim=-1)
 
             # Post process logits
             logits.div_(sampling_info.temperatures)
@@ -236,14 +230,14 @@ def get_top_logprobs(
     logprobs: torch.Tensor,
     original_logprobs: torch.Tensor,
     top_logprobs_nums: List[int],
-    is_temperture_one: bool,
+    is_temperatures_one: bool,
 ):
     max_k = max(top_logprobs_nums)
     ret = logprobs.topk(max_k, dim=1)
     values = ret.values.tolist()
     indices = ret.indices.tolist()
-    origin_ret = original_logprobs.topk(max_k, dim=1)
-    origin_values = origin_ret.values.tolist()
+    original_ret = original_logprobs.topk(max_k, dim=1)
+    original_values = original_ret.values.tolist()
 
     output_top_logprobs_val = []
     output_top_logprobs_idx = []
@@ -251,10 +245,11 @@ def get_top_logprobs(
     for i, k in enumerate(top_logprobs_nums):
         output_top_logprobs_val.append(values[i][:k])
         output_top_logprobs_idx.append(indices[i][:k])
-        if not is_temperture_one:
-            output_top_original_logprobs_val.append(origin_values[i][:k])
-    if is_temperture_one:
-        output_top_original_logprobs_val = output_top_logprobs_val
+        if is_temperatures_one:
+            output_top_original_logprobs_val.append(values[i][:k])
+        else:
+            output_top_original_logprobs_val.append(original_values[i][:k])
+
     return (
         output_top_logprobs_val,
         output_top_logprobs_idx,
@@ -266,7 +261,7 @@ def get_token_ids_logprobs(
     logprobs: torch.Tensor,
     original_logprobs: torch.Tensor,
     token_ids_logprobs: List[List[int]],
-    is_temperture_one: bool,
+    is_temperatures_one: bool,
 ):
     output_token_ids_logprobs_val = []
     output_token_ids_logprobs_idx = []
@@ -275,17 +270,18 @@ def get_token_ids_logprobs(
         if token_ids is not None:
             output_token_ids_logprobs_val.append(logprobs[i, token_ids].tolist())
             output_token_ids_logprobs_idx.append(token_ids)
-            if not is_temperture_one:
+            if is_temperatures_one:
+                output_token_ids_original_logprobs_val.append(
+                    logprobs[i, token_ids].tolist()
+                )
+            else:
                 output_token_ids_original_logprobs_val.append(
                     original_logprobs[i, token_ids].tolist()
                 )
         else:
             output_token_ids_logprobs_val.append([])
             output_token_ids_logprobs_idx.append([])
-            if not is_temperture_one:
-                output_token_ids_original_logprobs_val.append([])
-        if is_temperture_one:
-            output_token_ids_original_logprobs_val = output_token_ids_logprobs_val
+            output_token_ids_original_logprobs_val.append([])
 
     return (
         output_token_ids_logprobs_val,

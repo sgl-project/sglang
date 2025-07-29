@@ -745,6 +745,8 @@ class EAGLEWorker(TpModelWorker):
         token_ids_logprobs = batch.token_ids_logprobs
         accepted_indices = res.accepted_indices
         assert len(accepted_indices) == len(logits_output.next_token_logits)
+
+        # Temperature rescales logits (logits / temperature); only temperature = 1.0 leaves the model’s “true” log‑probs unchanged.
         is_temperatures_one = torch.all(batch.sampling_info.temperatures == 1.0)
         temperatures = batch.sampling_info.temperatures
         num_draft_tokens = batch.spec_info.draft_token_num
