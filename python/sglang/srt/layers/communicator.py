@@ -27,6 +27,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
+    dp_reduce_scatter_tensor,
     dp_scatter,
     get_attention_dp_size,
     get_attention_tp_rank,
@@ -239,6 +240,13 @@ class LayerCommunicator:
             residual=residual,
             forward_batch=forward_batch,
             context=self._context,
+        )
+
+    def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
+        return (
+            self._communicate_summable_tensor_pair_fn
+            is CommunicateSummableTensorPairFn._scatter_hidden_states
+            and forward_batch.dp_padding_mode.is_max_len()
         )
 
 
@@ -534,14 +542,15 @@ class CommunicateSummableTensorPairFn:
         forward_batch: ForwardBatch,
         context: CommunicateContext,
     ):
-        # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
-        # important: forward batch.gathered_buffer is used both after scatter and after gather.
-        # be careful about this!
         hidden_states, global_hidden_states = (
             forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
             hidden_states,
         )
-        dp_scatter(hidden_states, global_hidden_states, forward_batch)
+        if forward_batch.dp_padding_mode.is_max_len():
+            # When using padding, all_reduce is skipped after MLP and MOE and reduce scatter is used here instead.
+            dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
+        else:
+            dp_scatter(hidden_states, global_hidden_states, forward_batch)
         return hidden_states, residual
 
     @staticmethod
