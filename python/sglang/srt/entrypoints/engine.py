@@ -631,6 +631,9 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
+    # Can also be passed as argument
+    os.environ["SGLANG_RUN_ID"] = f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
+
     # Set prometheus env vars
     if server_args.enable_metrics:
         set_prometheus_multiproc_dir()
@@ -676,11 +679,6 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
-
-    # TODO maybe only expose run_id
-    run_id = f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
-    os.environ["SGLANG_NAIVE_DISTRIBUTED_DIRECTORY"] = f"/tmp/{run_id}"
-    os.environ["SGLANG_SHARED_MEMORY_MANAGER_BASE_NAME"] = run_id
 
 
 def _launch_subprocesses(

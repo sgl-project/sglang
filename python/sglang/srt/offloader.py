@@ -156,19 +156,21 @@ class OffloaderV2(BaseOffloader):
         self.prefetch_step = prefetch_step
         self.mode = mode
 
+        run_id = os.environ["SGLANG_RUN_ID"]
+
         # Temporarily init inside Offloader, can move if other modules also need this
         if self.mode in {"sharded_gpu", "shm_cpu"}:
             set_naive_distributed(
                 NaiveDistributed(
                     rank=global_server_args_dict["dp_rank"],
                     world_size=global_server_args_dict["dp_size"],
-                    rendezvous=TODO,
+                    rendezvous=f"/tmp/{run_id}",
                 )
             )
         if self.mode in {"shm_cpu"}:
             set_host_shared_memory_manager(
                 HostSharedMemoryManager(
-                    base_name=TODO,
+                    base_name=run_id,
                 )
             )
 
