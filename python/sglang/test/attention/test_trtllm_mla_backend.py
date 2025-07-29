@@ -1,5 +1,4 @@
 import unittest
-from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -7,6 +6,7 @@ import torch
 from sglang.srt.layers import dp_attention as _dp_attn
 
 # Patch DP-attention globals before importing backends
+# TODO: change the interface of both trtllm_mla and flashinfer backends to take tp_size as an argument instead of patching
 _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
 
 from sglang.srt.configs.model_config import AttentionArch
