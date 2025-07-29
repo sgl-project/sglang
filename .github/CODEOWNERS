@@ -1,7 +1,7 @@
 .github @merrymercy @zhyncs
 /docker @zhyncs @HaiShaw @ByronHsu
 /python/pyproject.toml @merrymercy @zhyncs
-/python/sglang/* @merrymercy @Ying1123 @zhyncs @hnyls2002 
+/python/sglang/* @merrymercy @Ying1123 @zhyncs @hnyls2002
 /python/sglang/srt/constrained @hnyls2002
 /python/sglang/srt/disaggregation @ByronHsu @hnyls2002
 /python/sglang/srt/distributed @yizhang2077
