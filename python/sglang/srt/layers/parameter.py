@@ -119,9 +119,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     self.output_dim, tp_rank * shard_size, shard_size
                 )
 
-        assert (
-            self.data.shape == loaded_weight.shape
-        ), f"{self.data.shape=} {loaded_weight.shape=}"
+        assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
 
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
