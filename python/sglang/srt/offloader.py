@@ -6,7 +6,6 @@ from typing import Callable, Generator, List, Optional
 import torch
 from torch.func import functional_call
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.host_shared_memory import (
     HostSharedMemoryManager,
     get_host_shared_memory_manager,
@@ -168,6 +167,8 @@ class OffloaderV2(BaseOffloader):
 
         # Temporarily init inside Offloader, can move if other modules also need this
         if self.mode in {"sharded_gpu", "shm_cpu"}:
+            from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
             assert (
                 get_tensor_model_parallel_world_size() == 1
             ), "not yet support tp_size!=1"
@@ -371,6 +372,8 @@ class _ShmCpuParamOffloader(_BaseParamOffloader):
         super().__init__(module, param_name)
         self._rank = get_naive_distributed().get_rank()
         self._world_size = get_naive_distributed().get_world_size()
+
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
 
         assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
         assert (
