@@ -190,7 +190,6 @@ class EPMoE(FusedMoE):
         prefix: str = "",
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
-        use_per_token_if_dynamic: bool = True,
     ):
         super().__init__(
             num_experts=num_experts,
@@ -206,48 +205,14 @@ class EPMoE(FusedMoE):
             activation=activation,
             routed_scaling_factor=routed_scaling_factor,
             enable_ep_moe=True,
-            skip_quant=True,
         )
 
-        if params_dtype is None:
-            params_dtype = torch.get_default_dtype()
-
-        self.layer_id = layer_id
-        self.num_local_experts, self.expert_map = self.determine_expert_map()
         self.start_expert_id = self.ep_rank * self.num_local_experts
         self.end_expert_id = self.start_expert_id + self.num_local_experts - 1
 
         self.intermediate_size = intermediate_size
-        self.use_per_token_if_dynamic = use_per_token_if_dynamic
 
-        # TODO(ch-wan): move quant preparation to FusedMoE
-        if quant_config is None:
-            self.quant_method: Optional[QuantizeMethodBase] = (
-                UnquantizedFusedMoEMethod()
-            )
-            self.use_fp8_w8a8 = False
-            self.use_block_quant = False
-            self.block_shape = None
-            self.activation_scheme = None
-            self.w13_input_scale = None
-            self.w2_input_scale = None
-            self.w13_weight_scale = None
-            self.w2_weight_scale = None
-        elif isinstance(quant_config, W4AFp8Config):
-            self.quant_method: Optional[QuantizeMethodBase] = W4AFp8MoEMethod(
-                quant_config
-            )
-            self.use_fp8_w8a8 = False
-            self.use_block_quant = False
-            self.fp8_dtype = torch.float8_e4m3fn
-            self.w13_input_scale = None
-            self.w2_input_scale = None
-            self.w13_weight_scale = None
-            self.w2_weight_scale = None
-            self.activation_scheme = quant_config.moe_activation_scheme
-        elif isinstance(quant_config, Fp8Config):
-            self.quant_method: Optional[QuantizeMethodBase] = Fp8MoEMethod(quant_config)
-            self.use_fp8_w8a8 = True
+        if isinstance(quant_config, Fp8Config):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.block_shape = (
                 self.quant_method.quant_config.weight_block_size
@@ -257,62 +222,15 @@ class EPMoE(FusedMoE):
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
         else:
-            raise ValueError(f"Unsupported quant_config: {quant_config}")
+            self.use_fp8_w8a8 = False
+            self.use_block_quant = False
+            self.block_shape = None
+            self.activation_scheme = None
+            self.w13_input_scale = None
+            self.w2_input_scale = None
+            self.w13_weight_scale = None
+            self.w2_weight_scale = None
 
-        self.quant_config = quant_config
-        self.quant_method.create_weights(
-            layer=self,
-            num_experts=self.num_local_experts,
-            hidden_size=hidden_size,
-            intermediate_size=self.intermediate_size,
-            params_dtype=params_dtype,
-            weight_loader=self.weight_loader,
-        )
-
-        self.grouped_gemm_runner = None
-
-    # Adapted from https://github.com/vllm-project/vllm/blob/9fb52e523abf7bdaf7e60cf2971edb5a1b13dc08/vllm/model_executor/layers/fused_moe/layer.py#L544C1-L586C43
-    # Modifications: use determine_expert_map as a class internal function, set 'global_num_experts' rather than '-1' for experts not assigned to the current rank.
-    def determine_expert_map(self) -> Tuple[int, Optional[torch.Tensor]]:
-        """
-        Calculates how many experts should be assigned to each rank for EP and
-        creates a mapping from global to local expert index. Experts are
-        distributed evenly across ranks. Any remaining are assigned to the
-        last rank.
-
-        Returns:
-            Tuple[int, Optional[torch.Tensor]]: A tuple containing:
-                - local_num_experts (int): The number of experts assigned
-                    to the current rank.
-                - expert_map (Optional[torch.Tensor]): A tensor of shape
-                    (global_num_experts,) mapping from global to local index.
-                    Contains global_num_experts for experts not assigned to the current rank.
-                    Returns None if ep_size is 1.
-        """
-        ep_size = self.ep_size
-        ep_rank = self.ep_rank
-        global_num_experts = self.num_experts
-
-        assert ep_size > 0
-        if ep_size == 1:
-            return (global_num_experts, None)
-
-        local_num_experts = global_num_experts // ep_size
-
-        expert_map = torch.full(
-            (global_num_experts,), global_num_experts, dtype=torch.int32
-        )
-        if ep_rank < (ep_size - 1):
-            expert_map[
-                ep_rank * local_num_experts : (ep_rank + 1) * local_num_experts
-            ] = torch.arange(0, local_num_experts, dtype=torch.int32)
-        else:
-            local_num_experts = global_num_experts - ep_rank * local_num_experts
-
-            expert_map[-local_num_experts:] = torch.arange(
-                0, local_num_experts, dtype=torch.int32
-            )
-        return (local_num_experts, expert_map)
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
@@ -479,248 +397,6 @@ class EPMoE(FusedMoE):
 
     def forward_normal(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         return self.quant_method.apply(self, hidden_states, topk_output)
-
-    def run_moe(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-
-        topk_weights, topk_ids, _ = topk_output
-
-        hidden_states_shape = hidden_states.shape
-        hidden_states_dtype = hidden_states.dtype
-        hidden_states_device = hidden_states.device
-        if self.grouped_gemm_runner is None:
-            self.grouped_gemm_runner = GroupedGemmRunner(
-                hidden_states.device,
-                use_flashinfer=False,  # TODO: use flashinfer
-                use_per_token_if_dynamic=self.use_per_token_if_dynamic,
-            )
-
-        num_experts = self.num_experts
-
-        reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
-            topk_ids,
-            num_experts,
-        )
-
-        gateup_input = torch.empty(
-            (int(hidden_states.shape[0] * self.top_k), hidden_states.shape[1]),
-            device=hidden_states.device,
-            dtype=(
-                self.fp8_dtype
-                if self.use_fp8_w8a8 and not self.use_block_quant
-                else hidden_states.dtype
-            ),
-        )
-        if self.activation_scheme == "dynamic" and not self.use_block_quant:
-            if self.use_per_token_if_dynamic:
-                max_value = torch.max(hidden_states, dim=1).values.to(torch.float32)
-                self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
-            else:
-                max_value = (
-                    torch.max(hidden_states)
-                    .repeat(self.num_local_experts)
-                    .to(torch.float32)
-                )
-                self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
-
-        # PreReorder
-        pre_reorder_triton_kernel[(hidden_states.shape[0],)](
-            hidden_states,
-            gateup_input,
-            src2dst,
-            topk_ids,
-            self.w13_input_scale,
-            self.start_expert_id,
-            self.end_expert_id,
-            self.top_k,
-            hidden_states.shape[1],
-            BLOCK_SIZE=512,
-            use_per_token_if_dynamic=self.use_per_token_if_dynamic,
-        )
-        dispose_tensor(hidden_states)
-
-        if (
-            self.activation_scheme == "dynamic"
-            and not self.use_block_quant
-            and self.use_per_token_if_dynamic
-        ):
-            scale = torch.empty(
-                hidden_states_shape[0] * self.top_k,
-                device=hidden_states_device,
-                dtype=torch.float32,
-            )
-            scale[src2dst] = (
-                self.w13_input_scale.unsqueeze(1)
-                .expand(hidden_states_shape[0], self.top_k)
-                .reshape(-1)
-            )
-            self.w13_input_scale = scale
-
-        seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
-        weight_indices_cur_rank = torch.arange(
-            0,
-            self.num_local_experts,
-            device=hidden_states_device,
-            dtype=torch.int64,
-        )
-        # GroupGemm-0
-        gateup_output = self.grouped_gemm_runner(
-            a=gateup_input,
-            b=self.w13_weight,
-            c=None,
-            c_dtype=hidden_states_dtype,
-            batch_size=self.num_local_experts,
-            weight_column_major=True,
-            seg_indptr=seg_indptr_cur_rank,
-            weight_indices=weight_indices_cur_rank,
-            use_fp8_w8a8=self.use_fp8_w8a8,
-            scale_a=self.w13_input_scale,
-            scale_b=self.w13_weight_scale,
-            block_shape=self.block_shape,
-        )
-        del gateup_input
-
-        # Act
-        if self.activation_scheme == "dynamic" and not self.use_block_quant:
-            self.w2_input_scale = None
-            down_input = torch.empty(
-                gateup_output.shape[0],
-                gateup_output.shape[1] // 2,
-                device=gateup_output.device,
-                dtype=hidden_states_dtype,
-            )
-        else:
-            down_input = torch.empty(
-                gateup_output.shape[0],
-                gateup_output.shape[1] // 2,
-                device=gateup_output.device,
-                dtype=(
-                    self.fp8_dtype
-                    if (self.use_fp8_w8a8 and not self.use_block_quant)
-                    else hidden_states_dtype
-                ),
-            )
-
-        if self.activation == "silu":
-            silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
-                gateup_output,
-                down_input,
-                gateup_output.shape[1],
-                reorder_topk_ids,
-                self.w2_input_scale,
-                self.start_expert_id,
-                self.end_expert_id,
-                BLOCK_SIZE=512,
-            )
-        elif self.activation == "gelu":
-            gelu_and_mul_triton_kernel[(gateup_output.shape[0],)](
-                gateup_output,
-                down_input,
-                gateup_output.shape[1],
-                reorder_topk_ids,
-                self.w2_input_scale,
-                self.start_expert_id,
-                self.end_expert_id,
-                BLOCK_SIZE=512,
-            )
-        else:
-            raise ValueError(f"Unsupported activation: {self.activation=}")
-        del gateup_output
-
-        if self.activation_scheme == "dynamic" and not self.use_block_quant:
-            if self.use_per_token_if_dynamic:
-                down_input, self.w2_input_scale = sglang_per_token_quant_fp8(down_input)
-            else:
-                self.w2_input_scale = torch.ones(
-                    self.num_local_experts,
-                    dtype=torch.float32,
-                    device=hidden_states_device,
-                )
-
-        # GroupGemm-1
-        down_output = torch.empty(
-            down_input.shape[0],
-            self.w2_weight.shape[1],
-            device=hidden_states_device,
-            dtype=hidden_states_dtype,
-        )
-        down_output = self.grouped_gemm_runner(
-            a=down_input,
-            b=self.w2_weight,
-            c=down_output,
-            batch_size=self.num_local_experts,
-            weight_column_major=True,
-            seg_indptr=seg_indptr_cur_rank,
-            weight_indices=weight_indices_cur_rank,
-            use_fp8_w8a8=self.use_fp8_w8a8,
-            scale_a=self.w2_input_scale,
-            scale_b=self.w2_weight_scale,
-            block_shape=self.block_shape,
-        )
-        del down_input
-
-        # PostReorder
-        output = torch.empty(
-            hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
-        )
-        post_reorder_triton_kernel[(hidden_states_shape[0],)](
-            down_output,
-            output,
-            src2dst,
-            topk_ids,
-            topk_weights,
-            self.start_expert_id,
-            self.end_expert_id,
-            self.top_k,
-            hidden_states_shape[1],
-            0,
-            BLOCK_SIZE=512,
-        )
-        return output
-
-    @classmethod
-    def make_expert_params_mapping(
-        cls,
-        ckpt_gate_proj_name: str,
-        ckpt_down_proj_name: str,
-        ckpt_up_proj_name: str,
-        num_experts: int,
-    ) -> List[Tuple[str, str, int, str]]:
-        return [
-            # (param_name, weight_name, expert_id, shard_id)
-            (
-                (
-                    "experts.w13_"
-                    if weight_name in [ckpt_gate_proj_name, ckpt_up_proj_name]
-                    else "experts.w2_"
-                ),
-                f"experts.{expert_id}.{weight_name}.",
-                expert_id,
-                shard_id,
-            )
-            for expert_id in range(num_experts)
-            for shard_id, weight_name in [
-                ("w1", ckpt_gate_proj_name),
-                ("w2", ckpt_down_proj_name),
-                ("w3", ckpt_up_proj_name),
-            ]
-        ]
-
-    @classmethod
-    def make_expert_input_scale_params_mapping(
-        cls,
-        num_experts: int,
-    ) -> List[Tuple[str, str, int, str]]:
-        # (param_name, weight_name, expert_id, shard_id)
-        return [
-            (
-                "experts.w13_" if shard_id in ["w1", "w3"] else "experts.w2_",
-                f"experts.{expert_id}.{shard_id}.",
-                expert_id,
-                shard_id,
-            )
-            for expert_id in range(num_experts)
-            for shard_id in ["w1", "w2", "w3"]
-        ]
 
     def weight_loader(
         self,

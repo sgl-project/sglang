@@ -984,22 +984,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.ep_moe.layer import EPMoE
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-
-        if isinstance(layer, EPMoE):
-            layer.w13_weight_scale = (
-                layer.w13_weight_scale_inv
-                if self.block_quant
-                else layer.w13_weight_scale
-            )
-            layer.w2_weight_scale = (
-                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
-            )
-            return layer.run_moe(
-                hidden_states=x,
-                topk_output=topk_output,
-            )
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu

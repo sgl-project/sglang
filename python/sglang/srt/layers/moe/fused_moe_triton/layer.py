@@ -79,7 +79,6 @@ class FusedMoE(torch.nn.Module):
         routed_scaling_factor: Optional[float] = None,
         enable_flashinfer_cutlass_moe: Optional[bool] = False,
         enable_ep_moe: Optional[bool] = False,
-        skip_quant: Optional[bool] = False,
     ):
         super().__init__()
 
@@ -135,9 +134,6 @@ class FusedMoE(torch.nn.Module):
         self.use_triton_kernels = (
             not _is_cpu and global_server_args_dict["enable_triton_kernel_moe"]
         )
-
-        if skip_quant:
-            return
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
@@ -669,4 +665,21 @@ class FusedMoE(torch.nn.Module):
                 ("w2", ckpt_down_proj_name),
                 ("w3", ckpt_up_proj_name),
             ]
+        ]
+
+    @classmethod
+    def make_expert_input_scale_params_mapping(
+        cls,
+        num_experts: int,
+    ) -> List[Tuple[str, str, int, str]]:
+        # (param_name, weight_name, expert_id, shard_id)
+        return [
+            (
+                "experts.w13_" if shard_id in ["w1", "w3"] else "experts.w2_",
+                f"experts.{expert_id}.{shard_id}.",
+                expert_id,
+                shard_id,
+            )
+            for expert_id in range(num_experts)
+            for shard_id in ["w1", "w2", "w3"]
         ]
