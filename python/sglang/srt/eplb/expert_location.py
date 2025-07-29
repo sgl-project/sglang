@@ -82,6 +82,10 @@ class ExpertLocationMetadata:
     def init_trivial(server_args: ServerArgs, model_config: ModelConfig):
         """Trivial location - logical expert i corresponds to physical expert i"""
         common = ExpertLocationMetadata._init_common(server_args, model_config)
+
+        if common is None:
+            return None
+
         num_physical_experts = common["num_physical_experts"]
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_layers = model_config_for_expert_location.num_layers
@@ -109,6 +113,10 @@ class ExpertLocationMetadata:
         physical_to_logical_map = physical_to_logical_map.to(server_args.device)
 
         common = ExpertLocationMetadata._init_common(server_args, model_config)
+
+        if common is None:
+            return None
+
         model_config_for_expert_location = common["model_config_for_expert_location"]
         logical_to_all_physical_map = _compute_logical_to_all_physical_map(
             physical_to_logical_map,
@@ -133,6 +141,10 @@ class ExpertLocationMetadata:
         logical_count = logical_count.to(server_args.device)
 
         common = ExpertLocationMetadata._init_common(server_args, model_config)
+
+        if common is None:
+            return None
+
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_physical_experts = common["num_physical_experts"]
         num_groups = model_config_for_expert_location.num_groups
@@ -167,6 +179,9 @@ class ExpertLocationMetadata:
         model_config_for_expert_location = (
             ModelConfigForExpertLocation.from_model_config(model_config)
         )
+
+        if model_config_for_expert_location is None:
+            return None
 
         num_physical_experts = (
             model_config_for_expert_location.num_logical_experts
@@ -399,10 +414,6 @@ class ModelConfigForExpertLocation:
     num_groups: Optional[int] = None
 
     @staticmethod
-    def init_dummy():
-        return ModelConfigForExpertLocation(num_layers=1, num_logical_experts=1)
-
-    @staticmethod
     def from_model_config(model_config: ModelConfig):
         model_class, _ = get_model_architecture(model_config)
         if hasattr(model_class, "get_model_config_for_expert_location"):
@@ -410,12 +421,12 @@ class ModelConfigForExpertLocation:
                 model_config.hf_config
             )
         else:
-            return ModelConfigForExpertLocation.init_dummy()
+            return None
 
 
 def compute_initial_expert_location_metadata(
     server_args: ServerArgs, model_config: ModelConfig
-) -> ExpertLocationMetadata:
+) -> Optional[ExpertLocationMetadata]:
     data = server_args.init_expert_location
     if data == "trivial":
         return ExpertLocationMetadata.init_trivial(server_args, model_config)

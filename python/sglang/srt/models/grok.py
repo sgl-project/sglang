@@ -78,6 +78,7 @@ class Grok1MoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        layer_id: int,
         num_experts: int,
         top_k: int,
         hidden_size: int,
@@ -128,6 +129,7 @@ class Grok1MoE(nn.Module):
         self.experts = MoEImpl(
             num_experts=num_experts,
             top_k=top_k,
+            layer_id=layer_id,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             params_dtype=params_dtype,
@@ -331,6 +333,7 @@ class Grok1DecoderLayer(nn.Module):
         )
         self.block_sparse_moe = Grok1MoE(
             config=config,
+            layer_id=layer_id,
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,

@@ -43,6 +43,7 @@ class GraniteMoeMoE(nn.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
+        layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
@@ -71,6 +72,7 @@ class GraniteMoeMoE(nn.Module):
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            layer_id=layer_id,
             params_dtype=params_dtype,
             reduce_results=True,
             quant_config=quant_config,
@@ -203,6 +205,7 @@ class GraniteMoeDecoderLayer(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
+            layer_id=layer_id,
             quant_config=quant_config,
             prefix=f"{prefix}.block_sparse_moe",
         )

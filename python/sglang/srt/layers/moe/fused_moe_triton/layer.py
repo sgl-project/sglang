@@ -11,6 +11,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -62,8 +63,9 @@ class FusedMoE(torch.nn.Module):
         num_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        layer_id: int,
         top_k: Optional[int] = None,
-        layer_id: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
         params_dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
@@ -84,6 +86,7 @@ class FusedMoE(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
+        self.layer_id = layer_id
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.tp_size = (
@@ -91,6 +94,7 @@ class FusedMoE(torch.nn.Module):
         )
         self.tp_rank = get_tensor_model_parallel_rank()
         self.num_experts = num_experts
+        self.num_fused_shared_experts = num_fused_shared_experts
         self.expert_map = None
 
         if enable_flashinfer_cutlass_moe and quant_config is None:
@@ -368,6 +372,45 @@ class FusedMoE(torch.nn.Module):
         return self.expert_map[expert_id].item()
 
     def weight_loader(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> None:
+
+        global_expert_location_metadata = get_global_expert_location_metadata()
+        if global_expert_location_metadata is None:
+            self._weight_loader_impl(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+            )
+            return
+
+        if expert_id >= self.num_experts - self.num_fused_shared_experts:
+            # This is a shared expert.
+            physical_expert_ids = [expert_id]
+        else:
+            physical_expert_ids = (
+                global_expert_location_metadata.logical_to_all_physical(
+                    self.layer_id, expert_id
+                )
+            )
+
+        for physical_expert_id in physical_expert_ids:
+            self._weight_loader_physical(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=physical_expert_id,
+            )
+
+    def _weight_loader_physical(
         self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,

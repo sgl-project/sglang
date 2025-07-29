@@ -434,6 +434,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
             + global_server_args_dict["ep_num_redundant_experts"],
+            num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -740,10 +741,11 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
             global_server_args_dict["enable_deepep_moe"]
             or global_server_args_dict["enable_ep_moe"]
         ):
-            disable_reason = "Deepseek GLM-4.5 can not use shared experts fusion optimization when in deepep_moe or ep_moe mode."
+            disable_reason = "Deepseek and GLM-4.5 can not use shared experts fusion optimization when in deepep_moe or ep_moe mode."
 
         if disable_reason is not None:
             global_server_args_dict["disable_shared_experts_fusion"] = True
+            self.num_fused_shared_experts = 0
             log_info_on_rank0(
                 logger,
                 f"{disable_reason} Shared experts fusion optimization is disabled.",

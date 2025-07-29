@@ -87,6 +87,7 @@ class Llama4MoE(nn.Module):
     def __init__(
         self,
         config: Llama4TextConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -114,6 +115,7 @@ class Llama4MoE(nn.Module):
             num_experts=config.num_local_experts,
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size_moe,
+            layer_id=layer_id,
             reduce_results=False,
             quant_config=quant_config,
             apply_router_weight_on_input=True,
@@ -373,6 +375,7 @@ class Llama4DecoderLayer(nn.Module):
         if is_moe_layer:
             self.feed_forward = Llama4MoE(
                 config=config,
+                layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("feed_forward", prefix),
             )
