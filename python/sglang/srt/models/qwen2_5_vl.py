@@ -123,7 +123,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm1 = Qwen2RMSNorm(dim, eps=1e-6)
         self.norm2 = Qwen2RMSNorm(dim, eps=1e-6)
-        
+
         if attn_implementation is None:
             softmax_in_single_precision = False
             qkv_backend = None
