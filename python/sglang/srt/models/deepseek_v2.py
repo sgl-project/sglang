@@ -58,6 +58,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -106,7 +107,8 @@ from sglang.srt.utils import (
     is_hip,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
-    use_intel_amx_backend, make_layers,
+    make_layers,
+    use_intel_amx_backend,
 )
 
 _is_hip = is_hip()
@@ -2002,7 +2004,6 @@ class DeepseekV2Model(nn.Module):
                     else layer.mlp
                 ),
                 whitelist_param_names_creator=lambda module: (
-                    # for simplicity, not offload weight_scale
                     [
                         "w13_weight",
                         "w2_weight",
