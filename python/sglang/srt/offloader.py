@@ -1,18 +1,9 @@
-import base64
-import ctypes
-import gc
+import logging
 import logging
 import os
-import pickle
-import time
 from abc import ABC
-from dataclasses import dataclass
-from multiprocessing import shared_memory
-from pathlib import Path
-from typing import Any, Callable, Generator, List, Optional
+from typing import Callable, Generator, List, Optional
 
-import numpy as np
-import psutil
 import torch
 from torch.func import functional_call
 
@@ -32,8 +23,6 @@ from sglang.srt.naive_distributed import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
-    dispose_tensor,
-    get_bool_env_var,
     get_int_env_var,
     is_pin_memory_available,
 )
