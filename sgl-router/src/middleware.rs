@@ -105,11 +105,22 @@ where
         // Insert request ID into request extensions
         req.extensions_mut().insert(RequestId(request_id.clone()));
 
+        // Log the request with the request ID now that it's available
+        tracing::info!(
+            target: "sglang_router_rs::request",
+            method = %req.method(),
+            uri = %req.uri(),
+            request_id = %request_id,
+            "started processing request"
+        );
+
         // Call the inner service
         let future = self.inner.call(req);
 
         Box::pin(async move {
+            let start_time = Instant::now();
             let mut response = future.await?;
+            let latency = start_time.elapsed();
 
             // Add request ID to response headers
             response.headers_mut().insert(
@@ -117,6 +128,34 @@ where
                 HeaderValue::from_str(&request_id)
                     .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id")),
             );
+
+            // Log the response with proper request ID
+            let status = response.status();
+            if status.is_server_error() {
+                tracing::error!(
+                    target: "sglang_router_rs::response",
+                    request_id = %request_id,
+                    status = %status,
+                    latency = ?latency,
+                    "request failed with server error"
+                );
+            } else if status.is_client_error() {
+                tracing::warn!(
+                    target: "sglang_router_rs::response",
+                    request_id = %request_id,
+                    status = %status,
+                    latency = ?latency,
+                    "request failed with client error"
+                );
+            } else {
+                tracing::info!(
+                    target: "sglang_router_rs::response",
+                    request_id = %request_id,
+                    status = %status,
+                    latency = ?latency,
+                    "finished processing request"
+                );
+            }
 
             Ok(response)
         })
@@ -131,19 +170,14 @@ pub struct RequestSpan;
 
 impl<B> MakeSpan<B> for RequestSpan {
     fn make_span(&mut self, request: &Request<B>) -> Span {
-        // Extract request ID from extensions
-        let request_id = request
-            .extensions()
-            .get::<RequestId>()
-            .map(|id| id.0.as_str())
-            .unwrap_or("unknown");
-
+        // Don't try to extract request ID here - it won't be available yet
+        // The RequestIdLayer runs after TraceLayer creates the span
         info_span!(
             "http_request",
             method = %request.method(),
             uri = %request.uri(),
             version = ?request.version(),
-            request_id = %request_id,
+            request_id = Empty,  // Will be set later
             status_code = Empty,
             latency = Empty,
             error = Empty,
@@ -156,12 +190,16 @@ impl<B> MakeSpan<B> for RequestSpan {
 pub struct RequestLogger;
 
 impl<B> OnRequest<B> for RequestLogger {
-    fn on_request(&mut self, _request: &Request<B>, span: &Span) {
+    fn on_request(&mut self, request: &Request<B>, span: &Span) {
         let _enter = span.enter();
-        tracing::info!(
-            target: "sglang_router_rs::request",
-            "started processing request"
-        );
+
+        // Try to get the request ID from extensions
+        // This will work if RequestIdLayer has already run
+        if let Some(request_id) = request.extensions().get::<RequestId>() {
+            span.record("request_id", &request_id.0.as_str());
+        }
+
+        // Don't log here - we already log in RequestIdService with the proper request_id
     }
 }
 
@@ -213,7 +251,8 @@ impl<B> OnResponse<B> for ResponseLogger {
     }
 }
 
-/// Create a configured TraceLayer for HTTP logging with request ID support
+/// Create a configured TraceLayer for HTTP logging
+/// Note: Actual request/response logging with request IDs is done in RequestIdService
 pub fn create_logging_layer() -> TraceLayer<
     tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
     RequestSpan,
