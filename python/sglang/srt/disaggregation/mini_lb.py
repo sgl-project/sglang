@@ -50,10 +50,17 @@ class PrefillConfig:
 
 
 class MiniLoadBalancer:
-    def __init__(self, prefill_configs: List[PrefillConfig], decode_servers: List[str]):
+    def __init__(
+        self,
+        prefill_configs: List[PrefillConfig],
+        decode_servers: List[str],
+        encoder_servers: Optional[List[str]] = None,
+    ):
         self.prefill_configs = prefill_configs
         self.prefill_servers = [p.url for p in prefill_configs]
         self.decode_servers = decode_servers
+        self.encoder_servers = encoder_servers or []
+        self._encoder_index = 0
 
     def add_prefill_server(self, new_prefill_config: PrefillConfig):
         self.prefill_configs.append(new_prefill_config)
@@ -61,6 +68,17 @@ class MiniLoadBalancer:
 
     def add_decode_server(self, new_decode_server: str):
         self.decode_servers.append(new_decode_server)
+
+    def add_encoder_server(self, new_encoder_server: str):
+        self.encoder_servers.append(new_encoder_server)
+
+    def select_encoder_server(self):
+        if len(self.encoder_servers) == 0:
+            raise ValueError("No encoder servers available")
+
+        server = self.encoder_servers[self._encoder_index]
+        self._encoder_index = (self._encoder_index + 1) % len(self.encoder_servers)
+        return server
 
     def select_pair(self):
         # TODO: return some message instead of panic
@@ -70,6 +88,21 @@ class MiniLoadBalancer:
         prefill_config = random.choice(self.prefill_configs)
         decode_server = random.choice(self.decode_servers)
         return prefill_config.url, prefill_config.bootstrap_port, decode_server
+
+    def select_epd_trio(self):
+        assert len(self.encoder_servers) > 0, "No encoder servers available"
+        assert len(self.prefill_configs) > 0, "No prefill servers available"
+        assert len(self.decode_servers) > 0, "No decode servers available"
+
+        encoder_server = random.choice(self.encoder_servers)
+        prefill_config = random.choice(self.prefill_configs)
+        decode_server = random.choice(self.decode_servers)
+        return (
+            encoder_server,
+            prefill_config.url,
+            prefill_config.bootstrap_port,
+            decode_server,
+        )
 
     async def generate(
         self, modified_request, prefill_server, decode_server, endpoint
@@ -181,14 +214,15 @@ async def health_check():
 
 @app.get("/health_generate")
 async def health_check():
-    prefill_servers, decode_servers = (
+    prefill_servers, decode_servers, encoder_servers = (
         load_balancer.prefill_servers,
         load_balancer.decode_servers,
+        load_balancer.encoder_servers,
     )
     async with aiohttp.ClientSession() as session:
-        # Create the tasks
+        # Create the tasks for all server types
         tasks = []
-        for server in chain(prefill_servers, decode_servers):
+        for server in chain(prefill_servers, decode_servers, encoder_servers):
             tasks.append(session.post(f"{server}/health_generate"))
         for i, response in enumerate(asyncio.as_completed(tasks)):
             await response
@@ -197,14 +231,15 @@ async def health_check():
 
 @app.post("/flush_cache")
 async def flush_cache():
-    prefill_servers, decode_servers = (
+    prefill_servers, decode_servers, encoder_servers = (
         load_balancer.prefill_servers,
         load_balancer.decode_servers,
+        load_balancer.encoder_servers,
     )
     async with aiohttp.ClientSession() as session:
         # Create the tasks
         tasks = []
-        for server in chain(prefill_servers, decode_servers):
+        for server in chain(prefill_servers, decode_servers, encoder_servers):
             tasks.append(session.post(f"{server}/flush_cache"))
         for i, response in enumerate(asyncio.as_completed(tasks)):
             await response
@@ -213,12 +248,14 @@ async def flush_cache():
 
 @app.get("/get_server_info")
 async def get_server_info():
-    prefill_servers, decode_servers = (
+    prefill_servers, decode_servers, encoder_servers = (
         load_balancer.prefill_servers,
         load_balancer.decode_servers,
+        load_balancer.encoder_servers,
     )
     prefill_infos = []
     decode_infos = []
+    encoder_infos = []
     all_internal_states = []
 
     async with aiohttp.ClientSession() as session:
@@ -232,6 +269,9 @@ async def get_server_info():
             # Extract internal_states from decode servers
             if "internal_states" in info_json:
                 all_internal_states.extend(info_json["internal_states"])
+        for server in chain(encoder_servers):
+            server_info = await session.get(f"{server}/get_server_info")
+            encoder_infos.append(await server_info.json())
 
     # Return format expected by bench_one_batch_server.py
     if all_internal_states:
@@ -239,6 +279,7 @@ async def get_server_info():
             "internal_states": all_internal_states,
             "prefill": prefill_infos,
             "decode": decode_infos,
+            "encoder": encoder_infos,
         }
     else:
         # Fallback with dummy data if no internal states found
@@ -251,6 +292,7 @@ async def get_server_info():
             ],
             "prefill": prefill_infos,
             "decode": decode_infos,
+            "encoder": encoder_infos,
         }
 
 
@@ -346,6 +388,32 @@ async def handle_completion_request(request_data: dict):
     return await _forward_to_backend(request_data, "v1/completions")
 
 
+async def _forward_to_encoder(request_data: dict, endpoint_name: str = "generate"):
+    if len(load_balancer.encoder_servers) == 0:
+        raise HTTPException(status_code=503, detail="No encoder servers available")
+
+    assert (
+        endpoint_name[0] != "/"
+    ), f"Endpoint should not start with '/': {endpoint_name}"
+
+    encoder_server = load_balancer.select_encoder_server()
+    modified_request = request_data.copy()
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=3600)
+    ) as session:
+        response = await session.post(
+            f"{encoder_server}/{endpoint_name}", json=modified_request
+        )
+        ret_json = await response.json()
+        return ORJSONResponse(content=ret_json, status_code=response.status)
+
+
+@app.post("/encode")
+async def handle_encode_request(request_data: dict):
+    return await _forward_to_encoder(request_data, "generate")
+
+
 def _generate_bootstrap_room():
     return random.randint(0, 2**63 - 1)
 
@@ -387,23 +455,27 @@ async def register(obj: PDRegistryRequest):
     elif obj.mode == "decode":
         load_balancer.add_decode_server(obj.registry_url)
         logger.info(f"Registered decode server: {obj.registry_url}")
+    elif obj.mode == "encode":
+        load_balancer.add_encoder_server(obj.registry_url)
+        logger.info(f"Registered encoder server: {obj.registry_url}")
     else:
         raise HTTPException(
             status_code=400,
-            detail="Invalid mode. Must be either PREFILL or DECODE.",
+            detail="Invalid mode. Must be either PREFILL, DECODE, or ENCODE.",
         )
 
     logger.info(
         f"#Prefill servers: {len(load_balancer.prefill_configs)}, "
-        f"#Decode servers: {len(load_balancer.decode_servers)}"
+        f"#Decode servers: {len(load_balancer.decode_servers)}, "
+        f"#Encoder servers: {len(load_balancer.encoder_servers)}"
     )
 
     return Response(status_code=200)
 
 
-def run(prefill_configs, decode_addrs, host, port):
+def run(prefill_configs, decode_addrs, host, port, encoder_addrs=None):
     global load_balancer
-    load_balancer = MiniLoadBalancer(prefill_configs, decode_addrs)
+    load_balancer = MiniLoadBalancer(prefill_configs, decode_addrs, encoder_addrs)
     uvicorn.run(app, host=host, port=port)
 
 

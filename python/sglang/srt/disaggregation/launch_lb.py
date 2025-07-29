@@ -10,6 +10,7 @@ class LBArgs:
     policy: str = "random"
     prefill_infos: list = dataclasses.field(default_factory=list)
     decode_infos: list = dataclasses.field(default_factory=list)
+    encoder_infos: list = dataclasses.field(default_factory=list)
     log_interval: int = 5
     timeout: int = 600
 
@@ -54,6 +55,13 @@ class LBArgs:
             help="URLs for decode servers",
         )
         parser.add_argument(
+            "--encode",
+            type=str,
+            default=[],
+            nargs="+",
+            help="URLs for encoder servers",
+        )
+        parser.add_argument(
             "--prefill-bootstrap-ports",
             type=int,
             nargs="+",
@@ -96,6 +104,7 @@ class LBArgs:
             policy=args.policy,
             prefill_infos=prefill_infos,
             decode_infos=args.decode,
+            encoder_infos=args.encode,
             log_interval=args.log_interval,
             timeout=args.timeout,
         )
@@ -133,7 +142,13 @@ def main():
         prefill_configs = [
             PrefillConfig(url, port) for url, port in lb_args.prefill_infos
         ]
-        run(prefill_configs, lb_args.decode_infos, lb_args.host, lb_args.port)
+        run(
+            prefill_configs,
+            lb_args.decode_infos,
+            lb_args.host,
+            lb_args.port,
+            lb_args.encoder_infos,
+        )
 
 
 if __name__ == "__main__":
