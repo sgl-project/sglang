@@ -11,13 +11,6 @@ from sglang.srt.utils import MultiprocessingSerializer
 
 
 class NaiveDistributed:
-    instance: Optional["NaiveDistributed"] = None
-
-    @staticmethod
-    def initialize(**kwargs):
-        assert NaiveDistributed.instance is None
-        NaiveDistributed.instance = NaiveDistributed(**kwargs)
-
     def __init__(self, rank: int, world_size: int, rendezvous: str):
         self._rank = rank
         self._world_size = world_size
@@ -102,3 +95,14 @@ class NaiveDistributed:
     def barrier(self):
         actual_objs = self.all_gather_object(self._rank)
         assert actual_objs == list(range(self._world_size)), f"{actual_objs=}"
+
+# Can have multi instances if needed
+_instance: Optional[NaiveDistributed] = None
+
+def get_naive_distributed():
+    assert _instance is not None
+    return _instance
+
+def set_naive_distributed(instance: NaiveDistributed):
+    global _instance
+    _instance = instance
