@@ -32,6 +32,7 @@ def test_exists():
     assert isinstance(result, dict)
     assert "test_key_0" in result
 
+
 if __name__ == "__main__":
     test_init_and_warmup()
     test_register_buffer()

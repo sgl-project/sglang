@@ -26,10 +26,11 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache, MLATokenToKVPoolHost
 
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
-
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
-
-from sglang.srt.mem_cache.mooncake_store.mooncake_store import MooncakeStore, get_hash_str_mooncake
+from sglang.srt.mem_cache.mooncake_store.mooncake_store import (
+    MooncakeStore,
+    get_hash_str_mooncake,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ class LayerDoneCounter:
     def reset(self):
         with self.conditions[self.producer_index]:
             self.counters[self.producer_index] = 0
+
 
 class CacheOperation:
 
@@ -162,6 +164,7 @@ class TransferBuffer:
 
     def clear(self):
         self.buffers.queue.clear()
+
 
 class StorageOperation:
     counter = 0
@@ -531,8 +534,11 @@ class HiCacheController:
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if isinstance(self.storage_backend, MooncakeStore):
-                    key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(operation.hash_value,
-                                                                                 operation.host_indices)
+                    key_strs, buffer_ptrs, buffer_sizes = (
+                        self.mem_pool_host.get_buffer_meta(
+                            operation.hash_value, operation.host_indices
+                        )
+                    )
                     self.storage_backend.batch_get(key_strs, buffer_ptrs, buffer_sizes)
                     operation.increment(len(operation.hash_value) * self.page_size)
                 else:
@@ -586,12 +592,12 @@ class HiCacheController:
                         )
                     elif isinstance(self.storage_backend, MooncakeStore):
                         last_hash = get_hash_str_mooncake(
-                                last_hash, 
-                                tokens_to_fetch[
-                                    storage_hit_count : storage_hit_count + self.page_size
-                                ],
-                            )
-                    
+                            last_hash,
+                            tokens_to_fetch[
+                                storage_hit_count : storage_hit_count + self.page_size
+                            ],
+                        )
+
                     if isinstance(self.storage_backend, HiCacheFile):
                         exist_result = self.storage_backend.exists(last_hash)
 
@@ -610,7 +616,9 @@ class HiCacheController:
                         break
                 if isinstance(self.storage_backend, MooncakeStore):
                     exist_result = self.storage_backend.exists(hash_value)
-                    storage_hit_count = sum(1 for v in exist_result.values() if v != 0) * self.page_size
+                    storage_hit_count = (
+                        sum(1 for v in exist_result.values() if v != 0) * self.page_size
+                    )
 
                 if self.tp_world_size > 1:
                     storage_hit_count_tensor = torch.tensor(
@@ -684,11 +692,11 @@ class HiCacheController:
                         )
                     elif isinstance(self.storage_backend, MooncakeStore):
                         last_hash = get_hash_str_mooncake(
-                                last_hash, 
-                                tokens_to_backup[
-                                    backup_hit_count : backup_hit_count + self.page_size
-                                ],
-                            )
+                            last_hash,
+                            tokens_to_backup[
+                                backup_hit_count : backup_hit_count + self.page_size
+                            ],
+                        )
                     backup_hit_count += self.page_size
                     hash_value.append(last_hash)
                     remaining_tokens -= self.page_size
@@ -703,12 +711,23 @@ class HiCacheController:
                         for i in range(len(hash_value)):
                             if not exist_hashvalues[hash_value[i]]:
                                 non_exist_keys.append(hash_value[i])
-                                non_exist_indices.extend(indices[i * self.page_size: (i + 1) * self.page_size])
+                                non_exist_indices.extend(
+                                    indices[
+                                        i * self.page_size : (i + 1) * self.page_size
+                                    ]
+                                )
                         if len(non_exist_keys) > 0:
-                            key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(non_exist_keys,
-                                                                                             non_exist_indices)
+                            key_strs, buffer_ptrs, buffer_sizes = (
+                                self.mem_pool_host.get_buffer_meta(
+                                    non_exist_keys, non_exist_indices
+                                )
+                            )
                             # TODO: check the return value of batch set to see how many tokens are set successfully
-                            self.storage_backend.batch_set(key_strs, target_location=buffer_ptrs, target_sizes=buffer_sizes)
+                            self.storage_backend.batch_set(
+                                key_strs,
+                                target_location=buffer_ptrs,
+                                target_sizes=buffer_sizes,
+                            )
                     operation.completed_tokens += len(hash_value) * self.page_size
                 else:
                     for i in range(0, len(tokens_to_backup), self.page_size):
@@ -721,7 +740,9 @@ class HiCacheController:
                             ),
                         )
                         if not success:
-                            logger.warning(f"Failed to write page {last_hash} to storage.")
+                            logger.warning(
+                                f"Failed to write page {last_hash} to storage."
+                            )
                             break
                         operation.completed_tokens += self.page_size
 

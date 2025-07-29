@@ -1,26 +1,24 @@
 import hashlib
-from dataclasses import dataclass
-from typing import List, Optional, Any
-import uuid
 import json
 import logging
 import os
+import uuid
+from dataclasses import dataclass
+from typing import Any, List, Optional
 
-import torch
 import numpy as np
-
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
+import torch
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 128 * 1024 * 1024  # 128 MB
 
 logger = logging.getLogger(__name__)
 
-def get_hash_str_mooncake(
-    prefix_block_key: str, current_page_ids: List
-):
+
+def get_hash_str_mooncake(prefix_block_key: str, current_page_ids: List):
     local_rank = get_tensor_model_parallel_rank()
     prefix_str = ""
     if prefix_block_key:
@@ -30,6 +28,7 @@ def get_hash_str_mooncake(
     current_hash_object = hashlib.sha256(current_token_ids_bytes)
     current_hash_hex = current_hash_object.hexdigest()
     return f"{prefix_str}_{int(current_hash_hex[:16], 16)}_{local_rank}"
+
 
 @dataclass
 class MooncakeStoreConfig:
@@ -79,22 +78,23 @@ class MooncakeStoreConfig:
         return MooncakeStoreConfig(
             local_hostname=os.getenv("LOCAL_HOSTNAME", "localhost"),
             metadata_server=os.getenv("MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"),
-            global_segment_size=int(os.getenv(
-                "MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE
-            )),
-            local_buffer_size=int(os.getenv(
-                "MOONCAKE_LOCAL_BUFFER_SIZE", DEFAULT_LOCAL_BUFFER_SIZE
-            )),
+            global_segment_size=int(
+                os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
+            ),
+            local_buffer_size=int(
+                os.getenv("MOONCAKE_LOCAL_BUFFER_SIZE", DEFAULT_LOCAL_BUFFER_SIZE)
+            ),
             protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
             device_name=os.getenv("MOONCAKE_DEVICE", "auto"),
             master_server_address=os.getenv("MOONCAKE_MASTER"),
         )
-    
 
     def __post_init__(self):
         if self.device_name == "auto":
-            os.environ['MC_MS_AUTO_DISC'] = "1"
-            os.environ['MC_MS_FILTERS'] = "mlx5_bond_0, mlx5_bond_1, mlx5_bond_2, mlx5_bond_3" 
+            os.environ["MC_MS_AUTO_DISC"] = "1"
+            os.environ["MC_MS_FILTERS"] = (
+                "mlx5_bond_0, mlx5_bond_1, mlx5_bond_2, mlx5_bond_3"
+            )
 
 
 class MooncakeStore(HiCacheStorage):
@@ -124,7 +124,7 @@ class MooncakeStore(HiCacheStorage):
             )
             if ret_code:
                 logger.error(f"failed to setup mooncake store, error code: {ret_code}")
-            
+
             logger.info("Connect to Mooncake store successfully.")
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
@@ -135,7 +135,7 @@ class MooncakeStore(HiCacheStorage):
         except Exception as exc:
             logger.error("An error occurred while loading the configuration: %s", exc)
             raise
-        
+
     def warmup(self):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
         # 10 MB
@@ -145,10 +145,7 @@ class MooncakeStore(HiCacheStorage):
         self.store.get(warmup_key)
         self.store.remove(warmup_key)
 
-    def register_buffer(
-        self,
-        buffer: torch.Tensor
-    ) -> None:
+    def register_buffer(self, buffer: torch.Tensor) -> None:
         try:
             buffer_ptr = buffer.data_ptr()
             buffer_size = buffer.numel() * buffer.element_size()
@@ -159,75 +156,68 @@ class MooncakeStore(HiCacheStorage):
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
 
-
     def set(
-        self, 
-        key, 
-        value: Optional[Any] = None, 
+        self,
+        key,
+        value: Optional[Any] = None,
         target_location: Optional[List[int]] = None,
-        target_sizes: Optional[List[int]] = None) -> bool:
+        target_sizes: Optional[List[int]] = None,
+    ) -> bool:
         assert len(key) == len(target_location) == len(target_sizes)
         if len(key) == 0:
             return
 
         for i in range(len(key)):
-            if (key[i] is None
-                or target_location[i] is None
-                or target_sizes[i] is None):
+            if key[i] is None or target_location[i] is None or target_sizes[i] is None:
                 return
 
         self._put_batch_zero_copy_impl(key, target_location, target_sizes)
 
     def batch_set(
-        self, 
-        keys: List[str], 
-        value: Optional[Any] = None, 
+        self,
+        keys: List[str],
+        value: Optional[Any] = None,
         target_location: Optional[List[int]] = None,
-        target_sizes: Optional[List[int]] = None) -> bool:
+        target_sizes: Optional[List[int]] = None,
+    ) -> bool:
         assert len(keys) == len(target_location) == len(target_sizes)
         if len(keys) == 0:
             return
 
         for i in range(len(keys)):
-            if (keys[i] is None
-                or target_location[i] is None
-                or target_sizes[i] is None):
+            if keys[i] is None or target_location[i] is None or target_sizes[i] is None:
                 return
 
         self._put_batch_zero_copy_impl(keys, target_location, target_sizes)
 
     def get(
-        self, 
-        key, 
+        self,
+        key,
         target_location: Optional[Any] = None,
-        target_sizes: Optional[Any] = None
+        target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
         assert len(key) == len(target_location) == len(target_sizes)
         if len(key) == 0:
             return
 
         for i in range(len(key)):
-            if (key[i] is None
-                or target_location[i] is None
-                or target_sizes[i] is None):
+            if key[i] is None or target_location[i] is None or target_sizes[i] is None:
                 return
 
         return self._get_batch_zero_copy_impl(key, target_location, target_sizes)
-    
+
     def batch_get(
-        self, 
-        keys: List[str], 
+        self,
+        keys: List[str],
         target_location: Optional[Any] = None,
-        target_sizes: Optional[Any] = None
+        target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
         assert len(keys) == len(target_location) == len(target_sizes)
         if len(keys) == 0:
             return
 
         for i in range(len(keys)):
-            if (keys[i] is None
-                or target_location[i] is None
-                or target_sizes[i] is None):
+            if keys[i] is None or target_location[i] is None or target_sizes[i] is None:
                 return
 
         return self._get_batch_zero_copy_impl(keys, target_location, target_sizes)
@@ -245,8 +235,7 @@ class MooncakeStore(HiCacheStorage):
         return result
 
     def delete(self, key) -> None:
-        raise(NotImplementedError)
-    
+        raise (NotImplementedError)
 
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
@@ -254,13 +243,10 @@ class MooncakeStore(HiCacheStorage):
         pass
 
     def clear(self) -> None:
-        raise(NotImplementedError)
+        raise (NotImplementedError)
 
     def _put_batch_zero_copy_impl(
-        self,
-        key_strs: List[str],
-        buffer_ptrs: List[int],
-        buffer_sizes: List[int]
+        self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> None:
         try:
             self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
@@ -269,10 +255,7 @@ class MooncakeStore(HiCacheStorage):
             raise TypeError("Mooncake Store Put Type Error.") from err
 
     def _get_batch_zero_copy_impl(
-        self,
-        key_strs: List[str],
-        buffer_ptrs: List[int],
-        buffer_sizes: List[int]
+        self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> None:
         try:
             self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
