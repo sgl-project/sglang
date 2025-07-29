@@ -29,10 +29,10 @@ def sglang_per_token_quant_fp8(
     return output, scale
 
 
-def calculate_diff(batch_size: int, seq_len: int):
+def calculate_diff(batch_size: int, seq_len: int, hidden_dim: int):
     """Calculate difference between VLLM and SGLang implementations."""
     device = torch.device("cuda")
-    x = torch.rand((batch_size, seq_len), dtype=torch.float16, device=device)
+    x = torch.rand((batch_size * seq_len, hidden_dim), dtype=torch.float16, device=device)
 
     vllm_out, vllm_scale = vllm_per_token_quant_fp8(x)
     sglang_out, sglang_scale = sglang_per_token_quant_fp8(x)
@@ -43,20 +43,22 @@ def calculate_diff(batch_size: int, seq_len: int):
     if torch.allclose(
         vllm_out.to(torch.float32), sglang_out.to(torch.float32), rtol=1e-3, atol=1e-5
     ) and torch.allclose(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-5):
-        print("✅ All implementations match")
+        print(f"✅ All implementations match for hidden_dim={hidden_dim}")
     else:
-        print("❌ Implementations differ")
+        print(f"❌ Implementations differ for hidden_dim={hidden_dim}")
 
 
 batch_size_range = [16, 32, 64, 128]
 seq_len_range = [64, 128, 256, 512, 1024, 2048, 4096]
+hidden_dim_range = [1368, 4096]
+# hidden_dim_range = [2048, 4096]
 
-configs = list(itertools.product(batch_size_range, seq_len_range))
+configs = list(itertools.product(batch_size_range, seq_len_range, hidden_dim_range))
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["batch_size", "seq_len"],
+        x_names=["batch_size", "seq_len", "hidden_dim"],
         x_vals=configs,
         line_arg="provider",
         line_vals=["vllm", "sglang"],
@@ -67,11 +69,11 @@ configs = list(itertools.product(batch_size_range, seq_len_range))
         args={},
     )
 )
-def benchmark_quantization(batch_size, seq_len, provider):
+def benchmark_quantization(batch_size, seq_len, hidden_dim, provider):
     dtype = torch.float16
     device = torch.device("cuda")
 
-    x = torch.randn(batch_size * seq_len, 4096, device=device, dtype=dtype)
+    x = torch.randn(batch_size * seq_len, hidden_dim, device=device, dtype=dtype)
 
     quantiles = [0.5, 0.2, 0.8]
 
@@ -86,5 +88,10 @@ def benchmark_quantization(batch_size, seq_len, provider):
 
 
 if __name__ == "__main__":
-    calculate_diff(batch_size=4, seq_len=4096)
+    # Test both hidden dimensions for correctness
+    print("Testing hidden_dim=1368:")
+    calculate_diff(batch_size=4, seq_len=4096, hidden_dim=1368)
+    print("Testing hidden_dim=4096:")
+    calculate_diff(batch_size=4, seq_len=4096, hidden_dim=4096)
+    
     benchmark_quantization.run(print_data=True)
