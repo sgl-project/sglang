@@ -242,9 +242,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         topk_idx = topk_idx.to(torch.int64)
-        if (
-            not global_server_args_dict["enable_flashinfer_moe"]
-        ) and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -257,10 +255,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return hidden_states, topk_idx, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
-        if (
-            global_server_args_dict["enable_flashinfer_moe"]
-            or deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-        ):
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             (
                 hidden_states,
                 topk_idx,
@@ -435,11 +430,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        if (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            or global_server_args_dict["enable_flashinfer_moe"]
-            or _use_aiter
-        ):
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter:
             output = hidden_states
         else:
             if hidden_states.shape[0] > 0:
