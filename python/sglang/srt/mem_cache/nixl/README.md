@@ -74,27 +74,22 @@ Note: The `-o asyncio_mode=strict` flag is added to suppress warnings about asyn
 
 ## Test Coverage
 
-The unified test suite (`test_nixl_unified.py`) covers:
+Tests for this integration, a test suite can be found at `test_hicache_nixl_storage.py` which covers:
 
 ### HiCache Integration Tests (4 tests)
 - Single tensor set/get operations
 - Batch tensor set/get operations
 - Mixed single and batch operations
-- Error handling in set/get operations
+- Data integrity for various tensor types
 
 ### File Management Tests (5 tests)
 - Basic file operations
 - NIXL tuple creation
 - Error handling in file operations
-- File descriptor cleanup on failure
 
 ### Registration Tests (2 tests)
 - Tensor registration with memory type detection
 - File registration using NIXL tuples
-
-### Backend Selection Tests (1 test)
-- NixlBackendSelection class testing
-- Priority order verification (3FS > POSIX > GDS_MT > GDS)
 
 ## Expected Output
 
@@ -153,7 +148,7 @@ The NIXL backend selection follows this priority order:
     - Best for high-throughput file operations using Deepseek 3FS APIs
 2. **POSIX** - Standard file I/O (fallback)
     - Universal compatibility
-    - Good for development and testing - Levearges both libaio/liburing
+    - Good for development and testing - Leverages both libaio/liburing
 3. **GDS_MT** - Multi-threaded GDS (if available)
     - Optimized for concurrent operations
     - Supports GPU Direct storage with multiple light weight threads

@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import time
 import uuid
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -39,7 +40,7 @@ class HiCacheNixl(HiCacheStorage):
 
         self.backend_selector = NixlBackendSelection(plugin)
         if not self.backend_selector.create_backend(self.agent):
-            raise Exception("Failed to create NIXL backend")
+            raise RuntimeError("Failed to create NIXL backend")
 
         self.registration = NixlRegistration(self.agent)
 
@@ -95,6 +96,7 @@ class HiCacheNixl(HiCacheStorage):
                 if state == "ERR":
                     logger.error("Transfer failed")
                     return False
+            time.sleep(0.0001) # Can be changed to os.sched_yield() or parametrized
             return True
 
         except Exception as e:
@@ -123,7 +125,9 @@ class HiCacheNixl(HiCacheStorage):
     def set(self, key: str, value: torch.Tensor) -> bool:
         return self.batch_set([key], [value])
 
-    def get(self, key: str, dst_tensor: torch.Tensor) -> torch.Tensor | None:
+    def get(self, key: str, dst_tensor: Optional[torch.Tensor] = None) -> torch.Tensor | None:
+        if dst_tensor is None: # To be removed, being compatible with the current API
+            return None
         result = self.batch_get([key], [dst_tensor])
         return result[0] if result else None
 

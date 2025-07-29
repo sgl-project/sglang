@@ -97,7 +97,7 @@ class HiCacheFile(HiCacheStorage):
                         .reshape(target_location.shape)
                         .storage()
                     )
-                return None
+                return target_location
             else:
                 loaded_tensor = torch.load(tensor_path)
                 if isinstance(loaded_tensor, torch.Tensor):

@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Any
 
 import torch
 
@@ -10,12 +10,10 @@ logger = logging.getLogger(__name__)
 class NixlBackendSelection:
     """Handles NIXL backend selection and creation."""
 
-    # File-based plugins
-    FILE_PLUGINS = {"3FS", "POSIX", "GDS_MT", "GDS"}
-    # Object-based plugins (add more as needed)
-    OBJ_PLUGINS = {"OBJ"}  # Based on Amazon S3 SDK
-    # Priority order for auto selection
-    AUTO_PRIORITY = ["3FS", "POSIX", "GDS_MT", "GDS", "OBJ"]
+    # Priority order for File-based plugins in case of auto selection
+    FILE_PLUGINS = ["3FS", "POSIX", "GDS_MT", "GDS"]
+    # Priority order for File-based plugins in case of auto selection (add more as needed)
+    OBJ_PLUGINS = ["OBJ"]  # Based on Amazon S3 SDK
 
     def __init__(self, plugin: str = "auto"):
         """Initialize backend selection.
@@ -112,7 +110,7 @@ class NixlRegistration:
 
     def _register_memory(
         self, items: Union[List[tuple], List[torch.Tensor]], mem_type: str, desc: str
-    ) -> Optional[any]:
+    ) -> Optional[Any]:
         """Common registration logic for files, objects, and buffers.
         Args:
             items: List of tuples or tensors to register
@@ -141,7 +139,7 @@ class NixlRegistration:
 
     def register_buffers(
         self, buffers: Union[torch.Tensor, List[torch.Tensor]]
-    ) -> Optional[any]:
+    ) -> Optional[Any]:
         """Register tensors/buffers with NIXL."""
         if isinstance(buffers, torch.Tensor):
             buffers = [buffers]
@@ -153,13 +151,13 @@ class NixlRegistration:
         mem_type = "VRAM" if buffers[0].device.type == "cuda" else "DRAM"
         return self._register_memory(buffers, mem_type, "buffers")
 
-    def register_files(self, tuples: List[tuple]) -> Optional[any]:
+    def register_files(self, tuples: List[tuple]) -> Optional[Any]:
         """Register files with NIXL using (0, 0, fd, file_path) tuples."""
         return self._register_memory(tuples, "FILE", "files")
 
     def register_objects(
         self, keys: List[str], tensors: Optional[List[torch.Tensor]] = None
-    ) -> Optional[any]:
+    ) -> Optional[Any]:
         """Register objects with NIXL."""
         if not keys:
             return None
@@ -233,7 +231,8 @@ class NixlFileManager:
         for path in file_paths:
             if (fd := self.open_file(path)) is None:
                 # Clean up on failure
-                [self.close_file(t[2]) for t in tuples]
+                for t in tuples:
+                    self.close_file(t[2])
                 return []
             tuples.append((0, 0, fd, path))
         return tuples
