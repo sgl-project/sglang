@@ -372,13 +372,6 @@ def _move_param_to_meta(module, param_name):
 
     setattr(module, param_name, new_param)
 
-    # logger.info(f"hi move_param_to_meta {old_param.device=} {old_param.dtype=} {old_param.shape=}")
-    # dispose_tensor(old_param)
-    #
-    # # TODO do not call it *per* param
-    # gc.collect()
-    # trim_memory()
-
 
 def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
     return torch.empty_strided(
@@ -423,15 +416,3 @@ def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tens
 
     return output_tensors
 
-
-def trim_memory():
-    rss_before = psutil.Process().memory_info().rss
-
-    libc = ctypes.CDLL("libc.so.6")
-    ret = libc.malloc_trim(0)
-
-    rss_after = psutil.Process().memory_info().rss
-
-    logger.info(
-        f"trim_memory {ret=} {rss_after=} {rss_before=} reduced={rss_before - rss_after}"
-    )
