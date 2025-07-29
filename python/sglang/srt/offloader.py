@@ -17,11 +17,18 @@ import torch
 from torch.func import functional_call
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.host_shared_memory import get_host_shared_memory_manager, set_host_shared_memory_manager, \
-    HostSharedMemoryManager
+from sglang.srt.host_shared_memory import (
+    HostSharedMemoryManager,
+    get_host_shared_memory_manager,
+    set_host_shared_memory_manager,
+)
 from sglang.srt.layers.parameter import ModelWeightParameter
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.naive_distributed import get_naive_distributed, set_naive_distributed, NaiveDistributed
+from sglang.srt.naive_distributed import (
+    NaiveDistributed,
+    get_naive_distributed,
+    set_naive_distributed,
+)
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     dispose_tensor,
@@ -46,15 +53,19 @@ class ModuleOffloader:
 
         # Temporarily init inside Offloader, can move if other modules also need this
         if self.mode in {"sharded_gpu", "shm_cpu"}:
-            set_naive_distributed(NaiveDistributed(
-                rank=global_server_args_dict["dp_rank"],
-                world_size=global_server_args_dict["dp_size"],
-                rendezvous=TODO,
-            ))
+            set_naive_distributed(
+                NaiveDistributed(
+                    rank=global_server_args_dict["dp_rank"],
+                    world_size=global_server_args_dict["dp_size"],
+                    rendezvous=TODO,
+                )
+            )
         if self.mode in {"shm_cpu"}:
-            set_host_shared_memory_manager(HostSharedMemoryManager(
-                base_name=TODO,
-            ))
+            set_host_shared_memory_manager(
+                HostSharedMemoryManager(
+                    base_name=TODO,
+                )
+            )
 
     def wrap_modules(
         self,
@@ -422,4 +433,3 @@ def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tens
             )
 
     return output_tensors
-

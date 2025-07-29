@@ -10,11 +10,10 @@ import numpy as np
 import torch
 
 from sglang.srt.naive_distributed import get_naive_distributed
-from sglang.srt.utils import (
-    check_cuda_result,
-)
+from sglang.srt.utils import check_cuda_result
 
 logger = logging.getLogger(__name__)
+
 
 class HostSharedMemoryManager:
     def __init__(self, base_name: str):
@@ -68,12 +67,15 @@ class _Record:
     np_array: np.ndarray
     tensor: torch.Tensor
 
+
 # Can have multi instances if needed
 _instance: Optional[HostSharedMemoryManager] = None
+
 
 def get_host_shared_memory_manager():
     assert _instance is not None
     return _instance
+
 
 def set_host_shared_memory_manager(instance: HostSharedMemoryManager):
     global _instance

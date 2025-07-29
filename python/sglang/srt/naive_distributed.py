@@ -96,12 +96,15 @@ class NaiveDistributed:
         actual_objs = self.all_gather_object(self._rank)
         assert actual_objs == list(range(self._world_size)), f"{actual_objs=}"
 
+
 # Can have multi instances if needed
 _instance: Optional[NaiveDistributed] = None
+
 
 def get_naive_distributed():
     assert _instance is not None
     return _instance
+
 
 def set_naive_distributed(instance: NaiveDistributed):
     global _instance
