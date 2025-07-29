@@ -9,7 +9,7 @@ import cuda.bindings.runtime as cuda_rt
 import numpy as np
 import torch
 
-from sglang.srt.naive_distributed import NaiveDistributed
+from sglang.srt.naive_distributed import get_naive_distributed
 from sglang.srt.utils import (
     check_cuda_result,
 )
@@ -32,12 +32,12 @@ class _HostSharedMemoryManager:
         shm_name = f"{self._base_name}_op{self._operation_index}"
 
         # TODO handle dispose
-        if NaiveDistributed.instance.get_rank() == 0:
+        if get_naive_distributed().get_rank() == 0:
             shm = shared_memory.SharedMemory(name=shm_name, create=True, size=num_bytes)
 
-        NaiveDistributed.instance.barrier()
+        get_naive_distributed().barrier()
 
-        if NaiveDistributed.instance.get_rank() != 0:
+        if get_naive_distributed().get_rank() != 0:
             shm = shared_memory.SharedMemory(name=shm_name)
 
         np_array = np.ndarray((num_bytes,), dtype=np.uint8, buffer=shm.buf)
@@ -50,7 +50,7 @@ class _HostSharedMemoryManager:
             )
         )
 
-        NaiveDistributed.instance.barrier()
+        get_naive_distributed().barrier()
 
         self._records.append(
             _Record(

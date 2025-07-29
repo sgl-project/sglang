@@ -115,7 +115,7 @@ class ModuleOffloader:
             memory_profile_path = os.path.join(
                 "/data/numa0/tom/temp_sglang_server2local",
                 str(time.time())
-                + f"-DP-{NaiveDistributed.instance.get_rank()}-memory"
+                + f"-DP-{get_naive_distributed().get_rank()}-memory"
                 + ".pickle",
             )
             torch.cuda.memory._dump_snapshot(memory_profile_path)
@@ -252,8 +252,8 @@ class _CpuParamOffloader(_BaseParamOffloader):
 class _ShmCpuParamOffloader(_BaseParamOffloader):
     def __init__(self, module, param_name):
         super().__init__(module, param_name)
-        self._rank = NaiveDistributed.instance.get_rank()
-        self._world_size = NaiveDistributed.instance.get_world_size()
+        self._rank = get_naive_distributed().get_rank()
+        self._world_size = get_naive_distributed().get_world_size()
 
         assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
         assert (
@@ -269,7 +269,7 @@ class _ShmCpuParamOffloader(_BaseParamOffloader):
             self._param.data = self.shm_cpu_data
         else:
             _move_param_to_meta(self._module, self._param_name)
-        NaiveDistributed.instance.barrier()
+        get_naive_distributed().barrier()
 
     def post_init(self):
         if self._rank == 0:
@@ -287,8 +287,8 @@ class _ShmCpuParamOffloader(_BaseParamOffloader):
 class _ShardedGpuParamOffloader(_BaseParamOffloader):
     def __init__(self, module, param_name):
         super().__init__(module, param_name)
-        self._rank = NaiveDistributed.instance.get_rank()
-        self._world_size = NaiveDistributed.instance.get_world_size()
+        self._rank = get_naive_distributed().get_rank()
+        self._world_size = get_naive_distributed().get_world_size()
 
         assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
         assert (
@@ -325,7 +325,7 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
             local_tensor=sharded_param
         )
 
-        NaiveDistributed.instance.scatter(
+        get_naive_distributed().scatter(
             sharded_param, scatter_list if self._rank == 0 else None
         )
 
@@ -404,10 +404,10 @@ def _empty_strided_like(x: torch.Tensor, device, pin_memory=False):
 
 
 def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tensor]:
-    self_rank = NaiveDistributed.instance.get_rank()
-    world_size = NaiveDistributed.instance.get_world_size()
+    self_rank = get_naive_distributed().get_rank()
+    world_size = get_naive_distributed().get_world_size()
 
-    object_list = NaiveDistributed.instance.all_gather_object(
+    object_list = get_naive_distributed().all_gather_object(
         dict(
             dup_serialized_local_tensor=[
                 (
