@@ -79,17 +79,16 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         yield module
         return
 
-    print("hack!!! device_loading_context")
-    # original_device_states: Dict[str, torch.device] = {}
-    original_params = {}
+    original_info: Dict[str, Dict] = {}
 
     # Store original device states and move parameters to GPU if they're on CPU
     for name, p in module.named_parameters():
         if p.device.type == "cpu":
-            # original_device_states[name] = p.device
-            original_params[name] = p.data
+            original_info[name] = dict(
+                device=p.device,
+                data=p.data,
+            )
             p.data = p.data.to(target_device)
-            assert p.data.is_contiguous()
         # Parameters already on target device are not touched
 
     try:
