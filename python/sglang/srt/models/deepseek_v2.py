@@ -325,6 +325,7 @@ class DeepseekV2MoE(nn.Module):
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
             + global_server_args_dict["ep_num_redundant_experts"],
+            num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -2112,6 +2113,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         if disable_reason is not None:
             global_server_args_dict["disable_shared_experts_fusion"] = True
+            self.num_fused_shared_experts = 0
             log_info_on_rank0(
                 logger,
                 f"{disable_reason} Shared experts fusion optimization is disabled.",
