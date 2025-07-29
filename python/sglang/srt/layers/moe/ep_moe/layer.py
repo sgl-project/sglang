@@ -1263,7 +1263,7 @@ class DeepEPMoE(EPMoE):
         self,
         dispatch_output: DeepEPLLOutput,
     ):
-        hidden_states_fp8, _, _, masked_m, expected_m = dispatch_output
+        hidden_states_fp8, _, _, masked_m, _, expected_m = dispatch_output
         assert self.quant_method is not None
         assert self.activation == "silu"
 
@@ -1434,6 +1434,21 @@ class AscendDeepEPMoE(EPMoE):
             routed_scaling_factor=routed_scaling_factor,
         )
         self.deepep_mode = deepep_mode
+        from sglang.srt.distributed.parallel_state import get_tp_group
+        from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
+
+        self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
+            group=get_tp_group().device_group,
+            router_topk=self.top_k,
+            permute_fusion=True,
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
+            hidden_size=hidden_size,
+            params_dtype=params_dtype,
+            deepep_mode=deepep_mode,
+            async_finish=True,
+            return_recv_hook=True,
+        )
 
     def weight_loader(
         self,
@@ -1526,15 +1541,24 @@ class AscendDeepEPMoE(EPMoE):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        reorder_topk_ids: torch.Tensor,
-        seg_indptr: torch.Tensor,
-        masked_m: torch.Tensor,
-        expected_m: int,
-        num_recv_tokens_per_expert: List[int],
         forward_batch: ForwardBatch,
     ):
         assert self.quant_method is not None
         assert self.activation == "silu"
+
+        (
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            masked_m,
+            seg_indptr,
+            expected_m
+        ) = self.deepep_dispatcher.dispatch(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            forward_batch=forward_batch,
+        )
         output_dtype = torch.bfloat16
 
         pertoken_scale = hidden_states[1]
@@ -1575,6 +1599,13 @@ class AscendDeepEPMoE(EPMoE):
             group_list=seg_indptr,
             output_dtype=output_dtype,
         )[0]
+
+        hidden_states = self.deepep_dispatcher.combine(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            forward_batch=forward_batch,
+        )
 
         return hidden_states
 

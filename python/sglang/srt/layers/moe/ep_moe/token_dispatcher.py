@@ -84,6 +84,7 @@ class DeepEPLLOutput(NamedTuple):
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
     masked_m: torch.Tensor
+    seg_indptr: torch.Tensor
     expected_m: int
 
     @property
@@ -160,20 +161,20 @@ class DeepEPBuffer:
             num_qps_per_rank = num_experts // group.size()
         else:
             raise NotImplementedError
-
-        total_num_sms = torch.cuda.get_device_properties(
-            device="cuda"
-        ).multi_processor_count
-        if (
-            (deepep_mode != DeepEPMode.low_latency)
-            and not global_server_args_dict["enable_two_batch_overlap"]
-            and (DeepEPConfig.get_instance().num_sms < total_num_sms // 2)
-        ):
-            logger.warning(
-                f"Only use {DeepEPConfig.get_instance().num_sms} SMs for DeepEP communication. "
-                f"This may result in highly suboptimal performance. "
-                f"Consider using --deepep-config to change the behavior."
-            )
+        if not is_npu():
+            total_num_sms = torch.cuda.get_device_properties(
+                device="cuda"
+            ).multi_processor_count
+            if (
+                (deepep_mode != DeepEPMode.low_latency)
+                and not global_server_args_dict["enable_two_batch_overlap"]
+                and (DeepEPConfig.get_instance().num_sms < total_num_sms // 2)
+            ):
+                logger.warning(
+                    f"Only use {DeepEPConfig.get_instance().num_sms} SMs for DeepEP communication. "
+                    f"This may result in highly suboptimal performance. "
+                    f"Consider using --deepep-config to change the behavior."
+                )
 
         cls._buffer = Buffer(
             group,
@@ -523,6 +524,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             topk_idx,
             topk_weights,
             masked_m,
+            self.handle[1],
             expected_m,
         )
 
