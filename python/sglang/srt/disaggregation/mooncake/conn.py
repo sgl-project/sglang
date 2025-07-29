@@ -149,10 +149,6 @@ class MooncakeKVManager(BaseKVManager):
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
         self.enable_dp_attention = server_args.enable_dp_attention
-        if not server_args.enable_dp_attention and server_args.dp_size != 1:
-            raise ValueError(
-                "If dp_attention is not enabled, dp size must be 1 in disaggregation mode."
-            )
         self.request_status: Dict[int, KVPoll] = {}
         self.rank_port = None
         self.server_socket = zmq.Context().socket(zmq.PULL)
