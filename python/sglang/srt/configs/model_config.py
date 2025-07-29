@@ -261,6 +261,9 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
+        self.num_nextn_predict_layers = getattr(
+            self.hf_text_config, "num_nextn_predict_layers", None
+        )
         self.vocab_size = self.hf_text_config.vocab_size
 
         # Verify quantization
