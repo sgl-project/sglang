@@ -49,7 +49,7 @@ class BaseOffloader(ABC):
         submodule_accessor: Optional[_SubmoduleAccessor] = None,
         whitelist_param_names_creator: Optional[_WhitelistParamNamesCreator] = None,
     ):
-        raise NotImplementedError
+        return list(all_modules_generator)
 
 
 class OffloaderV1(BaseOffloader):
@@ -63,7 +63,7 @@ class OffloaderV1(BaseOffloader):
             submodule_accessor: Optional[_SubmoduleAccessor] = None,
             whitelist_param_names_creator: Optional[_WhitelistParamNamesCreator] = None,
     ):
-        raise NotImplementedError
+        TODO
 
     def maybe_offload_to_cpu(self, module: torch.nn.Module) -> torch.nn.Module:
         device = next(module.parameters()).device

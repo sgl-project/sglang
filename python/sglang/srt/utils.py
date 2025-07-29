@@ -458,10 +458,10 @@ def make_layers(
     )
     modules = torch.nn.ModuleList(
         [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
-        + [
-            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
+        + get_offloader().wrap_modules((
+            layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
             for idx in range(start_layer, end_layer)
-        ]
+        ))
         + [
             PPMissingLayer(return_tuple=return_tuple)
             for _ in range(end_layer, num_hidden_layers)
