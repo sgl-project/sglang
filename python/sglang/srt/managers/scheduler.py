@@ -13,7 +13,6 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
-import datetime
 import faulthandler
 import logging
 import os
@@ -21,11 +20,10 @@ import signal
 import sys
 import threading
 import time
-from collections import defaultdict, deque
+from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -37,7 +35,6 @@ from torch.distributed import barrier
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
@@ -47,7 +44,6 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -78,21 +74,15 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
-    GetWeightsByNameReqOutput,
     HealthCheckOutput,
     InitWeightsUpdateGroupReqInput,
-    InitWeightsUpdateGroupReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
-    ProfileReqOutput,
-    ProfileReqType,
     ReleaseMemoryOccupationReqInput,
-    ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
-    ResumeMemoryOccupationReqOutput,
     RpcReqInput,
     RpcReqOutput,
     SetInternalStateReq,
@@ -104,11 +94,8 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
@@ -124,7 +111,10 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
-from sglang.srt.managers.scheduler_metrics_mixin import SchedulerMetricsMixin
+from sglang.srt.managers.scheduler_metrics_mixin import (
+    RECORD_STEP_TIME,
+    SchedulerMetricsMixin,
+)
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )

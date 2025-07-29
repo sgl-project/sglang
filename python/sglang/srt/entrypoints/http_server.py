@@ -269,8 +269,8 @@ async def health_generate(request: Request) -> Response:
     task = asyncio.create_task(gen())
 
     # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
-    tic = time.perf_counter()
-    while time.perf_counter() < tic + HEALTH_CHECK_TIMEOUT:
+    tic = time.time()
+    while time.time() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
