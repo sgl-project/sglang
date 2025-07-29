@@ -78,13 +78,18 @@ spec:
               path: /health
               port: 30000
             initialDelaySeconds: 120
-            periodSeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /health
+              path: /health_generate
               port: 30000
             initialDelaySeconds: 120
-            periodSeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 3
+            successThreshold: 1
       volumes:
         - name: shm
           emptyDir:
