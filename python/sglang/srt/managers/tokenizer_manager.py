@@ -19,7 +19,6 @@ import dataclasses
 import json
 import logging
 import math
-import multiprocessing
 import os
 import pickle
 import signal
@@ -63,10 +62,6 @@ from sglang.srt.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
-)
-from sglang.srt.managers.detokenizer_manager import (
-    deserialize_tokenizer_mapping,
-    read_from_shared_memory,
 )
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.io_struct import (
@@ -1870,7 +1865,6 @@ class TokenizerManager:
         req.ipc_name = self.tokenizer_ipc_name
         self.send_to_scheduler.send_pyobj(req)
         time.sleep(5)
-        return True
      
     def _handle_batch_output(
         self,

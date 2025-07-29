@@ -204,46 +204,6 @@ def get_main_process_id() -> int:
     return multiprocessing.current_process()._parent_pid
 
 
-def serialize_tokenizer_mapping(mapping: Dict[int, str]) -> dict:
-    """Serialize tokenizer_ipc_name mapping into a shareable dictionary"""
-    return mapping
-
-
-def deserialize_tokenizer_mapping(data: dict) -> Dict[int, str]:
-    """Deserialize tokenizer_ipc_name mapping from a shared dictionary"""
-    return data
-
-
-def create_shared_lock() -> Lock:
-    """Create a shared lock"""
-    return Lock()
-
-
-def update_tokenizer_mapping(
-    worker_id: int, ipc_name: str, shm_name: str, lock_value: Value
-) -> tuple[shared_memory.SharedMemory, int]:
-    """Update or create the tokenizer_ipc_name mapping"""
-    with lock_value.get_lock():  # Use a shared lock to ensure inter-process synchronization
-        try:
-            # Try to read the existing mapping
-            existing_data = read_from_shared_memory(shm_name)
-            mapping = deserialize_tokenizer_mapping(existing_data)
-        except FileNotFoundError:
-            # If not present, create a new mapping
-            mapping = {}
-
-        # Update the mapping
-        mapping[worker_id] = ipc_name
-        logger.info(f"worker_id:{worker_id}, mapping:{mapping}")
-
-        # Write to shared memory
-        shm = write_to_shared_memory(
-            serialize_tokenizer_mapping(mapping),
-            shm_name,
-        )
-        return shm, len(mapping)
-
-
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
     server_args = getattr(fast_api_app, "server_args", None)
@@ -287,9 +247,6 @@ async def lifespan(fast_api_app: FastAPI):
         scheduler_info_data = read_from_shared_memory(
             f"scheduler_info_{main_pid}"
         )
-        lock_data = read_from_shared_memory(f"mapping_lock_{main_pid}")
-        lock_value = Value(ctypes.c_int, lock_data["lock_value"])
-
         port_args = deserialize_port_args(port_args_data)
         server_args = deserialize_server_args(server_args_data)
         scheduler_info = deserialize_scheduler_info(scheduler_info_data)
@@ -1162,9 +1119,6 @@ def launch_server(
         current_pid = os.getpid()
         logger.info(f"main process ID: {main_pid}, current process ID: {current_pid}")
 
-        # Create a shared lock value
-        lock_value = Value(ctypes.c_int, 0)
-
         # Write port_args to shared memory
         port_args_shm = write_to_shared_memory(
             serialize_port_args(port_args), f"port_args_{os.getpid()}"
@@ -1173,11 +1127,6 @@ def launch_server(
         server_args_shm = write_to_shared_memory(
             serialize_server_args(server_args), f"server_args_{os.getpid()}"
         )
-        # Write lock value address to shared memory
-        lock_shm = write_to_shared_memory(
-            {"lock_value": lock_value.value}, f"mapping_lock_{os.getpid()}"
-        )
-
         # Write scheduler_info to shared memory
         scheduler_info_shm = write_to_shared_memory(
             serialize_scheduler_info(scheduler_info), f"scheduler_info_{os.getpid()}"
@@ -1186,7 +1135,6 @@ def launch_server(
         port_args_shm.close()
         server_args_shm.close()
         scheduler_info_shm.close()
-        lock_shm.close()
         # template_manager_shm.close()
     else:
         # Send a warmup request - we will create the thread launch it
@@ -1253,7 +1201,6 @@ def launch_server(
             port_args_shm.unlink()
             server_args_shm.unlink()
             scheduler_info_shm.unlink()
-            lock_shm.unlink()
         else:
             warmup_thread.join()
 
