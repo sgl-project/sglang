@@ -86,79 +86,6 @@ if use_flashinfer_trtllm_moe:
 logger = logging.getLogger(__name__)
 
 
-class GroupedGemmRunner(torch.nn.Module):
-    flashinfer_gemm_warpper = None
-
-    def __init__(
-        self,
-        device,
-        use_flashinfer: bool = False,
-        use_per_token_if_dynamic: bool = True,
-    ):
-        super().__init__()
-        self.device = device
-        self.use_flashinfer = use_flashinfer
-        self.use_per_token_if_dynamic = use_per_token_if_dynamic
-        if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_warpper is None:
-            GroupedGemmRunner._init_flashinfer_wrapper(device)
-
-    @classmethod
-    def _init_flashinfer_wrapper(cls, device):
-        from flashinfer import SegmentGEMMWrapper
-
-        workspace_buffer = torch.empty(
-            128 * 1024 * 1024, dtype=torch.int8, device=device
-        )
-        cls.flashinfer_gemm_warpper = SegmentGEMMWrapper(workspace_buffer)
-
-    # c = a * b
-    def forward(
-        self,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        c: torch.Tensor,
-        batch_size: int,
-        weight_column_major: bool,
-        seg_indptr: Optional[torch.Tensor] = None,
-        weight_indices: Optional[torch.Tensor] = None,
-        use_fp8_w8a8: bool = False,
-        scale_a: torch.Tensor = None,
-        scale_b: torch.Tensor = None,
-        block_shape: Optional[List[int]] = None,
-        c_dtype=None,
-    ):
-        if self.use_flashinfer:
-            # TODO: flashinfer
-            assert False
-            assert GroupedGemmRunner.flashinfer_gemm_warpper is not None
-            c = GroupedGemmRunner.flashinfer_gemm_warpper.run(
-                x=a,
-                weights=b,
-                batch_size=batch_size,
-                weight_column_major=weight_column_major,
-                seg_indptr=seg_indptr,
-                weight_indices=weight_indices,
-            )
-        else:
-            assert weight_column_major == True
-            c = grouped_gemm_triton(
-                a,
-                b,
-                c,
-                batch_size,
-                weight_column_major,
-                seg_indptr,
-                weight_indices,
-                use_fp8_w8a8,
-                scale_a,
-                scale_b,
-                block_shape=block_shape,
-                c_dtype=c_dtype,
-                use_per_token_if_dynamic=self.use_per_token_if_dynamic,
-            )
-        return c
-
-
 def _get_tile_tokens_dim(num_tokens, top_k, num_experts):
     # Guess tokens per expert assuming perfect expert distribution first.
     num_tokens_per_expert = (num_tokens * top_k) // num_experts
@@ -233,7 +160,7 @@ class EPMoE(FusedMoE):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
             return self.forward_deepgemm(hidden_states, topk_output)
         else:
-            return self.forward_normal(hidden_states, topk_output)
+            return super().forward(hidden_states, topk_output)
 
     def forward_deepgemm(
         self,
@@ -392,60 +319,6 @@ class EPMoE(FusedMoE):
         )
         return output
 
-    def forward_normal(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        return self.quant_method.apply(self, hidden_states, topk_output)
-
-    def weight_loader(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-    ) -> None:
-        global_expert_location_metadata = get_global_expert_location_metadata()
-        if global_expert_location_metadata is None:
-            self._weight_loader_impl(
-                param=param,
-                loaded_weight=loaded_weight,
-                weight_name=weight_name,
-                shard_id=shard_id,
-                expert_id=expert_id,
-            )
-            return
-
-        physical_expert_ids = global_expert_location_metadata.logical_to_all_physical(
-            self.layer_id, expert_id
-        )
-        for physical_expert_id in physical_expert_ids:
-            self._weight_loader_physical(
-                param=param,
-                loaded_weight=loaded_weight,
-                weight_name=weight_name,
-                shard_id=shard_id,
-                expert_id=physical_expert_id,
-            )
-
-    def _weight_loader_physical(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-    ) -> None:
-        if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
-            return
-        expert_id = expert_id - self.start_expert_id
-
-        self._weight_loader_impl(
-            param=param,
-            loaded_weight=loaded_weight,
-            weight_name=weight_name,
-            shard_id=shard_id,
-            expert_id=expert_id,
-        )
-        return
 
 
 class DeepEPMoE(EPMoE):
@@ -583,10 +456,8 @@ class DeepEPMoE(EPMoE):
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
             return self.forward_aiter(dispatch_output)
         if dispatch_output.format.is_deepep_normal():
-            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-                return self.forward_deepgemm_contiguous(dispatch_output)
-            else:
-                return self.forward_normal(dispatch_output)
+            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            return self.forward_deepgemm_contiguous(dispatch_output)
         elif dispatch_output.format.is_deepep_ll():
             return self.forward_deepgemm_masked(dispatch_output)
         else:
@@ -605,185 +476,6 @@ class DeepEPMoE(EPMoE):
             topk_weights=topk_weights,
             forward_batch=forward_batch,
         )
-
-    def _prepare_for_normal(
-        self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-    ):
-        from sglang.srt.layers.moe.ep_moe.kernels import (
-            deepep_permute_triton_kernel,
-            deepep_run_moe_deep_preprocess,
-        )
-
-        if hidden_states.shape[0] == 0:
-            reorder_topk_ids = torch.empty(
-                (0,), device=hidden_states.device, dtype=torch.int64
-            )
-            seg_indptr = torch.zeros(
-                (self.num_experts + 1,),
-                device=hidden_states.device,
-                dtype=torch.int64,
-            )
-            return reorder_topk_ids, seg_indptr, hidden_states
-        else:
-            if _use_aiter:
-                # skip permutation here as aiter fused_moe has fused inside
-                reorder_topk_ids = torch.empty(
-                    (0,), device=hidden_states.device, dtype=torch.int64
-                )
-                seg_indptr = torch.zeros(
-                    (self.num_experts + 1,),
-                    device=hidden_states.device,
-                    dtype=torch.int64,
-                )
-                return reorder_topk_ids, seg_indptr, hidden_states
-
-            reorder_topk_ids, self.src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
-                topk_idx, self.num_experts
-            )
-            num_total_tokens = reorder_topk_ids.numel()
-            gateup_input = torch.empty(
-                (int(num_total_tokens), hidden_states.shape[1]),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
-            # PreReorder
-            deepep_permute_triton_kernel[(hidden_states.shape[0],)](
-                hidden_states,
-                gateup_input,
-                self.src2dst,
-                topk_idx,
-                None,
-                self.router_topk,
-                hidden_states.shape[1],
-                BLOCK_SIZE=512,
-            )
-            return reorder_topk_ids, seg_indptr, gateup_input
-
-    def forward_normal(
-        self,
-        dispatch_output: DeepEPNormalOutput,
-    ):
-        hidden_states, topk_idx = (
-            dispatch_output.hidden_states,
-            dispatch_output.topk_idx,
-        )
-        reorder_topk_ids, seg_indptr, hidden_states = self._prepare_for_normal(
-            hidden_states, topk_idx
-        )
-        hidden_states_dtype = hidden_states.dtype
-        hidden_states_device = hidden_states.device
-
-        assert self.quant_method is not None
-        assert self.activation == "silu"
-        if self.grouped_gemm_runner is None:
-            self.grouped_gemm_runner = GroupedGemmRunner(
-                hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
-            )
-
-        if self.activation_scheme == "dynamic" and not self.use_block_quant:
-            max_value = (
-                torch.max(hidden_states)
-                .repeat(self.num_local_experts)
-                .to(torch.float32)
-            )
-            self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
-        weight_indices_cur_rank = torch.arange(
-            0,
-            self.num_local_experts,
-            device=hidden_states.device,
-            dtype=torch.int64,
-        )
-
-        # GroupGemm-0
-        if hidden_states.shape[0] > 0:
-            gateup_output = self.grouped_gemm_runner(
-                a=hidden_states,
-                b=self.w13_weight,
-                c=None,
-                c_dtype=hidden_states.dtype,
-                batch_size=self.num_local_experts,
-                weight_column_major=True,
-                seg_indptr=seg_indptr,
-                weight_indices=weight_indices_cur_rank,
-                use_fp8_w8a8=self.use_fp8_w8a8,
-                scale_a=self.w13_input_scale,
-                scale_b=(
-                    self.w13_weight_scale_inv
-                    if self.use_block_quant
-                    else self.w13_weight_scale
-                ),
-                block_shape=self.block_shape,
-            )
-        else:
-            gateup_output = torch.empty(
-                hidden_states.shape[0],
-                self.w13_weight.shape[1],
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
-
-        # Act
-        down_input = torch.empty(
-            gateup_output.shape[0],
-            gateup_output.shape[1] // 2,
-            device=gateup_output.device,
-            dtype=(
-                self.fp8_dtype
-                if (self.use_fp8_w8a8 and not self.use_block_quant)
-                else hidden_states_dtype
-            ),
-        )
-        if self.w2_input_scale is None and not self.use_block_quant:
-            self.w2_input_scale = torch.ones(
-                self.num_local_experts,
-                dtype=torch.float32,
-                device=hidden_states_device,
-            )
-
-        if self.activation == "silu":
-            silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
-                gateup_output,
-                down_input,
-                gateup_output.shape[1],
-                reorder_topk_ids,
-                self.w2_input_scale,
-                0,
-                self.num_local_experts - 1,
-                BLOCK_SIZE=512,
-            )
-        else:
-            raise ValueError(f"Unsupported activation: {self.activation=}")
-
-        del gateup_output
-
-        # GroupGemm-1
-        down_output = torch.empty(
-            down_input.shape[0],
-            self.w2_weight.shape[1],
-            device=hidden_states_device,
-            dtype=hidden_states_dtype,
-        )
-        if down_input.shape[0] > 0:
-            down_output = self.grouped_gemm_runner(
-                a=down_input,
-                b=self.w2_weight,
-                c=down_output,
-                batch_size=self.num_local_experts,
-                weight_column_major=True,
-                seg_indptr=seg_indptr,
-                weight_indices=weight_indices_cur_rank,
-                use_fp8_w8a8=self.use_fp8_w8a8,
-                scale_a=self.w2_input_scale,
-                scale_b=(
-                    self.w2_weight_scale_inv
-                    if self.use_block_quant
-                    else self.w2_weight_scale
-                ),
-                block_shape=self.block_shape,
-            )
-        return down_output
 
     def forward_aiter(
         self,

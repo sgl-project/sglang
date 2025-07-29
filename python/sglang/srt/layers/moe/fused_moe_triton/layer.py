@@ -94,7 +94,8 @@ class FusedMoE(torch.nn.Module):
         self.tp_rank = get_tensor_model_parallel_rank()
         self.num_experts = num_experts
         self.num_fused_shared_experts = num_fused_shared_experts
-        self.expert_map = None
+        self.expert_map_cpu = None
+        self.expert_map_gpu = None
 
         if enable_flashinfer_cutlass_moe and quant_config is None:
             logger.warning("Disable flashinfer MoE when quantization config is None.")
@@ -103,20 +104,22 @@ class FusedMoE(torch.nn.Module):
 
         self.enable_flashinfer_cutlass_moe = enable_flashinfer_cutlass_moe
         if enable_ep_moe:
+            # TODO(ch-wan): support shared experts fusion
             self.ep_size = self.tp_size
             self.ep_rank = self.tp_rank
             self.tp_size = 1
             self.tp_rank = 0
             # Create a tensor of size num_experts filled with -1
-            self.expert_map = torch.full((self.num_experts,), -1, dtype=torch.int32)
+            self.expert_map_cpu = torch.full((self.num_experts,), -1, dtype=torch.int32)
             # Create a expert map for the local experts
             assert num_experts % self.ep_size == 0
             self.num_local_experts = num_experts // self.ep_size
-            self.expert_map[
+            self.expert_map_cpu[
                 self.ep_rank
                 * self.num_local_experts : (self.ep_rank + 1)
                 * self.num_local_experts
             ] = torch.arange(0, self.num_local_experts, dtype=torch.int32, device="cpu")
+            self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
         else:
             self.ep_size = 1
             self.ep_rank = 0
@@ -363,9 +366,9 @@ class FusedMoE(torch.nn.Module):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
-        if self.expert_map is None:
+        if self.expert_map_cpu is None:
             return expert_id
-        return self.expert_map[expert_id].item()
+        return self.expert_map_cpu[expert_id].item()
 
     def weight_loader(
         self,
@@ -612,6 +615,11 @@ class FusedMoE(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         assert self.quant_method is not None
+
+        if self.expert_map_gpu is not None:
+            topk_output = topk_output._replace(
+                topk_ids=self.expert_map_gpu[topk_output.topk_ids]
+            )
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
