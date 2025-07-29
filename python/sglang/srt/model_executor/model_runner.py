@@ -285,10 +285,18 @@ class ModelRunner:
             if architectures and not any("Llama4" in arch for arch in architectures):
                 self.is_hybrid = self.model_config.is_hybrid = True
 
-        self.start_layer = getattr(self.model, "start_layer", 0)
-        self.end_layer = getattr(
-            self.model, "end_layer", self.model_config.num_hidden_layers
+        # For MTP draft model, we need to adjust the effective layers
+        is_mtp_draft_model = (
+            self.is_draft_worker
+            and self.model_config.num_nextn_predict_layers is not None
         )
+        model_num_layers = (
+            self.model_config.num_nextn_predict_layers
+            if is_mtp_draft_model
+            else self.model_config.num_hidden_layers
+        )
+        self.start_layer = getattr(self.model, "start_layer", 0)
+        self.end_layer = getattr(self.model, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
 
         # Apply torchao quantization
