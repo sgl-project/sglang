@@ -630,6 +630,7 @@ def general_mm_embed_routine(
     """
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
+    get_multimodal_embedding = kwargs.pop("get_multimodal_embedding", False)
     if (
         not forward_batch.forward_mode.is_decode()
         and forward_batch.contains_mm_inputs()
@@ -662,6 +663,9 @@ def general_mm_embed_routine(
         forward_batch.mm_inputs = None
     else:
         inputs_embeds = embed_tokens(input_ids)
+
+    if get_multimodal_embedding:
+        return inputs_embeds
 
     hidden_states = language_model(
         input_ids=None,
