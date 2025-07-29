@@ -3,7 +3,7 @@ import itertools
 import pytest
 import torch
 
-from python.sglang.srt.layers.quantization import deep_gemm_wrapper
+from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
