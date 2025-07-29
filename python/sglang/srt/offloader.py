@@ -138,13 +138,17 @@ class OffloaderV1(BaseOffloader):
 
 
 class OffloaderV2(BaseOffloader):
-    def __init__(self):
-        self.group_size = get_int_env_var("SGLANG_OFFLOAD_GROUP_SIZE", -1)
-        self.num_offload_in_group = get_int_env_var(
-            "SGLANG_OFFLOAD_NUM_OFFLOAD_IN_GROUP", 1
-        )
-        self.prefetch_step = get_int_env_var("SGLANG_OFFLOAD_PREFETCH_STEP", 1)
-        self.mode = os.environ.get("SGLANG_OFFLOAD_MODE", "cpu")
+    def __init__(
+        self,
+        group_size: int,
+        num_in_group: int,
+        prefetch_step: int,
+        mode: str,
+    ):
+        self.group_size = group_size
+        self.num_in_group = num_in_group
+        self.prefetch_step = prefetch_step
+        self.mode = mode
 
         # Temporarily init inside Offloader, can move if other modules also need this
         if self.mode in {"sharded_gpu", "shm_cpu"}:
@@ -173,7 +177,7 @@ class OffloaderV2(BaseOffloader):
         assert len(self.offloaders) == 0, "should only call wrap_modules once"
 
         logger.info(
-            f"[offloader] {self.group_size=} {self.num_offload_in_group=} {self.prefetch_step=}"
+            f"[offloader] {self.group_size=} {self.num_in_group=} {self.prefetch_step=}"
         )
 
         alt_stream = torch.cuda.Stream()
@@ -185,7 +189,7 @@ class OffloaderV2(BaseOffloader):
             all_modules.append(module)
             if (
                 module_index % self.group_size
-                >= self.group_size - self.num_offload_in_group
+                >= self.group_size - self.num_in_group
             ):
                 submodule = submodule_accessor(module)
                 whitelist_param_names = whitelist_param_names_creator(submodule)
