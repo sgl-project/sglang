@@ -57,6 +57,8 @@ class Router:
         request_id_headers: List of HTTP headers to check for request IDs. If not specified,
             uses common defaults: ['x-request-id', 'x-correlation-id', 'x-trace-id', 'request-id'].
             Example: ['x-my-request-id', 'x-custom-trace-id']. Default: None
+        request_timeout_secs: Timeout in seconds for requests to workers. If a request takes longer,
+            it will be aborted. Default: 600
     """
 
     def __init__(
@@ -89,6 +91,7 @@ class Router:
         prefill_policy: Optional[PolicyType] = None,
         decode_policy: Optional[PolicyType] = None,
         request_id_headers: Optional[List[str]] = None,
+        request_timeout_secs: int = 600,
     ):
         if selector is None:
             selector = {}
@@ -126,6 +129,7 @@ class Router:
             prefill_policy=prefill_policy,
             decode_policy=decode_policy,
             request_id_headers=request_id_headers,
+            request_timeout_secs=request_timeout_secs,
         )
 
     def start(self) -> None:

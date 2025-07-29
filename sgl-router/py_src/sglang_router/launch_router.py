@@ -66,6 +66,7 @@ class RouterArgs:
     prometheus_host: Optional[str] = None
     # Request ID headers configuration
     request_id_headers: Optional[List[str]] = None
+    request_timeout_secs: int = 600
 
     @staticmethod
     def add_cli_args(
@@ -263,6 +264,12 @@ class RouterArgs:
             nargs="*",
             help="Custom HTTP headers to check for request IDs (e.g., x-request-id x-trace-id). If not specified, uses common defaults.",
         )
+        parser.add_argument(
+            f"--{prefix}request-timeout-secs",
+            type=int,
+            default=600,
+            help="Timeout in seconds for requests to workers. If a request takes longer, it will be aborted.",
+        )
 
     @classmethod
     def from_cli_args(
@@ -322,6 +329,7 @@ class RouterArgs:
             prometheus_port=getattr(args, f"{prefix}prometheus_port", None),
             prometheus_host=getattr(args, f"{prefix}prometheus_host", None),
             request_id_headers=getattr(args, f"{prefix}request_id_headers", None),
+            request_timeout_secs=getattr(args, f"{prefix}request_timeout_secs", 600),
         )
 
     @staticmethod
@@ -491,6 +499,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
                 else None
             ),
             request_id_headers=router_args.request_id_headers,
+            request_timeout_secs=router_args.request_timeout_secs,
         )
 
         router.start()
