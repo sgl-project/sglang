@@ -394,7 +394,11 @@ class VisionAttention(nn.Module):
 
         if global_server_args_dict["mm_attention_backend"] is None:
             if qkv_backend is None:
-                qkv_backend = "sdpa"
+                if is_cuda():
+                    # Double prefill throughput by setting attn backend to Triton on CUDA
+                    qkv_backend = "triton_attn"
+                else:
+                    qkv_backend = "sdpa"
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         else:
             qkv_backend = global_server_args_dict["mm_attention_backend"]
