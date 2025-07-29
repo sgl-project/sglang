@@ -51,11 +51,18 @@ class BaseOffloader(ABC):
     ):
         raise NotImplementedError
 
+
 class OffloaderV1(BaseOffloader):
+    def wrap_modules(
+            self,
+            all_modules_generator: Generator[torch.nn.Module, None, None],
+            submodule_accessor: Optional[_SubmoduleAccessor] = None,
+            whitelist_param_names_creator: Optional[_WhitelistParamNamesCreator] = None,
+    ):
+        raise NotImplementedError
 
 
-# TODO improve
-class ModuleOffloader:
+class OffloaderV2(BaseOffloader):
     def __init__(self):
         self.group_size = get_int_env_var("SGLANG_OFFLOAD_GROUP_SIZE", -1)
         self.num_offload_in_group = get_int_env_var(
@@ -84,8 +91,8 @@ class ModuleOffloader:
     def wrap_modules(
         self,
         all_modules_generator: Generator[torch.nn.Module, None, None],
-        submodule_accessor: Callable[[torch.nn.Module], torch.nn.Module],
-        whitelist_param_names_creator: Callable[[torch.nn.Module], List[str]],
+        submodule_accessor: Optional[_SubmoduleAccessor] = None,
+        whitelist_param_names_creator: Optional[_WhitelistParamNamesCreator] = None,
     ):
         if not self.enabled:
             return list(all_modules_generator)
