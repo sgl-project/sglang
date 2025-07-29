@@ -127,6 +127,9 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
+        if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
+            self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
+
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
         # Check model type
@@ -635,6 +638,7 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
+    "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
 ]

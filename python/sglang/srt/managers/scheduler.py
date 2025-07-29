@@ -24,6 +24,7 @@ import time
 from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass
+from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
@@ -370,6 +371,7 @@ class Scheduler(
             self.max_total_num_tokens,
             self.max_prefill_tokens,
             self.max_running_requests,
+            self.max_queued_requests,
             self.max_req_len,
             self.max_req_input_len,
             self.random_seed,
@@ -458,7 +460,10 @@ class Scheduler(
         self.grammar_queue: List[Req] = []
         if not server_args.skip_tokenizer_init:
             self.grammar_backend = create_grammar_backend(
-                server_args, self.tokenizer, self.model_config.vocab_size
+                server_args,
+                self.tokenizer,
+                self.model_config.vocab_size,
+                self.model_config.hf_eos_token_id,
             )
         else:
             self.grammar_backend = None
@@ -1083,6 +1088,19 @@ class Scheduler(
                 self.return_health_check_ct += 1
                 continue
 
+            # If it is a work request, accept or reject the request based on the request queue size.
+            if is_work_request(recv_req):
+                if len(self.waiting_queue) + 1 > self.max_queued_requests:
+                    abort_req = AbortReq(
+                        recv_req.rid,
+                        finished_reason={
+                            "type": "abort",
+                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                            "message": "The request queue is full.",
+                        },
+                    )
+                    self.send_to_tokenizer.send_pyobj(abort_req)
+                    continue
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 if isinstance(output, RpcReqOutput):
@@ -2437,6 +2455,37 @@ class Scheduler(
                     req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
 
+        # Delete requests not in the waiting queue when PD disaggregation is enabled
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Abort requests that have not yet been bootstrapped
+            for i, req in enumerate(self.disagg_prefill_bootstrap_queue.queue):
+                logger.debug(f"Abort bootstrap queue request. {req.rid=}")
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    if hasattr(req.disagg_kv_sender, "abort"):
+                        req.disagg_kv_sender.abort()
+
+            # Abort in-flight requests
+            for i, req in enumerate(self.disagg_prefill_inflight_queue):
+                logger.debug(f"Abort inflight queue request. {req.rid=}")
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    if hasattr(req.disagg_kv_sender, "abort"):
+                        req.disagg_kv_sender.abort()
+
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            # Abort requests that have not yet finished preallocation
+            for i, decode_req in enumerate(self.disagg_decode_prealloc_queue.queue):
+                logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
+                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                    if hasattr(decode_req.kv_receiver, "abort"):
+                        decode_req.kv_receiver.abort()
+
+            # Abort requests waiting for kvcache to release tree cache
+            for i, decode_req in enumerate(self.disagg_decode_transfer_queue.queue):
+                logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
+                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                    if hasattr(decode_req.kv_receiver, "abort"):
+                        decode_req.kv_receiver.abort()
+
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:
             reqs = self.running_batch.reqs
@@ -2866,6 +2915,10 @@ class Scheduler(
 
 def is_health_check_generate_req(recv_req):
     return getattr(recv_req, "rid", "").startswith("HEALTH_CHECK")
+
+
+def is_work_request(recv_req):
+    return isinstance(recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
 
 
 def _export_static_state(model):
