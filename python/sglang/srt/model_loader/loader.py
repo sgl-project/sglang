@@ -101,26 +101,25 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
             # if name in original_device_states:
             if name in original_infos:
                 original_info = original_infos[name]
+                original_data = original_info["param_data"]
+                original_device: torch.device = original_info["device"]
                 if TODO:
-                    original_data = original_info["param_data"]
                     original_data.copy_(p.data.to(original_data.device))
                     p.data = original_data
+                elif original_device.type == "cpu":
+                    # `torch.empty_like` does not support `pin_memory` argument
+                    cpu_data = torch.empty_strided(
+                        size=p.data.size(),
+                        stride=p.data.stride(),
+                        dtype=p.data.dtype,
+                        layout=p.data.layout,
+                        device="cpu",
+                        pin_memory=pin_memory,
+                    )
+                    cpu_data.copy_(p.data)
+                    p.data = cpu_data
                 else:
-                    original_device: torch.device = original_info["device"]
-                    if original_device.type == "cpu":
-                        # `torch.empty_like` does not support `pin_memory` argument
-                        cpu_data = torch.empty_strided(
-                            size=p.data.size(),
-                            stride=p.data.stride(),
-                            dtype=p.data.dtype,
-                            layout=p.data.layout,
-                            device="cpu",
-                            pin_memory=pin_memory,
-                        )
-                        cpu_data.copy_(p.data)
-                        p.data = cpu_data
-                    else:
-                        p.data = p.data.to(original_device)
+                    p.data = p.data.to(original_device)
         # New parameters or parameters already on target device are untouched
 
 
