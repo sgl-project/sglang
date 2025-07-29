@@ -18,11 +18,11 @@ class NaiveDistributed:
         assert NaiveDistributed.instance is None
         NaiveDistributed.instance = NaiveDistributed(**kwargs)
 
-    def __init__(self, rank: int, world_size: int):
+    def __init__(self, rank: int, world_size: int, rendezvous: str):
         self._rank = rank
         self._world_size = world_size
         self._operation_index = 0
-        self._directory = Path(os.environ["SGLANG_NAIVE_DISTRIBUTED_DIRECTORY"])
+        self._directory = Path(rendezvous)
         self._directory.mkdir(parents=True, exist_ok=True)
         assert 0 <= rank < world_size
 
