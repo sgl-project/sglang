@@ -218,7 +218,9 @@ class ReplicatedLinear(LinearBase):
                 else:
                     raise ValueError(f"{loaded_weight} are not all equal")
 
-        assert param.size() == loaded_weight.size(), f"{param.shape=} {loaded_weight.shape=}"
+        assert (
+            param.size() == loaded_weight.size()
+        ), f"{param.shape=} {loaded_weight.shape=}"
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
