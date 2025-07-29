@@ -19,6 +19,7 @@ from torch.func import functional_call
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.parameter import ModelWeightParameter
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.naive_distributed import get_naive_distributed, set_naive_distributed, NaiveDistributed
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     dispose_tensor,
@@ -42,10 +43,11 @@ class ModuleOffloader:
         self.enabled = self.group_size > 0
 
         if self.mode in {"sharded_gpu", "shm_cpu"}:
-            NaiveDistributed.initialize(
+            set_naive_distributed(NaiveDistributed(
                 rank=global_server_args_dict["dp_rank"],
                 world_size=global_server_args_dict["dp_size"],
-            )
+                rendezvous=TODO,
+            ))
 
     def wrap_modules(
         self,

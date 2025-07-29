@@ -105,4 +105,5 @@ def get_naive_distributed():
 
 def set_naive_distributed(instance: NaiveDistributed):
     global _instance
+    assert _instance is None
     _instance = instance
