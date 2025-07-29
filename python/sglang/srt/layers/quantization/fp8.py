@@ -172,7 +172,6 @@ class Fp8Config(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
-        from sglang.srt.layers.moe.ep_moe.layer import EPMoE
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
@@ -181,8 +180,6 @@ class Fp8Config(QuantizationConfig):
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return Fp8MoEMethod(self)
-        elif isinstance(layer, EPMoE):
-            return Fp8EPMoEMethod(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
