@@ -10,6 +10,9 @@ import time
 import unittest
 from types import SimpleNamespace
 
+import numpy as np
+import requests
+
 from sglang.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -38,7 +41,7 @@ class TestPPAccuracy(unittest.TestCase):
                 "--quantization",
                 "fp8",
                 "--tp-size",
-                4,
+                2,
                 "--pp-size",
                 2,
                 "--pp-async-batch-depth",
@@ -70,6 +73,69 @@ class TestPPAccuracy(unittest.TestCase):
         self.assertGreater(metrics["accuracy"], 0.74)
         # Wait a little bit so that the memory check happens.
         time.sleep(5)
+
+    def test_logprob(self):
+        response = requests.post(
+            f"{self.base_url}/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 16,
+                },
+                "return_logprob": True,
+                "top_logprobs_num": 5,
+                "logprob_start_len": 0,
+            },
+        )
+        response_json = response.json()
+        input_token_logprobs = response_json["meta_info"]["input_token_logprobs"]
+        output_token_logprobs = response_json["meta_info"]["output_token_logprobs"]
+        output_top_logprobs = response_json["meta_info"]["output_top_logprobs"]
+
+        assert len(input_token_logprobs) == 6
+        assert len(output_token_logprobs) == 16
+        assert len(output_top_logprobs) == 16 and len(output_top_logprobs[0]) == 5
+
+        input_token_logprobs_ref = np.array(
+            [
+                # [None, 128000, None],
+                [-7.72140645980835, 791],
+                [-8.190326690673828, 6864],
+                [-0.48766013979911804, 315],
+                [-3.844438314437866, 9822],
+                [-1.0061391592025757, 374],
+            ]
+        )
+        output_token_logprobs_ref = np.array(
+            [
+                [-1.6044657230377197, 12366],
+                [-0.8911485075950623, 11],
+                [-1.5385538339614868, 902],
+                [-0.20421777665615082, 374],
+                [-1.7213633060455322, 7559],
+                [-0.16415093839168549, 304],
+                [-0.03759857267141342, 279],
+                [-0.6046031713485718, 18671],
+                [-0.1309979259967804, 961],
+                [-0.0011125572491437197, 315],
+                [-0.031382400542497635, 279],
+                [-0.005265890154987574, 3224],
+                [-0.3354410231113434, 13],
+                [-1.069690465927124, 12366],
+                [-0.10867499560117722, 374],
+                [-1.4493504762649536, 3967],
+            ]
+        )
+
+        input_token_logprobs = np.array([x[:2] for x in input_token_logprobs[1:]])
+        output_token_logprobs = np.array([x[:2] for x in output_token_logprobs])
+        np.testing.assert_allclose(
+            input_token_logprobs, input_token_logprobs_ref, atol=1e-4
+        )
+        np.testing.assert_allclose(
+            output_token_logprobs, output_token_logprobs_ref, atol=1e-4
+        )
 
 
 class TestQwenPPAccuracy(unittest.TestCase):
