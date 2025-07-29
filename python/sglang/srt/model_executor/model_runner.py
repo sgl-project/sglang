@@ -162,6 +162,7 @@ class ModelRunner:
         pp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
+        dp_rank: Optional[int] = None,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
@@ -217,7 +218,7 @@ class ModelRunner:
         )
 
         # CPU offload
-        set_offloader(create_offloader_from_server_args(server_args))
+        set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":

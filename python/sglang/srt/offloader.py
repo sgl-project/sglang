@@ -61,7 +61,7 @@ def set_offloader(instance: BaseOffloader):
     global _instance
     _instance = instance
 
-def create_offloader_from_server_args(server_args: ServerArgs):
+def create_offloader_from_server_args(server_args: ServerArgs, dp_rank: int):
     if server_args.cpu_offload_gb > 0:
         return OffloaderV1(cpu_offload_max_bytes=int(server_args.cpu_offload_gb * 1024**3))
     if server_args.offload_group_size > 0:
@@ -71,6 +71,8 @@ def create_offloader_from_server_args(server_args: ServerArgs):
             num_in_group=server_args.offload_num_in_group,
             prefetch_step=server_args.offload_prefetch_step,
             mode=server_args.offload_mode,
+            dp_rank=dp_rank,
+            dp_size=server_args.dp_size,
         )
     return NoopOffloader()
 
@@ -150,6 +152,8 @@ class OffloaderV2(BaseOffloader):
         num_in_group: int,
         prefetch_step: int,
         mode: str,
+        dp_rank: int,
+        dp_size: int,
     ):
         self.group_size = group_size
         self.num_in_group = num_in_group
