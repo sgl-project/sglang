@@ -140,6 +140,7 @@ class AnthropicServingMessages(OpenAIServingBase):
         openai_messages = self._convert_anthropic_to_openai_messages(
             request.messages, request.system
         )
+        request.messages = openai_messages
         
         # Generate prompt using template manager
         conversation = generate_chat_conv(
