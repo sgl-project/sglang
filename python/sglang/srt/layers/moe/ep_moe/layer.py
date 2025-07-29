@@ -459,9 +459,10 @@ class DeepEPMoE(EPMoE):
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             return self.forward_deepgemm_contiguous(dispatch_output)
         elif dispatch_output.format.is_deepep_ll():
+            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             return self.forward_deepgemm_masked(dispatch_output)
         else:
-            raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
+            raise ValueError(f"Dispatch output format {dispatch_output.format} is not supported")
 
     def combine(
         self,
