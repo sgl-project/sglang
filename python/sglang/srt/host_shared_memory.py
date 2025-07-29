@@ -1,3 +1,4 @@
+import logging
 import os
 from dataclasses import dataclass
 from multiprocessing import shared_memory
@@ -13,6 +14,7 @@ from sglang.srt.utils import (
     check_cuda_result,
 )
 
+logger = logging.getLogger(__name__)
 
 class _HostSharedMemoryManager:
     def __init__(self):
