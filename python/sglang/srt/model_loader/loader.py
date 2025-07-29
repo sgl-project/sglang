@@ -94,6 +94,17 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 _is_npu = is_npu()
+# ModelOpt: Define placeholder for quantization config choices
+# Users will need to populate this with actual names of config objects
+# available in modelopt.torch.quantization, e.g., "FP8_DEFAULT_CONFIG"
+# For example: QUANT_CFG_CHOICES = {"fp8": "FP8_CONFIG_NAME_IN_MTQ", "int4_awq": "INT4_AWQ_CONFIG_NAME_IN_MTQ"}
+# This needs to be adapted based on the actual ModelOpt library's provided configs.
+# For demonstration, we'll assume "fp8" maps to a hypothetical "FP8_QUANT_CFG" attribute in mtq.
+QUANT_CFG_CHOICES = {
+    "fp8": "FP8_DEFAULT_CFG",  # Replace "FP8_DEFAULT_CFG" with the actual attribute name in mtq for FP8 config
+    # Add other presets like:
+    # "int4_awq": "INT4_AWQ_DEFAULT_CFG",
+}
 
 
 @contextmanager
@@ -483,12 +494,30 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-        target_device = torch.device(device_config.device)
-        with set_default_torch_dtype(model_config.dtype):
-            with target_device:
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
+        model = _initialize_model(model_config, self.load_config, device_config)
+
+        self._load_weights(model_config, model)
+
+        # <<< ModelOpt Quantization Integration Start >>>
+        if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
+            logger.info(
+                f"ModelOpt quantization requested: {model_config.modelopt_quant}"
+            )
+            try:
+                import modelopt.torch.quantization as mtq
+                from modelopt.torch.utils.dataset_utils import create_forward_loop
+            except ImportError:
+                logger.error(
+                    "NVIDIA Model Optimizer (modelopt) library not found. "
+                    "Please install it to use 'modelopt_quant' feature."
+                )
+                raise
+
+            quant_choice_str = model_config.modelopt_quant
+            if not isinstance(quant_choice_str, str):
+                raise TypeError(
+                    f"modelopt_quant must be a string preset key (e.g., 'fp8'), "
+                    f"got {type(quant_choice_str)}"
                 )
 
         self.load_weights_and_postprocess(
