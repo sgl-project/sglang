@@ -147,6 +147,7 @@ class EPMoE(FusedMoE):
                 if self.use_block_quant
                 else None
             )
+            self.use_fp8_w8a8 = True
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
         else:
