@@ -82,6 +82,8 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
@@ -95,6 +97,8 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqOutput,
     RpcReqInput,
     RpcReqOutput,
+    SendWeightsToRemoteInstanceReqInput,
+    SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     SlowDownReqInput,
@@ -526,6 +530,8 @@ class Scheduler(
                 (CloseSessionReqInput, self.close_session),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
+                (InitWeightsSendGroupForRemoteInstanceReqInput, self.init_weights_send_group_for_remote_instance),
+                (SendWeightsToRemoteInstanceReqInput, self.send_weights_to_remote_instance),
                 (
                     UpdateWeightsFromDistributedReqInput,
                     self.update_weights_from_distributed,
@@ -2545,6 +2551,16 @@ class Scheduler(
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
         return InitWeightsUpdateGroupReqOutput(success, message)
+
+    def init_weights_send_group_for_remote_instance(self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput):
+        """Init the seed and client instance communication group."""
+        success, message = self.tp_worker.init_weights_send_group_for_remote_instance(recv_req)
+        return InitWeightsSendGroupForRemoteInstanceReqOutput(success, message)
+
+    def send_weights_to_remote_instance(self, recv_req: SendWeightsToRemoteInstanceReqInput):
+        """Send the seed model weights to forked engine."""
+        success, message = self.tp_worker.send_weights_to_remote_instance(recv_req)
+        return SendWeightsToRemoteInstanceReqOutput(success, message)
 
     def update_weights_from_distributed(
         self,

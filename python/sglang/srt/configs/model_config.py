@@ -62,12 +62,16 @@ class ModelConfig:
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
+        model_config_path: Optional[str] = None,
+        seed_instance_url: Optional[str] = None,
     ) -> None:
 
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
         self.model_impl = model_impl
+        self.model_config_path = model_config_path
+        self.seed_instance_url = seed_instance_url
 
         # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
@@ -293,6 +297,8 @@ class ModelConfig:
             quantization=server_args.quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
+            model_config_path=server_args.model_config_path,
+            seed_instance_url=server_args.seed_instance_url,
             **kwargs,
         )
 
@@ -508,19 +514,25 @@ class ModelConfig:
             model: The model name or path.
 
         """
-        from sglang.srt.connector import create_remote_connector
-        from sglang.srt.utils import is_remote_url
+        from sglang.srt.connector import ConnectorType, create_remote_connector
+        from sglang.srt.utils import is_remote_url, parse_connector_type
 
         if is_remote_url(self.model_path):
-            logger.info("Pulling model configs from remote...")
-            # BaseConnector implements __del__() to clean up the local dir.
-            # Since config files need to exist all the time, so we DO NOT use
-            # with statement to avoid closing the client.
-            client = create_remote_connector(self.model_path)
-            if is_remote_url(self.model_path):
-                client.pull_files(allow_pattern=["*config.json"])
+            if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
+                logger.info("Pulling model configs from remote...")
+                # BaseConnector implements __del__() to clean up the local dir.
+                # Since config files need to exist all the time, so we DO NOT use
+                # with statement to avoid closing the client.
+                client = create_remote_connector(self.model_path)
+                if is_remote_url(self.model_path):
+                    client.pull_files(allow_pattern=["*config.json"])
+                    self.model_weights = self.model_path
+                    self.model_path = client.get_local_dir()
+            else:
+                if hasattr(self, "model_weights") and self.model_weights != None:
+                    return
                 self.model_weights = self.model_path
-                self.model_path = client.get_local_dir()
+                self.model_path = self.model_config_path
 
 
 # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
