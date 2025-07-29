@@ -88,9 +88,7 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
             "per_token_group_quant_8bit_kernel",
         ),
     }[provider]
-    bench_fn = lambda: fn(
-        x=x, group_size=group_size, dst_dtype=dst_dtype, **flags
-    )
+    bench_fn = lambda: fn(x=x, group_size=group_size, dst_dtype=dst_dtype, **flags)
 
     time_s = bench_kineto(bench_fn, kernel_names=kernel_names)
     return time_s * 1e6
