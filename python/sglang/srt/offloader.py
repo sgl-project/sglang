@@ -52,6 +52,8 @@ class BaseOffloader(ABC):
     ):
         return list(all_modules_generator)
 
+    def post_init(self):
+        pass
 
 
 class NoopOffloader(BaseOffloader):
