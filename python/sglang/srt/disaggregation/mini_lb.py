@@ -61,6 +61,7 @@ class MiniLoadBalancer:
         self.decode_servers = decode_servers
         self.encoder_servers = encoder_servers or []
         self._encoder_index = 0
+        self._encoder_lock: asyncio.Lock = asyncio.Lock()
 
     def add_prefill_server(self, new_prefill_config: PrefillConfig):
         self.prefill_configs.append(new_prefill_config)
@@ -69,16 +70,17 @@ class MiniLoadBalancer:
     def add_decode_server(self, new_decode_server: str):
         self.decode_servers.append(new_decode_server)
 
-    def add_encoder_server(self, new_encoder_server: str):
-        self.encoder_servers.append(new_encoder_server)
+    async def add_encoder_server(self, new_encoder_server: str):
+        async with self._encoder_lock:
+            self.encoder_servers.append(new_encoder_server)
 
-    def select_encoder_server(self):
-        if len(self.encoder_servers) == 0:
-            raise ValueError("No encoder servers available")
-
-        server = self.encoder_servers[self._encoder_index]
-        self._encoder_index = (self._encoder_index + 1) % len(self.encoder_servers)
-        return server
+    async def select_encoder_server(self) -> str:
+        async with self._encoder_lock:
+            if not self.encoder_servers:
+                raise ValueError("No encoder servers available")
+            server = self.encoder_servers[self._encoder_index]
+            self._encoder_index = (self._encoder_index + 1) % len(self.encoder_servers)
+            return server
 
     def select_pair(self):
         # TODO: return some message instead of panic
@@ -396,7 +398,7 @@ async def _forward_to_encoder(request_data: dict, endpoint_name: str = "generate
         endpoint_name[0] != "/"
     ), f"Endpoint should not start with '/': {endpoint_name}"
 
-    encoder_server = load_balancer.select_encoder_server()
+    encoder_server = await load_balancer.select_encoder_server()
     modified_request = request_data.copy()
 
     async with aiohttp.ClientSession(
@@ -456,7 +458,7 @@ async def register(obj: PDRegistryRequest):
         load_balancer.add_decode_server(obj.registry_url)
         logger.info(f"Registered decode server: {obj.registry_url}")
     elif obj.mode == "encode":
-        load_balancer.add_encoder_server(obj.registry_url)
+        await load_balancer.add_encoder_server(obj.registry_url)
         logger.info(f"Registered encoder server: {obj.registry_url}")
     else:
         raise HTTPException(
