@@ -29,6 +29,7 @@ from sglang.srt.naive_distributed import (
     get_naive_distributed,
     set_naive_distributed,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     dispose_tensor,
@@ -69,10 +70,17 @@ def set_offloader(instance: BaseOffloader):
     global _instance
     _instance = instance
 
+def create_offloader_from_server_args(server_args: ServerArgs):
+    if server_args.cpu_offload_gb > 0:
+        return OffloaderV1(cpu_offload_max_bytes=int(server_args.cpu_offload_gb * 1024**3))
+    if TODO:
+        return OffloaderV2()
+    return NoopOffloader()
+
 class OffloaderV1(BaseOffloader):
-    def __init__(self):
+    def __init__(self, cpu_offload_max_bytes: int):
         self._cpu_offload_bytes = 0
-        self._cpu_offload_max_bytes = 0
+        self._cpu_offload_max_bytes = cpu_offload_max_bytes
 
     def wrap_modules(
             self,
