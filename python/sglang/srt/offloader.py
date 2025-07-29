@@ -173,12 +173,16 @@ class OffloaderV2(BaseOffloader):
                 )
             )
 
+        self.offloaders = []
+
     def wrap_modules(
         self,
         all_modules_generator: Generator[torch.nn.Module, None, None],
         submodule_accessor: Optional[_SubmoduleAccessor] = None,
         whitelist_param_names_creator: Optional[_WhitelistParamNamesCreator] = None,
     ):
+        assert len(self.offloaders) == 0, "should only call wrap_modules once"
+
         logger.info(
             f"[offloader] {self.group_size=} {self.num_offload_in_group=} {self.prefetch_step=}"
         )
@@ -188,7 +192,6 @@ class OffloaderV2(BaseOffloader):
         # TODO maybe improve
         all_modules = []
         offload_submodules = []
-        self.offloaders = []
         for module_index, module in enumerate(all_modules_generator):
             logger.info(f"[offloader] {module_index=} {torch.cuda.memory_allocated()=}")
             all_modules.append(module)
