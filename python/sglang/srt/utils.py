@@ -2855,3 +2855,12 @@ SUPPORTED_LORA_TARGET_MODULES = [
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
+
+def check_cuda_result(raw_output):
+    import cuda.bindings.runtime as cuda_rt
+
+    err, *results = raw_output
+    if err != cuda_rt.cudaError_t.cudaSuccess:
+        raise Exception(f"CUDA error: {err}")
+
+    return results

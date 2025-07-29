@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import ctypes
 
 
-import cuda.bindings.runtime as cuda_rt
 import numpy as np
 import base64
 import logging
@@ -506,12 +505,6 @@ class _SharedMemoryRecord:
     tensor: torch.Tensor
 
 _shared_memory_manager = _SharedMemoryManager()
-
-def check_cuda_result(raw_output):
-    err, *results = raw_output
-    if err != cuda_rt.cudaError_t.cudaSuccess:
-        raise Exception(f"CUDA error: {err}")
-    return results
 
 def trim_memory():
     rss_before = psutil.Process().memory_info().rss
