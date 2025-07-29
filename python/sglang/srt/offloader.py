@@ -88,7 +88,10 @@ class OffloaderV1(BaseOffloader):
             submodule_accessor: Optional[_SubmoduleAccessor] = None,
             whitelist_param_names_creator: Optional[_WhitelistParamNamesCreator] = None,
     ):
-        TODO
+        return [
+            self.maybe_offload_to_cpu(module)
+            for module in all_modules_generator
+        ]
 
     def maybe_offload_to_cpu(self, module: torch.nn.Module) -> torch.nn.Module:
         device = next(module.parameters()).device
