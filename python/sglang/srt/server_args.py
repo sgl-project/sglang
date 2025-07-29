@@ -237,7 +237,7 @@ class ServerArgs:
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     mm_attention_backend: Optional[str] = None
-    pick_free_dp_port: bool = False
+    enable_dp_attention_port_picking: bool = False
     enable_return_hidden_states: bool = False
     enable_triton_kernel_moe: bool = False
 
@@ -1767,7 +1767,7 @@ class ServerArgs:
         )
 
         parser.add_argument(
-            "--pick-free-dp-port",
+            "--enable-dp-attention-port-picking",
             action="store_true",
             help="Whether to picks dp ports from free ports, or use fixed dp port as default. Useful when get frequent port conflict under huge DP cases",
         )
@@ -2010,7 +2010,7 @@ class PortArgs:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
             else:
-                if server_args.pick_free_dp_port:
+                if server_args.enable_dp_attention_port_picking:
                     scheduler_input_port = dp_controller_zmq_ports[dp_rank]
                 else:
                     scheduler_input_port = port_base + 4 + 1 + dp_rank
