@@ -85,7 +85,6 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager
 
-from sglang.srt.offloader import get_offloader
 
 logger = logging.getLogger(__name__)
 
@@ -448,6 +447,7 @@ def make_layers(
     # circula imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
+    from sglang.srt.offloader import get_offloader
 
     assert not pp_size or num_hidden_layers >= pp_size
     start_layer, end_layer = (
