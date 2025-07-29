@@ -150,9 +150,7 @@ int moe_align_block_size(
     int32_t* __restrict__ local_cnts = T_INDEX(tid + 1);
 
     for (int i = begin; i < end; ++i) {
-      if (topk_ids[i] >= 0) {
-        local_cnts[topk_ids[i]]++;
-      }
+      local_cnts[topk_ids[i] + 1]++;
     }
   });
 
@@ -171,7 +169,7 @@ int moe_align_block_size(
     cumsums[e + 1] = cumsums[e] + div_up(total_cnts_t_1[e], BLOCK_M) * BLOCK_M;
 
     for (int k = cumsums[e]; k < cumsums[e + 1]; k += BLOCK_M) {
-      expert_ids[k / BLOCK_M] = e;
+      expert_ids[k / BLOCK_M] = e - 1;
     }
   }
   int num_tokens_post_pad = cumsums[num_experts];
@@ -182,10 +180,7 @@ int moe_align_block_size(
     int32_t* __restrict__ offsets = T_INDEX(tid);
 
     for (int i = begin; i < end; ++i) {
-      int32_t expert_id = topk_ids[i];
-      if (expert_id < 0) {
-        continue;
-      }
+      int32_t expert_id = topk_ids[i] + 1;
       int32_t b_offset = cumsums[expert_id];
       int32_t t_offset = offsets[expert_id];
       sorted_ids[b_offset + t_offset] = i;
