@@ -91,7 +91,7 @@ class DataParallelController:
         self.scheduler_procs = []
         self.workers = [None] * server_args.dp_size
 
-        if server_args.node_rank == 0 and server_args.pick_free_dp_port:
+        if server_args.node_rank == 0 and server_args.enable_dp_attention_port_picking:
             self.workers_port = {}
             for dp_rank in range(server_args.dp_size):
                 port_and_socket = get_tcp_zmq_socket_binded_to_local_free_port(
@@ -108,7 +108,7 @@ class DataParallelController:
             dp_port_args = self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
 
-        if server_args.node_rank == 0 and not server_args.pick_free_dp_port:
+        if server_args.node_rank == 0 and not server_args.enable_dp_attention_port_picking:
             for dp_rank in range(server_args.dp_size):
                 self.workers[dp_rank] = get_zmq_socket(
                     self.context,
@@ -225,7 +225,7 @@ class DataParallelController:
         PortArgs.register_dp_controller_to_attn_tp_rk0_port(free_ports)
 
     def launch_dp_attention_schedulers(self, server_args, port_args):
-        if server_args.pick_free_dp_port:
+        if server_args.enable_dp_attention_port_picking:
             self._dispatch_dp_attn_ctrl_zmq_port(server_args)
         dp_port_args = []
         for dp_rank in range(server_args.dp_size):
