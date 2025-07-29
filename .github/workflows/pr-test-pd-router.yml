@@ -115,6 +115,7 @@ jobs:
         echo "Installing SGLang with all extras..."
         python3 -m pip --no-cache-dir install -e "python[all]" --break-system-packages
         python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.5
+        python3 -m pip --no-cache-dir install genai-bench==0.0.1
 
     - name: Build and install sgl-router
       run: |
@@ -250,42 +251,105 @@ jobs:
             exit 1
           fi
 
-          # Run benchmark
-          echo "Running benchmark for $policy..."
-          benchmark_output=$(python3 -m sglang.bench_one_batch_server \
-            --model-path "/raid/models/meta-llama/Llama-3.1-8B-Instruct" \
-            --base-url "http://127.0.0.9:8000" \
-            --batch-size 8 \
-            --input-len 4096 \
-            --output-len 5 \
-            --skip-warmup)
+          # Run genai-bench benchmark
+          echo "Running genai-bench for $policy..."
+          genai-bench benchmark \
+            --api-backend openai \
+            --api-base "http://127.0.0.9:8000" \
+            --api-key "dummy-token" \
+            --api-model-name "/raid/models/meta-llama/Llama-3.1-8B-Instruct" \
+            --model-tokenizer /raid/models/meta-llama/Llama-3.1-8B-Instruct \
+            --task text-to-text \
+            --num-concurrency 64 \
+            --traffic-scenario "D(8000,2000)" \
+            --max-requests-per-run 640 \
+            --max-time-per-run 2 \
+            --experiment-folder-name "benchmark_${policy}" \
+            --experiment-base-dir "."
 
-          echo "$benchmark_output"
+          # Find the actual experiment folder
+          actual_folder=$(find . -maxdepth 1 -name "benchmark_${policy}" -type d | head -1)
 
-          # Save benchmark output
-          echo "$benchmark_output" > "benchmark_${policy}.txt"
+          if [ -n "$actual_folder" ]; then
+            # Extract metrics from the Excel summary or JSON files
+            summary_file="$actual_folder"/*_summary.xlsx
+            json_files=$(find "$actual_folder" -name "*.json" | grep -v experiment_metadata)
 
-          # Extract and validate metrics
-          latency=$(echo "$benchmark_output" | grep "latency:" | awk '{print $2}' | sed 's/s//')
-          input_throughput=$(echo "$benchmark_output" | grep "input throughput:" | awk '{print $3}')
-          output_throughput=$(echo "$benchmark_output" | grep "output throughput:" | awk '{print $3}')
+            echo "Genai-bench results saved in: $actual_folder"
 
-          command -v bc >/dev/null || (apt-get update && apt-get install -y bc)
+            # Extract mean values and validate performance thresholds
+            echo "📊 Extracting performance metrics for $policy..."
 
-          echo "Performance for $policy: ${latency}s | ${input_throughput} | ${output_throughput} tok/s"
+            # Find JSON files excluding experiment metadata
+            json_files=$(find "$actual_folder" -name "*.json" | grep -v experiment_metadata)
 
-          # Validate performance
-          fail=""
-          (( $(echo "$latency > 1.5" | bc -l) )) && fail="Latency too high (${latency}s>1.5s) "
-          (( $(echo "$input_throughput < 20000" | bc -l) )) && fail="${fail}Input too low (${input_throughput}<20k) "
-          (( $(echo "$output_throughput < 1000" | bc -l) )) && fail="${fail}Output too low (${output_throughput}<1k) "
+            if [ -n "$json_files" ]; then
+              # Extract metrics using jq and validate against loose thresholds
+              for json_file in $json_files; do
+                echo "Processing: $(basename "$json_file")"
 
-          if [ -n "$fail" ]; then
-            echo "✗ Benchmark failed for $policy: $fail"
+                                # Extract mean values for performance validation
+                ttft_mean=$(jq -r '.aggregated_metrics.stats.ttft.mean' "$json_file")
+                e2e_latency_mean=$(jq -r '.aggregated_metrics.stats.e2e_latency.mean' "$json_file")
+                input_throughput_mean=$(jq -r '.aggregated_metrics.stats.input_throughput.mean' "$json_file")
+                output_throughput_mean=$(jq -r '.aggregated_metrics.stats.output_throughput.mean' "$json_file")
+
+                echo "  TTFT mean: ${ttft_mean}s"
+                echo "  E2E Latency mean: ${e2e_latency_mean}s"
+                echo "  Input Throughput mean: ${input_throughput_mean} tokens/s"
+                echo "  Output Throughput mean: ${output_throughput_mean} tokens/s"
+
+                # Set mean thresholds (allowing for reasonable variance)
+                # These can be adjusted based on your performance requirements
+                ttft_threshold=2.0          # Max 2.0 seconds for mean TTFT
+                e2e_latency_threshold=8.0   # Max 8.0 seconds for mean E2E latency
+                input_throughput_threshold=10000   # Min 9000 tokens/s for mean input throughput
+                output_throughput_threshold=100    # Min 100 tokens/s for mean output throughput
+
+
+                # Validate mean thresholds
+                validation_passed=true
+
+                if (( $(echo "$ttft_mean > $ttft_threshold" | bc -l) )); then
+                  echo "❌ TTFT validation failed: $ttft_mean > $ttft_threshold"
+                  validation_passed=false
+                fi
+
+                if (( $(echo "$e2e_latency_mean > $e2e_latency_threshold" | bc -l) )); then
+                  echo "❌ E2E Latency validation failed: $e2e_latency_mean > $e2e_latency_threshold"
+                  validation_passed=false
+                fi
+
+                if (( $(echo "$input_throughput_mean < $input_throughput_threshold" | bc -l) )); then
+                  echo "❌ Input Throughput validation failed: $input_throughput_mean < $input_throughput_threshold"
+                  validation_passed=false
+                fi
+
+                if (( $(echo "$output_throughput_mean < $output_throughput_threshold" | bc -l) )); then
+                  echo "❌ Output Throughput validation failed: $output_throughput_mean < $output_throughput_threshold"
+                  validation_passed=false
+                fi
+
+                if [ "$validation_passed" = true ]; then
+                  echo "✅ Performance validation passed for $policy"
+                else
+                  echo "❌ Performance validation failed for $policy"
+                  kill $ROUTER_PID 2>/dev/null || true
+                  exit 1
+                fi
+              done
+
+              echo "✓ Genai-bench completed successfully for $policy"
+              echo "📊 Detailed metrics and plots available in: $actual_folder"
+            else
+              echo "✗ Benchmark failed for $policy: No JSON results found"
+              kill $ROUTER_PID 2>/dev/null || true
+              exit 1
+            fi
+          else
+            echo "✗ Benchmark failed for $policy: Experiment folder not found"
             kill $ROUTER_PID 2>/dev/null || true
             exit 1
-          else
-            echo "✓ Performance validation passed for $policy"
           fi
 
           # Stop router before testing next policy
@@ -322,8 +386,8 @@ jobs:
       if: success()
       uses: actions/upload-artifact@v4
       with:
-        name: benchmark-results-all-policies
-        path: benchmark_*.txt
+        name: genai-bench-results-all-policies
+        path: benchmark_**/
 
     - name: Cleanup servers
       if: always()
@@ -343,27 +407,156 @@ jobs:
     if: success()
 
     steps:
+    - name: Install jq
+      run: sudo apt-get update && sudo apt-get install -y jq bc
+
     - name: Download benchmark results
       uses: actions/download-artifact@v4
       with:
-        name: benchmark-results-all-policies
+        name: genai-bench-results-all-policies
+
+    - name: List downloaded contents
+      run: |
+        echo "Contents after download:"
+        ls -la
+        find . -name "benchmark_*" -type d
+        echo "JSON files found:"
+        find . -name "*.json" | head -10
 
     - name: Create benchmark summary
       run: |
-        echo "## PD Router Benchmark Results Summary" >> $GITHUB_STEP_SUMMARY
+        echo "=== DEBUG: Creating benchmark summary ==="
+        echo "Available benchmark directories:"
+        find . -name "benchmark_*" -type d
+        echo "=========================================="
+
+        echo "## PD Router Genai-Bench Results Summary" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "| Policy | Latency (s) | Input Throughput (tok/s) | Output Throughput (tok/s) |" >> $GITHUB_STEP_SUMMARY
-        echo "|--------|-------------|-------------------------|--------------------------|" >> $GITHUB_STEP_SUMMARY
+        echo "🚀 **Benchmarked with genai-bench for comprehensive LLM serving performance evaluation**" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Policy | Status | TTFT (s) | E2E Latency (s) | Input Throughput (tok/s) | Output Throughput (tok/s) |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|--------|----------|-----------------|--------------------------|---------------------------|" >> $GITHUB_STEP_SUMMARY
 
+        # First, complete the table with all policies
         for policy in random round_robin cache_aware power_of_two; do
-          if [ -f "benchmark_${policy}.txt" ]; then
-            latency=$(grep "latency:" "benchmark_${policy}.txt" | awk '{print $2}')
-            input_throughput=$(grep "input throughput:" "benchmark_${policy}.txt" | awk '{print $3}')
-            output_throughput=$(grep "output throughput:" "benchmark_${policy}.txt" | awk '{print $3}')
+          # Find genai-bench result folders for this policy (handle zip extraction structure)
+          result_folder=$(find . -maxdepth 2 -name "benchmark_${policy}" -type d | head -1)
+          if [ -z "$result_folder" ]; then
+            # Try alternative patterns in case of different extraction structure
+            result_folder=$(find . -maxdepth 3 -path "*benchmark_${policy}*" -type d | head -1)
+          fi
 
-            echo "| ${policy} | ${latency} | ${input_throughput} | ${output_throughput} |" >> $GITHUB_STEP_SUMMARY
+          echo "DEBUG: Policy ${policy} -> Found folder: ${result_folder:-'NOT FOUND'}"
+
+          if [ -n "$result_folder" ] && [ -d "$result_folder" ]; then
+            # Find JSON file with metrics
+            json_file=$(find "$result_folder" -name "*.json" -not -name "experiment_metadata.json" | head -1)
+
+            if [ -n "$json_file" ] && [ -f "$json_file" ]; then
+              # Extract performance metrics
+              ttft_mean=$(jq -r '.aggregated_metrics.stats.ttft.mean // "N/A"' "$json_file" 2>/dev/null || echo "N/A")
+              e2e_latency_mean=$(jq -r '.aggregated_metrics.stats.e2e_latency.mean // "N/A"' "$json_file" 2>/dev/null || echo "N/A")
+              input_throughput_mean=$(jq -r '.aggregated_metrics.stats.input_throughput.mean // "N/A"' "$json_file" 2>/dev/null || echo "N/A")
+              output_throughput_mean=$(jq -r '.aggregated_metrics.stats.output_throughput.mean // "N/A"' "$json_file" 2>/dev/null || echo "N/A")
+
+              # Format numbers for display (2 decimal places)
+              if [ "$ttft_mean" != "N/A" ] && [ "$ttft_mean" != "null" ]; then
+                ttft_display=$(printf "%.2f" "$ttft_mean" 2>/dev/null || echo "$ttft_mean")
+              else
+                ttft_display="N/A"
+              fi
+
+              if [ "$e2e_latency_mean" != "N/A" ] && [ "$e2e_latency_mean" != "null" ]; then
+                e2e_display=$(printf "%.2f" "$e2e_latency_mean" 2>/dev/null || echo "$e2e_latency_mean")
+              else
+                e2e_display="N/A"
+              fi
+
+              if [ "$input_throughput_mean" != "N/A" ] && [ "$input_throughput_mean" != "null" ]; then
+                input_display=$(printf "%.0f" "$input_throughput_mean" 2>/dev/null || echo "$input_throughput_mean")
+              else
+                input_display="N/A"
+              fi
+
+              if [ "$output_throughput_mean" != "N/A" ] && [ "$output_throughput_mean" != "null" ]; then
+                output_display=$(printf "%.0f" "$output_throughput_mean" 2>/dev/null || echo "$output_throughput_mean")
+              else
+                output_display="N/A"
+              fi
+
+              echo "| ${policy} | ✅ Success | $ttft_display | $e2e_display | $input_display | $output_display |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| ${policy} | ❌ No Data | N/A | N/A | N/A | N/A |" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "| ${policy} | ❌ Failed | N/A | N/A | N/A | N/A |" >> $GITHUB_STEP_SUMMARY
           fi
         done
 
+        # Add performance validation summary
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "✅ All policies tested successfully!" >> $GITHUB_STEP_SUMMARY
+        echo "## 📊 Performance Validation" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Thresholds:** TTFT ≤ 2.0s | E2E Latency ≤ 8.0s | Input Throughput ≥ 10,000 tok/s | Output Throughput ≥ 100 tok/s" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        validation_summary=""
+        for policy in random round_robin cache_aware power_of_two; do
+          # Use same robust path finding as above
+          result_folder=$(find . -maxdepth 2 -name "benchmark_${policy}" -type d | head -1)
+          if [ -z "$result_folder" ]; then
+            result_folder=$(find . -maxdepth 3 -path "*benchmark_${policy}*" -type d | head -1)
+          fi
+
+          if [ -n "$result_folder" ] && [ -d "$result_folder" ]; then
+            json_file=$(find "$result_folder" -name "*.json" -not -name "experiment_metadata.json" | head -1)
+            if [ -n "$json_file" ] && [ -f "$json_file" ]; then
+              # Extract metrics for validation
+              ttft=$(jq -r '.aggregated_metrics.stats.ttft.mean // "N/A"' "$json_file" 2>/dev/null || echo "N/A")
+              e2e_latency=$(jq -r '.aggregated_metrics.stats.e2e_latency.mean // "N/A"' "$json_file" 2>/dev/null || echo "N/A")
+              input_throughput=$(jq -r '.aggregated_metrics.stats.input_throughput.mean // "N/A"' "$json_file" 2>/dev/null || echo "N/A")
+              output_throughput=$(jq -r '.aggregated_metrics.stats.output_throughput.mean // "N/A"' "$json_file" 2>/dev/null || echo "N/A")
+
+              # Check thresholds (using same values as in main workflow)
+              validation_status="✅"
+              if [ "$ttft" != "N/A" ] && [ "$ttft" != "null" ]; then
+                if (( $(echo "$ttft > 2.0" | bc -l 2>/dev/null || echo "0") )); then
+                  validation_status="❌"
+                fi
+              fi
+              if [ "$e2e_latency" != "N/A" ] && [ "$e2e_latency" != "null" ]; then
+                if (( $(echo "$e2e_latency > 8.0" | bc -l 2>/dev/null || echo "0") )); then
+                  validation_status="❌"
+                fi
+              fi
+              if [ "$input_throughput" != "N/A" ] && [ "$input_throughput" != "null" ]; then
+                if (( $(echo "$input_throughput < 10000" | bc -l 2>/dev/null || echo "0") )); then
+                  validation_status="❌"
+                fi
+              fi
+              if [ "$output_throughput" != "N/A" ] && [ "$output_throughput" != "null" ]; then
+                if (( $(echo "$output_throughput < 100" | bc -l 2>/dev/null || echo "0") )); then
+                  validation_status="❌"
+                fi
+              fi
+
+              validation_summary="${validation_summary}- **${policy}**: $validation_status\n"
+            else
+              validation_summary="${validation_summary}- **${policy}**: ❌ No data\n"
+            fi
+          else
+            validation_summary="${validation_summary}- **${policy}**: ❌ Failed\n"
+          fi
+        done
+
+        echo -e "$validation_summary" >> $GITHUB_STEP_SUMMARY
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## 📊 Genai-Bench Features Used" >> $GITHUB_STEP_SUMMARY
+        echo "- **Token-level Performance**: TTFT, TPOT, End-to-End latency" >> $GITHUB_STEP_SUMMARY
+        echo "- **Throughput Analysis**: Input/Output/Total token throughput" >> $GITHUB_STEP_SUMMARY
+        echo "- **Statistical Analysis**: Percentiles, mean, std dev for all metrics" >> $GITHUB_STEP_SUMMARY
+        echo "- **Visual Reports**: Automated plots and Excel summaries" >> $GITHUB_STEP_SUMMARY
+        echo "- **SGLang Backend**: Native integration with SGLang serving" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "✅ All policies tested successfully with genai-bench!" >> $GITHUB_STEP_SUMMARY
