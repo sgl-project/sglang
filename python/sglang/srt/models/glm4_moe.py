@@ -740,10 +740,11 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
             global_server_args_dict["enable_deepep_moe"]
             or global_server_args_dict["enable_ep_moe"]
         ):
-            disable_reason = "Deepseek GLM-4.5 can not use shared experts fusion optimization when in deepep_moe or ep_moe mode."
+            disable_reason = "Deepseek and GLM-4.5 can not use shared experts fusion optimization when in deepep_moe or ep_moe mode."
 
         if disable_reason is not None:
             global_server_args_dict["disable_shared_experts_fusion"] = True
+            self.num_fused_shared_experts = 0
             log_info_on_rank0(
                 logger,
                 f"{disable_reason} Shared experts fusion optimization is disabled.",
