@@ -64,8 +64,14 @@ def set_offloader(instance: BaseOffloader):
 def create_offloader_from_server_args(server_args: ServerArgs):
     if server_args.cpu_offload_gb > 0:
         return OffloaderV1(cpu_offload_max_bytes=int(server_args.cpu_offload_gb * 1024**3))
-    if TODO:
-        return OffloaderV2()
+    if server_args.offload_group_size > 0:
+        assert server_args.cpu_offload_gb == 0, "V2 offload does not support cpu_offload_gb yet"
+        return OffloaderV2(
+            group_size=server_args.offload_group_size,
+            num_in_group=server_args.offload_num_in_group,
+            prefetch_step=server_args.offload_prefetch_step,
+            mode=server_args.offload_mode,
+        )
     return NoopOffloader()
 
 class OffloaderV1(BaseOffloader):
