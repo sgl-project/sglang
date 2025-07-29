@@ -12,6 +12,7 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
+from sglang.srt.managers.mm_utils import TransportProxyTensor
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import load_audio, load_image, load_video, logger
 
@@ -142,11 +143,14 @@ class MultimodalSpecialTokens:
 class BaseMultimodalProcessor(ABC):
     models = []
 
-    def __init__(self, hf_config, server_args, _processor):
+    def __init__(
+        self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
+    ):
         self.hf_config = hf_config
         self._processor = _processor
         self.arch = hf_config.architectures[0]
         self.server_args = server_args
+        self.transport_mode = transport_mode
 
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
@@ -217,10 +221,6 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        if "pixel_values" in result and isinstance(
-            result["pixel_values"], torch.Tensor
-        ):
-            result["pixel_values"] = result["pixel_values"].to("cpu")
         return result
 
     @abstractmethod
@@ -500,7 +500,6 @@ class BaseMultimodalProcessor(ABC):
     ) -> List[MultimodalDataItem]:
         """Create mm_items directly from processor output."""
         items: dict[Modality, MultimodalDataItem] = {}
-
         for attr_name, value in data_dict.items():
             if attr_name == "input_ids":
                 continue
@@ -623,5 +622,20 @@ class BaseMultimodalProcessor(ABC):
                 input_ids=input_ids,
                 mm_token_id=mm_token_id,
             )
+
+        # post-process
+        for item in all_collected_items:
+            # replace the feature tensor with a proxy
+            if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
+                item.feature = TransportProxyTensor(
+                    transport_mode=self.transport_mode, data=item.feature
+                )
+            elif (
+                isinstance(item.precomputed_embeddings, torch.Tensor)
+                and item.precomputed_embeddings.is_cuda
+            ):
+                item.precomputed_embeddings = TransportProxyTensor(
+                    transport_mode=self.transport_mode, data=item.precomputed_embeddings
+                )
 
         return all_collected_items, input_ids, ret

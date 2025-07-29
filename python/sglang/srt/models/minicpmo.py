@@ -1134,7 +1134,10 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states, attn_weights, past_key_values = self.self_attn(
+        # TODO (lifuhuang): confirmed with Mick that the logic for past_key_values is copied from minicpmo official code,
+        # currently we are not using past_key_values at all. We need to redesign the caching logic when we support streaming
+        # in the future.
+        hidden_states, attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             layer_head_mask=layer_head_mask,

@@ -26,6 +26,7 @@ import zmq
 
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
+    BlockReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
@@ -282,6 +283,9 @@ class DataParallelController:
                     ),
                 ):
                     self.dispatching(recv_req)
+                elif isinstance(recv_req, BlockReqInput):
+                    for worker in self.workers:
+                        worker.send_pyobj(recv_req)
                 else:
                     # Send other control messages to first worker of tp group
                     for worker in self.workers[:: self.control_message_step]:

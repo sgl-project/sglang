@@ -16,6 +16,20 @@ from sglang.test.test_utils import (
 
 
 class TestOpenAIServerFunctionCalling(CustomTestCase):
+    # NOTE: this system_message is for Llama3.2 system prompt. Without this,
+    # sometimes Llama3.2 gives a different tool call format such as:
+    # '<|python_tag|>{"type": "function", "function": "add", "parameters": {"a": "3", "b": "5"}}'
+    SYSTEM_MESSAGE = (
+        "You are a helpful assistant with tool calling capabilities. "
+        "Only reply with a tool call if the function exists in the library provided by the user. "
+        "If it doesn't exist, just reply directly in natural language. "
+        "When you receive a tool call response, use the output to format an answer to the original user question. "
+        "You have access to the following functions. "
+        "To call a function, please respond with JSON for a function call. "
+        'Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}. '
+        "Do not use variables.\n\n"
+    )
+
     @classmethod
     def setUpClass(cls):
         # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -73,9 +87,13 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             }
         ]
 
-        messages = [{"role": "user", "content": "Compute (3+5)"}]
+        messages = [
+            {"role": "system", "content": self.SYSTEM_MESSAGE},
+            {"role": "user", "content": "Compute (3+5)"},
+        ]
         response = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -91,6 +109,84 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
 
         function_name = tool_calls[0].function.name
         assert function_name == "add", "Function name should be 'add'"
+
+    # This unit test is too difficult for default model. Mark it as optional unit tests so it won't trigger unless specified.
+    def _test_function_calling_multiturn(self):
+        """
+        Test: Whether the function call format returned by the AI is correct.
+        When returning a tool call, message.content should be None, and tool_calls should be a list.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "add",
+                    "description": "Compute the sum of two numbers",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "a": {
+                                "type": "int",
+                                "description": "A number",
+                            },
+                            "b": {
+                                "type": "int",
+                                "description": "A number",
+                            },
+                        },
+                        "required": ["a", "b"],
+                    },
+                },
+            }
+        ]
+
+        messages = [{"role": "user", "content": "Compute (3+5)"}]
+
+        response = client.chat.completions.create(
+            model=self.model,
+            max_tokens=2048,
+            messages=messages,
+            temperature=0.8,
+            top_p=0.8,
+            stream=False,
+            tools=tools,
+        )
+
+        tool_call = response.choices[0].message.tool_calls[0]
+        function_name = tool_call.function.name
+        assert function_name == "add", "Function name should be 'add'"
+        function_arguments = tool_call.function.arguments
+        function_arguments = json.loads(tool_call.function.arguments)
+        assert function_arguments in [
+            {"a": 3, "b": 5},
+            {"a": "3", "b": "5"},
+        ], f"Unexpected function arguments: {function_arguments}"
+
+        messages.append(response.choices[0].message)
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": "8",
+                "name": function_name,
+            }
+        )
+
+        final_response = client.chat.completions.create(
+            model=self.model,
+            max_tokens=2048,
+            messages=messages,
+            temperature=0.8,
+            top_p=0.8,
+            stream=False,
+            tools=tools,
+        )
+
+        assert (
+            "8" in final_response.choices[0].message.content
+        ), "tool_call response should have the sum 8 in the content"
 
     def test_function_calling_streaming_simple(self):
         """
@@ -125,10 +221,17 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             }
         ]
 
-        messages = [{"role": "user", "content": "What is the temperature in Paris?"}]
+        messages = [
+            {"role": "system", "content": self.SYSTEM_MESSAGE},
+            {
+                "role": "user",
+                "content": "What is the temperature in Paris in celsius??",
+            },
+        ]
 
         response_stream = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -200,11 +303,13 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         ]
 
         messages = [
-            {"role": "user", "content": "Please sum 5 and 7, just call the function."}
+            {"role": "system", "content": self.SYSTEM_MESSAGE},
+            {"role": "user", "content": "Please sum 5 and 7, just call the function."},
         ]
 
         response_stream = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.9,
             top_p=0.9,
@@ -213,8 +318,9 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         )
 
         argument_fragments = []
+        chunks = list(response_stream)
         function_name = None
-        for chunk in response_stream:
+        for chunk in chunks:
             choice = chunk.choices[0]
             if choice.delta.tool_calls:
                 tool_call = choice.delta.tool_calls[0]
@@ -229,6 +335,13 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         self.assertTrue(
             len(joined_args) > 0,
             "No parameter fragments were returned in the function call",
+        )
+
+        finish_reason = chunks[-1].choices[0].finish_reason
+        self.assertEqual(
+            finish_reason,
+            "tool_calls",
+            "Final response of function calling should have finish_reason 'tool_calls'",
         )
 
         # Check whether the concatenated JSON is valid
@@ -281,6 +394,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         ]
         response = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -349,6 +463,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         messages = [{"role": "user", "content": "What is the capital of France?"}]
         response = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -436,6 +551,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         messages = [{"role": "user", "content": "What is the capital of France?"}]
         response = client.chat.completions.create(
             model=self.model,
+            max_tokens=2048,
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -454,6 +570,211 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             function_name, "get_weather", "Function name should be 'get_weather'"
         )
         self.assertIn("city", args_obj, "Function arguments should have 'city'")
+
+    def test_streaming_multiple_choices_finish_reason(self):
+        """
+        Test: Verify that each choice gets its own finish_reason chunk in streaming mode with n > 1.
+        This tests the fix for the bug where only the last index got a finish_reason chunk.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_weather",
+                    "description": "Get the current weather in a given location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "The city and state, e.g. San Francisco, CA",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+
+        messages = [
+            {"role": "user", "content": "What is the weather like in Los Angeles?"}
+        ]
+
+        # Request with n=2 to get multiple choices
+        response_stream = client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            max_tokens=2048,
+            temperature=0.8,
+            stream=True,
+            tools=tools,
+            tool_choice="required",  # Force tool calls
+            n=2,  # Multiple choices
+        )
+
+        chunks = list(response_stream)
+
+        # Track finish_reason chunks for each index
+        finish_reason_chunks = {}
+        for chunk in chunks:
+            if chunk.choices:
+                for choice in chunk.choices:
+                    if choice.finish_reason is not None:
+                        index = choice.index
+                        if index not in finish_reason_chunks:
+                            finish_reason_chunks[index] = []
+                        finish_reason_chunks[index].append(choice.finish_reason)
+
+        # Verify we got finish_reason chunks for both indices
+        self.assertEqual(
+            len(finish_reason_chunks),
+            2,
+            f"Expected finish_reason chunks for 2 indices, got {len(finish_reason_chunks)}",
+        )
+
+        # Verify both index 0 and 1 have finish_reason
+        self.assertIn(
+            0, finish_reason_chunks, "Missing finish_reason chunk for index 0"
+        )
+        self.assertIn(
+            1, finish_reason_chunks, "Missing finish_reason chunk for index 1"
+        )
+
+        # Verify the finish_reason is "tool_calls" since we forced tool calls
+        for index, reasons in finish_reason_chunks.items():
+            self.assertEqual(
+                reasons[-1],  # Last finish_reason for this index
+                "tool_calls",
+                f"Expected finish_reason 'tool_calls' for index {index}, got {reasons[-1]}",
+            )
+
+    def test_function_calling_streaming_no_tool_call(self):
+        """
+        Test: Whether the finish_reason is stop in streaming mode when no tool call is given.
+        - Expect no function call to be found.
+        - Verify that finish_reason is stop
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_weather",
+                    "description": "Get the current weather in a given location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "The city to find the weather for",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "description": "Weather unit (celsius or fahrenheit)",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["city", "unit"],
+                    },
+                },
+            }
+        ]
+
+        messages = [{"role": "user", "content": "Who are you?"}]
+
+        response_stream = client.chat.completions.create(
+            model=self.model,
+            max_tokens=2048,
+            messages=messages,
+            temperature=0.8,
+            top_p=0.8,
+            stream=True,
+            tools=tools,
+            tool_choice="none",
+        )
+
+        chunks = list(response_stream)
+        self.assertTrue(len(chunks) > 0, "Streaming should return at least one chunk")
+
+        found_tool_call = False
+        for chunk in chunks:
+            choice = chunk.choices[0]
+            # Check whether the current chunk contains tool_calls
+            found_tool_call = choice.delta.tool_calls is not None
+
+        self.assertFalse(
+            found_tool_call,
+            "Shouldn't have any tool_call in the streaming chunks",
+        )
+
+        finish_reason = chunks[-1].choices[0].finish_reason
+        self.assertEqual(
+            finish_reason,
+            "stop",
+            "Final response of no function calling should have finish_reason 'stop'",
+        )
+
+    def test_streaming_multiple_choices_without_tools(self):
+        """
+        Test: Verify that each choice gets its own finish_reason chunk without tool calls.
+        This tests the fix for regular content streaming with multiple choices.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        messages = [{"role": "user", "content": "Say hello in one word."}]
+
+        # Request with n=2 to get multiple choices, no tools
+        response_stream = client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.8,
+            stream=True,
+            max_tokens=10,  # Keep it short
+            n=2,  # Multiple choices
+        )
+
+        chunks = list(response_stream)
+
+        # Track finish_reason chunks for each index
+        finish_reason_chunks = {}
+        for chunk in chunks:
+            if chunk.choices:
+                for choice in chunk.choices:
+                    if choice.finish_reason is not None:
+                        index = choice.index
+                        if index not in finish_reason_chunks:
+                            finish_reason_chunks[index] = []
+                        finish_reason_chunks[index].append(choice.finish_reason)
+
+        # Verify we got finish_reason chunks for both indices
+        self.assertEqual(
+            len(finish_reason_chunks),
+            2,
+            f"Expected finish_reason chunks for 2 indices, got {len(finish_reason_chunks)}",
+        )
+
+        # Verify both index 0 and 1 have finish_reason
+        self.assertIn(
+            0, finish_reason_chunks, "Missing finish_reason chunk for index 0"
+        )
+        self.assertIn(
+            1, finish_reason_chunks, "Missing finish_reason chunk for index 1"
+        )
+
+        # Verify the finish_reason is "stop" (regular completion)
+        for index, reasons in finish_reason_chunks.items():
+            self.assertIn(
+                reasons[-1],
+                ["stop", "length"],  # Could be either depending on how model responds
+                f"Expected finish_reason 'stop' or 'length' for index {index}, got {reasons[-1]}",
+            )
 
 
 class TestOpenAIPythonicFunctionCalling(CustomTestCase):
@@ -591,6 +912,41 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
             f"Function name '{found_names}' should container either 'get_weather' or 'get_tourist_attractions'",
         )
 
+
+# Skip for ci test
+# class TestGLM45ServerFunctionCalling(TestOpenAIServerFunctionCalling):
+#     @classmethod
+#     def setUpClass(cls):
+#         # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+#         cls.model = "THUDM/GLM-4.5"
+#         cls.base_url = DEFAULT_URL_FOR_TEST
+#         cls.api_key = "sk-123456"
+
+#         # Start the local OpenAI Server. If necessary, you can add other parameters such as --enable-tools.
+#         cls.process = popen_launch_server(
+#             cls.model,
+#             cls.base_url,
+#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+#             api_key=cls.api_key,
+#             other_args=[
+#                 # If your server needs extra parameters to test function calling, please add them here.
+#                 "--tool-call-parser",
+#                 "glm45",
+#                 "--reasoning-parser",
+#                 "glm45",
+#                 "--tp-size",
+#                 "8"
+#             ],
+#         )
+#         cls.base_url += "/v1"
+#         cls.tokenizer = get_tokenizer(cls.model)
+
+#     # This test is too difficult for GLM4-moe. Skip it from the UT
+#     def test_function_call_required(self):
+#         pass
+
+#     def test_function_calling_multiturn(self):
+#         self._test_function_calling_multiturn()
 
 if __name__ == "__main__":
     unittest.main()

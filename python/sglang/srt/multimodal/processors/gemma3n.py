@@ -27,8 +27,8 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
 
     models = [Gemma3nForConditionalGeneration]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
         self.IM_START_TOKEN_ID = hf_config.boi_token_id
         self.IM_END_TOKEN_ID = hf_config.eoi_token_id

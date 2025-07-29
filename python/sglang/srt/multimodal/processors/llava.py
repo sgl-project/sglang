@@ -30,8 +30,8 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         LlavaMistralForCausalLM,
     ]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
     @staticmethod
     def _process_single_image_task(
@@ -187,7 +187,7 @@ class LlavaMultimodalProcessor(BaseMultimodalProcessor):
             f"Cannot find corresponding multimodal processor registered in sglang for model type `{model_type}`"
         )
 
-    def __init__(self, hf_config, server_args, _processor):
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         assert hasattr(hf_config, "vision_config")
         assert hasattr(hf_config, "text_config")
         self.vision_config = hf_config.vision_config
@@ -196,7 +196,7 @@ class LlavaMultimodalProcessor(BaseMultimodalProcessor):
 
         if vision_type := getattr(self.vision_config, "model_type"):
             self.inner = self._get_sgl_processor_cls(vision_type)(
-                hf_config, server_args, _processor
+                hf_config, server_args, _processor, *args, **kwargs
             )
         else:
             raise ValueError(

@@ -10,6 +10,7 @@ from transformers import (
     PretrainedConfig,
     PreTrainedTokenizer,
     Qwen2Config,
+    Qwen3Config,
 )
 
 from sglang.utils import logger
@@ -314,6 +315,8 @@ class InternVLChatConfig(PretrainedConfig):
             self.llm_config = InternLM2Config(**llm_config)
         elif llm_config.get("architectures")[0] == "Qwen2ForCausalLM":
             self.llm_config = Qwen2Config(**llm_config)
+        elif llm_config.get("architectures")[0] == "Qwen3MoeForCausalLM":
+            self.llm_config = Qwen3Config(**llm_config)
         else:
             raise ValueError(
                 "Unsupported architecture: {}".format(

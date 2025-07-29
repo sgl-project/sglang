@@ -648,6 +648,7 @@ mod tests {
             user: None,
             seed: None,
             suffix: None,
+            other: serde_json::Map::new(),
         };
 
         let pd_req = req.to_pd_request();
@@ -687,6 +688,7 @@ mod tests {
             user: None,
             seed: None,
             suffix: None,
+            other: serde_json::Map::new(),
         };
 
         let pd_req = req.to_pd_request();
@@ -725,6 +727,7 @@ mod tests {
             user: Some("user123".to_string()),
             seed: Some(42),
             suffix: Some("...".to_string()),
+            other: serde_json::Map::new(),
         };
 
         let pd_req = req.to_pd_request();
@@ -768,6 +771,7 @@ mod tests {
             user: None,
             seed: None,
             suffix: None,
+            other: serde_json::Map::new(),
         };
 
         let pd_req = req.to_pd_request();
@@ -799,6 +803,7 @@ mod tests {
             user: None,
             seed: None,
             suffix: None,
+            other: serde_json::Map::new(),
         };
 
         let pd_req = req.to_pd_request();

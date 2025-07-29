@@ -6,6 +6,7 @@ from decord import VideoReader, cpu
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.models.interns1 import InternS1ForConditionalGeneration
 from sglang.srt.models.internvl import InternVLChatModel
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -14,12 +15,19 @@ from sglang.srt.multimodal.processors.base_processor import (
 
 
 class InternVLImageProcessor(BaseMultimodalProcessor):
-    models = [InternVLChatModel]
+    models = [InternVLChatModel, InternS1ForConditionalGeneration]
 
-    def __init__(self, hf_config, server_args, _image_processor):
-        super().__init__(hf_config, server_args, _image_processor)
-        image_size = hf_config.force_image_size or hf_config.vision_config.image_size
+    def __init__(self, hf_config, server_args, _image_processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _image_processor, *args, **kwargs)
+        image_size = (
+            getattr(hf_config, "force_image_size", None)
+            or hf_config.vision_config.image_size
+        )
         patch_size = hf_config.vision_config.patch_size
+        if isinstance(image_size, list):
+            image_size = image_size[0]
+        if isinstance(patch_size, list):
+            patch_size = patch_size[0]
 
         self.IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
         self.IMG_START_TOKEN = "<img>"
@@ -27,8 +35,12 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         self.num_image_token = int(
             (image_size // patch_size) ** 2 * (hf_config.downsample_ratio**2)
         )
+        if hasattr(self._processor, "tokenizer"):
+            tokenizer = self._processor.tokenizer
+        else:
+            tokenizer = self._processor
+        self.tokenizer = tokenizer
 
-        tokenizer = self._processor
         self.img_start_token_id = tokenizer.convert_tokens_to_ids(self.IMG_START_TOKEN)
         self.img_end_token_id = tokenizer.convert_tokens_to_ids(self.IMG_END_TOKEN)
         self.mm_tokens = MultimodalSpecialTokens(
@@ -195,7 +207,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             try:
                 # TODO: video input
                 raw_image = process_image_internvl(image)
-                pixel_value = [raw_image.to(torch.bfloat16).cuda()]
+                pixel_value = [raw_image.to(torch.bfloat16)]
                 pixel_values += pixel_value
                 num_patches = raw_image.shape[0]
                 num_patches_list += [num_patches]
@@ -214,8 +226,9 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             )
             input_text = input_text.replace("<image>", image_tokens, 1)
 
-        tokenizer = self._processor
-        input_ids = tokenizer(input_text, return_tensors="pt")["input_ids"].flatten()
+        input_ids = self.tokenizer(input_text, return_tensors="pt")[
+            "input_ids"
+        ].flatten()
         image_offsets = self.get_mm_items_offset(
             input_ids=input_ids,
             mm_token_id=self.mm_tokens.image_token_id,

@@ -172,28 +172,29 @@ class TestGemma3nServer(TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
-class TestKimiVLServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "moonshotai/Kimi-VL-A3B-Instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--context-length",
-                "4096",
-                "--dtype",
-                "bfloat16",
-            ],
-        )
-        cls.base_url += "/v1"
+# commented out before https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/discussions/27 get fixed
+# class TestKimiVLServer(TestOpenAIVisionServer):
+#     @classmethod
+#     def setUpClass(cls):
+#         cls.model = "moonshotai/Kimi-VL-A3B-Instruct"
+#         cls.base_url = DEFAULT_URL_FOR_TEST
+#         cls.api_key = "sk-123456"
+#         cls.process = popen_launch_server(
+#             cls.model,
+#             cls.base_url,
+#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+#             other_args=[
+#                 "--trust-remote-code",
+#                 "--context-length",
+#                 "4096",
+#                 "--dtype",
+#                 "bfloat16",
+#             ],
+#         )
+#         cls.base_url += "/v1"
 
-    def test_video_images_chat_completion(self):
-        pass
+#     def test_video_images_chat_completion(self):
+#         pass
 
 
 class TestPhi4MMServer(TestOpenAIVisionServer):

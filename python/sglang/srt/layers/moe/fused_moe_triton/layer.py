@@ -75,8 +75,9 @@ class FusedMoE(torch.nn.Module):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
-        enable_flashinfer_moe: Optional[bool] = False,
+        enable_flashinfer_cutlass_moe: Optional[bool] = False,
         enable_ep_moe: Optional[bool] = False,
+        skip_quant: Optional[bool] = False,
     ):
         super().__init__()
 
@@ -92,16 +93,13 @@ class FusedMoE(torch.nn.Module):
         self.num_experts = num_experts
         self.expert_map = None
 
-        if enable_flashinfer_moe and quant_config is None:
+        if enable_flashinfer_cutlass_moe and quant_config is None:
             logger.warning("Disable flashinfer MoE when quantization config is None.")
-            enable_flashinfer_moe = False
+            enable_flashinfer_cutlass_moe = False
             enable_ep_moe = False
 
-        self.enable_flashinfer_moe = enable_flashinfer_moe
+        self.enable_flashinfer_cutlass_moe = enable_flashinfer_cutlass_moe
         if enable_ep_moe:
-            assert (
-                self.enable_flashinfer_moe
-            ), "FusedMoE only supports EP with --enable-flashinfer-moe"
             self.ep_size = self.tp_size
             self.ep_rank = self.tp_rank
             self.tp_size = 1
@@ -110,16 +108,16 @@ class FusedMoE(torch.nn.Module):
             self.expert_map = torch.full((self.num_experts,), -1, dtype=torch.int32)
             # Create a expert map for the local experts
             assert num_experts % self.ep_size == 0
-            self.local_num_experts = num_experts // self.ep_size
+            self.num_local_experts = num_experts // self.ep_size
             self.expert_map[
                 self.ep_rank
-                * self.local_num_experts : (self.ep_rank + 1)
-                * self.local_num_experts
-            ] = torch.arange(0, self.local_num_experts, dtype=torch.int32, device="cpu")
+                * self.num_local_experts : (self.ep_rank + 1)
+                * self.num_local_experts
+            ] = torch.arange(0, self.num_local_experts, dtype=torch.int32, device="cpu")
         else:
             self.ep_size = 1
             self.ep_rank = 0
-            self.local_num_experts = num_experts
+            self.num_local_experts = num_experts
         self.routed_scaling_factor = routed_scaling_factor
         assert intermediate_size % self.tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
@@ -134,6 +132,9 @@ class FusedMoE(torch.nn.Module):
             not _is_cpu and global_server_args_dict["enable_triton_kernel_moe"]
         )
 
+        if skip_quant:
+            return
+
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
                 self.use_triton_kernels
@@ -141,13 +142,15 @@ class FusedMoE(torch.nn.Module):
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod":
-                self.quant_method.enable_flashinfer_moe = self.enable_flashinfer_moe
+                self.quant_method.enable_flashinfer_cutlass_moe = (
+                    self.enable_flashinfer_cutlass_moe
+                )
         assert self.quant_method is not None
 
         self.quant_config = quant_config
         self.quant_method.create_weights(
             layer=self,
-            num_experts=self.local_num_experts,
+            num_experts=self.num_local_experts,
             hidden_size=hidden_size,
             # FIXME: figure out which intermediate_size to use
             intermediate_size=self.intermediate_size_per_partition,
@@ -376,6 +379,23 @@ class FusedMoE(torch.nn.Module):
         if expert_id == -1:
             return
 
+        self._weight_loader_impl(
+            param=param,
+            loaded_weight=loaded_weight,
+            weight_name=weight_name,
+            shard_id=shard_id,
+            expert_id=expert_id,
+        )
+
+    def _weight_loader_impl(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> None:
+
         # TP rank is set to 0 if EP is enabled
         tp_rank = 0 if self.ep_size > 1 else get_tensor_model_parallel_rank()
 
@@ -395,6 +415,10 @@ class FusedMoE(torch.nn.Module):
             raise ValueError(
                 f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
             )
+
+        # Flashinfer assumes w31 format for w13_weight. Same for the scales.
+        if getattr(self, "use_flashinfer_trtllm_moe", False):
+            shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
 
         WEIGHT_SCALE_SUPPORTED = [e.value for e in FusedMoeWeightScaleSupported]
         # Fetch the dim to shard the parameter/loaded weight
@@ -603,37 +627,3 @@ class FusedMoE(torch.nn.Module):
                 ("w3", ckpt_up_proj_name),
             ]
         ]
-
-    def _load_fp8_scale(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-    ) -> None:
-        param_data = param.data
-
-        # Input scales can be loaded directly and should be equal.
-        if "input_scale" in weight_name:
-            if (
-                param_data[expert_id] != 1
-                and (param_data[expert_id] - loaded_weight).abs() > 1e-5
-            ):
-                raise ValueError(
-                    "input_scales of w1 and w3 of a layer "
-                    f"must be equal. But got {param_data[expert_id]} "
-                    f"vs. {loaded_weight}"
-                )
-            param_data[expert_id] = loaded_weight
-        # Weight scales
-        elif "weight_scale" in weight_name:
-            # If we are in merged column case (gate_up_proj)
-            if shard_id in ("w1", "w3"):
-                # We have to keep the weight scales of w1 and w3 because
-                # we need to re-quantize w1/w3 weights after weight loading.
-                idx = 0 if shard_id == "w1" else 1
-                param_data[expert_id][idx] = loaded_weight
-            # If we are in the row parallel case (down_proj)
-            else:
-                param_data[expert_id] = loaded_weight

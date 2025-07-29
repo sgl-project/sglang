@@ -86,6 +86,7 @@ fn test_benchmark_request_creation() {
         logit_bias: None,
         user: None,
         seed: None,
+        other: serde_json::Map::new(),
     };
 
     // Test serialization works
@@ -181,6 +182,7 @@ fn test_benchmark_request_adaptation() {
         logit_bias: None,
         user: None,
         seed: None,
+        other: serde_json::Map::new(),
     };
 
     // Test PD adaptation (should not panic)

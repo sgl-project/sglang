@@ -36,7 +36,6 @@
 #include "cute/arch/copy_sm90.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/numeric/arithmetic_tuple.hpp"
-#include "cute/tensor_predicate.hpp"
 #include "cutlass/cuda_host_adapter.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"

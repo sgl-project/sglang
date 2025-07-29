@@ -99,8 +99,16 @@ impl MockWorker {
 
 // Handler implementations
 
+/// Check if request should fail based on configured fail_rate
+async fn should_fail(config: &MockWorkerConfig) -> bool {
+    rand::random::<f32>() < config.fail_rate
+}
+
 async fn health_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> HttpResponse {
     let config = config.read().await;
+
+    // Note: We don't apply fail_rate to health endpoint to allow workers to be added successfully
+    // fail_rate is only applied to actual request endpoints
 
     match config.health_status {
         HealthStatus::Healthy => HttpResponse::Ok().json(json!({
@@ -122,6 +130,13 @@ async fn health_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> Htt
 async fn health_generate_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> HttpResponse {
     let config = config.read().await;
 
+    // Simulate failure based on fail_rate
+    if should_fail(&config).await {
+        return HttpResponse::InternalServerError().json(json!({
+            "error": "Random failure for testing"
+        }));
+    }
+
     if matches!(config.health_status, HealthStatus::Healthy) {
         HttpResponse::Ok().json(json!({
             "status": "ok",
@@ -137,6 +152,13 @@ async fn health_generate_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>
 
 async fn server_info_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> HttpResponse {
     let config = config.read().await;
+
+    // Simulate failure based on fail_rate
+    if should_fail(&config).await {
+        return HttpResponse::InternalServerError().json(json!({
+            "error": "Random failure for testing"
+        }));
+    }
 
     // Return response matching actual sglang server implementation
     HttpResponse::Ok().json(json!({
@@ -182,7 +204,16 @@ async fn server_info_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -
     }))
 }
 
-async fn model_info_handler(_config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> HttpResponse {
+async fn model_info_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> HttpResponse {
+    let config = config.read().await;
+
+    // Simulate failure based on fail_rate
+    if should_fail(&config).await {
+        return HttpResponse::InternalServerError().json(json!({
+            "error": "Random failure for testing"
+        }));
+    }
+
     // Return response matching actual sglang server implementation
     HttpResponse::Ok().json(json!({
         "model_path": "mock-model-path",
@@ -205,7 +236,7 @@ async fn generate_handler(
     let config = config.read().await;
 
     // Simulate failure based on fail_rate
-    if rand::random::<f32>() < config.fail_rate {
+    if should_fail(&config).await {
         return HttpResponse::InternalServerError().json(json!({
             "error": "Random failure for testing"
         }));
@@ -229,7 +260,10 @@ async fn generate_handler(
 
         tokio::spawn(async move {
             let tokens = vec!["This ", "is ", "a ", "mock ", "response."];
-            let timestamp_start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+            let timestamp_start = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64();
 
             for (i, token) in tokens.iter().enumerate() {
                 let chunk = json!({
@@ -248,7 +282,14 @@ async fn generate_handler(
                     }
                 });
 
-                if tx.send(format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap())).await.is_err() {
+                if tx
+                    .send(format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&chunk).unwrap()
+                    ))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
 
@@ -269,7 +310,6 @@ async fn generate_handler(
     } else {
         // Return non-streaming response matching sglang format
         let request_id = format!("mock-req-{}", rand::random::<u32>());
-        let timestamp_start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
 
         HttpResponse::Ok().json(json!({
             "text": "Mock generated response for the input",
@@ -567,7 +607,16 @@ async fn completions_handler(
     }
 }
 
-async fn flush_cache_handler(_config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> HttpResponse {
+async fn flush_cache_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> HttpResponse {
+    let config = config.read().await;
+
+    // Simulate failure based on fail_rate
+    if should_fail(&config).await {
+        return HttpResponse::InternalServerError().json(json!({
+            "error": "Random failure for testing"
+        }));
+    }
+
     HttpResponse::Ok().json(json!({
         "status": "success",
         "message": "Cache flushed",
@@ -575,7 +624,16 @@ async fn flush_cache_handler(_config: web::Data<Arc<RwLock<MockWorkerConfig>>>) 
     }))
 }
 
-async fn v1_models_handler(_config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> HttpResponse {
+async fn v1_models_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> HttpResponse {
+    let config = config.read().await;
+
+    // Simulate failure based on fail_rate
+    if should_fail(&config).await {
+        return HttpResponse::InternalServerError().json(json!({
+            "error": "Random failure for testing"
+        }));
+    }
+
     HttpResponse::Ok().json(json!({
         "object": "list",
         "data": [{

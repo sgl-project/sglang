@@ -91,4 +91,4 @@ done
 echo "✅ All disaggregation servers are ready and waiting for router connections"
 
 # Keep the script running
-wait  # Wait for all background server jobs
+wait

@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any, Optional, Tuple, Union
 
 import torch
@@ -18,11 +18,16 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
-from sglang.srt.distributed import parallel_state
+from sglang.srt.distributed import (
+    parallel_state,
+    split_tensor_along_last_dim,
+    tensor_model_parallel_all_gather,
+)
 from sglang.srt.distributed import utils as dist_utils
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -349,24 +354,43 @@ class VisionAttention(nn.Module):
         flatten_batch: bool = False,
         prefix: str = "",
         proj_bias: bool = True,
+        num_dummy_heads: int = 0,
+        qkv_bias: bool = True,
+        qk_normalization: bool = False,
+        layer_norm_eps: float = 1e-06,
         **kwargs,
     ):
         super().__init__()
         world_size = parallel_state.get_tensor_model_parallel_world_size()
+        self.tp_size = world_size
+        self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
         self.dropout = dropout
         self.head_size = embed_dim // num_heads
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
         self.num_attention_heads_per_partition = dist_utils.divide(
-            num_heads, world_size
+            num_dummy_heads + num_heads, world_size
         )
         self.num_attention_kv_heads_per_partition = dist_utils.divide(
-            num_heads, world_size
+            num_dummy_heads + num_heads, world_size
         )
 
         self.q_size = self.num_attention_heads_per_partition * self.head_size
         self.kv_size = self.num_attention_kv_heads_per_partition * self.head_size
+
+        self.qk_normalization = qk_normalization
+
+        # Additional dummy heads are used to enable TP for common GPU counts.
+        self.dummy_dim = (num_dummy_heads + num_heads) * self.head_size
+
+        if self.qk_normalization:
+            self.q_norm = RMSNorm(
+                self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
+            )
+            self.k_norm = RMSNorm(
+                self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
+            )
 
         if global_server_args_dict["mm_attention_backend"] is None:
             if qkv_backend is None:
@@ -391,25 +415,45 @@ class VisionAttention(nn.Module):
             self.qkv_proj = QKVParallelLinear(
                 hidden_size=embed_dim,
                 head_size=self.head_size,
-                total_num_heads=num_heads,
-                total_num_kv_heads=num_heads,
+                total_num_heads=num_dummy_heads + num_heads,
+                total_num_kv_heads=num_dummy_heads + num_heads,
+                bias=qkv_bias,
                 quant_config=quant_config,
                 prefix=add_prefix("qkv_proj", prefix),
             )
         else:
             self.qkv_proj = ColumnParallelLinear(
                 input_size=embed_dim,
-                output_size=3 * projection_size,
+                output_size=3 * self.dummy_dim,
+                bias=qkv_bias,
                 quant_config=quant_config,
                 prefix=add_prefix("qkv_proj", prefix),
             )
         self.proj = RowParallelLinear(
-            input_size=embed_dim,
+            input_size=self.dummy_dim,
             output_size=embed_dim,
             bias=proj_bias,
             quant_config=quant_config,
             prefix=add_prefix("proj", prefix),
         )
+
+    def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor):
+        """apply qk norm for internvl vit attn"""
+        q = q.flatten(1, 2)
+        k = k.flatten(1, 2)
+
+        if self.tp_size > 1:
+            q = tensor_model_parallel_all_gather(q.contiguous())
+            k = tensor_model_parallel_all_gather(k.contiguous())
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        if self.tp_size > 1:
+            splitter = partial(split_tensor_along_last_dim, num_partitions=self.tp_size)
+            q = splitter(q)[self.tp_rank]
+            k = splitter(k)[self.tp_rank]
+        q = q.unflatten(-1, (-1, self.head_size))
+        k = k.unflatten(-1, (-1, self.head_size))
+        return q, k
 
     def forward(
         self,
@@ -488,6 +532,10 @@ class VisionAttention(nn.Module):
         assert q.dim() == 3, q.dim()
         assert k.dim() == 3, k.dim()
         assert v.dim() == 3, v.dim()
+
+        # internvl
+        if self.qk_normalization:
+            q, k = self._apply_qk_norm(q, k)
 
         output = self.qkv_backend.forward(
             q=q,

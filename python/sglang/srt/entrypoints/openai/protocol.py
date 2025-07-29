@@ -192,9 +192,9 @@ class CompletionRequest(BaseModel):
     session_params: Optional[Dict] = None
 
     # For PD disaggregation
-    bootstrap_host: Optional[str] = None
-    bootstrap_port: Optional[int] = None
-    bootstrap_room: Optional[int] = None
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -317,7 +317,9 @@ class ToolCall(BaseModel):
 
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool"]
-    content: Union[str, List[ChatCompletionMessageContentTextPart], None]
+    content: Union[str, List[ChatCompletionMessageContentTextPart], None] = Field(
+        default=None
+    )
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
