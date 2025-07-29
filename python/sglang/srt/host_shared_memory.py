@@ -17,8 +17,8 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 
 class _HostSharedMemoryManager:
-    def __init__(self):
-        self._base_name = Path(os.environ["SGLANG_SHARED_MEMORY_MANAGER_BASE_NAME"])
+    def __init__(self, base_name: str):
+        self._base_name = Path(base_name)
         self._operation_index = 0
         self._records: List[_Record] = []
 
