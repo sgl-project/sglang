@@ -3,7 +3,6 @@
 
 # Individual folders
 /docker @zhyncs @HaiShaw @ByronHsu
-/docs @zhaochenyang20
 /python/sglang/srt/constrained @hnyls2002
 /python/sglang/srt/disaggregation @ByronHsu @hnyls2002
 /python/sglang/srt/distributed @yizhang2077
