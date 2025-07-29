@@ -1839,6 +1839,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
         )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:

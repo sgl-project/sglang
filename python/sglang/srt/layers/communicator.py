@@ -150,10 +150,13 @@ class LayerCommunicator:
         layer_scatter_modes: LayerScatterModes,
         input_layernorm: torch.nn.Module,
         post_attention_layernorm: torch.nn.Module,
+        # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
+        allow_reduce_scatter: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
+        self.allow_reduce_scatter = allow_reduce_scatter
 
         self._context = CommunicateContext.init_new()
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -240,11 +243,13 @@ class LayerCommunicator:
             residual=residual,
             forward_batch=forward_batch,
             context=self._context,
+            allow_reduce_scatter=self.allow_reduce_scatter,
         )
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         return (
-            self._communicate_summable_tensor_pair_fn
+            self.allow_reduce_scatter
+            and self._communicate_summable_tensor_pair_fn
             is CommunicateSummableTensorPairFn._scatter_hidden_states
             and forward_batch.dp_padding_mode.is_max_len()
         )
@@ -541,12 +546,13 @@ class CommunicateSummableTensorPairFn:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         context: CommunicateContext,
+        allow_reduce_scatter: bool = False,
     ):
         hidden_states, global_hidden_states = (
             forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
             hidden_states,
         )
-        if forward_batch.dp_padding_mode.is_max_len():
+        if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
             # When using padding, all_reduce is skipped after MLP and MOE and reduce scatter is used here instead.
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:
