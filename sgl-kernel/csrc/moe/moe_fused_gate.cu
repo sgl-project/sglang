@@ -14,11 +14,6 @@ using bfloat16_t = cutlass::bfloat16_t;
 using float16_t = cutlass::half_t;
 using float32_t = float;
 
-// Fixed constants common to both dynamic and static template versions:
-static constexpr int WARP_SIZE = 32;
-static constexpr int WARPS_PER_CTA = 6;
-static constexpr int MAX_VPT = 32;  // maximum VPT we support, > params.VPT = num_expert / num_expert_group
-
 // QQ NOTE: to handle the case for at::Half, error: more than one operator ">" matches these operands: built-in operator
 // "arithmetic > arithmetic" function "operator>(const __half &, const __half &)"
 template <typename T>
@@ -41,78 +36,10 @@ __device__ inline bool cmp_eq(const T& a, const T& b) {
   }
 }
 
-template <typename T>
-__device__ __forceinline__ T warp_shfl_down_sync(unsigned mask, T v, int delta, int width = WARP_SIZE);
-
-// ---- float -------------------------------------------------------
-template <>
-__device__ __forceinline__ float warp_shfl_down_sync<float>(unsigned mask, float v, int delta, int width) {
-  return __shfl_down_sync(mask, v, delta, width);
-}
-
-// ---- int ---------------------------------------------------------
-template <>
-__device__ __forceinline__ int warp_shfl_down_sync<int>(unsigned mask, int v, int delta, int width) {
-  return __shfl_down_sync(mask, v, delta, width);
-}
-
-// ---- unsigned ----------------------------------------------------
-template <>
-__device__ __forceinline__ unsigned warp_shfl_down_sync<unsigned>(unsigned mask, unsigned v, int delta, int width) {
-  return __shfl_down_sync(mask, v, delta, width);
-}
-
-// ---- cutlass::half_t --------------------------------------------
-template <>
-__device__ __forceinline__ cutlass::half_t
-warp_shfl_down_sync<cutlass::half_t>(unsigned mask, cutlass::half_t v, int delta, int width) {
-  float tmp = static_cast<float>(v);                // half -> float
-  tmp = __shfl_down_sync(mask, tmp, delta, width);  // shuffle
-  return cutlass::half_t(tmp);                      // float -> half
-}
-
-// ---- cutlass::bfloat16_t ----------------------------------------
-template <>
-__device__ __forceinline__ cutlass::bfloat16_t
-warp_shfl_down_sync<cutlass::bfloat16_t>(unsigned mask, cutlass::bfloat16_t v, int delta, int width) {
-  float tmp = static_cast<float>(v);         // bf16 -> float
-  tmp = __shfl_down_sync(mask, tmp, delta, width);   // shuffle
-  return cutlass::bfloat16_t(tmp);           // float -> bf16
-}
-
-// 32‑lane warp reduce：pair(min_val, tie_breaker_idx)
-template <typename T>
-__device__ inline void warp_argmin_pair(T& val, int& idx, unsigned mask = 0xffffffff, int width = WARP_SIZE) {
-#pragma unroll
-  for (int delta = WARP_SIZE >> 1; delta > 0; delta >>= 1) {
-    T other_val = warp_shfl_down_sync(mask, val, delta, width);
-    int other_idx = __shfl_down_sync(mask, idx, delta, width);
-    if (cmp_gt(val, other_val) || (cmp_eq(other_val, val) && other_idx > idx)) {
-      val = other_val;
-      idx = other_idx;
-    }
-  }
-}
-
-template <typename T>
-__device__ inline void warp_argmax_pair(T& val, int& idx, unsigned mask = 0xffffffff, int width = WARP_SIZE) {
-#pragma unroll
-  for (int delta = WARP_SIZE >> 1; delta > 0; delta >>= 1) {
-    T other_val = warp_shfl_down_sync(mask, val, delta, width);
-    int other_idx = __shfl_down_sync(mask, idx, delta, width);
-    if (cmp_gt(other_val, val) || (cmp_eq(other_val, val) && other_idx < idx)) {
-      val = other_val;
-      idx = other_idx;
-    }
-  }
-}
-
-__device__ inline float warp_reduce_sum(float v, unsigned mask = 0xffffffff, int width = WARP_SIZE) {
-#pragma unroll
-  for (int delta = WARP_SIZE >> 1; delta > 0; delta >>= 1)
-    v += warp_shfl_down_sync(mask, v, delta, width);
-  return v;
-}
+// Fixed constants common to both dynamic and static template versions:
+static constexpr int WARP_SIZE = 32;
+static constexpr int WARPS_PER_CTA = 6;
+static constexpr int MAX_VPT = 32;  // maximum VPT we support, > params.VPT = num_expert / num_expert_group
 
 // Create an alias for Array using AlignedArray
 template <typename T, int N>
@@ -171,11 +98,14 @@ __device__ void moe_fused_gate_impl(
     bias_chunk[ii] = vec_bias_thread_read_ptr[0][ii];
   }
 
+  __syncthreads();
+
 ////////////////////// Sigmoid //////////////////////
 #pragma unroll
   for (int ii = 0; ii < params.VPT; ++ii) {
     row_chunk[ii] = static_cast<T>(1.0f / (1.0f + expf(-float(row_chunk[ii]))));
   }
+  __syncthreads();
 
 ////////////////////// Add Bias //////////////////////
 #pragma unroll
@@ -187,6 +117,7 @@ __device__ void moe_fused_gate_impl(
 #pragma unroll
   for (int k_idx = 0; k_idx < params.THREADS_PER_ROW - topk_group;
        ++k_idx) {  // QQ NOTE Here params.THREADS_PER_ROW = num_expert_group
+    int expert = first_elt_read_by_thread;
     // local argmax
     T max_val = static_cast<T>(-FLT_MAX);
     T max_val_second = static_cast<T>(-FLT_MAX);
@@ -205,76 +136,118 @@ __device__ void moe_fused_gate_impl(
     // QQ NOTE: currently fixed to pick top2 sigmoid weight value in each expert group and sum them as the group weight
     // to select expert groups
     T max_sum = max_val + max_val_second;
-    int expert = first_elt_read_by_thread;
-    // Warp-level argmin
-    warp_argmin_pair(max_sum, expert);
 
-    if (expert == first_elt_read_by_thread) {
+// argmin reduce
 #pragma unroll
-      for (int ii = 0; ii < params.VPT; ++ii) {
-        bias_chunk[ii] = static_cast<T>(FLT_MAX);
+    for (int mask = params.THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+      T other_max_sum =
+          static_cast<T>(__shfl_xor_sync(0xFFFFFFFF, static_cast<float>(max_sum), mask, params.THREADS_PER_ROW));
+      int other_expert = __shfl_xor_sync(0xFFFFFFFF, expert, mask, params.THREADS_PER_ROW);
+
+      // higher indices win
+      if (cmp_gt(max_sum, other_max_sum) || (cmp_eq(other_max_sum, max_sum) && other_expert > expert)) {
+        max_sum = other_max_sum;
+        expert = other_expert;
       }
     }
-    __syncwarp();
+
+    // clear the max value in the thread
+    if (k_idx < params.THREADS_PER_ROW - topk_group) {
+      int const thread_to_clear_in_group = expert / params.VPT;
+
+      if (thread_group_idx == thread_to_clear_in_group) {
+#pragma unroll
+        for (int ii = 0; ii < params.VPT; ++ii) {
+          bias_chunk[ii] = static_cast<T>(FLT_MAX);
+        }
+      }
+    }
   }
 
-  ////////////////////// Topk //////////////////////
+  __syncthreads();
 
-  // Warp-level weight
-  float weight_local = 0.0f;
+  ////////////////////// Topk //////////////////////
+  float output_sum = 0.0f;
   for (int k_idx = 0; k_idx < topk_excluding_share_expert_fusion; ++k_idx) {
-    // local argmax per thread
-    T max_val = static_cast<T>(-FLT_MAX);
+    // local argmax
+    T max_val = bias_chunk[0];
     int expert = first_elt_read_by_thread;
 
+    if (!cmp_eq(max_val, static_cast<T>(FLT_MAX))) {
 #pragma unroll
-    for (int ii = 0; ii < params.VPT; ++ii) {
-      T val = bias_chunk[ii];
-      if (!cmp_eq(val, static_cast<T>(FLT_MAX)) && cmp_gt(val, max_val)) {
-        max_val = val;
-        expert = first_elt_read_by_thread + ii;
+      for (int ii = 1; ii < params.VPT; ++ii) {
+        T val = bias_chunk[ii];
+        if (cmp_gt(val, max_val)) {
+          max_val = val;
+          expert = first_elt_read_by_thread + ii;
+        }
+      }
+    } else {
+      max_val = static_cast<T>(-FLT_MAX);
+    }
+
+    // argmax reduce
+#pragma unroll
+    for (int mask = params.THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+      T other_max =
+          static_cast<T>(__shfl_xor_sync(0xFFFFFFFF, static_cast<float>(max_val), mask, params.THREADS_PER_ROW));
+      int other_expert = __shfl_xor_sync(0xFFFFFFFF, expert, mask, params.THREADS_PER_ROW);
+
+      // lower indices to win
+      if (cmp_gt(other_max, max_val) || (cmp_eq(other_max, max_val) && other_expert < expert)) {
+        max_val = other_max;
+        expert = other_expert;
       }
     }
 
-    // Warp-level argmax
-    warp_argmax_pair(max_val, expert);
-
+    int thread_to_clear_in_group = expert / params.VPT;
     int64_t idx = topk * thread_row + k_idx;
 
-    if (expert / params.VPT == thread_group_idx) {
+    if (thread_group_idx == thread_to_clear_in_group) {
       int expert_to_clear_in_thread = expert % params.VPT;
 
       // clear the max value in the thread
       bias_chunk[expert_to_clear_in_thread] = static_cast<T>(-FLT_MAX);
+
       // store output
       output_ptr[idx] = static_cast<float>(row_chunk[expert_to_clear_in_thread]);
       indices_ptr[idx] = static_cast<int32_t>(expert);
-      weight_local += output_ptr[idx];
     }
 
-    __syncwarp();
+    // accumulate sum for all elements
+    if (thread_group_idx == 0) {
+      output_sum += output_ptr[idx];
+    }
+
+    __syncthreads();
   }
 
-  float output_sum = warp_reduce_sum(weight_local);
-
-  // Thread 0 on each line write sum to register
   if (thread_group_idx == 0 && num_fused_shared_experts > 0) {
-    int64_t base_idx = topk * thread_row + topk_excluding_share_expert_fusion;
+    int64_t last_idx = topk * thread_row + topk_excluding_share_expert_fusion;
     int64_t expert_offset = 0;
+    indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
 
-    for (int i = 0; i < num_fused_shared_experts; ++i) {
-      indices_ptr[base_idx + i] = static_cast<int32_t>(params.NUM_EXPERTS + i);
-      // Set the weight to the sum of all weights divided by routed_scaling_factor
-      output_ptr[base_idx + i] = output_sum / routed_scaling_factor;
+    // Set the weight to the sum of all weights divided by routed_scaling_factor
+    output_ptr[last_idx] = output_sum / routed_scaling_factor;
+
+    if (num_fused_shared_experts > 1) {
+      for (int i = 1; i < num_fused_shared_experts; ++i) {
+        ++last_idx;
+        ++expert_offset;
+        indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
+        // Set the weight to the sum of all weights divided by routed_scaling_factor
+        output_ptr[last_idx] = output_sum / routed_scaling_factor;
+      }
     }
   }
+  __syncthreads();
 
   ////////////////////// Rescale Output //////////////////////
   if (thread_group_idx == 0) {
 #pragma unroll
     for (int ii = 0; ii < topk; ++ii) {
       int64_t const idx = topk * thread_row + ii;
-      output_ptr[idx] /= output_sum;
+      output_ptr[idx] = output_ptr[idx] / output_sum;
     }
   }
 }
