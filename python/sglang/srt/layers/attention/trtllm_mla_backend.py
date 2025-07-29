@@ -147,6 +147,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             block_kv_indices,
             self.req_to_token.stride(0),
             max_blocks,
+            TRITON_PAD_NUM_PAGE_PER_BLOCK,
             self.page_size,
         )
 
@@ -179,28 +180,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         spec_info: Optional[SpecInfo],
     ):
         """Initialize metadata for CUDA graph capture."""
-        if forward_mode.is_decode_or_idle() and spec_info is None:
-            max_seqlen_pad = self._calc_padded_blocks(seq_lens.max().item())
-            block_kv_indices = self.cuda_graph_kv_indices[:bs, :max_seqlen_pad]
-
-            create_flashmla_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                seq_lens,
-                None,
-                block_kv_indices,
-                self.req_to_token.stride(0),
-                max_seqlen_pad,
-                self.page_size,
-            )
-
-            metadata = TRTLLMMLADecodeMetadata(
-                self.cuda_graph_workspace, block_kv_indices
-            )
-            self.decode_cuda_graph_metadata[bs] = metadata
-            self.forward_metadata = metadata
-        else:
-            super().init_forward_metadata_capture_cuda_graph(
+        # Delegate to parent for non-decode modes or when speculative execution is used.
+        if not (forward_mode.is_decode_or_idle() and spec_info is None):
+            return super().init_forward_metadata_capture_cuda_graph(
                 bs,
                 num_tokens,
                 req_pool_indices,
@@ -209,6 +191,26 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_mode,
                 spec_info,
             )
+
+        # Custom fast-path for decode/idle without speculative execution.
+        max_seqlen_pad = self._calc_padded_blocks(seq_lens.max().item())
+        block_kv_indices = self.cuda_graph_kv_indices[:bs, :max_seqlen_pad]
+
+        create_flashmla_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            None,
+            block_kv_indices,
+            self.req_to_token.stride(0),
+            max_seqlen_pad,
+            TRITON_PAD_NUM_PAGE_PER_BLOCK,
+            self.page_size,
+        )
+
+        metadata = TRTLLMMLADecodeMetadata(self.cuda_graph_workspace, block_kv_indices)
+        self.decode_cuda_graph_metadata[bs] = metadata
+        self.forward_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -222,24 +224,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         """Replay CUDA graph with new inputs."""
-        if forward_mode.is_decode_or_idle() and spec_info is None:
-            metadata = self.decode_cuda_graph_metadata[bs]
-
-            # Update block indices for new sequences
-            create_flashmla_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices[:bs],
-                seq_lens[:bs],
-                None,
-                metadata.block_kv_indices,
-                self.req_to_token.stride(0),
-                metadata.block_kv_indices.shape[1],
-                self.page_size,
-            )
-
-            self.forward_metadata = metadata
-        else:
-            super().init_forward_metadata_replay_cuda_graph(
+        # Delegate to parent for non-decode modes or when speculative execution is used.
+        if not (forward_mode.is_decode_or_idle() and spec_info is None):
+            return super().init_forward_metadata_replay_cuda_graph(
                 bs,
                 req_pool_indices,
                 seq_lens,
@@ -250,40 +237,55 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 seq_lens_cpu,
             )
 
+        metadata = self.decode_cuda_graph_metadata[bs]
+
+        # Update block indices for new sequences.
+        create_flashmla_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            req_pool_indices[:bs],
+            seq_lens[:bs],
+            None,
+            metadata.block_kv_indices,
+            self.req_to_token.stride(0),
+            metadata.block_kv_indices.shape[1],
+            TRITON_PAD_NUM_PAGE_PER_BLOCK,
+            self.page_size,
+        )
+
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
-        if (
+        # Delegate to parent for non-decode modes or when speculative execution is used.
+        if not (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is None
         ):
-            bs = forward_batch.batch_size
+            return super().init_forward_metadata(forward_batch)
 
-            # Get maximum sequence length
-            if getattr(forward_batch, "seq_lens_cpu", None) is not None:
-                max_seq = forward_batch.seq_lens_cpu.max().item()
-            else:
-                max_seq = forward_batch.seq_lens.max().item()
+        bs = forward_batch.batch_size
 
-            max_seqlen_pad = self._calc_padded_blocks(max_seq)
-            block_kv_indices = self._create_block_kv_indices(
-                bs,
-                max_seqlen_pad,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens.device,
-            )
-
-            self.forward_metadata = TRTLLMMLADecodeMetadata(
-                self.workspace_buffer, block_kv_indices
-            )
-            forward_batch.decode_trtllm_mla_metadata = self.forward_metadata
+        # Get maximum sequence length.
+        if getattr(forward_batch, "seq_lens_cpu", None) is not None:
+            max_seq = forward_batch.seq_lens_cpu.max().item()
         else:
-            # For prefill or other modes, fallback to parent implementation.
-            super().init_forward_metadata(forward_batch)
+            max_seq = forward_batch.seq_lens.max().item()
+
+        max_seqlen_pad = self._calc_padded_blocks(max_seq)
+        block_kv_indices = self._create_block_kv_indices(
+            bs,
+            max_seqlen_pad,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.seq_lens.device,
+        )
+
+        self.forward_metadata = TRTLLMMLADecodeMetadata(
+            self.workspace_buffer, block_kv_indices
+        )
+        forward_batch.decode_trtllm_mla_metadata = self.forward_metadata
 
     def forward_decode(
         self,

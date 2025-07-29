@@ -55,11 +55,10 @@ def create_flashmla_kv_indices_triton(
     kv_indices_ptr,
     req_to_token_ptr_stride: tl.constexpr,
     kv_indices_ptr_stride: tl.constexpr,
+    NUM_PAGE_PER_BLOCK: tl.constexpr = TRITON_PAD_NUM_PAGE_PER_BLOCK,
     PAGED_SIZE: tl.constexpr = 64,
 ):
     BLOCK_SIZE: tl.constexpr = 4096
-    # Keep in sync with module-level TRITON_PAD_NUM_PAGE_PER_BLOCK constant above
-    NUM_PAGE_PER_BLOCK: tl.constexpr = 64
     pid = tl.program_id(axis=0)
 
     # find the req pool idx, this is for batch to token
