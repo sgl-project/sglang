@@ -881,7 +881,7 @@ class MllamaForConditionalGeneration(nn.Module):
                 dtype=torch.float32,
             )
             batched_ar_ids = torch.ones(
-                bs, max_num_images, dtype=torch.int64, device="cuda"
+                bs, max_num_images, dtype=torch.int64
             )
             batched_ar_mask = torch.zeros(
                 bs, max_num_images, max_num_tiles, dtype=torch.int64
