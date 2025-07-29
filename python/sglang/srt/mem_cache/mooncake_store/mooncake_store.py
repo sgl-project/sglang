@@ -18,7 +18,7 @@ DEFAULT_LOCAL_BUFFER_SIZE = 128 * 1024 * 1024  # 128 MB
 logger = logging.getLogger(__name__)
 
 
-def get_hash_str_mooncake(prefix_block_key: str, current_page_ids: List):
+def get_hash_str_mooncake(current_page_ids: List, prefix_block_key: str):
     local_rank = get_tensor_model_parallel_rank()
     prefix_str = ""
     if prefix_block_key:

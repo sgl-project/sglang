@@ -1,10 +1,7 @@
 import hashlib
-import json
 import logging
 import os
-import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import Any, List, Optional
 
 import torch
@@ -43,7 +40,7 @@ class HiCacheStorage(ABC):
     @abstractmethod
     def get(
         self,
-        key,
+        key: str,
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
@@ -69,7 +66,7 @@ class HiCacheStorage(ABC):
     @abstractmethod
     def set(
         self,
-        key,
+        key: str,
         value: Optional[Any] = None,
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
@@ -95,7 +92,7 @@ class HiCacheStorage(ABC):
         pass
 
     @abstractmethod
-    def exists(self, key) -> bool | dict:
+    def exists(self, key: str) -> bool | dict:
         """
         Check if the key exists in the storage.
         Returns True if the key exists, False otherwise.
@@ -119,7 +116,7 @@ class HiCacheFile(HiCacheStorage):
 
     def get(
         self,
-        key,
+        key: str,
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
@@ -151,11 +148,12 @@ class HiCacheFile(HiCacheStorage):
 
     def set(
         self,
-        key,
+        key: str,
         value: Optional[Any] = None,
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
+        key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         if self.exists(key):
             logger.debug(f"Key {key} already exists. Skipped.")
@@ -179,7 +177,8 @@ class HiCacheFile(HiCacheStorage):
                 return False
         return True
 
-    def exists(self, key) -> bool | dict:
+    def exists(self, key: str) -> bool:
+        key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         return os.path.exists(tensor_path)
 
