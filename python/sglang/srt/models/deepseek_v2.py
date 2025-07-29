@@ -1996,7 +1996,6 @@ class DeepseekV2Model(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        module_offloader=None,
     ) -> None:
         super().__init__()
         self.padding_id = config.pad_token_id
@@ -2113,12 +2112,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
-        self.module_offloader = ModuleOffloader()
         self.model = DeepseekV2Model(
             config,
             quant_config,
             prefix=add_prefix("model", prefix),
-            module_offloader=self.module_offloader,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
