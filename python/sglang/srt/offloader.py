@@ -156,7 +156,6 @@ class OffloaderV2(BaseOffloader):
         )
         self.prefetch_step = get_int_env_var("SGLANG_OFFLOAD_PREFETCH_STEP", 1)
         self.mode = os.environ.get("SGLANG_OFFLOAD_MODE", "cpu")
-        self.enabled = self.group_size > 0
 
         # Temporarily init inside Offloader, can move if other modules also need this
         if self.mode in {"sharded_gpu", "shm_cpu"}:
@@ -180,9 +179,6 @@ class OffloaderV2(BaseOffloader):
         submodule_accessor: Optional[_SubmoduleAccessor] = None,
         whitelist_param_names_creator: Optional[_WhitelistParamNamesCreator] = None,
     ):
-        if not self.enabled:
-            return list(all_modules_generator)
-
         logger.info(
             f"[offloader] {self.group_size=} {self.num_offload_in_group=} {self.prefetch_step=}"
         )
@@ -226,9 +222,6 @@ class OffloaderV2(BaseOffloader):
         return all_modules
 
     def post_init(self):
-        if not self.enabled:
-            return
-
         for offloader in self.offloaders:
             offloader.post_init()
 
