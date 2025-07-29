@@ -74,8 +74,6 @@ class ForwardMode(IntEnum):
     MIXED = auto()
     # No sequence to forward. For data parallel attention, some workers will be IDLE if no sequence are allocated.
     IDLE = auto()
-    # Split Prefill for PD multiplexing
-    SPLIT_PREFILL = auto()
 
     # Used in speculative decoding: verify a batch in the target model.
     TARGET_VERIFY = auto()
@@ -85,6 +83,9 @@ class ForwardMode(IntEnum):
     # A dummy first batch to start the pipeline for overlap scheduler.
     # It is now used for triggering the sampling_info_done event for the first prefill batch.
     DUMMY_FIRST = auto()
+
+    # Split Prefill for PD multiplexing
+    SPLIT_PREFILL = auto()
 
     def is_prefill(self):
         return self.is_extend()
@@ -103,11 +104,11 @@ class ForwardMode(IntEnum):
     def is_mixed(self):
         return self == ForwardMode.MIXED
 
-    def is_split_prefill(self):
-        return self == ForwardMode.SPLIT_PREFILL
-
     def is_idle(self):
         return self == ForwardMode.IDLE
+
+    def is_decode_or_idle(self):
+        return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
     def is_target_verify(self):
         return self == ForwardMode.TARGET_VERIFY
@@ -132,8 +133,8 @@ class ForwardMode(IntEnum):
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
 
-    def is_decode_or_idle(self):
-        return self == ForwardMode.DECODE or self == ForwardMode.IDLE
+    def is_split_prefill(self):
+        return self == ForwardMode.SPLIT_PREFILL
 
 
 @total_ordering
