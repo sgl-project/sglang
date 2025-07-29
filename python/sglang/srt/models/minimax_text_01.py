@@ -1575,4 +1575,8 @@ def get_finished_requests_ids(forward_batch: ForwardBatch, **kwargs):
     return finished_requests_ids
 
 
-EntryClass = [MiniMaxText01ForCausalLM]
+class MiniMaxM1ForCausalLM(MiniMaxText01ForCausalLM):
+    pass
+
+
+EntryClass = [MiniMaxText01ForCausalLM, MiniMaxM1ForCausalLM]
