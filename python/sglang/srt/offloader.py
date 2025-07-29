@@ -321,7 +321,7 @@ class _BaseParamOffloader(ABC):
             "meta": _MetaParamOffloader,
             "cpu": _CpuParamOffloader,
             "shm_cpu": _ShmCpuParamOffloader,
-            # "sharded_gpu": _ShardedGpuParamOffloader,
+            "sharded_gpu": _ShardedGpuParamOffloader,
         }[mode](**kwargs)
 
     def __init__(self, module, param_name):
