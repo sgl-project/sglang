@@ -891,10 +891,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         ), "Weight Blockscale must be represented as FP8-E4M3"
         w13_blockscale_swizzled = self.swizzle_blockscale(layer.w13_weight_scale)
 
-        layer.w13_blockscale_swizzled = Parameter(
-            w13_blockscale_swizzled, requires_grad=False
-        )
-        dispose_tensor(layer.w13_weight_scale.data)
+        layer.w13_blockscale_swizzled.data.copy_(w13_blockscale_swizzled)
+        dispose_tensor(layer.w13_weight_scale.data) # TODO remove?
         del layer.w13_weight_scale
 
         # This is for quantization, so we need to invert it.
@@ -928,10 +926,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         ), "Weight Blockscale must be represented as FP8-E4M3"
         w2_blockscale_swizzled = self.swizzle_blockscale(layer.w2_weight_scale)
 
-        layer.w2_blockscale_swizzled = Parameter(
-            w2_blockscale_swizzled, requires_grad=False
-        )
-        dispose_tensor(layer.w2_weight_scale.data)
+        layer.w2_blockscale_swizzled.data.copy_(w2_blockscale_swizzled)
+        dispose_tensor(layer.w2_weight_scale.data) # TODO remove?
         del layer.w2_weight_scale
         layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 

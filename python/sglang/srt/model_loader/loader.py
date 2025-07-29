@@ -103,6 +103,7 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
                 original_info = original_infos[name]
                 original_data = original_info["param_data"]
                 original_device: torch.device = original_info["device"]
+
                 if original_data.data_ptr() == p.data.data_ptr():
                     original_data.copy_(p.data.to(original_data.device))
                     p.data = original_data
