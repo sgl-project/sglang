@@ -1994,9 +1994,10 @@ class DeepseekV2Model(nn.Module):
                 config,
                 layer_id=idx,
                 quant_config=quant_config,
-                prefix=add_prefix(f"layers.{idx}", prefix),
+                prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
+            prefix=f"{prefix}.layers",
             offloader_kwargs=dict(
                 submodule_accessor=lambda layer: (
                     layer.mlp.experts
