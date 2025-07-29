@@ -18,11 +18,9 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-
-try:
-    from transformers import Ernie4_5_MoEConfig  # Added in 4.54.0.dev0
-except (ImportError, AttributeError):
-    from transformers import PretrainedConfig as Ernie4_5_MoEConfig
+from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import (
+    Ernie4_5_MoeConfig,
+)
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -40,7 +38,7 @@ from sglang.srt.utils import add_prefix
 class Ernie4ModelMTP(nn.Module):
     def __init__(
         self,
-        config: Ernie4_5_MoEConfig,
+        config: Ernie4_5_MoeConfig,
         layer_id: int,
         prefix: str,
         quant_config: Optional[QuantizationConfig] = None,
@@ -103,7 +101,7 @@ class Ernie4ModelMTP(nn.Module):
 class Ernie4_5_MoeForCausalLMMTP(nn.Module):
     def __init__(
         self,
-        config: Ernie4_5_MoEConfig,
+        config: Ernie4_5_MoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         mtp_layer_id: int = 0,

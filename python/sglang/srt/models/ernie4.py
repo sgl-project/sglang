@@ -19,11 +19,9 @@ from typing import Iterable, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
-
-try:
-    from transformers import Ernie4_5_MoEConfig  # Added in 4.54.0.dev0
-except (ImportError, AttributeError):
-    from transformers import PretrainedConfig as Ernie4_5_MoEConfig
+from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import (
+    Ernie4_5_MoeConfig,
+)
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -69,7 +67,7 @@ class MoEGate(nn.Module):
 class Ernie4Moe(nn.Module):
     def __init__(
         self,
-        config: Ernie4_5_MoEConfig,
+        config: Ernie4_5_MoeConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -251,7 +249,7 @@ class Ernie4DecoderLayer(nn.Module):
 class Ernie4Model(nn.Module):
     def __init__(
         self,
-        config: Ernie4_5_MoEConfig,
+        config: Ernie4_5_MoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -314,12 +312,12 @@ class Ernie4_5_ForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: Ernie4_5_MoEConfig,
+        config: Ernie4_5_MoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__()
-        self.config: Ernie4_5_MoEConfig = config
+        self.config: Ernie4_5_MoeConfig = config
         self.quant_config = quant_config
         self.model = Ernie4Model(config, quant_config, add_prefix("model", prefix))
         if config.tie_word_embeddings:
