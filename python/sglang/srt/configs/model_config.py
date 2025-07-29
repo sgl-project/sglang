@@ -316,6 +316,7 @@ class ModelConfig:
             quantization=server_args.quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
+            modelopt_quant=server_args.modelopt_quant,
             **kwargs,
         )
 
