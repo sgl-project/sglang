@@ -236,7 +236,6 @@ class DeepEPMoE(FusedMoE):
             dispatch_output.topk_weights,
         )
         local_topk_ids = topk_idx
-        # hidden_states,hidden_states_scale=hidden_states
         local_topk_ids = (
             torch.where(local_topk_ids == -1, self.num_experts, topk_idx)
             .to(torch.int32)
