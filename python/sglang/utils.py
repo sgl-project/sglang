@@ -291,17 +291,6 @@ def find_printable_text(text: str):
         return text[: text.rfind(" ") + 1]
 
 
-def graceful_registry(sub_module_name: str):
-    def graceful_shutdown(signum, frame):
-        logger.info(
-            f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown..."
-        )
-        if signum == signal.SIGTERM:
-            logger.info(f"{sub_module_name} receive sigterm")
-
-    signal.signal(signal.SIGTERM, graceful_shutdown)
-
-
 class LazyImport:
     """Lazy import to make `import sglang` run faster."""
 

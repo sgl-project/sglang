@@ -238,6 +238,9 @@ async def health() -> Response:
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """Check the health of the inference server by generating one token."""
+    if _global_state.tokenizer_manager.gracefully_exit:
+        logger.info("Health check request received during shutdown. Returning 503.")
+        return Response(status_code=503)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     rid = f"HEALTH_CHECK_{time.time()}"
@@ -260,9 +263,14 @@ async def health_generate(request: Request) -> Response:
         async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
             break
 
-    tic = time.perf_counter()
+    # This request is a special request.
+    # If the server already has something running, this request will be ignored, so it creates zero overhead.
+    # If the server is not running, this request will be run, so we know whether the server is healthy.
     task = asyncio.create_task(gen())
-    while time.perf_counter() < tic + HEALTH_CHECK_TIMEOUT:
+
+    # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
+    tic = time.time()
+    while time.time() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
