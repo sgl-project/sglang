@@ -343,6 +343,8 @@ class _BaseParamOffloader(ABC):
 
 
 class _MetaParamOffloader(_BaseParamOffloader):
+    """Usually used for debugging."""
+
     def __init__(self, module, param_name):
         super().__init__(module, param_name)
         _move_param_to_meta(module, param_name)
