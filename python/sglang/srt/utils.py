@@ -2891,6 +2891,8 @@ class ConcurrentCounter:
         other tasks to run while waiting. When the counter becomes zero, the coroutine resumes.
         """
         self.wait_for(lambda count: count == 0)
+
+
 def check_cuda_result(raw_output):
     import cuda.bindings.runtime as cuda_rt
 

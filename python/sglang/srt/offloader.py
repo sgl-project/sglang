@@ -196,22 +196,17 @@ class OffloaderV2(BaseOffloader):
     ):
         assert len(self.offloaders) == 0, "should only call wrap_modules once"
 
-        logger.info(
-            f"[offloader] {self.group_size=} {self.num_in_group=} {self.prefetch_step=}"
-        )
-
         alt_stream = torch.cuda.Stream()
 
         all_modules = []
         offload_submodules = []
         for module_index, module in enumerate(all_modules_generator):
-            logger.info(f"[offloader] {module_index=} {torch.cuda.memory_allocated()=}")
             all_modules.append(module)
             if module_index % self.group_size >= self.group_size - self.num_in_group:
                 submodule = submodule_accessor(module)
                 whitelist_param_names = whitelist_param_names_creator(submodule)
                 logger.info(
-                    f"[offloader] offload {module_index=} submodule={type(submodule)} params={whitelist_param_names}"
+                    f"[offloader] offload {module_index=} submodule={type(submodule)} params={whitelist_param_names} memory_allocated={torch.cuda.memory_allocated()}"
                 )
                 offload_submodules.append(submodule)
                 self.offloaders.append(
