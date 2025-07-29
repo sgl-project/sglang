@@ -234,7 +234,7 @@ class SchedulerOutputProcessorMixin:
                     req.spec_verify_ct += 1
                     self.num_generated_tokens += accept_length_cpu[i]
                 self.spec_num_total_accepted_tokens += sum(accept_length_cpu)
-                self.spec_num_total_forward_ct += 1
+                self.spec_num_total_forward_ct += len(batch.reqs)
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
