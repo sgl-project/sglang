@@ -8,6 +8,7 @@ from typing import List, Optional, Set, Tuple
 import torch
 from torch import nn
 from transformers import Llama4Config, Llama4VisionConfig
+from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.attention.vision import VisionAttention
@@ -36,6 +37,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_cpu
 
 _is_cpu = is_cpu()
+import pdb
+
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -84,29 +87,6 @@ class Llama4VisionMLP(nn.Module):
         hidden_states, _ = self.fc2(hidden_states)
         if self.output_activation:
             return self.activation_fn(hidden_states)
-        return hidden_states
-
-
-class Llama4MultiModalProjector(nn.Module):
-
-    def __init__(
-        self,
-        config,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.linear_1 = ColumnParallelLinear(
-            input_size=config.vision_config.vision_output_dim,
-            output_size=config.text_config.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            gather_output=True,
-            prefix=f"{prefix}.linear_1",
-        )
-
-    def forward(self, image_features):
-        hidden_states, _ = self.linear_1(image_features)
         return hidden_states
 
 
@@ -515,8 +495,10 @@ class Llama4ForConditionalGeneration(nn.Module):
             .type(next(self.vision_model.parameters()).dtype)
         )
 
-        image_outputs = self.vision_model(pixel_values, output_hidden_states=False)
-        image_features = image_outputs.last_hidden_state
+        pdb.set_trace()
+
+        image_features = self.vision_model(pixel_values)
+        pdb.set_trace()
         vision_flat = image_features.view(-1, image_features.size(-1))
         projected_vision_flat = self.multi_modal_projector(vision_flat)
         return projected_vision_flat
