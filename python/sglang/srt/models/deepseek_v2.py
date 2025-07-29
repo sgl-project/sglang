@@ -1997,7 +1997,7 @@ class DeepseekV2Model(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            prefix=f"{prefix}.layers",
+            prefix=add_prefix("layers", prefix),
             offloader_kwargs=dict(
                 submodule_accessor=lambda layer: (
                     layer.mlp.experts
