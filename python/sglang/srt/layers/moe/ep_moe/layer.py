@@ -155,7 +155,6 @@ class EPMoE(FusedMoE):
             self.block_shape = None
             self.activation_scheme = None
 
-
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
             return self.forward_deepgemm(hidden_states, topk_output)
@@ -320,7 +319,6 @@ class EPMoE(FusedMoE):
         return output
 
 
-
 class DeepEPMoE(EPMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
@@ -457,7 +455,9 @@ class DeepEPMoE(EPMoE):
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
-            raise ValueError(f"Dispatch output format {dispatch_output.format} is not supported")
+            raise ValueError(
+                f"Dispatch output format {dispatch_output.format} is not supported"
+            )
 
     def combine(
         self,

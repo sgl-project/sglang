@@ -419,7 +419,7 @@ def fused_moe_kernel(
     token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-    
+
     # TODO(ch-wan): this can be removed
     if off_experts == -1:
         # -----------------------------------------------------------
@@ -709,8 +709,6 @@ def invoke_fused_moe_kernel(
         even_Ks = True
     else:
         even_Ks = False
-    
-    # print(f"sorted_token_ids: {sorted_token_ids}, expert_ids: {expert_ids}, num_tokens_post_padded: {num_tokens_post_padded}")
 
     if (
         (use_int8_w8a16 or use_int4_w4a16)
@@ -1423,7 +1421,7 @@ def fused_experts_impl(
         out_hidden_states = hidden_states
     else:
         out_hidden_states = torch.empty_like(hidden_states)
-    
+
     for chunk in range((num_tokens // CHUNK_SIZE) + 1):
         begin_chunk_idx, end_chunk_idx = (
             chunk * CHUNK_SIZE,
