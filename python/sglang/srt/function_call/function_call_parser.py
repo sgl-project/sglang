@@ -17,6 +17,7 @@ from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
+from sglang.srt.function_call.step3v_detector import Step3VDetector
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class FunctionCallParser:
         "kimi_k2": KimiK2Detector,
         "qwen3_coder": Qwen3CoderDetector,
         "glm45": Glm4MoeDetector,
+        "step3v": Step3VDetector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
