@@ -32,8 +32,12 @@ struct ActDtype<false> {
   using type = uint8_t;
 };
 
+struct alignas(32) m256i_wrapper {
+  __m256i data;
+};
+
 #if defined(CPU_CAPABILITY_AVX512)
-inline std::array<__m256i, 2> load_zps_4vnni(const int8_t* __restrict__ zps) {
+inline std::array<m256i_wrapper, 2> load_zps_4vnni(const int8_t* __restrict__ zps) {
   // broadcast 01234567 to
   // 01234567012345670123456701234567
   __m256i vzps_low = _mm256_set1_epi64x(*reinterpret_cast<const long*>(zps));
@@ -46,16 +50,22 @@ inline std::array<__m256i, 2> load_zps_4vnni(const int8_t* __restrict__ zps) {
       _mm256_set_epi8(7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
   vzps_low = _mm256_shuffle_epi8(vzps_low, shuffle_mask);
   vzps_high = _mm256_shuffle_epi8(vzps_high, shuffle_mask);
-  return {vzps_low, vzps_high};
+  m256i_wrapper vzps_low_wp, vzps_high_wp;
+  vzps_low_wp.data = vzps_low;
+  vzps_high_wp.data = vzps_high;
+  return {vzps_low_wp, vzps_high_wp};
 }
 
-inline std::array<__m256i, 2> load_uint4_as_int8(const uint8_t* __restrict__ qB) {
+inline std::array<m256i_wrapper, 2> load_uint4_as_int8(const uint8_t* __restrict__ qB) {
   __m256i packed = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qB));
   const __m256i low_mask = _mm256_set1_epi8(0x0f);
   __m256i high = _mm256_srli_epi16(packed, 4);
   high = _mm256_and_si256(high, low_mask);
   __m256i low = _mm256_and_si256(packed, low_mask);
-  return {low, high};
+  m256i_wrapper low_wp, high_wp;
+  low_wp.data = low;
+  high_wp.data = high;
+  return {low_wp, high_wp};
 }
 
 template <int64_t N, int64_t ldb>
@@ -66,9 +76,13 @@ void _dequant_weight_zp_only(const uint8_t* __restrict__ B, int8_t* dqB, const i
   // dqB shape = [K, N], actual shape = [K / 4, N, 4]
 #pragma GCC unroll 2
   for (int n = 0; n < N; n += 16) {
-    auto [zps_low, zps_high] = load_zps_4vnni(&qzeros[n]);
+    auto [zps_low_wp, zps_high_wp] = load_zps_4vnni(&qzeros[n]);
+    auto zps_low = zps_low_wp.data;
+    auto zps_high = zps_high_wp.data;
     for (int k = 0; k < K; k += 4) {
-      auto [vb_low, vb_high] = load_uint4_as_int8(B + ldb * k + n / 2 * 4);
+      auto [vb_low_wp, vb_high_wp] = load_uint4_as_int8(B + ldb * k + n / 2 * 4);
+      auto vb_low = vb_low_wp.data;
+      auto vb_high = vb_high_wp.data;
       vb_high = _mm256_sub_epi8(vb_high, zps_high);
       vb_low = _mm256_sub_epi8(vb_low, zps_low);
       // store vb to B
@@ -155,8 +169,8 @@ inline __m512i combine_m256i(__m256i a, __m256i b) {
   return _mm512_inserti64x4(c, b, 1);
 }
 
-inline __m512i combine_m256i(std::array<__m256i, 2> two_256) {
-  return combine_m256i(two_256[0], two_256[1]);
+inline __m512i combine_m256i(std::array<m256i_wrapper, 2> two_256) {
+  return combine_m256i(two_256[0].data, two_256[1].data);
 }
 
 // negate elements in a according to b's sign

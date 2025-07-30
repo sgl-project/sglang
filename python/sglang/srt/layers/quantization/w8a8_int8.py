@@ -498,8 +498,11 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
                 False,  # inplace See [Note] inplace should be False in fused_experts.
                 True,  # use_int8_w8a8
                 False,  # use_fp8_w8a16
+                False,  # use_int4_w4a16
                 layer.w13_weight_scale,  # w1_scale
                 layer.w2_weight_scale,  # w2_scale
+                None,  # w1_zp
+                None,  # w2_zp
                 None,  # block_size
                 layer.w13_input_scale,  # a1_scale
                 layer.w2_input_scale,  # a2_scale
