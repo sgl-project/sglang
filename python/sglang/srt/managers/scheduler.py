@@ -24,6 +24,7 @@ import time
 from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass
+from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
@@ -122,6 +123,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
@@ -370,6 +372,7 @@ class Scheduler(
             self.max_total_num_tokens,
             self.max_prefill_tokens,
             self.max_running_requests,
+            self.max_queued_requests,
             self.max_req_len,
             self.max_req_input_len,
             self.random_seed,
@@ -501,6 +504,12 @@ class Scheduler(
             enable=server_args.enable_memory_saver
         )
         self.init_profier()
+
+        self.input_blocker = (
+            SchedulerInputBlocker(noop=self.attn_tp_rank != 0)
+            if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
+            else None
+        )
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
@@ -1033,6 +1042,9 @@ class Scheduler(
             else:
                 recv_reqs = None
 
+        if self.input_blocker is not None:
+            recv_reqs = self.input_blocker.handle(recv_reqs)
+
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0:
                 work_reqs = [
@@ -1086,6 +1098,19 @@ class Scheduler(
                 self.return_health_check_ct += 1
                 continue
 
+            # If it is a work request, accept or reject the request based on the request queue size.
+            if is_work_request(recv_req):
+                if len(self.waiting_queue) + 1 > self.max_queued_requests:
+                    abort_req = AbortReq(
+                        recv_req.rid,
+                        finished_reason={
+                            "type": "abort",
+                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                            "message": "The request queue is full.",
+                        },
+                    )
+                    self.send_to_tokenizer.send_pyobj(abort_req)
+                    continue
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 if isinstance(output, RpcReqOutput):
@@ -2900,6 +2925,10 @@ class Scheduler(
 
 def is_health_check_generate_req(recv_req):
     return getattr(recv_req, "rid", "").startswith("HEALTH_CHECK")
+
+
+def is_work_request(recv_req):
+    return isinstance(recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
 
 
 def _export_static_state(model):
