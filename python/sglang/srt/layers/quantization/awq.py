@@ -147,12 +147,14 @@ class AWQConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[LinearMethodBase]:
         from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
                 return UnquantizedLinearMethod()
             return AWQLinearMethod(self)
-
+        elif isinstance(layer, FusedMoE):
+            return AWQMoEMethod(self)
         return None
 
 
@@ -703,9 +705,21 @@ class AWQMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
 
         device = layer.w13_qweight.device
-        layer.workspace = marlin_make_workspace(device, 4)
+        if device.type != "cpu":
+            layer.workspace = marlin_make_workspace(device, 4)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _is_cpu:
+            assert (
+                _is_cpu_amx_available
+            ), "AWQLinearMethod on CPU requires that CPU has AMX support"
+            _amx_process_int4_packed_qweight_after_loading(
+                layer, ["w13_qweight", "w13_qzeros", "w13_scales"], "awq"
+            )
+            _amx_process_int4_packed_qweight_after_loading(
+                layer, ["w2_qweight", "w2_qzeros", "w2_scales"], "awq"
+            )
+            return
         num_experts = layer.w13_qweight.shape[0]
         device = layer.w13_qweight.device
 
@@ -781,6 +795,28 @@ class AWQMoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
 
         assert activation == "silu", "Only SiLU activation is supported."
+
+        if use_intel_amx_backend(layer):
+            topk_weights, topk_ids, _ = topk_output
+            return torch.ops.sgl_kernel.fused_experts_cpu(
+                x,
+                layer.w13_qweight,
+                layer.w2_qweight,
+                topk_weights,
+                topk_ids,
+                False,  # inplace See [Note] inplace should be False in fused_experts.
+                False,  # use_int8_w8a8
+                False,  # use_fp8_w8a16
+                True,  # use_int4_w4a16
+                layer.w13_scales,  # w1_scale
+                layer.w2_scales,  # w2_scale
+                layer.w13_qzeros,
+                layer.w2_qzeros,
+                None,  # block_size
+                None,  # a1_scale
+                None,  # a2_scale
+                True,  # is_vnni
+            )
 
         # The input must currently be float16
         orig_dtype = x.dtype
