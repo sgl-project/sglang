@@ -473,10 +473,10 @@ void transfer_kv_direct(
     }
     auto src_index = src_indices_ptr[start_index];
     auto dst_index = dst_indices_ptr[start_index];
-    auto num_pages = end_index - start_index;
+    auto num_tokens = end_index - start_index;
 
     for (int64_t j = 0; j < num_layers; ++j) {
-      transfer_page_direct(src_layers[j], dst_layers[j], src_index, dst_index, page_size);
+      transfer_page_direct(src_layers[j], dst_layers[j], src_index, dst_index, num_tokens);
     }
     start_index = end_index;
   }
