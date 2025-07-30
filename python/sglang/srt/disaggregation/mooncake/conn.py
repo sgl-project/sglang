@@ -145,9 +145,12 @@ class MooncakeKVManager(BaseKVManager):
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
         self.attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = get_attention_tp_rank()
         self.attn_dp_size = get_attention_dp_size()
-        self.enable_dp_attention = server_args.enable_dp_attention
-        self.system_dp_size = server_args.dp_size
+        self.attn_dp_rank = get_attention_dp_rank()
+        self.system_dp_size = (
+            1 if server_args.enable_dp_attention else server_args.dp_size
+        )
         self.system_dp_rank = (
             self.kv_args.system_dp_rank if self.kv_args.system_dp_rank else 0
         )
@@ -889,15 +892,15 @@ class MooncakeKVManager(BaseKVManager):
         payload = {
             "role": "Prefill",
             "attn_tp_size": self.attn_tp_size,
+            "attn_tp_rank": self.attn_tp_rank,
             "attn_dp_size": self.attn_dp_size,
+            "attn_dp_rank": self.attn_dp_rank,
             "pp_size": self.pp_size,
             "pp_rank": self.pp_rank,
-            "enable_dp_attention": self.enable_dp_attention,
             "system_dp_size": self.system_dp_size,
             "system_dp_rank": self.system_dp_rank,
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
-            "engine_rank": self.kv_args.engine_rank,
         }
 
         try:
@@ -1409,49 +1412,44 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
         data = await request.json()
         role = data["role"]
         attn_tp_size = data["attn_tp_size"]
+        attn_tp_rank = data["attn_tp_rank"]
         attn_dp_size = data["attn_dp_size"]
+        attn_dp_rank = data["attn_dp_rank"]
         pp_size = data["pp_size"]
         pp_rank = data["pp_rank"]
-        enable_dp_attention = data["enable_dp_attention"]
         system_dp_size = data["system_dp_size"]
         system_dp_rank = data["system_dp_rank"]
         rank_ip = data["rank_ip"]
         rank_port = int(data["rank_port"])
-        engine_rank = int(data["engine_rank"])
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
 
         if self.dp_size is None:
-            if enable_dp_attention:
-                self.dp_size = attn_dp_size
-            else:
-                self.dp_size = system_dp_size
+            self.dp_size = attn_dp_size if system_dp_size == 1 else system_dp_size
 
         if self.pp_size is None:
             self.pp_size = pp_size
 
         if role == "Prefill":
-            if enable_dp_attention:
-                dp_group = engine_rank // self.attn_tp_size
-                tp_rank_in_dp_group = engine_rank % self.attn_tp_size
+            if system_dp_size == 1:
+                dp_group = attn_dp_rank
             else:
                 dp_group = system_dp_rank
-                tp_rank_in_dp_group = engine_rank
 
             # Add lock to make sure thread-safe
             async with self.lock:
                 if dp_group not in self.prefill_port_table:
                     self.prefill_port_table[dp_group] = {}
-                if tp_rank_in_dp_group not in self.prefill_port_table[dp_group]:
-                    self.prefill_port_table[dp_group][tp_rank_in_dp_group] = {}
+                if attn_tp_rank not in self.prefill_port_table[dp_group]:
+                    self.prefill_port_table[dp_group][attn_tp_rank] = {}
 
-            self.prefill_port_table[dp_group][tp_rank_in_dp_group][pp_rank] = {
+            self.prefill_port_table[dp_group][attn_tp_rank][pp_rank] = {
                 "rank_ip": rank_ip,
                 "rank_port": rank_port,
             }
             logger.debug(
-                f"Register prefill bootstrap: TP{engine_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
+                f"Register prefill bootstrap: DP {dp_group} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
             )
 
         return web.Response(text="OK", status=200)
