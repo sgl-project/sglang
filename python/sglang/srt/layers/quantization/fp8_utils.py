@@ -159,7 +159,7 @@ def flashinfer_gemm_w8a8_block_fp8_linear(
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=False
+        input_2d, block_size[1], column_major_scales=True
     )
 
     output = gemm_fp8_nt_groupwise(
@@ -167,8 +167,9 @@ def flashinfer_gemm_w8a8_block_fp8_linear(
         weight,
         x_scale,
         weight_scale,
-        scale_major_mode="K",
+        scale_major_mode="MN",
         out_dtype=input_2d.dtype,
+        backend="trtllm"
     )
 
     if bias is not None:
