@@ -33,7 +33,7 @@ def dim_is_supported(weight):
 
 
 def _autoawq_to_int4pack(
-    qweight: torch.Tensor, qzeros: torch.Tensor, scales: torch.Tensor
+    qweight: torch.Tensor, qzeros: torch.Tensor, scales: torch.Tensor, is_w4a8: bool
 ):
     """Convert AutoAWQ weight format to sgl-kernel's CPU int4
 
@@ -50,7 +50,7 @@ def _autoawq_to_int4pack(
 
     qzeros = (qzeros.unsqueeze(-1) >> bitshifts) & 0xF
     qzeros = qzeros.flatten(-2).to(torch.uint8)
-    if SGLANG_USE_CPU_INT4_W4A8:
+    if is_w4a8:
         qzeros = qzeros.T.contiguous()
         scales = scales.T.contiguous()
         qweight, scales, qzeros, compensation = (
@@ -89,10 +89,11 @@ def _amx_process_int4_packed_qweight_after_loading(
         prefix_list = weight_names[0].split("_")
         # MoE layers have prefix
         has_prefix = len(prefix_list) != 1
-        if SGLANG_USE_CPU_INT4_W4A8 and not has_prefix:
+        use_w4a8 = SGLANG_USE_CPU_INT4_W4A8 and not has_prefix
+        if use_w4a8:
             # TODO: support MoE layers for W4A8 path
             qweight, qzeros, scales, compensation = _autoawq_to_int4pack(
-                qweight_tensor.data, qzeros_tensor.data, scales_tensor.data
+                qweight_tensor.data, qzeros_tensor.data, scales_tensor.data, use_w4a8
             )
             compensation = torch.nn.Parameter(compensation, requires_grad=False)
             setattr(
@@ -102,7 +103,7 @@ def _amx_process_int4_packed_qweight_after_loading(
             )
         else:
             qweight, qzeros, scales = _autoawq_to_int4pack(
-                qweight_tensor.data, qzeros_tensor.data, scales_tensor.data
+                qweight_tensor.data, qzeros_tensor.data, scales_tensor.data, use_w4a8
             )
         packed_qweight = torch.nn.Parameter(
             qweight,
