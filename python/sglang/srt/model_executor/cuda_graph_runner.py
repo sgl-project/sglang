@@ -39,6 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     enable_num_token_non_padded,
 )
+from sglang.srt.model_executor.graph_runner import GraphRunner
 from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
@@ -46,10 +47,6 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_device_memory_capacity,
     rank0_log,
-    require_attn_tp_gather,
-    require_gathered_buffer,
-    require_mlp_sync,
-    require_mlp_tp_gather,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,7 +90,7 @@ def patch_model(
     num_tokens: int,
     tp_group: GroupCoordinator,
 ):
-    """Patch the model to make it compatible with with torch.compile"""
+    """Patch the model to make it compatible with torch.compile"""
     backup_ca_comm = None
 
     try:
@@ -200,38 +197,12 @@ def set_global_graph_memory_pool(val):
     global_graph_memory_pool = val
 
 
-class CudaGraphRunner:
+class CudaGraphRunner(GraphRunner):
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
-        # Parse args
-        self.model_runner = model_runner
-        self.graphs = {}
-        self.output_buffers = {}
-        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
-        self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
-        self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
-        self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
-        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
-        self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
-        self.enable_two_batch_overlap = (
-            model_runner.server_args.enable_two_batch_overlap
-        )
-        self.speculative_algorithm = model_runner.server_args.speculative_algorithm
-        self.enable_profile_cuda_graph = (
-            model_runner.server_args.enable_profile_cuda_graph
-        )
-        self.tp_size = model_runner.server_args.tp_size
-        self.dp_size = model_runner.server_args.dp_size
-        self.pp_size = model_runner.server_args.pp_size
+        super().__init__(model_runner, device="cuda")
 
-        # Batch sizes to capture
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-        rank0_log(f"Capture cuda graph bs {self.capture_bs}")
-        self.capture_forward_mode = ForwardMode.DECODE
-        self.capture_hidden_mode = CaptureHiddenMode.NULL
-        self.num_tokens_per_bs = 1
         if model_runner.spec_algorithm.is_eagle():
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -241,13 +212,13 @@ class CudaGraphRunner:
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
 
-        # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
-        if model_runner.server_args.enable_return_hidden_states:
-            self.capture_hidden_mode = CaptureHiddenMode.FULL
-
+        # Batch sizes to capture
+        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+        rank0_log(f"Capture graph bs {self.capture_bs}")
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
+
         self.model_runner.attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
@@ -592,37 +563,6 @@ class CudaGraphRunner:
         global_graph_memory_pool = graph.pool()
         return graph, out
 
-    def recapture_if_needed(self, forward_batch: ForwardBatch):
-
-        # If the required capture_hidden_mode changes, we need to recapture the graph
-
-        # These are the different factors that can influence the capture_hidden_mode
-        capture_hidden_mode_required_by_forward_batch = (
-            forward_batch.capture_hidden_mode
-        )
-        capture_hidden_mode_required_by_spec_info = getattr(
-            forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
-        )
-        capture_hidden_mode_required_for_returning_hidden_states = (
-            CaptureHiddenMode.FULL
-            if self.model_runner.server_args.enable_return_hidden_states
-            else CaptureHiddenMode.NULL
-        )
-
-        # Determine the highest capture_hidden_mode required
-        # (If we have FULL, we can emulate LAST or NULL)
-        # (If we have LAST, we can emulate NULL)
-        required_capture_hidden_mode = max(
-            capture_hidden_mode_required_by_forward_batch,
-            capture_hidden_mode_required_by_spec_info,
-            capture_hidden_mode_required_for_returning_hidden_states,
-        )
-
-        # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
-        if self.capture_hidden_mode != required_capture_hidden_mode:
-            self.capture_hidden_mode = required_capture_hidden_mode
-            self.capture()
-
     def replay_prepare(
         self,
         forward_batch: ForwardBatch,
@@ -728,32 +668,6 @@ class CudaGraphRunner:
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
-
-    def get_spec_info(self, num_tokens: int):
-        spec_info = None
-        if self.model_runner.spec_algorithm.is_eagle():
-            from sglang.srt.speculative.eagle_utils import EagleVerifyInput
-
-            if self.model_runner.is_draft_worker:
-                raise RuntimeError("This should not happen.")
-            else:
-                spec_info = EagleVerifyInput(
-                    draft_token=None,
-                    custom_mask=self.custom_mask,
-                    positions=None,
-                    retrive_index=None,
-                    retrive_next_token=None,
-                    retrive_next_sibling=None,
-                    retrive_cum_len=None,
-                    spec_steps=self.model_runner.server_args.speculative_num_steps,
-                    topk=self.model_runner.server_args.speculative_eagle_topk,
-                    draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
-                    seq_lens_sum=None,
-                    seq_lens_cpu=None,
-                )
-
-        return spec_info
 
 
 CUDA_GRAPH_CAPTURE_FAILED_MSG = (

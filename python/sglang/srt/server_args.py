@@ -294,11 +294,11 @@ class ServerArgs:
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
-        gpu_mem = get_device_memory_capacity(self.device)
+        device_mem = get_device_memory_capacity(self.device)
 
         # Set mem fraction static
         if self.mem_fraction_static is None:
-            if gpu_mem is not None:
+            if device_mem is not None and self.device != "cpu":
                 # GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
                 # mem_fraction_static = (model weights + KV cache pool) / GPU memory capacity.
 
@@ -311,19 +311,19 @@ class ServerArgs:
                 # capture more cuda graphs, so they need to reserve more memory.
                 parallel_size = self.tp_size * self.pp_size
 
-                if gpu_mem < 20 * 1024:
+                if device_mem < 20 * 1024:
                     # T4, 4080. (chunked_prefill_size 2k, cuda_graph_max_bs 8)
                     reserved_mem = (2.8 + parallel_size / 10) * 1024
-                elif gpu_mem < 35 * 1024:
+                elif device_mem < 35 * 1024:
                     # A10, L40, 4090, 5090. (chunked_prefill_size 2k, cuda_graph_max_bs 8)
                     reserved_mem = (2.8 + parallel_size / 10) * 1024
-                elif gpu_mem < 90 * 1024:
+                elif device_mem < 90 * 1024:
                     # H100, A100. (chunked_prefill_size 8k, cuda_graph_max_bs 160)
                     reserved_mem = (9.5 + parallel_size / 2) * 1024
-                elif gpu_mem < 100 * 1024:
+                elif device_mem < 100 * 1024:
                     # H20. (chunked_prefill_size 8k, cuda_graph_max_bs 256)
                     reserved_mem = (12 + parallel_size / 2) * 1024
-                elif gpu_mem < 160 * 1024:
+                elif device_mem < 160 * 1024:
                     # H200. (chunked_prefill_size 8k, cuda_graph_max_bs 256)
                     reserved_mem = (12 + parallel_size / 2) * 1024
                 else:
@@ -336,7 +336,9 @@ class ServerArgs:
                 if self.enable_dp_attention:
                     reserved_mem += 4 * 1024
 
-                self.mem_fraction_static = round((gpu_mem - reserved_mem) / gpu_mem, 3)
+                self.mem_fraction_static = round(
+                    (device_mem - reserved_mem) / device_mem, 3
+                )
             else:
                 self.mem_fraction_static = 0.88
 
@@ -350,10 +352,10 @@ class ServerArgs:
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
-            if gpu_mem is not None:
-                if gpu_mem < 35 * 1024:  # A10, L40, 4090
+            if device_mem is not None and self.device != "cpu":
+                if device_mem < 35 * 1024:  # A10, L40, 4090
                     self.chunked_prefill_size = 2048
-                elif gpu_mem < 160 * 1024:  # H100, H200, A100, H20
+                elif device_mem < 160 * 1024:  # H100, H200, A100, H20
                     self.chunked_prefill_size = 8192
                 else:  # B200, MI300
                     self.chunked_prefill_size = 16384
@@ -364,7 +366,11 @@ class ServerArgs:
         # Set cuda graph max batch size
         if self.cuda_graph_max_bs is None:
             # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
-            if gpu_mem is not None and gpu_mem < 35 * 1024:
+            if (
+                device_mem is not None
+                and self.device != "cpu"
+                and device_mem < 35 * 1024
+            ):
                 if self.tp_size < 4:
                     self.cuda_graph_max_bs = 8
                 else:
