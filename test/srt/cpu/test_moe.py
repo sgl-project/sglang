@@ -8,6 +8,8 @@ import torch
 
 kernel = torch.ops.sgl_kernel
 
+torch.manual_seed(1234)
+
 from utils import (
     BLOCK_K,
     BLOCK_N,

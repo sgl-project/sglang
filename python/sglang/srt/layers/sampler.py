@@ -91,7 +91,7 @@ class Sampler(nn.Module):
                         )
                     else:
                         batch_next_token_ids = top_k_top_p_sampling_from_probs(
-                            probs,
+                            probs.contiguous(),
                             sampling_info.top_ks,
                             sampling_info.top_ps,
                             filter_apply_order="joint",

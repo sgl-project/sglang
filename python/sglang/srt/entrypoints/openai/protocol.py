@@ -14,9 +14,16 @@
 """Pydantic models for OpenAI API protocol"""
 
 import time
-from typing import Dict, List, Optional, Union
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 from typing_extensions import Literal
 
 
@@ -167,6 +174,7 @@ class CompletionRequest(BaseModel):
     temperature: float = 1.0
     top_p: float = 1.0
     user: Optional[str] = None
+    return_hidden_states: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -184,9 +192,12 @@ class CompletionRequest(BaseModel):
     session_params: Optional[Dict] = None
 
     # For PD disaggregation
-    bootstrap_host: Optional[str] = None
-    bootstrap_port: Optional[int] = None
-    bootstrap_room: Optional[int] = None
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For request id
+    rid: Optional[Union[List[str], str]] = None
 
     @field_validator("max_tokens")
     @classmethod
@@ -200,8 +211,16 @@ class CompletionResponseChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Literal["stop", "length", "content_filter", "abort"]
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
+    hidden_states: Optional[object] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.hidden_states is None:
+            data.pop("hidden_states", None)
+        return data
 
 
 class CompletionResponse(BaseModel):
@@ -217,8 +236,16 @@ class CompletionResponseStreamChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[Literal["stop", "length", "content_filter"]] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
+    hidden_states: Optional[object] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.hidden_states is None:
+            data.pop("hidden_states", None)
+        return data
 
 
 class CompletionStreamResponse(BaseModel):
@@ -240,6 +267,10 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
 
 
+class ChatCompletionMessageContentVideoURL(BaseModel):
+    url: str
+
+
 class ChatCompletionMessageContentAudioURL(BaseModel):
     url: str
 
@@ -250,6 +281,11 @@ class ChatCompletionMessageContentImagePart(BaseModel):
     modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
 
 
+class ChatCompletionMessageContentVideoPart(BaseModel):
+    type: Literal["video_url"]
+    video_url: ChatCompletionMessageContentVideoURL
+
+
 class ChatCompletionMessageContentAudioPart(BaseModel):
     type: Literal["audio_url"]
     audio_url: ChatCompletionMessageContentAudioURL
@@ -258,6 +294,7 @@ class ChatCompletionMessageContentAudioPart(BaseModel):
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentImagePart,
+    ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
 ]
 
@@ -280,11 +317,25 @@ class ToolCall(BaseModel):
 
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool"]
-    content: Union[str, List[ChatCompletionMessageContentTextPart], None]
+    content: Union[str, List[ChatCompletionMessageContentTextPart], None] = Field(
+        default=None
+    )
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def _normalize_role(cls, v):
+        if isinstance(v, str):
+            v_lower = v.lower()
+            if v_lower not in {"system", "assistant", "tool"}:
+                raise ValueError(
+                    "'role' must be one of 'system', 'assistant', or 'tool' (case-insensitive)."
+                )
+            return v_lower
+        raise ValueError("'role' must be a string")
 
 
 class ChatCompletionMessageUserParam(BaseModel):
@@ -376,24 +427,17 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
+    return_hidden_states: bool = False
 
     @model_validator(mode="before")
     @classmethod
     def set_tool_choice_default(cls, values):
-        if isinstance(values, dict):
-            if values.get("tool_choice") is None:
-                if values.get("tools") is None:
-                    values["tool_choice"] = "none"
-                else:
-                    values["tool_choice"] = "auto"
+        if values.get("tool_choice") is None:
+            if values.get("tools") is None:
+                values["tool_choice"] = "none"
+            else:
+                values["tool_choice"] = "auto"
         return values
-
-    @field_validator("messages")
-    @classmethod
-    def validate_messages_not_empty(cls, v):
-        if not v:
-            raise ValueError("Messages cannot be empty")
-        return v
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -413,8 +457,8 @@ class ChatCompletionRequest(BaseModel):
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
 
-    # The request id.
-    rid: Optional[str] = None
+    # For request id
+    rid: Optional[Union[List[str], str]] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[str] = None
@@ -433,10 +477,20 @@ class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
-    finish_reason: Literal[
-        "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
-    ]
+    finish_reason: Optional[
+        Literal[
+            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+        ]
+    ] = None
     matched_stop: Union[None, int, str] = None
+    hidden_states: Optional[object] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.hidden_states is None:
+            data.pop("hidden_states", None)
+        return data
 
 
 class ChatCompletionResponse(BaseModel):
@@ -453,6 +507,14 @@ class DeltaMessage(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    hidden_states: Optional[object] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.hidden_states is None:
+            data.pop("hidden_states", None)
+        return data
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
@@ -460,7 +522,9 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     delta: DeltaMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
-        Literal["stop", "length", "tool_calls", "content_filter", "function_call"]
+        Literal[
+            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+        ]
     ] = None
     matched_stop: Union[None, int, str] = None
 
@@ -490,11 +554,11 @@ class EmbeddingRequest(BaseModel):
     input: EmbeddingInput
     model: str
     encoding_format: str = "float"
-    dimensions: int = None
+    dimensions: Optional[int] = None
     user: Optional[str] = None
 
     # The request id.
-    rid: Optional[str] = None
+    rid: Optional[Union[List[str], str]] = None
 
 
 class EmbeddingObject(BaseModel):
@@ -534,6 +598,50 @@ class ScoringResponse(BaseModel):
     object: str = "scoring"
 
 
+class V1RerankReqInput(BaseModel):
+    query: str
+    documents: List[str]
+
+
+class RerankResponse(BaseModel):
+    score: float
+    document: str
+    index: int
+    meta_info: Optional[dict] = None
+
+
 OpenAIServingRequest = Union[
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, ScoringRequest
+    ChatCompletionRequest,
+    CompletionRequest,
+    EmbeddingRequest,
+    ScoringRequest,
+    V1RerankReqInput,
 ]
+
+
+@dataclass
+class MessageProcessingResult:
+    """Result of processing chat messages and applying templates.
+
+    This dataclass encapsulates all the outputs from message processing including
+    prompt generation, multimodal data extraction, and constraint preparation.
+    Used internally by OpenAIServingChat to pass processed data between methods.
+
+    Args:
+        prompt: The final text prompt after applying chat template
+        prompt_ids: Either the text prompt (str) or tokenized IDs (List[int])
+        image_data: Extracted image data from messages, if any
+        audio_data: Extracted audio data from messages, if any
+        modalities: List of modality types present in the messages
+        stop: Combined stop strings from template and request
+        tool_call_constraint: Optional constraint for structured tool calls
+    """
+
+    prompt: str
+    prompt_ids: Union[str, List[int]]
+    image_data: Optional[Any]
+    audio_data: Optional[Any]
+    video_data: Optional[Any]
+    modalities: List[str]
+    stop: List[str]
+    tool_call_constraint: Optional[Any] = None

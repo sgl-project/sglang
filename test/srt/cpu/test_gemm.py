@@ -14,6 +14,8 @@ from utils import (
 
 from sglang.test.test_utils import CustomTestCase
 
+torch.manual_seed(1234)
+
 
 class Mod(nn.Module):
     def __init__(self, input_channel, output_channel, has_bias):
@@ -26,7 +28,7 @@ class Mod(nn.Module):
 
 class TestGemm(CustomTestCase):
     M = [1, 101]
-    N = [32 * 13]
+    N = [16, 32 * 13]
     K = [32 * 16]
     has_bias = [False, True]
 

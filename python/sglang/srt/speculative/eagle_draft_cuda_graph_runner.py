@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
+from sglang.srt.layers.dp_attention import DPPaddingMode
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
@@ -20,6 +21,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.speculative.eagle_utils import EagleDraftInput
+from sglang.srt.utils import (
+    require_attn_tp_gather,
+    require_gathered_buffer,
+    require_mlp_sync,
+    require_mlp_tp_gather,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -39,8 +46,10 @@ class EAGLEDraftCudaGraphRunner:
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
-        self.enable_dp_attention = model_runner.server_args.enable_dp_attention
-        self.enable_sp_layernorm = model_runner.server_args.enable_sp_layernorm
+        self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
+        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
+        self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
+        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
         self.dp_size = self.model_runner.dp_size
         self.tp_size = self.model_runner.tp_size
         self.topk = model_runner.server_args.speculative_eagle_topk
@@ -88,21 +97,38 @@ class EAGLEDraftCudaGraphRunner:
                 dtype=self.model_runner.dtype,
             )
 
-            if self.enable_dp_attention or self.enable_sp_layernorm:
-                # TODO(ch-wan): SP layernorm should use a different logic to manage gathered_buffer
-                self.gathered_buffer = torch.zeros(
-                    (
-                        self.max_num_token,
-                        self.model_runner.model_config.hidden_size,
-                    ),
-                    dtype=self.model_runner.dtype,
-                )
-                self.global_num_tokens_gpu = torch.zeros(
-                    (self.dp_size,), dtype=torch.int32
-                )
-                self.global_num_tokens_for_logprob_gpu = torch.zeros(
-                    (self.dp_size,), dtype=torch.int32
-                )
+            if self.require_gathered_buffer:
+                if self.require_mlp_tp_gather:
+                    self.global_num_tokens_gpu = torch.zeros(
+                        (self.dp_size,), dtype=torch.int32
+                    )
+                    self.global_num_tokens_for_logprob_gpu = torch.zeros(
+                        (self.dp_size,), dtype=torch.int32
+                    )
+                    self.gathered_buffer = torch.zeros(
+                        (
+                            self.max_num_token * self.dp_size,
+                            self.model_runner.model_config.hidden_size,
+                        ),
+                        dtype=self.model_runner.dtype,
+                    )
+                else:
+                    assert self.require_attn_tp_gather
+                    self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
+                    self.global_num_tokens_for_logprob_gpu = torch.zeros(
+                        (1,), dtype=torch.int32
+                    )
+                    self.gathered_buffer = torch.zeros(
+                        (
+                            self.max_num_token,
+                            self.model_runner.model_config.hidden_size,
+                        ),
+                        dtype=self.model_runner.dtype,
+                    )
+            else:
+                self.global_num_tokens_gpu = None
+                self.global_num_tokens_for_logprob_gpu = None
+                self.gathered_buffer = None
 
         # Capture
         try:
@@ -114,26 +140,24 @@ class EAGLEDraftCudaGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
-        if self.enable_dp_attention:
-            # TODO(ch-wan): check --moe-dense-tp-size and --enable-dp-lm-head
-            if not forward_batch.can_run_dp_cuda_graph:
-                return False
-            total_batch_size = (
-                sum(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
+        if self.require_mlp_tp_gather:
+            cuda_graph_bs = (
+                max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
-                else sum(forward_batch.global_num_tokens_cpu)
-            )
-            is_bs_supported = (
-                total_batch_size in self.graphs
-                if self.disable_padding
-                else total_batch_size <= self.max_bs
+                else max(forward_batch.global_num_tokens_cpu)
             )
         else:
-            is_bs_supported = (
-                forward_batch.batch_size in self.graphs
-                if self.disable_padding
-                else forward_batch.batch_size <= self.max_bs
-            )
+            cuda_graph_bs = forward_batch.batch_size
+
+        is_bs_supported = (
+            cuda_graph_bs in self.graphs
+            if self.disable_padding
+            else cuda_graph_bs <= self.max_bs
+        )
+
+        if self.require_mlp_sync:
+            is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
+
         return is_bs_supported
 
     def capture(self):
@@ -153,23 +177,35 @@ class EAGLEDraftCudaGraphRunner:
         topk_index = self.topk_index[:num_seqs]
         hidden_states = self.hidden_states[:num_seqs]
 
-        if self.enable_dp_attention or self.enable_sp_layernorm:
+        if self.require_mlp_tp_gather:
             self.global_num_tokens_gpu.copy_(
                 torch.tensor(
-                    [
-                        num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
-                        for i in range(self.dp_size)
-                    ],
+                    [num_tokens] * self.dp_size,
                     dtype=torch.int32,
                     device=self.input_ids.device,
                 )
             )
             self.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
-                    [
-                        num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
-                        for i in range(self.dp_size)
-                    ],
+                    [num_tokens] * self.dp_size,
+                    dtype=torch.int32,
+                    device=self.input_ids.device,
+                )
+            )
+            global_num_tokens = self.global_num_tokens_gpu
+            gathered_buffer = self.gathered_buffer[: num_tokens * self.dp_size]
+            global_num_tokens_for_logprob = self.global_num_tokens_for_logprob_gpu
+        elif self.require_attn_tp_gather:
+            self.global_num_tokens_gpu.copy_(
+                torch.tensor(
+                    [num_tokens],
+                    dtype=torch.int32,
+                    device=self.input_ids.device,
+                )
+            )
+            self.global_num_tokens_for_logprob_gpu.copy_(
+                torch.tensor(
+                    [num_tokens],
                     dtype=torch.int32,
                     device=self.input_ids.device,
                 )
@@ -203,6 +239,7 @@ class EAGLEDraftCudaGraphRunner:
             return_logprob=False,
             positions=positions,
             global_num_tokens_gpu=global_num_tokens,
+            dp_padding_mode=DPPaddingMode.get_default_mode_in_cuda_graph(),
             gathered_buffer=gathered_buffer,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
@@ -259,13 +296,14 @@ class EAGLEDraftCudaGraphRunner:
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
         # Pad
-        if self.enable_dp_attention or self.enable_sp_layernorm:
-            total_batch_size = (
-                sum(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
+        if self.require_mlp_tp_gather:
+            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
+            max_batch_size = (
+                max_num_tokens // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
-                else sum(forward_batch.global_num_tokens_cpu)
+                else max_num_tokens
             )
-            index = bisect.bisect_left(self.capture_bs, total_batch_size)
+            index = bisect.bisect_left(self.capture_bs, max_batch_size)
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
@@ -286,12 +324,10 @@ class EAGLEDraftCudaGraphRunner:
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
 
-        if self.enable_dp_attention or self.enable_sp_layernorm:
-            self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
-            self.global_num_tokens_for_logprob_gpu.copy_(
-                forward_batch.global_num_tokens_for_logprob_gpu
-            )
-            forward_batch.gathered_buffer = self.gathered_buffer
+        # TODO(ch-wan): support num_token_non_padded
+        if self.require_gathered_buffer:
+            self.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
+            self.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
 
         # Attention backend
         if bs != raw_bs:
@@ -300,7 +336,6 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.req_pool_indices = self.req_pool_indices[:bs]
             forward_batch.positions = self.positions[:num_tokens]
 
-        # Special handle for seq_len_cpu used when flashinfer mla is used
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(self.seq_len_fill_value)

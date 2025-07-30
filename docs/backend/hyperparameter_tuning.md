@@ -11,15 +11,15 @@ When the server is running at full load in a steady state, look for the followin
 
 `#queue-req` indicates the number of requests in the queue.
 If you frequently see `#queue-req: 0`, it suggests that your client code is submitting requests too slowly.
-A healthy range for `#queue-req` is `100 - 1000`.
+A healthy range for `#queue-req` is `100 - 2000`.
 However, avoid making `#queue-req` too large, as this will increase the scheduling overhead on the server.
 
-### Tune `--schedule-conservativeness` to achieve a high `token usage`.
+### Achieve a high `token usage`
 
 `token usage` indicates the KV cache memory utilization of the server. `token usage > 0.9` means good utilization.
 
 If you frequently see `token usage < 0.9` and `#queue-req > 0`, it means the server is too conservative about taking in new requests. You can decrease `--schedule-conservativeness` to a value like 0.3.
-The case of server being too conservative can happen when users send many requests with a large `max_new_tokens` but the requests stop very early due to EOS or stop strings.
+The case of a server being too conservative can happen when users send many requests with a large `max_new_tokens` but the requests stop very early due to EOS or stop strings.
 
 On the other hand, if you see `token usage` very high and you frequently see warnings like
 `KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_token_ratio: 0.9998 -> 1.0000`, you can increase `--schedule-conservativeness` to a value like 1.3.
@@ -36,7 +36,7 @@ for activations and CUDA graph buffers.
 
 A simple strategy is to increase `--mem-fraction-static` by 0.01 each time until you encounter out-of-memory errors.
 
-## Avoid out-of-memory errors by tuning `--chunked-prefill-size`, `--mem-fraction-static`, and `--max-running-requests`
+### Avoid out-of-memory errors by tuning `--chunked-prefill-size`, `--mem-fraction-static`, and `--max-running-requests`
 
 If you encounter out-of-memory (OOM) errors, you can adjust the following parameters:
 
@@ -57,5 +57,6 @@ Data parallelism is better for throughput. When there is enough GPU memory, alwa
 ### Try other options
 
 - `torch.compile` accelerates small models on small batch sizes. You can enable it with `--enable-torch-compile`.
-- Try other quantization (e.g. FP8 quantizatioin) or other parallelism strategies (e.g. expert parallelism)
+- Try other quantization (e.g. FP8 quantization with `--quantization fp8`)
+- Try other parallelism strategies (e.g. expert parallelism) or DP attention for deepseek models (with `--enable-dp-attention --dp-size 8`).
 - If the workload has many shared prefixes, try `--schedule-policy lpm`. Here, `lpm` stands for longest prefix match. It reorders requests to encourage more cache hits but introduces more scheduling overhead.
