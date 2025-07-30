@@ -326,3 +326,32 @@ def _(
     M = mat1.shape[0]
     N = mat2.shape[0]
     return mat1.new_empty(M, N, dtype=out_dtype)
+
+
+@torch.library.register_fake("sgl_kernel::int4_scaled_mm_cpu")
+def _(
+    x,
+    w,
+    w_zeros,
+    w_scales,
+    bias,
+):
+    M = x.shape[0]
+    N = w.shape[0]
+    return x.new_empty(M, N)
+
+
+@torch.library.register_fake("sgl_kernel::int4_scaled_mm_cpu_with_quant")
+def _(
+    input,
+    weight,
+    weight_scales,
+    weight_qzeros,
+    compensation,
+    bias,
+    output_dtype,
+):
+    N = weight.shape[0] * weight.shape[-1] * 2
+    shape = list(input.shape)
+    shape[-1] = N
+    return input.new_empty(shape, dtype=output_dtype)
