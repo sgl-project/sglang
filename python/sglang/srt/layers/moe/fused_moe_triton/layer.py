@@ -420,6 +420,22 @@ class FusedMoE(torch.nn.Module):
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
         if expert_id == -1:
             return
+        self._weight_loader_impl(
+            param=param,
+            loaded_weight=loaded_weight,
+            weight_name=weight_name,
+            shard_id=shard_id,
+            expert_id=expert_id,
+        )
+    
+    def _weight_loader_impl(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> None:
 
         # TP rank is set to 0 if EP is enabled
         tp_rank = 0 if self.ep_size > 1 else get_tensor_model_parallel_rank()
