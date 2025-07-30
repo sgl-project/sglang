@@ -318,7 +318,6 @@ class Step3VDetector(BaseFormatDetector):
         # Parse parameters incrementally
         if self._function_name_sent:
             # Extract all complete parameters
-            new_params = {}
             for param_match in self.param_regex.finditer(invoke_part):
                 param_name = param_match.group(1)
                 param_value = param_match.group(2).strip()
@@ -329,29 +328,26 @@ class Step3VDetector(BaseFormatDetector):
                 )
                 if arg_type and arg_type != "string":
                     parsed_value, _ = parse_arguments(param_value)
-                    new_params[param_name] = parsed_value
+                    self._current_parameters[param_name] = parsed_value
                 else:
-                    new_params[param_name] = param_value
+                    self._current_parameters[param_name] = param_value
             # Check if we have new parameters to stream
-            if new_params != self._current_parameters:
-                params_json = json.dumps(new_params, ensure_ascii=False)
-                sent_len = len(self.streamed_args_for_tool[self.current_tool_id])
-                if len(params_json) > sent_len:
-                    diff = params_json[sent_len:]
-                    calls.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            parameters=diff,
-                        )
-                    )
-                    self.streamed_args_for_tool[self.current_tool_id] += diff
-                    self._current_parameters = new_params
-                    self.prev_tool_call_arr[self.current_tool_id][
-                        "arguments"
-                    ] = new_params
+
 
             # Check if tool call is complete
             if self.tool_call_end in self._buffer:
+                json_params = json.dumps(self._current_parameters, ensure_ascii=False)
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        parameters=json_params,
+                    )
+                )
+                self.streamed_args_for_tool[self.current_tool_id] = json_params
+                self.prev_tool_call_arr[self.current_tool_id][
+                    "arguments"
+                ] = json_params
+
                 # Find the end position
                 end_idx = self._buffer.find(self.tool_call_end)
                 # Remove the processed tool call from buffer
