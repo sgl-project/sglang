@@ -89,6 +89,7 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.log_cold_token_prob = server_args.log_cold_token_prob
         self.padded_static_len = -1
 
         # Override context length with target model's context length
@@ -116,6 +117,17 @@ class EAGLEWorker(TpModelWorker):
             server_args.json_model_override_args = (
                 f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
             )
+
+            if self.log_cold_token_prob:
+                # Create a boolean mask for cold tokens
+                self.cold_token_mask = torch.ones(
+                    target_worker.model_runner.model_config.vocab_size,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                self.cold_token_mask[self.hot_token_id.to(self.device)] = False
+            else:
+                self.hot_token_id = None
         else:
             self.hot_token_id = None
 
@@ -146,7 +158,7 @@ class EAGLEWorker(TpModelWorker):
                 )
 
         else:
-            if self.hot_token_id is not None:
+            if self.hot_token_id is not None and not self.log_cold_token_prob:
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
                 head.data = head.data[self.hot_token_id]
@@ -631,8 +643,11 @@ class EAGLEWorker(TpModelWorker):
             )
             self._detect_nan_if_needed(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            if self.log_cold_token_prob:
+                cold_probs = probs[:, self.cold_token_mask]
+                logger.info(f"Sum of cold token probs in draft_forward: {torch.sum(cold_probs, dim=-1)}")
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            if self.hot_token_id is not None:
+            if self.hot_token_id is not None and not self.log_cold_token_prob:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
@@ -909,6 +924,9 @@ class EAGLEWorker(TpModelWorker):
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+        if self.log_cold_token_prob:
+            cold_probs = probs[:, self.cold_token_mask]
+            logger.info(f"Sum of cold token probs in capture_for_decode: {torch.sum(cold_probs, dim=-1)}")
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
 

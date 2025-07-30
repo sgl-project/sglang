@@ -164,6 +164,7 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
+    log_cold_token_prob: bool = False
 
     # Expert parallelism
     ep_size: int = 1
@@ -1272,10 +1273,16 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-token-map",
             type=str,
-            help="The path of the draft model's small vocab table.",
-            default=ServerArgs.speculative_token_map,
+                    help="The path of the draft model's small vocab table.",
+        default=ServerArgs.speculative_token_map,
         )
-
+        parser.add_argument(
+            "--log-cold-token-prob",
+            action="store_true",
+            default=ServerArgs.log_cold_token_prob,
+            help="Log the sum of probabilities for cold tokens. "
+            "This is for debugging and requires --speculative-token-map.",
+        )
         # Expert parallelism
         parser.add_argument(
             "--expert-parallel-size",
