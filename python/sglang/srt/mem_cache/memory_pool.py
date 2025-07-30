@@ -362,8 +362,6 @@ class MHATokenToKVPool(KVCache):
             dst_v=self.v_buffer[layer_id],
             src_indices=host_indices,
             dst_indices=device_indices,
-            io_backend=io_backend,
-            page_size=self.page_size,
             item_size=self.token_stride,
         )
 
@@ -383,8 +381,6 @@ class MHATokenToKVPool(KVCache):
                 dst_v=host_pool.v_buffer[layer_id],
                 src_indices=device_indices,
                 dst_indices=host_indices,
-                io_backend=io_backend,
-                page_size=self.page_size,
                 item_size=self.token_stride,
             )
 
@@ -917,8 +913,6 @@ class MLATokenToKVPool(KVCache):
             dst=self.kv_buffer[layer_id],
             src_indices=host_indices,
             dst_indices=device_indices,
-            io_backend=io_backend,
-            page_size=self.page_size,
             item_size=self.token_stride,
         )
 
@@ -936,8 +930,6 @@ class MLATokenToKVPool(KVCache):
                 dst=host_pool.kv_buffer[layer_id],
                 src_indices=device_indices,
                 dst_indices=host_indices,
-                io_backend=io_backend,
-                page_size=self.page_size,
                 item_size=self.token_stride,
             )
 
