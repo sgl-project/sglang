@@ -206,16 +206,12 @@ try:
     is_intel_amx_backend_available = hasattr(
         torch.ops.sgl_kernel, "convert_weight_packed"
     )
-    # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
-    # to support torch compile 
-    is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
 except:
     is_intel_amx_backend_available = False
-    is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
 
 
 def cpu_has_amx_support():
-    return is_amx_tile_supported and is_intel_amx_backend_available
+    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
 
 
 def use_intel_amx_backend(layer):
@@ -1486,20 +1482,18 @@ def get_npu_memory_capacity():
 
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
-        memory = get_nvgpu_memory_capacity()
+        gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
-        memory = get_amdgpu_memory_capacity()
+        gpu_mem = get_amdgpu_memory_capacity()
     elif device == "hpu":
-        memory = get_hpu_memory_capacity()
+        gpu_mem = get_hpu_memory_capacity()
     elif device == "npu":
-        memory = get_npu_memory_capacity()
-    elif device == "cpu":
-        memory = psutil.virtual_memory().available
+        gpu_mem = get_npu_memory_capacity()
     else:
-        # memory is not known yet.
-        memory = None
+        # GPU memory is not known yet or no GPU is available.
+        gpu_mem = None
 
-    return memory
+    return gpu_mem
 
 
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.

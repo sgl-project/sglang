@@ -8,8 +8,6 @@ import torch
 from torch.nn import Parameter
 
 from sglang.srt.utils import is_cpu
-import copy
-import torch.utils._pytree as pytree
 
 __all__ = [
     "BasevLLMParameter",
@@ -50,48 +48,6 @@ class BasevLLMParameter(Parameter):
         """
 
         self._weight_loader = weight_loader
-
-    def __tensor_flatten__(self):
-        return ["data"], [
-            self.requires_grad,
-            self._weight_loader,
-        ]
-
-    @staticmethod
-    def __tensor_unflatten__(inner_tensors, ctx, outer_size, outer_stride):
-        out = BasevLLMParameter(data=inner_tensors["data"], weight_loader=ctx[1])
-        return out
-
-    @classmethod
-    def __torch_dispatch__(cls, func, types, args, kwargs):
-        with torch._C._DisableTorchDispatch():
-            if kwargs is None:
-                kwargs = {}
-            args_data = pytree.tree_map_only(BasevLLMParameter, lambda x: x.data, args)
-            return func(*args_data, **kwargs)
-
-    @classmethod
-    def __metadata_guard__(cls, orig_data, other):
-        return (
-            orig_data[0] == other[0]
-            and orig_data[1] == other[1]
-        )
-
-    def __copy__(self):
-        new_param = BasevLLMParameter(data=self.data, weight_loader=self.weight_loader)
-        for k, v in self.__dict__.items():
-            if k != "data":
-                setattr(new_param, k, copy.copy(v))
-        return new_param
-
-    def __deepcopy__(self, memo):
-        new_param = BasevLLMParameter(
-            data=copy.deepcopy(self.data, memo), weight_loader=copy.deepcopy(self.weight_loader, memo)
-        )
-        for k, v in self.__dict__.items():
-            if k != "data" or k != "weight_loader":
-                setattr(new_param, k, copy.deepcopy(v, memo))
-        return new_param
 
     @property
     def weight_loader(self):
@@ -336,6 +292,7 @@ class ChannelQuantScaleParameter(_ColumnvLLMParameter):
     Parameter class for weight scales loaded for weights with
     channel-wise quantization. Equivalent to _ColumnvLLMParameter.
     """
+
     pass
 
 
