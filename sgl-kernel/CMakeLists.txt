@@ -209,70 +209,70 @@ string(REPLACE "-D__CUDA_NO_BFLOAT16_CONVERSIONS__" "" CMAKE_CUDA_FLAGS "${CMAKE
 string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__"      "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 
 set(SOURCES
-    # "csrc/allreduce/mscclpp_allreduce.cu"
-    # "csrc/allreduce/custom_all_reduce.cu"
-    # "csrc/attention/cascade.cu"
-    # "csrc/attention/merge_attn_states.cu"
-    # "csrc/attention/cutlass_mla_kernel.cu"
-    # "csrc/attention/vertical_slash_index.cu"
-    # "csrc/attention/lightning_attention_decode_kernel.cu"
-    # "csrc/elementwise/activation.cu"
-    # "csrc/elementwise/fused_add_rms_norm_kernel.cu"
-    # "csrc/elementwise/rope.cu"
-    # "csrc/gemm/awq_kernel.cu"
-    # "csrc/gemm/bmm_fp8.cu"
-    # "csrc/gemm/dsv3_fused_a_gemm.cu"
-    # "csrc/gemm/dsv3_router_gemm_bf16_out.cu"
-    # "csrc/gemm/dsv3_router_gemm_entry.cu"
-    # "csrc/gemm/dsv3_router_gemm_float_out.cu"
-    # "csrc/gemm/fp8_blockwise_gemm_kernel.cu"
-    # "csrc/gemm/fp8_gemm_kernel.cu"
-    # "csrc/gemm/int8_gemm_kernel.cu"
-    # "csrc/gemm/nvfp4_expert_quant.cu"
-    # "csrc/gemm/nvfp4_quant_entry.cu"
-    # "csrc/gemm/nvfp4_quant_kernels.cu"
-    # "csrc/gemm/nvfp4_scaled_mm_entry.cu"
-    # "csrc/gemm/nvfp4_scaled_mm_kernels.cu"
-    # "csrc/gemm/per_tensor_quant_fp8.cu"
-    # "csrc/gemm/per_token_group_quant_8bit.cu"
+    "csrc/allreduce/mscclpp_allreduce.cu"
+    "csrc/allreduce/custom_all_reduce.cu"
+    "csrc/attention/cascade.cu"
+    "csrc/attention/merge_attn_states.cu"
+    "csrc/attention/cutlass_mla_kernel.cu"
+    "csrc/attention/vertical_slash_index.cu"
+    "csrc/attention/lightning_attention_decode_kernel.cu"
+    "csrc/elementwise/activation.cu"
+    "csrc/elementwise/fused_add_rms_norm_kernel.cu"
+    "csrc/elementwise/rope.cu"
+    "csrc/gemm/awq_kernel.cu"
+    "csrc/gemm/bmm_fp8.cu"
+    "csrc/gemm/dsv3_fused_a_gemm.cu"
+    "csrc/gemm/dsv3_router_gemm_bf16_out.cu"
+    "csrc/gemm/dsv3_router_gemm_entry.cu"
+    "csrc/gemm/dsv3_router_gemm_float_out.cu"
+    "csrc/gemm/fp8_blockwise_gemm_kernel.cu"
+    "csrc/gemm/fp8_gemm_kernel.cu"
+    "csrc/gemm/int8_gemm_kernel.cu"
+    "csrc/gemm/nvfp4_expert_quant.cu"
+    "csrc/gemm/nvfp4_quant_entry.cu"
+    "csrc/gemm/nvfp4_quant_kernels.cu"
+    "csrc/gemm/nvfp4_scaled_mm_entry.cu"
+    "csrc/gemm/nvfp4_scaled_mm_kernels.cu"
+    "csrc/gemm/per_tensor_quant_fp8.cu"
+    "csrc/gemm/per_token_group_quant_8bit.cu"
     "csrc/gemm/per_token_quant_fp8.cu"
-    # "csrc/gemm/qserve_w4a8_per_chn_gemm.cu"
-    # "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
-    # "csrc/moe/moe_align_kernel.cu"
-    # "csrc/moe/moe_fused_gate.cu"
-    # "csrc/moe/moe_topk_softmax_kernels.cu"
-    # "csrc/moe/nvfp4_blockwise_moe.cu"
-    # "csrc/moe/fp8_blockwise_moe_kernel.cu"
-    # "csrc/moe/prepare_moe_input.cu"
-    # "csrc/moe/ep_moe_reorder_kernel.cu"
-    # "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
-    # "csrc/speculative/eagle_utils.cu"
-    # "csrc/speculative/packbit.cu"
-    # "csrc/spatial/greenctx_stream.cu"
-    # "csrc/speculative/speculative_sampling.cu"
-    # "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
-    # "csrc/kvcacheio/transfer.cu"
-    # "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
-    # "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
-    # "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
+    "csrc/gemm/qserve_w4a8_per_chn_gemm.cu"
+    "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
+    "csrc/moe/moe_align_kernel.cu"
+    "csrc/moe/moe_fused_gate.cu"
+    "csrc/moe/moe_topk_softmax_kernels.cu"
+    "csrc/moe/nvfp4_blockwise_moe.cu"
+    "csrc/moe/fp8_blockwise_moe_kernel.cu"
+    "csrc/moe/prepare_moe_input.cu"
+    "csrc/moe/ep_moe_reorder_kernel.cu"
+    "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
+    "csrc/speculative/eagle_utils.cu"
+    "csrc/speculative/packbit.cu"
+    "csrc/spatial/greenctx_stream.cu"
+    "csrc/speculative/speculative_sampling.cu"
+    "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
+    "csrc/kvcacheio/transfer.cu"
+    "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
+    "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
+    "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
     "csrc/common_extension.cc"
-    # "csrc/moe/marlin_moe_wna16/ops.cu"
-    # "csrc/moe/marlin_moe_wna16/gptq_marlin_repack.cu"
-    # "csrc/moe/marlin_moe_wna16/awq_marlin_repack.cu"
-    # "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4.cu"
-    # "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4b8.cu"
-    # "csrc/moe/marlin_moe_wna16/kernel_bf16_ku8b128.cu"
-    # "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4.cu"
-    # "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4b8.cu"
-    # "csrc/moe/marlin_moe_wna16/kernel_fp16_ku8b128.cu"
-    # "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
-    # "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
-    # "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
-    # "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
-    # "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
-    # "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_causal_sm80.cu"
-    # "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
-    # "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
+    "csrc/moe/marlin_moe_wna16/ops.cu"
+    "csrc/moe/marlin_moe_wna16/gptq_marlin_repack.cu"
+    "csrc/moe/marlin_moe_wna16/awq_marlin_repack.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4b8.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku8b128.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4b8.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku8b128.cu"
+    "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
+    "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
+    "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
+    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
+    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
+    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_causal_sm80.cu"
+    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
+    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
@@ -370,34 +370,34 @@ if (SGL_KERNEL_ENABLE_FA3)
 
     set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS} ${FA3_SM8X_GEN_SRCS})
 
-    # set(FLASH_SOURCES
-    #     "csrc/flash_extension.cc"
-    #     "${repo-flash-attention_SOURCE_DIR}/hopper/flash_prepare_scheduler.cu"
-    #     "${repo-flash-attention_SOURCE_DIR}/hopper/flash_api.cpp"
-    #     "${repo-flash-attention_SOURCE_DIR}/hopper/flash_fwd_combine.cu"
-    #     "${FA3_GEN_SRCS}"
-    # )
+    set(FLASH_SOURCES
+        "csrc/flash_extension.cc"
+        "${repo-flash-attention_SOURCE_DIR}/hopper/flash_prepare_scheduler.cu"
+        "${repo-flash-attention_SOURCE_DIR}/hopper/flash_api.cpp"
+        "${repo-flash-attention_SOURCE_DIR}/hopper/flash_fwd_combine.cu"
+        "${FA3_GEN_SRCS}"
+    )
 
-    # Python_add_library(flash_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${FLASH_SOURCES})
+    Python_add_library(flash_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${FLASH_SOURCES})
 
-    # target_compile_options(flash_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_FLASH_KERNEL_CUDA_FLAGS}>)
-    # target_include_directories(flash_ops PRIVATE
-    #     ${repo-flash-attention_SOURCE_DIR}/hopper
-    # )
-    # target_link_libraries(flash_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+    target_compile_options(flash_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_FLASH_KERNEL_CUDA_FLAGS}>)
+    target_include_directories(flash_ops PRIVATE
+        ${repo-flash-attention_SOURCE_DIR}/hopper
+    )
+    target_link_libraries(flash_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 
-    # install(TARGETS flash_ops LIBRARY DESTINATION "sgl_kernel")
-    # set(FLASH_OPS_COMPILE_DEFS
-    #     FLASHATTENTION_DISABLE_BACKWARD
-    #     FLASHATTENTION_DISABLE_DROPOUT
-    #     FLASHATTENTION_DISABLE_UNEVEN_K
-    #     FLASHATTENTION_VARLEN_ONLY
-    # )
+    install(TARGETS flash_ops LIBRARY DESTINATION "sgl_kernel")
+    set(FLASH_OPS_COMPILE_DEFS
+        FLASHATTENTION_DISABLE_BACKWARD
+        FLASHATTENTION_DISABLE_DROPOUT
+        FLASHATTENTION_DISABLE_UNEVEN_K
+        FLASHATTENTION_VARLEN_ONLY
+    )
 
-    # if(NOT ENABLE_BELOW_SM90)
-    #     list(APPEND FLASH_OPS_COMPILE_DEFS FLASHATTENTION_DISABLE_SM8x)
-    # endif()
-    # target_compile_definitions(flash_ops PRIVATE ${FLASH_OPS_COMPILE_DEFS})
+    if(NOT ENABLE_BELOW_SM90)
+        list(APPEND FLASH_OPS_COMPILE_DEFS FLASHATTENTION_DISABLE_SM8x)
+    endif()
+    target_compile_definitions(flash_ops PRIVATE ${FLASH_OPS_COMPILE_DEFS})
 endif()
 
 # JIT Logic
