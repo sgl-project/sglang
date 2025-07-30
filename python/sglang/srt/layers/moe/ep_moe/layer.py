@@ -1529,18 +1529,13 @@ class AscendDeepEPMoE(EPMoE):
         assert self.quant_method is not None
         assert self.activation == "silu"
 
-        (
-            hidden_states,
-            topk_idx,
-            topk_weights,
-            _,
-            seg_indptr,
-            _
-        ) = self.deepep_dispatcher.dispatch(
-            hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            forward_batch=forward_batch,
+        hidden_states, topk_idx, topk_weights, _, seg_indptr, _ = (
+            self.deepep_dispatcher.dispatch(
+                hidden_states=hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                forward_batch=forward_batch,
+            )
         )
         output_dtype = torch.bfloat16
 
