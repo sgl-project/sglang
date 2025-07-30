@@ -177,6 +177,7 @@ class DecodePreallocQueue:
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
+        self.prefill_pp_size = prefill_pp_size
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> BaseKVManager:
