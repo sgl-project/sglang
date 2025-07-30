@@ -152,8 +152,6 @@ class GenerateReqInput:
         else:
             self._normalize_batch_inputs()
 
-        self._validate_session_params()
-
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
         if (
