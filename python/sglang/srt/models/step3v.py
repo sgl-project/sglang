@@ -1,24 +1,10 @@
 import logging
 import math
-from collections.abc import Iterable, Mapping, Sequence
-from functools import cached_property
-from itertools import product
-from math import ceil, sqrt
-from typing import (
-    Any,
-    Dict,
-    Iterable,
-    List,
-    Literal,
-    Optional,
-    Tuple,
-    Type,
-    TypedDict,
-    Union,
-)
+from collections.abc import Iterable
+from math import sqrt
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, TypedDict, Union
 
 import torch
-from einops import rearrange
 from torch import nn
 from torch.nn import LayerNorm
 from torch.nn import functional as F
@@ -55,7 +41,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -93,7 +78,7 @@ Text Model
 """
 
 
-class Step3vMLP(nn.Module):
+class Step3TextMLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -131,7 +116,7 @@ class Step3vMLP(nn.Module):
         return x
 
 
-class Step3vMoEMLP(nn.Module):
+class Step3TextMoEMLP(nn.Module):
     # Native
     def __init__(
         self,
@@ -203,7 +188,7 @@ class Step3vMoEMLP(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
-class Step3vAttention(nn.Module):
+class Step3TextAttention(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -321,7 +306,7 @@ class Step3vAttention(nn.Module):
         return output
 
 
-class Step3vDecoderLayer(nn.Module):
+class Step3TextDecoderLayer(nn.Module):
     def __init__(
         self,
         config: Step3vConfig,
@@ -345,7 +330,7 @@ class Step3vDecoderLayer(nn.Module):
         )
         self.num_fused_shared_experts = 0
         rms_norm_eps = config.rms_norm_eps
-        self.self_attn = Step3vAttention(
+        self.self_attn = Step3TextAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=1,
@@ -388,7 +373,7 @@ class Step3vDecoderLayer(nn.Module):
         )
 
         if not self.is_layer_sparse:
-            self.mlp = Step3vMLP(
+            self.mlp = Step3TextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act="silu",
@@ -398,13 +383,13 @@ class Step3vDecoderLayer(nn.Module):
         else:
             self.use_moe = True
             if self.num_fused_shared_experts == 0:
-                self.moe = Step3vMoEMLP(
+                self.moe = Step3TextMoEMLP(
                     layer_id=layer_id,
                     config=config,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp", prefix),
                 )
-                self.share_expert = Step3vMLP(
+                self.share_expert = Step3TextMLP(
                     hidden_size=config.hidden_size,
                     intermediate_size=config.share_expert_dim,
                     hidden_act="silu",
@@ -412,7 +397,7 @@ class Step3vDecoderLayer(nn.Module):
                     prefix=add_prefix("share_expert", prefix),
                 )
             else:
-                self.moe = Step3vMoEMLP(
+                self.moe = Step3TextMoEMLP(
                     layer_id=layer_id,
                     config=config,
                     quant_config=quant_config,
@@ -468,7 +453,7 @@ class Step3vDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Step3vModel(nn.Module):
+class Step3TextModel(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -488,7 +473,7 @@ class Step3vModel(nn.Module):
 
         self.layers = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: Step3vDecoderLayer(
+            lambda idx, prefix: Step3TextDecoderLayer(
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
@@ -565,7 +550,7 @@ def get_abs_pos(abs_pos, tgt_size):
         return abs_pos
 
 
-class StepCLIPMLP(nn.Module):
+class Step3VisionMLP(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -599,7 +584,7 @@ class StepCLIPMLP(nn.Module):
         return hidden_states
 
 
-class StepCLIPAttention(nn.Module):
+class Step3VisionAttention(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -657,7 +642,7 @@ class StepCLIPAttention(nn.Module):
         return attn_output
 
 
-class StepCLIPVisionEmbeddings(nn.Module):
+class Step3VisionEmbeddings(nn.Module):
 
     def __init__(self, config: StepVisionEncoderConfig):
         super().__init__()
@@ -711,17 +696,17 @@ class StepCLIPVisionEmbeddings(nn.Module):
         return embeddings
 
 
-class StepCLIPEncoderLayer(nn.Module):
+class Step3VisionEncoderLayer(nn.Module):
     def __init__(self, config, attn_implementation: str = "sdpa") -> None:
         super().__init__()
         self.embed_dim = config.hidden_size
         self.layer_norm1 = LayerNorm(self.embed_dim, eps=1e-6)
         self.layer_norm2 = LayerNorm(self.embed_dim, eps=1e-6)
 
-        self.self_attn = StepCLIPAttention(
+        self.self_attn = Step3VisionAttention(
             self.embed_dim, num_heads=config.num_attention_heads
         )
-        self.mlp = StepCLIPMLP(
+        self.mlp = Step3VisionMLP(
             dim=self.embed_dim,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -733,13 +718,13 @@ class StepCLIPEncoderLayer(nn.Module):
         return hidden_states
 
 
-class StepCLIPVisionTransformer(nn.Module):
+class Step3VisionTransformer(nn.Module):
     def __init__(self, config: StepVisionEncoderConfig):
         super().__init__()
         self.config = config
         self.image_size = config.image_size
-        self.embeddings = StepCLIPVisionEmbeddings(config)
-        self.transformer = StepCLIPEncoder(config)
+        self.embeddings = Step3VisionEmbeddings(config)
+        self.transformer = Step3VisionEncoder(config)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -754,10 +739,10 @@ class StepCLIPVisionTransformer(nn.Module):
         return hidden_states
 
 
-class StepCLIPEncoder(nn.Module):
+class Step3VisionEncoder(nn.Module):
     """
     Transformer encoder consisting of `config.num_hidden_layers` self attention layers. Each layer is a
-    [`StepCLIPEncoderLayer`].
+    [`Step3VisionEncoderLayer`].
 
     Args:
         config: StepVisionEncoderConfig
@@ -767,7 +752,7 @@ class StepCLIPEncoder(nn.Module):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList(
-            [StepCLIPEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [Step3VisionEncoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
 
     def forward(
@@ -795,11 +780,11 @@ class Step3VLForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = Step3vModel(
+        self.model = Step3TextModel(
             config.text_config, quant_config, prefix=add_prefix("model", prefix)
         )
 
-        self.vision_model = StepCLIPVisionTransformer(config.vision_config)
+        self.vision_model = Step3VisionTransformer(config.vision_config)
 
         self.vit_downsampler = nn.Conv2d(
             config.vision_config.hidden_size,
