@@ -252,6 +252,17 @@ class CompressedTensorsConfig(QuantizationConfig):
             return False
 
     def _is_fp4a16_nvfp4(self, weight_quant: BaseModel, input_quant: BaseModel):
+        """
+        Checks if quantization configuration matches NVFP4 (w4a16) format.
+
+        Verifies these key conditions:
+        - Weight-only quantization (input remains FP16)
+        - 4-bit floating point weights
+        - Group size of 16
+        - Symmetric quantization
+
+        Returns True only when all NVFP4 requirements are met.
+        """
 
         is_weight_only = weight_quant is not None and input_quant is None
         is_tensor_group_quant = (

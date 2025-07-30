@@ -16,7 +16,7 @@ from vllm.scalar_type import scalar_types
 
 from sglang.srt.layers.quantization.marlin_utils import (
     USE_FP32_REDUCE_DEFAULT,
-    marlin_make_workspace_new,
+    marlin_make_workspace,
     marlin_permute_scales,
     should_use_atomic_add_reduce,
 )
@@ -142,7 +142,7 @@ def prepare_fp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     device = layer.weight.device
 
     # WORKSPACE
-    layer.workspace = marlin_make_workspace_new(device)
+    layer.workspace = marlin_make_workspace(device)
 
     # WEIGHT
     # Repack weights to marlin format
@@ -189,7 +189,7 @@ def prepare_moe_fp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     # WORKSPACE
     device = layer.w13_weight.device
     param_dtype = layer.params_dtype
-    layer.workspace = marlin_make_workspace_new(device, 4)
+    layer.workspace = marlin_make_workspace(device, 4)
     perm = torch.empty(0, dtype=torch.int, device=device)
 
     # WEIGHT
