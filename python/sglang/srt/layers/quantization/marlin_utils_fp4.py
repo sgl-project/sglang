@@ -1,21 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Optional
 import logging
+from typing import Optional
 
 import torch
 
 try:
-  from vllm import _custom_ops as ops
+    from vllm import _custom_ops as ops
 except ImportError:
-  ops = None
+    ops = None
 
-from sglang.srt.layers.quantization.marlin_utils import (
-    USE_FP32_REDUCE_DEFAULT, marlin_make_workspace_new, marlin_permute_scales,
-    should_use_atomic_add_reduce)
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
+
+from sglang.srt.layers.quantization.marlin_utils import (
+    USE_FP32_REDUCE_DEFAULT,
+    marlin_make_workspace_new,
+    marlin_permute_scales,
+    should_use_atomic_add_reduce,
+)
 
 FP4_MARLIN_SUPPORTED_GROUP_SIZES = [16]
 
@@ -32,7 +36,8 @@ def fp4_marlin_process_scales(marlin_scales):
             "NVFP4 Marlin assumes the scales to be >=0, but has encountered "
             "negative scales. Accuracy will likely be degraded. This is "
             "because it changes the scales from FP8-S1E4M3 to a special "
-            "FP8-S0E5M3 format to speedup the dequantization.")
+            "FP8-S0E5M3 format to speedup the dequantization."
+        )
 
     # convert to half first, we would convert to fp8 later
     marlin_scales = marlin_scales.to(torch.half)
@@ -40,11 +45,13 @@ def fp4_marlin_process_scales(marlin_scales):
     # 8 is the number of scale number using by one thread
     marlin_scales = marlin_scales.view(marlin_scales.size(0) // 2, 2, -1, 8)
     marlin_scales = marlin_scales.permute(0, 2, 1, 3).reshape(
-        marlin_scales.size(0) * 2, -1)
+        marlin_scales.size(0) * 2, -1
+    )
 
     # fit the layout of fp8 dequantization
     marlin_scales = marlin_scales.view(-1, 4)[:, [0, 2, 1, 3]].view(
-        marlin_scales.size(0), -1)
+        marlin_scales.size(0), -1
+    )
 
     # We assume that weight_scale (FP8-S1E4M3) is always greater
     # than or equal to 0. So we can convert
@@ -69,47 +76,48 @@ def fp4_marlin_process_global_scale(global_scale):
         target_exponent = 8
     # exponent_bias_fp16 = 2 ** 4 - 2 ** 1 = 14
     # exponent_bias_bf16 = 2 ** 7 - 2 ** 1 = 126
-    exponent_bias = 2**(target_exponent - 1) - 2**(fp4_exponent - 1)
-    return global_scale * (2.0**(exponent_bias - 7))
+    exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp4_exponent - 1)
+    return global_scale * (2.0 ** (exponent_bias - 7))
 
 
 def apply_fp4_marlin_linear(
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        weight_scale: torch.Tensor,
-        weight_scale_2: torch.Tensor,
-        workspace: torch.Tensor,
-        size_n: int,
-        size_k: int,
-        bias: Optional[torch.Tensor] = None,
-        use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT) -> torch.Tensor:
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    workspace: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    bias: Optional[torch.Tensor] = None,
+    use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
+) -> torch.Tensor:
     # For GPUs that lack FP4 hardware support, we can leverage the
     # Marlin kernel for fast weight-only FP4 quantization
 
     reshaped_x = input.reshape(-1, input.shape[-1])
-    out_shape = input.shape[:-1] + (size_n, )
+    out_shape = input.shape[:-1] + (size_n,)
 
-    use_atomic_add = should_use_atomic_add_reduce(m=reshaped_x.size(0),
-                                                  n=size_n,
-                                                  k=size_k,
-                                                  device=input.device,
-                                                  dtype=input.dtype)
+    use_atomic_add = should_use_atomic_add_reduce(
+        m=reshaped_x.size(0), n=size_n, k=size_k, device=input.device, dtype=input.dtype
+    )
 
-    output = ops.gptq_marlin_gemm(a=reshaped_x,
-                                  c=None,
-                                  b_q_weight=weight,
-                                  b_scales=weight_scale,
-                                  global_scale=weight_scale_2,
-                                  b_zeros=None,
-                                  g_idx=None,
-                                  perm=None,
-                                  workspace=workspace,
-                                  b_q_type=scalar_types.float4_e2m1f,
-                                  size_m=reshaped_x.size(0),
-                                  size_n=size_n,
-                                  size_k=size_k,
-                                  use_atomic_add=use_atomic_add,
-                                  use_fp32_reduce=use_fp32_reduce)
+    output = ops.gptq_marlin_gemm(
+        a=reshaped_x,
+        c=None,
+        b_q_weight=weight,
+        b_scales=weight_scale,
+        global_scale=weight_scale_2,
+        b_zeros=None,
+        g_idx=None,
+        perm=None,
+        workspace=workspace,
+        b_q_type=scalar_types.float4_e2m1f,
+        size_m=reshaped_x.size(0),
+        size_n=size_n,
+        size_k=size_k,
+        use_atomic_add=use_atomic_add,
+        use_fp32_reduce=use_fp32_reduce,
+    )
 
     if bias is not None:
         output.add_(bias)  # In-place add
@@ -122,7 +130,8 @@ def prepare_fp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         "Your GPU does not have native support for FP4 computation but "
         "FP4 quantization is being used. Weight-only FP4 compression will "
         "be used leveraging the Marlin kernel. This may degrade "
-        "performance for compute-heavy workloads.")
+        "performance for compute-heavy workloads."
+    )
 
     part_size_n = layer.output_size_per_partition
     part_size_k = layer.input_size_per_partition
@@ -140,27 +149,27 @@ def prepare_fp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     perm = torch.empty(0, dtype=torch.int, device=device)
     qweight = layer.weight.view(torch.int32).T.contiguous()
 
-    marlin_qweight = ops.gptq_marlin_repack(b_q_weight=qweight,
-                                            perm=perm,
-                                            size_k=part_size_k,
-                                            size_n=part_size_n,
-                                            num_bits=4)
+    marlin_qweight = ops.gptq_marlin_repack(
+        b_q_weight=qweight,
+        perm=perm,
+        size_k=part_size_k,
+        size_n=part_size_n,
+        num_bits=4,
+    )
     layer.weight = torch.nn.Parameter(marlin_qweight, requires_grad=False)
 
     # WEIGHT SCALES
     # Permute scales
     weight_scale = layer.weight_scale.T.to(param_dtype)
-    weight_scale = marlin_permute_scales(s=weight_scale,
-                                         size_k=part_size_k,
-                                         size_n=part_size_n,
-                                         group_size=16)
+    weight_scale = marlin_permute_scales(
+        s=weight_scale, size_k=part_size_k, size_n=part_size_n, group_size=16
+    )
     weight_scale = fp4_marlin_process_scales(weight_scale)
     layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 
     weight_scale_2 = layer.weight_scale_2.to(param_dtype)
     weight_scale_2 = fp4_marlin_process_global_scale(weight_scale_2)
-    layer.weight_scale_2 = torch.nn.Parameter(weight_scale_2,
-                                              requires_grad=False)
+    layer.weight_scale_2 = torch.nn.Parameter(weight_scale_2, requires_grad=False)
 
     return
 
@@ -170,7 +179,8 @@ def prepare_moe_fp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         "Your GPU does not have native support for FP4 computation but "
         "FP4 quantization is being used. Weight-only FP4 compression will "
         "be used leveraging the Marlin kernel. This may degrade "
-        "performance for compute-heavy workloads.")
+        "performance for compute-heavy workloads."
+    )
 
     e = layer.num_experts
     k = layer.hidden_size
@@ -197,11 +207,9 @@ def prepare_moe_fp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         for i in range(e):
             qweight = weight[i].view(torch.int32).T.contiguous()
 
-            marlin_qweight = ops.gptq_marlin_repack(b_q_weight=qweight,
-                                                    perm=perm,
-                                                    size_k=size_k,
-                                                    size_n=size_n,
-                                                    num_bits=4)
+            marlin_qweight = ops.gptq_marlin_repack(
+                b_q_weight=qweight, perm=perm, size_k=size_k, size_n=size_n, num_bits=4
+            )
             tensor_list.append(marlin_qweight)
 
         weight = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
@@ -222,10 +230,9 @@ def prepare_moe_fp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             size_n, size_k = k, n
 
         for i in range(e):
-            marlin_scales = marlin_permute_scales(s=scales[i].T,
-                                                  size_k=size_k,
-                                                  size_n=size_n,
-                                                  group_size=16)
+            marlin_scales = marlin_permute_scales(
+                s=scales[i].T, size_k=size_k, size_n=size_n, group_size=16
+            )
             marlin_scales = fp4_marlin_process_scales(marlin_scales)
             tensor_list.append(marlin_scales)
 
@@ -247,26 +254,26 @@ def rand_marlin_weight_fp4_like(weight, group_size):
     global_scale = scales.max() / 448
     scales = (scales / global_scale).to(torch.float8_e4m3fn)
 
-    fp4_weight = torch.randint(0,
-                               256, (size_n, size_k // 2),
-                               dtype=torch.uint8,
-                               device=weight.device)
-    fp4_weight_part_1 = ((fp4_weight & 0b10000000) |
-                         ((fp4_weight & 0b01110000) >> 2))
+    fp4_weight = torch.randint(
+        0, 256, (size_n, size_k // 2), dtype=torch.uint8, device=weight.device
+    )
+    fp4_weight_part_1 = (fp4_weight & 0b10000000) | ((fp4_weight & 0b01110000) >> 2)
     fp4_weight_part_1 = fp4_weight_part_1.view(torch.float8_e4m3fn)
     fp4_weight_part_1 = fp4_weight_part_1.to(weight.dtype) * (2**6)
 
     fp4_weight2 = fp4_weight << 4
-    fp4_weight_part_2 = ((fp4_weight2 & 0b10000000) |
-                         ((fp4_weight2 & 0b01110000) >> 2))
+    fp4_weight_part_2 = (fp4_weight2 & 0b10000000) | ((fp4_weight2 & 0b01110000) >> 2)
     fp4_weight_part_2 = fp4_weight_part_2.view(torch.float8_e4m3fn)
     fp4_weight_part_2 = fp4_weight_part_2.to(weight.dtype) * (2**6)
 
     weight_ref = torch.cat(
-        [fp4_weight_part_2.unsqueeze(2),
-         fp4_weight_part_1.unsqueeze(2)], 2).view(size_n, size_k)
-    weight_ref = weight_ref * global_scale.to(weight.dtype) * \
-        scales.repeat_interleave(group_size, 1).to(weight.dtype)
+        [fp4_weight_part_2.unsqueeze(2), fp4_weight_part_1.unsqueeze(2)], 2
+    ).view(size_n, size_k)
+    weight_ref = (
+        weight_ref
+        * global_scale.to(weight.dtype)
+        * scales.repeat_interleave(group_size, 1).to(weight.dtype)
+    )
 
     marlin_qweight = ops.gptq_marlin_repack(
         b_q_weight=fp4_weight.view(torch.int32).T.contiguous(),
@@ -276,10 +283,9 @@ def rand_marlin_weight_fp4_like(weight, group_size):
         num_bits=4,
     )
 
-    marlin_scales = marlin_permute_scales(s=scales.T.to(weight.dtype),
-                                          size_k=size_k,
-                                          size_n=size_n,
-                                          group_size=group_size)
+    marlin_scales = marlin_permute_scales(
+        s=scales.T.to(weight.dtype), size_k=size_k, size_n=size_n, group_size=group_size
+    )
     marlin_scales = fp4_marlin_process_scales(marlin_scales)
 
     global_scale = fp4_marlin_process_global_scale(global_scale)
