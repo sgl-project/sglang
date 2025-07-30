@@ -50,6 +50,8 @@ class RouterArgs:
     eviction_interval: int = 60
     max_tree_size: int = 2**24
     max_payload_size: int = 256 * 1024 * 1024  # 256MB default for large batches
+    dp_aware: bool = False
+    api_key: Optional[str] = None
     log_dir: Optional[str] = None
     log_level: Optional[str] = None
     # Service discovery configuration
@@ -198,6 +200,17 @@ class RouterArgs:
             help="Maximum payload size in bytes",
         )
         parser.add_argument(
+            f"--{prefix}dp-aware",
+            action="store_true",
+            help="Enable data parallelism aware schedule",
+        )
+        parser.add_argument(
+            f"--{prefix}api-key",
+            type=str,
+            default=None,
+            help="The api key used for the authorization with the worker.  Useful when the dp aware scheduling strategy is enaled.",
+        )
+        parser.add_argument(
             f"--{prefix}log-dir",
             type=str,
             default=None,
@@ -304,6 +317,8 @@ class RouterArgs:
             eviction_interval=getattr(args, f"{prefix}eviction_interval"),
             max_tree_size=getattr(args, f"{prefix}max_tree_size"),
             max_payload_size=getattr(args, f"{prefix}max_payload_size"),
+            dp_aware=getattr(args, f"{prefix}dp_aware", False),
+            api_key=getattr(args, f"{prefix}api_key", None),
             log_dir=getattr(args, f"{prefix}log_dir", None),
             log_level=getattr(args, f"{prefix}log_level", None),
             service_discovery=getattr(args, f"{prefix}service_discovery", False),
@@ -463,6 +478,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             eviction_interval_secs=router_args.eviction_interval,
             max_tree_size=router_args.max_tree_size,
             max_payload_size=router_args.max_payload_size,
+            dp_aware=router_args.dp_aware,
+            api_key=router_args.api_key,
             log_dir=router_args.log_dir,
             log_level=router_args.log_level,
             service_discovery=router_args.service_discovery,
