@@ -302,7 +302,7 @@ class MxFp4Config(QuantizationConfig):
             ):
                 raise ValueError(
                     f"Found a different quantization configuration for "
-                    f"{shard_proj_names} in {layer_name}. vLLM "
+                    f"{shard_proj_names=} in {layer_name=}. vLLM "
                     "requires all to use the same scheme."
                 )
             return shard_configs[0]
@@ -340,8 +340,8 @@ class MxFp4Config(QuantizationConfig):
 
         raise NotImplementedError(
             "No quark compatible scheme was found. "
-            f"Weight config: {weight_config}, "
-            f"Input config: {input_config}"
+            f"{weight_config=}, "
+            f"{input_config=}"
         )
 
     def get_scheme(self, layer: torch.nn.Module, layer_name: str) -> "QuarkScheme":
@@ -666,7 +666,7 @@ class W4A4MXFp4MoEStaticMethod(MxFp4MoEMethod):
             raise ValueError(
                 "For MX(FP4) Fused MoE layers, only per-group scales "
                 "for weights and activations are supported. Found "
-                f"{weight_qscheme}, {input_qscheme}"
+                f"{weight_qscheme=}, {input_qscheme=}"
             )  # noqa E501
 
         self.static_input_scales = not self.input_quant.get("is_dynamic")
