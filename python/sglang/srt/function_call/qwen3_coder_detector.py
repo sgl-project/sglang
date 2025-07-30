@@ -176,10 +176,15 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 if self.tool_call_end_token in self._buf:
                     end_pos = self._buf.find(self.tool_call_end_token)
                     
-                    # Process any remaining complete parameters before the end token
-                    before_end = self._buf[:end_pos]
-                    final_calls = self._parse_and_stream_parameters(before_end)
-                    calls.extend(final_calls)
+                    # Add closing brace to complete the JSON object
+                    current_streamed = self.streamed_args_for_tool[self.current_tool_id]
+                    if current_streamed and not current_streamed.endswith('}'):
+                        calls.append(ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None,
+                            parameters='}',
+                        ))
+                        self.streamed_args_for_tool[self.current_tool_id] = current_streamed + '}'
                     
                     # Complete the tool call
                     self._buf = self._buf[end_pos + len(self.tool_call_end_token):]
@@ -220,23 +225,46 @@ class Qwen3CoderDetector(BaseFormatDetector):
             param_value = match.group(2)
             new_params[param_name] = _safe_val(param_value)
         
-        # Calculate parameter diff to stream
+        # Calculate parameter diff to stream with proper incremental JSON building
         if new_params != self._current_parameters:
-            current_args_json = json.dumps(new_params, ensure_ascii=False)
+            previous_args_json = self.streamed_args_for_tool[self.current_tool_id]
             
-            # Calculate what to send based on what we've already streamed
-            sent_length = len(self.streamed_args_for_tool[self.current_tool_id])
-            
-            if len(current_args_json) > sent_length:
-                argument_diff = current_args_json[sent_length:]
+            # Build incremental JSON properly
+            if not self._current_parameters:
+                # First parameter(s) - start JSON object but don't close it yet
+                if len(new_params) == 1:
+                    # Single parameter so far - send opening but no closing brace
+                    key, value = next(iter(new_params.items()))
+                    json_fragment = f'{{{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}'
+                else:
+                    # Multiple parameters in first batch - send complete JSON
+                    json_fragment = json.dumps(new_params, ensure_ascii=False)
                 
                 calls.append(ToolCallItem(
                     tool_index=self.current_tool_id,
                     name=None,
-                    parameters=argument_diff,
+                    parameters=json_fragment,
                 ))
+                self.streamed_args_for_tool[self.current_tool_id] = json_fragment
                 
-                self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+            else:
+                # Additional parameters - add them incrementally
+                new_keys = set(new_params.keys()) - set(self._current_parameters.keys())
+                if new_keys:
+                    # Build the continuation part (no closing brace yet)
+                    continuation_parts = []
+                    for key in new_keys:
+                        value = new_params[key]
+                        continuation_parts.append(f'{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}')
+                    
+                    json_fragment = ', ' + ', '.join(continuation_parts)
+                    
+                    calls.append(ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        name=None,
+                        parameters=json_fragment,
+                    ))
+                    self.streamed_args_for_tool[self.current_tool_id] = previous_args_json + json_fragment
             
             # Update current state
             self._current_parameters = new_params
