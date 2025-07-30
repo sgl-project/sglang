@@ -119,13 +119,15 @@ class EAGLEWorker(TpModelWorker):
             )
 
             if self.log_cold_token_prob:
+                # Move hot_token_id to the correct device first
+                self.hot_token_id = self.hot_token_id.to(self.device)
                 # Create a boolean mask for cold tokens
                 self.cold_token_mask = torch.ones(
                     target_worker.model_runner.model_config.vocab_size,
                     dtype=torch.bool,
                     device=self.device,
                 )
-                self.cold_token_mask[self.hot_token_id.to(self.device)] = False
+                self.cold_token_mask[self.hot_token_id] = False
             else:
                 self.hot_token_id = None
         else:
@@ -601,7 +603,7 @@ class EAGLEWorker(TpModelWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
-        if self.hot_token_id is not None:
+        if self.hot_token_id is not None and not self.log_cold_token_prob:
             topk_index = self.hot_token_id[topk_index]
 
         out_cache_loc = out_cache_loc.reshape(
@@ -647,12 +649,8 @@ class EAGLEWorker(TpModelWorker):
                 cold_probs = probs[:, self.cold_token_mask]
                 logger.info(f"Sum of cold token probs for each batched req in draft_forward: {torch.sum(cold_probs, dim=-1)}")
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            if self.hot_token_id is not None:
-                if not self.log_cold_token_prob:
-                    topk_index = self.hot_token_id[topk_index]
-                else:
-                    # When logging, we don't prune, so we should not remap indices
-                    pass
+            if self.hot_token_id is not None and not self.log_cold_token_prob:
+                topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
         return score_list, token_list, parents_list
