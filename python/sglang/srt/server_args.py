@@ -270,14 +270,6 @@ class ServerArgs:
     sm_group_num: int = 3
 
     def __post_init__(self):
-        # Expert parallelism
-        # We put it here first due to some internal ckpt conversation issues.
-        if self.enable_ep_moe:
-            self.ep_size = self.tp_size
-            logger.warning(
-                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
-
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
