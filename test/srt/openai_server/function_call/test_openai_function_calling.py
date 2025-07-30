@@ -16,19 +16,6 @@ from sglang.test.test_utils import (
 
 
 class TestOpenAIServerFunctionCalling(CustomTestCase):
-    # NOTE: this system_message is for Llama3.2 system prompt. Without this,
-    # sometimes Llama3.2 gives a different tool call format such as:
-    # '<|python_tag|>{"type": "function", "function": "add", "parameters": {"a": "3", "b": "5"}}'
-    SYSTEM_MESSAGE = (
-        "You are a helpful assistant with tool calling capabilities. "
-        "Only reply with a tool call if the function exists in the library provided by the user. "
-        "If it doesn't exist, just reply directly in natural language. "
-        "When you receive a tool call response, use the output to format an answer to the original user question. "
-        "You have access to the following functions. "
-        "To call a function, please respond with JSON for a function call. "
-        'Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}. '
-        "Do not use variables.\n\n"
-    )
 
     @classmethod
     def setUpClass(cls):
@@ -88,7 +75,6 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         ]
 
         messages = [
-            {"role": "system", "content": self.SYSTEM_MESSAGE},
             {"role": "user", "content": "Compute (3+5)"},
         ]
         response = client.chat.completions.create(
@@ -222,7 +208,6 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         ]
 
         messages = [
-            {"role": "system", "content": self.SYSTEM_MESSAGE},
             {
                 "role": "user",
                 "content": "What is the temperature in Paris in celsius??",
@@ -303,7 +288,6 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         ]
 
         messages = [
-            {"role": "system", "content": self.SYSTEM_MESSAGE},
             {"role": "user", "content": "Please sum 5 and 7, just call the function."},
         ]
 
