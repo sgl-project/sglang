@@ -7,9 +7,9 @@ from typing import Any, Dict, List
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
-    _GetInfoFunc,
     StreamingParseResult,
     ToolCallItem,
+    _GetInfoFunc,
 )
 from sglang.srt.function_call.ebnf_composer import EBNFComposer
 
@@ -150,7 +150,7 @@ class Step3VDetector(BaseFormatDetector):
                 type_part, invoke_part = call_content.split(self.tool_sep, 1)
                 if type_part.strip() != "function":
                     continue
-                
+
                 func_name, params = self._parse_steptml_invoke(invoke_part, tools)
                 if func_name:
                     # Use parse_base_json to create the ToolCallItem
@@ -333,7 +333,6 @@ class Step3VDetector(BaseFormatDetector):
                     self._current_parameters[param_name] = param_value
             # Check if we have new parameters to stream
 
-
             # Check if tool call is complete
             if self.tool_call_end in self._buffer:
                 json_params = json.dumps(self._current_parameters, ensure_ascii=False)
@@ -344,9 +343,7 @@ class Step3VDetector(BaseFormatDetector):
                     )
                 )
                 self.streamed_args_for_tool[self.current_tool_id] = json_params
-                self.prev_tool_call_arr[self.current_tool_id][
-                    "arguments"
-                ] = json_params
+                self.prev_tool_call_arr[self.current_tool_id]["arguments"] = json_params
 
                 # Find the end position
                 end_idx = self._buffer.find(self.tool_call_end)

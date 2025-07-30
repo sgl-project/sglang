@@ -327,10 +327,6 @@ class ModelConfig:
                 self.hf_config.num_attention_heads,
             )
 
-        # For Step3v
-        if self.hf_config.model_type in ["step3v"]:
-            return getattr(self.text_config, "num_attention_groups", 1)
-
         attributes = [
             # For Falcon:
             "n_head_kv",
@@ -339,10 +335,13 @@ class ModelConfig:
             "num_key_value_heads",
             # For ChatGLM:
             "multi_query_group_num",
+            # For Step3
+            "num_attention_groups",
         ]
         for attr in attributes:
             num_kv_heads = getattr(self.hf_text_config, attr, None)
             if num_kv_heads is not None:
+                print("debug attr", attr, num_kv_heads)
                 return num_kv_heads
 
         # For non-grouped-query attention models, the number of KV heads is
