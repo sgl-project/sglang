@@ -1288,7 +1288,7 @@ class Scheduler(
             self.disagg_decode_prealloc_queue.add(req)
         else:
             if self.enable_hicache_storage:
-                req.init_next_round_input(self.tree_cache, disable_inc_hit_count=True)
+                req.init_next_round_input(self.tree_cache)
                 last_hash = req.last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 if (matched_len > 0 and last_hash is not None) or matched_len == 0:
@@ -1772,6 +1772,9 @@ class Scheduler(
                 self.tree_cache.check_prefetch_progress(req.rid)
 
             req.init_next_round_input(self.tree_cache)
+            if self.enable_hierarchical_cache:
+                req.inc_node_hit_count(self.tree_cache)
+
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
 
             if res != AddReqResult.CONTINUE:

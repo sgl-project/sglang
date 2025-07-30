@@ -632,7 +632,6 @@ class Req:
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
-        disable_inc_hit_count:  Optional[bool] = False,
     ):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
@@ -643,9 +642,17 @@ class Req:
                 self.host_hit_length,
             ) = tree_cache.match_prefix(
                 key=self.adjust_max_prefix_ids(),
-                disable_inc_hit_count=disable_inc_hit_count
             )
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
+
+    def inc_node_hit_count(
+        self,
+        tree_cache: Optional[BasePrefixCache] = None,
+    ):
+        node = self.last_node
+        while node != tree_cache.root_node:
+            tree_cache.inc_hit_count(node)
+            node = node.parent
 
     def adjust_max_prefix_ids(self):
         self.fill_ids = self.origin_input_ids + self.output_ids

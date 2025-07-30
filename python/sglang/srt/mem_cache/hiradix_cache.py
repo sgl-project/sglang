@@ -453,7 +453,7 @@ class HiRadixCache(RadixCache):
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
-        value, last_node = self._match_prefix_helper(self.root_node, key, **kwargs)
+        value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
             value = torch.cat(value)
         else:
@@ -540,8 +540,7 @@ class HiRadixCache(RadixCache):
             node.children[child_key] = new_node
         return matched_length
 
-    def _match_prefix_helper(self, node: TreeNode, key: List, **kwargs):
-        disable_inc_hit_count = kwargs.pop("disable_inc_hit_count", False)
+    def _match_prefix_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.monotonic()
         child_key = self.get_child_key_fn(key)
         value = []
@@ -552,15 +551,11 @@ class HiRadixCache(RadixCache):
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
-                if not disable_inc_hit_count:
-                    self.inc_hit_count(new_node)
                 if not new_node.evicted:
                     value.append(new_node.value)
                 node = new_node
                 break
             else:
-                if not disable_inc_hit_count:
-                    self.inc_hit_count(child)
                 if not child.evicted:
                     value.append(child.value)
                 node = child
