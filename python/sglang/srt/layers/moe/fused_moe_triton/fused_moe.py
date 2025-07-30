@@ -414,7 +414,8 @@ def fused_moe_kernel(
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    offs_token_id_mask = offs_token_id < EM
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id, mask=offs_token_id_mask)
     offs_token = offs_token.to(tl.int64)
     token_mask = offs_token < num_valid_tokens
 
