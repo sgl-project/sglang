@@ -1460,7 +1460,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
         engine_rank = request.query.get("engine_rank")
         target_dp_group = request.query.get("target_dp_group")
         target_pp_rank = request.query.get("target_pp_rank")
-        if not engine_rank or not target_dp_group:
+        if not engine_rank or not target_dp_group or not target_pp_rank:
             return web.Response(text="Missing inputs for bootstrap server.", status=400)
 
         # Currently we use engine_rank == -1 and target_dp_group == -1 to sync dp size
