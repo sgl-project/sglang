@@ -32,7 +32,7 @@ __all__ = ["CompressedTensorsW8A8Fp8"]
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-if _is_hip:
+if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
 def use_aiter_scaled_mm():
