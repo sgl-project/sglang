@@ -607,7 +607,16 @@ def apply_fp8_linear(
                 and not per_tensor_activations
                 and (USE_ROWWISE_TORCH_SCALED_MM or _use_aiter)
             ):
-                if _use_aiter:                    
+                # into this sector means use dynamic per-token-per-channel quant
+                # per-token scale quant for input matrix, every row(one token) have one scale factor 
+                # per-channel scale quant for weight matrix, every col(one channel) have one scale factor
+                if _use_aiter:
+                    # gemm_a8w8_bpreshuffle(XQ, WQ, x_scale, w_scale, dtype)
+                    # XQ -> input tensor, shape = (m, k)
+                    # WQ -> weight tensor, shape = (n, k), with preshuffe get better perf
+                    # x_scale -> input scale tensor, shape = (m, 1)
+                    # w_scale -> weight scale tensor, shape = (n ,1)
+                    # dtype -> output dtype
                     output = gemm_a8w8_bpreshuffle(
                         XQ=qinput,
                         WQ=weight,
