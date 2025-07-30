@@ -137,6 +137,14 @@ __device__ void moe_fused_gate_small_vpt(
   // Small VPT value optimization path - Using the original non-tile implementation
   // ===== Place the original implementation (non-tile version) code here =====
 
+  int tidx = threadIdx.x;
+  int thread_group_idx = threadIdx.y;
+  int thread_row = blockIdx.x * params.ROWS_PER_CTA + thread_group_idx * params.ROWS_PER_WARP;
+  T* thread_row_ptr = reinterpret_cast<T*>(input) + thread_row * params.NUM_EXPERTS;
+  T* bias_ptr = reinterpret_cast<T*>(bias) + thread_row * params.NUM_EXPERTS;
+  int first_elt_read_by_thread = tidx * params.VPT;
+  int topk_excluding_share_expert_fusion = topk - num_fused_shared_experts;
+
   Array<T, 32> row_chunk;  // Since VPT ≤ 32, 32 is sufficient.
   Array<T, 32> bias_chunk;
 
@@ -288,6 +296,13 @@ __device__ void moe_fused_gate_large_vpt(
     Params params) {
   // Add shared memory array to store processing results
   // Only allocate shared memory for the currently processed tile, not the entire VPT
+  int tidx = threadIdx.x;
+  int thread_group_idx = threadIdx.y;
+  int thread_row = blockIdx.x * params.ROWS_PER_CTA + thread_group_idx * params.ROWS_PER_WARP;
+  T* thread_row_ptr = reinterpret_cast<T*>(input) + thread_row * params.NUM_EXPERTS;
+  T* bias_ptr = reinterpret_cast<T*>(bias) + thread_row * params.NUM_EXPERTS;
+  int first_elt_read_by_thread = tidx * params.VPT;
+  int topk_excluding_share_expert_fusion = topk - num_fused_shared_experts;
   // __shared__ T shared_sigmoid[WARP_SIZE * 32]; // 32 * 32 = 1024
   // __shared__ T shared_bias[WARP_SIZE * 32];    // 32 * 32 = 1024
   __shared__ T shared_sigmoid[WARP_SIZE * (32 + 1)];
@@ -295,8 +310,6 @@ __device__ void moe_fused_gate_large_vpt(
 
   __shared__ int current_tile_idx;
 
-  // Calculate the offset of the current thread in shared memory
-  int thread_linear_idx = threadIdx.y * WARP_SIZE + tidx;
   // Calculate the offset of the current thread in the warp
   int thread_shared_offset = tidx % WARP_SIZE;
 
@@ -497,7 +510,7 @@ __device__ void moe_fused_gate_large_vpt(
     }
 
     // argmax reduce
-    topk_argmax_reduce(max_val, expert, params.THREADS_PER_ROW);
+    topk_argmax_reduce(local_max_val, expert, params.THREADS_PER_ROW);
 
     int thread_to_clear_in_group = expert / params.VPT;
     int64_t idx = topk * thread_row + k_idx;
@@ -653,41 +666,40 @@ __global__ void moe_fused_gate_kernel(
 }
 
 // Macro to compute compile-time constants and launch the kernel.
-#define LAUNCH_MOE_GATE_CONFIG(T, EXPERTS, EXPERT_GROUP)                                                 \
-  do {                                                                                                   \
-    constexpr int VPT = (EXPERTS) / (EXPERT_GROUP);                                                      \
-    /* If EXPERT_GROUP > WARP_SIZE, fall back to 1 row per warp */                                       \
-    constexpr int ROWS_PER_WARP = ((EXPERT_GROUP) <= WARP_SIZE) ? (WARP_SIZE / (EXPERT_GROUP)) : 1;      \
-    constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;                                          \
-    /* Calculate shared memory size */                                                                   \
-    size_t shared_mem_size = (VPT <= 32) ? 0 : (2 * WARP_SIZE * 32 * sizeof(T) + sizeof(int));           \
-    moe_fused_gate_kernel<T, VPT, (EXPERTS), (EXPERT_GROUP), ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA> \
-        <<<num_blocks, block_dim, shared_mem_size, stream>>>(                                            \
-            input.data_ptr(),                                                                            \
-            bias.data_ptr(),                                                                             \
-            output.data_ptr<float>(),                                                                    \
-            indices.data_ptr<int32_t>(),                                                                 \
-            num_rows,                                                                                    \
-            topk_group,                                                                                  \
-            topk,                                                                                        \
-            num_fused_shared_experts,                                                                    \
-            routed_scaling_factor);                                                                      \
-    dispatched = true;                                                                                   \
+#define LAUNCH_MOE_GATE_CONFIG(T, EXPERTS, EXPERT_GROUP)                                                            \
+  do {                                                                                                              \
+    constexpr int VPT = (EXPERTS) / (EXPERT_GROUP);                                                                 \
+    constexpr int ROWS_PER_WARP = ((EXPERT_GROUP) <= WARP_SIZE) ? (WARP_SIZE / (EXPERT_GROUP)) : 1;                 \
+    constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;                                                     \
+    size_t shared_mem_size = (VPT <= 32) ? 0 : (2 * WARP_SIZE * 32 * sizeof(T) + sizeof(int));                      \
+    moe_fused_gate_kernel<T, VPT, (EXPERTS), (EXPERT_GROUP), ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA>            \
+        <<<static_cast<unsigned int>(num_blocks), block_dim, static_cast<unsigned int>(shared_mem_size), stream>>>( \
+            input.data_ptr(),                                                                                       \
+            bias.data_ptr(),                                                                                        \
+            output.data_ptr<float>(),                                                                               \
+            indices.data_ptr<int32_t>(),                                                                            \
+            num_rows,                                                                                               \
+            topk_group,                                                                                             \
+            topk,                                                                                                   \
+            num_fused_shared_experts,                                                                               \
+            routed_scaling_factor);                                                                                 \
+    dispatched = true;                                                                                              \
   } while (0)
 
 // Helper macro for dynamic kernel launch (small/large VPT, all types)
-#define LAUNCH_DYNAMIC_MOE_KERNEL(KERNEL, TYPE, SHMEM)                          \
-  KERNEL<TYPE, KernelParamsDynamic> < <<num_blocks, block_dim, SHMEM, stream>>( \
-                                          input.data_ptr<TYPE>(),               \
-                                          bias.data_ptr<TYPE>(),                \
-                                          output.data_ptr<float>(),             \
-                                          indices.data_ptr<int32_t>(),          \
-                                          num_rows,                             \
-                                          topk_group,                           \
-                                          topk,                                 \
-                                          num_fused_shared_experts,             \
-                                          routed_scaling_factor,                \
-                                          params)
+#define LAUNCH_DYNAMIC_MOE_KERNEL(KERNEL, TYPE, SHMEM)                                                  \
+  KERNEL<TYPE, KernelParamsDynamic>                                                                     \
+      <<<static_cast<unsigned int>(num_blocks), block_dim, static_cast<unsigned int>(SHMEM), stream>>>( \
+          input.data_ptr<TYPE>(),                                                                       \
+          bias.data_ptr<TYPE>(),                                                                        \
+          output.data_ptr<float>(),                                                                     \
+          indices.data_ptr<int32_t>(),                                                                  \
+          num_rows,                                                                                     \
+          topk_group,                                                                                   \
+          topk,                                                                                         \
+          num_fused_shared_experts,                                                                     \
+          routed_scaling_factor,                                                                        \
+          params)
 
 //------------------------------------------------------------------------------
 // Dynamic Kernel Version (parameters computed at runtime)
@@ -761,7 +773,7 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t num_fused_shared_experts,
     double routed_scaling_factor) {
   int64_t num_rows = input.size(0);
-  int32_t num_experts = input.size(1);
+  int32_t num_experts = static_cast<int32_t>(input.size(1));
   auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
   auto output = torch::empty({num_rows, topk}, options);
   auto indices = torch::empty({num_rows, topk}, options.dtype(torch::kInt32));
@@ -794,7 +806,7 @@ std::vector<at::Tensor> moe_fused_gate(
       " / ",
       num_expert_group);
 
-  int computed_vpt = num_experts / num_expert_group;
+  int computed_vpt = static_cast<int>(num_experts / num_expert_group);
   // Check 3: Ensure that num_experts/num_expert_group does not exceed MAX_VPT=512. Maximum VPT indicate max value per
   // threads we can process.
   TORCH_CHECK(
@@ -888,9 +900,9 @@ std::vector<at::Tensor> moe_fused_gate(
     KernelParamsDynamic params;
     params.NUM_EXPERTS = num_experts;
     params.VPT = computed_vpt;
-    params.THREADS_PER_ROW = num_expert_group;
+    params.THREADS_PER_ROW = static_cast<int>(num_expert_group);
     params.WARPS_PER_CTA = WARPS_PER_CTA;
-    params.ROWS_PER_WARP = rows_per_warp;
+    params.ROWS_PER_WARP = static_cast<int>(rows_per_warp);
     params.ROWS_PER_CTA = params.WARPS_PER_CTA * params.ROWS_PER_WARP;
 
     // Select kernel type and shared memory size according to VPT and dtype
