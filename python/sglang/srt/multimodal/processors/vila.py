@@ -34,8 +34,10 @@ class VILAMultimodalProcessor(BaseMultimodalProcessor):
         hf_config: PretrainedConfig,
         server_args: ServerArgs,
         _processor: VILAProcessor,
+        *args,
+        **kwargs,
     ) -> None:
-        super().__init__(hf_config, server_args, _processor)
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self._processor.tokenizer.image_token,
             image_token_id=hf_config.image_token_id,
@@ -47,13 +49,11 @@ class VILAMultimodalProcessor(BaseMultimodalProcessor):
         image_data: Optional[ImageDataInputItem | List[ImageDataInputItem]],
         input_text: str | List[int],
         request_obj: GenerateReqInput | EmbeddingReqInput,
-        max_req_input_len: int,
         **kwargs,
     ) -> Optional[Dict[str, Any]]:
         base_output = self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=self.mm_tokens,
-            max_req_input_len=max_req_input_len,
             image_data=image_data,
         )
 
