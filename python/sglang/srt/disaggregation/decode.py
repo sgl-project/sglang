@@ -694,10 +694,7 @@ class SchedulerDisaggregationDecodeMixin:
                 + len(self.disagg_decode_prealloc_queue.queue)
                 == 0
             ):
-                # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
 
@@ -771,10 +768,7 @@ class SchedulerDisaggregationDecodeMixin:
                 + len(self.disagg_decode_prealloc_queue.queue)
                 == 0
             ):
-                # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
             self.last_batch_in_queue = last_batch_in_queue
