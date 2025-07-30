@@ -162,6 +162,27 @@ impl BasicWorker {
         self.metadata.health_config = config;
         self
     }
+
+    pub fn normalised_url(&self) -> WorkerResult<&str> {
+        if self.url().contains("@") {
+            // Need to extract the URL from "http://host:port@dp_rank"
+            let parts: Vec<&str> = self.url().split('@').collect();
+            if parts.len() != 2 {
+                return Err(WorkerError::InvalidUrl {
+                    url: self.url().to_string(),
+                });
+            }
+            // Ensure the second part (the dp_rank) can be parsed as an integer
+            match parts[1].parse::<usize>() {
+                Ok(_) => Ok(parts[0]),
+                Err(_) => Err(WorkerError::InvalidUrl {
+                    url: self.url().to_string(),
+                }),
+            }
+        } else {
+            Ok(self.url())
+        }
+    }
 }
 
 #[async_trait]
@@ -186,7 +207,8 @@ impl Worker for BasicWorker {
         use std::time::Duration;
 
         // Perform actual HTTP health check
-        let health_url = format!("{}{}", self.url(), self.metadata.health_config.endpoint);
+        let url = self.normalised_url()?;
+        let health_url = format!("{}{}", url, self.metadata.health_config.endpoint);
         let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
 
         // Use the shared client with a custom timeout for this request
@@ -203,7 +225,7 @@ impl Worker for BasicWorker {
                 } else {
                     self.set_healthy(false);
                     Err(WorkerError::HealthCheckFailed {
-                        url: self.url().to_string(),
+                        url: url.to_string(),
                         reason: format!("Health check returned status: {}", response.status()),
                     })
                 }
@@ -211,7 +233,7 @@ impl Worker for BasicWorker {
             Err(e) => {
                 self.set_healthy(false);
                 Err(WorkerError::HealthCheckFailed {
-                    url: self.url().to_string(),
+                    url: url.to_string(),
                     reason: format!("Health check request failed: {}", e),
                 })
             }

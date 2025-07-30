@@ -31,6 +31,10 @@ class Router:
             routing. Default: 60
         max_payload_size: Maximum payload size in bytes. Default: 256MB
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
+        dp_aware: Enable data parallelism aware schedule. Default: False
+        api_key: The api key used for the authorization with the worker.
+            Useful when the dp aware scheduling strategy is enabled.
+            Default: None
         log_dir: Directory to store log files. If None, logs are only output to console. Default: None
         log_level: Logging level. Options: 'debug', 'info', 'warning', 'error', 'critical'.
         service_discovery: Enable Kubernetes service discovery. When enabled, the router will
@@ -73,6 +77,8 @@ class Router:
         eviction_interval_secs: int = 60,
         max_tree_size: int = 2**24,
         max_payload_size: int = 256 * 1024 * 1024,  # 256MB
+        dp_aware: bool = False,
+        api_key: Optional[str] = None,
         log_dir: Optional[str] = None,
         log_level: Optional[str] = None,
         service_discovery: bool = False,
@@ -110,6 +116,8 @@ class Router:
             eviction_interval_secs=eviction_interval_secs,
             max_tree_size=max_tree_size,
             max_payload_size=max_payload_size,
+            dp_aware=dp_aware,
+            api_key=api_key,
             log_dir=log_dir,
             log_level=log_level,
             service_discovery=service_discovery,

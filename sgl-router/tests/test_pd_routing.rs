@@ -169,6 +169,8 @@ mod test_pd_routing {
                 request_timeout_secs: 60,
                 worker_startup_timeout_secs: 10,
                 worker_startup_check_interval_secs: 1,
+                dp_aware: false,
+                api_key: None,
                 discovery: None,
                 metrics: None,
                 log_dir: None,

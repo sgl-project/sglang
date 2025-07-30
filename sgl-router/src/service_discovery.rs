@@ -581,7 +581,7 @@ mod tests {
         use crate::routers::router::Router;
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Random);
-        let router = Router::new(vec![], policy, 5, 1).unwrap();
+        let router = Router::new(vec![], policy, 5, 1, false, None).unwrap();
         Arc::new(router) as Arc<dyn RouterTrait>
     }
 

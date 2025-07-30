@@ -16,6 +16,8 @@ pub fn create_test_config(worker_urls: Vec<String>) -> RouterConfig {
         request_timeout_secs: 600,
         worker_startup_timeout_secs: 300,
         worker_startup_check_interval_secs: 10,
+        dp_aware: false,
+        api_key: None,
         discovery: None,
         metrics: None,
         log_dir: None,
@@ -37,6 +39,8 @@ pub fn create_test_config_no_workers() -> RouterConfig {
         request_timeout_secs: 600,
         worker_startup_timeout_secs: 0, // No wait
         worker_startup_check_interval_secs: 10,
+        dp_aware: false,
+        api_key: None,
         discovery: None,
         metrics: None,
         log_dir: None,
