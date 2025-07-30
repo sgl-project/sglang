@@ -2187,6 +2187,9 @@ class Scheduler(
             req = self.waiting_queue.pop(i)
             self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
             logger.debug(f"Abort queued request. {req.rid=}")
+            # in decode engine, the request has been granted memory, so we need to free it.
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                self.tree_cache.cache_finished_request(req)
 
         # Delete the requests in the grammar queue
         for req in self.grammar_queue:
