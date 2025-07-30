@@ -36,6 +36,8 @@ impl TestContext {
             worker_startup_timeout_secs: 1,
             worker_startup_check_interval_secs: 1,
             discovery: None,
+            dp_aware: false,
+            api_key: None,
             metrics: None,
             log_dir: None,
             log_level: None,
@@ -150,7 +152,7 @@ mod health_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -203,7 +205,7 @@ mod health_tests {
                 fail_rate: 0.0,
             },
         ])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -235,7 +237,7 @@ mod health_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -271,7 +273,7 @@ mod generation_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -312,7 +314,7 @@ mod generation_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -348,7 +350,7 @@ mod generation_tests {
             response_delay_ms: 0,
             fail_rate: 1.0, // Always fail
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -379,7 +381,7 @@ mod generation_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -424,7 +426,7 @@ mod model_info_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -462,7 +464,7 @@ mod model_info_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -507,7 +509,7 @@ mod model_info_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -631,7 +633,7 @@ mod model_info_tests {
                 fail_rate: 0.0,
             },
         ])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -668,7 +670,7 @@ mod model_info_tests {
             response_delay_ms: 0,
             fail_rate: 1.0, // Always fail
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -750,7 +752,7 @@ mod worker_management_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -929,7 +931,7 @@ mod router_policy_tests {
                 fail_rate: 0.0,
             },
         ])
-            .await;
+        .await;
 
         // Send multiple requests and verify they succeed
         let app = ctx.create_app().await;
@@ -963,7 +965,7 @@ mod router_policy_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let _payload = json!({
             "text": "Test selection",
@@ -992,7 +994,7 @@ mod error_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -1031,7 +1033,7 @@ mod error_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -1095,7 +1097,7 @@ mod error_tests {
                 fail_rate: 0.0,
             }],
         )
-            .await;
+        .await;
 
         // Note: The server would have payload size middleware configured
         // but we cannot test it directly through the test app
@@ -1113,7 +1115,7 @@ mod error_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -1151,7 +1153,7 @@ mod error_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -1184,7 +1186,7 @@ mod error_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -1222,7 +1224,7 @@ mod cache_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -1268,7 +1270,7 @@ mod cache_tests {
                 fail_rate: 0.0,
             },
         ])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -1339,7 +1341,7 @@ mod load_balancing_tests {
                 fail_rate: 0.0,
             },
         ])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -1459,7 +1461,7 @@ mod request_id_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }])
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 
@@ -1591,7 +1593,7 @@ mod request_id_tests {
                 fail_rate: 0.0,
             }],
         )
-            .await;
+        .await;
 
         let app = ctx.create_app().await;
 

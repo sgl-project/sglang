@@ -481,7 +481,11 @@ impl Router {
                 Ok(tup) => tup,
                 Err(e) => {
                     error!("Failed to extract dp_rank: {}", e);
-                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to extract dp_rank: {}", e)).into_response();
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to extract dp_rank: {}", e),
+                    )
+                        .into_response();
                 }
             };
 
@@ -489,7 +493,11 @@ impl Router {
             let mut json_val = match serde_json::to_value(typed_req) {
                 Ok(j) => j,
                 Err(e) => {
-                    return (StatusCode::BAD_REQUEST, format!("Convert into serde_json::Value failed: {}", e)).into_response();
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("Convert into serde_json::Value failed: {}", e),
+                    )
+                        .into_response();
                 }
             };
 
@@ -504,7 +512,11 @@ impl Router {
                     serde_json::to_string(&json_val).unwrap_or(String::from("ERR"))
                 );
             } else {
-                return (StatusCode::BAD_REQUEST, "Failed to insert the data_parallel_rank field into the request body").into_response();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Failed to insert the data_parallel_rank field into the request body",
+                )
+                    .into_response();
             }
 
             client
@@ -837,28 +849,6 @@ impl Router {
         }
     }
 
-    /// Remove a specific failed worker; for internal usage
-    fn remove_failed_worker(&self, worker_url: &str) {
-        let mut workers_guard = self.workers.write().unwrap();
-        if let Some(index) = workers_guard.iter().position(|w| w.url() == worker_url) {
-            workers_guard.remove(index);
-            info!("Removed failed worker: {}", worker_url);
-            RouterMetrics::set_active_workers(workers_guard.len());
-        } else {
-            warn!("Worker {} not found, skipping removal", worker_url);
-            return;
-        }
-
-        // If cache aware policy, remove the worker from the tree
-        if let Some(cache_aware) = self
-            .policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            cache_aware.remove_worker(worker_url);
-        }
-    }
-
     async fn get_worker_load(&self, client: &reqwest::Client, worker_url: &str) -> Option<isize> {
         let worker_url = if self.dp_aware {
             // Need to extract the URL from "http://host:port@dp_rank"
@@ -1099,7 +1089,11 @@ impl RouterTrait for Router {
                     Ok(tup) => tup,
                     Err(e) => {
                         error!("Failed to extract dp_rank: {}", e);
-                        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to extract dp_rank: {}", e)).into_response();
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to extract dp_rank: {}", e),
+                        )
+                            .into_response();
                     }
                 };
                 worker_url_prefix
