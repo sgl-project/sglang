@@ -645,10 +645,14 @@ class EAGLEWorker(TpModelWorker):
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             if self.log_cold_token_prob:
                 cold_probs = probs[:, self.cold_token_mask]
-                logger.info(f"Sum of cold token probs in draft_forward: {torch.sum(cold_probs, dim=-1)}")
+                logger.info(f"Sum of cold token probs for each batched req in draft_forward: {torch.sum(cold_probs, dim=-1)}")
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            if self.hot_token_id is not None and not self.log_cold_token_prob:
-                topk_index = self.hot_token_id[topk_index]
+            if self.hot_token_id is not None:
+                if not self.log_cold_token_prob:
+                    topk_index = self.hot_token_id[topk_index]
+                else:
+                    # When logging, we don't prune, so we should not remap indices
+                    pass
             hidden_states = logits_output.hidden_states
 
         return score_list, token_list, parents_list
@@ -926,7 +930,7 @@ class EAGLEWorker(TpModelWorker):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         if self.log_cold_token_prob:
             cold_probs = probs[:, self.cold_token_mask]
-            logger.info(f"Sum of cold token probs in capture_for_decode: {torch.sum(cold_probs, dim=-1)}")
+            logger.info(f"Sum of cold token probs for each batched req in capture_for_decode: {torch.sum(cold_probs, dim=-1)}")
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
 
