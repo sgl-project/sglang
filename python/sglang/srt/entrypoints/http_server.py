@@ -38,7 +38,7 @@ import orjson
 import requests
 import uvicorn
 import uvloop
-from fastapi import Depends, FastAPI, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -174,6 +174,18 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(HTTPException)
+async def validation_exception_handler(request: Request, exc: HTTPException):
+    """Enrich HTTP exception with status code and other details"""
+    error = ErrorResponse(
+        object="error",
+        message=exc.detail,
+        type=str(exc.status_code),
+        code=exc.status_code,
+    )
+    return ORJSONResponse(content=error.model_dump(), status_code=exc.status_code)
+
+
 # Custom exception handlers to change validation error status codes
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -226,6 +238,9 @@ async def health() -> Response:
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """Check the health of the inference server by generating one token."""
+    if _global_state.tokenizer_manager.gracefully_exit:
+        logger.info("Health check request received during shutdown. Returning 503.")
+        return Response(status_code=503)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     rid = f"HEALTH_CHECK_{time.time()}"
@@ -248,9 +263,14 @@ async def health_generate(request: Request) -> Response:
         async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
             break
 
-    tic = time.perf_counter()
+    # This request is a special request.
+    # If the server already has something running, this request will be ignored, so it creates zero overhead.
+    # If the server is not running, this request will be run, so we know whether the server is healthy.
     task = asyncio.create_task(gen())
-    while time.perf_counter() < tic + HEALTH_CHECK_TIMEOUT:
+
+    # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
+    tic = time.time()
+    while time.time() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
