@@ -578,6 +578,7 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
+    # In EP, expert_ids for filtered experts are -1. We have num_experts + 1 ids in total.
     cumsum_buffer = torch.empty(
         (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
     )
