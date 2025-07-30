@@ -9,7 +9,6 @@ from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
-    StructureInfo,
     ToolCallItem,
     _GetInfoFunc,
 )
@@ -104,9 +103,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     self._buf = ""
                     break
                     
-                if s > 0:
-                    normal += self._buf[:s]
-                    self._buf = self._buf[s:]
+               
+                normal += self._buf[:s]
+                self._buf = self._buf[s:]
                     
                 self._in_tool_call = True
                 self._function_name_sent = False
@@ -169,35 +168,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
             
             # Parse parameters incrementally
             if self._function_name_sent:
-                # Only look for complete parameter patterns first
-                param_matches = list(re.finditer(r'<parameter=([^>]+)>(.*?)</parameter>', self._buf, re.DOTALL))
-                
-                new_params = {}
-                for match in param_matches:
-                    param_name = match.group(1).strip()
-                    param_value = match.group(2)
-                    new_params[param_name] = _safe_val(param_value)
-                
-                # Calculate parameter diff to stream
-                if new_params != self._current_parameters:
-                    current_args_json = json.dumps(new_params, ensure_ascii=False)
-                    
-                    # Calculate what to send based on what we've already streamed
-                    sent_length = len(self.streamed_args_for_tool[self.current_tool_id])
-                    
-                    if len(current_args_json) > sent_length:
-                        argument_diff = current_args_json[sent_length:]
-                        
-                        calls.append(ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=None,
-                            parameters=argument_diff,
-                        ))
-                        
-                        self.streamed_args_for_tool[self.current_tool_id] += argument_diff
-                    
-                    self._current_parameters = new_params
-                    self.prev_tool_call_arr[self.current_tool_id]["arguments"] = new_params
+                # Process parameters and get any calls to emit
+                parameter_calls = self._parse_and_stream_parameters(self._buf)
+                calls.extend(parameter_calls)
                 
                 # Check if tool call is complete
                 if self.tool_call_end_token in self._buf:
@@ -205,25 +178,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     
                     # Process any remaining complete parameters before the end token
                     before_end = self._buf[:end_pos]
-                    final_matches = list(re.finditer(r'<parameter=([^>]+)>(.*?)</parameter>', before_end, re.DOTALL))
-                    
-                    final_params = {}
-                    for match in final_matches:
-                        param_name = match.group(1).strip()
-                        param_value = match.group(2)
-                        final_params[param_name] = _safe_val(param_value)
-                    
-                    if final_params != self._current_parameters:
-                        final_args_json = json.dumps(final_params, ensure_ascii=False)
-                        sent_length = len(self.streamed_args_for_tool[self.current_tool_id])
-                        
-                        if len(final_args_json) > sent_length:
-                            final_diff = final_args_json[sent_length:]
-                            calls.append(ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=None,
-                                parameters=final_diff,
-                            ))
+                    final_calls = self._parse_and_stream_parameters(before_end)
+                    calls.extend(final_calls)
                     
                     # Complete the tool call
                     self._buf = self._buf[end_pos + len(self.tool_call_end_token):]
@@ -235,6 +191,60 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     break
         
         return StreamingParseResult(normal_text=normal, calls=calls)
+
+    def _parse_and_stream_parameters(self, text_to_parse: str) -> List[ToolCallItem]:
+        """
+        Parse complete parameter blocks from text and return any tool call items to emit.
+        
+        This method:
+        1. Finds all complete <parameter> blocks  
+        2. Parses them into a dictionary
+        3. Compares with current parameters and generates diff if needed
+        4. Updates internal state
+        
+        Args:
+            text_to_parse: The text to search for parameter blocks
+            
+        Returns:
+            List of ToolCallItem objects to emit (may be empty)
+        """
+        calls: List[ToolCallItem] = []
+        
+        # Find all complete parameter patterns
+        param_matches = list(re.finditer(r'<parameter=([^>]+)>(.*?)</parameter>', text_to_parse, re.DOTALL))
+        
+        # Build new parameters dictionary
+        new_params = {}
+        for match in param_matches:
+            param_name = match.group(1).strip()
+            param_value = match.group(2)
+            new_params[param_name] = _safe_val(param_value)
+        
+        # Calculate parameter diff to stream
+        if new_params != self._current_parameters:
+            current_args_json = json.dumps(new_params, ensure_ascii=False)
+            
+            # Calculate what to send based on what we've already streamed
+            sent_length = len(self.streamed_args_for_tool[self.current_tool_id])
+            
+            if len(current_args_json) > sent_length:
+                argument_diff = current_args_json[sent_length:]
+                
+                calls.append(ToolCallItem(
+                    tool_index=self.current_tool_id,
+                    name=None,
+                    parameters=argument_diff,
+                ))
+                
+                self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+            
+            # Update current state
+            self._current_parameters = new_params
+            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = new_params
+        
+        return calls
+
+
 
     def _reset_streaming_state(self):
         """Reset streaming state for the next tool call"""
