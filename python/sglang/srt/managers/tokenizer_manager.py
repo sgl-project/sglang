@@ -401,9 +401,6 @@ class TokenizerManager:
         self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.health_check_communitcator = _Communicator(
-            self.send_to_scheduler, 1
-        )
         self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -519,19 +516,6 @@ class TokenizerManager:
             else:
                 # If it's a single value, add worker_id prefix
                 obj.rid = f"{self.worker_id}_{obj.rid}"
-        if isinstance(obj, GenerateReqInput):
-            return_hidden_states = obj.return_hidden_states
-            has_return_hidden_states = return_hidden_states == True or (
-                isinstance(return_hidden_states, list) and any(return_hidden_states)
-            )
-            if (
-                not self.server_args.enable_return_hidden_states
-                and has_return_hidden_states
-            ):
-                raise ValueError(
-                    "return_hidden_states=True requires the server to be started "
-                    "with --enable-return-hidden-states (ServerArgs.enable_return_hidden_states)."
-                )
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
