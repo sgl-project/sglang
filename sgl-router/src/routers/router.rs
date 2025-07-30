@@ -246,7 +246,24 @@ impl Router {
     }
 
     pub async fn send_health_check(&self, client: &Client, worker_url: &str) -> Response {
-        let request_builder = client.get(format!("{}/health", worker_url));
+        let health_url = if self.dp_aware {
+            // Need to extract the URL from "http://host:port@dp_rank"
+            match Self::extract_dp_rank(worker_url) {
+                Ok((worker_url_prefix, _dp_rank)) => worker_url_prefix,
+                Err(e) => {
+                    error!("Failed to extract dp_rank for health check: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to extract dp_rank: {}", e),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            worker_url
+        };
+
+        let request_builder = client.get(format!("{}/health", health_url));
 
         let response = match request_builder.send().await {
             Ok(res) => {
@@ -257,7 +274,7 @@ impl Router {
                     Ok(body) => (status, body).into_response(),
                     Err(e) => {
                         error!(
-                            worker_url = %worker_url,
+                            worker_url = %health_url,
                             error = %e,
                             "Failed to read health response body"
                         );
@@ -271,13 +288,13 @@ impl Router {
             }
             Err(e) => {
                 error!(
-                    worker_url = %worker_url,
+                    worker_url = %health_url,
                     error = %e,
                     "Failed to send health request to worker"
                 );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to send request to worker {}: {}", worker_url, e),
+                    format!("Failed to send request to worker {}: {}", health_url, e),
                 )
                     .into_response()
             }
