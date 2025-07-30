@@ -812,7 +812,6 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
         elif self.disaggregation_mode == DisaggregationMode.EMBEDDING:
             buffer_size = self.max_running_requests
-            # buffer_size = int(os.environ.get("SGLANG_EMBEDDING_BUFFER_SIZE", "16"))
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
@@ -835,7 +834,6 @@ class Scheduler(
             self.disagg_embedding_inflight_queue: List[Req] = []
         elif self.disaggregation_mode == DisaggregationMode.LANGUAGE:
             buffer_size = self.max_running_requests
-            # buffer_size = int(os.environ.get("SGLANG_LANGUAGE_BUFFER_SIZE", "16"))
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )

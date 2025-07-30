@@ -666,6 +666,9 @@ class SchedulerOutputProcessorMixin:
             ):
                 req.log_time_stats()
 
+            if req.finished():
+                req.clear_mm_resources()
+
         # Send to detokenizer
         if rids:
             if self.model_config.is_multimodal_gen:

@@ -296,6 +296,17 @@ class MultimodalDataItem:
         self.hash = hash((self.hash, other.hash))
         self.set_pad_value()
 
+    def clear_cuda_tensors(self):
+        if self.feature is not None and self.feature.device.type != "cpu":
+            del self.feature
+            self.feature = None
+        if (
+            self.precomputed_embeddings is not None
+            and self.precomputed_embeddings.device.type != "cpu"
+        ):
+            del self.precomputed_embeddings
+            self.precomputed_embeddings = None
+
 
 @dataclasses.dataclass
 class MultimodalInputs:
@@ -779,6 +790,7 @@ class Req:
     def set_finish_with_abort(self, error_msg: str):
         if get_tensor_model_parallel_rank() == 0:
             logger.error(f"{error_msg}, {self.rid=}")
+        self.clear_mm_resources()
         self.multimodal_inputs = None
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
@@ -786,6 +798,15 @@ class Req:
         self.finished_reason = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
+
+    def clear_mm_resources(self):
+        if self.multimodal_inputs and self.multimodal_inputs.mm_items:
+            for mm_item in self.multimodal_inputs.mm_items:
+                if mm_item is None:
+                    continue
+                mm_item.clear_cuda_tensors()
+            del self.multimodal_inputs.mm_items
+        self.multimodal_inputs = None
 
     def __repr__(self):
         return (
