@@ -451,12 +451,14 @@ void transfer_kv_direct(
   auto src_indices_cpu = src_indices.cpu();
   auto dst_indices_cpu = dst_indices.cpu();
 
-  auto num_indices = src_indices_cpu.numel();
+  const auto num_indices = src_indices_cpu.numel();
+  const int64_t num_layers = src_layers.size();
   int64_t* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
   int64_t* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
 
   int64_t start_index = 0;
   int64_t end_index = 0;
+
   for (int64_t i = 0; i < num_indices; ++i) {
     if (i < num_indices - 1) {
       auto src_diff = src_indices_ptr[i + 1] - src_indices_ptr[i];
@@ -472,18 +474,9 @@ void transfer_kv_direct(
     auto src_index = src_indices_ptr[start_index];
     auto dst_index = dst_indices_ptr[start_index];
     auto num_pages = end_index - start_index;
-    if constexpr (AllLayers) {
-      for (const auto j : c10::irange(num_layers)) {
-        transfer_page_direct(src_k.select(0, j), dst_k.select(0, j), src_index, dst_index, num_pages);
-        if constexpr (!IsMLA) {
-          transfer_page_direct(src_v_opt.select(0, j), dst_v_opt.select(0, j), src_index, dst_index, num_pages);
-        }
-      }
-    } else {
-      transfer_page_direct(src_k, dst_k, src_index, dst_index, num_pages);
-      if constexpr (!IsMLA) {
-        transfer_page_direct(src_v_opt, dst_v_opt, src_index, dst_index, num_pages);
-      }
+
+    for (int64_t j = 0; j < num_layers; ++j) {
+      transfer_page_direct(src_layers[j], dst_layers[j], src_index, dst_index, page_size);
     }
     start_index = end_index;
   }
