@@ -36,6 +36,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
     log_info_on_rank0,
+    mxfp_supported,
     set_weight_attrs,
 )
 
@@ -123,6 +124,11 @@ class MxFp4Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "MxFp4Config":
+        if not mxfp_supported():
+            platform = torch.cuda.get_device_properties(0).gcnArchName
+            raise ValueError(
+                f"Current platform {platform} not suppor mxfp4 computation"
+            )
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp4_serialized = (
             True if quant_method else False
