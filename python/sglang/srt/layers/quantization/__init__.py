@@ -47,7 +47,11 @@ from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
-from sglang.srt.layers.quantization.fp4 import MxFp4Config
+from sglang.srt.utils import mxfp_supported
+
+if mxfp_supported:
+    from sglang.srt.layers.quantization.fp4 import MxFp4Config
+
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.gptq import (
     GPTQConfig,

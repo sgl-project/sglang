@@ -127,7 +127,7 @@ class MxFp4Config(QuantizationConfig):
         if not mxfp_supported():
             platform = torch.cuda.get_device_properties(0).gcnArchName
             raise ValueError(
-                f"Current platform {platform} not suppor mxfp4 computation"
+                f"Current platform {platform} not support mxfp4 computation"
             )
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp4_serialized = (
