@@ -58,7 +58,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
 
         def to_tensor(img):
             # Convert PIL Image to numpy array
-            img_array = np.array(img).astype(np.float32) / 255.0
+            img_array = np.asarray(img).astype(np.float32) / 255.0
             # Convert HWC to CHW format
             img_array = img_array.transpose(2, 0, 1)
             return torch.from_numpy(img_array)

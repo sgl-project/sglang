@@ -679,7 +679,7 @@ def decode_video_base64(video_base64):
         img = Image.open(BytesIO(img_bytes))
 
         # Convert PIL Image to a NumPy array
-        frame = np.array(img)
+        frame = np.asarray(img)
 
         # Append the frame to the list of frames
         frames.append(frame)
