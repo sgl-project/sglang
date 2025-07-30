@@ -420,7 +420,6 @@ def fused_moe_kernel(
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
 
-    # TODO(ch-wan): this can be removed
     if off_experts == -1:
         # -----------------------------------------------------------
         # Write back zeros to the output when the expert is not
