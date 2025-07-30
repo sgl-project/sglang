@@ -304,8 +304,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 False,  # inplace # See [Note] inplace should be False in fused_experts.
                 False,  # use_int8_w8a8
                 False,  # use_fp8_w8a16
+                False,  # use_int4_w4a16
                 None,  # w1_scale
                 None,  # w2_scale
+                None,  # w1_zp
+                None,  # w2_zp
                 None,  # block_size
                 None,  # a1_scale
                 None,  # a2_scale

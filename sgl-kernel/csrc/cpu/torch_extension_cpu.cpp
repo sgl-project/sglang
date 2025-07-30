@@ -132,6 +132,24 @@ at::Tensor int8_scaled_mm_with_quant(
     at::ScalarType out_dtype,
     bool is_vnni);
 
+// int4 gemm
+at::Tensor int4_scaled_mm_cpu(
+    at::Tensor& x, at::Tensor& w, at::Tensor& w_zeros, at::Tensor& w_scales, std::optional<at::Tensor> bias);
+
+// weight prepack for int4 weights
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+convert_int4_weight_packed(const at::Tensor& weight, const at::Tensor& scales, const at::Tensor& qzeros);
+
+// quant + igemm
+at::Tensor int4_scaled_mm_cpu_with_quant(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const at::Tensor& weight_scales,
+    const at::Tensor& weight_qzeros,
+    const at::Tensor& compensation,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType output_dtype);
+
 // bmm
 void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
 
@@ -145,8 +163,11 @@ at::Tensor fused_experts_cpu(
     bool inplace,
     bool use_int8_w8a8,
     bool use_fp8_w8a16,
+    bool use_int4_w4a16,
     const std::optional<at::Tensor>& w1_scale,
     const std::optional<at::Tensor>& w2_scale,
+    const std::optional<at::Tensor>& w1_zero,
+    const std::optional<at::Tensor>& w2_zero,
     const std::optional<std::vector<int64_t>> block_size,
     const std::optional<at::Tensor>& a1_scale,
     const std::optional<at::Tensor>& a2_scale,
@@ -304,6 +325,20 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "is_vnni) -> Tensor");
   m.impl("int8_scaled_mm_with_quant", torch::kCPU, &int8_scaled_mm_with_quant);
 
+  // int4 gemm
+  m.def("int4_scaled_mm_cpu(Tensor x, Tensor w, Tensor w_zeros, Tensor w_scales, Tensor? bias) -> Tensor");
+  m.impl("int4_scaled_mm_cpu", torch::kCPU, &int4_scaled_mm_cpu);
+
+  // weight prepack for int4 weights
+  m.def("convert_int4_weight_packed(Tensor weight, Tensor scales, Tensor qzeros) -> (Tensor, Tensor, Tensor, Tensor)");
+  m.impl("convert_int4_weight_packed", torch::kCPU, &convert_int4_weight_packed);
+
+  // quant + igemm
+  m.def(
+      "int4_scaled_mm_cpu_with_quant(Tensor input, Tensor weight, Tensor weight_scales, Tensor weight_qzeros, Tensor "
+      "compensation, Tensor? bias, ScalarType output_dtype) -> Tensor");
+  m.impl("int4_scaled_mm_cpu_with_quant", torch::kCPU, &int4_scaled_mm_cpu_with_quant);
+
   // bmm
   m.def("bmm_cpu(Tensor(a!) out, Tensor mat1, Tensor mat2, bool is_vnni, Tensor? scale) -> ()");
   m.impl("bmm_cpu", torch::kCPU, &bmm_cpu);
@@ -311,7 +346,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // moe
   m.def(
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
-      "inplace, bool use_int8_w8a8, bool use_fp8_w8a16, Tensor? w1_scale, Tensor? w2_scale, int[]? block_size, Tensor? "
+      "inplace, bool use_int8_w8a8, bool use_fp8_w8a16, bool use_int4_w4a16, Tensor? w1_scale, Tensor? w2_scale, "
+      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, Tensor? "
       "a1_scale, Tensor? a2_scale, bool "
       "is_vnni) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);

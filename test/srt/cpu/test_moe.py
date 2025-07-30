@@ -13,6 +13,7 @@ torch.manual_seed(1234)
 from utils import (
     BLOCK_K,
     BLOCK_N,
+    autoawq_to_int4pack,
     factor_for_scale,
     fp8_max,
     fp8_min,
@@ -21,6 +22,7 @@ from utils import (
     scaled_weight,
     torch_naive_fused_moe,
     torch_w8a8_per_column_fused_moe,
+    unpack_and_dequant_awq,
 )
 
 from sglang.test.test_utils import CustomTestCase
@@ -51,6 +53,9 @@ def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
         inplace,
         False,
         False,
+        False,
+        None,
+        None,
         None,
         None,
         None,
@@ -79,6 +84,12 @@ class TestFusedExperts(CustomTestCase):
     K_fp8 = [256]
     E_fp8 = [8]
     topk_fp8 = [4]
+
+    M_int4 = [1]
+    N_int4 = [512]
+    K_int4 = [256]
+    E_int4 = [8]
+    topk_int4 = [4]
 
     def _bf16_moe(self, m, n, k, e, topk, renormalize):
         dtype = torch.bfloat16
@@ -159,8 +170,11 @@ class TestFusedExperts(CustomTestCase):
             inplace,
             True,
             False,
+            False,
             w1_s,
             w2_s,
+            None,
+            None,
             None,
             None,
             None,
@@ -226,8 +240,11 @@ class TestFusedExperts(CustomTestCase):
             False,
             False,
             True,
+            False,
             w1s,
             w2s,
+            None,
+            None,
             [BLOCK_N, BLOCK_K],
             None,
             None,
@@ -253,6 +270,108 @@ class TestFusedExperts(CustomTestCase):
                 topk=params[4],
             ):
                 self._fp8_moe(*params)
+
+    def _int4_moe(self, M, N, K, E, topk, group_size=128):
+        dtype = torch.bfloat16
+
+        a = torch.rand(M, K, dtype=dtype) / math.sqrt(K)
+
+        awq_w13_weight = torch.randint(-127, 128, (E, K, 2 * N // 8)).to(torch.int)
+        awq_w13_zero = torch.randint(0, 10, (E, K // group_size, 2 * N // 8)).to(
+            torch.int
+        )
+        awq_w13_scales = torch.rand(E, int(K // group_size), 2 * N).to(torch.bfloat16)
+
+        awq_w2_weight = torch.randint(-127, 128, (E, N, K // 8)).to(torch.int)
+        awq_w2_zero = torch.randint(0, 10, (E, N // group_size, K // 8)).to(torch.int)
+        awq_w2_scales = torch.rand(E, int(N // group_size), K).to(torch.bfloat16)
+        bf16_w13_weight = []
+        bf16_w2_weight = []
+        for i in range(E):
+            bf16_w13_weight_i, _ = unpack_and_dequant_awq(
+                awq_w13_weight[i], awq_w13_zero[i], awq_w13_scales[i], 4, 128
+            )
+            bf16_w2_weight_i, _ = unpack_and_dequant_awq(
+                awq_w2_weight[i], awq_w2_zero[i], awq_w2_scales[i], 4, 128
+            )
+            bf16_w13_weight.append(bf16_w13_weight_i)
+            bf16_w2_weight.append(bf16_w2_weight_i)
+        bf16_w13_weight = torch.stack(bf16_w13_weight).detach()
+        bf16_w2_weight = torch.stack(bf16_w2_weight).detach()
+
+        score = torch.rand((M, E), dtype=dtype)
+
+        ref_out = torch_naive_fused_moe(
+            a, bf16_w13_weight, bf16_w2_weight, score, topk, False
+        )
+        score = torch.softmax(score, dim=-1, dtype=torch.float32)
+        topk_weight, topk_ids = torch.topk(score, topk)
+        awq_w13_weight_pack = []
+        awq_w13_zero_pack = []
+        awq_w13_scales_pack = []
+        awq_w2_weight_pack = []
+        awq_w2_zero_pack = []
+        awq_w2_scales_pack = []
+        for i in range(E):
+            packed_weight_13_i, packed_zero_13_i, packed_scales_13_i = (
+                autoawq_to_int4pack(
+                    awq_w13_weight[i], awq_w13_zero[i], awq_w13_scales[i], False
+                )
+            )
+            awq_w13_weight_pack.append(packed_weight_13_i)
+            awq_w13_zero_pack.append(packed_zero_13_i)
+            awq_w13_scales_pack.append(packed_scales_13_i)
+            packed_weight_2_i, packed_zero_2_i, packed_scales_2_i = autoawq_to_int4pack(
+                awq_w2_weight[i], awq_w2_zero[i], awq_w2_scales[i], False
+            )
+            awq_w2_weight_pack.append(packed_weight_2_i)
+            awq_w2_zero_pack.append(packed_zero_2_i)
+            awq_w2_scales_pack.append(packed_scales_2_i)
+        awq_w13_weight_pack = torch.stack(awq_w13_weight_pack).detach()
+        awq_w13_zero_pack = torch.stack(awq_w13_zero_pack).detach()
+        awq_w13_scales_pack = torch.stack(awq_w13_scales_pack).detach()
+        awq_w2_weight_pack = torch.stack(awq_w2_weight_pack).detach()
+        awq_w2_zero_pack = torch.stack(awq_w2_zero_pack).detach()
+        awq_w2_scales_pack = torch.stack(awq_w2_scales_pack).detach()
+        out = kernel.fused_experts_cpu(
+            a,
+            awq_w13_weight_pack,
+            awq_w2_weight_pack,
+            topk_weight,
+            topk_ids.to(torch.int32),
+            False,
+            False,
+            False,
+            True,
+            awq_w13_scales_pack,
+            awq_w2_scales_pack,
+            awq_w13_zero_pack,
+            awq_w2_zero_pack,
+            None,
+            None,
+            None,
+            True,
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
+
+    def test_int4_moe(self):
+        for params in itertools.product(
+            self.M_int4,
+            self.N_int4,
+            self.K_int4,
+            self.E_int4,
+            self.topk_int4,
+        ):
+            with self.subTest(
+                M=params[0],
+                N=params[1],
+                K=params[2],
+                E=params[3],
+                topk=params[4],
+            ):
+                self._int4_moe(*params)
 
 
 if __name__ == "__main__":

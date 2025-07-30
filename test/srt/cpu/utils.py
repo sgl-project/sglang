@@ -252,3 +252,147 @@ def make_non_contiguous(x: torch.Tensor) -> torch.Tensor:
     """
     last_dim = x.shape[-1]
     return x[..., : last_dim // 2] if x.is_contiguous() else x
+
+
+def autoawq_to_int4pack(
+    qweight: torch.Tensor,
+    qzeros: torch.Tensor,
+    scales: torch.Tensor,
+    SGLANG_USE_CPU_INT4_W4A8: bool,
+):
+    """Convert AutoAWQ weight format to sgl-kernel's CPU int4
+    Args:
+        qweight: (*, K, N / 8), int32
+        qzeros: (*, K / group_size, N / 8), int32
+        scales: (*, K / group_size, N), bfloat16
+    """
+    # unpack from AutoAWQ format
+    # https://github.com/casper-hansen/AutoAWQ/blob/23d584c2/awq/modules/triton/gemm.py#L73-L86
+    bitshifts = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], dtype=torch.int32) * 4
+    qweight = (qweight.unsqueeze(-1) >> bitshifts) & 0xF
+    qweight = qweight.flatten(-2).transpose(-1, -2).to(torch.uint8)
+
+    qzeros = (qzeros.unsqueeze(-1) >> bitshifts) & 0xF
+    qzeros = qzeros.flatten(-2).to(torch.uint8)
+    if SGLANG_USE_CPU_INT4_W4A8:
+        qzeros = qzeros.T.contiguous()
+        scales = scales.T.contiguous()
+        qweight, scales, qzeros, compensation = (
+            torch.ops.sgl_kernel.convert_int4_weight_packed(qweight, scales, qzeros)
+        )
+        return qweight, qzeros, scales, compensation
+    else:
+        # TODO: unify below in convert_int4_weight_packed
+        # convert to VNNI format: (*, N/BLOCK_N, K/2, BLOCK_N, 2)
+        BLOCK_N = 32  # must match what's used in the kernel
+        *dims, N, K = qweight.shape
+        qweight = qweight.reshape(*dims, N // BLOCK_N, BLOCK_N, K // 2, 2)
+        qweight = qweight.transpose(-3, -2)
+        # bit packing
+        BIT_COUNT = 32
+        qweight = qweight.reshape(-1, BIT_COUNT * 2)
+        qweight = (qweight[:, BIT_COUNT:] << 4) | qweight[:, :BIT_COUNT]
+        qweight = qweight.reshape(*dims, N, K // 2)
+        return qweight, qzeros, scales
+
+
+def awq_reverse_reorder_int_tensor(int_tensor, bits: int):
+    assert bits == 4
+
+    int_tensor = int_tensor.T.contiguous()
+    compress_ratio = 32 // bits
+    assert int_tensor.shape[-1] % compress_ratio == 0
+
+    order_map = [0, 2, 4, 6, 1, 3, 5, 7]
+    order_tensor = torch.tensor(
+        order_map, dtype=torch.int32, device=int_tensor.device
+    ).reshape(1, -1)
+    order_tensor = order_tensor.repeat(int_tensor.shape[1] // compress_ratio, 1)
+    order_tensor = order_tensor + torch.arange(
+        0,
+        int_tensor.shape[1],
+        compress_ratio,
+        dtype=torch.int32,
+        device=int_tensor.device,
+    ).reshape(-1, 1)
+    order_tensor = order_tensor.reshape(-1)
+
+    reverse_order_tensor = torch.arange(order_tensor.shape[0])[order_tensor]
+    reverse_order_tensor = reverse_order_tensor[order_tensor]
+    int_tensor = int_tensor[:, reverse_order_tensor]
+    return int_tensor
+
+
+def unpack_and_dequant_awq(
+    awq_qweight: torch.Tensor,
+    awq_qzeros: torch.Tensor,
+    awq_scales: torch.Tensor,
+    bits: int,
+    group_size: int,
+):
+    """
+    Args:
+        awq_qweight (`torch.LongTensor`):
+            Expected shape: (in_features, out_features // (32 // bits))
+        awq_qzeros (`torch.LongTensor`):
+            Expected shape: (in_features // group_size, out_features // (32 // bits))
+        awq_scales (`torch.LongTensor`):
+            Expected shape: (in_features // group_size, out_features)
+
+    Returns:
+        fp16_weight (`torch.LongTensor`):
+            With shape (in_features, out_features).
+        zeros (`torch.LongTensor`):
+            With shape (in_features // group_size, out_features).
+    """
+    assert bits == 4
+
+    qzeros = awq_qzeros
+    qweight = awq_qweight
+    qweight = qweight.T.contiguous()
+
+    scales = awq_scales
+    scales = scales.reshape(-1, 1, scales.shape[-1])
+
+    infeatures = awq_qweight.shape[0]
+
+    wf = torch.tensor(
+        list(range(0, 32, bits)), dtype=torch.int32, device=qzeros.device
+    ).unsqueeze(0)
+    zeros = torch.bitwise_right_shift(torch.unsqueeze(qzeros, 2), wf.unsqueeze(0)).to(
+        torch.int16 if bits == 8 else torch.int8
+    )
+
+    torch.bitwise_and(zeros, (2**bits) - 1, out=zeros)
+
+    zeros = zeros.reshape(-1, 1, zeros.shape[1] * zeros.shape[2])
+
+    weight = torch.bitwise_right_shift(
+        torch.unsqueeze(qweight, 1), wf.unsqueeze(-1)
+    ).to(torch.int16 if bits == 8 else torch.int8)
+    torch.bitwise_and(weight, (2**bits) - 1, out=weight)
+    weight = weight.reshape(-1, group_size, weight.shape[2])
+
+    weight = weight.view(-1, weight.shape[-1])
+    zeros = zeros.view(-1, zeros.shape[-1])
+
+    zeros = zeros.T.contiguous()
+    zeros = awq_reverse_reorder_int_tensor(zeros, bits)
+    weight = awq_reverse_reorder_int_tensor(weight, bits)
+
+    # Dequantize weights.
+    scales = awq_scales
+    zeros = zeros.contiguous()
+    scale_zeros = zeros * scales
+
+    g_idx = torch.tensor(
+        [i // group_size for i in range(infeatures)], dtype=torch.int32
+    )
+    scale_mat = scales[g_idx]
+    scale_zeros_mat = scale_zeros[g_idx].to(torch.bfloat16)
+
+    qdq_weight_T = weight * scale_mat - scale_zeros_mat.to(torch.bfloat16)
+
+    fp16_weight = qdq_weight_T.T
+
+    return fp16_weight, zeros
