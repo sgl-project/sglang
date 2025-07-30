@@ -92,7 +92,7 @@ class ArceeMLP(nn.Module):
                 "Arcee model in SGLang only supports 'relu2'."
             )
         # The activation function is relu(x)^2
-        self.act_fn = get_act_fn(config.hidden_act)
+        self.act_fn = get_act_fn("relu2")
 
     def forward(self, x, forward_batch=None):
         x, _ = self.up_proj(x)
