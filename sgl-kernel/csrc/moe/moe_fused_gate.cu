@@ -675,6 +675,20 @@ __global__ void moe_fused_gate_kernel(
     dispatched = true;                                                                                   \
   } while (0)
 
+// Helper macro for dynamic kernel launch (small/large VPT, all types)
+#define LAUNCH_DYNAMIC_MOE_KERNEL(KERNEL, TYPE, SHMEM)                          \
+  KERNEL<TYPE, KernelParamsDynamic> < <<num_blocks, block_dim, SHMEM, stream>>( \
+                                          input.data_ptr<TYPE>(),               \
+                                          bias.data_ptr<TYPE>(),                \
+                                          output.data_ptr<float>(),             \
+                                          indices.data_ptr<int32_t>(),          \
+                                          num_rows,                             \
+                                          topk_group,                           \
+                                          topk,                                 \
+                                          num_fused_shared_experts,             \
+                                          routed_scaling_factor,                \
+                                          params)
+
 //------------------------------------------------------------------------------
 // Dynamic Kernel Version (parameters computed at runtime)
 //------------------------------------------------------------------------------
@@ -869,7 +883,7 @@ std::vector<at::Tensor> moe_fused_gate(
   }
   if (!dispatched) {
     // Fallback to the dynamic kernel if none of the supported combinations match.
-    // currently only support num_experts / num_expert_group <= 512 for dynamic kernels
+    // Only support num_experts / num_expert_group <= 512 for dynamic kernels.
 
     KernelParamsDynamic params;
     params.NUM_EXPERTS = num_experts;
@@ -879,95 +893,37 @@ std::vector<at::Tensor> moe_fused_gate(
     params.ROWS_PER_WARP = rows_per_warp;
     params.ROWS_PER_CTA = params.WARPS_PER_CTA * params.ROWS_PER_WARP;
 
-    if (computed_vpt <= 32) {
-      // Dynamic branch: VPT <= 32, launch small_vpt kernel
-      if (input.scalar_type() == at::kBFloat16) {
-        moe_fused_gate_kernel_small_vpt<bfloat16_t, KernelParamsDynamic><<<num_blocks, block_dim, 0, stream>>>(
-            input.data_ptr(),
-            bias.data_ptr(),
-            output.data_ptr<float>(),
-            indices.data_ptr<int32_t>(),
-            num_rows,
-            topk_group,
-            topk,
-            num_fused_shared_experts,
-            routed_scaling_factor,
-            params);
-      } else if (input.scalar_type() == at::kHalf) {
-        moe_fused_gate_kernel_small_vpt<float16_t, KernelParamsDynamic><<<num_blocks, block_dim, 0, stream>>>(
-            input.data_ptr(),
-            bias.data_ptr(),
-            output.data_ptr<float>(),
-            indices.data_ptr<int32_t>(),
-            num_rows,
-            topk_group,
-            topk,
-            num_fused_shared_experts,
-            routed_scaling_factor,
-            params);
-      } else if (input.scalar_type() == at::kFloat) {
-        moe_fused_gate_kernel_small_vpt<float32_t, KernelParamsDynamic><<<num_blocks, block_dim, 0, stream>>>(
-            input.data_ptr(),
-            bias.data_ptr(),
-            output.data_ptr<float>(),
-            indices.data_ptr<int32_t>(),
-            num_rows,
-            topk_group,
-            topk,
-            num_fused_shared_experts,
-            routed_scaling_factor,
-            params);
+    // Select kernel type and shared memory size according to VPT and dtype
+    bool is_small_vpt = computed_vpt <= 32;
+    size_t shared_mem_size =
+        is_small_vpt                             ? 0
+        : (input.scalar_type() == at::kBFloat16) ? (2 * WARP_SIZE * 32 * sizeof(bfloat16_t) + sizeof(int))
+        : (input.scalar_type() == at::kHalf)     ? (2 * WARP_SIZE * 32 * sizeof(float16_t) + sizeof(int))
+                                                 : (2 * WARP_SIZE * 32 * sizeof(float32_t) + sizeof(int));
+
+    // Launch the correct kernel for each dtype
+    if (input.scalar_type() == at::kBFloat16) {
+      if (is_small_vpt) {
+        // Dynamic branch: VPT <= 32, launch small_vpt kernel
+        LAUNCH_DYNAMIC_MOE_KERNEL(moe_fused_gate_kernel_small_vpt, bfloat16_t, shared_mem_size);
       } else {
-        TORCH_CHECK(false, "Unsupported data type for moe_fused_gate");
+        // Dynamic branch: VPT > 32, launch large_vpt kernel
+        LAUNCH_DYNAMIC_MOE_KERNEL(moe_fused_gate_kernel_large_vpt, bfloat16_t, shared_mem_size);
+      }
+    } else if (input.scalar_type() == at::kHalf) {
+      if (is_small_vpt) {
+        LAUNCH_DYNAMIC_MOE_KERNEL(moe_fused_gate_kernel_small_vpt, float16_t, shared_mem_size);
+      } else {
+        LAUNCH_DYNAMIC_MOE_KERNEL(moe_fused_gate_kernel_large_vpt, float16_t, shared_mem_size);
+      }
+    } else if (input.scalar_type() == at::kFloat) {
+      if (is_small_vpt) {
+        LAUNCH_DYNAMIC_MOE_KERNEL(moe_fused_gate_kernel_small_vpt, float32_t, shared_mem_size);
+      } else {
+        LAUNCH_DYNAMIC_MOE_KERNEL(moe_fused_gate_kernel_large_vpt, float32_t, shared_mem_size);
       }
     } else {
-      // Dynamic branch: VPT > 32, launch large_vpt kernel
-      size_t shared_mem_size =
-          (input.scalar_type() == at::kBFloat16) ? (2 * WARP_SIZE * 32 * sizeof(bfloat16_t) + sizeof(int))
-          : (input.scalar_type() == at::kHalf)   ? (2 * WARP_SIZE * 32 * sizeof(float16_t) + sizeof(int))
-                                                 : (2 * WARP_SIZE * 32 * sizeof(float32_t) + sizeof(int));
-      if (input.scalar_type() == at::kBFloat16) {
-        moe_fused_gate_kernel_large_vpt<bfloat16_t, KernelParamsDynamic>
-            <<<num_blocks, block_dim, shared_mem_size, stream>>>(
-                input.data_ptr(),
-                bias.data_ptr(),
-                output.data_ptr<float>(),
-                indices.data_ptr<int32_t>(),
-                num_rows,
-                topk_group,
-                topk,
-                num_fused_shared_experts,
-                routed_scaling_factor,
-                params);
-      } else if (input.scalar_type() == at::kHalf) {
-        moe_fused_gate_kernel_large_vpt<float16_t, KernelParamsDynamic>
-            <<<num_blocks, block_dim, shared_mem_size, stream>>>(
-                input.data_ptr(),
-                bias.data_ptr(),
-                output.data_ptr<float>(),
-                indices.data_ptr<int32_t>(),
-                num_rows,
-                topk_group,
-                topk,
-                num_fused_shared_experts,
-                routed_scaling_factor,
-                params);
-      } else if (input.scalar_type() == at::kFloat) {
-        moe_fused_gate_kernel_large_vpt<float32_t, KernelParamsDynamic>
-            <<<num_blocks, block_dim, shared_mem_size, stream>>>(
-                input.data_ptr(),
-                bias.data_ptr(),
-                output.data_ptr<float>(),
-                indices.data_ptr<int32_t>(),
-                num_rows,
-                topk_group,
-                topk,
-                num_fused_shared_experts,
-                routed_scaling_factor,
-                params);
-      } else {
-        TORCH_CHECK(false, "Unsupported data type for moe_fused_gate");
-      }
+      TORCH_CHECK(false, "Unsupported data type for moe_fused_gate");
     }
   }
   return {output, indices};
