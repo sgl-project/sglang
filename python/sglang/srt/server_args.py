@@ -215,6 +215,7 @@ class ServerArgs:
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
+    enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
@@ -1550,6 +1551,11 @@ class ServerArgs:
             "--enable-profile-cuda-graph",
             action="store_true",
             help="Enable profiling of cuda graph capture.",
+        )
+        parser.add_argument(
+            "--enable-cudagraph-gc",
+            action="store_true",
+            help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
         )
         parser.add_argument(
             "--enable-nccl-nvls",
