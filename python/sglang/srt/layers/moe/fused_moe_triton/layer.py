@@ -427,7 +427,7 @@ class FusedMoE(torch.nn.Module):
             shard_id=shard_id,
             expert_id=expert_id,
         )
-    
+
     def _weight_loader_impl(
         self,
         param: torch.nn.Parameter,
