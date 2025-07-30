@@ -640,7 +640,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.9rc1",
+            "0.2.9rc2",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -652,25 +652,19 @@ def _set_envs_and_config(server_args: ServerArgs):
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
-    def sigchld_handler(signum, frame):
-        pid, exitcode = os.waitpid(0, os.WNOHANG)
-        if exitcode != 0:
-            logger.warning(
-                f"Child process unexpectedly failed with {exitcode=}. {pid=}"
+    if True:  # Keep this check for internal code compatibility
+        # Register the signal handler.
+        # The child processes will send SIGQUIT to this process when any error happens
+        # This process then clean up the whole process tree
+        # Note: This sigquit handler is used in the launch phase, and may be replaced by
+        # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
+        def launch_phase_sigquit_handler(signum, frame):
+            logger.error(
+                "Received sigquit from a child process. It usually means the child failed."
             )
+            kill_process_tree(os.getpid())
 
-    signal.signal(signal.SIGCHLD, sigchld_handler)
-
-    # Register the signal handler.
-    # The child processes will send SIGQUIT to this process when any error happens
-    # This process then clean up the whole process tree
-    def sigquit_handler(signum, frame):
-        logger.error(
-            "Received sigquit from a child process. It usually means the child failed."
-        )
-        kill_process_tree(os.getpid())
-
-    signal.signal(signal.SIGQUIT, sigquit_handler)
+        signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
@@ -765,7 +759,9 @@ def _launch_subprocesses(
             # When using `Engine` as a Python API, we don't want to block here.
             return None, None, None
 
-        launch_dummy_health_check_server(server_args.host, server_args.port)
+        launch_dummy_health_check_server(
+            server_args.host, server_args.port, server_args.enable_metrics
+        )
 
         for proc in scheduler_procs:
             proc.join()

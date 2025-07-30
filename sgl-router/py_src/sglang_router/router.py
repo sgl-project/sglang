@@ -31,6 +31,10 @@ class Router:
             routing. Default: 60
         max_payload_size: Maximum payload size in bytes. Default: 256MB
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
+        dp_aware: Enable data parallelism aware schedule. Default: False
+        api_key: The api key used for the authorization with the worker.
+            Useful when the dp aware scheduling strategy is enabled.
+            Default: None
         log_dir: Directory to store log files. If None, logs are only output to console. Default: None
         log_level: Logging level. Options: 'debug', 'info', 'warning', 'error', 'critical'.
         service_discovery: Enable Kubernetes service discovery. When enabled, the router will
@@ -50,6 +54,13 @@ class Router:
         pd_disaggregation: Enable PD (Prefill-Decode) disaggregated mode. Default: False
         prefill_urls: List of (url, bootstrap_port) tuples for prefill servers (PD mode only)
         decode_urls: List of URLs for decode servers (PD mode only)
+        prefill_policy: Specific load balancing policy for prefill nodes (PD mode only).
+            If not specified, uses the main policy. Default: None
+        decode_policy: Specific load balancing policy for decode nodes (PD mode only).
+            If not specified, uses the main policy. Default: None
+        request_id_headers: List of HTTP headers to check for request IDs. If not specified,
+            uses common defaults: ['x-request-id', 'x-correlation-id', 'x-trace-id', 'request-id'].
+            Example: ['x-my-request-id', 'x-custom-trace-id']. Default: None
     """
 
     def __init__(
@@ -66,6 +77,8 @@ class Router:
         eviction_interval_secs: int = 60,
         max_tree_size: int = 2**24,
         max_payload_size: int = 256 * 1024 * 1024,  # 256MB
+        dp_aware: bool = False,
+        api_key: Optional[str] = None,
         log_dir: Optional[str] = None,
         log_level: Optional[str] = None,
         service_discovery: bool = False,
@@ -79,6 +92,9 @@ class Router:
         pd_disaggregation: bool = False,
         prefill_urls: Optional[List[tuple]] = None,
         decode_urls: Optional[List[str]] = None,
+        prefill_policy: Optional[PolicyType] = None,
+        decode_policy: Optional[PolicyType] = None,
+        request_id_headers: Optional[List[str]] = None,
     ):
         if selector is None:
             selector = {}
@@ -100,6 +116,8 @@ class Router:
             eviction_interval_secs=eviction_interval_secs,
             max_tree_size=max_tree_size,
             max_payload_size=max_payload_size,
+            dp_aware=dp_aware,
+            api_key=api_key,
             log_dir=log_dir,
             log_level=log_level,
             service_discovery=service_discovery,
@@ -113,6 +131,9 @@ class Router:
             pd_disaggregation=pd_disaggregation,
             prefill_urls=prefill_urls,
             decode_urls=decode_urls,
+            prefill_policy=prefill_policy,
+            decode_policy=decode_policy,
+            request_id_headers=request_id_headers,
         )
 
     def start(self) -> None:

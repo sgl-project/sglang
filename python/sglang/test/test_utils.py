@@ -1,6 +1,7 @@
 """Common utilities for testing and benchmarking"""
 
 import argparse
+import asyncio
 import copy
 import json
 import logging
@@ -14,9 +15,11 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable, List, Optional, Tuple
+from typing import Awaitable, Callable, List, Optional, Tuple
 
+import aiohttp
 import numpy as np
 import requests
 import torch
@@ -26,6 +29,7 @@ from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+from sglang.lang.interpreter import ProgramState
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
@@ -347,6 +351,7 @@ def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
         help="Device type (auto/cuda/rocm/cpu). Auto will detect available platforms",
     )
     parser.add_argument("--result-file", type=str, default="result.jsonl")
+    parser.add_argument("--raw-result-file", type=str)
     args = parser.parse_args()
 
     return args
@@ -714,6 +719,7 @@ def get_benchmark_args(
     seed: int = 0,
     device="auto",
     pd_separated: bool = False,
+    lora_name=None,
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -741,7 +747,7 @@ def get_benchmark_args(
         extra_request_body=None,
         apply_chat_template=False,
         profile=None,
-        lora_name=None,
+        lora_name=lora_name,
         prompt_suffix="",
         device=device,
         pd_separated=pd_separated,
@@ -764,6 +770,8 @@ def run_bench_serving(
     need_warmup=False,
     seed: int = 0,
     device="auto",
+    background_task: Optional[Callable[[str, asyncio.Event], Awaitable[None]]] = None,
+    lora_name: Optional[str] = None,
 ):
     if device == "auto":
         device = auto_config_device()
@@ -791,14 +799,35 @@ def run_bench_serving(
         disable_ignore_eos=disable_ignore_eos,
         seed=seed,
         device=device,
+        lora_name=lora_name,
     )
 
-    try:
+    async def _run():
         if need_warmup:
             warmup_args = copy.deepcopy(args)
             warmup_args.num_prompts = 16
-            run_benchmark(warmup_args)
-        res = run_benchmark(args)
+            await asyncio.to_thread(run_benchmark, warmup_args)
+
+        start_event = asyncio.Event()
+        stop_event = asyncio.Event()
+        task_handle = (
+            asyncio.create_task(background_task(base_url, start_event, stop_event))
+            if background_task
+            else None
+        )
+
+        try:
+            start_event.set()
+            result = await asyncio.to_thread(run_benchmark, args)
+        finally:
+            if task_handle:
+                stop_event.set()
+                await task_handle
+
+        return result
+
+    try:
+        res = asyncio.run(_run())
     finally:
         kill_process_tree(process.pid)
 
@@ -1275,6 +1304,58 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                                 raise
 
 
+def send_generate_requests(base_url: str, num_requests: int) -> List[str]:
+    """Sends generate request serially and returns status codes. Max concurrency is 1."""
+
+    def generate():
+        prompt = """
+        System: You are a helpful assistant.
+        User: What is the capital of France?
+        Assistant: The capital of France is
+        """
+        response = requests.post(
+            f"{base_url}/generate",
+            json={
+                "text": prompt,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 50,
+                },
+            },
+        )
+        return response.status_code
+
+    return [generate() for _ in range(num_requests)]
+
+
+async def send_concurrent_generate_requests(
+    base_url: str, num_requests: int
+) -> List[str]:
+    """Sends generate request concurrently and returns status codes. Max concurrency is num_requests."""
+
+    async def async_generate():
+        async with aiohttp.ClientSession() as session:
+            prompt = """
+            System: You are a helpful assistant.
+            User: What is the capital of France?
+            Assistant: The capital of France is
+            """
+            async with session.post(
+                f"{base_url}/generate",
+                json={
+                    "text": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 50,
+                    },
+                },
+            ) as response:
+                return response.status
+
+    tasks = [asyncio.create_task(async_generate()) for _ in range(num_requests)]
+    return await asyncio.gather(*tasks)
+
+
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
         max_retry = int(
@@ -1284,3 +1365,35 @@ class CustomTestCase(unittest.TestCase):
             lambda: super(CustomTestCase, self)._callTestMethod(method),
             max_retry=max_retry,
         )
+
+
+def dump_bench_raw_result(
+    path: str,
+    states,
+    preds,
+    labels,
+):
+    if not path:
+        return
+
+    rows = []
+    for i in range(len(states)):
+        state = states[i]
+        output = state["answer"]
+        prompt = _ensure_remove_suffix(state.text(), output)
+        rows.append(
+            dict(
+                prompt_id=i,
+                prompt=prompt,
+                output=output,
+                correct=bool(preds[i] == labels[i]),
+            )
+        )
+
+    print(f"BenchRawResultDumper save results to {path}")
+    Path(path).write_text("\n".join(json.dumps(row) for row in rows))
+
+
+def _ensure_remove_suffix(text: str, suffix: str):
+    assert text.endswith(suffix)
+    return text.removesuffix(suffix)

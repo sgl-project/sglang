@@ -31,10 +31,13 @@ impl TestContext {
             request_timeout_secs: 600,
             worker_startup_timeout_secs: 1,
             worker_startup_check_interval_secs: 1,
+            dp_aware: false,
+            api_key: None,
             discovery: None,
             metrics: None,
             log_dir: None,
             log_level: None,
+            request_id_headers: None,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -949,10 +952,13 @@ mod error_tests {
                 request_timeout_secs: 600,
                 worker_startup_timeout_secs: 1,
                 worker_startup_check_interval_secs: 1,
+                dp_aware: false,
+                api_key: None,
                 discovery: None,
                 metrics: None,
                 log_dir: None,
                 log_level: None,
+                request_id_headers: None,
             };
 
             let ctx = TestContext::new_with_config(

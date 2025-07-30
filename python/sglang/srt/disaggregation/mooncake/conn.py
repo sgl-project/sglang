@@ -992,6 +992,14 @@ class MooncakeKVSender(BaseKVSender):
             )
         raise KVTransferError(self.bootstrap_room, failure_reason)
 
+    def abort(self):
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            "Aborted by AbortReq.",
+        )
+        # Explicitly set the status to failure since this request has been aborted
+        self.conclude_state = KVPoll.Failed
+
 
 class MooncakeKVReceiver(BaseKVReceiver):
     _ctx = zmq.Context()
@@ -1304,6 +1312,14 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 self.bootstrap_room, "Failed due to an unknown reason from another rank"
             )
         raise KVTransferError(self.bootstrap_room, failure_reason)
+
+    def abort(self):
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            "Aborted by AbortReq.",
+        )
+        # Explicitly set the status to failure since this request has been aborted
+        self.conclude_state = KVPoll.Failed
 
 
 class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
