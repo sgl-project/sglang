@@ -30,6 +30,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
     get_device_name,
+    has_accelerator,
     is_cpu,
     is_cuda,
     is_hip,
@@ -1324,7 +1325,7 @@ def _per_token_group_quant_fp8_hopper_moe_mn_major(
         tl.store(sfa_ptrs, inp_amax / 448.0, mask=coord_m < m)
 
 
-if not _is_cpu:
+if not _is_cpu and has_accelerator():
     _per_token_group_quant_fp8_hopper_moe_mn_major = fp8_autotune(
         _per_token_group_quant_fp8_hopper_moe_mn_major
     )

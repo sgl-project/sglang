@@ -132,6 +132,11 @@ def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
+def has_accelerator() -> bool:
+    """Check if any accelerator hardware (CUDA, HIP, HPU, XPU, NPU) is available."""
+    return is_cuda() or is_hip() or is_hpu() or is_xpu() or is_npu()
+
+
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (
