@@ -353,6 +353,11 @@ class CudaGraphRunner:
                 dtype=torch.bool,
                 device="cuda",
             )
+            self.next_token_logits_buffer = torch.zeros(
+                (self.max_num_token, self.model_runner.model_config.vocab_size),
+                dtype=torch.float,
+                device="cuda",
+            )
 
         # Capture
         try:
@@ -493,6 +498,7 @@ class CudaGraphRunner:
         else:
             encoder_lens = None
         mrope_positions = self.mrope_positions[:, :bs]
+        next_token_logits_buffer = self.next_token_logits_buffer[:num_tokens]
         self.num_token_non_padded[...] = num_tokens
 
         # pipeline parallelism
@@ -574,6 +580,7 @@ class CudaGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_paths=lora_paths,
+            next_token_logits_buffer=next_token_logits_buffer,
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 

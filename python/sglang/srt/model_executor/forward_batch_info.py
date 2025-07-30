@@ -188,6 +188,7 @@ class ForwardBatch:
     token_ids_logprobs: Optional[List[List[int]]] = None
 
     # For logits and logprobs post processing
+    next_token_logits_buffer: torch.Tensor = None
     temp_scaled_logprobs: bool = False
     temperature: torch.Tensor = None
     top_p_normalized_logprobs: bool = False
