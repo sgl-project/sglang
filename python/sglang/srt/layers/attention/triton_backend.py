@@ -645,41 +645,97 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        # print(f"DEBUG: TritonAttnBackend.forward_extend - batch_size={q.shape[0]}, forward_mode={forward_batch.forward_mode}")
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
+            # print(f"DEBUG: TritonAttnBackend.forward_extend -- qk_head_dim != v_head_dim")
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
+            # print(f"DEBUG: TritonAttnBackend.forward_extend -- qk_head_dim == v_head_dim")
+            # True
             o = torch.empty_like(q)
 
         if save_kv_cache:
+            # True
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
+        # print(f"DEBUG: TritonAttnBackend.forward_extend -- save_kv_cache={save_kv_cache}")
 
         causal = True
         if layer.attn_type == AttentionType.ENCODER_ONLY:
+            # False
             causal = False
+        # print(f"DEBUG: TritonAttnBackend.forward_extend -- causal={causal}")
 
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            # print(f"DEBUG: TritonAttnBackend.forward_extend -- sliding window")
             sliding_window_size = (
                 layer.sliding_window_size
             )  # Needed for sliding window mask
             kv_indptr = self.forward_metadata.window_kv_indptr
             kv_indices = self.forward_metadata.window_kv_indices
         else:
+            # True
+            # print(f"DEBUG: TritonAttnBackend.forward_extend -- no sliding window")
             sliding_window_size = -1
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
+        
+        # print(f"DEBUG: TritonAttnBackend.forward_extend -- kv_indptr.shape={kv_indptr.shape}, kv_indices.shape={kv_indices.shape}")
+        if q.shape[0] == 30:
+            check=True
+        else:
+            check=False
+
+        if check:
+            for b in range(1,2):
+                for t in range(6):
+                    assert torch.allclose(q[b * 6 + t], q[t]), print(
+                        f"TritonAttnBackend.forward_extend -- before extend_attention_fwd q {layer.layer_id=}, {b=}, {t=}, {q[b*6+t]=}, {q[t]=}"
+                    )
+                    assert torch.allclose(k[b * 6 + t], k[t]), print(
+                        f"TritonAttnBackend.forward_extend -- before extend_attention_fwd k {layer.layer_id=}, {b=}, {t=}, {k[b*6+t]=}, {k[t]=}"
+                    )
+                    assert torch.allclose(v[b * 6 + t], v[t]), print(
+                        f"TritonAttnBackend.forward_extend -- before extend_attention_fwd v {layer.layer_id=}, {b=}, {t=}, {v[b*6+t]=}, {v[t]=}"
+                    )
+        
+        # print the inputs of extend_attention_fwd
+        if check:
+            print(f"DEBUG: TritonAttnBackend.forward_extend -- inputs of extend_attention_fwd")
+            print(f"DEBUG: TritonAttnBackend.forward_extend -- {layer.layer_id=}")
+            print(f"DEBUG: TritonAttnBackend.forward_extend -- {q.shape=}, {k.shape=}, {v.shape=}")
+            print(f"DEBUG: TritonAttnBackend.forward_extend -- {forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).shape=}")
+            print(f"DEBUG: TritonAttnBackend.forward_extend -- {forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).shape=}")
+            print(f"DEBUG: TritonAttnBackend.forward_extend -- {self.forward_metadata.qo_indptr.shape=}, {self.forward_metadata.qo_indptr=}")
+            print(f"DEBUG: TritonAttnBackend.forward_extend -- {kv_indptr.shape=}, {kv_indices.shape=}, {kv_indptr=}")
+            print(f"DEBUG: TritonAttnBackend.forward_extend -- {causal=}")
+            if self.forward_metadata.custom_mask is not None:
+                print(f"DEBUG: TritonAttnBackend.forward_extend -- {self.forward_metadata.custom_mask.shape=}")
+            if self.forward_metadata.mask_indptr is not None:
+                print(f"DEBUG: TritonAttnBackend.forward_extend -- {self.forward_metadata.mask_indptr.shape=}, {self.forward_metadata.mask_indptr=}")
+            print(f"DEBUG: TritonAttnBackend.forward_extend -- {self.forward_metadata.max_extend_len=}") # const scaler
+            print(f"DEBUG: TritonAttnBackend.forward_extend -- {layer.scaling=}, {layer.logit_cap=}") # const scaler
+            print(f"DEBUG: TritonAttnBackend.forward_extend -- {sliding_window_size=}") # const scaler
+        
+        # copy the first kv_indices.shape[0]//5 elements to the rest
+        # attempt 1: use the same kv indices
+        if check:
+            kv_indices = kv_indices[:kv_indices.shape[0]//5]
+            print(f"DEBUG: TritonAttnBackend.forward_extend -- after shorten {kv_indices.shape=}, {kv_indices=}")
+            kv_indices = kv_indices.repeat(5)
+            print(f"DEBUG: TritonAttnBackend.forward_extend -- after repeat {kv_indices.shape=}, {kv_indices=}")
 
         self.extend_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k.contiguous(),
-            v.contiguous(),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim), # checked
+            k.contiguous(), # checked
+            v.contiguous(), # checked
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim), # output
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id), # looks fine
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id), # looks fine
             self.forward_metadata.qo_indptr,
-            kv_indptr,
+            kv_indptr, # looks fine
             kv_indices,
             self.forward_metadata.custom_mask,
             causal,
@@ -689,6 +745,13 @@ class TritonAttnBackend(AttentionBackend):
             layer.logit_cap,
             sliding_window_size,
         )
+        # print(f"DEBUG: TritonAttnBackend.forward_extend -- after extend_attention_fwd o.shape={o.shape}")
+        if check:
+            for b in range(1,2):
+                for t in range(6):
+                    assert torch.allclose(o[b * 6 + t], o[t]), print(
+                        f"TritonAttnBackend.forward_extend -- after extend_attention_fwd {layer.layer_id=}, {b=}, {t=}, {o[b*6+t]=}, {o[t]=}"
+                    )
         return o
 
     def forward_decode(
@@ -700,6 +763,7 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        print(f"DEBUG: TritonAttnBackend.forward_decode - batch_size={q.shape[0]}, forward_mode={forward_batch.forward_mode}")
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -813,6 +877,7 @@ class TritonMultiStepDraftBackend:
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
                 : seq_lens_sum * self.topk + bs * (i + 1)
             ]
+            print(f"DEBUG: TritonAttnBackend.common_template - i={i}, call_fn={call_fn}")
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):

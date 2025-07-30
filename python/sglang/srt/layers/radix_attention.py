@@ -88,6 +88,7 @@ class RadixAttention(nn.Module):
         save_kv_cache: bool = True,
         **kwargs,
     ):
+        # print(f"DEBUG: RadixAttention.forward")
         if k is not None:
             # For cross-layer sharing, kv can be None
             assert v is not None

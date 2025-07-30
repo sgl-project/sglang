@@ -1480,7 +1480,10 @@ class ModelRunner:
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
         if not skip_attn_backend_init:
+            print(f"forward_extend(1483) -- not skip_attn_backend_init")
             self.attn_backend.init_forward_metadata(forward_batch)
+        else:
+            print(f"forward_extend(1485) -- skip_attn_backend_init")
 
         kwargs = {}
         if self.support_pp:
@@ -1544,6 +1547,7 @@ class ModelRunner:
             self.forward_pass_id,
             forward_batch,
         ):
+            print(f"forward(1547) -- self._forward_raw")
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -1577,20 +1581,24 @@ class ModelRunner:
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         elif forward_batch.forward_mode.is_decode():
+            print(f"forward(1581) -- forward_batch.forward_mode.is_decode()")
             ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         elif forward_batch.forward_mode.is_extend():
+            print(f"forward(1584) -- forward_batch.forward_mode.is_extend()")
             ret = self.forward_extend(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         elif forward_batch.forward_mode.is_split_prefill():
+            print(f"forward(1591) -- forward_batch.forward_mode.is_split_prefill()")
             ret = self.forward_split_prefill(
                 forward_batch,
                 reinit_attn_backend=reinit_attn_backend,
                 forward_count=split_forward_count,
             )
         elif forward_batch.forward_mode.is_idle():
+            print(f"forward(1598) -- forward_batch.forward_mode.is_idle()")
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")

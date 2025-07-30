@@ -231,17 +231,21 @@ class TpModelWorker:
             )
 
         if self.pp_group.is_last_rank:
+            print(f"forward_batch_generation(234) -- self.pp_group.is_last_rank")
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
             if launch_done is not None:
+                print(f"forward_batch_generation(241) -- launch_done is not None")
                 launch_done.set()
 
             if skip_sample:
+                print(f"forward_batch_generation(244) -- skip_sample")
                 next_token_ids = None
             else:
+                print(f"forward_batch_generation(247) -- not skip_sample")
                 next_token_ids = self.model_runner.sample(
                     logits_output, model_worker_batch
                 )
@@ -252,6 +256,7 @@ class TpModelWorker:
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
+            print(f"forward_batch_generation(256) -- not self.pp_group.is_last_rank")
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,

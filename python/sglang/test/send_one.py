@@ -25,6 +25,7 @@ class BenchArgs:
     return_logprob: bool = False
     prompt: str = (
         "Human: Give me a fully functional FastAPI server. Show the python code.\n\nAssistant:"
+        # "Human: Give me a fully functional inference engine server. Show the python code.\n\nAssistant:"
     )
     image: bool = False
     many_images: bool = False
@@ -124,6 +125,7 @@ def send_one_prompt(args):
     else:
         ret = response.json()
 
+    rets = ret
     if args.batch_size > 1:
         ret = ret[0]
 
@@ -142,7 +144,14 @@ def send_one_prompt(args):
 
     speed = ret["meta_info"]["completion_tokens"] / latency
 
-    print(ret["text"])
+    if args.batch_size > 1:
+        for r in rets:
+            print(r["text"])
+            print("-" * 40)
+    else:
+        print(ret["text"])
+        print("-" * 40)
+    # print(ret["text"])
     print()
     print(f"{acc_length=:.2f}")
     print(f"{speed=:.2f} token/s")

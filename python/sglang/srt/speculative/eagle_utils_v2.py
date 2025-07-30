@@ -237,6 +237,12 @@ class EagleVerifyInput:
                 verify_forward_batch
             )
         else:
+            print(f"DEBUG: prepare_for_verify(242) -- {verify_forward_batch=}")
+            # print all indices of verify_forward_batch.spec_info.custom_mask that are False
+            false_indices = torch.where(~verify_forward_batch.spec_info.custom_mask)[0]
+            torch.set_printoptions(threshold=float('inf'))
+            print(f"DEBUG: Indices where custom_mask is False: {false_indices.tolist()}")
+            torch.set_printoptions(threshold=1000)
             target_worker.model_runner.attn_backend.init_forward_metadata(
                 verify_forward_batch
             )
@@ -269,7 +275,15 @@ class EagleVerifyInput:
         # Sample tokens
         if sampling_info.is_all_greedy:
             target_predict = torch.argmax(next_token_logits, dim=-1)
+            target_predict_val = torch.max(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.num_draft_tokens)
+            # all rows of target_predict are the same
+            if not torch.all(target_predict == target_predict[0]):
+                print(
+                    f"sample -- {target_predict=}, {target_predict_val=}, {accept_index=}, {accept_length=}"
+                )
+                for i in range(bs):
+                    print(f"DEBUG: next_token_logits[{i*6}:{(i+1)*6}]={next_token_logits[i*6:(i+1)*6] if next_token_logits.numel() > 0 else 'empty'}")
 
             verify_tree_greedy(
                 predicts=predict,  # mutable

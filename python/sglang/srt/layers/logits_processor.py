@@ -222,6 +222,7 @@ class LogitsProcessor(nn.Module):
         self.debug_tensor_dump_output_folder = global_server_args_dict.get(
             "debug_tensor_dump_output_folder", None
         )
+        print(f"LogitsProcessor(225) -- LogitsProcessor.__init__")
 
     def forward(
         self,

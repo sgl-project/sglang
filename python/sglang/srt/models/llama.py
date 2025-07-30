@@ -183,11 +183,63 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # if hidden_states.shape[0] == 30:
+        #     check=True
+        # else:
+        #     check=False
+        check=False
+        
+        if check:
+            for b in range(1,2):
+                for t in range(6):
+                    assert torch.allclose(hidden_states[b * 6 + t], hidden_states[t]), print(
+                        f"LlamaAttention(192) -- forward before qkv_proj {b=}, {t=}, {hidden_states[b*6+t]=}, {hidden_states[t]=}"
+                    )
         qkv, _ = self.qkv_proj(hidden_states)
+        if check:
+            for b in range(1,2):
+                for t in range(6):
+                    assert torch.allclose(qkv[b * 6 + t], qkv[t]), print(
+                        f"LlamaAttention(201) -- forward after qkv_proj {b=}, {t=}, {qkv[b*6+t]=}, {qkv[t]=}"
+                    )
+        
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if check:
+            for b in range(1,2):
+                for t in range(6):
+                    assert torch.allclose(q[b * 6 + t], q[t]), print(
+                        f"LlamaAttention(205) -- forward after split {b=}, {t=}, {q[b*6+t]=}, {q[t]=}"
+                    )
+                    assert torch.allclose(k[b * 6 + t], k[t]), print(
+                        f"LlamaAttention(213) -- forward after split {b=}, {t=}, {k[b*6+t]=}, {k[t]=}"
+                    )
+                    assert torch.allclose(v[b * 6 + t], v[t]), print(
+                        f"LlamaAttention(215) -- forward after split {b=}, {t=}, {v[b*6+t]=}, {v[t]=}"
+                    )
         q, k = self.rotary_emb(positions, q, k)
+        if check:
+            for b in range(1,2):
+                for t in range(6):
+                    assert torch.allclose(q[b * 6 + t], q[t]), print(
+                        f"LlamaAttention(223) -- forward after rotary_emb {b=}, {t=}, {q[b*6+t]=}, {q[t]=}"
+                    )
+                    assert torch.allclose(k[b * 6 + t], k[t]), print(
+                        f"LlamaAttention(225) -- forward after rotary_emb {b=}, {t=}, {k[b*6+t]=}, {k[t]=}"
+                    )
         attn_output = self.attn(q, k, v, forward_batch)
+        if check:
+            for b in range(1,2):
+                for t in range(6):
+                    assert torch.allclose(attn_output[b * 6 + t], attn_output[t]), print(
+                        f"LlamaAttention(233) -- forward after attn {b=}, {t=}, {attn_output[b*6+t]=}, {attn_output[t]=}"
+                    )
         output, _ = self.o_proj(attn_output)
+        if check:
+            for b in range(1,2):
+                for t in range(6):
+                    assert torch.allclose(output[b * 6 + t], output[t]), print(
+                        f"LlamaAttention(237) -- forward after o_proj {b=}, {t=}, {output[b*6+t]=}, {output[t]=}"
+                    )
         return output
 
 
@@ -241,6 +293,7 @@ class LlamaDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        print(f"LlamaDecoderLayer(244) -- LlamaDecoderLayer.__init__")
 
     def forward(
         self,
@@ -255,15 +308,36 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if hidden_states.shape[0] == 30:
+            check=True
+        else:
+            check=False
+        if check:
+            for b in range(1,2):
+                for t in range(6):
+                    assert torch.allclose(hidden_states[b * 6 + t], hidden_states[t]), print(
+                        f"LlamaDecoderLayer(264) -- forward after norm {b=}, {t=}, {hidden_states[b*6+t]=}, {hidden_states[t]=}"
+                    )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-
+        if check:
+            for b in range(1,2):
+                for t in range(6):
+                    assert torch.allclose(hidden_states[b * 6 + t], hidden_states[t]), print(
+                        f"LlamaDecoderLayer(264) -- forward after self_attn {b=}, {t=}, {hidden_states[b*6+t]=}, {hidden_states[t]=}"
+                    )
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        if check:
+            for b in range(1,2):
+                for t in range(6):
+                    assert torch.allclose(hidden_states[b * 6 + t], hidden_states[t]), print(
+                        f"LlamaDecoderLayer(270) -- forward after mlp {b=}, {t=}, {hidden_states[b*6+t]=}, {hidden_states[t]=}"
+                    )
         return hidden_states, residual
 
 
@@ -304,6 +378,7 @@ class LlamaModel(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
         self.layers_to_capture = []
+        print(f"LlamaModel(307) -- LlamaModel.__init__")
 
     def forward(
         self,
@@ -337,6 +412,17 @@ class LlamaModel(nn.Module):
                 forward_batch,
                 residual,
             )
+            # check every 6 hidden_states are the same
+            if hidden_states.shape[0] == 30:
+                check=True
+            else:
+                check=False
+            if check:
+                for b in range(hidden_states.shape[0]//6):
+                    for t in range(6):
+                        assert torch.allclose(hidden_states[b * 6 + t], hidden_states[t]), print(
+                            f"LlamaModel(341) -- i={i}, {b=}, {t=}, {hidden_states[b*6+t]=}, {hidden_states[t]=}"
+                        )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -435,6 +521,7 @@ class LlamaForCausalLM(nn.Module):
         ]
 
         self.capture_aux_hidden_states = False
+        print(f"LlamaForCausalLM(438) -- LlamaForCausalLM.__init__")
 
     def _init_model(
         self,
@@ -454,6 +541,7 @@ class LlamaForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> LogitsProcessorOutput:
+        print(f"LlamaForCausalLM(458) -- LlamaForCausalLM.forward")
         hidden_states = self.model(
             input_ids,
             positions,
@@ -461,6 +549,18 @@ class LlamaForCausalLM(nn.Module):
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        # assert every 6 hidden_states are the same
+        if hidden_states.shape[0] == 30:
+            check=True
+        else:
+            check=False
+        if check:
+            print(f"LlamaForCausalLM(466) -- {hidden_states.shape=}")
+            for b in range(hidden_states.shape[0]//6):
+                for t in range(6):
+                    assert torch.allclose(hidden_states[b * 6 + t], hidden_states[t]), print(
+                        f"LlamaForCausalLM(466) -- {b=}, {t=}, {hidden_states[b*6+t]=}, {hidden_states[t]=}"
+                    )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
@@ -468,6 +568,7 @@ class LlamaForCausalLM(nn.Module):
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
+                print(f"LlamaForCausalLM(474) -- not get_embedding, return logits_processor")
                 return self.logits_processor(
                     input_ids,
                     hidden_states,

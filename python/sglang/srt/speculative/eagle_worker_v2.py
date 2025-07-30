@@ -410,7 +410,21 @@ class EAGLEWorker(TpModelWorker):
         forward_batch_output = self.target_worker.forward_batch_generation(
             verify_forward_batch, skip_sample=True, skip_attn_backend_init=True
         )
-        logits_output = forward_batch_output.logits_output
+        logits_output = forward_batch_output.logits_output # logits_output is incorrect
+        # assert every 6 logits_output.next_token_logits are the same
+        if bs == 5:
+            check=True
+        else:
+            check=False
+        if check:
+            for b in range(1,2):
+                for t in range(6):
+                    assert torch.allclose(
+                        logits_output.next_token_logits[b * 6 + t],
+                        logits_output.next_token_logits[t],
+                    ), print(
+                        f"verify(416) -- {logits_output.next_token_logits[b*6+t]=}, {logits_output.next_token_logits[t]=}"
+                    )
 
         # Sample
         self._detect_nan_if_needed(logits_output)
