@@ -652,25 +652,19 @@ def _set_envs_and_config(server_args: ServerArgs):
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
-    def sigchld_handler(signum, frame):
-        pid, exitcode = os.waitpid(0, os.WNOHANG)
-        if exitcode != 0:
-            logger.warning(
-                f"Child process unexpectedly failed with {exitcode=}. {pid=}"
+    if True:  # Keep this check for internal code compatibility
+        # Register the signal handler.
+        # The child processes will send SIGQUIT to this process when any error happens
+        # This process then clean up the whole process tree
+        # Note: This sigquit handler is used in the launch phase, and may be replaced by
+        # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
+        def launch_phase_sigquit_handler(signum, frame):
+            logger.error(
+                "Received sigquit from a child process. It usually means the child failed."
             )
+            kill_process_tree(os.getpid())
 
-    signal.signal(signal.SIGCHLD, sigchld_handler)
-
-    # Register the signal handler.
-    # The child processes will send SIGQUIT to this process when any error happens
-    # This process then clean up the whole process tree
-    def sigquit_handler(signum, frame):
-        logger.error(
-            "Received sigquit from a child process. It usually means the child failed."
-        )
-        kill_process_tree(os.getpid())
-
-    signal.signal(signal.SIGQUIT, sigquit_handler)
+        signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)

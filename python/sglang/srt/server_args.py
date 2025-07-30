@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import random
+import sys
 import tempfile
 from typing import List, Literal, Optional, Union
 
@@ -74,6 +75,7 @@ class ServerArgs:
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
+    max_queued_requests: Optional[int] = sys.maxsize
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
@@ -804,6 +806,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_running_requests,
             help="The maximum number of running requests.",
+        )
+        parser.add_argument(
+            "--max-queued-requests",
+            type=int,
+            default=ServerArgs.max_queued_requests,
+            help="The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
         )
         parser.add_argument(
             "--max-total-tokens",
@@ -2063,6 +2071,9 @@ class PortArgs:
 
             dist_init_host, dist_init_port = dist_init_addr
             port_base = int(dist_init_port) + 1
+            detokenizer_port = port_base + 1
+            rpc_port = port_base + 2
+            metrics_ipc_name = port_base + 3
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
@@ -2072,10 +2083,10 @@ class PortArgs:
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
-                detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
+                detokenizer_ipc_name=f"tcp://{dist_init_host}:{detokenizer_port}",
                 nccl_port=nccl_port,
-                rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
-                metrics_ipc_name=f"tcp://{dist_init_host}:{port_base + 3}",
+                rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
+                metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
             )
 
 

@@ -900,6 +900,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.w13_blockscale_swizzled = Parameter(
             w13_blockscale_swizzled, requires_grad=False
         )
+        del layer.w13_weight_scale
 
         # This is for quantization, so we need to invert it.
         layer.w13_input_scale_quant = Parameter(
@@ -935,6 +936,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.w2_blockscale_swizzled = Parameter(
             w2_blockscale_swizzled, requires_grad=False
         )
+        del layer.w2_weight_scale
         layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
         device = layer.w13_weight.device
