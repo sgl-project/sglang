@@ -12,7 +12,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -612,7 +612,7 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def forward(self, hidden_states: torch.Tensor, topk_output: StandardTopKOutput):
         assert self.quant_method is not None
 
         if self.expert_map_gpu is not None:
