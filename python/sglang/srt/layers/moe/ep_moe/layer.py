@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -9,6 +9,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
@@ -43,6 +44,7 @@ from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.layers.quantization.w8a8_int8 import NPU_W8A8EPMoEMethod, W8A8Int8Config
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.utils import (
     DeepEPMode,
     ceil_div,
@@ -821,11 +823,6 @@ class DeepEPMoE(EPMoE):
         )
         self.deepep_mode = deepep_mode
 
-        # TODO: move to the beginning of the file
-        from sglang.srt.distributed.parallel_state import get_tp_group
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
-        from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
-
         self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
             group=get_tp_group().device_group,
             router_topk=self.top_k,
@@ -1276,7 +1273,7 @@ class DeepEPMoE(EPMoE):
         self,
         dispatch_output: DeepEPLLOutput,
     ):
-        hidden_states_fp8, _, _, masked_m, _, expected_m = dispatch_output
+        hidden_states_fp8, _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
         assert self.activation == "silu"
 
@@ -1414,6 +1411,10 @@ class FlashInferEPMoE(EPMoE):
 
 
 class AscendDeepEPMoE(EPMoE):
+    """
+    Extend DeepEPMoE with Ascend-specific features
+    """
+
     _has_printed = False
 
     def __init__(
@@ -1427,8 +1428,6 @@ class AscendDeepEPMoE(EPMoE):
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
         prefix: str = "",
-        correction_bias: Optional[torch.Tensor] = None,
-        custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
         deepep_mode: DeepEPMode = DeepEPMode.auto,
@@ -1447,8 +1446,6 @@ class AscendDeepEPMoE(EPMoE):
             routed_scaling_factor=routed_scaling_factor,
         )
         self.deepep_mode = deepep_mode
-        from sglang.srt.distributed.parallel_state import get_tp_group
-        from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 
         self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
             group=get_tp_group().device_group,
@@ -1463,7 +1460,7 @@ class AscendDeepEPMoE(EPMoE):
             return_recv_hook=True,
         )
 
-    def weight_loader(
+    def _weight_loader_impl(
         self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
@@ -1471,32 +1468,6 @@ class AscendDeepEPMoE(EPMoE):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        physical_expert_ids = (
-            get_global_expert_location_metadata().logical_to_all_physical(
-                self.layer_id, expert_id
-            )
-        )
-        for physical_expert_id in physical_expert_ids:
-            self._weight_loader_physical(
-                param=param,
-                loaded_weight=loaded_weight,
-                weight_name=weight_name,
-                shard_id=shard_id,
-                expert_id=physical_expert_id,
-            )
-
-    def _weight_loader_physical(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-    ) -> None:
-        if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
-            return
-        expert_id = expert_id - self.start_expert_id
-
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(
                 f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
@@ -1505,7 +1476,7 @@ class AscendDeepEPMoE(EPMoE):
         # Special case for w8a8 scales.
         if "scale" in weight_name or "offset" in weight_name:
             self._load_w8a8_scale(
-                param.data,
+                param,
                 loaded_weight,
                 weight_name,
                 shard_id,
@@ -1530,7 +1501,6 @@ class AscendDeepEPMoE(EPMoE):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        param_data = param.data
         expert_data = param.data[expert_id]
         SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
         shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
@@ -1563,9 +1533,9 @@ class AscendDeepEPMoE(EPMoE):
             hidden_states,
             topk_idx,
             topk_weights,
-            masked_m,
+            _,
             seg_indptr,
-            expected_m
+            _
         ) = self.deepep_dispatcher.dispatch(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
