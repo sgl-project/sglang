@@ -16,7 +16,7 @@ from sglang.srt.function_call.ebnf_composer import EBNFComposer
 logger = logging.getLogger(__name__)
 
 
-def get_argument_type(func_name: str, arg_key: str, defined_tools: list) -> str:
+def get_argument_type(func_name: str, arg_key: str, defined_tools: List[Tool]) -> str:
     """Get the expected type for a function argument from tool schema."""
     name2tool = {tool.function.name: tool for tool in defined_tools}
     if func_name not in name2tool:
