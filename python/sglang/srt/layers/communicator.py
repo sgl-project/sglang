@@ -537,6 +537,7 @@ class CommunicateSummableTensorPairFn:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         context: CommunicateContext,
+        **kwargs,
     ):
         return hidden_states, residual
 
@@ -565,6 +566,7 @@ class CommunicateSummableTensorPairFn:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         context: CommunicateContext,
+        **kwargs,
     ):
         hidden_states += residual
         residual = None
