@@ -56,17 +56,13 @@ use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_K
 TORCH_DEVICE_IDENTITY = None
 
 
-def use_hip_scaled_mm():
+def use_rowwise_torch_scaled_mm():
+    _TORCH_VERSION = torch.__version__.split("+")[0]
+    try:
+        _TORCH_VERSION_TUPLE = tuple(map(int, _TORCH_VERSION.split(".")[:3]))
+    except ValueError:
+        _TORCH_VERSION_TUPLE = (0, 0, 0)
     if _is_hip:
-        if _use_aiter:
-            return get_device_capability() >= (9, 4)
-        
-        _TORCH_VERSION = torch.__version__.split("+")[0]
-        try:
-            _TORCH_VERSION_TUPLE = tuple(map(int, _TORCH_VERSION.split(".")[:3]))
-        except ValueError:
-            _TORCH_VERSION_TUPLE = (0, 0, 0)
-
         # The condition to determine if it is on a platform that supports
         # torch._scaled_mm rowwise feature.
         # The condition is determined once as the operations
@@ -74,7 +70,7 @@ def use_hip_scaled_mm():
         return get_device_capability() >= (9, 4) and _TORCH_VERSION_TUPLE >= (2, 7, 0)
     return False
 
-USE_HIP_SCALED_MM = use_hip_scaled_mm()
+USE_ROWWISE_TORCH_SCALED_MM = use_rowwise_torch_scaled_mm()
 
 
 def cutlass_fp8_supported():
@@ -609,7 +605,7 @@ def apply_fp8_linear(
                 use_per_token_if_dynamic
                 and not per_tensor_weights
                 and not per_tensor_activations
-                and USE_HIP_SCALED_MM
+                and (USE_ROWWISE_TORCH_SCALED_MM or _use_aiter)
             ):
                 if _use_aiter:                    
                     output = gemm_a8w8_bpreshuffle(
