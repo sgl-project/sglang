@@ -297,7 +297,7 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             prompt = conv.get_prompt()
             if self._get_enable_thinking_from_request(request):
-                prompt += "<think>"  # Note(Xinyuan): hard code for interns1
+                prompt += "<think>"  # Note(Xinyuan): hard code thinking token
 
         image_data = conv.image_data if conv.image_data else None
         video_data = conv.video_data if conv.video_data else None
@@ -841,7 +841,7 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
 
-    def _get_enable_thinking_from_request(request: ChatCompletionRequest) -> bool:
+    def _get_enable_thinking_from_request(self, request: ChatCompletionRequest) -> bool:
         """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
 
         NOTE: This parameter is only useful for models that support enable_thinking
