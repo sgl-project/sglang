@@ -415,8 +415,7 @@ class MooncakeKVManager(BaseKVManager):
         # This means heads_bytes_per_token_to_send <= (dst_kv_item_len // page_size)
         if heads_bytes_per_token_to_send > (dst_kv_item_len // page_size):
             logger.error(
-                f"[{mooncake_session_id}] Layer {layer_id}: "
-                f"slice size ({heads_bytes_per_token_to_send}) exceeds "
+                f"[{mooncake_session_id}] slice size ({heads_bytes_per_token_to_send}) exceeds "
                 f"target token slot size ({dst_kv_item_len // page_size})"
             )
             return -1
