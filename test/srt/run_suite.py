@@ -86,6 +86,7 @@ suites = {
         TestFile("test_radix_attention.py", 105),
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_retract_decode.py", 54),
+        TestFile("test_request_queue_validation.py", 30),
         TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_engine.py", 261),
@@ -109,6 +110,7 @@ suites = {
         TestFile("test_vision_openai_server_b.py", 620),
         TestFile("test_w8a8_quantization.py", 46),
         TestFile("test_reasoning_parser.py", 5),
+        TestFile("test_hybrid_attn_backend.py", 100),
     ],
     "per-commit-amd": [
         TestFile("models/lora/test_lora_backend.py", 99),
