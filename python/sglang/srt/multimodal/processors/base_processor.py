@@ -155,6 +155,7 @@ class BaseMultimodalProcessor(ABC):
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
 
+        self.IMAGE_NUM_LIMITATION = server_args.max_num_image
 
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 4))
@@ -253,10 +254,10 @@ class BaseMultimodalProcessor(ABC):
         num_images = len(image_data) if image_data else 0
         if not image_data or num_images == 0:
             return []
-        if num_images > self.server_args.max_num_image:
+        if num_images > self.IMAGE_NUM_LIMITATION:
             raise ValueError(
                 f"The number of images in the request ({num_images}) "
-                f"exceeds the configured limit ({self.server_args.max_num_image}). "
+                f"exceeds the configured limit ({self.IMAGE_NUM_LIMITATION}). "
                 f"Please reduce the number of images or increase the '--max-num-images' server argument."
             )
         estimated_frames_list = []

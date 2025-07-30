@@ -269,6 +269,9 @@ class ServerArgs:
     enable_pdmux: bool = False
     sm_group_num: int = 3
 
+    # Multimodal settings
+    max_num_image: Optional[int] = None
+
     def __post_init__(self):
         # Expert parallelism
         # We put it here first due to some internal ckpt conversation issues.
@@ -1813,7 +1816,7 @@ class ServerArgs:
         parser.add_argument(
             "--max-num-images",
             type=int,
-            default=ServerArgs.max_num_image,
+            default=None,
             help="The maximum number of images allowed in a single multimodal request to prevent OOM errors.",
         )
 
