@@ -229,10 +229,8 @@ class Step3VDetector(BaseFormatDetector):
             self._tool_block_finished = True
 
             # Reset any partial tool call state
-            self._in_tool_call = False
-            self._function_name_sent = False
-            self._current_function_name = ""
-            self._current_parameters = {}
+            self._reset_streaming_state()
+
             return StreamingParseResult(normal_text=remaining, calls=calls)
 
         # Check if we're in a tool call or need to start one
@@ -245,6 +243,7 @@ class Step3VDetector(BaseFormatDetector):
                 self._function_name_sent = False
                 self._current_function_name = ""
                 self._current_parameters = {}
+                self._current_tool_name_sent = False
                 # Fall through to parse the partial tool call
             else:
                 # Wait for tool call to begin
@@ -267,7 +266,7 @@ class Step3VDetector(BaseFormatDetector):
         type_part, invoke_part = self._buffer.split(self.tool_sep, 1)
         if type_part.strip() != "function":
             # Invalid tool type, skip this tool call
-            self._in_tool_call = False
+            self._reset_streaming_state()
             return StreamingParseResult(calls=calls)
 
         # Try to extract function name if not sent yet
@@ -309,7 +308,7 @@ class Step3VDetector(BaseFormatDetector):
                 else:
                     # Invalid function name
                     logger.warning(f"Invalid function name: {func_name}")
-                    self._in_tool_call = False
+                    self._reset_streaming_state()
                     return StreamingParseResult(calls=calls)
             else:
                 # Function name not complete yet
@@ -318,6 +317,7 @@ class Step3VDetector(BaseFormatDetector):
         # Parse parameters incrementally
         if self._function_name_sent:
             # Extract all complete parameters
+            new_params = {}
             for param_match in self.param_regex.finditer(invoke_part):
                 param_name = param_match.group(1)
                 param_value = param_match.group(2).strip()
@@ -328,22 +328,61 @@ class Step3VDetector(BaseFormatDetector):
                 )
                 if arg_type and arg_type != "string":
                     parsed_value, _ = parse_arguments(param_value)
-                    self._current_parameters[param_name] = parsed_value
+                    new_params[param_name] = parsed_value
                 else:
-                    self._current_parameters[param_name] = param_value
+                    new_params[param_name] = param_value
+
             # Check if we have new parameters to stream
+            if new_params != self._current_parameters:
+                # Build the JSON content without the closing brace for streaming
+                if not self._current_parameters:
+                    # First parameters - send opening brace and content
+                    params_content = json.dumps(new_params, ensure_ascii=False)
+                    if len(params_content) > 2:  # More than just "{}"
+                        # Send everything except the closing brace
+                        diff = params_content[:-1]
+                    else:
+                        diff = "{"
+                else:
+                    # Subsequent parameters - calculate the incremental diff
+                    old_json = json.dumps(self._current_parameters, ensure_ascii=False)
+                    new_json = json.dumps(new_params, ensure_ascii=False)
+
+                    # Remove closing braces for comparison
+                    old_without_brace = old_json[:-1]
+                    new_without_brace = new_json[:-1]
+
+                    # The new content should extend the old content
+                    if new_without_brace.startswith(old_without_brace):
+                        diff = new_without_brace[len(old_without_brace) :]
+                    else:
+                        # Parameters changed in unexpected way - shouldn't happen in normal streaming
+                        diff = ""
+
+                if diff:
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            parameters=diff,
+                        )
+                    )
+                    self.streamed_args_for_tool[self.current_tool_id] += diff
+
+                # Update current state
+                self._current_parameters = new_params
+                self.prev_tool_call_arr[self.current_tool_id]["arguments"] = new_params
 
             # Check if tool call is complete
             if self.tool_call_end in self._buffer:
-                json_params = json.dumps(self._current_parameters, ensure_ascii=False)
-                calls.append(
-                    ToolCallItem(
-                        tool_index=self.current_tool_id,
-                        parameters=json_params,
+                # Send closing brace if we've sent any parameters
+                if self.streamed_args_for_tool[self.current_tool_id]:
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            parameters="}",
+                        )
                     )
-                )
-                self.streamed_args_for_tool[self.current_tool_id] = json_params
-                self.prev_tool_call_arr[self.current_tool_id]["arguments"] = json_params
+                    self.streamed_args_for_tool[self.current_tool_id] += "}"
 
                 # Find the end position
                 end_idx = self._buffer.find(self.tool_call_end)
@@ -351,13 +390,18 @@ class Step3VDetector(BaseFormatDetector):
                 self._buffer = self._buffer[end_idx + len(self.tool_call_end) :]
 
                 # Reset state for next tool call
-                self._in_tool_call = False
+                self._reset_streaming_state()
                 self.current_tool_id += 1
-                self.current_tool_name_sent = False
-                self._current_function_name = ""
-                self._current_parameters = {}
 
         return StreamingParseResult(calls=calls)
+
+    def _reset_streaming_state(self):
+        """Reset streaming state for the next tool call"""
+        self._in_tool_call = False
+        self._function_name_sent = False
+        self._current_function_name = ""
+        self._current_parameters = {}
+        self._current_tool_name_sent = False
 
     def supports_structural_tag(self) -> bool:
         """Return True if this detector supports structural tag format."""
