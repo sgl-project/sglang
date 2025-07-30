@@ -1,9 +1,9 @@
 import pytest
 import torch
-from sgl_kernel import gptq_marlin_gemm, moe_wna16_marlin_gemm
+from sgl_kernel import gptq_marlin_gemm
+from sgl_kernel.scalar_type import scalar_types
 
 from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
-from sglang.srt.layers.quantization.scalar_type import scalar_types
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
 
 MNK_FACTORS = [

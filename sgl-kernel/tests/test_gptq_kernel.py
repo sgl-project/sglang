@@ -1,6 +1,6 @@
 import pytest
 import torch
-from sgl_kernel import gptq_gemm, gptq_marlin_gemm, gptq_shuffle
+from sgl_kernel import gptq_gemm
 
 
 def pack_ints(tensor: torch.Tensor, bit: int) -> torch.Tensor:
@@ -10,7 +10,8 @@ def pack_ints(tensor: torch.Tensor, bit: int) -> torch.Tensor:
 
         packed = torch.zeros(tensor.shape[0], dtype=torch.uint32, device=tensor.device)
         for i in range(8):
-            packed |= tensor[:, i].to(torch.uint32) << (i * 4)
+            shifted_value = (tensor[:, i].to(torch.int64) << (i * 4)).to(torch.uint32)
+            packed |= shifted_value
         return packed
     else:
         raise NotImplementedError(f"Packing for bit={bit} not implemented.")
