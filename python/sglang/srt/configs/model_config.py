@@ -413,6 +413,7 @@ class ModelConfig:
             "w8a8_int8",
             "w8a8_fp8",
             "moe_wna16",
+            "w4a8_machete",
             "qoq",
             "w4afp8",
             "petit_nvfp4",

@@ -152,6 +152,7 @@ option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
 option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
+option(SGL_KERNEL_ENABLE_MACHETE          "Enable Machete"          OFF)
 
 if (ENABLE_BELOW_SM90)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -200,6 +201,19 @@ endif()
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-DENABLE_NVFP4=1"
+    )
+endif()
+
+extract_unique_cuda_archs_ascending(CUDA_ARCHS "${SGL_KERNEL_CUDA_FLAGS}")
+message(STATUS "CUDA target architectures: ${CUDA_ARCHS}")
+cuda_archs_loose_intersection(IS_SM90_ARCHS "9.0;9.0a" "${CUDA_ARCHS}")
+
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.0" AND IS_SM90_ARCHS)
+    set(SGL_KERNEL_ENABLE_MACHETE ON)
+
+    set(SGL_KERNEL_ENABLE_TLLM_KERNELS ON)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-DCOMPILE_HOPPER_TMA_GROUPED_GEMMS"
     )
 endif()
 
@@ -274,6 +288,65 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
+
+
+if (SGL_KERNEL_ENABLE_MACHETE)
+    #
+    # For the Machete kernels we automatically generate sources for various
+    # preselected input type pairs and schedules.
+    # Generate sources: python3 csrc/quantization/machete/generate.py
+    set(MACHETE_GEN_SCRIPT
+      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/machete/generate.py)
+    file(MD5 ${MACHETE_GEN_SCRIPT} MACHETE_GEN_SCRIPT_HASH)
+
+    message(STATUS "Machete generation script hash: ${MACHETE_GEN_SCRIPT_HASH}")
+    message(STATUS "Last run machete generate script hash: $CACHE{MACHETE_GEN_SCRIPT_HASH}")
+
+    if (NOT DEFINED CACHE{MACHETE_GEN_SCRIPT_HASH}
+        OR NOT $CACHE{MACHETE_GEN_SCRIPT_HASH} STREQUAL ${MACHETE_GEN_SCRIPT_HASH})
+      execute_process(
+        COMMAND ${CMAKE_COMMAND} -E env
+        PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/extensions/:${repo-cutlass_SOURCE_DIR}/python/:$PYTHONPATH
+          ${Python_EXECUTABLE} ${MACHETE_GEN_SCRIPT}
+        RESULT_VARIABLE machete_generation_result
+        OUTPUT_VARIABLE machete_generation_output
+        OUTPUT_FILE ${CMAKE_CURRENT_BINARY_DIR}/machete_generation.log
+        ERROR_FILE ${CMAKE_CURRENT_BINARY_DIR}/machete_generation.log
+      )
+
+      if (NOT machete_generation_result EQUAL 0)
+        message(FATAL_ERROR "Machete generation failed."
+                            " Result: \"${machete_generation_result}\""
+                            "\nCheck the log for details: "
+                            "${CMAKE_CURRENT_BINARY_DIR}/machete_generation.log")
+      else()
+        set(MACHETE_GEN_SCRIPT_HASH ${MACHETE_GEN_SCRIPT_HASH}
+            CACHE STRING "Last run machete generate script hash" FORCE)
+        message(STATUS "Machete generation completed successfully.")
+      endif()
+    else()
+      message(STATUS "Machete generation script has not changed, skipping generation.")
+    endif()
+
+    # Add machete generated sources
+    file(GLOB MACHETE_GEN_SOURCES "csrc/quantization/machete/generated/*.cu")
+    list(APPEND SOURCES ${MACHETE_GEN_SOURCES})
+
+    list(APPEND SOURCES csrc/quantization/machete/machete_pytorch.cu)
+    list(APPEND SOURCES csrc/machete_extension.cc)
+
+    message(STATUS "Building Machete kernels for archs: cuda")
+else()
+    if (NOT "${CUDA_VERSION}" VERSION_GREATER_EQUAL 12.0)
+      message(STATUS "Not building Machete kernels as CUDA Compiler version is "
+                     "not >= 12.0, we recommend upgrading to CUDA 12.0 or "
+                     "later if you intend on running w4a16 quantized models on "
+                     "Hopper.")
+    else()
+      message(STATUS "Not building Machete kernels as no compatible archs "
+                     "found in CUDA target architectures")
+    endif()
+endif()
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 

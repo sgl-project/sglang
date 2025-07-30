@@ -1,0 +1,34 @@
+{
+    "1536_3072": {
+        "1": "128x16_1x1x1_TmaMI__TmaCoop_PersistentScheduler",
+        "8": "128x16_1x1x1_TmaMI__TmaCoop_PersistentScheduler",
+        "16": "128x16_1x1x1_TmaMI__TmaCoop_PersistentScheduler",
+        "32": "128x16_1x1x1_TmaMI__TmaCoop_PersistentScheduler",
+        "64": "128x32_1x1x1_TmaMI__TmaCoop_PersistentScheduler",
+        "128": "128x64_2x1x1_TmaMI__TmaCoop_PersistentScheduler"
+    },
+    "2048_7168": {
+        "1": "128x16_1x1x1_TmaMI__TmaCoop_PersistentScheduler",
+        "8": "128x16_1x1x1_TmaMI__TmaCoop_PersistentScheduler",
+        "16": "128x16_1x1x1_TmaMI__TmaCoop_PersistentScheduler",
+        "32": "128x32_1x1x1_TmaMI__TmaCoop_PersistentScheduler",
+        "64": "128x64_2x1x1_TmaMI__TmaCoop_PersistentScheduler",
+        "128": "128x128_1x1x1_TmaMI__TmaCoop_PersistentScheduler"
+    },
+    "2304_7168": {
+        "1": "128x16_1x1x1_TmaMI__TmaCoop_PersistentScheduler",
+        "8": "128x16_1x1x1_TmaMI__TmaCoop_PersistentScheduler",
+        "16": "128x16_1x1x1_TmaMI__TmaCoop_PersistentScheduler",
+        "32": "128x32_1x1x1_TmaMI__TmaCoop_PersistentScheduler",
+        "64": "128x64_1x1x1_TmaMI__TmaCoop_PersistentScheduler",
+        "128": "128x128_2x1x1_TmaMI__TmaCoop_PersistentScheduler"
+    },
+    "7168_4608": {
+        "1": "128x16_2x1x1_TmaMI__TmaCoop_streamK",
+        "8": "128x16_2x1x1_TmaMI__TmaCoop_streamK",
+        "16": "128x16_2x1x1_TmaMI__TmaCoop_streamK",
+        "32": "128x32_2x1x1_TmaMI__TmaCoop_streamK",
+        "64": "128x32_1x1x1_TmaMI__TmaCoop_PersistentScheduler",
+        "128": "128x64_2x1x1_TmaMI__TmaCoop_PersistentScheduler"
+    }
+}

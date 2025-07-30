@@ -257,6 +257,7 @@ class MoEGate(nn.Module):
             and hidden_states.shape[1] == 7168
             and self.weight.shape[0] == 256
             and _device_sm >= 90
+            and hidden_states.dtype in (torch.bfloat16, torch.float32)
         ):
             # router gemm output float32
             logits = dsv3_router_gemm(hidden_states, self.weight)
@@ -386,6 +387,7 @@ class DeepseekV2MoE(nn.Module):
                 "awq",
                 "awq_marlin",
                 "moe_wna16",
+                "w4a8_machete",
             }
             self.shared_experts_is_int8 = (
                 not is_packed_weight
@@ -909,8 +911,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             has_fused_proj
             and hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config")
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
-            in {"awq", "awq_marlin", "moe_wna16"}
+            in {"awq", "awq_marlin", "moe_wna16", "w4a8_machete"}
         )
+
         self.use_min_latency_fused_a_gemm = (
             has_fused_proj
             and not is_packed_weight
@@ -2390,7 +2393,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
@@ -2469,6 +2471,15 @@ class DeepseekV2ForCausalLM(nn.Module):
 
                 if "rotary_emb.inv_freq" in name:
                     continue
+
+                if self.quant_config.get_name() == "w4a8_machete" and (
+                    name.endswith(".activation_scales")
+                    or name.endswith(".weight_scales_2")
+                ):
+                    # w4a8_machete moe & linear, for speed_up, don't use activation_scales and weight_scales_2
+                    # if you want more accurate results, you can use this two variables when apply
+                    continue
+
                 for param_name, weight_name, shard_id in stacked_params_mapping:
                     # Skip non-stacked layers and experts (experts handled below).
                     if weight_name not in name:
@@ -2496,6 +2507,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
+                        if (
+                            self.quant_config.get_name() == "w4a8_machete"
+                            and name.endswith(".qzeros")
+                            and not self.quant_config.has_zp
+                        ):
+                            # for AWQ w4a8_machete moe, skip loading if qzeros is extra
+                            break
+
                         name = name.replace(weight_name, param_name)
                         param = params_dict[name]
                         weight_loader = param.weight_loader
@@ -2541,6 +2560,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                     self.quant_config.get_name() == "awq"
                                     or self.quant_config.get_name() == "awq_marlin"
                                     or self.quant_config.get_name() == "moe_wna16"
+                                    or self.quant_config.get_name() == "w4a8_machete"
                                 ):
                                     cat_dim = 1
                                 fused_weight = torch.cat(

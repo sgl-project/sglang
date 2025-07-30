@@ -61,6 +61,11 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
 )
+from sgl_kernel.machete import (
+    machete_mm,
+    machete_prepack_B,
+    machete_supported_schedules,
+)
 from sgl_kernel.marlin import (
     awq_marlin_moe_repack,
     awq_marlin_repack,
@@ -85,6 +90,7 @@ from sgl_kernel.sampling import (
     top_p_renorm_prob,
     top_p_sampling_from_probs,
 )
+from sgl_kernel.scalar_type import ScalarType, scalar_types
 from sgl_kernel.spatial import create_greenctx_stream_by_value, get_sm_available
 from sgl_kernel.speculative import (
     build_tree_kernel_efficient,
