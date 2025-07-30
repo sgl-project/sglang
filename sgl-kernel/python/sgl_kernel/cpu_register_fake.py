@@ -199,22 +199,25 @@ def _(mat1, mat2, scales1, scales2, bias, out_dtype, is_vnni):
 
 @torch.library.register_fake("sgl_kernel::fused_experts_cpu")
 def _(
-    x,
-    w13_weight,
-    w2_weight,
+    hidden_states,
+    w1,
+    w2,
     topk_weights,
     topk_ids,
     inplace,
     use_int8_w8a8,
     use_fp8_w8a16,
+    use_int4_w4a16,
     w1_scale,
     w2_scale,
+    w1_zero,
+    w2_zero,
     block_size,
     a1_scale,
     a2_scale,
     is_vnni,
 ):
-    return torch.empty_like(x)
+    return torch.empty_like(hidden_states)
 
 
 @torch.library.register_fake("sgl_kernel::grouped_topk_cpu")
