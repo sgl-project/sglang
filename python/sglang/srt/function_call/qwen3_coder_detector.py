@@ -64,12 +64,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self._in_tool_call: bool = False
         self._function_name_sent: bool = False
 
-    def _get_tool_indices(self, tools: List[Tool]) -> Dict[str, int]:
-        """Get a mapping of tool names to their indices in the tools list."""
-        return {
-            tool.function.name: i for i, tool in enumerate(tools) if tool.function.name
-        }
-
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 
@@ -232,13 +226,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # Build incremental JSON properly
             if not self._current_parameters:
                 # First parameter(s) - start JSON object but don't close it yet
-                if len(new_params) == 1:
-                    # Single parameter so far - send opening but no closing brace
-                    key, value = next(iter(new_params.items()))
-                    json_fragment = f'{{{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}'
-                else:
-                    # Multiple parameters in first batch - send complete JSON
-                    json_fragment = json.dumps(new_params, ensure_ascii=False)
+                items = []
+                for key, value in new_params.items():
+                    items.append(f'{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}')
+                json_fragment = '{' + ', '.join(items)
                 
                 calls.append(ToolCallItem(
                     tool_index=self.current_tool_id,
