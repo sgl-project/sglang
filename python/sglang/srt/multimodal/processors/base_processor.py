@@ -155,6 +155,7 @@ class BaseMultimodalProcessor(ABC):
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
 
+
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 4))
         )
@@ -249,8 +250,15 @@ class BaseMultimodalProcessor(ABC):
         from decord import VideoReader, cpu
 
         # Before processing inputs
-        if not image_data or len(image_data) == 0:
+        num_images = len(image_data) if image_data else 0
+        if not image_data or num_images == 0:
             return []
+        if num_images > self.server_args.max_num_image:
+            raise ValueError(
+                f"The number of images in the request ({num_images}) "
+                f"exceeds the configured limit ({self.server_args.max_num_image}). "
+                f"Please reduce the number of images or increase the '--max-num-images' server argument."
+            )
         estimated_frames_list = []
         for image in image_data:
             if isinstance(image, str) and image.startswith("video:"):

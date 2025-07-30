@@ -1810,6 +1810,12 @@ class ServerArgs:
             action="store_true",
             help="Disable mmap while loading weight using safetensors.",
         )
+        parser.add_argument(
+            "--max-num-images",
+            type=int,
+            default=ServerArgs.max_num_image,
+            help="The maximum number of images allowed in a single multimodal request to prevent OOM errors.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
