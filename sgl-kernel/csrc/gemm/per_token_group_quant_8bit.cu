@@ -1,5 +1,4 @@
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/util/Float8_e4m3fn.h>
 #include <cuda_fp8.h>
 
 #include <cmath>
