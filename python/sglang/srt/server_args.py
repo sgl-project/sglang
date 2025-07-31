@@ -448,6 +448,11 @@ class ServerArgs:
                 self.quantization == "modelopt_fp4"
             ), "modelopt_fp4 quantization is required for Flashinfer MOE"
             os.environ["TRTLLM_ENABLE_PDL"] = "1"
+            if self.enable_ep_moe:
+                self.ep_size = self.tp_size
+                logger.warning(
+                    f"Flashinfer cutlass MoE and EP MoE are enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+                )
 
         if self.enable_flashinfer_trtllm_moe:
             assert self.enable_ep_moe, "EP MoE is required for Flashinfer TRTLLM MOE"
@@ -1483,7 +1488,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-storage-backend",
             type=str,
-            choices=["file", "mooncake", "hf3fs"],
+            choices=["file", "mooncake", "hf3fs", "nixl"],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache.",
         )
