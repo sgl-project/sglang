@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
-from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import HiCacheHF3FS
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +261,9 @@ class HiCacheController:
                 self.storage_backend = HiCacheFile()
             elif storage_backend == "hf3fs":
                 from sglang.srt.distributed import get_tensor_model_parallel_rank
+                from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import (
+                    HiCacheHF3FS,
+                )
 
                 rank = get_tensor_model_parallel_rank()
                 bytes_per_page = (
