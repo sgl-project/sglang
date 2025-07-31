@@ -40,6 +40,71 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ 
   }
 }
 
+inline void copy_stub(float* __restrict__ out, const int32_t* __restrict__ input, const int32_t* __restrict__ bcomp, const float* __restrict__ Bs, int64_t size, float scale) {
+  using fVec = at::vec::Vectorized<float>;
+  using iVec = at::vec::Vectorized<int32_t>;
+  constexpr int kVecSizef = fVec::size();
+  constexpr int kVecSizei = iVec::size();
+
+  int64_t d;
+  #pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSizei; d += kVecSizei) {
+    iVec input_vec = iVec::loadu(input + d);
+    iVec bcomp_vec = iVec::loadu(bcomp + d);
+    fVec bs_vec = fVec::loadu(Bs + d);
+    fVec scale_vec = fVec(scale);
+    fVec data = convert<float>(input_vec - bcomp_vec) * scale_vec * bs_vec;
+    data.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = static_cast<float>((input[d]-bcomp[d]) * scale * Bs[d]);
+  }
+}
+
+template <typename scalar_t>
+inline void copy_silu_mul_stub(scalar_t* __restrict__ out, const int32_t* __restrict__ input0,
+  const int32_t* __restrict__ input1, const int32_t* __restrict__ bcomp0, const int32_t* __restrict__ bcomp1,
+  const float* __restrict__ Bs0, const float* __restrict__ Bs1, int64_t size, float scale) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  using iVec = at::vec::Vectorized<int32_t>;
+  constexpr int kVecSize = bVec::size();
+  constexpr int kVecSizef = fVec::size();
+  constexpr int kVecSizei = iVec::size();
+  const fVec one = fVec(1.f);
+
+  int64_t d;
+  #pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    iVec input0_vec0 = iVec::loadu(input0 + d);
+    iVec input0_vec1 = iVec::loadu(input0 + d + kVecSizei);
+    iVec bcomp0_vec0 = iVec::loadu(bcomp0 + d);
+    iVec bcomp0_vec1 = iVec::loadu(bcomp0 + d + kVecSizei);
+    fVec bs0_vec0 = fVec::loadu(Bs0 + d);
+    fVec bs0_vec1 = fVec::loadu(Bs0 + d + kVecSizef);
+    fVec scale_vec = fVec(scale);
+    fVec res0_vec0 = convert<float>(input0_vec0 - bcomp0_vec0) * scale_vec * bs0_vec0;
+    fVec res0_vec1 = convert<float>(input0_vec1 - bcomp0_vec1) * scale_vec * bs0_vec1;
+    iVec input1_vec0 = iVec::loadu(input1 + d);
+    iVec input1_vec1 = iVec::loadu(input1 + d + kVecSizei);
+    iVec bcomp1_vec0 = iVec::loadu(bcomp1 + d);
+    iVec bcomp1_vec1 = iVec::loadu(bcomp1 + d + kVecSizei);
+    fVec bs1_vec0 = fVec::loadu(Bs1 + d);
+    fVec bs1_vec1 = fVec::loadu(Bs1 + d + kVecSizef);
+    fVec res1_vec0 = convert<float>(input1_vec0 - bcomp1_vec0) * scale_vec * bs1_vec0;
+    fVec res1_vec1 = convert<float>(input1_vec1 - bcomp1_vec1) * scale_vec * bs1_vec1;
+    fVec data0 = res0_vec0 / (one + res0_vec0.neg().exp_u20()) * res1_vec0;
+    fVec data1 = res0_vec1 / (one + res0_vec1.neg().exp_u20()) * res1_vec1;
+    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
+    out_vec.store(out + d);
+  }
+  for (; d < size; ++d) {
+    float res0 = static_cast<float>(input0[d] - bcomp0[d]) * scale * Bs0[d];
+    float res1 = static_cast<float>(input1[d] - bcomp1[d]) * scale * Bs1[d];
+    out[d] = static_cast<scalar_t>(res0 / (1 + std::exp(-res0)) * res1);
+  }
+}
+
 // acc from [topk, K] to [K]
 template <typename scalar_t>
 inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t topk, int64_t K) {
@@ -259,12 +324,39 @@ struct tinygemm_kernel_vnni<at::BFloat16, BLOCK_M, BLOCK_N> {
       ldb,                                                 \
       ldc);
 
+
+template <typename scalar_t>
+struct brgemm2 {
+  static inline void apply(
+      const uint8_t* __restrict__ A, const int8_t* __restrict__ B0, const int8_t* __restrict__ B1,
+      scalar_t* __restrict__ C, int32_t* __restrict__ Ctmp0, int32_t* __restrict__ Ctmp1,
+      const int32_t* __restrict__ Bcomp0, const int32_t* __restrict__ Bcomp1, const float* __restrict__ As,
+      const float* __restrict__ Bs0, const float* __restrict__ Bs1, int64_t M, int64_t N, int64_t K,
+      int64_t lda, int64_t ldb, int64_t ldc) {
+
+    constexpr int BLOCK_N = block_size_n();
+    at::native::cpublas::brgemm(M, N, K, lda, ldb, BLOCK_N, /* add_C */false, A, B0, Ctmp0);
+    at::native::cpublas::brgemm(M, N, K, lda, ldb, BLOCK_N, /* add_C */false, A, B1, Ctmp1);
+
+    // copy from Ctmp to C
+    for (int64_t m = 0; m < M; ++m) {
+      float as = As[m];
+      copy_silu_mul_stub(
+          C + m * ldc, Ctmp0 + m * BLOCK_N, Ctmp1 + m * BLOCK_N,
+          Bcomp0, Bcomp1, Bs0, Bs1, N, as);
+    }
+  }
+};
+
+
 template <typename scalar_t>
 void tinygemm_kernel(
     const uint8_t* __restrict__ A,
     const int8_t* __restrict__ B0,
     const int8_t* __restrict__ B1,
     scalar_t* __restrict__ C,
+    int32_t* __restrict__ Ctmp0,
+    int32_t* __restrict__ Ctmp1,
     const float* __restrict__ As,
     const float* __restrict__ Bs0,
     const float* __restrict__ Bs1,
@@ -273,9 +365,16 @@ void tinygemm_kernel(
     int64_t K,
     int64_t lda,
     int64_t ldb,
-    int64_t ldc) {
+    int64_t ldc,
+    bool brg) {
+
   const int32_t* Bcomp0 = reinterpret_cast<const int32_t*>(B0 + block_size_n() * K);
   const int32_t* Bcomp1 = reinterpret_cast<const int32_t*>(B1 + block_size_n() * K);
+
+  if (brg) {
+    brgemm2<scalar_t>::apply(A, B0, B1, C, Ctmp0, Ctmp1, Bcomp0, Bcomp1, As, Bs0, Bs1, M, N, K, lda, ldb, ldc);
+    return;
+  }
 
   // pattern: 1-(2+2)-(8+8)
   constexpr int64_t BLOCK_M = 4;
@@ -418,10 +517,32 @@ struct tinygemm_kernel_vnni2<at::BFloat16, BLOCK_M, BLOCK_N> {
       ldc);
 
 template <typename scalar_t>
+struct brgemm {
+  static inline void apply(
+      const uint8_t* __restrict__ A, const int8_t* __restrict__ B, float* __restrict__ C,
+      int32_t* __restrict__ Ctmp, const int32_t* __restrict__ Bcomp, const float* __restrict__ As,
+      const float* __restrict__ Bs, int64_t M, int64_t N, int64_t K, int64_t lda, int64_t ldb,
+      int64_t ldc) {
+
+    constexpr int BLOCK_N = block_size_n();
+    at::native::cpublas::brgemm(
+        M, N, K, lda, ldb, BLOCK_N, /* add_C */false,
+        A, B, Ctmp);
+
+    // copy from Ctmp to C
+    for (int64_t m = 0; m < M; ++m) {
+      float as = As[m];
+      copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, Bcomp, Bs, N, as);
+    }
+  }
+};
+
+template <typename scalar_t>
 void tinygemm_kernel(
     const uint8_t* __restrict__ A,
     const int8_t* __restrict__ B,
     float* __restrict__ C,
+    int32_t* __restrict__ Ctmp,
     const float* __restrict__ As,
     const float* __restrict__ Bs,
     int64_t M,
@@ -429,10 +550,15 @@ void tinygemm_kernel(
     int64_t K,
     int64_t lda,
     int64_t ldb,
-    int64_t ldc) {
+    int64_t ldc,
+    bool brg) {
+
   // B compensation
   const int32_t* Bcomp = reinterpret_cast<const int32_t*>(B + block_size_n() * K);
-
+  if (brg) {
+    brgemm<scalar_t>::apply(A, B, C, Ctmp, Bcomp, As, Bs, M, N, K, lda, ldb, ldc);
+    return;
+  }
   // pattern: 1-4-16
   constexpr int64_t BLOCK_M = 4;
   constexpr int64_t BLOCK_N = 64;
@@ -515,6 +641,9 @@ void fused_experts_int8_kernel_impl(
 
   const int64_t stride_e = 2 * N * packed_K;
   const int64_t stride_n = packed_K;
+
+  const bool use_brgemm = M > 4;
+
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
   at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
     // get local pointers
@@ -522,6 +651,9 @@ void fused_experts_int8_kernel_impl(
     uint8_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
 
     alignas(64) float As[BLOCK_M];
+    // for brgemm, use int32_t for accumulate
+    alignas(64) int32_t Ctmp0[BLOCK_M * BLOCK_N];
+    alignas(64) int32_t Ctmp1[BLOCK_M * BLOCK_N];
 
     for (int64_t i = begin; i < end; ++i) {
       int64_t mb = i / NB;
@@ -555,6 +687,8 @@ void fused_experts_int8_kernel_impl(
           /* B0    */ B0,
           /* B1    */ B1,
           /* C     */ ic1 + offset * N + nb * BLOCK_N,
+          /* Ctmp0 */ Ctmp0,
+          /* Ctmp1 */ Ctmp1,
           /* As    */ As,
           /* Bs0   */ Bs0,
           /* Bs1   */ Bs1,
@@ -563,7 +697,8 @@ void fused_experts_int8_kernel_impl(
           /* K     */ K,
           /* lda   */ K,
           /* ldb   */ n_size,
-          /* ldc   */ N);
+          /* ldc   */ N,
+          /* brg   */ use_brgemm);
     }
   });
 
@@ -589,6 +724,8 @@ void fused_experts_int8_kernel_impl(
     int tid = at::get_thread_num();
     // we won't be using C1 for gemm2
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
+    // for brgemm, use int32_t for accumulate
+    alignas(64) int32_t Ctmp2[BLOCK_M * BLOCK_N];
 
     for (int64_t i = begin; i < end; ++i) {
       int64_t mb = i / NB2;
@@ -613,6 +750,7 @@ void fused_experts_int8_kernel_impl(
           /* A     */ A,
           /* B     */ B,
           /* C     */ C,
+          /* Ctmp  */ Ctmp2,
           /* As    */ As,
           /* Bs    */ Bs,
           /* M     */ m_size,
@@ -620,7 +758,8 @@ void fused_experts_int8_kernel_impl(
           /* K     */ IC,
           /* lda   */ IC,
           /* ldb   */ n_size,
-          /* ldc   */ BLOCK_N);
+          /* ldc   */ BLOCK_N,
+          /* brg   */ use_brgemm);
 
       // 2.b copy from C to ic2 in original order
       //   and also mul topk_weights in float32
@@ -708,8 +847,12 @@ void shared_expert_int8_kernel_impl(
   const int64_t packed_N = get_row_size<int8_t>(N);
   const int64_t stride_n = packed_K;
 
+  const bool use_brgemm = M > 4;
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
   at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
+    // for brgemm, use int32_t for accumulate
+    alignas(64) int32_t Ctmp0[BLOCK_M * BLOCK_N];
+    alignas(64) int32_t Ctmp1[BLOCK_M * BLOCK_N];
     for (int64_t i = begin; i < end; ++i) {
       int64_t mb = i / NB;
       int64_t nb = i % NB;
@@ -735,6 +878,8 @@ void shared_expert_int8_kernel_impl(
           /* B0    */ B0,
           /* B1    */ B1,
           /* C     */ ic1 + mb * BLOCK_M * N + nb * BLOCK_N,
+          /* Ctmp0 */ Ctmp0,
+          /* Ctmp1 */ Ctmp1,
           /* As    */ As,
           /* Bs0   */ Bs0,
           /* Bs1   */ Bs1,
@@ -743,7 +888,8 @@ void shared_expert_int8_kernel_impl(
           /* K     */ K,
           /* lda   */ K,
           /* ldb   */ n_size,
-          /* ldc   */ N);
+          /* ldc   */ N,
+          /* brg   */ use_brgemm);
     }
   });
 
@@ -768,6 +914,8 @@ void shared_expert_int8_kernel_impl(
     int tid = at::get_thread_num();
     // we won't be using C1 for gemm2
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
+    // for brgemm, use int32_t for accumulate
+    alignas(64) int32_t Ctmp2[BLOCK_M * BLOCK_N];
 
     for (int64_t i = begin; i < end; ++i) {
       int64_t mb = i / NB2;
@@ -789,6 +937,7 @@ void shared_expert_int8_kernel_impl(
           /* A     */ A,
           /* B     */ B,
           /* C     */ C,
+          /* Ctmp  */ Ctmp2,
           /* As    */ As,
           /* Bs    */ Bs,
           /* M     */ m_size,
@@ -796,7 +945,8 @@ void shared_expert_int8_kernel_impl(
           /* K     */ IC,
           /* lda   */ IC,
           /* ldb   */ n_size,
-          /* ldc   */ BLOCK_N);
+          /* ldc   */ BLOCK_N,
+          /* brg   */ use_brgemm);
 
       // 2.b copy from C to output and add fused_experts_out
       scalar_t* __restrict__ out = output + mb * BLOCK_M * K + nb * BLOCK_N;

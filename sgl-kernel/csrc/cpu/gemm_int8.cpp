@@ -3,7 +3,65 @@
 #include "vec.h"
 
 namespace {
+template <typename scalar_t>
+inline void copy_stub(scalar_t* __restrict__ out, const int32_t* __restrict__ input, const int32_t* __restrict__ bcomp, const float* __restrict__ Bs, int64_t size, float scale) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  using iVec = at::vec::Vectorized<int32_t>;
+  constexpr int kVecSize = bVec::size();
+  constexpr int kVecSizef = fVec::size();
+  constexpr int kVecSizei = iVec::size();
 
+  int64_t d;
+  #pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    iVec input_vec0 = iVec::loadu(input + d);
+    iVec input_vec1 = iVec::loadu(input + d + kVecSizei);
+    iVec bcomp_vec0 = iVec::loadu(bcomp + d);
+    iVec bcomp_vec1 = iVec::loadu(bcomp + d + kVecSizei);
+    fVec bs_vec0 = fVec::loadu(Bs + d);
+    fVec bs_vec1 = fVec::loadu(Bs + d + kVecSizef);
+    fVec scale_vec = fVec(scale);
+    fVec data0 = convert<float>(input_vec0 - bcomp_vec0) * scale_vec * bs_vec0;
+    fVec data1 = convert<float>(input_vec1 - bcomp_vec1) * scale_vec * bs_vec1;
+    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
+    out_vec.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = static_cast<scalar_t>((input[d]-bcomp[d]) * scale * Bs[d]);
+  }
+}
+
+template <typename scalar_t>
+inline void copy_add_stub(scalar_t* __restrict__ out, const int32_t* __restrict__ input, const int32_t* __restrict__ bcomp, const float* __restrict__ Bs, const float* __restrict__ bias, int64_t size, float scale) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  using iVec = at::vec::Vectorized<int32_t>;
+  constexpr int kVecSize = bVec::size();
+  constexpr int kVecSizef = fVec::size();
+  constexpr int kVecSizei = iVec::size();
+
+  int64_t d;
+  #pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    iVec input_vec0 = iVec::loadu(input + d);
+    iVec input_vec1 = iVec::loadu(input + d + kVecSizei);
+    iVec bcomp_vec0 = iVec::loadu(bcomp + d);
+    iVec bcomp_vec1 = iVec::loadu(bcomp + d + kVecSizei);
+    fVec bs_vec0 = fVec::loadu(Bs + d);
+    fVec bs_vec1 = fVec::loadu(Bs + d + kVecSizef);
+    fVec scale_vec = fVec(scale);
+    fVec bias_vec0 = fVec::loadu(bias + d);
+    fVec bias_vec1 = fVec::loadu(bias + d + kVecSizef);
+    fVec data0 = convert<float>(input_vec0 - bcomp_vec0) * scale_vec * bs_vec0 + bias_vec0;
+    fVec data1 = convert<float>(input_vec1 - bcomp_vec1) * scale_vec * bs_vec1 + bias_vec1;
+    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
+    out_vec.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = static_cast<scalar_t>((input[d]-bcomp[d]) * scale * Bs[d]);
+  }
+}
 template <typename scalar_t, bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn {
   static inline void apply(
@@ -151,6 +209,31 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
       ldc);
 
 template <typename scalar_t, bool has_bias>
+struct brgemm {
+  static inline void apply(
+      const uint8_t* __restrict__ A, const int8_t* __restrict__ B, scalar_t* __restrict__ C,
+      int32_t* __restrict__ Ctmp, const int32_t* __restrict__ Bcomp, const float* __restrict__ As, const float* __restrict__ Bs,
+      const float* __restrict__ bias, int64_t M, int64_t N, int64_t K, int64_t lda, int64_t ldb,
+      int64_t ldc) {
+
+    constexpr int BLOCK_N = block_size_n();
+    at::native::cpublas::brgemm(
+        M, N, K, lda, ldb, BLOCK_N, /* add_C */false,
+        A, B, Ctmp);
+
+    // copy from Ctmp to C
+    for (int64_t m = 0; m < M; ++m) {
+      float as = As[m];
+      if constexpr (has_bias) {
+        copy_add_stub(C + m * ldc, Ctmp + m * BLOCK_N, Bcomp, Bs, bias, N, as);
+      } else {
+        copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, Bcomp, Bs, N, as);
+      }
+    }
+  }
+};
+
+template <typename scalar_t, bool has_bias>
 void tinygemm_kernel(
     const uint8_t* __restrict__ A,
     const int8_t* __restrict__ B,
@@ -168,6 +251,11 @@ void tinygemm_kernel(
     bool brg) {
   // B compensation
   const int32_t* Bcomp = reinterpret_cast<const int32_t*>(B + block_size_n() * K);
+  if (brg) {
+    brgemm<scalar_t, has_bias>::apply(A, B, C, Ctmp, Bcomp, As, Bs, bias, M, N, K, lda, ldb, ldc);
+    return;
+  }
+
 
   // pattern: 1-4-16
   constexpr int64_t BLOCK_M = 4;
@@ -233,22 +321,23 @@ void int8_scaled_mm_kernel_impl(
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
 
-  // TODO: brgemm u8s8 depends on PyTorch 2.7 release.
-  const bool use_brgemm = false;
+  // TODO: find this threshold
+  const bool use_brgemm = M > 4;
 
   // K + 4 after compensation
   const int64_t packed_row_size = get_row_size<int8_t>(K);
 
+  // l2 cache block for n
+  int64_t cache_blocks_nb = get_cache_blocks<scalar_t>(BLOCK_N, K);
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
-    at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
-      int64_t mb{0}, nb{0};
-      data_index_init(begin, mb, MB, nb, NB);
+    parallel_2d(MB, NB, [&](int64_t begin_mb, int64_t end_mb, int64_t begin_nb, int64_t end_nb) {
 
       // for brgemm, use int32_t for accumulate
       alignas(64) int32_t Ctmp[BLOCK_M * BLOCK_N];
 
-      for (int i = begin; i < end; ++i) {
-        UNUSED(i);
+      for (int64_t nbb = begin_nb; nbb < end_nb; nbb += cache_blocks_nb) {
+      for (int64_t mb = begin_mb; mb < end_mb; ++mb) {
+      for (int64_t nb = nbb; nb < std::min(nbb + cache_blocks_nb, end_nb); ++nb) {
         int mb_start = mb * BLOCK_M;
         int mb_size = std::min(M - mb_start, BLOCK_M);
         int nb_start = nb * BLOCK_N;
@@ -270,10 +359,7 @@ void int8_scaled_mm_kernel_impl(
             /* ldc */ N,
             /* brg */ use_brgemm);
 
-        // move to the next index
-        data_index_step(mb, MB, nb, NB);
-      }
-
+      }}}
       if (use_brgemm) {
         at::native::cpublas::brgemm_release();
       }
