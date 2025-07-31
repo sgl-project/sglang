@@ -110,10 +110,10 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         self.language_model = Qwen2ForCausalLM(
             config.text_config, quant_config, prefix=add_prefix("model", prefix)
         )
+        self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return self.pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # Extract audio features from input items
