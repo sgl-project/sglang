@@ -138,7 +138,7 @@ class TestTorchNativeAttnBackend(CustomTestCase):
         # Set environment variable to disable AMX to test torch_native backend
         import os
 
-        os.environ["DISABLE_AMX"] = "1"
+        os.environ["SGLANG_CPU_DISABLE_AMX"] = "1"
 
     def test_latency(self):
         prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
