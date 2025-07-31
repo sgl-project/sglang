@@ -86,7 +86,7 @@ class W4A8MacheteConfig(QuantizationConfig):
         raise NotImplementedError
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> MoeWNA16Config:
+    def from_config(cls, config: Dict[str, Any]) -> "W4A8MacheteConfig":
         quant_method = cls.get_from_keys(config, ["quant_method"])
         weight_bits = cls.get_from_keys(config, ["bits"])
         group_size = cls.get_from_keys(config, ["group_size"])
