@@ -582,11 +582,6 @@ def moe_align_block_size(
     cumsum_buffer = torch.empty(
         (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
     )
-    token_cnts_buffer = torch.empty(
-        (num_experts + 1) * num_experts,
-        dtype=torch.int32,
-        device=topk_ids.device,
-    )
 
     # Threshold based on benchmark results
     fuse_sorted_ids_padding = sorted_ids.shape[0] <= 4096
@@ -600,7 +595,6 @@ def moe_align_block_size(
         sorted_ids,
         expert_ids,
         num_tokens_post_pad,
-        token_cnts_buffer,
         cumsum_buffer,
         fuse_sorted_ids_padding,
     )
