@@ -1221,11 +1221,12 @@ def should_use_tensor_core(
     # Calculate GQA group size
     gqa_group_size = num_attention_heads // num_kv_heads
 
-    # Determine based on dtype and GQA group size
+    # Determine based on dtype and GQA group size. Because Flashinfer fuses head group
+    # with seq dim in mma, too small a group size leads to excessive padding.
     if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         return True
     elif kv_cache_dtype in (torch.float16, torch.half, torch.bfloat16):
-        return gqa_group_size > 4
+        return gqa_group_size >= 4
     else:
         return False
 
