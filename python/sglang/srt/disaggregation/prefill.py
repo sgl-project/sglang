@@ -160,6 +160,7 @@ class PrefillBootstrapQueue:
             pp_rank=self.pp_rank,
         )
         self._process_req(req)
+        req.add_latency("prefill_prepare")
         self.queue.append(req)
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
@@ -244,6 +245,8 @@ class PrefillBootstrapQueue:
 
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+
+            req.add_latency("prefill_bootstrap")
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
 
@@ -392,6 +395,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
+                req.add_latency("prefill_forward")
                 self.disagg_prefill_inflight_queue.append(req)
                 if logits_output.hidden_states is not None:
                     last_hidden_index = (
@@ -522,6 +526,7 @@ class SchedulerDisaggregationPrefillMixin:
         )
         for req in done_reqs:
             req: Req
+            req.add_latency("prefill_transfer_kv_cache")
             self.req_to_metadata_buffer_idx_allocator.free(req.metadata_buffer_index)
             req.metadata_buffer_index = -1
 

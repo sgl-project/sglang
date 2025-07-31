@@ -244,6 +244,7 @@ class DecodePreallocQueue:
                 data_parallel_rank=req.data_parallel_rank,
             )
 
+            req.add_latency("decode_prepare")
             self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
             )
@@ -407,6 +408,7 @@ class DecodePreallocQueue:
                 kv_indices, self.token_to_kv_pool_allocator.page_size
             )
             decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
+            decode_req.req.add_latency("decode_bootstrap")
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
 
@@ -646,6 +648,7 @@ class DecodeTransferQueue:
         for i in indices_to_remove:
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
+            self.queue[i].req.add_latency("decode_transferred")
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [
@@ -837,6 +840,7 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
+                req.add_latency("decode_waiting")
                 req.init_next_round_input(self.tree_cache)
             else:
                 waiting_queue.append(req)

@@ -35,6 +35,7 @@ import copy
 import dataclasses
 import logging
 import threading
+import time
 from enum import Enum, auto
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
@@ -59,7 +60,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.metrics.collector import TimeStats
+from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -435,6 +436,7 @@ class Req:
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
+        metrics_collector: Optional[SchedulerMetricsCollector] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -589,10 +591,12 @@ class Req:
         self.spec_verify_ct = 0
 
         # For metrics
+        self.metrics_collector = metrics_collector
         self.time_stats: TimeStats = TimeStats()
         self.has_log_time_stats: bool = False
         self.queue_time_start = None
         self.queue_time_end = None
+        self.last_tic = time.monotonic()
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -619,6 +623,15 @@ class Req:
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
+
+    def add_latency(self, name: str):
+        if self.metrics_collector is None:
+            return
+        now = time.monotonic()
+        self.metrics_collector.observe_request_latency_seconds(
+            name, now - self.last_tic
+        )
+        self.last_tic = now
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
