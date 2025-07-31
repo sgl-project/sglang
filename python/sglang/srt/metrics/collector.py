@@ -153,7 +153,7 @@ class SchedulerStats:
     spec_accept_length: float = 0.0
 
     # PD disaggregation
-    num_prefill_prealloc_queue_reqs: int = 0
+    num_prefill_bootstrap_queue_reqs: int = 0
     num_prefill_inflight_queue_reqs: int = 0
     num_decode_prealloc_queue_reqs: int = 0
     num_decode_transfer_queue_reqs: int = 0
@@ -252,13 +252,28 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
-        # PD disaggregation
-        self.num_prefill_prealloc_queue_reqs = Gauge(
-            name="sglang:num_prefill_prealloc_queue_reqs",
-            documentation="The number of requests in the prefill prealloc queue.",
+        self.avg_request_queue_latency = Gauge(
+            name="sglang:avg_request_queue_latency",
+            documentation="The average request queue latency for the last batch of requests in seconds.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+
+        self.total_retracted_reqs = Gauge(
+            name="sglang:total_retracted_reqs",
+            documentation="The total number of retracted requests due to kvcache full.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        # Disaggregation queue metrics
+        self.num_prefill_bootstrap_queue_reqs = Gauge(
+            name="sglang:num_prefill_bootstrap_queue_reqs",
+            documentation="The number of requests in the prefill bootstrap queue.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
         self.num_prefill_inflight_queue_reqs = Gauge(
             name="sglang:num_prefill_inflight_queue_reqs",
             documentation="The number of requests in the prefill inflight queue.",
@@ -539,13 +554,17 @@ class SchedulerMetricsCollector:
             self.num_running_reqs_offline_batch, stats.num_running_reqs_offline_batch
         )
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
+        self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
+        self._log_gauge(self.total_retracted_reqs, stats.total_retracted_reqs)
+        self._log_gauge(self.avg_request_queue_latency, stats.avg_request_queue_latency)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
 
         # PD disaggregation
         self._log_gauge(
-            self.num_prefill_prealloc_queue_reqs, stats.num_prefill_prealloc_queue_reqs
+            self.num_prefill_bootstrap_queue_reqs,
+            stats.num_prefill_bootstrap_queue_reqs,
         )
         self._log_gauge(
             self.num_prefill_inflight_queue_reqs, stats.num_prefill_inflight_queue_reqs
