@@ -204,14 +204,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
 
-        from sglang.srt.layers.moe.ep_moe.layer import EPMoE
-
-        if isinstance(layer, EPMoE):
-            return layer.run_moe(
-                hidden_states=x,
-                topk_output=topk_output,
-            )
-
         return self.forward(
             x=x,
             layer=layer,

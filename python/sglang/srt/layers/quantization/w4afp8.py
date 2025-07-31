@@ -276,6 +276,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer: EPMoE,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        **kwargs,
     ) -> torch.Tensor:
 
         # TODO(ch-wan): move it out of this class
