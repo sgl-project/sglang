@@ -671,7 +671,7 @@ class ModelRunner:
             self.sliding_window_size = self.model.get_attention_sliding_window_size()
         elif self.model_config.attention_chunk_size is not None:
             self.sliding_window_size = self.model_config.attention_chunk_size
-            print(
+            logger.info(
                 f"Setting sliding_window_size to be attention_chunk_size: {self.sliding_window_size}"
             )
 
