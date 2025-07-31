@@ -26,7 +26,7 @@ class TestHiCache(CustomTestCase):
                 "--mem-fraction-static",
                 0.7,
                 "--hicache-size",
-                50,
+                100,
                 "--page-size",
                 "64",
                 "--hicache-storage-backend",
