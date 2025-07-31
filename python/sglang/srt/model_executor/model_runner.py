@@ -436,6 +436,7 @@ class ModelRunner:
                     "triton",
                     "flashmla",
                     "cutlass_mla",
+                    "trtllm_mla",
                     "ascend",
                 ]:
                     logger.info(
@@ -1437,6 +1438,12 @@ class ModelRunner:
             )
 
             return CutlassMLABackend(self)
+        elif self.server_args.attention_backend == "trtllm_mla":
+            if not self.use_mla_backend:
+                raise ValueError("trtllm_mla backend can only be used with MLA models.")
+            from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+
+            return TRTLLMMLABackend(self)
         elif self.server_args.attention_backend == "intel_amx":
             from sglang.srt.layers.attention.intel_amx_backend import (
                 IntelAMXAttnBackend,
