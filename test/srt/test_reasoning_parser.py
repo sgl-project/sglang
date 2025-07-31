@@ -147,6 +147,45 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "reasoning")
         self.assertEqual(result.normal_text, "normal")
 
+    def test_parse_streaming_increment_mixed_content_chunks(self):
+        """Test streaming parse with mixed content in multiple chunks."""
+        chunks = ["<think>", "reasoning", "</think>", "some text"]
+
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk)
+            all_reasoning += result.reasoning_text
+            all_normal += result.normal_text
+
+        self.assertEqual(all_reasoning, "reasoning")
+        self.assertEqual(all_normal, "some text")
+
+    def test_parse_streaming_increment_mixed_content_chunks_with_xml_tags(self):
+        """Test streaming parse with mixed content in multiple chunks."""
+        chunks = [
+            "<think>",
+            "reasoning",
+            "</think>",
+            "<",
+            "MY_TOOL",
+            ">",
+            "text",
+            "</",
+            "MY_TOOL",
+            ">",
+        ]
+
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk)
+            all_reasoning += result.reasoning_text
+            all_normal += result.normal_text
+
+        self.assertEqual(all_reasoning, "reasoning")
+        self.assertEqual(all_normal, "<MY_TOOL>text</MY_TOOL>")
+
 
 class TestDeepSeekR1Detector(CustomTestCase):
     def setUp(self):
