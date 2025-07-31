@@ -69,6 +69,7 @@ class RequestFuncInput:
     api_url: str
     prompt_len: int
     output_len: int
+    cached_tokens: int
     model: str
     lora_name: str
     image_data: str
