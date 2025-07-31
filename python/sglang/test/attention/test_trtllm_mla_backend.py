@@ -1,5 +1,6 @@
 import unittest
 
+import math
 import numpy as np
 import torch
 
@@ -11,6 +12,7 @@ _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
+from sglang.srt.layers.attention.flashinfer_mla_backend import TRITON_PAD_NUM_PAGE_PER_BLOCK
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,
@@ -739,12 +741,13 @@ class TestTRTLLMMLA(CustomTestCase):
                     f"Total tokens ({total_tokens}) should cover sequence length ({scenario['seq_len']})",
                 )
 
-                # Should satisfy TRT-LLM constraint (128 / page_size)
+                # Should satisfy TRT-LLM and Triton constraints
                 trtllm_constraint = 128 // scenario["page_size"]
+                constraint_lcm = math.lcm(trtllm_constraint, TRITON_PAD_NUM_PAGE_PER_BLOCK)
                 self.assertEqual(
-                    calculated_blocks % trtllm_constraint,
+                    calculated_blocks % constraint_lcm,
                     0,
-                    f"Block count should be multiple of TRT-LLM constraint ({trtllm_constraint})",
+                    f"Block count should be multiple of LCM of constraints ({constraint_lcm})",
                 )
 
     def test_metadata_kv_indices_correctness(self):

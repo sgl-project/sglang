@@ -9,11 +9,11 @@
 | **Triton**               | ❌                | ✅                 | ✅      | ✅                 | ❌              |
 | **Torch Native**         | ❌                | ❌                 | ❌      | ❌                 | ❌              |
 | **FlashMLA**             | ✅                | ✅                 | ✅      | ❌                 | ❌              |
-| **TRTLLM MLA**           | ✅                | ❌*                | ✅      | ✅                 | ❌**            |
+| **TRTLLM MLA**           | ✅                | ❌                 | ✅      | ✅                 | ❌              |
 | **Ascend**               | ✅                | ❌                 | ❌      | ❌                 | ❌              |
 
 **Notes:**
-- \*\*TRTLLM MLA only implements decode operations. For prefill operations (including multimodal inputs), it falls back to FlashInfer MLA backend.
+- TRTLLM MLA only implements decode operations. For prefill operations (including multimodal inputs), it falls back to FlashInfer MLA backend.
 
 Note: Every kernel backend is compatible with a page size > 1 by specifying an argument such as `--page-size 16`.
 This is because a page size of 16 can be converted to a page size of 1 in the kernel backend.
