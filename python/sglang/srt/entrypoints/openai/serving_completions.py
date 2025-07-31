@@ -279,7 +279,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         request: CompletionRequest,
         raw_request: Request,
     ) -> Union[CompletionResponse, ErrorResponse, ORJSONResponse]:
-        """Handle non-streaming completion request"""
+        """Handle non-streaming completion request """
         try:
             generator = self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
