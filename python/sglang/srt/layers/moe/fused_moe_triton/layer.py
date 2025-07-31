@@ -259,7 +259,7 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
 
         w13_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts, 2 * intermediate_size, hidden_size, dtype=params_dtype
+                num_experts, 2 * intermediate_size, hidden_size, dtype=torch.float8_e5m2
             ),
             requires_grad=False,
         )
@@ -268,7 +268,7 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
 
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts, hidden_size, intermediate_size, dtype=params_dtype
+                num_experts, hidden_size, intermediate_size, dtype=torch.float8_e5m2
             ),
             requires_grad=False,
         )
@@ -297,9 +297,9 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
             layer.register_parameter("w2_bias", None)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        w1_weight_fp4, w1_weight_scale = quantize_to_mxfp4(layer.w13_weight.data[:, :self.intermediate_size, :])
-        w3_weight_fp4, w3_weight_scale = quantize_to_mxfp4(layer.w13_weight.data[:, self.intermediate_size:, :])
-        w2_weight_fp4, w2_weight_scale = quantize_to_mxfp4(layer.w2_weight.data)
+        w1_weight_fp4, w1_weight_scale = quantize_to_mxfp4(layer.w13_weight.data[:, :self.intermediate_size, :].to(torch.bfloat16))
+        w3_weight_fp4, w3_weight_scale = quantize_to_mxfp4(layer.w13_weight.data[:, self.intermediate_size:, :].to(torch.bfloat16))
+        w2_weight_fp4, w2_weight_scale = quantize_to_mxfp4(layer.w2_weight.data.to(torch.bfloat16))
 
         tmp_w13_weight = torch.cat([w1_weight_fp4, w3_weight_fp4], dim=1)  # (num_experts, 2 * intermediate_size, hidden_size // 2)
         tmp_w13_weight = torch.transpose(tmp_w13_weight, 1, 2).contiguous()  # (num_experts, hidden_size // 2, 2 * intermediate_size)
@@ -342,7 +342,6 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
             torch.cuda.empty_cache()
         layer.w13_weight_scale = tmp_w13_scale
         layer.w2_weight_scale = tmp_w2_scale
-        return
 
     def apply(
         self,
