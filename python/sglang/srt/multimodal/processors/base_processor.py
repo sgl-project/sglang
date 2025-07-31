@@ -192,7 +192,12 @@ class BaseMultimodalProcessor(ABC):
 
         # name of the feature filed
         # TODO: pass from processors
-        self.FEATURE_NAMES = ["pixel_values", "pixel_values_videos", "audio_features"]
+        self.FEATURE_NAMES = [
+            "pixel_values",
+            "pixel_values_videos",
+            "audio_features",
+            "input_features",
+        ]
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
