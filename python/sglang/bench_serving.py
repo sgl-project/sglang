@@ -28,6 +28,7 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
+import pandas as pd
 import aiohttp
 import numpy as np
 import requests
@@ -679,6 +680,16 @@ def get_dataset(args, tokenizer):
             apply_chat_template=args.apply_chat_template,
             random_sample=True,
         )
+    elif args.dataset_name == "burstgpt":
+        assert not tokenize_prompt
+        input_requests = sample_burstgpt_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            random_seed=args.seed,
+            tokenizer=tokenizer,
+            prompt_suffix=args.prompt_suffix,
+            apply_chat_template=args.apply_chat_template,
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     return input_requests
@@ -733,6 +744,7 @@ class BenchmarkMetrics:
 
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+BURSTGPT_URL = "https://huggingface.co/datasets/lzzmm/BurstGPT/resolve/main/data/BurstGPT_without_fails_1.csv"
 
 
 def download_and_cache_file(url: str, filename: Optional[str] = None):
@@ -791,6 +803,65 @@ class DatasetRow:
     prompt_len: int
     output_len: int
     image_data: Optional[str] = None
+
+
+def sample_burstgpt_requests(
+    dataset_path: str,
+    num_requests: int,
+    random_seed: int,
+    tokenizer: PreTrainedTokenizerBase,
+    prompt_suffix: Optional[str] = "",
+    apply_chat_template: bool = True,
+) -> List[DatasetRow]:
+
+    if not is_file_valid_json(dataset_path) and dataset_path == "":
+        dataset_path = download_and_cache_file(BURSTGPT_URL)
+
+    df = pd.read_csv(dataset_path)
+
+    gpt4_df = df[df["Model"] == "GPT-4"]
+    # Remove the failed requests (i.e., response length is 0)
+    gpt4_df = gpt4_df[gpt4_df["Response tokens"] > 0]
+    # Randomly sample num_requests from the dataset
+    if num_requests <= len(gpt4_df):
+        gpt4_df = gpt4_df.sample(n=num_requests, random_state=random_seed)
+    else:
+        gpt4_df = gpt4_df.sample(n=num_requests,
+                                 random_state=random_seed,
+                                 replace=True)
+    # Convert the dataframe to a list of tuples
+    dataset = gpt4_df.values.tolist()
+    input_requests = []
+    for i in range(num_requests):
+        input_len = int(dataset[i][2])
+        output_len = int(dataset[i][3])
+        prompt = tokenizer.decode([(i + j) % tokenizer.vocab_size
+                                   for j in range(input_len)])
+
+        if prompt_suffix:
+            prompt = (
+                remove_suffix(prompt, ASSISTANT_SUFFIX)
+                + prompt_suffix
+                + ASSISTANT_SUFFIX
+            )
+
+        if apply_chat_template:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            prompt = prompt.replace(tokenizer.bos_token, "")
+
+        input_requests.append(
+            DatasetRow(
+                prompt=prompt,
+                prompt_len=input_len,
+                output_len=output_len,
+                image_data=None,
+            )
+        )
+    return input_requests
 
 
 def sample_mmmu_requests(
@@ -1819,7 +1890,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "mmmu"],
+        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "mmmu", "burstgpt"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
