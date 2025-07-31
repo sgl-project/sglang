@@ -30,7 +30,7 @@ def rmsnorm(
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        Enabled by default on Hopper architecture.
+        Enabled by default on Hopper or later architectures.
 
     Returns
     -------
