@@ -1,6 +1,6 @@
+import math
 import unittest
 
-import math
 import numpy as np
 import torch
 
@@ -12,11 +12,11 @@ _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
-from sglang.srt.layers.attention.flashinfer_mla_backend import TRITON_PAD_NUM_PAGE_PER_BLOCK
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,
 )
+from sglang.srt.layers.attention.utils import TRITON_PAD_NUM_PAGE_PER_BLOCK
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -743,7 +743,9 @@ class TestTRTLLMMLA(CustomTestCase):
 
                 # Should satisfy TRT-LLM and Triton constraints
                 trtllm_constraint = 128 // scenario["page_size"]
-                constraint_lcm = math.lcm(trtllm_constraint, TRITON_PAD_NUM_PAGE_PER_BLOCK)
+                constraint_lcm = math.lcm(
+                    trtllm_constraint, TRITON_PAD_NUM_PAGE_PER_BLOCK
+                )
                 self.assertEqual(
                     calculated_blocks % constraint_lcm,
                     0,

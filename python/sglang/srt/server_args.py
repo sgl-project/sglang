@@ -24,6 +24,7 @@ import tempfile
 from typing import List, Literal, Optional, Union
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
@@ -403,6 +404,11 @@ class ServerArgs:
             self.page_size = 128
 
         if self.attention_backend == "trtllm_mla":
+            if not is_sm100_supported():
+                raise ValueError(
+                    "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
+                )
+
             if self.page_size not in [32, 64]:
                 logger.warning(
                     f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
