@@ -1118,7 +1118,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             n_group=layer.num_expert_group,
             topk_group=layer.topk_group,
             intermediate_size=layer.w2_weight.shape[2],
-            local_expert_offset=layer.ep_rank * layer.num_local_experts,
+            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             local_num_experts=layer.num_local_experts,
             routed_scaling_factor=routed_scaling_factor,
             tile_tokens_dim=get_tile_tokens_dim(

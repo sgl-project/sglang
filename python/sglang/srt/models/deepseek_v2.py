@@ -352,7 +352,6 @@ class DeepseekV2MoE(nn.Module):
                     renormalize=config.norm_topk_prob,
                     use_grouped_topk=True,
                     num_expert_group=config.n_group,
-                    num_fused_shared_experts=self.num_fused_shared_experts,
                     topk_group=config.topk_group,
                     correction_bias=self.gate.e_score_correction_bias,
                 )
