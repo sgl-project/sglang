@@ -94,6 +94,7 @@ class EAGLEWorker(TpModelWorker):
         
         # Accumulators for cross-batch statistics
         self.all_cold_probs_data = []
+        self.log_stats_call_count = 0
 
         # Override context length with target model's context length
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -955,6 +956,11 @@ class EAGLEWorker(TpModelWorker):
         
         # Accumulate data for cross-batch statistics
         self.all_cold_probs_data.extend(sum_of_cold_probs.cpu().tolist())
+        self.log_stats_call_count += 1
+        
+        # Log accumulated stats every 50 calls
+        if self.log_stats_call_count % 50 == 0:
+            self.log_accumulated_stats()
     
     def log_accumulated_stats(self):
         """Log statistics across all batches processed so far."""
