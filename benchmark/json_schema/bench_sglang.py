@@ -4,9 +4,9 @@ import time
 from typing import List, Tuple
 
 import jsonschema
-from datasets import load_dataset
 
 import sglang as sgl
+from datasets import load_dataset
 from sglang.global_config import global_config
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (

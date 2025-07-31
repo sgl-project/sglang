@@ -87,6 +87,7 @@ class TestROPE(CustomTestCase):
             rotary_dim: int,
             max_position_embeddings: int,
             base: int,
+            dims: int,
             is_neox_style: bool,
             dtype: torch.dtype,
             device: str,
@@ -117,6 +118,12 @@ class TestROPE(CustomTestCase):
                 dtype=dtype,
                 device=device,
             )
+            if dims == 3:
+                query = query.view(batch_size * seq_len, num_q_heads, head_size)
+                key = key.view(batch_size * seq_len, num_kv_heads, head_size)
+            elif dims == 4:
+                query = query.view(batch_size, seq_len, num_q_heads, head_size)
+                key = key.view(batch_size, seq_len, num_kv_heads, head_size)
 
             query_ref, key_ref = query.clone(), key.clone()
             query_cpu, key_cpu = query.clone(), key.clone()
@@ -138,12 +145,18 @@ class TestROPE(CustomTestCase):
             torch.testing.assert_close(key_ref_out, key_cpu_out, atol=1e-2, rtol=1e-2)
 
         test_config = [
-            (64, 64, 32, 8000, True, torch.bfloat16, "cpu", 32, 32, 1, 1),
-            (256, 128, 4096, 10000, True, torch.bfloat16, "cpu", 2, 512, 32, 8),
-            (512, 128, 311, 10000, True, torch.bfloat16, "cpu", 3, 39, 4, 2),
-            (128, 128, 2048, 10000, False, torch.bfloat16, "cpu", 2, 512, 32, 8),
-            (128, 128, 2048, 10000, False, torch.bfloat16, "cpu", 2, 512, 16, 4),
-            (512, 128, 311, 10000, False, torch.bfloat16, "cpu", 3, 39, 4, 2),
+            (64, 64, 32, 8000, 2, True, torch.bfloat16, "cpu", 32, 32, 1, 1),
+            (256, 128, 4096, 10000, 2, True, torch.bfloat16, "cpu", 2, 512, 32, 8),
+            (512, 128, 311, 10000, 2, True, torch.bfloat16, "cpu", 3, 39, 4, 2),
+            (128, 128, 2048, 10000, 2, False, torch.bfloat16, "cpu", 2, 512, 32, 8),
+            (128, 128, 2048, 10000, 2, False, torch.bfloat16, "cpu", 2, 512, 16, 4),
+            (512, 128, 311, 10000, 2, False, torch.bfloat16, "cpu", 3, 39, 4, 2),
+            (64, 64, 32, 8000, 4, True, torch.bfloat16, "cpu", 32, 32, 1, 1),
+            (256, 128, 4096, 10000, 4, True, torch.bfloat16, "cpu", 2, 512, 32, 8),
+            (512, 128, 311, 10000, 4, True, torch.bfloat16, "cpu", 3, 39, 4, 2),
+            (128, 128, 2048, 10000, 4, False, torch.bfloat16, "cpu", 2, 512, 32, 8),
+            (128, 128, 2048, 10000, 4, False, torch.bfloat16, "cpu", 2, 512, 16, 4),
+            (512, 128, 311, 10000, 4, False, torch.bfloat16, "cpu", 3, 39, 4, 2),
         ]
 
         for (
@@ -151,6 +164,7 @@ class TestROPE(CustomTestCase):
             rotary_dim,
             max_position_embeddings,
             base,
+            dims,
             is_neox_style,
             dtype,
             device,
@@ -164,6 +178,7 @@ class TestROPE(CustomTestCase):
                 rotary_dim,
                 max_position_embeddings,
                 base,
+                dims,
                 is_neox_style,
                 dtype,
                 device,

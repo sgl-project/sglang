@@ -115,6 +115,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
 
         if use_intel_amx_backend(layer):
+            if x.dim() == 3:
+                x = x.reshape(-1, x.shape[-1])
             return torch.ops.sgl_kernel.weight_packed_linear(
                 x, layer.weight, bias, True  # is_vnni
             )

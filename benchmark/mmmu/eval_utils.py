@@ -19,8 +19,9 @@ from data_utils import (
     load_yaml,
     process_single_sample,
 )
-from datasets import concatenate_datasets, load_dataset
 from tqdm import tqdm
+
+from datasets import concatenate_datasets, load_dataset
 
 
 @dataclasses.dataclass

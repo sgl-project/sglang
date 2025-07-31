@@ -134,6 +134,154 @@ void rmsnorm_kernel_impl(
 }
 
 template <typename scalar_t>
+void gemma3_rmsnorm_kernel_impl(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    int64_t batch_size,
+    int64_t hidden_size,
+    int64_t input_strideN,
+    float eps = 1e-5) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+
+  constexpr int kVecSize = bVec::size();
+  at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t i = begin; i < end; ++i) {
+      // local ptrs
+      scalar_t* __restrict__ out_ptr = output + i * hidden_size;
+      const scalar_t* __restrict__ input_ptr = input + i * input_strideN;
+
+      fVec sum_fvec = fVec(float(0));
+      float sum_val = float(0);
+      fVec one_fvec = fVec(float(1));
+
+      int64_t d;
+#pragma GCC unroll 4
+      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
+        bVec x_bvec = bVec::loadu(input_ptr + d);
+        fVec x_fvec0, x_fvec1;
+        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+
+        sum_fvec += x_fvec0 * x_fvec0;
+        sum_fvec += x_fvec1 * x_fvec1;
+      }
+#pragma GCC unroll 4
+      for (; d < hidden_size; ++d) {
+        float x_val = static_cast<float>(input_ptr[d]);
+        sum_val += x_val * x_val;
+      }
+
+      sum_val += vec_reduce_sum(sum_fvec);
+      float rsqrt_var = float(1) / std::sqrt(sum_val / hidden_size + eps);
+      const fVec scale_fvec = fVec(rsqrt_var);
+
+#pragma GCC unroll 4
+      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
+        bVec x_bvec = bVec::loadu(input_ptr + d);
+        fVec x_fvec0, x_fvec1;
+        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+
+        bVec w_bvec = bVec::loadu(weight + d);
+        fVec w_fvec0, w_fvec1;
+        std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
+
+        x_fvec0 = x_fvec0 * scale_fvec * (w_fvec0 + one_fvec);
+        x_fvec1 = x_fvec1 * scale_fvec * (w_fvec1 + one_fvec);
+
+        bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+        out_bvec.store(out_ptr + d);
+      }
+#pragma GCC unroll 4
+      for (; d < hidden_size; ++d) {
+        float x_val = static_cast<float>(input_ptr[d]);
+        float w_val = static_cast<float>(weight[d]);
+        out_ptr[d] = static_cast<scalar_t>(x_val * rsqrt_var * (w_val + 1));
+      }
+    }
+  });
+}
+
+template <typename scalar_t>
+void gemma3_rmsnorm_kernel_4d_impl(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    int64_t batch_size,
+    int64_t num_head,
+    int64_t seq_len,
+    int64_t hidden_size,
+    int64_t input_strideB,
+    int64_t input_strideH,
+    int64_t input_strideS,
+    int64_t output_strideB,
+    int64_t output_strideH,
+    int64_t output_strideS,
+    float eps = 1e-5) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+
+  constexpr int kVecSize = bVec::size();
+  at::parallel_for(0, batch_size * num_head * seq_len, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t i = begin; i < end; ++i) {
+      int64_t bi = i / (num_head * seq_len);
+      int64_t hi = i / seq_len % num_head;
+      int64_t si = i % seq_len;
+      // local ptrs
+      scalar_t* __restrict__ out_ptr = output + bi * output_strideB + hi * output_strideH + si * output_strideS;
+      const scalar_t* __restrict__ input_ptr = input + bi * input_strideB + hi * input_strideH + si * input_strideS;
+
+      fVec sum_fvec = fVec(float(0));
+      float sum_val = float(0);
+      fVec one_fvec = fVec(float(1));
+
+      int64_t d;
+#pragma GCC unroll 4
+      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
+        bVec x_bvec = bVec::loadu(input_ptr + d);
+        fVec x_fvec0, x_fvec1;
+        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+
+        sum_fvec += x_fvec0 * x_fvec0;
+        sum_fvec += x_fvec1 * x_fvec1;
+      }
+#pragma GCC unroll 4
+      for (; d < hidden_size; ++d) {
+        float x_val = static_cast<float>(input_ptr[d]);
+        sum_val += x_val * x_val;
+      }
+
+      sum_val += vec_reduce_sum(sum_fvec);
+      float rsqrt_var = float(1) / std::sqrt(sum_val / hidden_size + eps);
+      const fVec scale_fvec = fVec(rsqrt_var);
+
+#pragma GCC unroll 4
+      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
+        bVec x_bvec = bVec::loadu(input_ptr + d);
+        fVec x_fvec0, x_fvec1;
+        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+
+        bVec w_bvec = bVec::loadu(weight + d);
+        fVec w_fvec0, w_fvec1;
+        std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
+
+        x_fvec0 = x_fvec0 * scale_fvec * (w_fvec0 + one_fvec);
+        x_fvec1 = x_fvec1 * scale_fvec * (w_fvec1 + one_fvec);
+
+        bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+        out_bvec.store(out_ptr + d);
+      }
+#pragma GCC unroll 4
+      for (; d < hidden_size; ++d) {
+        float x_val = static_cast<float>(input_ptr[d]);
+        float w_val = static_cast<float>(weight[d]);
+        out_ptr[d] = static_cast<scalar_t>(x_val * rsqrt_var * (w_val + 1));
+      }
+    }
+  });
+}
+
+template <typename scalar_t>
 void fused_add_rmsnorm_kernel_impl(
     scalar_t* __restrict__ input,
     scalar_t* __restrict__ residual,
@@ -264,6 +412,63 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
         input_strideN,
         eps);
   });
+  return output;
+}
+
+// input : {batch_size, hidden_size} or {batch_size, num_head, seq_len, head_dim}
+// weight: {hidden_size}
+at::Tensor gemma3_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
+  RECORD_FUNCTION("sgl-kernel::gemma3_rmsnorm_cpu", std::vector<c10::IValue>({input, weight}));
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_INPUT(weight);
+  TORCH_CHECK(
+      input.dim() == 2 || input.dim() == 4, "gemma3_rmsnorm_cpu: input must be 2D or 4D, got ", input.dim(), "D");
+  CHECK_DIM(1, weight);
+  CHECK_EQ(input.size(-1), weight.size(0));
+  int64_t batch_size = input.size(0);
+  int64_t hidden_size = weight.size(0);
+  at::Tensor output = at::empty_like(input);
+  if (input.dim() == 2) {
+    int64_t input_strideN = input.stride(0);
+
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma3_rmsnorm_kernel", [&] {
+      gemma3_rmsnorm_kernel_impl<scalar_t>(
+          output.data_ptr<scalar_t>(),
+          input.data_ptr<scalar_t>(),
+          weight.data_ptr<scalar_t>(),
+          batch_size,
+          hidden_size,
+          input_strideN,
+          eps);
+    });
+  } else {
+    int64_t input_strideB = input.stride(0);
+    int64_t input_strideH = input.stride(1);
+    int64_t input_strideS = input.stride(2);
+    int64_t output_strideB = output.stride(0);
+    int64_t output_strideH = output.stride(1);
+    int64_t output_strideS = output.stride(2);
+    int64_t num_head = input.size(1);
+    int64_t seq_len = input.size(2);
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma3_rmsnorm_kernel", [&] {
+      gemma3_rmsnorm_kernel_4d_impl<scalar_t>(
+          output.data_ptr<scalar_t>(),
+          input.data_ptr<scalar_t>(),
+          weight.data_ptr<scalar_t>(),
+          batch_size,
+          num_head,
+          seq_len,
+          hidden_size,
+          input_strideB,
+          input_strideH,
+          input_strideS,
+          output_strideB,
+          output_strideH,
+          output_strideS,
+          eps);
+    });
+  }
   return output;
 }
 

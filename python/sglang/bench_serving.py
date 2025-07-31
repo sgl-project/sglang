@@ -879,22 +879,38 @@ def sample_mmmu_requests(
                 prompt = f"Question: {question}\n\nAnswer: "
                 if apply_chat_template:
                     try:
-                        prompt = tokenizer.apply_chat_template(
-                            [
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        {
-                                            "type": "image_url",
-                                            "image_url": {"url": image_data},
-                                        },
-                                        {"type": "text", "text": prompt},
-                                    ],
-                                }
-                            ],
-                            add_generation_prompt=True,
-                            tokenize=False,
-                        )
+                        if "gemma" in tokenizer.name_or_path:
+                            # For Gemma, we need to use the <image> tag
+                            prompt = tokenizer.apply_chat_template(
+                                [
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "image", "image": image_data},
+                                            {"type": "text", "text": prompt},
+                                        ],
+                                    }
+                                ],
+                                add_generation_prompt=True,
+                                tokenize=False,
+                            )
+                        else:
+                            prompt = tokenizer.apply_chat_template(
+                                [
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {
+                                                "type": "image_url",
+                                                "image_url": {"url": image_data},
+                                            },
+                                            {"type": "text", "text": prompt},
+                                        ],
+                                    }
+                                ],
+                                add_generation_prompt=True,
+                                tokenize=False,
+                            )
                     except Exception as e:
                         # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
                         print(

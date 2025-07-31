@@ -13,9 +13,10 @@ import httpx
 import numpy as np
 import openai
 import transformers
-from datasets import load_dataset
 from openai import AsyncOpenAI
 from tqdm import tqdm
+
+from datasets import load_dataset
 
 # Mapping providers to their clients and models
 provider_to_models = {

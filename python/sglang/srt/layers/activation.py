@@ -87,6 +87,17 @@ class GeluAndMul(CustomOp):
         d = x.shape[-1] // 2
         return F.gelu(x[..., :d], approximate=self.approximate) * x[..., d:]
 
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        if _is_cpu_amx_available:
+            if self.approximate == "tanh":
+                return torch.ops.sgl_kernel.gelu_tanh_and_mul_cpu(x)
+            elif self.approximate == "none":
+                return torch.ops.sgl_kernel.gelu_and_mul_cpu(x)
+            else:
+                return self.forward_native(x)
+        else:
+            return self.forward_native(x)
+
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)

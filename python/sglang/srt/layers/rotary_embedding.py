@@ -202,8 +202,10 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
+            positions = (
+                torch.add(positions, offsets) if offsets is not None else positions
+            )
             return torch.ops.sgl_kernel.rotary_embedding_cpu(
                 positions,
                 query,

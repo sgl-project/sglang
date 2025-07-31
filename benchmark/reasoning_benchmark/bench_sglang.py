@@ -5,9 +5,9 @@ import time
 import answer_extraction
 import eval_utils
 import numpy as np
-from datasets import load_dataset
 
 import sglang as sgl
+from datasets import load_dataset
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,

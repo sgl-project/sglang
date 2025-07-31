@@ -8,8 +8,9 @@ from typing import List
 import openai
 import torch
 from bert_score import BERTScorer
-from datasets import load_dataset
 from tqdm import tqdm
+
+from datasets import load_dataset
 
 
 def get_client(api_url: str) -> openai.AsyncOpenAI:

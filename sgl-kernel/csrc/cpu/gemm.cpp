@@ -327,33 +327,33 @@ void weight_packed_linear_kernel_impl(
   // parallel on [MB, NB]
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
     parallel_2d(MB, NB, [&](int64_t begin_mb, int64_t end_mb, int64_t begin_nb, int64_t end_nb) {
-
       // for brgemm, use float32 for accumulate
       alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
 
       for (int64_t nbb = begin_nb; nbb < end_nb; nbb += cache_blocks_nb) {
-      for (int64_t mb = begin_mb; mb < end_mb; ++mb) {
-      for (int64_t nb = nbb; nb < std::min(nbb + cache_blocks_nb, end_nb); ++nb) {
+        for (int64_t mb = begin_mb; mb < end_mb; ++mb) {
+          for (int64_t nb = nbb; nb < std::min(nbb + cache_blocks_nb, end_nb); ++nb) {
+            int64_t mb_start = mb * BLOCK_M;
+            int64_t mb_size = std::min(M - mb_start, BLOCK_M);
+            int64_t nb_start = nb * BLOCK_N;
+            int64_t nb_size = std::min(N - nb_start, BLOCK_N);
 
-        int64_t mb_start = mb * BLOCK_M;
-        int64_t mb_size = std::min(M - mb_start, BLOCK_M);
-        int64_t nb_start = nb * BLOCK_N;
-        int64_t nb_size = std::min(N - nb_start, BLOCK_N);
-
-        tinygemm_kernel<scalar_t, has_bias>(
-            /*   A */ mat1 + mb_start * mat1_strideM,
-            /*   B */ mat2 + nb_start * K /* nb * BLOCK_N * K */,
-            /*   C */ out + mb_start * out_strideM + nb_start,
-            /* Ctmp*/ Ctmp,
-            /* bias*/ bias + nb_start,
-            /*   M */ mb_size,
-            /*   N */ nb_size,
-            /*   K */ K,
-            /* lda */ mat1_strideM,
-            /* ldb */ nb_size,
-            /* ldc */ out_strideM,
-            /* brg */ use_brgemm);
-      }}}
+            tinygemm_kernel<scalar_t, has_bias>(
+                /*   A */ mat1 + mb_start * mat1_strideM,
+                /*   B */ mat2 + nb_start * K /* nb * BLOCK_N * K */,
+                /*   C */ out + mb_start * out_strideM + nb_start,
+                /* Ctmp*/ Ctmp,
+                /* bias*/ bias + nb_start,
+                /*   M */ mb_size,
+                /*   N */ nb_size,
+                /*   K */ K,
+                /* lda */ mat1_strideM,
+                /* ldb */ nb_size,
+                /* ldc */ out_strideM,
+                /* brg */ use_brgemm);
+          }
+        }
+      }
 
       if (use_brgemm) {
         at::native::cpublas::brgemm_release();
