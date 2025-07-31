@@ -7,6 +7,10 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed import (
+    get_moe_expert_parallel_rank,
+    get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_rank,
+    get_moe_tensor_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -88,10 +92,6 @@ class FusedMoE(torch.nn.Module):
         self.layer_id = layer_id
         self.top_k = top_k
         self.hidden_size = hidden_size
-        self.tp_size = (
-            tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
-        )
-        self.tp_rank = get_tensor_model_parallel_rank()
         self.num_experts = num_experts
         self.num_fused_shared_experts = num_fused_shared_experts
         self.expert_map_cpu = None
@@ -103,30 +103,27 @@ class FusedMoE(torch.nn.Module):
             enable_ep_moe = False
 
         self.enable_flashinfer_cutlass_moe = enable_flashinfer_cutlass_moe
+        self.moe_ep_size = get_moe_expert_parallel_world_size()
+        self.moe_ep_rank = get_moe_expert_parallel_rank()
+        self.moe_tp_size = get_moe_tensor_parallel_world_size()
+        self.moe_tp_rank = get_moe_tensor_parallel_rank()
+        assert num_experts % self.moe_ep_size == 0
+        self.num_local_experts = num_experts // self.moe_ep_size
         if enable_ep_moe:
             # TODO(ch-wan): support shared experts fusion
-            self.ep_size = self.tp_size
-            self.ep_rank = self.tp_rank
-            self.tp_size = 1
-            self.tp_rank = 0
             # Create a tensor of size num_experts filled with -1
             self.expert_map_cpu = torch.full((self.num_experts,), -1, dtype=torch.int32)
             # Create a expert map for the local experts
-            assert num_experts % self.ep_size == 0
-            self.num_local_experts = num_experts // self.ep_size
             self.expert_map_cpu[
-                self.ep_rank
-                * self.num_local_experts : (self.ep_rank + 1)
+                self.moe_ep_rank
+                * self.num_local_experts : (self.moe_ep_rank + 1)
                 * self.num_local_experts
             ] = torch.arange(0, self.num_local_experts, dtype=torch.int32, device="cpu")
             self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
-        else:
-            self.ep_size = 1
-            self.ep_rank = 0
-            self.num_local_experts = num_experts
+
         self.routed_scaling_factor = routed_scaling_factor
-        assert intermediate_size % self.tp_size == 0
-        self.intermediate_size_per_partition = intermediate_size // self.tp_size
+        assert intermediate_size % self.moe_tp_size == 0
+        self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
         self.reduce_results = reduce_results
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -437,8 +434,7 @@ class FusedMoE(torch.nn.Module):
         expert_id: int,
     ) -> None:
 
-        # TP rank is set to 0 if EP is enabled
-        tp_rank = 0 if self.ep_size > 1 else get_tensor_model_parallel_rank()
+        tp_rank = self.moe_tp_rank
 
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
@@ -630,17 +626,17 @@ class FusedMoE(torch.nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             **(
                 dict(
-                    tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
-                    ep_rank=self.ep_rank,
-                    ep_size=self.ep_size,
+                    tp_rank=self.moe_tp_rank,
+                    tp_size=self.moe_tp_size,
+                    ep_rank=self.moe_ep_rank,
+                    ep_size=self.moe_ep_size,
                 )
                 if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod"
                 else {}
             ),
         )
 
-        if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
+        if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states

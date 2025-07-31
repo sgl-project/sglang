@@ -157,6 +157,8 @@ class ModelRunner:
         gpu_id: int,
         tp_rank: int,
         tp_size: int,
+        moe_ep_rank: int,
+        moe_ep_size: int,
         pp_rank: int,
         pp_size: int,
         nccl_port: int,
@@ -175,6 +177,8 @@ class ModelRunner:
             logger.addFilter(RankZeroFilter(tp_rank == 0))
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.moe_ep_rank = moe_ep_rank
+        self.moe_ep_size = moe_ep_size
         self.dp_size = server_args.dp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
@@ -549,6 +553,7 @@ class ModelRunner:
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
+                expert_model_parallel_size=self.moe_ep_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
             )
             initialize_dp_attention(
