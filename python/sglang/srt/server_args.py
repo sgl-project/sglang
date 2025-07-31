@@ -215,6 +215,7 @@ class ServerArgs:
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
+    enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
@@ -270,14 +271,6 @@ class ServerArgs:
     sm_group_num: int = 3
 
     def __post_init__(self):
-        # Expert parallelism
-        # We put it here first due to some internal ckpt conversation issues.
-        if self.enable_ep_moe:
-            self.ep_size = self.tp_size
-            logger.warning(
-                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
-
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -444,6 +437,11 @@ class ServerArgs:
                 self.quantization == "modelopt_fp4"
             ), "modelopt_fp4 quantization is required for Flashinfer MOE"
             os.environ["TRTLLM_ENABLE_PDL"] = "1"
+            if self.enable_ep_moe:
+                self.ep_size = self.tp_size
+                logger.warning(
+                    f"Flashinfer cutlass MoE and EP MoE are enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+                )
 
         if self.enable_flashinfer_trtllm_moe:
             assert self.enable_ep_moe, "EP MoE is required for Flashinfer TRTLLM MOE"
@@ -1117,9 +1115,10 @@ class ServerArgs:
                 "kimi_k2",
                 "qwen3_coder",
                 "glm45",
+                "step3",
             ],
             default=ServerArgs.tool_call_parser,
-            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', and 'qwen3_coder'.",
+            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'.",
         )
 
         # Data parallelism
@@ -1334,6 +1333,7 @@ class ServerArgs:
         parser.add_argument(
             "--expert-parallel-size",
             "--ep-size",
+            "--ep",
             type=int,
             default=ServerArgs.ep_size,
             help="The expert parallelism size.",
@@ -1476,7 +1476,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-storage-backend",
             type=str,
-            choices=["file", "hf3fs"],  # todo, mooncake
+            choices=["file", "mooncake", "hf3fs", "nixl"],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache.",
         )
@@ -1550,6 +1550,11 @@ class ServerArgs:
             "--enable-profile-cuda-graph",
             action="store_true",
             help="Enable profiling of cuda graph capture.",
+        )
+        parser.add_argument(
+            "--enable-cudagraph-gc",
+            action="store_true",
+            help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
         )
         parser.add_argument(
             "--enable-nccl-nvls",
