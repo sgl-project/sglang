@@ -614,21 +614,16 @@ class HiCacheController:
                         last_hash,
                     )
 
-                    if isinstance(self.storage_backend, HiCacheFile):
-                        if self.storage_backend.exists(last_hash):
-                            storage_hit_count += self.page_size
-                            hash_value.append(last_hash)
-                            remaining_tokens -= self.page_size
-                        else:
+                    # todo, more unified interface
+                    if not isinstance(self.storage_backend, MooncakeStore):
+                        if not self.storage_backend.exists(last_hash):
                             break
-                    elif isinstance(self.storage_backend, MooncakeStore):
-                        hash_value.append(last_hash)
-                        remaining_tokens -= self.page_size
-                        storage_hit_count += self.page_size
-                    else:
-                        break
+                    hash_value.append(last_hash)
+                    storage_hit_count += self.page_size
+                    remaining_tokens -= self.page_size
 
                 if isinstance(self.storage_backend, MooncakeStore):
+                    # deferring to batch exists for mooncake store
                     exist_result = self.storage_backend.exists(hash_value)
                     storage_hit_count = (
                         sum(1 for v in exist_result.values() if v != 0) * self.page_size
