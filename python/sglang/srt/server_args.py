@@ -270,14 +270,6 @@ class ServerArgs:
     sm_group_num: int = 3
 
     def __post_init__(self):
-        # Expert parallelism
-        # We put it here first due to some internal ckpt conversation issues.
-        if self.enable_ep_moe:
-            self.ep_size = self.tp_size
-            logger.warning(
-                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
-
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -1117,9 +1109,10 @@ class ServerArgs:
                 "kimi_k2",
                 "qwen3_coder",
                 "glm45",
+                "step3",
             ],
             default=ServerArgs.tool_call_parser,
-            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', and 'qwen3_coder'.",
+            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'.",
         )
 
         # Data parallelism
@@ -1334,6 +1327,7 @@ class ServerArgs:
         parser.add_argument(
             "--expert-parallel-size",
             "--ep-size",
+            "--ep",
             type=int,
             default=ServerArgs.ep_size,
             help="The expert parallelism size.",
@@ -1476,7 +1470,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-storage-backend",
             type=str,
-            choices=["file"],  # todo, mooncake
+            choices=["file", "mooncake", "hf3fs"],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache.",
         )
@@ -2071,6 +2065,9 @@ class PortArgs:
 
             dist_init_host, dist_init_port = dist_init_addr
             port_base = int(dist_init_port) + 1
+            detokenizer_port = port_base + 1
+            rpc_port = port_base + 2
+            metrics_ipc_name = port_base + 3
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
@@ -2080,10 +2077,10 @@ class PortArgs:
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
-                detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
+                detokenizer_ipc_name=f"tcp://{dist_init_host}:{detokenizer_port}",
                 nccl_port=nccl_port,
-                rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
-                metrics_ipc_name=f"tcp://{dist_init_host}:{port_base + 3}",
+                rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
+                metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
             )
 
 
