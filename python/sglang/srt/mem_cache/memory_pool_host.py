@@ -25,7 +25,6 @@ def synchronized(debug_only=False):
         @wraps(func)
         def wrapper(self, *args, **kwargs):
             if (not debug_only) or self.debug:
-                return func(self, *args, **kwargs)
                 with self.lock:
                     return func(self, *args, **kwargs)
             else:
@@ -126,6 +125,9 @@ class HostKVCache(abc.ABC):
 
     @synchronized()
     def alloc(self, need_size: int) -> torch.Tensor:
+        assert (
+            need_size % self.page_size == 0
+        ), "The requested size should be a multiple of the page size."
         if need_size > self.available_size():
             return None
 
@@ -174,6 +176,15 @@ class HostKVCache(abc.ABC):
         if not self.is_synced(indices):
             raise ValueError(
                 f"The host memory slots should be in SYNCED state before turning into BACKUP. "
+                f"Current state: {self.get_state(indices)}"
+            )
+        self.mem_state[indices] = MemoryStateInt.BACKUP
+
+    @synchronized(debug_only=True)
+    def update_prefetch(self, indices: torch.Tensor):
+        if not self.is_reserved(indices):
+            raise ValueError(
+                f"The host memory slots should be in RESERVED state before turning into BACKUP. "
                 f"Current state: {self.get_state(indices)}"
             )
         self.mem_state[indices] = MemoryStateInt.BACKUP
