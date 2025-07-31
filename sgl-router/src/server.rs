@@ -1,12 +1,14 @@
 use crate::config::RouterConfig;
 use crate::logging::{self, LoggingConfig};
 use crate::metrics::{self, PrometheusConfig};
+use crate::middleware::auth::{auth_middleware, AuthConfig};
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::routers::{RouterFactory, RouterTrait};
 use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
 use axum::{
     extract::{Query, Request, State},
     http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -185,6 +187,7 @@ pub fn build_app(
     max_payload_size: usize,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
+    api_key: Option<String>,
 ) -> Router {
     // Create routes
     let protected_routes = Router::new()
@@ -209,10 +212,22 @@ pub fn build_app(
         .route("/get_loads", get(get_loads));
 
     // Build app with all routes and middleware
-    Router::new()
+    let mut app = Router::new()
         .merge(protected_routes)
         .merge(public_routes)
-        .merge(admin_routes)
+        .merge(admin_routes);
+
+    // Conditionally add auth middleware if API key is configured
+    if api_key.is_some() {
+        app = app.layer(middleware::from_fn_with_state(
+            AuthConfig {
+                api_key: api_key.clone(),
+            },
+            auth_middleware,
+        ));
+    }
+
+    app
         // Request body size limiting
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
@@ -330,6 +345,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
+        config.router_config.api_key.clone(),
     );
 
     // Create TCP listener - use the configured host

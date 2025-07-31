@@ -36,6 +36,7 @@ pub struct PDRouter {
     pub worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub http_client: reqwest::Client,
+    pub api_key: Option<String>,
     _prefill_health_checker: Option<HealthChecker>,
     _decode_health_checker: Option<HealthChecker>,
 }
@@ -179,6 +180,7 @@ impl PDRouter {
         decode_policy: Arc<dyn LoadBalancingPolicy>,
         timeout_secs: u64,
         interval_secs: u64,
+        api_key: Option<String>,
     ) -> Result<Self, String> {
         // Convert URLs to Worker trait objects
         let prefill_workers: Vec<Box<dyn Worker>> = prefill_urls
@@ -299,6 +301,7 @@ impl PDRouter {
             worker_loads,
             load_monitor_handle,
             http_client,
+            api_key,
             _prefill_health_checker: Some(prefill_health_checker),
             _decode_health_checker: Some(decode_health_checker),
         })
@@ -588,7 +591,12 @@ impl PDRouter {
         if let Some(headers) = headers {
             for (name, value) in headers.iter() {
                 let name_str = name.as_str();
-                if name_str != "content-type" && name_str != "content-length" {
+                let name_lower = name_str.to_lowercase();
+                if name_lower != "content-type" && name_lower != "content-length" {
+                    // Skip Authorization header if we have our own API key
+                    if name_lower == "authorization" && self.api_key.is_some() {
+                        continue;
+                    }
                     // Skip headers with non-ASCII values
                     if value.to_str().is_ok() {
                         prefill_request = prefill_request.header(name, value);
@@ -596,6 +604,12 @@ impl PDRouter {
                     }
                 }
             }
+        }
+
+        // Add router's API key if configured
+        if let Some(key) = &self.api_key {
+            prefill_request = prefill_request.bearer_auth(key);
+            decode_request = decode_request.bearer_auth(key);
         }
 
         // Send both requests concurrently
@@ -1577,6 +1591,7 @@ mod tests {
             worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
             load_monitor_handle: None,
             http_client: reqwest::Client::new(),
+            api_key: None,
             _prefill_health_checker: None,
             _decode_health_checker: None,
         }

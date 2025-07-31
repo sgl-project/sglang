@@ -38,5 +38,6 @@ pub fn create_test_app(
         router_config.max_payload_size,
         request_id_headers,
         router_config.cors_allowed_origins.clone(),
+        router_config.api_key.clone(),
     )
 }
