@@ -1259,6 +1259,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.current_attention_backend == "fa3"
             or self.current_attention_backend == "flashinfer"
             or self.current_attention_backend == "cutlass_mla"
+            or self.current_attention_backend == "trtllm_mla"
         ):
             attn_output = self.attn_mqa(
                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
