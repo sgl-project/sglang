@@ -240,10 +240,6 @@ class EPMoE(FusedMoE):
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
             self.fp8_dtype = torch.float8_e4m3fn
-            self.w13_input_scale = None
-            self.w2_input_scale = None
-            self.w13_weight_scale = None
-            self.w2_weight_scale = None
             self.activation_scheme = quant_config.moe_activation_scheme
         elif isinstance(quant_config, Fp8Config):
             self.quant_method: Optional[QuantizeMethodBase] = Fp8MoEMethod(quant_config)
