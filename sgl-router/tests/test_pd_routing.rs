@@ -176,6 +176,8 @@ mod test_pd_routing {
                 log_dir: None,
                 log_level: None,
                 request_id_headers: None,
+                max_concurrent_requests: 64,
+                cors_allowed_origins: vec![],
             };
 
             // Router creation will fail due to health checks, but config should be valid

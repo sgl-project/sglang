@@ -35,6 +35,10 @@ pub struct RouterConfig {
     pub log_level: Option<String>,
     /// Custom request ID headers to check (defaults to common headers)
     pub request_id_headers: Option<Vec<String>>,
+    /// Maximum concurrent requests allowed (for rate limiting)
+    pub max_concurrent_requests: usize,
+    /// CORS allowed origins
+    pub cors_allowed_origins: Vec<String>,
 }
 
 /// Routing mode configuration
@@ -216,6 +220,8 @@ impl Default for RouterConfig {
             log_dir: None,
             log_level: None,
             request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
         }
     }
 }
@@ -324,6 +330,8 @@ mod tests {
             log_dir: Some("/var/log".to_string()),
             log_level: Some("debug".to_string()),
             request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -749,6 +757,8 @@ mod tests {
             log_dir: Some("/var/log/sglang".to_string()),
             log_level: Some("info".to_string()),
             request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
         };
 
         assert!(config.mode.is_pd_mode());
@@ -798,6 +808,8 @@ mod tests {
             log_dir: None,
             log_level: Some("debug".to_string()),
             request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -843,6 +855,8 @@ mod tests {
             log_dir: Some("/opt/logs/sglang".to_string()),
             log_level: Some("trace".to_string()),
             request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
         };
 
         assert!(config.has_service_discovery());

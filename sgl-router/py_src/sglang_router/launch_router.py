@@ -68,6 +68,12 @@ class RouterArgs:
     prometheus_host: Optional[str] = None
     # Request ID headers configuration
     request_id_headers: Optional[List[str]] = None
+    # Request timeout in seconds
+    request_timeout_secs: int = 600
+    # Max concurrent requests for rate limiting
+    max_concurrent_requests: int = 64
+    # CORS allowed origins
+    cors_allowed_origins: List[str] = dataclasses.field(default_factory=list)
 
     @staticmethod
     def add_cli_args(
@@ -276,6 +282,25 @@ class RouterArgs:
             nargs="*",
             help="Custom HTTP headers to check for request IDs (e.g., x-request-id x-trace-id). If not specified, uses common defaults.",
         )
+        parser.add_argument(
+            f"--{prefix}request-timeout-secs",
+            type=int,
+            default=RouterArgs.request_timeout_secs,
+            help="Request timeout in seconds",
+        )
+        parser.add_argument(
+            f"--{prefix}max-concurrent-requests",
+            type=int,
+            default=RouterArgs.max_concurrent_requests,
+            help="Maximum number of concurrent requests allowed (for rate limiting)",
+        )
+        parser.add_argument(
+            f"--{prefix}cors-allowed-origins",
+            type=str,
+            nargs="*",
+            default=[],
+            help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
+        )
 
     @classmethod
     def from_cli_args(
@@ -337,6 +362,15 @@ class RouterArgs:
             prometheus_port=getattr(args, f"{prefix}prometheus_port", None),
             prometheus_host=getattr(args, f"{prefix}prometheus_host", None),
             request_id_headers=getattr(args, f"{prefix}request_id_headers", None),
+            request_timeout_secs=getattr(
+                args, f"{prefix}request_timeout_secs", RouterArgs.request_timeout_secs
+            ),
+            max_concurrent_requests=getattr(
+                args,
+                f"{prefix}max_concurrent_requests",
+                RouterArgs.max_concurrent_requests,
+            ),
+            cors_allowed_origins=getattr(args, f"{prefix}cors_allowed_origins", []),
         )
 
     @staticmethod
@@ -490,6 +524,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             decode_selector=router_args.decode_selector,
             prometheus_port=router_args.prometheus_port,
             prometheus_host=router_args.prometheus_host,
+            request_timeout_secs=router_args.request_timeout_secs,
             pd_disaggregation=router_args.pd_disaggregation,
             prefill_urls=(
                 router_args.prefill_urls if router_args.pd_disaggregation else None
@@ -508,6 +543,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
                 else None
             ),
             request_id_headers=router_args.request_id_headers,
+            max_concurrent_requests=router_args.max_concurrent_requests,
+            cors_allowed_origins=router_args.cors_allowed_origins,
         )
 
         router.start()

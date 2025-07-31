@@ -61,6 +61,11 @@ class Router:
         request_id_headers: List of HTTP headers to check for request IDs. If not specified,
             uses common defaults: ['x-request-id', 'x-correlation-id', 'x-trace-id', 'request-id'].
             Example: ['x-my-request-id', 'x-custom-trace-id']. Default: None
+        bootstrap_port_annotation: Kubernetes annotation name for bootstrap port (PD mode).
+            Default: 'sglang.ai/bootstrap-port'
+        request_timeout_secs: Request timeout in seconds. Default: 600
+        max_concurrent_requests: Maximum number of concurrent requests allowed for rate limiting. Default: 64
+        cors_allowed_origins: List of allowed origins for CORS. Empty list allows all origins. Default: []
     """
 
     def __init__(
@@ -87,14 +92,18 @@ class Router:
         service_discovery_namespace: Optional[str] = None,
         prefill_selector: Dict[str, str] = None,
         decode_selector: Dict[str, str] = None,
+        bootstrap_port_annotation: str = "sglang.ai/bootstrap-port",
         prometheus_port: Optional[int] = None,
         prometheus_host: Optional[str] = None,
+        request_timeout_secs: int = 600,
+        request_id_headers: Optional[List[str]] = None,
         pd_disaggregation: bool = False,
         prefill_urls: Optional[List[tuple]] = None,
         decode_urls: Optional[List[str]] = None,
         prefill_policy: Optional[PolicyType] = None,
         decode_policy: Optional[PolicyType] = None,
-        request_id_headers: Optional[List[str]] = None,
+        max_concurrent_requests: int = 64,
+        cors_allowed_origins: List[str] = None,
     ):
         if selector is None:
             selector = {}
@@ -102,6 +111,8 @@ class Router:
             prefill_selector = {}
         if decode_selector is None:
             decode_selector = {}
+        if cors_allowed_origins is None:
+            cors_allowed_origins = []
 
         self._router = _Router(
             worker_urls=worker_urls,
@@ -126,14 +137,18 @@ class Router:
             service_discovery_namespace=service_discovery_namespace,
             prefill_selector=prefill_selector,
             decode_selector=decode_selector,
+            bootstrap_port_annotation=bootstrap_port_annotation,
             prometheus_port=prometheus_port,
             prometheus_host=prometheus_host,
+            request_timeout_secs=request_timeout_secs,
+            request_id_headers=request_id_headers,
             pd_disaggregation=pd_disaggregation,
             prefill_urls=prefill_urls,
             decode_urls=decode_urls,
             prefill_policy=prefill_policy,
             decode_policy=decode_policy,
-            request_id_headers=request_id_headers,
+            max_concurrent_requests=max_concurrent_requests,
+            cors_allowed_origins=cors_allowed_origins,
         )
 
     def start(self) -> None:

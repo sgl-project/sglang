@@ -46,11 +46,12 @@ class TestLaunchRouter(unittest.TestCase):
             dp_aware=False,
             prometheus_port=None,
             prometheus_host=None,
-            # PD-specific attributes
+            request_timeout_secs=60,
+            max_concurrent_requests=64,
+            cors_allowed_origins=[],
             pd_disaggregation=False,
             prefill=None,
             decode=None,
-            # Keep worker_urls for regular mode
             worker_urls=[],
         )
 
