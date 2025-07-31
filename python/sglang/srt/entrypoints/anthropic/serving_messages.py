@@ -241,25 +241,6 @@ class AnthropicServingMessages(OpenAIServingBase):
                 audio_data,
                 modalities,
             )
-
-            if "tool_calls" in processed_msg and isinstance(
-                processed_msg.get("tool_calls"), list
-            ):
-                for call in processed_msg["tool_calls"]:
-                    try:
-                        if "arguments" in call["function"] and isinstance(
-                            call["function"]["arguments"], str
-                        ):
-                            call["function"]["arguments"] = json.loads(
-                                call["function"]["arguments"]
-                            )
-                    except json.JSONDecodeError as e:
-                        # Log a warning or error if JSON parsing fails for arguments
-                        logger.warning(
-                            f"Failed to parse tool call arguments as JSON: {e}"
-                        )
-                        # Decide whether to continue or raise the exception based on desired behavior
-                        continue  # Or raise e if strict parsing is required
             openai_compatible_messages.append(processed_msg)
 
         # Handle assistant prefix for continue_final_message
