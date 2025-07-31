@@ -33,8 +33,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 from typing_extensions import Literal
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.managers.io_struct import ImageData
-from sglang.srt.utils import read_system_prompt_from_file
+from sglang.srt.utils import ImageData, read_system_prompt_from_file
 
 
 class SeparatorStyle(IntEnum):
