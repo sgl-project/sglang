@@ -1477,7 +1477,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-storage-backend",
             type=str,
-            choices=["file", "hf3fs"],  # todo, mooncake
+            choices=["file", "mooncake", "hf3fs"],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache.",
         )

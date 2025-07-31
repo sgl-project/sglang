@@ -2,7 +2,7 @@ import hashlib
 import logging
 import os
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import torch
 
@@ -39,7 +39,10 @@ class HiCacheStorage(ABC):
 
     @abstractmethod
     def get(
-        self, key: str, target_location: Optional[torch.Tensor] = None
+        self,
+        key: str,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
         """
         Retrieve the value associated with the given key.
@@ -49,7 +52,10 @@ class HiCacheStorage(ABC):
 
     @abstractmethod
     def batch_get(
-        self, keys: List[str], target_locations: Optional[List[torch.Tensor]] = None
+        self,
+        keys: List[str],
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
     ) -> List[torch.Tensor | None]:
         """
         Retrieve values for multiple keys.
@@ -58,7 +64,13 @@ class HiCacheStorage(ABC):
         pass
 
     @abstractmethod
-    def set(self, key, value) -> bool:
+    def set(
+        self,
+        key: str,
+        value: Optional[Any] = None,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
         """
         Store the value associated with the given key.
         Returns True if the operation was successful, False otherwise.
@@ -66,7 +78,13 @@ class HiCacheStorage(ABC):
         pass
 
     @abstractmethod
-    def batch_set(self, keys: List[str], values: List[torch.Tensor]) -> bool:
+    def batch_set(
+        self,
+        keys: List[str],
+        values: Optional[Any] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
         """
         Store multiple key-value pairs.
         Returns True if all operations were successful, False otherwise.
@@ -74,7 +92,7 @@ class HiCacheStorage(ABC):
         pass
 
     @abstractmethod
-    def exists(self, key: str) -> bool:
+    def exists(self, key: str) -> bool | dict:
         """
         Check if the key exists in the storage.
         Returns True if the key exists, False otherwise.
@@ -97,7 +115,10 @@ class HiCacheFile(HiCacheStorage):
         return key + self.tp_suffix
 
     def get(
-        self, key: str, target_location: Optional[torch.Tensor] = None
+        self,
+        key: str,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
@@ -115,7 +136,8 @@ class HiCacheFile(HiCacheStorage):
     def batch_get(
         self,
         keys: List[str],
-        target_locations: Optional[List[torch.Tensor]] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
     ) -> List[torch.Tensor | None]:
         return [
             self.get(key, target_location)
@@ -124,7 +146,13 @@ class HiCacheFile(HiCacheStorage):
             )
         ]
 
-    def set(self, key: str, value: torch.Tensor) -> bool:
+    def set(
+        self,
+        key: str,
+        value: Optional[Any] = None,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         if self.exists(key):
@@ -137,7 +165,13 @@ class HiCacheFile(HiCacheStorage):
             logger.error(f"Failed to save tensor {key}: {e}")
             return False
 
-    def batch_set(self, keys: List[str], values: List[torch.Tensor]) -> bool:
+    def batch_set(
+        self,
+        keys: List[str],
+        values: Optional[Any] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
         for key, value in zip(keys, values):
             if not self.set(key, value):
                 return False
