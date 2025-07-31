@@ -637,7 +637,6 @@ class Llama4ForConditionalGeneration(nn.Module):
             if "vision" in name:
                 name = name.replace(".self_attn.o_proj", ".self_attn.proj")
             else:
-                # if "vision" not in name:
                 name, loaded_weight = self.permute_qk_weight_for_rotary(
                     name, loaded_weight
                 )
@@ -690,7 +689,6 @@ class Llama4ForConditionalGeneration(nn.Module):
         """Handle stacked parameter loading. Returns True if handled."""
         for param_name, weight_name, shard_id in stacked_params_mapping:
             if weight_name in name:
-                # if weight_name in name and "vision" not in name:
                 transformed_name = name.replace(weight_name, param_name)
                 param = params_dict[transformed_name]
                 param.weight_loader(param, loaded_weight, shard_id)
