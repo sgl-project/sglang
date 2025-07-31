@@ -50,6 +50,8 @@ class RouterArgs:
     eviction_interval: int = 60
     max_tree_size: int = 2**24
     max_payload_size: int = 256 * 1024 * 1024  # 256MB default for large batches
+    dp_aware: bool = False
+    api_key: Optional[str] = None
     log_dir: Optional[str] = None
     log_level: Optional[str] = None
     # Service discovery configuration
@@ -66,6 +68,12 @@ class RouterArgs:
     prometheus_host: Optional[str] = None
     # Request ID headers configuration
     request_id_headers: Optional[List[str]] = None
+    # Request timeout in seconds
+    request_timeout_secs: int = 600
+    # Max concurrent requests for rate limiting
+    max_concurrent_requests: int = 64
+    # CORS allowed origins
+    cors_allowed_origins: List[str] = dataclasses.field(default_factory=list)
 
     @staticmethod
     def add_cli_args(
@@ -198,6 +206,17 @@ class RouterArgs:
             help="Maximum payload size in bytes",
         )
         parser.add_argument(
+            f"--{prefix}dp-aware",
+            action="store_true",
+            help="Enable data parallelism aware schedule",
+        )
+        parser.add_argument(
+            f"--{prefix}api-key",
+            type=str,
+            default=None,
+            help="The api key used for the authorization with the worker.  Useful when the dp aware scheduling strategy is enaled.",
+        )
+        parser.add_argument(
             f"--{prefix}log-dir",
             type=str,
             default=None,
@@ -263,6 +282,25 @@ class RouterArgs:
             nargs="*",
             help="Custom HTTP headers to check for request IDs (e.g., x-request-id x-trace-id). If not specified, uses common defaults.",
         )
+        parser.add_argument(
+            f"--{prefix}request-timeout-secs",
+            type=int,
+            default=RouterArgs.request_timeout_secs,
+            help="Request timeout in seconds",
+        )
+        parser.add_argument(
+            f"--{prefix}max-concurrent-requests",
+            type=int,
+            default=RouterArgs.max_concurrent_requests,
+            help="Maximum number of concurrent requests allowed (for rate limiting)",
+        )
+        parser.add_argument(
+            f"--{prefix}cors-allowed-origins",
+            type=str,
+            nargs="*",
+            default=[],
+            help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
+        )
 
     @classmethod
     def from_cli_args(
@@ -304,6 +342,8 @@ class RouterArgs:
             eviction_interval=getattr(args, f"{prefix}eviction_interval"),
             max_tree_size=getattr(args, f"{prefix}max_tree_size"),
             max_payload_size=getattr(args, f"{prefix}max_payload_size"),
+            dp_aware=getattr(args, f"{prefix}dp_aware", False),
+            api_key=getattr(args, f"{prefix}api_key", None),
             log_dir=getattr(args, f"{prefix}log_dir", None),
             log_level=getattr(args, f"{prefix}log_level", None),
             service_discovery=getattr(args, f"{prefix}service_discovery", False),
@@ -322,6 +362,15 @@ class RouterArgs:
             prometheus_port=getattr(args, f"{prefix}prometheus_port", None),
             prometheus_host=getattr(args, f"{prefix}prometheus_host", None),
             request_id_headers=getattr(args, f"{prefix}request_id_headers", None),
+            request_timeout_secs=getattr(
+                args, f"{prefix}request_timeout_secs", RouterArgs.request_timeout_secs
+            ),
+            max_concurrent_requests=getattr(
+                args,
+                f"{prefix}max_concurrent_requests",
+                RouterArgs.max_concurrent_requests,
+            ),
+            cors_allowed_origins=getattr(args, f"{prefix}cors_allowed_origins", []),
         )
 
     @staticmethod
@@ -463,6 +512,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             eviction_interval_secs=router_args.eviction_interval,
             max_tree_size=router_args.max_tree_size,
             max_payload_size=router_args.max_payload_size,
+            dp_aware=router_args.dp_aware,
+            api_key=router_args.api_key,
             log_dir=router_args.log_dir,
             log_level=router_args.log_level,
             service_discovery=router_args.service_discovery,
@@ -473,6 +524,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             decode_selector=router_args.decode_selector,
             prometheus_port=router_args.prometheus_port,
             prometheus_host=router_args.prometheus_host,
+            request_timeout_secs=router_args.request_timeout_secs,
             pd_disaggregation=router_args.pd_disaggregation,
             prefill_urls=(
                 router_args.prefill_urls if router_args.pd_disaggregation else None
@@ -491,6 +543,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
                 else None
             ),
             request_id_headers=router_args.request_id_headers,
+            max_concurrent_requests=router_args.max_concurrent_requests,
+            cors_allowed_origins=router_args.cors_allowed_origins,
         )
 
         router.start()
