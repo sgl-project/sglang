@@ -148,7 +148,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--file-storage-path` | The path of the file storage in backend. | sglang_storage |
 | `--enable-cache-report` | Return number of cached tokens in usage.prompt_tokens_details for each openai request. | False |
 | `--reasoning-parser` | Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}. | None |
-| `--tool-call-parser` | Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', and 'kimi_k2'. | None |
+| `--tool-call-parser` | Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'. | None |
 
 ## Data parallelism
 
