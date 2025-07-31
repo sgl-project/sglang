@@ -380,6 +380,9 @@ class WhisperForConditionalGeneration(torch.nn.Module):
             weights_dict[f"decoder.layers.{layer_idx}.encoder_attn.kv_proj.bias"] = (
                 torch.cat([k_proj_bias, v_proj_bias], dim=0)
             )
+        weights_dict["proj_out.weight"] = weights_dict[
+            "model.decoder.embed_tokens.weight"
+        ]
 
         for name, loaded_weight in weights_dict.items():
             name = name.replace("model.", "")
