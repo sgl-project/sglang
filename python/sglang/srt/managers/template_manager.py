@@ -112,7 +112,6 @@ class TemplateManager:
         logger.info(f"Loading chat template from argument: {chat_template_arg}")
 
         if chat_template_exists(chat_template_arg):
-            logger.info(f"Using built-in chat template: {chat_template_arg}")
             self._chat_template_name = chat_template_arg
             return
 
