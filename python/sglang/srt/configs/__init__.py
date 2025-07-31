@@ -5,7 +5,7 @@ from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.kimi_vl import KimiVLConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
-from sglang.srt.configs.step3v import (
+from sglang.srt.configs.step3_vl import (
     Step3TextConfig,
     Step3VisionEncoderConfig,
     Step3VLConfig,

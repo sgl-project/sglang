@@ -1,38 +1,22 @@
 import math
 import re
 from itertools import product
-from typing import Any, List, Literal, Optional, TypedDict, Union
+from typing import List, Literal, Optional, TypedDict, Union
 
 import numpy as np
 import torch
 from PIL import Image
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
-from transformers import BatchFeature, PretrainedConfig, TensorType
+from transformers import BatchFeature, TensorType
 
-from sglang.srt.models.step3v import (
-    MMGPTStep3vForCausalLM,
+from sglang.srt.models.step3_vl import (
     Step3VLForConditionalGeneration,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
-
-
-class Step3VLImagePixelInputs(TypedDict):
-    type: Literal["pixel_values"]
-    pixel_values: torch.Tensor
-    patch_pixel_values: Optional[torch.Tensor]
-    num_patches: list[int]
-
-
-class Step3VLImageEmbeddingInputs(TypedDict):
-    type: Literal["image_embeds"]
-    image_embeds: torch.Tensor
-
-
-Step3VLImageInputs = Union[Step3VLImagePixelInputs, Step3VLImageEmbeddingInputs]
 
 ImageWithPatches = tuple[Image.Image, list[Image.Image], list[int] | None]
 
@@ -484,8 +468,8 @@ class Step3VLProcessor:
 ################################################
 
 
-class Step3vImageProcessor(SGLangBaseProcessor):
-    models = [Step3VLForConditionalGeneration, MMGPTStep3vForCausalLM]
+class Step3VLImageProcessor(SGLangBaseProcessor):
+    models = [Step3VLForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         # TODO, check _processor is tokenizer or processor.
@@ -506,14 +490,6 @@ class Step3vImageProcessor(SGLangBaseProcessor):
 
     def __call__(self, image):
         return self.preprocess(image)
-
-    # def process_and_combine_mm_data(
-    #     self,
-    #     base_output,
-    #     mm_tokens: MultimodalSpecialTokens,
-    #     **kwargs,
-    # ):
-    #     pass
 
     async def process_mm_data_async(
         self,

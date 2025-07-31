@@ -11,7 +11,7 @@ from torch.nn import functional as F
 from transformers import PretrainedConfig
 from transformers.activations import ACT2FN
 
-from sglang.srt.configs.step3v import (
+from sglang.srt.configs.step3_vl import (
     Step3TextConfig,
     Step3VisionEncoderConfig,
     Step3VLConfig,
@@ -293,6 +293,7 @@ class Step3TextDecoderLayer(nn.Module):
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
+        # TODO:(Yuhao): support shared experts fusion
         self.n_shared_experts = 1
         self.num_fused_shared_experts = (
             0
@@ -778,6 +779,7 @@ class Step3VLForConditionalGeneration(nn.Module):
         )
 
         self.n_shared_experts = 1
+        # TODO:(Yuhao): support shared experts fusion
         # self.num_fused_shared_experts = (
         #     0
         #     if global_server_args_dict["disable_shared_experts_fusion"]
@@ -1016,10 +1018,6 @@ class Step3VLForConditionalGeneration(nn.Module):
             num_logical_experts=config.text_config.moe_num_experts,
             num_groups=None,
         )
-
-
-class MMGPTStep3vForCausalLM(Step3VLForConditionalGeneration):
-    pass
 
 
 EntryClass = Step3VLForConditionalGeneration

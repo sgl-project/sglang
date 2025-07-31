@@ -33,7 +33,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.model = "/root/.cache/step3v-models/fp8"
+        cls.model = "/root/.cache/step3-models/fp8"
         cls.base_url = "http://localhost:30000"
         cls.api_key = "sk-123456"
 

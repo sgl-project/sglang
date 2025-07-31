@@ -647,7 +647,6 @@ multimodal_model_archs = [
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
     "Step3VLForConditionalGeneration",
-    "MMGPTStep3vForCausalLM",
 ]
 
 

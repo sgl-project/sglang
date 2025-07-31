@@ -41,11 +41,11 @@ def parse_arguments(value: str) -> tuple[Any, bool]:
         return value, False
 
 
-class Step3VDetector(BaseFormatDetector):
+class Step3Detector(BaseFormatDetector):
     """
-    Detector for Step3V model function call format.
+    Detector for Step3 model function call format.
 
-    The Step3V format uses special Unicode tokens to delimit function calls
+    The Step3 format uses special Unicode tokens to delimit function calls
     with steptml XML format for invocations.
 
     Format Structure:
@@ -84,7 +84,7 @@ class Step3VDetector(BaseFormatDetector):
         self._function_name_sent: bool = False
 
     def has_tool_call(self, text: str) -> bool:
-        """Check if the text contains a Step3V format tool call."""
+        """Check if the text contains a Step3 format tool call."""
         return self.bot_token in text
 
     def _parse_steptml_invoke(
@@ -171,7 +171,7 @@ class Step3VDetector(BaseFormatDetector):
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """
-        Streaming incremental parsing for Step3V format.
+        Streaming incremental parsing for Step3 format.
         """
         self._buffer += new_text
 
@@ -412,7 +412,7 @@ class Step3VDetector(BaseFormatDetector):
 
     def build_ebnf(self, tools: List[Tool]) -> str:
         """
-        Build EBNF grammar for Step3V tool call format.
+        Build EBNF grammar for Step3 tool call format.
         """
         # Custom call rule for steptml format
         call_rule_fmt = (

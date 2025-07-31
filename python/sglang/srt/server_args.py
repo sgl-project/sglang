@@ -1117,10 +1117,10 @@ class ServerArgs:
                 "kimi_k2",
                 "qwen3_coder",
                 "glm45",
-                "step3v",
+                "step3",
             ],
             default=ServerArgs.tool_call_parser,
-            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3v'.",
+            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'.",
         )
 
         # Data parallelism
