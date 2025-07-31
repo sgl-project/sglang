@@ -5,6 +5,8 @@
 #include <assert.h>
 #include <cuda.h>
 #include <torch/all.h>
+#include <c10/cuda/CUDAStream.h>
+
 
 // Save the start index of each block in the given range into block_offset.
 // Returns the updated block count.
@@ -177,7 +179,7 @@ void convert_vertical_slash_indexes_64x64(
   const dim3 dimGrid(
       (int32_t)N_HEADS, (int32_t)BATCH_SIZE, ((int32_t)N_ROWS + (int32_t)N_THREADS - 1) / (int32_t)N_THREADS);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  convert_vertical_slash_indexes_kernel<<<dimGrid, dimBlock, stream>>>(
+  convert_vertical_slash_indexes_kernel<<<dimGrid, dimBlock, 0, stream>>>(
       q_seqlens,
       kv_seqlens,
       vertical_indexes,
@@ -395,7 +397,7 @@ void convert_vertical_slash_indexes_64x64_mergehead(
   const dim3 dimBlock(N_THREADS);
   const dim3 dimGrid(N_HEADS, BATCH_SIZE, (N_ROWS + N_THREADS - 1) / N_THREADS);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  convert_vertical_slash_indexes_kernel_mergehead<<<dimGrid, dimBlock, stream>>>(
+  convert_vertical_slash_indexes_kernel_mergehead<<<dimGrid, dimBlock, 0, stream>>>(
       q_seqlens,
       kv_seqlens,
       vertical_indexes,
