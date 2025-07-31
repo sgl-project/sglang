@@ -265,6 +265,11 @@ class HiCacheController:
             if storage_backend == "file":
                 self.storage_backend = HiCacheFile()
                 self.get_hash_str = get_hash_str
+            elif storage_backend == "nixl":
+                from sglang.srt.mem_cache.nixl.hicache_nixl import HiCacheNixl
+
+                self.storage_backend = HiCacheNixl()
+                self.get_hash_str = get_hash_str
             elif storage_backend == "mooncake":
                 self.storage_backend = MooncakeStore()
                 self.get_hash_str = get_hash_str_mooncake
@@ -545,7 +550,11 @@ class HiCacheController:
     def generic_page_transfer(self, operation, batch_size=8):
         for i in range(0, len(operation.hash_value), batch_size):
             page_hashes = operation.hash_value[i : i + batch_size]
-            page_data = self.storage_backend.batch_get(page_hashes)
+            # todo: zero copy
+            dummy_page_dst = [self.mem_pool_host.get_dummy_flat_data_page()] * len(
+                page_hashes
+            )
+            page_data = self.storage_backend.batch_get(page_hashes, dummy_page_dst)
             if page_data is None:
                 logger.warning(
                     f"Prefetch operation {operation.request_id} failed to retrieve page {page_hashes}."
@@ -679,7 +688,7 @@ class HiCacheController:
         for i in range(0, len(operation.hash_value), batch_size):
             page_hashes = operation.hash_value[i : i + batch_size]
             page_data = [
-                self.mem_pool_host.get_flat_data_pages(
+                self.mem_pool_host.get_flat_data_page(
                     operation.host_indices[j * self.page_size]
                 )
                 for j in range(i, i + len(page_hashes))
