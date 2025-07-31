@@ -63,18 +63,36 @@ TEST_CASES = {
     ],
     "decode_output_match": [
         {
-            "name": "single",
+            "name": "single_fp16",
             "batch_size": 1,
             "max_seq_len": 64,
             "page_size": 32,
-            "description": "Single vs reference",
+            "use_fp8": False,
+            "description": "Single FP16 vs reference",
         },
         {
-            "name": "batch",
+            "name": "single_fp8",
+            "batch_size": 1,
+            "max_seq_len": 64,
+            "page_size": 32,
+            "use_fp8": True,
+            "description": "Single FP8 vs reference",
+        },
+        {
+            "name": "batch_fp16",
             "batch_size": 32,
             "max_seq_len": 64,
             "page_size": 32,
-            "description": "Batch vs reference",
+            "use_fp8": False,
+            "description": "Batch FP16 vs reference",
+        },
+        {
+            "name": "batch_fp8",
+            "batch_size": 32,
+            "max_seq_len": 64,
+            "page_size": 32,
+            "use_fp8": True,
+            "description": "Batch FP8 vs reference",
         },
     ],
     "page_size_consistency": [
@@ -293,25 +311,37 @@ class TestTRTLLMMLA(CustomTestCase):
             layer,
         )
 
-    def _create_qkv_tensors(self, batch_size, config):
-        """Create Q, K, V tensors for testing."""
+    def _create_qkv_tensors(self, batch_size, config, dtype_override=None):
+        """Create Q, K, V random tensors for given batch size.
+
+        Args:
+            batch_size: Batch size.
+            config: Configuration dict with model dims and device.
+            dtype_override: Optional torch dtype to override config["dtype"].
+        """
         head_dim = config["kv_lora_rank"] + config["qk_rope_head_dim"]
         device = config["device"]
-        dtype = config["dtype"]
+        target_dtype = dtype_override or config["dtype"]
 
         q = torch.randn(
             (batch_size, config["num_attention_heads"], head_dim),
-            dtype=dtype,
+            dtype=config["dtype"],
             device=device,
         )
         k = torch.randn(
-            (batch_size, config["num_kv_heads"], head_dim), dtype=dtype, device=device
+            (batch_size, config["num_kv_heads"], head_dim),
+            dtype=config["dtype"],
+            device=device,
         )
         v = torch.randn(
             (batch_size, config["num_kv_heads"], config["v_head_dim"]),
-            dtype=dtype,
+            dtype=config["dtype"],
             device=device,
         )
+        if config["dtype"] != target_dtype:
+            q = q.to(target_dtype)
+            k = k.to(target_dtype)
+            v = v.to(target_dtype)
         return q, k, v
 
     def _create_forward_batch(
@@ -439,6 +469,7 @@ class TestTRTLLMMLA(CustomTestCase):
                 config = self._merge_config(test_case)
                 batch_size = config["batch_size"]
                 max_seq_len = config["max_seq_len"]
+                use_fp8 = config["use_fp8"]
 
                 # Create components
                 (
@@ -487,19 +518,33 @@ class TestTRTLLMMLA(CustomTestCase):
 
                 # Create Q, K, V tensors for current decode step
                 torch.manual_seed(config["seed_qkv"])
-                q, k, v = self._create_qkv_tensors(batch_size, config)
+                if use_fp8:
+                    # Generate tensors in FP8 for TRTLLM backend via helper
+                    q_trt, k_trt, v_trt = self._create_qkv_tensors(
+                        batch_size, config, dtype_override=getattr(torch, "float8_e4m3fn")
+                    )
+                    # Reference backend gets BF16 versions
+                    q_ref = q_trt.to(config["dtype"])
+                    k_ref = k_trt.to(config["dtype"])
+                    v_ref = v_trt.to(config["dtype"])
+                    tolerance = test_case.get("tolerance", 5e-2)
+                else:
+                    # BF16 path for both backends
+                    q_ref, k_ref, v_ref = self._create_qkv_tensors(batch_size, config)
+                    q_trt, k_trt, v_trt = q_ref, k_ref, v_ref
+                    tolerance = config["tolerance"]
 
                 # Run forward decode on both backends
                 out_trtllm = trtllm_backend.forward_decode(
-                    q.clone(), k.clone(), v.clone(), layer, fb_trtllm
+                    q_trt.clone(), k_trt.clone(), v_trt.clone(), layer, fb_trtllm
                 )
                 out_reference = reference_backend.forward_decode(
-                    q.clone(), k.clone(), v.clone(), layer, fb_reference
+                    q_ref.clone(), k_ref.clone(), v_ref.clone(), layer, fb_reference
                 )
 
                 # Compare outputs
                 comparison_passed = compare_outputs(
-                    out_trtllm, out_reference, tolerance=config["tolerance"]
+                    out_trtllm, out_reference, tolerance=tolerance
                 )
 
                 self.assertTrue(
