@@ -647,7 +647,8 @@ class EAGLEWorker(TpModelWorker):
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             if self.log_cold_token_prob:
                 cold_probs = probs[:, self.cold_token_mask]
-                logger.info(f"Sum of cold token probs for each batched req in draft_forward: {torch.sum(cold_probs, dim=-1)}")
+                sum_of_cold_probs = torch.sum(cold_probs, dim=-1)
+                log_stats(sum_of_cold_probs, "draft_forward")
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None and not self.log_cold_token_prob:
                 topk_index = self.hot_token_id[topk_index]
@@ -928,7 +929,8 @@ class EAGLEWorker(TpModelWorker):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         if self.log_cold_token_prob:
             cold_probs = probs[:, self.cold_token_mask]
-            logger.info(f"Sum of cold token probs for each batched req in capture_for_decode: {torch.sum(cold_probs, dim=-1)}")
+            sum_of_cold_probs = torch.sum(cold_probs, dim=-1)
+            log_stats(sum_of_cold_probs, "capture_for_decode")
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
 
@@ -993,3 +995,11 @@ def get_last_loc_large_page_size_large_top_k(
     )
 
     return prefix_lens, seq_lens, last_loc, num_new_pages_per_topk, extend_lens
+
+
+def log_stats(sum_of_cold_probs: torch.Tensor, calling_func: str):
+    logger.info(f"Sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs}")
+    logger.info(f"Mean sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.mean().item()}")
+    logger.info(f"Std of sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.std().item()}")
+    logger.info(f"Max sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.max().item()}")
+    logger.info(f"Min sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.min().item()}")
