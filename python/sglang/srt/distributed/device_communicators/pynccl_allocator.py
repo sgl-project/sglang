@@ -1,5 +1,4 @@
 import tempfile
-from contextlib import nullcontext
 
 import torch
 from torch.cuda.memory import CUDAPluggableAllocator
@@ -65,14 +64,16 @@ def get_nccl_mem_pool():
 
 class use_symmetric_memory:
     def __init__(self, group_coordinator: GroupCoordinator):
-        self.group_coordinator = group_coordinator
-        self._mem_pool_ctx = (
-            torch.cuda.use_mem_pool(get_nccl_mem_pool())
-            if is_symmetric_memory_enabled()
-            else nullcontext()
-        )
-        self.is_graph_capture = torch.cuda.is_current_stream_capturing()
-        self.device = torch.cuda.current_device()
+        if not is_symmetric_memory_enabled():
+            self.group_coordinator = None
+            self._mem_pool_ctx = None
+            self.is_graph_capture = None
+            self.device = None
+        else:
+            self.group_coordinator = group_coordinator
+            self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
+            self.is_graph_capture = torch.cuda.is_current_stream_capturing()
+            self.device = torch.cuda.current_device()
 
     def __enter__(self):
         if not is_symmetric_memory_enabled():
