@@ -4,7 +4,7 @@ import dataclasses
 import functools
 import math
 from functools import lru_cache, partial
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union, Callable
 
 import torch
 import torch.nn as nn
@@ -212,6 +212,14 @@ class VisionSdpaAttention(nn.Module):
         else:
             # SDPA
             # [b, h, s, head_size]
+            print(q.shape, k.shape, v.shape)
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_allocated()
+            # q = q.unsqueeze(0)
+            # k = k.unsqueeze(0)
+            # v = v.unsqueeze(0)
             output = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -220,6 +228,14 @@ class VisionSdpaAttention(nn.Module):
                 dropout_p=self.dropout,
                 is_causal=False,
             )
+            torch.cuda.synchronize()
+            after = torch.cuda.memory_allocated()
+            peak = torch.cuda.max_memory_allocated()
+
+            # output = output.squeeze(dim=0)
+            intermediate = peak - max(before, after)
+            print(f"Intermediate peak memory: {intermediate / 1024 / 1024:.2f} MB")
+            print(f"peak memory: {peak / 1024 / 1024:.2f} MB")
 
         # [b, h, s, head_size] --> [b * s, h, head_size]
         output = rearrange(output, "b h s d -> (b s) h d")
@@ -358,6 +374,8 @@ class VisionAttention(nn.Module):
         qkv_bias: bool = True,
         qk_normalization: bool = False,
         layer_norm_eps: float = 1e-06,
+        customized_position_embedding_applier: Callable[
+            [torch.Tensor, torch.Tensor, Any], Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ):
         super().__init__()
@@ -401,6 +419,7 @@ class VisionAttention(nn.Module):
 
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
+        self.customized_rotary_emb_applier = customized_position_embedding_applier
         self.qkv_backend = QKV_BACKEND_IMPL[qkv_backend](
             head_dim=self.head_size,
             num_heads=self.num_attention_heads_per_partition,
@@ -508,16 +527,23 @@ class VisionAttention(nn.Module):
             ]
 
         if position_embeddings is not None:
-            cos, sin = position_embeddings
             original_shape = q.shape
-            # [total_tokens, head, head_size]
-            q = q.view(-1, head, self.head_size)
-            k = k.view(-1, head, self.head_size)
 
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            if self.customized_rotary_emb_applier is not None:
+                q, k = self.customized_rotary_emb_applier(q, k, position_embeddings)
+                q = q.view(original_shape)
+                k = k.view(original_shape)
+            else:
+                cos, sin = position_embeddings
 
-            q = q.view(original_shape)
-            k = k.view(original_shape)
+                # [total_tokens, head, head_size]
+                q = q.view(-1, head, self.head_size)
+                k = k.view(-1, head, self.head_size)
+
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+                q = q.view(original_shape)
+                k = k.view(original_shape)
 
         if q.dim() == 4:
             # [b, s, head, head_size] --> [b * s, head, head_size]
