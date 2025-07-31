@@ -632,12 +632,18 @@ class ModelRunner:
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
-
+        
+        load_encode_weight="full"
+        if self.server_args.disaggregation_mode=="decode":
+            load_encode_weight="disable"
+        elif self.server_args.disaggregation_mode=="encode":
+            load_encode_weight="only"
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
                 device_config=DeviceConfig(self.device),
+                load_encode_weight=load_encode_weight,
             )
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
