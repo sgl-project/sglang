@@ -84,12 +84,8 @@ class SWAChunkCache(ChunkCache):
         self,
         req: Req,
         prelen: int,
-        attention_chunk_size: Optional[int],
+        attention_chunk_size: int,
     ):
-        # Skip eviction if attention_chunk_size is None or 0
-        if attention_chunk_size is None or attention_chunk_size == 0:
-            return
-
         if prelen >= req.evicted_seqlen_local + attention_chunk_size:
             new_evicted_seqlen_local = attention_chunk_size * (
                 prelen // attention_chunk_size
