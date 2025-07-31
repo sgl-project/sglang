@@ -602,6 +602,7 @@ class HiCacheController:
                     elif isinstance(self.storage_backend, MooncakeStore):
                         hash_value.append(last_hash)
                         remaining_tokens -= self.page_size
+                        storage_hit_count += self.page_size
                     else:
                         break
 
