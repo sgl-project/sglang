@@ -868,7 +868,6 @@ class Step3VLForConditionalGeneration(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        # TODO:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", 0),
@@ -901,9 +900,7 @@ class Step3VLForConditionalGeneration(nn.Module):
 
         for name, loaded_weight in weights:
             if "vision_model" in name:
-                # 1.It’s not great, but let’s leave it like this for now
                 name = name.replace("self_attn", "self_attn.attn")
-                # 2.
                 name = name.replace("out_proj", "proj")
 
             # TODO: support vision model

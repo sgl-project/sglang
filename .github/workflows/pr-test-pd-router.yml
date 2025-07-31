@@ -253,7 +253,7 @@ jobs:
 
           # Run genai-bench benchmark
           echo "Running genai-bench for $policy..."
-          genai-bench benchmark \
+          python3 -m genai-bench benchmark \
             --api-backend openai \
             --api-base "http://127.0.0.9:8000" \
             --api-key "dummy-token" \
