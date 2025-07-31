@@ -177,6 +177,53 @@ class TestGemma3nServer(TestOpenAIVisionServer):
         # self._test_audio_ambient_completion()
 
 
+class TestQwen2AudioServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen2-Audio-7B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.70",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_audio_chat_completion(self):
+        self._test_audio_speech_completion()
+        self._test_audio_ambient_completion()
+
+    # Qwen2Audio does not support image
+    def test_single_image_chat_completion(self):
+        pass
+
+    # Qwen2Audio does not support image
+    def test_multi_turn_chat_completion(self):
+        pass
+
+    # Qwen2Audio does not support image
+    def test_multi_images_chat_completion(self):
+        pass
+
+    # Qwen2Audio does not support image
+    def test_video_images_chat_completion(self):
+        pass
+
+    # Qwen2Audio does not support image
+    def test_regex(self):
+        pass
+
+    # Qwen2Audio does not support image
+    def test_mixed_batch(self):
+        pass
+
+
 class TestKimiVLServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):

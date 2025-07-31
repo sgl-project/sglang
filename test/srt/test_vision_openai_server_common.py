@@ -541,7 +541,7 @@ class TestOpenAIVisionServer(CustomTestCase):
         # bird song
         audio_response = self.get_audio_response(
             AUDIO_BIRD_SONG_URL,
-            "Please listen to the audio snippet carefully and transcribe the content.",
+            "Please listen to the audio snippet carefully and transcribe the content in English.",
             "ambient",
         )
         assert "bird" in audio_response
