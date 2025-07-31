@@ -293,13 +293,13 @@ class Step3TextDecoderLayer(nn.Module):
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
-        # TODO:(Yuhao): support shared experts fusion
-        self.n_shared_experts = 1
-        self.num_fused_shared_experts = (
-            0
-            if global_server_args_dict["disable_shared_experts_fusion"]
-            else self.n_shared_experts
-        )
+        # TODO: support shared experts fusion
+        # self.n_shared_experts = 1
+        # self.num_fused_shared_experts = (
+        #     0
+        #     if global_server_args_dict["disable_shared_experts_fusion"]
+        #     else self.n_shared_experts
+        # )
         self.num_fused_shared_experts = 0
         rms_norm_eps = config.rms_norm_eps
         self.self_attn = Step3TextAttention(
@@ -561,7 +561,7 @@ class Step3VisionAttention(nn.Module):
         self,
         dim: int,
         num_heads: int = 16,
-        attn_implementation="sdpa",
+        qkv_backend="fa3",
         quant_config=None,
         prefix: str = "",
     ) -> None:
@@ -578,23 +578,6 @@ class Step3VisionAttention(nn.Module):
         )
         self.scale = self.head_dim**-0.5
 
-        if attn_implementation == "sdpa":
-            softmax_in_single_precision = False
-            qkv_backend = "sdpa"
-            flatten_batch = False
-        elif attn_implementation == "flash_attention_2":
-            softmax_in_single_precision = False
-            qkv_backend = "triton_attn"
-            flatten_batch = False
-        elif attn_implementation == "eager":
-            softmax_in_single_precision = True
-            qkv_backend = "sdpa"
-            flatten_batch = False
-        elif attn_implementation == "flash_attention_3":
-            softmax_in_single_precision = False
-            qkv_backend = "fa3"
-            flatten_batch = False
-
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
@@ -603,8 +586,6 @@ class Step3VisionAttention(nn.Module):
             rotary_embed="normal",
             proj_bias=True,
             qkv_backend=qkv_backend,
-            softmax_in_single_precision=softmax_in_single_precision,
-            flatten_batch=flatten_batch,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -750,7 +731,6 @@ class Step3VLForConditionalGeneration(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        print("config", config)
         self.config = config
         self.quant_config = quant_config
         self.model = Step3TextModel(
@@ -778,8 +758,8 @@ class Step3VLForConditionalGeneration(nn.Module):
             bias=config.projector_bias,
         )
 
-        self.n_shared_experts = 1
-        # TODO:(Yuhao): support shared experts fusion
+        # TODO: support shared experts fusion
+        # self.n_shared_experts = 1
         # self.num_fused_shared_experts = (
         #     0
         #     if global_server_args_dict["disable_shared_experts_fusion"]
@@ -822,7 +802,6 @@ class Step3VLForConditionalGeneration(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         assert len(items) == 1  # We only have images.
-        # TODO: We should consider input image_embedding directly.
 
         item = items[0]
         pixel_values = item.feature.type(self.vision_model.dtype)
@@ -831,8 +810,6 @@ class Step3VLForConditionalGeneration(nn.Module):
         if patch_pixel_values is not None:
             patch_pixel_values = patch_pixel_values.type(self.vision_model.dtype)
 
-        # TODO:Remove this:
-        pixel_values = pixel_values.to("cuda")
         if patch_pixel_values is not None:
             patch_pixel_values = patch_pixel_values.to("cuda")
 
@@ -888,8 +865,6 @@ class Step3VLForConditionalGeneration(nn.Module):
             positions=positions,
         )
 
-        # return hidden_states
-        # hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
@@ -969,8 +944,6 @@ class Step3VLForConditionalGeneration(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-                # Check if param has too many zeros
-                # assert zero_ratio < 0.25, f"Parameter {name} has {zero_ratio:.2%} zeros (threshold: 25%)"
                 loaded_params.add(name)
                 break
             else:

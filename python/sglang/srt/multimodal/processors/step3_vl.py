@@ -10,9 +10,7 @@ from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from transformers import BatchFeature, TensorType
 
-from sglang.srt.models.step3_vl import (
-    Step3VLForConditionalGeneration,
-)
+from sglang.srt.models.step3_vl import Step3VLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )

@@ -996,7 +996,7 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
-        name="step3",
+        name="step3-vl",
         system_message="<｜begin▁of▁sentence｜>You are a helpful assistant",
         system_template="{system_message}\n",
         roles=(
@@ -1122,7 +1122,7 @@ def match_mimo_vl(model_path: str):
         return "mimo-vl"
 
 
-@register_conv_template_matching_function
-def match_step3(model_path: str):
-    if re.search(r"step3", model_path, re.IGNORECASE):
-        return "step3"
+# @register_conv_template_matching_function
+# def match_step3(model_path: str):
+#     if re.search(r"step3", model_path, re.IGNORECASE):
+#         return "step3-vl"
