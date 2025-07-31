@@ -24,7 +24,7 @@ try:
         make_iovec,
         register_fd,
     )
-except ImportError as e:
+except ImportError:
     HF3FS_AVAILABLE = False
 
 
