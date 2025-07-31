@@ -294,10 +294,6 @@ class HiCacheController:
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
 
-            self.enable_storage = True
-            # todo: threshold policy for prefetching
-            self.prefetch_threshold = max(prefetch_threshold, self.page_size)
-
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
