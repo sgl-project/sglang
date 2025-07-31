@@ -73,6 +73,7 @@ import requests
 import torch
 import torch.distributed
 import torch.distributed as dist
+import triton
 import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
@@ -83,10 +84,9 @@ from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
-
-import triton
-from sglang.srt.metrics.func_timer import enable_func_timer
 from triton.runtime.cache import FileCacheManager
+
+from sglang.srt.metrics.func_timer import enable_func_timer
 
 logger = logging.getLogger(__name__)
 
