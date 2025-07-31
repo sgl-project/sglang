@@ -15,7 +15,6 @@ hf3fs_utils = load(name="hf3fs_utils", sources=[f"{root}/hf3fs_utils.cpp"])
 logger = logging.getLogger(__name__)
 
 HF3FS_AVAILABLE = True
-
 try:
     from hf3fs_fuse.io import (
         deregister_fd,
@@ -58,7 +57,7 @@ class Hf3fsClient:
             raise ImportError(
                 "hf3fs_fuse.io is not available. Please install the hf3fs_fuse package."
             )
-            
+
         self.path = path
         self.size = size
         self.bytes_per_page = bytes_per_page
