@@ -219,9 +219,9 @@ except:
 @lru_cache(maxsize=1)
 def cpu_has_amx_support():
     return (
-        # Env DISABLE_AMX is to check whether AMX is disabled by user.
+        # Env SGLANG_CPU_DISABLE_AMX is to check whether AMX is disabled by user.
         # Current scenario is to enable torch_native UT on AMX CPUs.
-        os.environ.get("DISABLE_AMX") != "1"
+        not get_bool_env_var("SGLANG_CPU_DISABLE_AMX", "0")
         and torch._C._cpu._is_amx_tile_supported()
         and is_intel_amx_backend_available
     )
