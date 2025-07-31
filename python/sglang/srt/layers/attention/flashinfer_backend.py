@@ -262,17 +262,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged = True
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
-            seq_lens = forward_batch.seq_lens
-            req_pool_indices = forward_batch.req_pool_indices
-            seq_lens_sum = forward_batch.seq_lens_sum
             self.forward_metadata = PrefillMetadata(
                 wrappers, use_ragged, extend_no_prefix
             )
 
             self.indices_updater_prefill.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_sum,
                 prefix_lens,
                 prefill_wrappers=wrappers,
                 use_ragged=use_ragged,
