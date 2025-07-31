@@ -7,21 +7,17 @@ from typing import List, Optional, Set, Tuple
 
 import torch
 from torch import nn
-from transformers import Llama4Config, Llama4VisionConfig
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
-    QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -33,8 +29,8 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_cpu
+from sglang.srt.utils import is_cpu
+from transformers import Llama4Config, Llama4VisionConfig
 
 _is_cpu = is_cpu()
 import pdb
@@ -107,7 +103,7 @@ def pixel_shuffle(input_tensor, shuffle_ratio):
         batch_size,
         int(height * shuffle_ratio),
         int(width * shuffle_ratio),
-        int(channels / (shuffle_ratio**2)),
+        int(channels / (shuffle_ratio ** 2)),
     )
     reshaped_tensor = reshaped_tensor.permute(0, 2, 1, 3).contiguous()
 
@@ -127,7 +123,7 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
         super().__init__()
         self.pixel_shuffle_ratio = config.pixel_shuffle_ratio
         self.inner_dim = int(
-            config.projector_input_dim // (self.pixel_shuffle_ratio**2)
+            config.projector_input_dim // (self.pixel_shuffle_ratio ** 2)
         )
         self.output_dim = config.projector_output_dim
         self.mlp = Llama4VisionMLP(
@@ -202,7 +198,7 @@ class Llama4VisionEncoderLayer(nn.Module):
         hidden_state = self.mlp(hidden_state)
         hidden_state = residual + hidden_state
 
-        outputs = (hidden_state,)
+        outputs = hidden_state
         return outputs
 
 
@@ -235,7 +231,7 @@ class Llama4VisionEncoder(nn.Module):
     ) -> torch.Tensor:
         r"""
         Args:
-            inputs_embeds (`torch.FloatTensor` of shape
+            hidden_states (`torch.FloatTensor` of shape
                     `(batch_size, sequence_length, hidden_size)`):
                 Optionally, instead of passing `input_ids` you can choose to
                 directly pass an embedded representation. This is useful if you
@@ -246,7 +242,7 @@ class Llama4VisionEncoder(nn.Module):
 
         for encoder_layer in self.layers:
             layer_outputs = encoder_layer(hidden_states)
-            hidden_states = layer_outputs[0]
+            hidden_states = layer_outputs
 
         return hidden_states
 
@@ -302,7 +298,7 @@ class Llama4VisionModel(nn.Module):
         self.num_channels = config.num_channels
 
         self.num_patches = (self.image_size // self.patch_size) ** 2 + 1
-        self.scale = config.hidden_size**-0.5
+        self.scale = config.hidden_size ** -0.5
 
         self.patch_embedding = Llama4UnfoldConvolution(
             config,
