@@ -316,6 +316,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
+
+            # TODO: get rid of concat to improve perf
             query = torch.cat([q_nope, q_rope_reshaped], dim=-1)
         else:
             # q already has both parts
@@ -331,17 +333,27 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # TRT-LLM expects single KV data with extra dimension
         kv_cache = pages.unsqueeze(1)
 
+        # Quantize query to fp8 if kv is already set to fp8_e4m3 using --kv-cache-dtype fp8_e4m3
+        # TODO: add an assert to server args to make sure kv-cache-dtype is either fp8_em4m3 or fp16/auto
+        if query.dtype != k_cache.dtype:
+            query = query.to(k_cache.dtype)
+
         # Get metadata
         metadata = (
             getattr(forward_batch, "decode_trtllm_mla_metadata", None)
             or self.forward_metadata
         )
 
-        # Scale computation for TRTLLM MLA kernel:
-        # - BMM1 scale = q_scale * k_scale * softmax_scale
-        # - For FP16 path we keep q_scale = 1.0, softmax_scale = 1/sqrt(head_dim) which is pre-computed as layer.scaling
-        # - k_scale is read from model checkpoint if available
-        # TODO: Change once fp8 path is supported
+        # Scale computation for TRTLLM MLA kernel BMM1 operation:
+        # 
+        # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale
+        # 
+        # Scale components:
+        # - q_scale: Query scaling factor (set to 1.0 for both FP16/FP8 paths)
+        # - k_scale: Key scaling factor from model checkpoint (defaults to 1.0 if not available)
+        # - softmax_scale: Attention softmax scaling = 1/sqrt(head_dim), pre-computed as layer.scaling
+        #
+        # This unified approach works for both FP16 and FP8 quantized attention paths.
         q_scale = 1.0
         k_scale = (
             layer.k_scale_float
