@@ -243,7 +243,6 @@ class Step3Detector(BaseFormatDetector):
                 self._function_name_sent = False
                 self._current_function_name = ""
                 self._current_parameters = {}
-                self._current_tool_name_sent = False
                 # Fall through to parse the partial tool call
             else:
                 # Wait for tool call to begin
@@ -304,7 +303,6 @@ class Step3Detector(BaseFormatDetector):
                             parameters="",
                         )
                     )
-                    self.current_tool_name_sent = True
                 else:
                     # Invalid function name
                     logger.warning(f"Invalid function name: {func_name}")
@@ -401,7 +399,6 @@ class Step3Detector(BaseFormatDetector):
         self._function_name_sent = False
         self._current_function_name = ""
         self._current_parameters = {}
-        self._current_tool_name_sent = False
 
     def supports_structural_tag(self) -> bool:
         """Return True if this detector supports structural tag format."""
