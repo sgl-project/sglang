@@ -8,6 +8,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
     NVSHMEM_DIR=/sgl-workspace/nvshmem/install
+# Add GKE default lib and bin locations.
+ENV PATH="${PATH}:/usr/local/nvidia/bin" \
+    LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
 
 # Set timezone and install all packages
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
