@@ -1526,12 +1526,29 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
+        if torch.isnan(forward_batch.input_ids).any():
+            raise ValueError(
+                f"Detected NaN values: {forward_batch.input_ids[torch.isnan(forward_batch.input_ids)]=}"
+            )
+        if torch.isnan(forward_batch.positions).any():
+            raise ValueError(
+                f"Detected NaN values: {forward_batch.positions[torch.isnan(forward_batch.positions)]=}"
+            )
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+        if torch.isnan(forward_batch.input_ids).any():
+            raise ValueError(
+                f"Detected NaN values: {forward_batch.input_ids[torch.isnan(forward_batch.input_ids)]=}"
+            )
+        if torch.isnan(forward_batch.positions).any():
+            raise ValueError(
+                f"Detected NaN values: {forward_batch.positions[torch.isnan(forward_batch.positions)]=}"
+            )
+        logger.debug(f"{self.model.forward=}")
         return self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
@@ -1648,12 +1665,17 @@ class ModelRunner:
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
 
+        logger.debug(f"{forward_batch.forward_mode=}")
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if torch.isnan(ret.next_token_logits).any():
+                raise ValueError(
+                    f"Detected NaN values: {ret.next_token_logits[torch.isnan(ret.next_token_logits)]=}"
+                )
         elif forward_batch.forward_mode.is_extend():
             ret = self.forward_extend(
                 forward_batch,
@@ -1673,7 +1695,10 @@ class ModelRunner:
 
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.post_forward_mlp_sync_batch(ret)
-
+        if torch.isnan(ret.next_token_logits).any():
+            raise ValueError(
+                f"Detected NaN values: {ret.next_token_logits[torch.isnan(ret.next_token_logits)]=}"
+            )
         return ret, can_run_cuda_graph
 
     def _preprocess_logits(

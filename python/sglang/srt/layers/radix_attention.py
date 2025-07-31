@@ -14,6 +14,7 @@
 """Radix attention."""
 from __future__ import annotations
 
+import torch
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -90,9 +91,14 @@ class RadixAttention(nn.Module):
         save_kv_cache: bool = True,
         **kwargs,
     ):
+        finfo = torch.finfo(q.dtype)
+        q = torch.clamp(q, min=finfo.min, max=finfo.max)
+
         if k is not None:
+            k = torch.clamp(k, min=finfo.min, max=finfo.max)
             # For cross-layer sharing, kv can be None
             assert v is not None
+            v = torch.clamp(v, min=finfo.min, max=finfo.max)
             if "k_rope" not in kwargs:
                 k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
                 v = v.view(-1, self.tp_v_head_num, self.v_head_dim)

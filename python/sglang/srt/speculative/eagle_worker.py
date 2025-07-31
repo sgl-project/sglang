@@ -91,6 +91,7 @@ class EAGLEWorker(TpModelWorker):
             server_args.speculative_algorithm
         )
         self.padded_static_len = -1
+        self.log_num_cold_tokens = None
 
         # Override context length with target model's context length
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -151,10 +152,67 @@ class EAGLEWorker(TpModelWorker):
             if self.hot_token_id is not None:
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
-                head.data = head.data[self.hot_token_id]
+                # Create a boolean mask for hot tokens
+                vocab_size = head.data.shape[0]
+                mask_hot = torch.zeros(vocab_size, dtype=torch.bool, device=head.device)
+                mask_hot[self.hot_token_id] = True
+                # Save the number of cold tokens
+                self.num_cold_tokens = torch.sum(~mask_hot).item()
+                if self.num_cold_tokens > 0:
+                    self.log_num_cold_tokens = torch.log(
+                        torch.tensor(self.num_cold_tokens, device=head.device)
+                    ).item()
+                # Sum up the cold rows of the LM head
+                cold_sum = torch.sum(head.data[~mask_hot], dim=0)
+                # Remove cold rows
+                head.data = head.data[mask_hot]
+                # Add a row to sum up the cold rows
+                head.data = torch.cat([head.data, cold_sum.unsqueeze(0)], dim=0)
 
             # Share the embedding and lm_head
             self.draft_model_runner.model.set_embed_and_head(embed, head)
+
+        if (
+            self.hot_token_id is not None
+            and server_args.speculative_weaker_drafter_probs is None
+        ):
+            raise ValueError(
+                "When a `speculative_token_map` or an EAGLE3 model with a built-in "
+                "token map is used, `speculative_weaker_drafter_probs` must also be provided."
+            )
+
+        # Load weaker drafter map if provided
+        self.weaker_drafter = None
+        if server_args.speculative_weaker_drafter_probs is not None:
+            weaker_drafter_all_vocab = load_tensor_from_path(
+                server_args.speculative_weaker_drafter_probs
+            ).to(self.device)
+
+            if self.hot_token_id is not None:
+                # The loaded weaker_drafter is for the full vocabulary.
+                # We need to select the values for the cold tokens.
+                target_vocab_size = (
+                    self.target_worker.model_runner.model_config.vocab_size
+                )
+                if weaker_drafter_all_vocab.shape[0] != target_vocab_size:
+                    raise ValueError(
+                        "The weaker drafter probabilities tensor should have a size "
+                        f"equal to the target model's vocabulary size. "
+                        f"Expected {target_vocab_size}, but got "
+                        f"{weaker_drafter_all_vocab.shape[0]}."
+                    )
+                mask_hot = torch.zeros(
+                    target_vocab_size, dtype=torch.bool, device=self.device
+                )
+                mask_hot[self.hot_token_id.to(self.device)] = True
+                self.weaker_drafter = weaker_drafter_all_vocab[~mask_hot]
+                # Normalize the weaker drafter
+                self.weaker_drafter = self.weaker_drafter / self.weaker_drafter.sum()
+            else:
+                # If there is no hot token map, all tokens are considered cold.
+                # However, the weaker_drafter logic is only triggered when there is
+                # a hot/cold split, so we do nothing here.
+                pass
 
         # Init attention backend and cuda graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (
@@ -591,8 +649,6 @@ class EAGLEWorker(TpModelWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
-        if self.hot_token_id is not None:
-            topk_index = self.hot_token_id[topk_index]
 
         out_cache_loc = out_cache_loc.reshape(
             forward_batch.batch_size, self.topk, self.speculative_num_steps
@@ -612,6 +668,14 @@ class EAGLEWorker(TpModelWorker):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
+            if torch.isnan(hidden_states).any():
+                raise ValueError(
+                    f"Detected NaN values: {hidden_states[torch.isnan(hidden_states)]=}"
+                )
+            if torch.isnan(scores).any():
+                raise ValueError(
+                    f"Detected NaN values: {scores[torch.isnan(scores)]=}"
+                )
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
@@ -632,10 +696,11 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch, skip_attn_backend_init=True
             )
             self._detect_nan_if_needed(logits_output)
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            self._post_process_draft_logits(logits_output)
+            self._detect_nan_if_needed(logits_output)
+            probs = safe_softmax(logits_output.next_token_logits)
+            probs = self._post_process_draft_probs(probs)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            if self.hot_token_id is not None:
-                topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
         return score_list, token_list, parents_list
@@ -893,6 +958,7 @@ class EAGLEWorker(TpModelWorker):
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             )
+            self._detect_nan_if_needed(logits_output)
             self.capture_for_decode(logits_output, forward_batch.spec_info)
 
         self._detect_nan_if_needed(logits_output)
@@ -907,10 +973,73 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info.accept_length = accept_length_backup
         batch.return_logprob = return_logprob_backup
 
+    def _post_process_draft_logits(self, logits_output: LogitsProcessorOutput):
+        """Lower bound the ExpSumLog for out-of-vocab tokens."""
+        logger.debug("post_process_draft_logits")
+        if getattr(self, "num_cold_tokens", 0) == 0:
+            return
+
+        # Note: The last entry of the logits corresponds to the sum of cold tokens
+        logits = logits_output.next_token_logits
+
+        # Clamp inf values to avoid NaN in softmax
+        logger.debug(f"Before clamp: {logits=}")
+        finfo = torch.finfo(logits.dtype)
+        logits.clamp_(min=finfo.min, max=finfo.max)
+        logger.debug(f"After clamp: {logits=}")
+
+        cold_token_logits = logits[..., -1]
+        logger.debug(f"{cold_token_logits=}")
+        logger.debug(f"{self.num_cold_tokens=}")
+        logger.debug(f"{self.log_num_cold_tokens=}")
+
+        logits[..., -1] = self.log_num_cold_tokens + (
+            cold_token_logits / self.num_cold_tokens
+        )
+
+    def _post_process_draft_probs(self, probs: torch.Tensor) -> torch.Tensor:
+        logger.debug("post_process_draft_probs")
+        """Redistribute the probability mass of cold tokens."""
+        # TODO: Remove this before benchmarking
+        if torch.isnan(probs).any():
+            raise ValueError("Detected errors during sampling! NaN in the probs.")
+
+        if getattr(self, "num_cold_tokens", 0) == 0 or self.weaker_drafter is None:
+            return probs
+
+        # Note: The last entry of the probs lower bounds the accumulated probability of cold tokens
+        cold_token_probs = probs[..., -1].unsqueeze(1)
+        hot_token_probs = probs[..., :-1]
+        logger.debug(f"{hot_token_probs[..., -1]=}")
+
+        # Reshape weaker_drafter for broadcasting
+        weaker_drafter_reshaped = self.weaker_drafter.unsqueeze(0)
+
+        # Redistribute probabilities
+        redistributed_cold_probs = cold_token_probs * weaker_drafter_reshaped
+        logger.debug(f"{redistributed_cold_probs.sum(dim=-1)=}")
+
+        probs = torch.cat([hot_token_probs, redistributed_cold_probs], dim=-1)
+        # TODO: Remove this before benchmarking
+        if torch.isnan(probs).any():
+            raise ValueError("Detected errors during sampling! NaN in the probs.")
+        logger.debug(f"{probs[..., -1]=}")
+        # Normalize the probs with L1 norm
+        probs = torch.nn.functional.normalize(probs, p=1, dim=-1)
+        sum_after_norm = probs.sum(dim=-1)
+        logger.debug(f"Sum after normalization: {sum_after_norm=}")
+        logger.debug(
+            f"Checking with allclose after normalization: "
+            f"{torch.allclose(sum_after_norm, torch.ones_like(sum_after_norm))=}"
+        )
+        return probs
+
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
-        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+        self._post_process_draft_logits(logits_output)
+        probs = safe_softmax(logits_output.next_token_logits)
+        probs = self._post_process_draft_probs(probs)
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
 
@@ -920,6 +1049,94 @@ class EAGLEWorker(TpModelWorker):
             if torch.any(torch.isnan(logits)):
                 logger.error("Detected errors during sampling! NaN in the logits.")
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
+
+
+def safe_softmax(logits: torch.Tensor, dim: Optional[int] = -1) -> torch.Tensor:
+    """
+    A numerically stable softmax implementation with aggressive clamping
+    at each intermediate step to prevent NaN generation from inf values.
+    """
+    if torch.isnan(logits).any():
+        raise ValueError(
+            f"Detected NaN values: {logits[torch.isnan(logits)]=}"
+        )
+
+    finfo = torch.finfo(logits.dtype)
+
+    # 0. Clamp the logits.
+    logits = torch.clamp(logits, min=finfo.min, max=finfo.max)
+    if torch.isnan(logits).any():
+        raise ValueError(
+            f"Detected NaN values: {logits[torch.isnan(logits)]=}"
+        )
+
+    # 1. Find the maximum.
+    max_val = torch.max(logits, dim=dim, keepdim=True)[0]
+    
+    # 2. Shift the logits and clamp. This is where `inf - inf` -> NaN is prevented.
+    shifted_logits = logits - max_val
+    if torch.isnan(shifted_logits).any():
+        raise ValueError(
+            f"Detected NaN values: {shifted_logits[torch.isnan(shifted_logits)]=}"
+        )
+    shifted_logits = torch.clamp(shifted_logits, min=finfo.min, max=finfo.max)
+    if torch.isnan(shifted_logits).any():
+        raise ValueError(
+            f"Detected NaN values: {shifted_logits[torch.isnan(shifted_logits)]=}"
+        )
+
+    # 3. Exponentiate and clamp.
+    exp_logits = torch.exp(shifted_logits)
+    if torch.isnan(exp_logits).any():
+        raise ValueError(
+            f"Detected NaN values: {exp_logits[torch.isnan(exp_logits)]=}"
+        )
+    exp_logits = torch.clamp(exp_logits, min=finfo.min, max=finfo.max)
+    if torch.isnan(exp_logits).any():
+        raise ValueError(
+            f"Detected NaN values: {exp_logits[torch.isnan(exp_logits)]=}"
+        )
+
+    # 4. Sum the exponentiated values and clamp.
+    sum_exp_logits = torch.sum(exp_logits, dim=dim, keepdim=True)
+    if torch.isnan(sum_exp_logits).any():
+        raise ValueError(
+            f"Detected NaN values: {sum_exp_logits[torch.isnan(sum_exp_logits)]=}"
+        )
+    sum_exp_logits = torch.clamp(sum_exp_logits, min=finfo.eps, max=finfo.max)
+    if torch.isnan(sum_exp_logits).any():
+        raise ValueError(
+            f"Detected NaN values: {sum_exp_logits[torch.isnan(sum_exp_logits)]=}"
+        )
+
+    # 5. Normalize and perform a final clamp.
+    probs = exp_logits / sum_exp_logits
+    if torch.isnan(probs).any():
+        raise ValueError(
+            f"Detected NaN values: {probs[torch.isnan(probs)]=}"
+        )
+    probs = torch.clamp(probs, min=finfo.min, max=finfo.max)
+    if torch.isnan(probs).any():
+        raise ValueError(
+            f"Detected NaN values: {probs[torch.isnan(probs)]=}"
+        )
+
+    return probs
+
+
+def load_tensor_from_path(tensor_path: str) -> torch.Tensor:
+    if not os.path.exists(tensor_path):
+        cache_dir = snapshot_download(
+            os.path.dirname(tensor_path),
+            # Avoid downloading the large model weights
+            ignore_patterns=["*.bin", "*.safetensors"],
+        )
+        tensor_path = os.path.join(cache_dir, os.path.basename(tensor_path))
+    tensor = torch.load(tensor_path, weights_only=True)
+    if not isinstance(tensor, torch.Tensor):
+        # The loaded object could be a list of numbers
+        tensor = torch.tensor(tensor)
+    return tensor
 
 
 def load_token_map(token_map_path: str) -> List[int]:
