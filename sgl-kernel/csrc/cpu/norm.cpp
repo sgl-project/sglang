@@ -4,11 +4,11 @@
 namespace {
 
 // NB: avoid using `at::vec::map<>` on bfloat16 or half
+// Llama4TextL2Norm
 template <typename scalar_t>
-void rmsnorm_kernel_impl(
+void l2norm_kernel_impl(
     scalar_t* __restrict__ output,
     const scalar_t* __restrict__ input,
-    const scalar_t* __restrict__ weight,
     int64_t batch_size,
     int64_t hidden_size,
     float eps = 1e-5) {
@@ -21,6 +21,68 @@ void rmsnorm_kernel_impl(
       // local ptrs
       scalar_t* __restrict__ out_ptr = output + i * hidden_size;
       const scalar_t* __restrict__ input_ptr = input + i * hidden_size;
+
+      fVec sum_fvec = fVec(float(0));
+      float sum_val = float(0);
+
+      int64_t d;
+#pragma GCC unroll 4
+      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
+        bVec x_bvec = bVec::loadu(input_ptr + d);
+        fVec x_fvec0, x_fvec1;
+        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+
+        sum_fvec += x_fvec0 * x_fvec0;
+        sum_fvec += x_fvec1 * x_fvec1;
+      }
+#pragma GCC unroll 4
+      for (; d < hidden_size; ++d) {
+        float x_val = static_cast<float>(input_ptr[d]);
+        sum_val += x_val * x_val;
+      }
+
+      sum_val += vec_reduce_sum(sum_fvec);
+      float rsqrt_var = float(1) / std::sqrt(sum_val / hidden_size + eps);
+      const fVec scale_fvec = fVec(rsqrt_var);
+
+#pragma GCC unroll 4
+      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
+        bVec x_bvec = bVec::loadu(input_ptr + d);
+        fVec x_fvec0, x_fvec1;
+        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+
+        x_fvec0 = x_fvec0 * scale_fvec;
+        x_fvec1 = x_fvec1 * scale_fvec;
+
+        bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+        out_bvec.store(out_ptr + d);
+      }
+#pragma GCC unroll 4
+      for (; d < hidden_size; ++d) {
+        float x_val = static_cast<float>(input_ptr[d]);
+        out_ptr[d] = static_cast<scalar_t>(x_val * rsqrt_var);
+      }
+    }
+  });
+}
+template <typename scalar_t>
+void rmsnorm_kernel_impl(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    int64_t batch_size,
+    int64_t hidden_size,
+    int64_t input_strideN,
+    float eps = 1e-5) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+
+  constexpr int kVecSize = bVec::size();
+  at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t i = begin; i < end; ++i) {
+      // local ptrs
+      scalar_t* __restrict__ out_ptr = output + i * hidden_size;
+      const scalar_t* __restrict__ input_ptr = input + i * input_strideN;
 
       fVec sum_fvec = fVec(float(0));
       float sum_val = float(0);
@@ -79,6 +141,7 @@ void fused_add_rmsnorm_kernel_impl(
     float* __restrict__ buffer,
     int64_t batch_size,
     int64_t hidden_size,
+    int64_t input_strideN,
     float eps = 1e-5) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
@@ -90,7 +153,7 @@ void fused_add_rmsnorm_kernel_impl(
 
     for (int64_t i = begin; i < end; ++i) {
       // local ptrs
-      scalar_t* __restrict__ input_ptr = input + i * hidden_size;
+      scalar_t* __restrict__ input_ptr = input + i * input_strideN;
       scalar_t* __restrict__ residual_ptr = residual + i * hidden_size;
 
       fVec sum_fvec = fVec(float(0));
@@ -161,11 +224,27 @@ void fused_add_rmsnorm_kernel_impl(
 }  // anonymous namespace
 
 // input : {batch_size, hidden_size}
+at::Tensor l2norm_cpu(at::Tensor& input, double eps) {
+  RECORD_FUNCTION("sgl-kernel::l2norm_cpu", std::vector<c10::IValue>({input}));
+
+  CHECK_INPUT(input);
+  CHECK_DIM(2, input);
+  int64_t batch_size = input.size(0);
+  int64_t hidden_size = input.size(1);
+  at::Tensor output = at::empty_like(input);
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "l2norm_kernel", [&] {
+    l2norm_kernel_impl<scalar_t>(output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), batch_size, hidden_size, eps);
+  });
+  return output;
+}
+
+// input : {batch_size, hidden_size}
 // weight: {hidden_size}
 at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   RECORD_FUNCTION("sgl-kernel::rmsnorm_cpu", std::vector<c10::IValue>({input, weight}));
 
-  CHECK_INPUT(input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(weight);
   CHECK_DIM(2, input);
   CHECK_DIM(1, weight);
@@ -173,6 +252,7 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   int64_t batch_size = input.size(0);
   int64_t hidden_size = input.size(1);
   at::Tensor output = at::empty_like(input);
+  int64_t input_strideN = input.stride(0);
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "rmsnorm_kernel", [&] {
     rmsnorm_kernel_impl<scalar_t>(
@@ -181,6 +261,7 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
         weight.data_ptr<scalar_t>(),
         batch_size,
         hidden_size,
+        input_strideN,
         eps);
   });
   return output;
@@ -191,7 +272,7 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
 // weight  : {hidden_size}
 void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps) {
   RECORD_FUNCTION("sgl-kernel::fused_add_rmsnorm_cpu", std::vector<c10::IValue>({input, residual, weight}));
-  CHECK_INPUT(input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(residual);
   CHECK_INPUT(weight);
   CHECK_DIM(2, input);
@@ -202,6 +283,7 @@ void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& 
   CHECK_EQ(input.size(1), weight.size(0));
   int64_t batch_size = input.size(0);
   int64_t hidden_size = input.size(1);
+  int64_t input_strideN = input.stride(0);
 
   // allocate temp buffer to store x in float32 per thread
   // TODO: implement a singleton for context
@@ -216,6 +298,7 @@ void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& 
         buffer.data_ptr<float>(),
         batch_size,
         hidden_size,
+        input_strideN,
         eps);
   });
 }

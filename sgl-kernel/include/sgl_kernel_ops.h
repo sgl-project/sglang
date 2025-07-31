@@ -18,11 +18,14 @@ limitations under the License.
 #include <ATen/ATen.h>
 #include <ATen/Tensor.h>
 #include <Python.h>
+#include <torch/all.h>
 #include <torch/library.h>
 #include <torch/torch.h>
 
 #include <tuple>
 #include <vector>
+
+#include "scalar_type.hpp"
 
 #define _CONCAT(A, B) A##B
 #define CONCAT(A, B) _CONCAT(A, B)
@@ -63,6 +66,13 @@ void register_graph_buffers(
     fptr_t _fa, const std::vector<std::string>& handles, const std::vector<std::vector<int64_t>>& offsets);
 torch::Tensor allocate_meta_buffer(int64_t size);
 torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor& inp);
+// quick allreduce
+fptr_t init_custom_qr(int64_t rank, int64_t world_size, std::optional<int64_t> qr_max_size = std::nullopt);
+void qr_destroy(fptr_t _fa);
+torch::Tensor qr_get_handle(fptr_t _fa);
+void qr_open_handles(fptr_t _fa, const std::vector<torch::Tensor>& handles);
+void qr_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int64_t quant_level, bool cast_bf2half = false);
+int64_t qr_max_size();
 #else
 // custom allreduce
 fptr_t
@@ -74,6 +84,20 @@ std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta
 void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs);
 void register_graph_buffers(
     fptr_t _fa, const std::vector<std::vector<int64_t>>& handles, const std::vector<std::vector<int64_t>>& offsets);
+
+// mscclpp
+torch::Tensor mscclpp_generate_unique_id();
+fptr_t mscclpp_init_context(
+    const torch::Tensor& unique_id,
+    const int64_t rank,
+    const int64_t world_size,
+    torch::Tensor& scratch,
+    torch::Tensor& put_buffer,
+    const int64_t nranks_per_node,
+    const std::vector<int64_t>& rank_to_node,
+    const std::vector<int64_t>& rank_to_ib,
+    const int64_t context_selection);
+void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out, int64_t nthreads, int64_t nblocks);
 #endif
 
 /*
@@ -93,12 +117,19 @@ void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void cutlass_mla_decode(
     torch::Tensor const& out,
-    torch::Tensor const& q_nope_and_q_pe,
+    torch::Tensor const& q_nope,
+    torch::Tensor const& q_pe,
     torch::Tensor const& kv_c_and_k_pe_cache,
     torch::Tensor const& seq_lens,
     torch::Tensor const& page_table,
-    torch::Tensor const& workspace);
-int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count = 0);
+    torch::Tensor const& workspace,
+    double sm_scale,
+    int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
+int64_t cutlass_mla_get_workspace_size(
+    int64_t max_seq_len,
+    int64_t num_batches,
+    int64_t sm_count = 0,
+    int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
 /*
  * From csrc/elementwise
  */
@@ -107,9 +138,10 @@ void sgl_fused_add_rmsnorm(
     torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps, bool enable_pdl);
 void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
-void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
-void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
-void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+void silu_and_mul(at::Tensor& out, at::Tensor& input);
+void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input);
+void gelu_and_mul(at::Tensor& out, at::Tensor& input);
+
 void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor q,
     at::Tensor k,
@@ -120,6 +152,9 @@ void apply_rope_pos_ids_cos_sin_cache(
     bool interleave,
     int64_t cuda_stream);
 
+#ifdef USE_ROCM
+void gelu_quick(at::Tensor& out, const at::Tensor& input);
+#endif
 /*
  * From csrc/gemm
  */
@@ -160,7 +195,8 @@ void sgl_per_token_group_quant_fp8(
     int64_t group_size,
     double eps,
     double fp8_min,
-    double fp8_max);
+    double fp8_max,
+    bool scale_ue8m0);
 void sgl_per_token_group_quant_int8(
     at::Tensor input,
     at::Tensor output_q,
@@ -180,6 +216,9 @@ void bmm_fp8(
     at::Tensor workspace_buffer,
     int64_t cublas_handle,
     int64_t cuda_stream);
+void dsv3_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
+
+void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
 
 /*
  * From csrc/moe
@@ -191,14 +230,11 @@ void moe_align_block_size(
     torch::Tensor sorted_token_ids,
     torch::Tensor experts_ids,
     torch::Tensor num_tokens_post_pad,
-    torch::Tensor token_cnts_buffer,
-    torch::Tensor cumsum_buffer);
+    torch::Tensor cumsum_buffer,
+    bool pad_sorted_token_ids);
 
 void topk_softmax(
-    torch::Tensor& topk_weights,
-    torch::Tensor& topk_indices,
-    torch::Tensor& token_expert_indices,
-    torch::Tensor& gating_output);
+    torch::Tensor& topk_weights, torch::Tensor& topk_indices, torch::Tensor& gating_output, bool renormalize);
 
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
@@ -206,11 +242,16 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t num_expert_group,
     int64_t topk_group,
     int64_t topk,
-    int64_t n_share_experts_fusion,
+    int64_t num_fused_shared_experts,
     double routed_scaling_factor);
 
 void fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& a_scales_ptrs,
+    torch::Tensor& b_scales_ptrs,
     const torch::Tensor& a,
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
@@ -221,7 +262,87 @@ void fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& layout_sfa,
     const torch::Tensor& layout_sfb,
     const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets);
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace);
+
+void prepare_moe_input(
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_offsets,
+    const std::optional<torch::Tensor>& blockscale_offsets,
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& problem_sizes2,
+    torch::Tensor& input_permutation,
+    torch::Tensor& output_permutation,
+    const int64_t num_experts,
+    const int64_t n,
+    const int64_t k);
+
+void ep_moe_pre_reorder(
+    torch::Tensor input,
+    torch::Tensor gateup_input,
+    torch::Tensor src2dst,
+    torch::Tensor topk_ids,
+    torch::Tensor a1_scales,
+    int64_t start_expert_id,
+    int64_t end_expert_id,
+    int64_t topk,
+    bool use_per_token_if_dynamic);
+
+void ep_moe_silu_and_mul(
+    torch::Tensor gateup_output,
+    torch::Tensor down_input,
+    torch::Tensor reorder_topk_ids,
+    torch::Tensor scales,
+    int64_t start_expert_id,
+    int64_t end_expert_id);
+
+void ep_moe_post_reorder(
+    torch::Tensor down_output,
+    torch::Tensor output,
+    torch::Tensor src2dst,
+    torch::Tensor topk_ids,
+    torch::Tensor topk_weights,
+    int64_t start_expert_id,
+    int64_t end_expert_id,
+    int64_t topk);
+
+void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor);
+
+void apply_shuffle_mul_sum(
+    const torch::Tensor& input,
+    torch::Tensor& output,
+    const torch::Tensor& permutation,
+    const std::optional<torch::Tensor>& factors);
+
+void cutlass_fp4_group_mm(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& a_blockscale,
+    const torch::Tensor& b_blockscales,
+    const torch::Tensor& alphas,
+    const torch::Tensor& ab_strides,
+    const torch::Tensor& c_strides,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& sf_offsets);
+
+void scaled_fp4_experts_quant(
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    torch::Tensor const& input,
+    torch::Tensor const& input_global_scale,
+    torch::Tensor const& input_offset_by_experts,
+    torch::Tensor const& output_scale_offset_by_experts);
+
+namespace marlin_moe_wna16 {
+
+torch::Tensor
+gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm, int64_t size_k, int64_t size_n, int64_t num_bits);
+
+torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64_t size_n, int64_t num_bits);
+
+}  // namespace marlin_moe_wna16
 
 /*
  * From csrc/speculative
@@ -235,6 +356,7 @@ void tree_speculative_sampling_target_only(
     at::Tensor retrive_next_token,
     at::Tensor retrive_next_sibling,
     at::Tensor uniform_samples,
+    at::Tensor uniform_samples_for_final_sampling,
     at::Tensor target_probs,
     at::Tensor draft_probs,
     double threshold_single = 1,
@@ -264,10 +386,143 @@ void build_tree_kernel_efficient(
     at::Tensor retrive_next_sibling,
     int64_t topk,
     int64_t depth,
-    int64_t draft_token_num);
+    int64_t draft_token_num,
+    int64_t tree_mask_mode);
 
 void segment_packbits(
-    at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr, at::Tensor y, int64_t cuda_stream);
+    at::Tensor x,
+    at::Tensor input_indptr,
+    at::Tensor output_indptr,
+    at::Tensor y,
+    int64_t batch_size,
+    int64_t cuda_stream = 0);
+
+/*
+ * From csrc/kvcacheio
+ */
+void transfer_kv_per_layer(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_per_layer_pf_lf(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_all_layer(
+    const at::Tensor src_k_layers,
+    const at::Tensor dst_k_layers,
+    const at::Tensor src_v_layers,
+    const at::Tensor dst_v_layers,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_all_layer_lf_pf(
+    const at::Tensor src_k_layers,
+    at::Tensor dst_k,
+    const at::Tensor src_v_layers,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_per_layer_mla(
+    const at::Tensor src,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_per_layer_mla_pf_lf(
+    const at::Tensor src,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_all_layer_mla(
+    const at::Tensor src_layers,
+    const at::Tensor dst_layers,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_all_layer_mla_lf_pf(
+    const at::Tensor src_layers,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_direct(
+    const std::vector<at::Tensor>& src_layers,
+    std::vector<at::Tensor> dst_layers,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t page_size);
+
+/*
+ * From csrc/moe/cutlass_moe/w4a8
+ */
+void get_cutlass_w4a8_moe_mm_data(
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_offsets,
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& problem_sizes2,
+    torch::Tensor& input_permutation,
+    torch::Tensor& output_permutation,
+    const int64_t num_experts,
+    const int64_t n,
+    const int64_t k);
+
+void cutlass_w4a8_moe_mm(
+    torch::Tensor& d_tensors,
+    torch::Tensor const& a_tensors,
+    torch::Tensor const& b_tensors,
+    torch::Tensor const& a_scales,
+    torch::Tensor const& b_scales,
+    torch::Tensor const& expert_offsets,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor const& a_strides,
+    torch::Tensor const& b_strides,
+    torch::Tensor const& d_strides,
+    torch::Tensor const& s_strides,
+    int64_t chunk_size,
+    int64_t topk);
 
 /*
  * From FlashInfer
@@ -306,6 +561,31 @@ void top_p_sampling_from_probs(
     double top_p_val,
     bool deterministic,
     std::optional<at::Generator> gen);
+torch::Tensor moe_wna16_marlin_gemm(
+    torch::Tensor& a,
+    std::optional<torch::Tensor> const& c_or_none,
+    torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales,
+    std::optional<torch::Tensor> const& b_zeros_or_none,
+    std::optional<torch::Tensor> const& g_idx_or_none,
+    std::optional<torch::Tensor> const& perm_or_none,
+    torch::Tensor& workspace,
+    torch::Tensor& sorted_token_ids,
+    torch::Tensor& expert_ids,
+    torch::Tensor& num_tokens_past_padded,
+    torch::Tensor& topk_weights,
+    int64_t moe_block_size,
+    int64_t top_k,
+    bool mul_topk_weights,
+    bool is_ep,
+    sglang::ScalarTypeId const& b_q_type_id,
+    int64_t size_m,
+    int64_t size_n,
+    int64_t size_k,
+    bool is_k_full,
+    bool use_atomic_add,
+    bool use_fp32_reduce,
+    bool is_zp_float);
 
 namespace flash {
 /*
@@ -387,3 +667,29 @@ void convert_vertical_slash_indexes_mergehead(
  * From XGrammar
  */
 void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt);
+
+/*
+ * From QServe
+ */
+void qserve_w4a8_per_chn_gemm(
+    const torch::Tensor& _in_feats,
+    const torch::Tensor& _kernel,
+    const torch::Tensor& _wscales,
+    const torch::Tensor& _ascales,
+    const torch::Tensor& _w_szs,
+    const torch::Tensor& _a_ssums,
+    torch::Tensor& _out_feats);
+
+void qserve_w4a8_per_group_gemm(
+    const torch::Tensor& _in_feats,
+    const torch::Tensor& _kernel,
+    const torch::Tensor& _zeros,
+    const torch::Tensor& _scales_i8,
+    const torch::Tensor& _wscales,
+    const torch::Tensor& _ascales,
+    torch::Tensor& _out_feats);
+
+/*
+ * From csrc/spatial
+ */
+std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, int64_t device);

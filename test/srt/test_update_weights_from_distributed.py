@@ -162,7 +162,6 @@ def init_process_hf(
         rank=rank,
         group_name="test_parameter_update_group",
     )
-    dist.barrier(group=group, device_ids=[rank])
     torch.cuda.synchronize()
     time_begin_broadcast = time.perf_counter()
 
@@ -223,8 +222,8 @@ def init_process_sgl(
         if rank == 1:
             url = DEFAULT_URL_FOR_TEST
         else:
-            host, port = DEFAULT_URL_FOR_TEST.split(":")
-            url = ":".join(host, str(int(port) + 10000))
+            host, _, port = DEFAULT_URL_FOR_TEST.rpartition(":")
+            url = ":".join([host, str(int(port) + 10000)])
 
         print(f"[sgl] rank {rank} init server on url: {url}")
         process = popen_launch_server(
@@ -295,22 +294,27 @@ def init_process_sgl(
         update_parameters.remove("lm_head.weight")
 
     # Get weights from the training engine and update the inference engine.
-    for parameter_name in update_parameters:
-        if backend == "Engine":
-            engine.update_weights_from_distributed(
-                parameter_name,
-                dtype=torch.bfloat16,
-                shape=state_dict_key_to_shape[parameter_name],
-            )
-        else:
-            requests.post(
-                f"{url}/update_weights_from_distributed",
-                json={
-                    "name": parameter_name,
-                    "dtype": "bfloat16",
-                    "shape": state_dict_key_to_shape[parameter_name],
-                },
-            )
+    names = [parameter_name for parameter_name in update_parameters]
+    dtypes = [torch.bfloat16 if backend == "Engine" else "bfloat16"] * len(names)
+    shapes = [state_dict_key_to_shape[parameter_name] for parameter_name in names]
+
+    if backend == "Engine":
+        engine.update_weights_from_distributed(
+            names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name="test_parameter_update_group",
+        )
+    else:
+        requests.post(
+            f"{url}/update_weights_from_distributed",
+            json={
+                "names": names,
+                "dtypes": dtypes,
+                "shapes": shapes,
+                "group_name": "test_parameter_update_group",
+            },
+        )
     torch.cuda.synchronize()
     time_end_update = time.perf_counter()
 

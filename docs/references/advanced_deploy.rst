@@ -5,3 +5,4 @@ Multi-Node Deployment
 
    multi_node.md
    deploy_on_k8s.md
+   disaggregation/lws_pd_deploy.md

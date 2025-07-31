@@ -6,13 +6,13 @@ import functools
 import json
 import logging
 import os
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -24,22 +24,36 @@ from sglang.srt.layers.quantization.int8_kernel import (
     sglang_per_token_group_quant_int8,
 )
 from sglang.srt.utils import (
+    ceil_div,
+    cpu_has_amx_support,
     direct_register_custom_op,
     get_bool_env_var,
     get_device_name,
+    is_cpu,
     is_cuda,
     is_hip,
-    log_info_on_rank0,
+    next_power_of_2,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
-else:
-    from vllm import _custom_ops as vllm_ops
-    from vllm._custom_ops import scaled_fp8_quant
+elif _is_cpu and _is_cpu_amx_available:
+    pass
+elif _is_hip:
+    from vllm import _custom_ops as vllm_ops  # gelu_and_mul, silu_and_mul
+
+    if _use_aiter:
+        try:
+            from aiter import moe_sum
+        except ImportError:
+            raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+
 
 if _is_cuda or _is_hip:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
@@ -47,9 +61,6 @@ if _is_cuda or _is_hip:
 
 logger = logging.getLogger(__name__)
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
-enable_moe_align_block_size_triton = bool(
-    int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
-)
 
 
 @triton.jit
@@ -402,18 +413,37 @@ def fused_moe_kernel(
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
-    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     offs_token = offs_token.to(tl.int64)
     token_mask = offs_token < num_valid_tokens
 
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+
+    if off_experts == -1:
+        # -----------------------------------------------------------
+        # Write back zeros to the output when the expert is not
+        # in the current expert parallel rank.
+        write_zeros_to_output(
+            c_ptr,
+            stride_cm,
+            stride_cn,
+            pid_n,
+            N,
+            offs_token,
+            token_mask,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            compute_type,
+        )
+        return
+
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
     )
 
-    off_experts = tl.load(expert_ids_ptr + pid_m)
     b_ptrs = (
         b_ptr
         + off_experts * stride_be
@@ -486,7 +516,6 @@ def fused_moe_kernel(
 
                 accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             else:
-                # fix out of shared memory issue
                 if use_fp8_w8a8:
                     accumulator = tl.dot(a, b, acc=accumulator)
                 else:
@@ -515,139 +544,6 @@ def fused_moe_kernel(
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
-
-
-def ceil_div(a, b):
-    return (a + b - 1) // b
-
-
-@triton.jit
-def moe_align_block_size_stage1(
-    topk_ids_ptr,
-    tokens_cnts_ptr,
-    num_experts: tl.constexpr,
-    numel: tl.constexpr,
-    tokens_per_thread: tl.constexpr,
-):
-    pid = tl.program_id(0)
-
-    start_idx = pid * tokens_per_thread
-
-    off_c = (pid + 1) * num_experts
-
-    for i in range(tokens_per_thread):
-        if start_idx + i < numel:
-            idx = tl.load(topk_ids_ptr + start_idx + i)
-            token_cnt = tl.load(tokens_cnts_ptr + off_c + idx)
-            tl.store(tokens_cnts_ptr + off_c + idx, token_cnt + 1)
-
-
-@triton.jit
-def moe_align_block_size_stage2(
-    tokens_cnts_ptr,
-    num_experts: tl.constexpr,
-):
-    pid = tl.program_id(0)
-
-    last_cnt = 0
-    for i in range(1, num_experts + 1):
-        token_cnt = tl.load(tokens_cnts_ptr + i * num_experts + pid)
-        last_cnt = last_cnt + token_cnt
-        tl.store(tokens_cnts_ptr + i * num_experts + pid, last_cnt)
-
-
-@triton.jit
-def moe_align_block_size_stage3(
-    total_tokens_post_pad_ptr,
-    tokens_cnts_ptr,
-    cumsum_ptr,
-    num_experts: tl.constexpr,
-    block_size: tl.constexpr,
-):
-    last_cumsum = 0
-    off_cnt = num_experts * num_experts
-    for i in range(1, num_experts + 1):
-        token_cnt = tl.load(tokens_cnts_ptr + off_cnt + i - 1)
-        last_cumsum = last_cumsum + tl.cdiv(token_cnt, block_size) * block_size
-        tl.store(cumsum_ptr + i, last_cumsum)
-    tl.store(total_tokens_post_pad_ptr, last_cumsum)
-
-
-@triton.jit
-def moe_align_block_size_stage4(
-    topk_ids_ptr,
-    sorted_token_ids_ptr,
-    expert_ids_ptr,
-    tokens_cnts_ptr,
-    cumsum_ptr,
-    num_experts: tl.constexpr,
-    block_size: tl.constexpr,
-    numel: tl.constexpr,
-    tokens_per_thread: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    start_idx = tl.load(cumsum_ptr + pid)
-    end_idx = tl.load(cumsum_ptr + pid + 1)
-
-    for i in range(start_idx, end_idx, block_size):
-        tl.store(expert_ids_ptr + i // block_size, pid)
-
-    start_idx = pid * tokens_per_thread
-    off_t = pid * num_experts
-
-    for i in range(start_idx, tl.minimum(start_idx + tokens_per_thread, numel)):
-        expert_id = tl.load(topk_ids_ptr + i)
-        token_cnt = tl.load(tokens_cnts_ptr + off_t + expert_id)
-        rank_post_pad = token_cnt + tl.load(cumsum_ptr + expert_id)
-        tl.store(sorted_token_ids_ptr + rank_post_pad, i)
-        tl.store(tokens_cnts_ptr + off_t + expert_id, token_cnt + 1)
-
-
-def moe_align_block_size_triton(
-    topk_ids: torch.Tensor,
-    num_experts: int,
-    block_size: int,
-    sorted_token_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    num_tokens_post_pad: torch.Tensor,
-) -> None:
-    numel = topk_ids.numel()
-    grid = (num_experts,)
-    tokens_cnts = torch.zeros(
-        (num_experts + 1, num_experts), dtype=torch.int32, device=topk_ids.device
-    )
-    cumsum = torch.zeros((num_experts + 1,), dtype=torch.int32, device=topk_ids.device)
-    tokens_per_thread = ceil_div(numel, num_experts)
-
-    moe_align_block_size_stage1[grid](
-        topk_ids,
-        tokens_cnts,
-        num_experts,
-        numel,
-        tokens_per_thread,
-    )
-    moe_align_block_size_stage2[grid](
-        tokens_cnts,
-        num_experts,
-    )
-    moe_align_block_size_stage3[(1,)](
-        num_tokens_post_pad,
-        tokens_cnts,
-        cumsum,
-        num_experts,
-        block_size,
-    )
-    moe_align_block_size_stage4[grid](
-        topk_ids,
-        sorted_token_ids,
-        expert_ids,
-        tokens_cnts,
-        cumsum,
-        num_experts,
-        block_size,
-        numel,
-        tokens_per_thread,
-    )
 
 
 def moe_align_block_size(
@@ -690,45 +586,36 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
-    sorted_ids.fill_(topk_ids.numel())
     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
     expert_ids = torch.empty(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    if enable_moe_align_block_size_triton:
-        moe_align_block_size_triton(
-            topk_ids,
-            num_experts,
-            block_size,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-        )
-    else:
-        token_cnts_buffer = torch.empty(
-            (num_experts + 1) * num_experts,
-            dtype=torch.int32,
-            device=topk_ids.device,
-        )
-        cumsum_buffer = torch.empty(
-            num_experts + 1, dtype=torch.int32, device=topk_ids.device
-        )
 
-        sgl_moe_align_block_size(
-            topk_ids,
-            num_experts,
-            block_size,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-            token_cnts_buffer,
-            cumsum_buffer,
-        )
+    # In EP, expert_ids for filtered experts are -1. We have num_experts + 1 ids in total.
+    cumsum_buffer = torch.empty(
+        (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
+    )
+
+    # Threshold based on benchmark results
+    fuse_sorted_ids_padding = sorted_ids.shape[0] <= 4096
+    if not fuse_sorted_ids_padding:
+        sorted_ids.fill_(topk_ids.numel())
+
+    sgl_moe_align_block_size(
+        topk_ids,
+        num_experts + 1,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        cumsum_buffer,
+        fuse_sorted_ids_padding,
+    )
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 
@@ -931,13 +818,22 @@ def get_moe_configs(
     kernel on a given batch size bs, the closest batch size in the grid should
     be picked and the associated configuration chosen to invoke the kernel.
     """
+    # Supported Triton versions, should be sorted from the newest to the oldest
+    supported_triton_versions = ["3.3.1", "3.2.0", "3.1.0"]
 
     # First look up if an optimized configuration is available in the configs
     # directory
     json_file_name = get_config_file_name(E, N, dtype, [block_n, block_k])
 
+    # We found that using the fused_moe_kernel config from Triton 3.1.0 with Triton 3.2.0 results in negative performance gains,
+    # so we also include the Triton version as a key for finding the fused_moe_kernel config to achieve the best performance.
+    triton_version = triton.__version__
+    version_dir = f"triton_{triton_version.replace('.', '_')}"
     config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
+        os.path.dirname(os.path.realpath(__file__)),
+        "configs",
+        version_dir,
+        json_file_name,
     )
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
@@ -946,11 +842,27 @@ def get_moe_configs(
             # For example, updating the Triton version might cause all old configs to become suboptimal.
             # To achieve the best performance, consider re-tuning the Triton fused MOE kernel in your environment.
             # For the tuning method, refer to: https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
-            log_info_on_rank0(
-                logger, f"Using MoE kernel config from {config_file_path}."
-            )
+            logger.info(f"Using MoE kernel config from {config_file_path}.")
             # If a configuration has been found, return it
             return {int(key): val for key, val in json.load(f).items()}
+
+    # Searching for other triton versions that supports the same config
+    for try_triton_version in supported_triton_versions:
+        if try_triton_version == triton_version:
+            continue
+        try_config_file_path = os.path.join(
+            os.path.dirname(os.path.realpath(__file__)),
+            "configs",
+            f"triton_{try_triton_version.replace('.', '_')}",
+            json_file_name,
+        )
+        if os.path.exists(try_config_file_path):
+            with open(try_config_file_path) as f:
+                logger.warning(
+                    f"Config file not found at {config_file_path}. Fallback to triton version {try_triton_version} and use MoE kernel config from {try_config_file_path}. Performance might be sub-optimal!",
+                )
+                # If a configuration has been found, return it
+                return {int(key): val for key, val in json.load(f).items()}
 
     # If no optimized configuration is available, we will use the default
     # configuration
@@ -1096,6 +1008,7 @@ def inplace_fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    routed_scaling_factor: Optional[float] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -1118,6 +1031,8 @@ def inplace_fused_experts(
         a1_scale,
         a2_scale,
         block_shape,
+        False,
+        routed_scaling_factor,
     )
 
 
@@ -1141,6 +1056,7 @@ def inplace_fused_experts_fake(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    routed_scaling_factor: Optional[float] = None,
 ) -> None:
     pass
 
@@ -1174,6 +1090,7 @@ def outplace_fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -1197,6 +1114,7 @@ def outplace_fused_experts(
         a2_scale,
         block_shape,
         no_combine=no_combine,
+        routed_scaling_factor=routed_scaling_factor,
     )
 
 
@@ -1221,6 +1139,7 @@ def outplace_fused_experts_fake(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -1237,8 +1156,7 @@ def fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
+    topk_output: TopKOutput,
     inplace: bool = False,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
@@ -1255,7 +1173,9 @@ def fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
 ):
+    topk_weights, topk_ids, _ = topk_output
     if inplace:
         assert not no_combine, "no combine + inplace makes no sense"
         torch.ops.sglang.inplace_fused_experts(
@@ -1278,6 +1198,7 @@ def fused_experts(
             a1_scale,
             a2_scale,
             block_shape,
+            routed_scaling_factor,
         )
         return hidden_states
     else:
@@ -1302,7 +1223,100 @@ def fused_experts(
             a2_scale,
             block_shape,
             no_combine=no_combine,
+            routed_scaling_factor=routed_scaling_factor,
         )
+
+
+# _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
+@triton.jit
+def _moe_sum_reduce_kernel(
+    input_ptr,
+    input_stride_0,
+    input_stride_1,
+    input_stride_2,
+    output_ptr,
+    output_stride_0,
+    output_stride_1,
+    token_num: int,
+    topk_num: int,
+    hidden_dim: int,
+    routed_scaling_factor: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    input_stride_0 = tl.cast(input_stride_0, dtype=tl.int64)
+    input_stride_1 = tl.cast(input_stride_1, dtype=tl.int64)
+    output_stride_0 = tl.cast(output_stride_0, dtype=tl.int64)
+
+    token_block_id = tl.program_id(0)
+    dim_block_id = tl.program_id(1)
+
+    token_start = token_block_id * BLOCK_M
+    token_end = min((token_block_id + 1) * BLOCK_M, token_num)
+
+    dim_start = dim_block_id * BLOCK_DIM
+    dim_end = min((dim_block_id + 1) * BLOCK_DIM, hidden_dim)
+
+    offs_dim = dim_start + tl.arange(0, BLOCK_DIM)
+
+    for token_index in range(token_start, token_end):
+        accumulator = tl.zeros((BLOCK_DIM,), dtype=tl.float32)
+        input_t_ptr = input_ptr + token_index * input_stride_0 + offs_dim
+        for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
+            tmp = tl.load(
+                input_t_ptr + i * input_stride_1, mask=offs_dim < dim_end, other=0.0
+            )
+            accumulator += tmp
+        accumulator = accumulator * routed_scaling_factor
+        store_t_ptr = output_ptr + token_index * output_stride_0 + offs_dim
+        tl.store(
+            store_t_ptr,
+            accumulator.to(input_ptr.dtype.element_ty),
+            mask=offs_dim < dim_end,
+        )
+
+
+def moe_sum_reduce_triton(
+    input: torch.Tensor, output: torch.Tensor, routed_scaling_factor: float
+):
+    assert input.is_contiguous()
+    assert output.is_contiguous()
+
+    token_num, topk_num, hidden_dim = input.shape
+    assert output.shape[0] == token_num and output.shape[1] == hidden_dim
+
+    BLOCK_M = 1
+    BLOCK_DIM = 2048
+    NUM_STAGE = 1
+    num_warps = 8
+
+    grid = (
+        triton.cdiv(token_num, BLOCK_M),
+        triton.cdiv(hidden_dim, BLOCK_DIM),
+    )
+
+    _moe_sum_reduce_kernel[grid](
+        input,
+        *input.stride(),
+        output,
+        *output.stride(),
+        token_num=token_num,
+        topk_num=topk_num,
+        hidden_dim=hidden_dim,
+        routed_scaling_factor=routed_scaling_factor,
+        BLOCK_M=BLOCK_M,
+        BLOCK_DIM=BLOCK_DIM,
+        NUM_STAGE=NUM_STAGE,
+        num_warps=num_warps,
+    )
+    return
+
+
+@torch.compile
+def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
+    torch.sum(x, dim=1, out=out)
+    out.mul_(routed_scaling_factor)
 
 
 def fused_experts_impl(
@@ -1327,13 +1341,10 @@ def fused_experts_impl(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
 ):
     padded_size = padding_size
-    if (
-        not (use_fp8_w8a8 or use_int8_w8a8)
-        or block_shape is not None
-        or (_is_hip and get_bool_env_var("SGLANG_AITER_MOE"))
-    ):
+    if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
         padded_size = 0
 
     # Check constraints.
@@ -1503,28 +1514,50 @@ def fused_experts_impl(
             block_shape=block_shape,
         )
 
+        if routed_scaling_factor is None:
+            routed_scaling_factor = 1.0
+
         if no_combine:
             pass
-        elif _is_hip:
-            vllm_ops.moe_sum(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states[begin_chunk_idx:end_chunk_idx],
-            )
-        else:
-            if topk_ids.shape[1] == 1:
+        elif _is_cuda:
+            if topk_ids.shape[1] == 1 and routed_scaling_factor == 1.0:
                 pass  # we write directly into out_hidden_states
-            elif topk_ids.shape[1] == 2:
+            elif topk_ids.shape[1] == 2 and routed_scaling_factor == 1.0:
                 torch.add(
                     intermediate_cache3[:, 0],
                     intermediate_cache3[:, 1],
                     out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
                 ).squeeze(dim=1)
-            elif topk_ids.shape[1] > 2:
-                torch.sum(
+            else:
+                # According to micro benchmark results, torch.compile can get better performance for small token.
+                if tokens_in_chunk <= 32:
+                    moe_sum_reduce_torch_compile(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                        routed_scaling_factor,
+                    )
+                else:
+                    moe_sum_reduce_triton(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                        routed_scaling_factor,
+                    )
+        elif _is_hip:
+            if _use_aiter:
+                moe_sum(
                     intermediate_cache3.view(*intermediate_cache3.shape),
-                    dim=1,
-                    out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
                 )
+            else:
+                vllm_ops.moe_sum(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                )
+        else:
+            vllm_ops.moe_sum(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                out_hidden_states[begin_chunk_idx:end_chunk_idx],
+            )
 
     return out_hidden_states
 
@@ -1533,15 +1566,10 @@ def fused_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
+    topk_output: TopKOutput,
     inplace: bool = False,
     activation: str = "silu",
-    use_grouped_topk: bool = False,
-    num_expert_group: Optional[int] = None,
-    topk_group: Optional[int] = None,
-    custom_routing_function: Optional[Callable] = None,
+    apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -1565,16 +1593,9 @@ def fused_moe(
     - hidden_states (torch.Tensor): The input tensor to the MoE layer.
     - w1 (torch.Tensor): The first set of expert weights.
     - w2 (torch.Tensor): The second set of expert weights.
-    - gating_output (torch.Tensor): The output of the gating operation
-        (before softmax).
-    - topk (int): The number of top-k experts to select.
-    - renormalize (bool): If True, renormalize the top-k weights to sum to 1.
+    - topk_output (TopKOutput): The top-k output of the experts.
     - inplace (bool): If True, perform the operation in-place.
         Defaults to False.
-    - num_expert_group: Optional[int]: additional parameter for grouped_topk
-    - topk_group: Optional[int]: additional parameter for grouped_topk
-    - use_grouped_topk: If True, use grouped_topk instead of fused_topk
-        note: Deepseek V2/V3/R1 series models use grouped_topk
     - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner
         products for w1 and w2. Defaults to False.
     - use_int8_w8a8 (bool): If True, use int8 arithmetic to compute the inner
@@ -1598,29 +1619,15 @@ def fused_moe(
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
-    # Check constraints.
-    assert gating_output.shape[1] == w1.shape[0], "Number of experts mismatch"
-
-    topk_weights, topk_ids = select_experts(
-        hidden_states=hidden_states,
-        router_logits=gating_output,
-        use_grouped_topk=use_grouped_topk,
-        top_k=topk,
-        renormalize=renormalize,
-        topk_group=topk_group,
-        num_expert_group=num_expert_group,
-        custom_routing_function=custom_routing_function,
-        routed_scaling_factor=routed_scaling_factor,
-    )
 
     return fused_experts(
         hidden_states,
         w1,
         w2,
-        topk_weights,
-        topk_ids,
+        topk_output,
         inplace=inplace,
         activation=activation,
+        apply_router_weight_on_input=apply_router_weight_on_input,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
@@ -1634,4 +1641,5 @@ def fused_moe(
         a2_scale=a2_scale,
         block_shape=block_shape,
         no_combine=no_combine,
+        routed_scaling_factor=routed_scaling_factor,
     )

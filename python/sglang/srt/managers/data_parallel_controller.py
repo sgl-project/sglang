@@ -26,6 +26,7 @@ import zmq
 
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
+    BlockReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
@@ -221,6 +222,7 @@ class DataParallelController:
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
+                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
                 proc = mp.Process(
                     target=run_scheduler_process,
                     args=(
@@ -228,6 +230,7 @@ class DataParallelController:
                         rank_port_args,
                         gpu_id,
                         tp_rank,
+                        moe_ep_rank,
                         pp_rank,
                         dp_rank,
                         writer,
@@ -248,12 +251,20 @@ class DataParallelController:
 
     def round_robin_scheduler(self, req: Req):
         if self.server_args.disaggregation_mode == "null":
-            self.workers[self.round_robin_counter].send_pyobj(req)
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                self.workers
-            )
+            if req.data_parallel_rank is not None:
+                logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
+                self.workers[req.data_parallel_rank].send_pyobj(req)
+            else:
+                self.workers[self.round_robin_counter].send_pyobj(req)
+                self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                    self.workers
+                )
         else:
-            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+            if req.data_parallel_rank is not None:
+                logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
+                self.workers[req.data_parallel_rank].send_pyobj(req)
+            else:
+                self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, input_requests):
         raise NotImplementedError()
@@ -274,6 +285,9 @@ class DataParallelController:
                     ),
                 ):
                     self.dispatching(recv_req)
+                elif isinstance(recv_req, BlockReqInput):
+                    for worker in self.workers:
+                        worker.send_pyobj(recv_req)
                 else:
                     # Send other control messages to first worker of tp group
                     for worker in self.workers[:: self.control_message_step]:
