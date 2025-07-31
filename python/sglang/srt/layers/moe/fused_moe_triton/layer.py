@@ -119,7 +119,8 @@ class FusedMoE(torch.nn.Module):
                 * self.num_local_experts : (self.moe_ep_rank + 1)
                 * self.num_local_experts
             ] = torch.arange(0, self.num_local_experts, dtype=torch.int32, device="cpu")
-            self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
+            if not self.enable_flashinfer_cutlass_moe:
+                self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
 
         self.routed_scaling_factor = routed_scaling_factor
         assert intermediate_size % self.moe_tp_size == 0
