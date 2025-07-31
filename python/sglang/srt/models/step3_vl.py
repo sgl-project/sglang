@@ -258,7 +258,6 @@ class Step3TextAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
-        self.iter = 0
 
     def forward(
         self,
@@ -266,7 +265,6 @@ class Step3TextAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        self.iter += 1
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = self.inter_norm(q.contiguous())
