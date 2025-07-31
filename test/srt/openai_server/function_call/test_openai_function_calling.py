@@ -33,8 +33,8 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.model = "/root/.cache/step3-models/fp8"
-        cls.base_url = "http://localhost:30000"
+        cls.model = "/root/.cache/step3v-models/fp8"
+        cls.base_url = "http://localhost:30001"
         cls.api_key = "sk-123456"
 
         # Start the local OpenAI Server. If necessary, you can add other parameters such as --enable-tools.
@@ -50,7 +50,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         #     ],
         # )
         cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(cls.model)
+        # cls.tokenizer = get_tokenizer(cls.model)
 
     @classmethod
     def tearDownClass(cls):

@@ -53,7 +53,7 @@ class TemplateManager:
     def __init__(self):
         self._chat_template_name: Optional[str] = None
         self._completion_template_name: Optional[str] = None
-        self._jinja_template_content_format: Optional[str] = None
+        self._jinja_template_content_format: Optional[str] = "openai"
 
     @property
     def chat_template_name(self) -> Optional[str]:
