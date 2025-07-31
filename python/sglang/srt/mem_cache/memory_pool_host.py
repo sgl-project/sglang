@@ -106,6 +106,14 @@ class HostKVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        """
+        Get a dummy flat data page from the host memory pool.
+        This is used for prefetching or initializing empty pages.
+        """
+        raise NotImplementedError()
+
+    @abc.abstractmethod
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         """
         Set a flat data page to the host memory pool.
@@ -256,6 +264,14 @@ class MHATokenToKVPoolHost(HostKVCache):
     def get_flat_data_page(self, index) -> torch.Tensor:
         return self.kv_buffer[:, :, index : index + self.page_size, :, :].flatten()
 
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        return torch.zeros(
+            (2, self.layer_num, self.page_size, self.head_num, self.head_dim),
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        ).flatten()
+
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         self.kv_buffer[:, :, index : index + self.page_size, :, :] = data_page.reshape(
             2,
@@ -354,6 +370,19 @@ class MLATokenToKVPoolHost(HostKVCache):
 
     def get_flat_data_page(self, index) -> torch.Tensor:
         return self.kv_buffer[:, index : index + self.page_size, :, :].flatten()
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        return torch.zeros(
+            (
+                self.layer_num,
+                self.page_size,
+                1,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ),
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         self.kv_buffer[:, index : index + self.page_size, :, :] = data_page.reshape(

@@ -123,13 +123,22 @@ class HiCacheFile(HiCacheStorage):
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         try:
-            # todo: fixing the target_location logic to enable in-place loading
-            loaded_tensor = torch.load(tensor_path)
-            if isinstance(loaded_tensor, torch.Tensor):
-                return loaded_tensor
+            if target_location is not None:
+                # Load directly into target_location's memory buffer
+                with open(tensor_path, "rb") as f:
+                    target_location.set_(
+                        torch.frombuffer(f.read(), dtype=target_location.dtype)
+                        .reshape(target_location.shape)
+                        .storage()
+                    )
+                return target_location
             else:
-                logger.error(f"Loaded data for key {key} is not a tensor.")
-                return None
+                loaded_tensor = torch.load(tensor_path)
+                if isinstance(loaded_tensor, torch.Tensor):
+                    return loaded_tensor
+                else:
+                    logger.error(f"Loaded data for key {key} is not a tensor.")
+                    return None
         except FileNotFoundError:
             return None
 
