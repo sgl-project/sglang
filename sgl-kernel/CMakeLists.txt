@@ -45,7 +45,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        f115c3f85467d5d9619119d1dbeb9c03c3d73864
+    GIT_TAG        664c4f7b3ed1959414905025728eef5568209479
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -56,7 +56,7 @@ if("${CUDA_VERSION}" VERSION_EQUAL "12.8")
   set(DeepGEMM_TAG "blackwell")
 else()
   set(DeepGEMM_REPO "https://github.com/deepseek-ai/DeepGEMM")
-  set(DeepGEMM_TAG "8dfa3298274bfe6b242f6f8a3e6f3eff2707dd9f")
+  set(DeepGEMM_TAG "391755ada0ffefa9a6a52b6f14dcaf22d1a463e0")
 endif()
 
 FetchContent_Declare(
@@ -222,7 +222,9 @@ set(SOURCES
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
     "csrc/gemm/dsv3_fused_a_gemm.cu"
-    "csrc/gemm/dsv3_router_gemm.cu"
+    "csrc/gemm/dsv3_router_gemm_bf16_out.cu"
+    "csrc/gemm/dsv3_router_gemm_entry.cu"
+    "csrc/gemm/dsv3_router_gemm_float_out.cu"
     "csrc/gemm/fp8_blockwise_gemm_kernel.cu"
     "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"

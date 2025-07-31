@@ -22,7 +22,7 @@ class TestPixtralServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.73",
+                "0.70",
             ],
         )
         cls.base_url += "/v1"
@@ -44,7 +44,7 @@ class TestMistral3_1Server(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.8",
+                "0.75",
             ],
         )
         cls.base_url += "/v1"
@@ -67,6 +67,7 @@ class TestDeepseekVL2Server(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--context-length",
                 "4096",
+                "--disable-cuda-graph",
             ],
         )
         cls.base_url += "/v1"
@@ -88,7 +89,7 @@ class TestJanusProServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.4",
+                "0.35",
             ],
         )
         cls.base_url += "/v1"
@@ -150,6 +151,32 @@ class TestGemma3itServer(TestOpenAIVisionServer):
         pass
 
 
+class TestGemma3nServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "google/gemma-3n-E2B-it"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.70",
+                "--cuda-graph-max-bs",
+                "1",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_audio_chat_completion(self):
+        self._test_audio_speech_completion()
+        # This _test_audio_ambient_completion test is way too complicated to pass for a small LLM
+        # self._test_audio_ambient_completion()
+
+
 class TestKimiVLServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
@@ -197,19 +224,20 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.75",
+                "0.70",
                 "--disable-radix-cache",
                 "--max-loras-per-batch",
-                "1",
+                "2",
                 "--revision",
                 revision,
                 "--lora-paths",
                 f"vision={constants.HF_HUB_CACHE}/models--microsoft--Phi-4-multimodal-instruct/snapshots/{revision}/vision-lora",
+                f"speech={constants.HF_HUB_CACHE}/models--microsoft--Phi-4-multimodal-instruct/snapshots/{revision}/speech-lora",
             ],
         )
         cls.base_url += "/v1"
 
-    def get_request_kwargs(self):
+    def get_vision_request_kwargs(self):
         return {
             "extra_body": {
                 "lora_path": "vision",
@@ -218,8 +246,19 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
             }
         }
 
-    def test_video_chat_completion(self):
-        pass
+    def get_audio_request_kwargs(self):
+        return {
+            "extra_body": {
+                "lora_path": "speech",
+                "top_k": 1,
+                "top_p": 1.0,
+            }
+        }
+
+    def test_audio_chat_completion(self):
+        self._test_audio_speech_completion()
+        # This _test_audio_ambient_completion test is way too complicated to pass for a small LLM
+        # self._test_audio_ambient_completion()
 
 
 class TestVILAServer(TestOpenAIVisionServer):
