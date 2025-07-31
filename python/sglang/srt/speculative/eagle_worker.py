@@ -91,6 +91,9 @@ class EAGLEWorker(TpModelWorker):
         )
         self.log_cold_token_prob = server_args.log_cold_token_prob
         self.padded_static_len = -1
+        
+        # Accumulators for cross-batch statistics
+        self.all_cold_probs_data = []
 
         # Override context length with target model's context length
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -648,7 +651,7 @@ class EAGLEWorker(TpModelWorker):
             if self.log_cold_token_prob:
                 cold_probs = probs[:, self.cold_token_mask]
                 sum_of_cold_probs = torch.sum(cold_probs, dim=-1)
-                log_stats(sum_of_cold_probs, "draft_forward")
+                self.log_stats(sum_of_cold_probs, "draft_forward")
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None and not self.log_cold_token_prob:
                 topk_index = self.hot_token_id[topk_index]
@@ -930,7 +933,7 @@ class EAGLEWorker(TpModelWorker):
         if self.log_cold_token_prob:
             cold_probs = probs[:, self.cold_token_mask]
             sum_of_cold_probs = torch.sum(cold_probs, dim=-1)
-            log_stats(sum_of_cold_probs, "capture_for_decode")
+            self.log_stats(sum_of_cold_probs, "capture_for_decode")
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
 
@@ -940,6 +943,37 @@ class EAGLEWorker(TpModelWorker):
             if torch.any(torch.isnan(logits)):
                 logger.error("Detected errors during sampling! NaN in the logits.")
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
+    
+    def log_stats(self, sum_of_cold_probs: torch.Tensor, calling_func: str):
+        """Log statistics for current batch and accumulate for cross-batch stats."""
+        sum_of_cold_probs = sum_of_cold_probs.to(torch.float64)
+        # logger.info(f"Sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs}")
+        logger.info(f"Mean sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.mean().item()}")
+        logger.info(f"Std of sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.std().item()}")
+        logger.info(f"Max sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.max().item()}")
+        logger.info(f"Min sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.min().item()}")
+        
+        # Accumulate data for cross-batch statistics
+        self.all_cold_probs_data.extend(sum_of_cold_probs.cpu().tolist())
+    
+    def log_accumulated_stats(self):
+        """Log statistics across all batches processed so far."""
+        if not self.all_cold_probs_data:
+            logger.info("No accumulated cold token probability data to log.")
+            return
+        
+        all_probs = torch.tensor(self.all_cold_probs_data)
+        logger.info(f"=== ACCUMULATED STATS ACROSS ALL BATCHES ===")
+        logger.info(f"Total number of requests processed: {len(self.all_cold_probs_data)}")
+        logger.info(f"Mean sum of cold token probs across all requests: {all_probs.mean().item()}")
+        logger.info(f"Std of sum of cold token probs across all requests: {all_probs.std().item()}")
+        logger.info(f"Max sum of cold token probs across all requests: {all_probs.max().item()}")
+        logger.info(f"Min sum of cold token probs across all requests: {all_probs.min().item()}")
+        logger.info(f"=== END ACCUMULATED STATS ===")
+    
+    def reset_accumulated_stats(self):
+        """Reset the accumulated statistics."""
+        self.all_cold_probs_data = []
 
 
 def load_token_map(token_map_path: str) -> List[int]:
@@ -995,11 +1029,3 @@ def get_last_loc_large_page_size_large_top_k(
     )
 
     return prefix_lens, seq_lens, last_loc, num_new_pages_per_topk, extend_lens
-
-
-def log_stats(sum_of_cold_probs: torch.Tensor, calling_func: str):
-    logger.info(f"Sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs}")
-    logger.info(f"Mean sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.mean().item()}")
-    logger.info(f"Std of sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.std().item()}")
-    logger.info(f"Max sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.max().item()}")
-    logger.info(f"Min sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.min().item()}")
