@@ -23,6 +23,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     parallel_state,
@@ -388,6 +389,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
     ):
         nn.Module.__init__(self)
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
@@ -482,12 +484,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if global_server_args_dict["enable_deepep_moe"]
-                    or global_server_args_dict["enable_ep_moe"]
-                    else {}
-                ),
+                **(dict(tp_rank=0, tp_size=1) if self.ep_size > 1 else {}),
             )
             is_packed_weight = hasattr(
                 self.shared_experts.gate_up_proj.quant_method, "quant_config"
@@ -555,10 +552,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                 final_hidden_states *= self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
 
-        if (
-            global_server_args_dict["enable_ep_moe"]
-            and not global_server_args_dict["enable_deepep_moe"]
-        ):
+        if self.ep_size > 1:
             if self.tp_size > 1 and not can_fuse_mlp_allreduce:
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
@@ -592,10 +586,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
-        if (
-            global_server_args_dict["enable_ep_moe"]
-            and not global_server_args_dict["enable_deepep_moe"]
-        ):
+        if self.ep_size > 1:
             if self.tp_size > 1 and not can_fuse_mlp_allreduce:
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
