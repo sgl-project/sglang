@@ -1326,6 +1326,7 @@ class ServerArgs:
         parser.add_argument(
             "--expert-parallel-size",
             "--ep-size",
+            "--ep",
             type=int,
             default=ServerArgs.ep_size,
             help="The expert parallelism size.",
