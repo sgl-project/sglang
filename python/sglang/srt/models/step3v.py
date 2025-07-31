@@ -11,6 +11,11 @@ from torch.nn import functional as F
 from transformers import PretrainedConfig
 from transformers.activations import ACT2FN
 
+from sglang.srt.configs.step3v import (
+    Step3TextConfig,
+    Step3VisionEncoderConfig,
+    Step3VLConfig,
+)
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -52,24 +57,9 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, log_info_on_rank0, make_layers
-from sglang.srt.configs.step3v import Step3VConfig, StepVisionEncoderConfig
 
 logger = logging.getLogger(__name__)
 
-
-class Step3VLImagePixelInputs(TypedDict):
-    type: Literal["pixel_values"]
-    pixel_values: torch.Tensor
-    patch_pixel_values: Optional[torch.Tensor]
-    num_patches: list[int]
-
-
-class Step3VLImageEmbeddingInputs(TypedDict):
-    type: Literal["image_embeds"]
-    image_embeds: torch.Tensor
-
-
-Step3VLImageInputs = Union[Step3VLImagePixelInputs, Step3VLImageEmbeddingInputs]
 
 """
 Text Model
@@ -119,7 +109,7 @@ class Step3TextMoEMLP(nn.Module):
     def __init__(
         self,
         layer_id: int,
-        config: PretrainedConfig,
+        config: Step3TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -157,21 +147,9 @@ class Step3TextMoEMLP(nn.Module):
         )
 
         if global_server_args_dict["enable_deepep_moe"]:
-            raise NotImplementedError(
-                "DeepEP MoE is not supported yet in Step2Mini model."
-            )
+            raise NotImplementedError("DeepEP MoE is not supported yet in Step3 model.")
 
-    def forward(
-        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
-    ) -> torch.Tensor:
-        if not global_server_args_dict["enable_deepep_moe"]:
-            return self.forward_normal(hidden_states)
-        else:
-            raise NotImplementedError(
-                "DeepEP MoE is not supported yet in Step3v model."
-            )
-
-    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -239,7 +217,7 @@ class Step3TextAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=0,  # In fact, we need a MergedReplicatedLinear
             tp_size=1,
-            prefix=f"{prefix}.qkv_proj",
+            prefix=add_prefix("qkv_proj", prefix),
         )
 
         self.o_proj = RowParallelLinear(
@@ -262,7 +240,7 @@ class Step3TextAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
-            prefix=f"{prefix}.wq",
+            prefix=add_prefix("wq", prefix),
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -294,12 +272,7 @@ class Step3TextAttention(nn.Module):
         q = self.inter_norm(q.contiguous())
         q, _ = self.wq(q)
         q, k = self.rotary_emb(positions, q, k)
-        # torch.save([q,k,v], f"fa3qkv_{self.attn_tp_rank}.pt")
-        # torch.save([q,k,v], f"dpattn_qkv_{self.all_tp_rank}_{self.iter}.pt")
-        # torch.save([q,k,v], f"fa3qkv_{self.attn_tp_rank}_{self.layer_id}.pt")
         attn_output = self.attn(q, k, v, forward_batch)
-        # torch.save([attn_output], f"flinferattn_{self.attn_tp_rank}_{self.layer_id}.pt")
-        # torch.save([attn_output], f"fa3attn_{self.attn_tp_rank}_{self.layer_id}.pt")
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -307,7 +280,7 @@ class Step3TextAttention(nn.Module):
 class Step3TextDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: Step3VConfig,
+        config: Step3TextConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -642,7 +615,7 @@ class Step3VisionAttention(nn.Module):
 
 class Step3VisionEmbeddings(nn.Module):
 
-    def __init__(self, config: StepVisionEncoderConfig):
+    def __init__(self, config: Step3VisionEncoderConfig):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
@@ -717,7 +690,7 @@ class Step3VisionEncoderLayer(nn.Module):
 
 
 class Step3VisionTransformer(nn.Module):
-    def __init__(self, config: StepVisionEncoderConfig):
+    def __init__(self, config: Step3VisionEncoderConfig):
         super().__init__()
         self.config = config
         self.image_size = config.image_size
@@ -746,7 +719,7 @@ class Step3VisionEncoder(nn.Module):
         config: StepVisionEncoderConfig
     """
 
-    def __init__(self, config: StepVisionEncoderConfig):
+    def __init__(self, config: Step3VisionEncoderConfig):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList(
@@ -771,11 +744,12 @@ class Step3VLForConditionalGeneration(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: Step3VLConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
+        print("config", config)
         self.config = config
         self.quant_config = quant_config
         self.model = Step3TextModel(
@@ -815,12 +789,12 @@ class Step3VLForConditionalGeneration(nn.Module):
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
+                config.text_config.vocab_size,
+                config.text_config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
-        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor = LogitsProcessor(config.text_config)
 
     def _get_vision_model_output(self, input_tensor: torch.Tensor) -> torch.Tensor:
         return self.vision_model(input_tensor)[:, 4:]
@@ -937,7 +911,8 @@ class Step3VLForConditionalGeneration(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.moe_num_experts + self.num_fused_shared_experts,
+            num_experts=self.config.text_config.moe_num_experts
+            + self.num_fused_shared_experts,
         )
 
         params_dict = dict(self.named_parameters())
@@ -963,7 +938,7 @@ class Step3VLForConditionalGeneration(nn.Module):
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if (
-                        expert_id != self.config.moe_num_experts
+                        expert_id != self.config.text_config.moe_num_experts
                         or not match_expert_and_shard_ids(name, weight_name)
                     ):
                         continue
@@ -1015,7 +990,7 @@ class Step3VLForConditionalGeneration(nn.Module):
 
                     for mapping in expert_params_mapping:
                         param_name, weight_name, expert_id, shard_id = mapping
-                        if expert_id == self.config.moe_num_experts:
+                        if expert_id == self.config.text_config.moe_num_experts:
                             continue
                         if not match_expert_and_shard_ids(name, weight_name):
                             continue
@@ -1035,10 +1010,10 @@ class Step3VLForConditionalGeneration(nn.Module):
                         # Don't break here, because this 'loaded_weight' includes all the weights for this layer
 
     @classmethod
-    def get_model_config_for_expert_location(cls, config):
+    def get_model_config_for_expert_location(cls, config: Step3VLConfig):
         return ModelConfigForExpertLocation(
-            num_layers=config.num_hidden_layers,
-            num_logical_experts=config.moe_num_experts,
+            num_layers=config.text_config.num_hidden_layers,
+            num_logical_experts=config.text_config.moe_num_experts,
             num_groups=None,
         )
 

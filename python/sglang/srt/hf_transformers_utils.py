@@ -41,7 +41,7 @@ from sglang.srt.configs import (
     ExaoneConfig,
     KimiVLConfig,
     MultiModalityConfig,
-    Step3VConfig,
+    Step3VLConfig,
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
@@ -55,7 +55,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     MultiModalityConfig.model_type: MultiModalityConfig,
     KimiVLConfig.model_type: KimiVLConfig,
     InternVLChatConfig.model_type: InternVLChatConfig,
-    Step3VConfig.model_type: Step3VConfig,
+    Step3VLConfig.model_type: Step3VLConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():

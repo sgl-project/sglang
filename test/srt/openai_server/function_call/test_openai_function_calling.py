@@ -33,7 +33,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.model = "/models/step3v-models/fp8"
+        cls.model = "/root/.cache/step3v-models/fp8"
         cls.base_url = "http://localhost:30000"
         cls.api_key = "sk-123456"
 
@@ -101,7 +101,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             stream=False,
             tools=tools,
         )
-        
+
         print(response)
 
         tool_calls = response.choices[0].message.tool_calls
@@ -251,10 +251,10 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         for chunk in chunks:
             if chunk.choices[0].delta.reasoning_content:
                 reasoning_content += chunk.choices[0].delta.reasoning_content
-                
+
             if chunk.choices[0].delta.content:
                 content += chunk.choices[0].delta.content
-            
+
             choice = chunk.choices[0]
             # Check whether the current chunk contains tool_calls
             if choice.delta.tool_calls:
@@ -412,7 +412,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             stream=False,
             tools=tools,
         )
-        
+
         print(response)
 
         tool_calls = response.choices[0].message.tool_calls
@@ -484,7 +484,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             tools=tools,
             tool_choice="required",
         )
-        
+
         print(response)
 
         tool_calls = response.choices[0].message.tool_calls

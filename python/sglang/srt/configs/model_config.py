@@ -341,7 +341,6 @@ class ModelConfig:
         for attr in attributes:
             num_kv_heads = getattr(self.hf_text_config, attr, None)
             if num_kv_heads is not None:
-                print("debug attr", attr, num_kv_heads)
                 return num_kv_heads
 
         # For non-grouped-query attention models, the number of KV heads is

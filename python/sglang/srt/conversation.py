@@ -1122,7 +1122,7 @@ def match_mimo_vl(model_path: str):
         return "mimo-vl"
 
 
-@register_conv_template_matching_function
-def match_step3v(model_path: str):
-    if re.search(r"step3v", model_path, re.IGNORECASE):
-        return "step3v"
+# @register_conv_template_matching_function
+# def match_step3v(model_path: str):
+#     if re.search(r"step3v", model_path, re.IGNORECASE):
+#         return "step3v"
