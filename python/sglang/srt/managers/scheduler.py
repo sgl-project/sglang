@@ -589,6 +589,7 @@ class Scheduler(
                         else server_args.hicache_io_backend
                     ),
                     hicache_storage_backend=server_args.hicache_storage_backend,
+                    historage_prefetch_stop_policy=server_args.historage_prefetch_stop_policy,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -1524,7 +1525,8 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                self.tree_cache.check_prefetch_progress(req.rid)
+                if not self.tree_cache.check_prefetch_progress(req.rid):
+                    continue
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))

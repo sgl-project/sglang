@@ -16,6 +16,7 @@ limitations under the License.
 import logging
 import math
 import threading
+import time
 from queue import Empty, Full, PriorityQueue, Queue
 from typing import TYPE_CHECKING, List, Optional
 
@@ -200,6 +201,8 @@ class PrefetchOperation(StorageOperation):
 
         self._done_flag = False
         self._lock = threading.Lock()
+
+        self.start_time = time.monotonic()
 
         super().__init__(host_indices, token_ids, last_hash)
 
@@ -528,7 +531,7 @@ class HiCacheController:
         host_indices: torch.Tensor,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
-    ) -> int:
+    ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """

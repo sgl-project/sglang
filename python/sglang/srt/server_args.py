@@ -199,6 +199,7 @@ class ServerArgs:
     hicache_write_policy: str = "write_through_selective"
     hicache_io_backend: str = ""
     hicache_storage_backend: Optional[str] = None
+    historage_prefetch_stop_policy: Optional[str] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -1473,6 +1474,13 @@ class ServerArgs:
             choices=["file", "mooncake", "hf3fs"],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache.",
+        )
+        parser.add_argument(
+            "--historage-prefetch-stop-policy",
+            type=str,
+            choices=["best_effort", "wait_complete", "timeout"],
+            default=ServerArgs.historage_prefetch_stop_policy,
+            help="Control when prefetching from the storage backend should stop.",
         )
 
         # Double Sparsity

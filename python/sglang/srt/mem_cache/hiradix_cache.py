@@ -6,7 +6,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import (
@@ -36,6 +36,7 @@ class HiRadixCache(RadixCache):
         hicache_write_policy: str,
         hicache_io_backend: str,
         hicache_storage_backend: Optional[str] = None,
+        historage_prefetch_stop_policy: Optional[str] = "best_effort",
     ):
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
@@ -54,6 +55,9 @@ class HiRadixCache(RadixCache):
         self.enable_storage = hicache_storage_backend is not None
         # todo: customizable storage prefetch threshold
         self.prefetch_threshold = 256
+        self.prefetch_stop_policy = historage_prefetch_stop_policy
+        # todo: customizable storage prefetch timeout
+        self.prefetch_timeout = 3  # seconds
 
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
@@ -402,16 +406,43 @@ class HiRadixCache(RadixCache):
             host_node.release_host()
             del self.ongoing_backup[ack_id]
 
+    def can_terminate_prefetch(self, operation: PrefetchOperation):
+        can_terminate = True
+
+        if self.prefetch_stop_policy == "best_effort":
+            return can_terminate
+
+        if self.prefetch_stop_policy == "wait_complete":
+            can_terminate = operation.completed_tokens == len(operation.token_ids)
+        elif self.prefetch_stop_policy == "timeout":
+            can_terminate = (
+                time.monotonic() - operation.start_time > self.prefetch_timeout
+            )
+
+        if self.tp_world_size > 1:
+            can_terminate = torch.tensor(can_terminate, dtype=torch.int)
+            torch.distributed.all_reduce(
+                can_terminate,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            can_terminate = bool(can_terminate.item())
+
+        return can_terminate
+
     def check_prefetch_progress(self, req_id: str):
         if req_id not in self.ongoing_prefetch:
             # there is no ongoing prefetch for this request or it has been revoked
-            return
+            return True
 
         # todo: more policies for prefetch progress such as timeout
         # the current policy is to prefetch with best effort and terminate when queuing is over
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
             req_id
         ]
+
+        if not self.can_terminate_prefetch(operation):
+            return False
 
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
@@ -447,6 +478,8 @@ class HiRadixCache(RadixCache):
         )
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
+
+        return True
 
     def match_prefix(self, key: List[int], **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
