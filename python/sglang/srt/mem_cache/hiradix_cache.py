@@ -79,7 +79,9 @@ class HiRadixCache(RadixCache):
         self.write_through_threshold = (
             1 if hicache_write_policy == "write_through" else 3
         )
-        self.write_through_threshold_storage = 3
+        self.write_through_threshold_storage = (
+            1 if hicache_write_policy == "write_through" else 3
+        )
         self.load_back_threshold = 10
         super().__init__(
             req_to_token_pool, token_to_kv_pool_allocator, page_size, disable=False
@@ -388,10 +390,14 @@ class HiRadixCache(RadixCache):
                 self.cache_controller.ack_backup_queue.get()
             )
             host_node = self.ongoing_backup[ack_id]
-            if completed_tokens < len(host_node.key):
+            if completed_tokens == 0:
+                host_node.hash_value = None
+            elif completed_tokens < len(host_node.key):
                 # backup is only partially successful, split the node
                 new_node = self._split_node(host_node.key, host_node, completed_tokens)
                 new_node.hash_value = hash_value
+            else:
+                host_node.hash_value = hash_value
             host_node.release_host()
             del self.ongoing_backup[ack_id]
 
@@ -431,6 +437,8 @@ class HiRadixCache(RadixCache):
             written_indices,
             hash_value[:min_completed_tokens],
         )
+        if len(written_indices):
+            self.cache_controller.mem_pool_host.update_prefetch(written_indices)
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
         self.cache_controller.mem_pool_host.free(
