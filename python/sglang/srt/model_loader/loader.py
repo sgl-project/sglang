@@ -178,7 +178,7 @@ def _initialize_model(
             "q_a_proj",
             "kv_a_proj_with_mqa",
         ]
-        
+
     quant_config = _get_quantization_config(
         model_config, load_config, packed_modules_mapping
     )
