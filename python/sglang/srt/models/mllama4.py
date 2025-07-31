@@ -7,6 +7,7 @@ from typing import List, Optional, Set, Tuple
 
 import torch
 from torch import nn
+from transformers import Llama4Config, Llama4VisionConfig
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from sglang.srt.layers.attention.vision import VisionAttention
@@ -30,7 +31,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cpu
-from transformers import Llama4Config, Llama4VisionConfig
 
 _is_cpu = is_cpu()
 import pdb
@@ -103,7 +103,7 @@ def pixel_shuffle(input_tensor, shuffle_ratio):
         batch_size,
         int(height * shuffle_ratio),
         int(width * shuffle_ratio),
-        int(channels / (shuffle_ratio ** 2)),
+        int(channels / (shuffle_ratio**2)),
     )
     reshaped_tensor = reshaped_tensor.permute(0, 2, 1, 3).contiguous()
 
@@ -123,7 +123,7 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
         super().__init__()
         self.pixel_shuffle_ratio = config.pixel_shuffle_ratio
         self.inner_dim = int(
-            config.projector_input_dim // (self.pixel_shuffle_ratio ** 2)
+            config.projector_input_dim // (self.pixel_shuffle_ratio**2)
         )
         self.output_dim = config.projector_output_dim
         self.mlp = Llama4VisionMLP(
@@ -298,7 +298,7 @@ class Llama4VisionModel(nn.Module):
         self.num_channels = config.num_channels
 
         self.num_patches = (self.image_size // self.patch_size) ** 2 + 1
-        self.scale = config.hidden_size ** -0.5
+        self.scale = config.hidden_size**-0.5
 
         self.patch_embedding = Llama4UnfoldConvolution(
             config,
@@ -491,10 +491,10 @@ class Llama4ForConditionalGeneration(nn.Module):
             .type(next(self.vision_model.parameters()).dtype)
         )
 
-        pdb.set_trace()
+        # pdb.set_trace()
 
         image_features = self.vision_model(pixel_values)
-        pdb.set_trace()
+        # pdb.set_trace()
         vision_flat = image_features.view(-1, image_features.size(-1))
         projected_vision_flat = self.multi_modal_projector(vision_flat)
         return projected_vision_flat
