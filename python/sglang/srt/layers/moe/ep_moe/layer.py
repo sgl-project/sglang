@@ -135,7 +135,7 @@ class EPMoE(FusedMoE):
             enable_ep_moe=True,
         )
 
-        self.start_expert_id = self.ep_rank * self.num_local_experts
+        self.start_expert_id = self.moe_ep_rank * self.num_local_experts
         self.end_expert_id = self.start_expert_id + self.num_local_experts - 1
 
         self.intermediate_size = intermediate_size
