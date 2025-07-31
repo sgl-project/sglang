@@ -165,7 +165,7 @@ def process_content_for_template_format(
         new_msg["content"] = processed_content_parts
         return new_msg
 
-    else:  # content_format == "string"
+    elif content_format == "string":
         # String format: flatten to text only (for templates like DeepSeek)
         text_parts = []
         for chunk in msg_dict["content"]:
@@ -179,3 +179,6 @@ def process_content_for_template_format(
         new_msg["content"] = " ".join(text_parts) if text_parts else ""
         new_msg = {k: v for k, v in new_msg.items() if v is not None}
         return new_msg
+
+    else:
+        raise ValueError(f"Invalid content format: {content_format}")
