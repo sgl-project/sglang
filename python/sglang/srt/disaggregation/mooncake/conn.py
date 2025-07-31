@@ -263,6 +263,26 @@ class MooncakeKVManager(BaseKVManager):
         socket.connect(endpoint)
         return socket
 
+    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+        if not transfer_blocks:
+            return 0
+
+        # TODO(shangming): Fix me when nvlink_transport of Mooncake is bug-free
+        if self.enable_custom_mem_pool:
+            # batch_transfer_sync has a higher chance to trigger an accuracy drop for MNNVL, fallback to transfer_sync temporarily
+            for src_addr, dst_addr, length in transfer_blocks:
+                status = self.engine.transfer_sync(
+                    mooncake_session_id, src_addr, dst_addr, length
+                )
+                if status != 0:
+                    return status
+            return 0
+        else:
+            src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+            )
+
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -295,21 +315,7 @@ class MooncakeKVManager(BaseKVManager):
                 length = item_len * len(prefill_index)
                 transfer_blocks.append((src_addr, dst_addr, length))
 
-            # TODO(shangming): Fix me when nvlink_transport of Mooncake is bug-free
-            if self.enable_custom_mem_pool:
-                # batch_transfer_sync has a higher chance to trigger an accuracy drop for MNNVL, fallback to transfer_sync temporarily
-                for src_addr, dst_addr, length in transfer_blocks:
-                    status = self.engine.transfer_sync(
-                        mooncake_session_id, src_addr, dst_addr, length
-                    )
-                    if status != 0:
-                        return status
-                return 0
-            else:
-                src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-                return self.engine.batch_transfer_sync(
-                    mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
-                )
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         futures = [
             executor.submit(
@@ -491,20 +497,7 @@ class MooncakeKVManager(BaseKVManager):
             dst_addr = dst_aux_ptrs[i] + length * dst_aux_index
             transfer_blocks.append((src_addr, dst_addr, length))
 
-        # TODO(shangming): Fix me when nvlink_transport of Mooncake is bug-free
-        if self.enable_custom_mem_pool:
-            for src_addr, dst_addr, length in transfer_blocks:
-                status = self.engine.transfer_sync(
-                    mooncake_session_id, src_addr, dst_addr, length
-                )
-                if status != 0:
-                    return status
-            return 0
-        else:
-            src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-            return self.engine.batch_transfer_sync(
-                mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
-            )
+        return self._transfer_data(mooncake_session_id, transfer_blocks)
 
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
