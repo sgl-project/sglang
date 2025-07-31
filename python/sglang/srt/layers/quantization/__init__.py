@@ -49,7 +49,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 )
 from sglang.srt.utils import mxfp_supported
 
-if mxfp_supported:
+if mxfp_supported():
     from sglang.srt.layers.quantization.fp4 import MxFp4Config
 
 from sglang.srt.layers.quantization.fp8 import Fp8Config
