@@ -233,6 +233,7 @@ class ReasoningParser:
         "qwen3-thinking": Qwen3ThinkingDetector,
         "glm45": Qwen3Detector,
         "kimi": KimiDetector,
+        "step3": DeepSeekR1Detector,
     }
 
     def __init__(self, model_type: Optional[str] = None, stream_reasoning: bool = True):

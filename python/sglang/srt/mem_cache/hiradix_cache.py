@@ -79,7 +79,9 @@ class HiRadixCache(RadixCache):
         self.write_through_threshold = (
             1 if hicache_write_policy == "write_through" else 3
         )
-        self.write_through_threshold_storage = 3
+        self.write_through_threshold_storage = (
+            1 if hicache_write_policy == "write_through" else 3
+        )
         self.load_back_threshold = 10
         super().__init__(
             req_to_token_pool, token_to_kv_pool_allocator, page_size, disable=False
@@ -111,6 +113,7 @@ class HiRadixCache(RadixCache):
             )
         if host_indices is not None:
             node.host_value = host_indices
+            assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
             if not write_back:
                 # no need to lock nodes if write back
@@ -388,10 +391,14 @@ class HiRadixCache(RadixCache):
                 self.cache_controller.ack_backup_queue.get()
             )
             host_node = self.ongoing_backup[ack_id]
-            if completed_tokens < len(host_node.key):
+            if completed_tokens == 0:
+                host_node.hash_value = None
+            elif completed_tokens < len(host_node.key):
                 # backup is only partially successful, split the node
                 new_node = self._split_node(host_node.key, host_node, completed_tokens)
                 new_node.hash_value = hash_value
+            else:
+                host_node.hash_value = hash_value
             host_node.release_host()
             del self.ongoing_backup[ack_id]
 
@@ -431,6 +438,8 @@ class HiRadixCache(RadixCache):
             written_indices,
             hash_value[:min_completed_tokens],
         )
+        if len(written_indices):
+            self.cache_controller.mem_pool_host.update_prefetch(written_indices)
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
         self.cache_controller.mem_pool_host.free(
@@ -551,13 +560,11 @@ class HiRadixCache(RadixCache):
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
-                self.inc_hit_count(new_node)
                 if not new_node.evicted:
                     value.append(new_node.value)
                 node = new_node
                 break
             else:
-                self.inc_hit_count(child)
                 if not child.evicted:
                     value.append(child.value)
                 node = child
@@ -587,6 +594,10 @@ class HiRadixCache(RadixCache):
         if child.backuped:
             new_node.host_value = child.host_value[:split_len]
             child.host_value = child.host_value[split_len:]
+
+        if child.hash_value:
+            new_node.hash_value = child.hash_value[: split_len // self.page_size]
+            child.hash_value = child.hash_value[split_len // self.page_size :]
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
