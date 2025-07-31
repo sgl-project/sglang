@@ -190,6 +190,8 @@ class AscendAttnBackend(AttentionBackend):
             use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
             q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            k_ = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+            v_ = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
             o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
             causal = True
@@ -201,6 +203,8 @@ class AscendAttnBackend(AttentionBackend):
 
             self.native_attn._run_sdpa_forward_extend(
                 q_,
+                k_,
+                v_,
                 o_,
                 k_cache.view(
                     -1, layer.tp_k_head_num, (self.kv_lora_rank + self.qk_rope_head_dim)
@@ -210,7 +214,9 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.extend_prefix_lens,
+                forward_batch.extend_prefix_lens_cpu,
                 forward_batch.extend_seq_lens,
+                forward_batch.extend_seq_lens_cpu,
                 scaling=layer.scaling,
                 enable_gqa=use_gqa,
                 causal=causal,
