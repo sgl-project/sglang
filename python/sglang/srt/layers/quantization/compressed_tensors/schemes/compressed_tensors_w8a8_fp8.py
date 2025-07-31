@@ -21,11 +21,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import (
-    get_bool_env_var,
-    is_hip,
-)
-
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
@@ -33,6 +29,7 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
+
 
 class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
 
@@ -87,12 +84,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
 
             if _use_aiter:
                 layer.weight = Parameter(
-                    shuffle_weight(weight, (16, 16)),
-                    requires_grad=False
+                    shuffle_weight(weight, (16, 16)), requires_grad=False
                 )
             else:
                 layer.weight = Parameter(weight.t(), requires_grad=False)
-                
+
             # required by torch.compile to be torch.nn.Parameter
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
