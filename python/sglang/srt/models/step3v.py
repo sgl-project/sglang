@@ -52,11 +52,9 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, log_info_on_rank0, make_layers
+from sglang.srt.configs.step3v import Step3VConfig, StepVisionEncoderConfig
 
 logger = logging.getLogger(__name__)
-
-Step3vConfig = None
-StepVisionEncoderConfig = None
 
 
 class Step3VLImagePixelInputs(TypedDict):
@@ -309,7 +307,7 @@ class Step3TextAttention(nn.Module):
 class Step3TextDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: Step3vConfig,
+        config: Step3VConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",

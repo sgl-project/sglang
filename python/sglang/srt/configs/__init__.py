@@ -5,6 +5,7 @@ from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.kimi_vl import KimiVLConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
+from sglang.srt.configs.step3v import Step3VConfig, Step3VTextConfig, StepVisionEncoderConfig
 
 __all__ = [
     "ExaoneConfig",
@@ -14,4 +15,7 @@ __all__ = [
     "MultiModalityConfig",
     "KimiVLConfig",
     "MoonViTConfig",
+    "Step3VConfig",
+    "Step3VTextConfig",
+    "StepVisionEncoderConfig",
 ]
