@@ -60,7 +60,7 @@ def create_hidden_states(num_tokens, dim, dtype, num_experts, num_topk, device):
     hidden_states = torch.randn([num_tokens, dim], dtype=ddtype, device=device)
     ll = [i for i in range(num_experts-1)]
     topks = []
-    # 模拟融合 shared_experts
+    # Simulated fusion of shared_experts
     for i in range(num_tokens):
         ll_cp = deepcopy(ll)
         random.shuffle(ll_cp)
@@ -98,7 +98,7 @@ def benchmark_config(
 ) -> float:
     schedule = get_schedule_name(config)
 
-    # 创造 weight, hidden_states
+    # create weight, hidden_states
     tensors = create_moe_data(num_experts, [num_tokens, shard_intermediate_size, hidden_size], types, 128, 8)
     hidden_states, topk_ids, topk_weights = create_hidden_states(num_tokens, hidden_size, torch.float8_e4m3fn, num_experts, topk, tensors.w_q.device)
 
@@ -155,7 +155,7 @@ def benchmark_config(
     end_event.record()
     end_event.synchronize()
     latencies.append(start_event.elapsed_time(end_event))
-    avg = sum(latencies) / (num_iters * 10) * 1000  # us
+    avg = sum(latencies) / num_iters * 100  # us
     graph.reset()
     return avg
 

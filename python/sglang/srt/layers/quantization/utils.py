@@ -570,7 +570,7 @@ def machete_quantize_and_pack(
 
 
 def parse_machete_config(input_size, output_size):
-    machete_config_path = os.path.dirname(__file__) + "/configs/machete_mm_linear.json"
+    machete_config_path = os.path.join(os.path.dirname(__file__), "configs/machete_mm_linear.json")
     with open(machete_config_path, "r") as f:
         machete_config = json.load(f)
     for k_n, schedules in machete_config.items():

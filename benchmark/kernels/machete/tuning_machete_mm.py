@@ -83,7 +83,7 @@ def benchmark_config(
         end_event.synchronize()
         latencies.append(start_event.elapsed_time(end_event))
 
-    avg = sum(latencies) / (num_iters * 10) * 1000  # us
+    avg = sum(latencies) / num_iters * 100  # us
     graph.reset()
     return avg
 

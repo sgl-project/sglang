@@ -1835,7 +1835,7 @@ def silu_and_mul_with_mask_kernel(
 
     for dim_offset in range(0, dim, BLOCK_SIZE_DIM):
         col_idx = dim_offset + tl.arange(0, BLOCK_SIZE_DIM)
-        col_mask = col_idx < 1000000
+        col_mask = col_idx < dim
 
         offs_x1 = row_idx * stride_x_row + col_idx * stride_x_col
 
