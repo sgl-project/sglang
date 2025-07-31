@@ -1772,9 +1772,6 @@ class Scheduler(
                 self.tree_cache.check_prefetch_progress(req.rid)
 
             req.init_next_round_input(self.tree_cache)
-            if self.enable_hierarchical_cache:
-                req.inc_node_hit_count(self.tree_cache)
-
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
 
             if res != AddReqResult.CONTINUE:

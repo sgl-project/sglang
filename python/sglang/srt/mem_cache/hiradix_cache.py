@@ -611,6 +611,7 @@ class HiRadixCache(RadixCache):
                     self.token_to_kv_pool_host.update_synced(node.host_value)
                     self.evictable_size_ += len(node.value)
                 else:
+                    self.inc_hit_count(node)
                     total_prefix_length += prefix_len
             else:
                 # partial match, split the node
@@ -620,6 +621,7 @@ class HiRadixCache(RadixCache):
                     self.token_to_kv_pool_host.update_synced(new_node.host_value)
                     self.evictable_size_ += len(new_node.value)
                 else:
+                    self.inc_hit_count(new_node)
                     total_prefix_length += prefix_len
                 node = new_node
 
