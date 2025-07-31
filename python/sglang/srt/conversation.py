@@ -11,7 +11,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Conversation chat templates."""
+"""Conversation chat templates.
+
+This module provides conversation template definitions, data structures, and utilities
+for managing chat templates across different model types in SGLang.
+
+Key components:
+- Conversation class: Defines the structure and behavior of chat templates
+- SeparatorStyle enum: Different conversation formatting styles
+- Template registry: Functions to register and retrieve templates by name or model path
+- Built-in templates: Pre-defined templates for popular models
+"""
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
@@ -20,7 +30,8 @@ import re
 from enum import IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
-from sglang.srt.openai_api.protocol import ChatCompletionRequest
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.utils import read_system_prompt_from_file
 
 
 class SeparatorStyle(IntEnum):
@@ -48,6 +59,7 @@ class SeparatorStyle(IntEnum):
     METAMATH = auto()
     DeepSeekVL2 = auto()
     QWEN2_VL_EMBED = auto()
+    QWEN2_AUDIO = auto()
     GEMMA3 = auto()
     MPT = auto()
 
@@ -76,9 +88,11 @@ class Conversation:
     stop_str: Union[str, List[str]] = None
     # The string that represents an image token in the prompt
     image_token: str = "<image>"
+    video_token: str = "<video>"
     audio_token: str = "<audio>"
 
     image_data: Optional[List[str]] = None
+    video_data: Optional[List[str]] = None
     modalities: Optional[List[str]] = None
     stop_token_ids: Optional[int] = None
 
@@ -339,6 +353,23 @@ class Conversation:
                 else:
                     ret += role
             return ret
+        elif self.sep_style == SeparatorStyle.QWEN2_AUDIO:
+            ret = "" if system_prompt == "" else system_prompt + self.sep
+
+            counter = 1
+            for role, message in self.messages:
+                if message:
+                    while self.audio_token in message:
+                        message = message.replace(
+                            self.audio_token, self.audio_token.format(idx=counter), 1
+                        )
+                        counter += 1
+
+                    ret += role + "\n" + message + self.sep
+                else:
+                    ret += role + "\n"
+
+            return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
@@ -351,11 +382,15 @@ class Conversation:
         self.messages.append([role, message])
 
     def append_image(self, image: str):
-        """Append a new message."""
+        """Append a new image."""
         self.image_data.append(image)
 
+    def append_video(self, video: str):
+        """Append a new video."""
+        self.video_data.append(video)
+
     def append_audio(self, audio: str):
-        """Append a new message."""
+        """Append a new audio."""
         self.audio_data.append(audio)
 
     def update_last_message(self, message: str):
@@ -404,6 +439,7 @@ class Conversation:
             sep2=self.sep2,
             stop_str=self.stop_str,
             image_token=self.image_token,
+            video_token=self.video_token,
             audio_token=self.audio_token,
         )
 
@@ -466,8 +502,12 @@ def generate_embedding_convs(
             sep2=conv_template.sep2,
             stop_str=conv_template.stop_str,
             image_data=[],
+            video_data=[],
+            audio_data=[],
             modalities=[],
             image_token=conv_template.image_token,
+            video_token=conv_template.video_token,
+            audio_token=conv_template.audio_token,
         )
         real_content = ""
 
@@ -528,10 +568,12 @@ def generate_chat_conv(
         sep2=conv.sep2,
         stop_str=conv.stop_str,
         image_data=[],
+        video_data=[],
         audio_data=[],
         modalities=[],
         image_token=conv.image_token,
         audio_token=conv.audio_token,
+        video_token=conv.video_token,
     )
 
     if isinstance(request.messages, str):
@@ -561,14 +603,11 @@ def generate_chat_conv(
                     if content.type == "image_url":
                         num_image_url += 1
                         conv.modalities.append(content.modalities)
-                if num_image_url > 1:
-                    image_token = conv.image_token
-                else:
-                    image_token = (
-                        conv.image_token + "\n"
-                        if conv.name != "qwen2-vl"
-                        else conv.image_token
-                    )
+                image_token = (
+                    conv.image_token + "\n"
+                    if conv.name != "qwen2-vl"
+                    else conv.image_token
+                )
                 add_token_as_needed: bool = (
                     conv.name in _MODELS_REQUIRING_MODALITY_SUPPLEMENT
                 )
@@ -576,6 +615,7 @@ def generate_chat_conv(
                     image_token = ""
 
                 audio_token = conv.audio_token
+                video_token = conv.video_token
                 for content in message.content:
                     if content.type == "text":
                         if num_image_url > 16:
@@ -583,11 +623,14 @@ def generate_chat_conv(
                         real_content += content.text
                     elif content.type == "image_url":
                         # NOTE: works for llava and intervl2_5
-                        if conv.name == "internvl-2-5":
+                        if conv.name in ["internvl-2-5", "interns1"]:
                             real_content = image_token + real_content
                         else:
                             real_content += image_token
                         conv.append_image(content.image_url.url)
+                    elif content.type == "video_url":
+                        real_content += video_token
+                        conv.append_video(content.video_url.url)
                     elif content.type == "audio_url":
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)
@@ -620,7 +663,7 @@ def generate_chat_conv(
 
 
 # llama2 template
-# reference: https://huggingface.co/blog/codellama#conversational-instructions
+# reference: https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
 # reference: https://github.com/facebookresearch/llama/blob/1a240688810f8036049e8da36b073f63d2ac552c/llama/generation.py#L212
 register_conv_template(
     Conversation(
@@ -648,6 +691,20 @@ register_conv_template(
     )
 )
 
+register_conv_template(
+    Conversation(
+        name="devstral",
+        system_template="[SYSTEM_PROMPT]\n{system_message}\n[/SYSTEM_PROMPT]\n\n",
+        system_message=read_system_prompt_from_file("mistralai/Devstral-Small-2505"),
+        roles=("[INST]", "[/INST]"),
+        sep_style=SeparatorStyle.LLAMA2,
+        sep=" ",
+        sep2=" </s><s>",
+        stop_str=["[INST]", "[/INST]", "[SYSTEM_PROMPT]", "[/SYSTEM_PROMPT]"],
+        image_token="[IMG]",
+    )
+)
+
 # reference: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct/blob/main/chat_template.json
 register_conv_template(
     Conversation(
@@ -658,6 +715,21 @@ register_conv_template(
         sep="",
         stop_str=["<|end_of_text|>", "<|eot|>", "<|eom|>"],
         image_token="<|image|>",
+    )
+)
+
+# TODO (lifuhuang): Refactor BaseMultimodalProcessor to support the default image token "<|image_{index}|>" in the future.
+register_conv_template(
+    Conversation(
+        name="phi-4-mm",
+        system_message="",
+        system_template="{system_message}",
+        roles=("<|user|>", "<|assistant|>"),
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
+        sep="<|end|>",
+        stop_str="<|end|>",
+        image_token="<|endoftext10|>",
+        audio_token="<|endoftext11|>",
     )
 )
 
@@ -745,6 +817,19 @@ register_conv_template(
     )
 )
 
+register_conv_template(
+    Conversation(
+        name="interns1",
+        system_template="<|im_start|>system\n{system_message}",
+        system_message="You are an AI assistant whose name is Intern-S1 (书生大模型).\n- Intern-S1 (书生大模型) is a vision-language model that is developed by Shanghai AI Laboratory (上海人工智能实验室).  It is designed to be helpful, honest, and harmless.\n- Intern-S1 (书生大模型) can understand and communicate fluently in the language chosen by the user such as English and 中文.\nYou are an expert reasoner with extensive experience in all areas. You approach problems through systematic thinking and rigorous reasoning. Your response should reflect deep understanding and precise logical thinking, making your solution path and reasoning clear to others. Please put your thinking process within <think>...</think> tags.",
+        roles=("<|im_start|>user\n", "<|im_start|>assistant\n"),
+        sep_style=SeparatorStyle.MPT,
+        sep="<|im_end|>\n",
+        stop_str=["<|im_end|>", "<|action_end|>"],
+        image_token="<image>",
+    )
+)
+
 # Reference: https://huggingface.co/docs/transformers/main/model_doc/qwen2_vl#usage-example
 register_conv_template(
     Conversation(
@@ -756,6 +841,7 @@ register_conv_template(
         sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
         stop_str=["<|im_end|>"],
         image_token="<|vision_start|><|image_pad|><|vision_end|>",
+        video_token="<|vision_start|><|video_pad|><|vision_end|>",
     )
 )
 
@@ -781,12 +867,13 @@ register_conv_template(
     Conversation(
         name="gemma-it",
         system_message="You are a helpful assistant.",
-        system_template="<start_of_turn>user{system_message}\n\n",
+        system_template="<start_of_turn>user\n{system_message}\n\n",
         roles=("<start_of_turn>user\n", "<start_of_turn>model\n"),
         sep="<end_of_turn>\n",
         sep_style=SeparatorStyle.GEMMA3,
         stop_str=["<end_of_turn>"],
         image_token="<start_of_image>",
+        audio_token="<start_of_audio>",
     )
 )
 
@@ -815,6 +902,7 @@ register_conv_template(
         sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
         stop_str=("<|im_end|>", "<|endoftext|>"),
         image_token="(<image>./</image>)",
+        video_token="(<video>./</video>)",
     )
 )
 
@@ -866,17 +954,78 @@ register_conv_template(
     )
 )
 
+register_conv_template(
+    Conversation(
+        name="mimo-vl",
+        system_message="You are MiMo, an AI assistant developed by Xiaomi.",
+        system_template="<|im_start|>system\n{system_message}",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<|im_end|>"],
+        image_token="<|vision_start|><|image_pad|><|vision_end|>",
+    )
+)
+
+
+register_conv_template(
+    Conversation(
+        name="qwen2-audio",
+        system_template="<|im_start|>system\n{system_message}",
+        system_message="You are a helpful assistant.",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.QWEN2_AUDIO,
+        stop_str=["<|im_end|>"],
+        audio_token="Audio {idx}: <|audio_bos|><|AUDIO|><|audio_eos|>\n",
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="llama_4_vision",
+        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
+        system_template="<|header_start|>system<|header_end|>\n\n{system_message}<|eot|>",
+        roles=("user", "assistant"),
+        sep_style=SeparatorStyle.LLAMA4,
+        sep="",
+        stop_str="<|eot|>",
+        image_token="<|image|>",
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="step3-vl",
+        system_message="<｜begin▁of▁sentence｜>You are a helpful assistant",
+        system_template="{system_message}\n",
+        roles=(
+            "<|BOT|>user\n",
+            "<|BOT|>assistant\n<think>\n",
+        ),
+        sep="<|EOT|>",
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
+        stop_str="<|EOT|>",
+        image_token="<im_patch>",
+        # add_bos=True,
+    )
+)
+
 
 @register_conv_template_matching_function
 def match_internvl(model_path: str):
-    if re.search(r"internvl2_5", model_path, re.IGNORECASE):
+    if re.search(r"internvl", model_path, re.IGNORECASE):
         return "internvl-2-5"
+    if re.search(r"intern.*s1", model_path, re.IGNORECASE):
+        return "interns1"
 
 
 @register_conv_template_matching_function
-def match_llama_3_vision(model_path: str):
+def match_llama_vision(model_path: str):
     if re.search(r"llama.*3\.2.*vision", model_path, re.IGNORECASE):
         return "llama_3_vision"
+    if re.search(r"llama.*4.*", model_path, re.IGNORECASE):
+        return "llama_4_vision"
 
 
 @register_conv_template_matching_function
@@ -919,6 +1068,8 @@ def match_qwen_chat_ml(model_path: str):
         return "gme-qwen2-vl"
     if re.search(r"qwen.*vl", model_path, re.IGNORECASE):
         return "qwen2-vl"
+    if re.search(r"qwen.*audio", model_path, re.IGNORECASE):
+        return "qwen2-audio"
     if re.search(
         r"llava-v1\.6-34b|llava-v1\.6-yi-34b|llava-next-video-34b|llava-onevision-qwen2",
         model_path,
@@ -945,3 +1096,33 @@ def match_openbmb_minicpm(model_path: str):
 def match_moonshot_kimivl(model_path: str):
     if re.search(r"kimi.*vl", model_path, re.IGNORECASE):
         return "kimi-vl"
+
+
+@register_conv_template_matching_function
+def match_devstral(model_path: str):
+    if re.search(r"devstral", model_path, re.IGNORECASE):
+        return "devstral"
+
+
+@register_conv_template_matching_function
+def match_phi_4_mm(model_path: str):
+    if "phi-4-multimodal" in model_path.lower():
+        return "phi-4-mm"
+
+
+@register_conv_template_matching_function
+def match_vila(model_path: str):
+    if re.search(r"vila", model_path, re.IGNORECASE):
+        return "chatml"
+
+
+@register_conv_template_matching_function
+def match_mimo_vl(model_path: str):
+    if re.search(r"mimo.*vl", model_path, re.IGNORECASE):
+        return "mimo-vl"
+
+
+# @register_conv_template_matching_function
+# def match_step3(model_path: str):
+#     if re.search(r"step3", model_path, re.IGNORECASE):
+#         return "step3-vl"

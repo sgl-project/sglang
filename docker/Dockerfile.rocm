@@ -1,46 +1,96 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.4.6.post4 -t v0.4.6.post4-rocm630 -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx942 -t v0.4.9.post1-rocm630-mi30x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx950 -t v0.4.9.post1-rocm700-mi35x -f Dockerfile.rocm .
 
-# default base image
-ARG BASE_IMAGE="rocm/sgl-dev:vllm20250114"
+# Default base images
+ARG BASE_IMAGE_950="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.8.5_mi35X_prealpha"
+ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
 
-FROM $BASE_IMAGE AS base
-USER root
+# This is necessary for scope purpose
+ARG GPU_ARCH=gfx950
 
-WORKDIR /sgl-workspace
-ARG BUILD_TYPE=all
-ARG SGL_REPO="https://github.com/sgl-project/sglang"
-ENV SGL_DEFAULT="main"
+# ===============================
+# Base image 942 and args
+FROM $BASE_IMAGE_942 AS gfx942
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_AITER_ALL="1"
+ENV AITER_COMMIT="v0.1.4"
+
+# ===============================
+# Base image 950 and args
+FROM $BASE_IMAGE_950 AS gfx950
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="0"
+ENV BUILD_AITER_ALL="1"
+ENV AITER_COMMIT="v0.1.4"
+
+# ===============================
+# Chosen arch and args
+FROM ${GPU_ARCH}
+
+# This is necessary for scope purpose, again
+ARG GPU_ARCH=gfx950
+ENV GPU_ARCH_LIST=${GPU_ARCH:-${PYTORCH_ROCM_ARCH}}
+
+ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
+ARG SGL_DEFAULT="main"
 ARG SGL_BRANCH=${SGL_DEFAULT}
 
 ARG TRITON_REPO="https://github.com/ROCm/triton.git"
 ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 
-
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
-ARG AITER_COMMIT="v0.1.1"
 
-RUN git clone ${SGL_REPO} \
-    && cd sglang \
-    && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
-         echo "Using ${SGL_DEFAULT}, default branch."; \
-       else \
-         echo "Using ${SGL_BRANCH} branch."; \
-         git checkout ${SGL_BRANCH}; \
-       fi \
-    && cd sgl-kernel \
-    && rm -f pyproject.toml \
-    && mv pyproject_rocm.toml pyproject.toml \
-    && python setup_rocm.py install \
-    && cd .. \
-    && if [ "$BUILD_TYPE" = "srt" ]; then \
-         python -m pip --no-cache-dir install -e "python[srt_hip]"; \
-       else \
-         python -m pip --no-cache-dir install -e "python[all_hip]"; \
-       fi
+USER root
 
-RUN cp -r /sgl-workspace/sglang /sglang
-RUN python -m pip cache purge
+# Install some basic utilities
+RUN python -m pip install --upgrade pip && pip install setuptools_scm
+RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which sccache)"
+
+WORKDIR /sgl-workspace
+
+# -----------------------
+# AITER
+RUN pip uninstall -y aiter
+RUN git clone ${AITER_REPO} \
+ && cd aiter \
+ && git checkout ${AITER_COMMIT} \
+ && git submodule update --init --recursive
+RUN cd aiter \
+     && if [ "$BUILD_AITER_ALL" = "1" ]; then \
+          PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
+        else \
+          GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
+        fi
+
+# -----------------------
+# Triton
+RUN if [ "$BUILD_TRITON" = "1" ]; then \
+        pip uninstall -y triton \
+     && git clone ${TRITON_REPO} \
+     && cd triton \
+     && git checkout ${TRITON_COMMIT} \
+     && cd python \
+     && python setup.py install; \
+    fi
+
+# -----------------------
+# Build vLLM
+ARG VLLM_REPO="https://github.com/ROCm/vllm.git"
+ARG VLLM_BRANCH="9f6b92db47c3444b7a7d67451ba0c3a2d6af4c2c"
+RUN if [ "$BUILD_VLLM" = "1" ]; then \
+        git clone ${VLLM_REPO} \
+     && cd vllm \
+     && git checkout ${VLLM_BRANCH} \
+     && python -m pip install -r requirements/rocm.txt \
+     && python setup.py clean --all \
+     && python setup.py develop; \
+    fi
+
+# -----------------------
+# Build SGLang
+ARG BUILD_TYPE=all
 
 RUN pip install IPython \
     && pip install orjson \
@@ -48,18 +98,28 @@ RUN pip install IPython \
     && pip install torchao \
     && pip install pybind11
 
-RUN pip uninstall -y triton
-RUN git clone ${TRITON_REPO} \
-    && cd triton \
-    && git checkout ${TRITON_COMMIT} \
-    && cd python \
-    && python3 setup.py install
+RUN pip uninstall -y sgl_kernel sglang
+RUN git clone ${SGL_REPO} \
+    && cd sglang \
+    && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
+         echo "Using ${SGL_DEFAULT}, default branch."; \
+         git checkout ${SGL_DEFAULT}; \
+       else \
+         echo "Using ${SGL_BRANCH} branch."; \
+         git checkout ${SGL_BRANCH}; \
+       fi \
+    && cd sgl-kernel \
+    && rm -f pyproject.toml \
+    && mv pyproject_rocm.toml pyproject.toml \
+    && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install \
+    && cd .. \
+    && if [ "$BUILD_TYPE" = "srt" ]; then \
+         python -m pip --no-cache-dir install -e "python[srt_hip]"; \
+       else \
+         python -m pip --no-cache-dir install -e "python[all_hip]"; \
+       fi
 
-RUN git clone ${AITER_REPO} \
-    && cd aiter \
-    && git checkout ${AITER_COMMIT} \
-    && git submodule update --init --recursive \
-    && PREBUILD_KERNELS=1 GPU_ARCHS=gfx942 python3 setup.py develop
+RUN python -m pip cache purge
 
 # Copy config files to support MI300X in virtualized environments (MI300X_VF).  Symlinks will not be created in image build.
 RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
@@ -67,13 +127,13 @@ RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
          -type f -name '*MI300X*' | xargs -I {} sh -c 'vf_config=$(echo "$1" | sed "s/MI300X/MI300X_VF/"); cp "$1" "$vf_config"' -- {}
 
 # Performance environment variable.
-
 ENV HIP_FORCE_DEV_KERNARG=1
 ENV HSA_NO_SCRATCH_RECLAIM=1
 ENV SGLANG_SET_CPU_AFFINITY=1
 ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 ENV NCCL_MIN_NCHANNELS=112
 
+ENV SGLANG_USE_AITER=1
 ENV SGLANG_MOE_PADDING=1
 ENV VLLM_FP8_PADDING=1
 ENV VLLM_FP8_ACT_PADDING=1

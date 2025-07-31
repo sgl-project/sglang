@@ -127,6 +127,10 @@ def send_one_prompt(args):
     if args.batch_size > 1:
         ret = ret[0]
 
+    if response.status_code != 200:
+        print(ret)
+        return 0, 0
+
     latency = ret["meta_info"]["e2e_latency"]
 
     if "spec_verify_ct" in ret["meta_info"]:

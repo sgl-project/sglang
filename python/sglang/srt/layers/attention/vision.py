@@ -1,26 +1,33 @@
 from __future__ import annotations
 
+import dataclasses
+import functools
 import math
-from functools import lru_cache, wraps
-from typing import Optional, Tuple
+from functools import lru_cache, partial
+from typing import Any, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, print_info_once
 
 _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
-from sglang.srt.distributed import parallel_state
+from sglang.srt.distributed import (
+    parallel_state,
+    split_tensor_along_last_dim,
+    tensor_model_parallel_all_gather,
+)
 from sglang.srt.distributed import utils as dist_utils
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -29,29 +36,42 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import add_prefix, logger
+from sglang.srt.utils import add_prefix
 
 ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
 }
 
 
-def execute_once(func):
-    has_run = None
+@dataclasses.dataclass
+class SingletonCache:
+    data: Any = None
 
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        nonlocal has_run
-        if not has_run:
-            func(*args, **kwargs)
-            has_run = True
+    def set_data(self, value: Any) -> None:
+        self.data = value
 
-    return wrapper
+    def get_data(self) -> Optional[Any]:
+        return self.data
+
+    def empty(self) -> bool:
+        return self.get_data() is None
 
 
-@execute_once
-def info_once(message: str):
-    logger.info(message)
+# TODO: requires real seqlens from images
+@functools.lru_cache(maxsize=128)
+def _get_cu_seqlens_for_shape(batch_size: int, seqlen: int, device) -> torch.Tensor:
+    """
+    Generates cumulative sequence lengths (cu_seqlens) for a given batch_size, seqlen, and device.
+    Caches the result based on these parameters.
+    """
+    cu_seqlens = torch.arange(
+        0,
+        (batch_size + 1) * seqlen,
+        step=seqlen,
+        dtype=torch.int32,
+        device=device,
+    )
+    return cu_seqlens
 
 
 class VisionSdpaAttention(nn.Module):
@@ -120,7 +140,7 @@ class VisionSdpaAttention(nn.Module):
         flatten_batch: bool = False,
     ) -> Optional[torch.Tensor]:
         r"""
-        Creates a non-causal 4D mask of shape `(b, 1, s, s)` or `(1, s, s)`.
+        Creates a non-causal 4D mask of shape `(b, 1, s, s)` or `(1, 1, s, s)`.
         Args:
             s: sequence length
             cu_seqlens: cumulative sequence lengths tensor. If not, returns an empty mask
@@ -265,8 +285,9 @@ class VisionFlash3Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: Optional[torch.Tensor],
-        attention_mask: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[Union[SingletonCache, torch.Tensor]],
+        bsz: int,
+        seq_len: int,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -275,7 +296,16 @@ class VisionFlash3Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        cu_seqlens = cu_seqlens.to(dtype=torch.int32).cuda()
+        if cu_seqlens is None:
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+        elif isinstance(cu_seqlens, SingletonCache):
+            if cu_seqlens.empty():
+                cu_seqlens.set_data(
+                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+                )
+            cu_seqlens = cu_seqlens.get_data()
+
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
         output = flash_attn_varlen_func(
@@ -324,33 +354,52 @@ class VisionAttention(nn.Module):
         flatten_batch: bool = False,
         prefix: str = "",
         proj_bias: bool = True,
+        num_dummy_heads: int = 0,
+        qkv_bias: bool = True,
+        qk_normalization: bool = False,
+        layer_norm_eps: float = 1e-06,
         **kwargs,
     ):
         super().__init__()
         world_size = parallel_state.get_tensor_model_parallel_world_size()
+        self.tp_size = world_size
+        self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
         self.dropout = dropout
         self.head_size = embed_dim // num_heads
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
         self.num_attention_heads_per_partition = dist_utils.divide(
-            num_heads, world_size
+            num_dummy_heads + num_heads, world_size
         )
         self.num_attention_kv_heads_per_partition = dist_utils.divide(
-            num_heads, world_size
+            num_dummy_heads + num_heads, world_size
         )
 
         self.q_size = self.num_attention_heads_per_partition * self.head_size
         self.kv_size = self.num_attention_kv_heads_per_partition * self.head_size
 
+        self.qk_normalization = qk_normalization
+
+        # Additional dummy heads are used to enable TP for common GPU counts.
+        self.dummy_dim = (num_dummy_heads + num_heads) * self.head_size
+
+        if self.qk_normalization:
+            self.q_norm = RMSNorm(
+                self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
+            )
+            self.k_norm = RMSNorm(
+                self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
+            )
+
         if global_server_args_dict["mm_attention_backend"] is None:
             if qkv_backend is None:
                 qkv_backend = "sdpa"
-            info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
+            print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         else:
             qkv_backend = global_server_args_dict["mm_attention_backend"]
 
-        info_once(f"Using {qkv_backend} as multimodal attention backend.")
+        print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
         self.qkv_backend = QKV_BACKEND_IMPL[qkv_backend](
             head_dim=self.head_size,
@@ -366,25 +415,45 @@ class VisionAttention(nn.Module):
             self.qkv_proj = QKVParallelLinear(
                 hidden_size=embed_dim,
                 head_size=self.head_size,
-                total_num_heads=num_heads,
-                total_num_kv_heads=num_heads,
+                total_num_heads=num_dummy_heads + num_heads,
+                total_num_kv_heads=num_dummy_heads + num_heads,
+                bias=qkv_bias,
                 quant_config=quant_config,
                 prefix=add_prefix("qkv_proj", prefix),
             )
         else:
             self.qkv_proj = ColumnParallelLinear(
                 input_size=embed_dim,
-                output_size=3 * projection_size,
+                output_size=3 * self.dummy_dim,
+                bias=qkv_bias,
                 quant_config=quant_config,
                 prefix=add_prefix("qkv_proj", prefix),
             )
         self.proj = RowParallelLinear(
-            input_size=embed_dim,
+            input_size=self.dummy_dim,
             output_size=embed_dim,
             bias=proj_bias,
             quant_config=quant_config,
             prefix=add_prefix("proj", prefix),
         )
+
+    def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor):
+        """apply qk norm for internvl vit attn"""
+        q = q.flatten(1, 2)
+        k = k.flatten(1, 2)
+
+        if self.tp_size > 1:
+            q = tensor_model_parallel_all_gather(q.contiguous())
+            k = tensor_model_parallel_all_gather(k.contiguous())
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        if self.tp_size > 1:
+            splitter = partial(split_tensor_along_last_dim, num_partitions=self.tp_size)
+            q = splitter(q)[self.tp_rank]
+            k = splitter(k)[self.tp_rank]
+        q = q.unflatten(-1, (-1, self.head_size))
+        k = k.unflatten(-1, (-1, self.head_size))
+        return q, k
 
     def forward(
         self,
@@ -423,15 +492,16 @@ class VisionAttention(nn.Module):
             # [s, b, embed_dim] --> [s, b, head * 3 * head_size]
             qkv, _ = self.qkv_proj(x)
 
-            # [s, b, head * 3 * head_size] --> [s, b, head, 3 * head_size]
+            # [s, b, head, head_dim_sum]
             new_x_shape = qkv.size()[:-1] + (
                 head,
-                3 * self.hidden_size_per_attention_head,
+                self.q_size + 2 * self.kv_size,
             )
             qkv = qkv.view(*new_x_shape)
 
             # [s, b, head, 3 * head_size] --> 3 [s, b, head, head_size]
-            q, k, v = dist_utils.split_tensor_along_last_dim(qkv, 3)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
             # [s, b, head, head_size] --> [b, s, head, head_size]
             q, k, v = [
                 rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)
@@ -463,11 +533,16 @@ class VisionAttention(nn.Module):
         assert k.dim() == 3, k.dim()
         assert v.dim() == 3, v.dim()
 
+        # internvl
+        if self.qk_normalization:
+            q, k = self._apply_qk_norm(q, k)
+
         output = self.qkv_backend.forward(
             q=q,
             k=k,
             v=v,
             bsz=bsz,
+            seq_len=s,
             cu_seqlens=cu_seqlens,
             attention_mask=attention_mask,
         )

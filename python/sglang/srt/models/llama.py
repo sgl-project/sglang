@@ -17,7 +17,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -480,6 +480,47 @@ class LlamaForCausalLM(nn.Module):
         else:
             return hidden_states
 
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],  # [start, end) 0-based
+        input_embeds: torch.Tensor = None,
+    ) -> Optional[LogitsProcessorOutput]:
+        start, end = split_interval
+        # embed
+        if start == 0:
+            if input_embeds is None:
+                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
+            else:
+                forward_batch.hidden_states = input_embeds
+        # decoder layer
+        for i in range(start, end):
+            layer = self.model.layers[i]
+            forward_batch.hidden_states, forward_batch.residual = layer(
+                positions,
+                forward_batch.hidden_states,
+                forward_batch,
+                forward_batch.residual,
+            )
+
+        if end == self.model.config.num_hidden_layers:
+            # norm
+            hidden_states, _ = self.model.norm(
+                forward_batch.hidden_states, forward_batch.residual
+            )
+            forward_batch.hidden_states = hidden_states
+            # logits process
+            result = self.logits_processor(
+                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            result = None
+
+        return result
+
     @property
     def start_layer(self):
         return self.model.start_layer
@@ -574,6 +615,8 @@ class LlamaForCausalLM(nn.Module):
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -697,13 +740,19 @@ class LlamaForCausalLM(nn.Module):
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
 
-    def set_eagle3_layers_to_capture(self):
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if not self.pp_group.is_last_rank:
             return
 
-        self.capture_aux_hidden_states = True
-        num_layers = self.config.num_hidden_layers
-        self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        if layer_ids is None:
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.capture_aux_hidden_states = True
+            # we plus 1 here because in sglang, for the ith layer, it takes the output
+            # of the (i-1)th layer as aux hidden state
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):

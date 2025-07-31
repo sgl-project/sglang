@@ -15,7 +15,6 @@ from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
-import triton
 
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
@@ -29,10 +28,11 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -108,8 +108,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
+        fmha_backend = "auto"
+        if is_sm100_supported():
+            fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD"
+            self.workspace_buffer, "NHD", backend=fmha_backend
         )
 
         if not self.skip_prefill:
@@ -196,7 +199,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
 
     def init_cuda_graph_state(
-        self, max_bs: int, kv_indices_buf: Optional[torch.Tensor] = None
+        self,
+        max_bs: int,
+        max_num_tokens: int,
+        kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
@@ -278,6 +284,28 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = verify_wrapper
             self.forward_metadata = PrefillMetadata(verify_wrapper, False)
+        elif forward_mode.is_draft_extend():
+            draft_extend_wrapper = BatchMLAPagedAttentionWrapper(
+                self.workspace_buffer,
+                use_cuda_graph=True,
+                qo_indptr=self.cuda_graph_qo_indptr[: bs + 1],
+                kv_indptr=self.cuda_graph_kv_indptr[: bs + 1],
+                kv_indices=self.cuda_graph_kv_indices,
+                kv_len_arr=self.cuda_graph_kv_lens[:bs],
+                backend="auto",
+            )
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrapper_paged=draft_extend_wrapper,
+                use_ragged=False,
+                spec_info=spec_info,
+            )
+            self.prefill_cuda_graph_metadata[bs] = draft_extend_wrapper
+            self.forward_metadata = PrefillMetadata(draft_extend_wrapper, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -325,11 +353,21 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 use_ragged=False,
                 spec_info=spec_info,
             )
+        elif forward_mode.is_draft_extend():
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrapper_paged=self.prefill_cuda_graph_metadata[bs],
+                use_ragged=False,
+                spec_info=spec_info,
+            )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return 0
+        return 1
 
     def forward_extend(
         self,
@@ -346,7 +384,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         cache_loc = forward_batch.out_cache_loc
         logits_soft_cap = layer.logit_cap
         prefill_wrapper_paged = self.forward_metadata.prefill_wrapper
-        k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         # Save kv cache
         if save_kv_cache and k is not None:
@@ -381,6 +418,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
         else:
             # mla paged prefill
+            k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
+                q.dtype
+            )
             if q_rope is None:
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 q, q_rope = (
@@ -442,7 +482,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_nope = reshaped_q[:, :, : layer.v_head_dim]
             q_rope = reshaped_q[:, :, layer.v_head_dim :]
 
-        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
+            q.dtype
+        )
 
         o = q_nope.new_empty(q_nope.shape)
         # Direct call to run without the wrapper
@@ -467,7 +509,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         self.scaling = model_runner.model_config.scaling
-        self.data_type = model_runner.kv_cache_dtype
+        self.data_type = model_runner.dtype
         self.attn_backend = attn_backend
 
         # Buffers and wrappers
@@ -577,7 +619,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         self.v_head_dim = model_runner.model_config.v_head_dim
         self.scaling = model_runner.model_config.scaling
-        self.data_type = model_runner.kv_cache_dtype
+        self.data_type = model_runner.dtype
         self.q_data_type = model_runner.dtype
         self.attn_backend = attn_backend
 
@@ -716,7 +758,7 @@ class FlashInferMLAMultiStepDraftBackend:
 
         if topk > 1:
             raise ValueError(
-                f"Currently Flashinfer MLA only supports topk=1 for speculative decoding"
+                "Currently Flashinfer MLA only supports topk=1 for speculative decoding"
             )
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
@@ -750,6 +792,7 @@ class FlashInferMLAMultiStepDraftBackend:
 
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+        self.page_size = model_runner.server_args.page_size
 
     def common_template(
         self,
@@ -770,14 +813,13 @@ class FlashInferMLAMultiStepDraftBackend:
             kv_indices_buffer,
             self.kv_indptr,
             forward_batch.positions,
-            num_seqs,
-            self.topk,
             self.pool_len,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
-            triton.next_power_of_2(num_seqs),
-            triton.next_power_of_2(self.speculative_num_steps),
-            triton.next_power_of_2(bs),
+            next_power_of_2(num_seqs),
+            next_power_of_2(self.speculative_num_steps),
+            next_power_of_2(bs),
+            self.page_size,
         )
 
         assert forward_batch.spec_info is not None
@@ -813,7 +855,7 @@ class FlashInferMLAMultiStepDraftBackend:
 
         self.common_template(forward_batch, kv_indices, call_fn)
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, max_bs * self.max_context_len),
             dtype=torch.int32,
@@ -822,7 +864,7 @@ class FlashInferMLAMultiStepDraftBackend:
 
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_cuda_graph_state(
-                max_bs, kv_indices_buf=self.cuda_graph_kv_indices[i]
+                max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
             )
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
@@ -880,19 +922,18 @@ def fast_mla_decode_plan(
     self._page_size = page_size
     self._sm_scale = sm_scale
 
-    with self.device as device:
-        try:
-            # Standard version with just the required arguments (no use_profiler)
-            self._cached_module.plan.default(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                qo_indptr_cpu,
-                kv_indptr_cpu,
-                kv_len_arr_cpu,
-                num_heads,
-                head_dim_ckv,
-                causal,
-            )
-        except Exception as e:
-            raise RuntimeError(f"Error in alternate MLA plan: {e}")
+    try:
+        # Standard version with just the required arguments (no use_profiler)
+        self._cached_module.plan.default(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._pin_memory_int_workspace_buffer,
+            qo_indptr_cpu,
+            kv_indptr_cpu,
+            kv_len_arr_cpu,
+            num_heads,
+            head_dim_ckv,
+            causal,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Error in alternate MLA plan: {e}")

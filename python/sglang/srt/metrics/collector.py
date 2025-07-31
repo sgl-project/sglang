@@ -145,6 +145,7 @@ class SchedulerStats:
     num_prefill_infight_queue_reqs: int = 0
     num_decode_prealloc_queue_reqs: int = 0
     num_decode_transfer_queue_reqs: int = 0
+    total_retracted_reqs: int = 0
 
 
 class SchedulerMetricsCollector:
@@ -154,7 +155,7 @@ class SchedulerMetricsCollector:
         from prometheus_client import Counter, Gauge
 
         self.labels = labels
-        self.last_log_time = time.time()
+        self.last_log_time = time.perf_counter()
 
         self.num_running_reqs = Gauge(
             name="sglang:num_running_reqs",
@@ -219,6 +220,13 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        self.total_retracted_reqs = Gauge(
+            name="sglang:total_retracted_reqs",
+            documentation="The total number of retracted requests due to kvcache full.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
         # Disaggregation queue metrics
         self.num_prefill_prealloc_queue_reqs = Gauge(
             name="sglang:num_prefill_prealloc_queue_reqs",
@@ -279,6 +287,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
+        self._log_gauge(self.total_retracted_reqs, stats.total_retracted_reqs)
 
         # Disaggregation metrics
         self._log_gauge(
@@ -294,7 +303,7 @@ class SchedulerMetricsCollector:
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
 
-        self.last_log_time = time.time()
+        self.last_log_time = time.perf_counter()
 
 
 class TokenizerMetricsCollector:
@@ -399,6 +408,12 @@ class TokenizerMetricsCollector:
         self.num_so_requests_total = Counter(
             name="sglang:num_so_requests_total",
             documentation="Number of structured output requests processed.",
+            labelnames=labels.keys(),
+        )
+
+        self.num_aborted_requests_total = Counter(
+            name="sglang:num_aborted_requests",
+            documentation="Number of requests aborted.",
             labelnames=labels.keys(),
         )
 
@@ -533,3 +548,6 @@ class TokenizerMetricsCollector:
             if adjusted_interval <= bound:
                 his._buckets[i].inc(num_new_tokens)
                 break
+
+    def observe_one_aborted_request(self):
+        self.num_aborted_requests_total.labels(**self.labels).inc(1)

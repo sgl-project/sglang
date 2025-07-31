@@ -1,10 +1,13 @@
 """Common utilities for testing and benchmarking"""
 
 import argparse
+import asyncio
 import copy
+import json
 import logging
 import os
 import random
+import re
 import subprocess
 import threading
 import time
@@ -12,9 +15,11 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable, List, Optional, Tuple
+from typing import Awaitable, Callable, List, Optional, Tuple
 
+import aiohttp
 import numpy as np
 import requests
 import torch
@@ -24,8 +29,10 @@ from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+from sglang.lang.interpreter import ProgramState
 from sglang.srt.utils import (
     get_bool_env_var,
+    get_device,
     is_port_available,
     kill_process_tree,
     retry,
@@ -36,10 +43,13 @@ from sglang.utils import get_exception_traceback
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE = "meta-llama/Llama-3.2-1B"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
 
 # MLA test models
+DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
+DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST = "cross-encoder/ms-marco-MiniLM-L6-v2"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
@@ -80,17 +90,30 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-In
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4,hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
-DEFAULT_VLM_CHAT_TEMPLATE_FOR_TEST = "qwen2-vl"
 
 DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
 
-DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1000
+DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 
 
 def is_in_ci():
     """Return whether it is in CI runner."""
     return get_bool_env_var("SGLANG_IS_IN_CI")
+
+
+def is_in_amd_ci():
+    """Return whether it is in an AMD CI runner."""
+    return get_bool_env_var("SGLANG_AMD_CI")
+
+
+def _use_cached_default_models(model_repo: str):
+    cache_dir = os.getenv("DEFAULT_MODEL_CACHE_DIR")
+    if cache_dir and model_repo:
+        model_path = os.path.join(cache_dir, model_repo)
+        if os.path.isdir(model_path):
+            return os.path.abspath(model_path)
+    return ""
 
 
 if is_in_ci():
@@ -102,6 +125,9 @@ else:
         7000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
     )
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
+
+if is_in_amd_ci():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -300,13 +326,34 @@ def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
     return args
 
 
+def auto_config_device() -> str:
+    """Auto-config available device platform"""
+
+    try:
+        device = get_device()
+    except (RuntimeError, ImportError) as e:
+        print(f"Warning: {e} - Falling back to CPU")
+        device = "cpu"
+
+    return device
+
+
 def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
     parser.add_argument("--parallel", type=int, default=64)
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--backend", type=str, default="srt")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "rocm", "cpu"],
+        help="Device type (auto/cuda/rocm/cpu). Auto will detect available platforms",
+    )
     parser.add_argument("--result-file", type=str, default="result.jsonl")
+    parser.add_argument("--raw-result-file", type=str)
     args = parser.parse_args()
+
     return args
 
 
@@ -387,16 +434,55 @@ def get_call_select(args: argparse.Namespace):
     return func
 
 
+def _get_default_models():
+    import inspect
+
+    current_module = inspect.getmodule(_get_default_models)
+    default_models = set()
+    for name, value in current_module.__dict__.items():
+        if (
+            isinstance(name, str)
+            and "DEFAULT_" in name
+            and "MODEL_" in name
+            and isinstance(value, str)
+        ):
+            if "," in value:
+                parts = [part.strip() for part in value.split(",")]
+                default_models.update(parts)
+            else:
+                default_models.add(value.strip())
+    return json.dumps(list(default_models))
+
+
+def try_cached_model(model_repo: str):
+    model_dir = _use_cached_default_models(model_repo)
+    return model_dir if model_dir else model_repo
+
+
 def popen_launch_server(
     model: str,
     base_url: str,
     timeout: float,
     api_key: Optional[str] = None,
-    other_args: list[str] = (),
+    other_args: list[str] = [],
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
+    device: str = "auto",
     pd_separated: bool = False,
 ):
+    """Launch a server process with automatic device detection.
+
+    Args:
+        device: Device type ("auto", "cuda", "rocm" or "cpu").
+                If "auto", will detect available platforms automatically.
+    """
+    # Auto-detect device if needed
+    if device == "auto":
+        device = auto_config_device()
+        print(f"Auto-configed device: {device}", flush=True)
+        other_args = list(other_args)
+        other_args += ["--device", str(device)]
+
     _, host, port = base_url.split(":")
     host = host[2:]
 
@@ -452,6 +538,15 @@ def popen_launch_server(
     start_time = time.perf_counter()
     with requests.Session() as session:
         while time.perf_counter() - start_time < timeout:
+
+            return_code = process.poll()
+            if return_code is not None:
+                # Server failed to start (non-zero exit code) or crashed
+                raise Exception(
+                    f"Server process exited with code {return_code}. "
+                    "Check server logs for errors."
+                )
+
             try:
                 headers = {
                     "Content-Type": "application/json; charset=utf-8",
@@ -485,7 +580,6 @@ def popen_launch_pd_server(
     api_key: Optional[str] = None,
     other_args: list[str] = (),
     env: Optional[dict] = None,
-    return_stdout_stderr: Optional[tuple] = None,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -515,42 +609,9 @@ def popen_launch_pd_server(
 
     print(f"command={' '.join(command)}")
 
-    if return_stdout_stderr:
-        process = subprocess.Popen(
-            command,
-            stdout=return_stdout_stderr[0],
-            stderr=return_stdout_stderr[1],
-            env=env,
-            text=True,
-        )
-    else:
-        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
+    process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
-    start_time = time.time()
-    with requests.Session() as session:
-        while time.time() - start_time < timeout:
-            try:
-                headers = {
-                    "Content-Type": "application/json; charset=utf-8",
-                    "Authorization": f"Bearer {api_key}",
-                }
-                response = session.get(
-                    f"{base_url}/health",
-                    headers=headers,
-                )
-                if response.status_code == 200:
-                    return process
-            except requests.RequestException:
-                pass
-
-            return_code = process.poll()
-            if return_code is not None:
-                raise Exception(f"Server unexpectedly exits ({return_code=}).")
-
-            time.sleep(10)
-
-    kill_process_tree(process.pid)
-    raise TimeoutError("Server failed to start within the timeout period.")
+    return process
 
 
 def run_with_timeout(
@@ -656,7 +717,9 @@ def get_benchmark_args(
     disable_stream=False,
     disable_ignore_eos=False,
     seed: int = 0,
+    device="auto",
     pd_separated: bool = False,
+    lora_name=None,
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -684,8 +747,9 @@ def get_benchmark_args(
         extra_request_body=None,
         apply_chat_template=False,
         profile=None,
-        lora_name=None,
+        lora_name=lora_name,
         prompt_suffix="",
+        device=device,
         pd_separated=pd_separated,
     )
 
@@ -705,7 +769,12 @@ def run_bench_serving(
     disable_ignore_eos=False,
     need_warmup=False,
     seed: int = 0,
+    device="auto",
+    background_task: Optional[Callable[[str, asyncio.Event], Awaitable[None]]] = None,
+    lora_name: Optional[str] = None,
 ):
+    if device == "auto":
+        device = auto_config_device()
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
     process = popen_launch_server(
@@ -729,14 +798,36 @@ def run_bench_serving(
         disable_stream=disable_stream,
         disable_ignore_eos=disable_ignore_eos,
         seed=seed,
+        device=device,
+        lora_name=lora_name,
     )
 
-    try:
+    async def _run():
         if need_warmup:
             warmup_args = copy.deepcopy(args)
             warmup_args.num_prompts = 16
-            run_benchmark(warmup_args)
-        res = run_benchmark(args)
+            await asyncio.to_thread(run_benchmark, warmup_args)
+
+        start_event = asyncio.Event()
+        stop_event = asyncio.Event()
+        task_handle = (
+            asyncio.create_task(background_task(base_url, start_event, stop_event))
+            if background_task
+            else None
+        )
+
+        try:
+            start_event.set()
+            result = await asyncio.to_thread(run_benchmark, args)
+        finally:
+            if task_handle:
+                stop_event.set()
+                await task_handle
+
+        return result
+
+    try:
+        res = asyncio.run(_run())
     finally:
         kill_process_tree(process.pid)
 
@@ -779,6 +870,18 @@ def run_bench_serving_multi(
 
 
 def run_bench_one_batch(model, other_args):
+    """Launch a offline process with automatic device detection.
+
+    Args:
+        device: Device type ("auto", "cuda", "rocm" or "cpu").
+                If "auto", will detect available platforms automatically.
+    """
+    # Auto-detect device if needed
+
+    device = auto_config_device()
+    print(f"Auto-configed device: {device}", flush=True)
+    other_args += ["--device", str(device)]
+
     command = [
         "python3",
         "-m",
@@ -802,12 +905,23 @@ def run_bench_one_batch(model, other_args):
         print(f"Output: {output}", flush=True)
         print(f"Error: {error}", flush=True)
 
-        lastline = output.split("\n")[-3]
-        output_throughput = float(lastline.split(" ")[-2])
+        # Return prefill_latency, decode_throughput, decode_latency
+        prefill_line = output.split("\n")[-9]
+        decode_line = output.split("\n")[-3]
+        pattern = (
+            r"latency: (?P<latency>\d+\.\d+).*?throughput:\s*(?P<throughput>\d+\.\d+)"
+        )
+        match = re.search(pattern, prefill_line)
+        if match:
+            prefill_latency = float(match.group("latency"))
+        match = re.search(pattern, decode_line)
+        if match:
+            decode_latency = float(match.group("latency"))
+            decode_throughput = float(match.group("throughput"))
     finally:
         kill_process_tree(process.pid)
 
-    return output_throughput
+    return prefill_latency, decode_throughput, decode_latency
 
 
 def run_bench_offline_throughput(model, other_args):
@@ -910,20 +1024,24 @@ def calculate_rouge_l(output_strs_list1, output_strs_list2):
     return rouge_l_scores
 
 
-STDERR_FILENAME = "stderr.txt"
-STDOUT_FILENAME = "stdout.txt"
+STDERR_FILENAME = "/tmp/stderr.txt"
+STDOUT_FILENAME = "/tmp/stdout.txt"
 
 
 def read_output(output_lines: List[str], filename: str = STDERR_FILENAME):
     """Print the output in real time with another thread."""
     while not os.path.exists(filename):
-        time.sleep(1)
+        time.sleep(0.01)
 
     pt = 0
     while pt >= 0:
         if pt > 0 and not os.path.exists(filename):
             break
-        lines = open(filename).readlines()
+        try:
+            lines = open(filename).readlines()
+        except FileNotFoundError:
+            print(f"{pt=}, {os.path.exists(filename)=}")
+            raise
         for line in lines[pt:]:
             print(line, end="", flush=True)
             output_lines.append(line)
@@ -1186,6 +1304,58 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                                 raise
 
 
+def send_generate_requests(base_url: str, num_requests: int) -> List[str]:
+    """Sends generate request serially and returns status codes. Max concurrency is 1."""
+
+    def generate():
+        prompt = """
+        System: You are a helpful assistant.
+        User: What is the capital of France?
+        Assistant: The capital of France is
+        """
+        response = requests.post(
+            f"{base_url}/generate",
+            json={
+                "text": prompt,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 50,
+                },
+            },
+        )
+        return response.status_code
+
+    return [generate() for _ in range(num_requests)]
+
+
+async def send_concurrent_generate_requests(
+    base_url: str, num_requests: int
+) -> List[str]:
+    """Sends generate request concurrently and returns status codes. Max concurrency is num_requests."""
+
+    async def async_generate():
+        async with aiohttp.ClientSession() as session:
+            prompt = """
+            System: You are a helpful assistant.
+            User: What is the capital of France?
+            Assistant: The capital of France is
+            """
+            async with session.post(
+                f"{base_url}/generate",
+                json={
+                    "text": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 50,
+                    },
+                },
+            ) as response:
+                return response.status
+
+    tasks = [asyncio.create_task(async_generate()) for _ in range(num_requests)]
+    return await asyncio.gather(*tasks)
+
+
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
         max_retry = int(
@@ -1195,3 +1365,35 @@ class CustomTestCase(unittest.TestCase):
             lambda: super(CustomTestCase, self)._callTestMethod(method),
             max_retry=max_retry,
         )
+
+
+def dump_bench_raw_result(
+    path: str,
+    states,
+    preds,
+    labels,
+):
+    if not path:
+        return
+
+    rows = []
+    for i in range(len(states)):
+        state = states[i]
+        output = state["answer"]
+        prompt = _ensure_remove_suffix(state.text(), output)
+        rows.append(
+            dict(
+                prompt_id=i,
+                prompt=prompt,
+                output=output,
+                correct=bool(preds[i] == labels[i]),
+            )
+        )
+
+    print(f"BenchRawResultDumper save results to {path}")
+    Path(path).write_text("\n".join(json.dumps(row) for row in rows))
+
+
+def _ensure_remove_suffix(text: str, suffix: str):
+    assert text.endswith(suffix)
+    return text.removesuffix(suffix)

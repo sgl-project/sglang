@@ -60,7 +60,7 @@ class BaseGrammarObject:
         raise NotImplementedError()
 
     def copy(self) -> "BaseGrammarObject":
-        raise NotImplementedError()
+        return self
 
     @property
     def finished(self):
@@ -99,9 +99,12 @@ class BaseGrammarObject:
         raise NotImplementedError()
 
 
+INVALID_GRAMMAR_OBJ = BaseGrammarObject()
+
+
 @dataclass
 class CacheEntry:
-    value: Optional[BaseGrammarObject]
+    value: BaseGrammarObject
     event: Event
 
 
@@ -165,7 +168,10 @@ class BaseGrammarBackend:
 
 
 def create_grammar_backend(
-    server_args: ServerArgs, tokenizer, vocab_size: int
+    server_args: ServerArgs,
+    tokenizer,
+    vocab_size: int,
+    eos_token_ids: Optional[set] = None,
 ) -> Optional[BaseGrammarBackend]:
     if server_args.grammar_backend == "outlines":
         from sglang.srt.constrained.outlines_backend import OutlinesGrammarBackend
@@ -177,7 +183,12 @@ def create_grammar_backend(
     elif server_args.grammar_backend == "xgrammar":
         from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
 
-        grammar_backend = XGrammarGrammarBackend(tokenizer, vocab_size=vocab_size)
+        # Convert Set[int] to List[int] if needed
+        eos_list = list(eos_token_ids) if eos_token_ids else None
+
+        grammar_backend = XGrammarGrammarBackend(
+            tokenizer, vocab_size=vocab_size, model_eos_token_ids=eos_list
+        )
     elif server_args.grammar_backend == "llguidance":
         from sglang.srt.constrained.llguidance_backend import GuidanceBackend
 

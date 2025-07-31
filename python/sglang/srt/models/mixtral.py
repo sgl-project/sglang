@@ -37,6 +37,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import EPMoE
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -68,6 +69,7 @@ class MixtralMoE(nn.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
+        layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
@@ -86,14 +88,20 @@ class MixtralMoE(nn.Module):
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
+
+        self.topk = TopK(
+            top_k=top_k,
+            renormalize=True,
+        )
+
         MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
         self.experts = MoEImpl(
             num_experts=num_experts,
             top_k=top_k,
+            layer_id=layer_id,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             params_dtype=params_dtype,
-            renormalize=True,
             quant_config=quant_config,
             tp_size=tp_size,
             prefix=add_prefix("experts", prefix),
@@ -105,7 +113,8 @@ class MixtralMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states, router_logits)
+        topk_output = self.topk(hidden_states, router_logits)
+        final_hidden_states = self.experts(hidden_states, topk_output)
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(orig_shape)
@@ -219,6 +228,7 @@ class MixtralDecoderLayer(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
+            layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("block_sparse_moe", prefix),
         )

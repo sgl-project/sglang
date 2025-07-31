@@ -147,8 +147,8 @@ class TestVisionChunkedPrefill(CustomTestCase):
 
     def _test_chunked_prefill(self, batches, num_frames):
         # Chunked
+        chunked_server_pid = self.launch_server(chunked_prefill_size=1024)
         try:
-            chunked_server_pid = self.launch_server(chunked_prefill_size=1024)
             outputs_chunked = []
             for batch, num_frame in zip(batches, num_frames):
                 output_chunked = self.generate_for_video(
@@ -178,7 +178,7 @@ class TestVisionChunkedPrefill(CustomTestCase):
             print(output_chunked)
             print("output without chunked prefill:")
             print(output_no_chunked)
-            assert output_chunked == output_no_chunked
+            self.assertEqual(output_chunked, output_no_chunked)
 
     def test_chunked_prefill(self):
         self._test_chunked_prefill(batches=[False, True], num_frames=[1, [2, 6, 8, 10]])

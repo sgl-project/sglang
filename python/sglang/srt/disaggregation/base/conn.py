@@ -1,23 +1,34 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import numpy.typing as npt
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
+
+if TYPE_CHECKING:
+    from sglang.srt.disaggregation.utils import DisaggregationMode
 
 
 class KVArgs:
     engine_rank: int
-    kv_data_ptrs: list[int]
-    kv_data_lens: list[int]
-    kv_item_lens: list[int]
-    aux_data_ptrs: list[int]
-    aux_data_lens: list[int]
-    aux_item_lens: list[int]
+    kv_data_ptrs: List[int]
+    kv_data_lens: List[int]
+    kv_item_lens: List[int]
+    aux_data_ptrs: List[int]
+    aux_data_lens: List[int]
+    aux_item_lens: List[int]
     ib_device: str
+    ib_traffic_class: str
     gpu_id: int
+    # for different tp
+    decode_tp_size: int
+    # for pp prefill
+    prefill_pp_size: int
+    kv_head_num: int
+    page_size: int
 
 
 class KVPoll:
@@ -45,7 +56,12 @@ class BaseKVSender(ABC):
 
     @abstractmethod
     def __init__(
-        self, mgr: BaseKVManager, bootstrap_addr: str, bootstrap_room: int
+        self,
+        mgr: BaseKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: int,
+        dest_tp_ranks: List[int],
+        pp_rank: int,
     ): ...
 
     @abstractmethod
@@ -56,7 +72,7 @@ class BaseKVSender(ABC):
         ...
 
     @abstractmethod
-    def send(self, kv_indices: npt.NDArray[np.int64]):
+    def send(self, kv_indices: npt.NDArray[np.int32]):
         """
         Send the kv cache at the given kv indices to the decoder server
         """
@@ -88,7 +104,7 @@ class BaseKVReceiver(ABC):
     ): ...
 
     @abstractmethod
-    def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+    def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
         """
         Notify the prefill server about the kv indices and aux index
         """

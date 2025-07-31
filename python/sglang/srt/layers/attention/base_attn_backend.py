@@ -19,7 +19,7 @@ class AttentionBackend(ABC):
         """Init the metadata for a forward pass."""
         raise NotImplementedError()
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
 
@@ -65,7 +65,9 @@ class AttentionBackend(ABC):
         **kwargs,
     ):
         """Run forward on an attention layer."""
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_idle():
+            return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+        elif forward_batch.forward_mode.is_decode():
             return self.forward_decode(
                 q,
                 k,
@@ -109,3 +111,7 @@ class AttentionBackend(ABC):
     ):
         """Run a forward for extend."""
         raise NotImplementedError()
+
+    def support_triton(self):
+        """Check if the current backend supports triton."""
+        return True

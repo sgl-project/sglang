@@ -4,10 +4,15 @@
 
 - Benchmark the latency of running a single static batch without a server. The arguments are the same as for `launch_server.py`.
   Note that this is a simplified test script without a dynamic batching server, so it may run out of memory for a batch size that a real server can handle. A real server truncates the prefill into several batches, while this simplified script does not.
+  - Without a server (do not need to launch a server)
+    ```bash
+    python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch 32 --input-len 256 --output-len 32
+    ```
+  - With a server (please use `sglang.launch_server` to launch a server first and run the following command.)
+    ```bash
+    python -m sglang.bench_one_batch_server --base-url http://127.0.0.1:30000 --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
+    ```
 
-  ```bash
-  python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch 32 --input-len 256 --output-len 32
-  ```
 
 - Benchmark offline processing. This script will start an offline engine and run the benchmark.
 
@@ -49,6 +54,17 @@
   python3 -m sglang.bench_one_batch --model-path meta-llama/Llama-3.1-8B-Instruct --batch 32 --input-len 1024 --output-len 10 --profile
 
   # profile multiple batches with bench_offline_throughput.py
+  python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
+  ```
+
+- Possible PyTorch Bug
+  If in any cases you encounter the following error (for example, using qwen 2.5 VL):
+  ```bash
+  RuntimeError: !stack.empty() INTERNAL ASSERT FAILED at "/pytorch/torch/csrc/autograd/profiler_python.cpp":983, please report a bug to PyTorch. Python replay stack is empty.
+  ```
+  This is likely a PyTorch Bug reported in [Bug: vLLM Profiler](https://github.com/vllm-project/vllm/issues/18240) and [Bug: torch.profiler.profile](https://github.com/pytorch/pytorch/issues/101632). As a workaround, you may disable `with_stack` with an environment variable such as follows:
+  ```bash
+  export SGLANG_PROFILE_WITH_STACK=False
   python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
   ```
 
