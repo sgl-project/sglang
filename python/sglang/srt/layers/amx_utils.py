@@ -71,6 +71,62 @@ def _autoawq_to_int4pack(
         qweight = qweight.reshape(*dims, N, K // 2)
         return qweight, qzeros, scales
 
+# Copied from https://github.com/IST-DASLab/marlin/pull/1
+def unpack_4bit_to_32bit_signed(qweight, qzeros):
+    # Unpack 4-bit values and interpret them as signed integers
+    unpacked_weights = torch.zeros(
+        (qweight.shape[0] * 8, qweight.shape[1]),
+        dtype=torch.int8,
+        device=qweight.device,
+        requires_grad=False,
+    )
+
+    unpacked_zeros = torch.zeros(
+        (qzeros.shape[0], qzeros.shape[1] * 8),
+        dtype=torch.int8,
+        device=qzeros.device,
+        requires_grad=False,
+    )
+
+    for row in range(unpacked_weights.shape[0]):
+        i = row % 8
+        unpacked_weights[row, :] = (qweight[row // 8, :] >> (4 * i)) & 0xF
+
+    for col in range(unpacked_zeros.shape[1]):
+        i = col % 8
+        unpacked_zeros[:, col] = (qzeros[:, col // 8] >> (4 * i)) & 0xF
+
+    return unpacked_weights, unpacked_zeros + 1
+
+
+
+# Copied from https://github.com/IST-DASLab/marlin/pull/1
+def _autogptq_to_int4pack(qweight: torch.Tensor, qzeros: torch.Tensor, scales: torch.Tensor, is_w4a8: bool
+):
+    unpacked_qweight, unpacked_qzeros = unpack_4bit_to_32bit_signed(qweight, qzeros)
+    qweight = unpacked_qweight.T.to(torch.uint8)
+    qzeros = unpacked_qzeros.to(torch.uint8)
+    if is_w4a8:
+        qzeros = qzeros.T.contiguous()
+        scales = scales.T.contiguous()
+        qweight, scales, qzeros, compensation = (
+            torch.ops.sgl_kernel.convert_int4_weight_packed(qweight, scales, qzeros)
+        )
+        return qweight, qzeros, scales, compensation
+    else:
+        # TODO: unify below in convert_int4_weight_packed
+        # convert to VNNI format: (*, N/BLOCK_N, K/2, BLOCK_N, 2)
+        BLOCK_N = 32  # must match what's used in the kernel
+        *dims, N, K = qweight.shape
+        qweight = qweight.reshape(*dims, N // BLOCK_N, BLOCK_N, K // 2, 2)
+        qweight = qweight.transpose(-3, -2)
+        # bit packing
+        BIT_COUNT = 32
+        qweight = qweight.reshape(-1, BIT_COUNT * 2)
+        qweight = (qweight[:, BIT_COUNT:] << 4) | qweight[:, :BIT_COUNT]
+        qweight = qweight.reshape(*dims, N, K // 2)
+        return qweight, qzeros, scales
+
 
 def _amx_process_int4_packed_qweight_after_loading(
     module, weight_names, quant_method
@@ -78,11 +134,12 @@ def _amx_process_int4_packed_qweight_after_loading(
     devices = {getattr(module, weight_name).device for weight_name in weight_names}
     assert len(devices) == 1, f"Expects all weights to be on the same device"
     device = devices.pop()
-    assert quant_method in ["awq"]  # TODO: add GPTQ, etc.
+    assert quant_method in ["awq", "gptq"]  # TODO: add GPTQ, etc.
     module.use_intel_amx_backend = (
         device == torch.device("cpu") and cpu_has_amx_support()
     )
-    if module.use_intel_amx_backend and quant_method == "awq":
+    if module.use_intel_amx_backend:
+        pack_f = _autoawq_to_int4pack if quant_method == "awq" else _autogptq_to_int4pack
         qweight_tensor = getattr(module, weight_names[0])
         qzeros_tensor = getattr(module, weight_names[1])
         scales_tensor = getattr(module, weight_names[2])
@@ -92,7 +149,7 @@ def _amx_process_int4_packed_qweight_after_loading(
         use_w4a8 = SGLANG_USE_CPU_INT4_W4A8 and not has_prefix
         if use_w4a8:
             # TODO: support MoE layers for W4A8 path
-            qweight, qzeros, scales, compensation = _autoawq_to_int4pack(
+            qweight, qzeros, scales, compensation = pack_f(
                 qweight_tensor.data, qzeros_tensor.data, scales_tensor.data, use_w4a8
             )
             compensation = torch.nn.Parameter(compensation, requires_grad=False)
@@ -102,9 +159,24 @@ def _amx_process_int4_packed_qweight_after_loading(
                 compensation,
             )
         else:
-            qweight, qzeros, scales = _autoawq_to_int4pack(
-                qweight_tensor.data, qzeros_tensor.data, scales_tensor.data, use_w4a8
-            )
+            if has_prefix and quant_method == "gptq":
+                qweight_list = []
+                qzeros_list = []
+                scales_list = []
+                for i in range(qweight_tensor.data.size(0)):
+                    qweight_i, qzeros_i, scales_i = pack_f(
+                        qweight_tensor.data[i], qzeros_tensor.data[i], scales_tensor.data[i], use_w4a8
+                    )
+                    qweight_list.append(qweight_i)
+                    qzeros_list.append(qzeros_i)
+                    scales_list.append(scales_i)
+                qweight = torch.stack(qweight_list).detach()
+                qzeros = torch.stack(qzeros_list).detach()
+                scales = torch.stack(scales_list).detach()
+            else:
+                qweight, qzeros, scales = pack_f(
+                    qweight_tensor.data, qzeros_tensor.data, scales_tensor.data, use_w4a8
+                )
         packed_qweight = torch.nn.Parameter(
             qweight,
             requires_grad=False,

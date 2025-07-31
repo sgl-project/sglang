@@ -42,7 +42,7 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, use_intel_amx_backend
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
 
@@ -54,10 +54,15 @@ except ImportError:
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
-
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 if _is_cuda:
     from sgl_kernel import fused_marlin_moe
-
+elif _is_cpu and _is_cpu_amx_available:
+    from sglang.srt.layers.amx_utils import (
+        SGLANG_USE_CPU_INT4_W4A8,
+        _amx_process_int4_packed_qweight_after_loading,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +180,7 @@ class GPTQConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.half]
+        return [torch.half,torch.bfloat16]
 
     @classmethod
     # Need to figure it out
@@ -207,7 +212,8 @@ class GPTQConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             return get_linear_quant_method(self, layer, prefix, GPTQLinearMethod)
         elif isinstance(layer, FusedMoE):
-            raise TypeError("GPTQ Method does not support MoE, please use gptq_marlin")
+            return GPTQMarlinMoEMethod(self)
+            # raise TypeError("GPTQ Method does not support MoE, please use gptq_marlin")
         return None
 
 
@@ -515,22 +521,30 @@ class GPTQLinearMethod(LinearMethodBase):
         layer.register_parameter("scales", scales)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # for torch.compile
-        layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
-        layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
-        layer.g_idx = torch.nn.Parameter(layer.g_idx.data, requires_grad=False)
-        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+        if _is_cpu:
+            assert (
+                _is_cpu_amx_available
+            ), "AWQLinearMethod on CPU requires that CPU has AMX support"
+            _amx_process_int4_packed_qweight_after_loading(
+                layer, ["qweight", "qzeros", "scales"], "gptq"
+            )
+        else:
+            # for torch.compile
+            layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
+            layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
+            layer.g_idx = torch.nn.Parameter(layer.g_idx.data, requires_grad=False)
+            layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
-        # exllama needs to shuffle the weight after the weight is loaded
-        # here we do the shuffle on first forward pass
-        if self.use_shuffle:
-            if self.quant_config.desc_act:
-                layer.g_idx.data = torch.argsort(layer.g_idx).to(torch.int)
-            else:
-                layer.g_idx.data = torch.empty(
-                    (0,), dtype=torch.int, device=layer.g_idx.device
-                )
-            ops.gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
+            # exllama needs to shuffle the weight after the weight is loaded
+            # here we do the shuffle on first forward pass
+            if self.use_shuffle:
+                if self.quant_config.desc_act:
+                    layer.g_idx.data = torch.argsort(layer.g_idx).to(torch.int)
+                else:
+                    layer.g_idx.data = torch.empty(
+                        (0,), dtype=torch.int, device=layer.g_idx.device
+                    )
+                ops.gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
 
     def apply(
         self,
@@ -538,6 +552,21 @@ class GPTQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if use_intel_amx_backend(layer):
+            if SGLANG_USE_CPU_INT4_W4A8:
+                return torch.ops.sgl_kernel.int4_scaled_mm_cpu_with_quant(
+                    x,
+                    layer.qweight,
+                    layer.scales,
+                    layer.qzeros,
+                    layer.compensation,
+                    bias,
+                    x.dtype,
+                )
+            else:
+                return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+                    x, layer.qweight, layer.qzeros, layer.scales, bias
+                )
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
@@ -893,7 +922,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
                 num_experts,
                 scales_size13,
                 2 * intermediate_size_per_partition,
-                dtype=torch.half,
+                dtype=params_dtype,
             ),
             requires_grad=False,
         )
@@ -901,7 +930,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_scales, extra_weight_attrs)
         # down_proj scales
         w2_scales = torch.nn.Parameter(
-            torch.empty(num_experts, scales_size2, hidden_size, dtype=torch.half),
+            torch.empty(num_experts, scales_size2, hidden_size, dtype=params_dtype),
             requires_grad=False,
         )
         layer.register_parameter("w2_scales", w2_scales)
@@ -914,7 +943,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
                 num_experts,
                 scales_size13,
                 2 * intermediate_size_per_partition // self.quant_config.pack_factor,
-                dtype=params_dtype,
+                dtype=torch.int32,
             ),
             requires_grad=False,
         )
@@ -926,7 +955,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
                 num_experts,
                 scales_size2,
                 hidden_size // self.quant_config.pack_factor,
-                dtype=params_dtype,
+                dtype=torch.int32,
             ),
             requires_grad=False,
         )
@@ -976,7 +1005,17 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-
+        if _is_cpu:
+            assert (
+                _is_cpu_amx_available
+            ), "AWQLinearMethod on CPU requires that CPU has AMX support"
+            _amx_process_int4_packed_qweight_after_loading(
+                layer, ["w13_qweight", "w13_qzeros", "w13_scales"], "gptq"
+            )
+            _amx_process_int4_packed_qweight_after_loading(
+                layer, ["w2_qweight", "w2_qzeros", "w2_scales"], "gptq"
+            )
+            return
         # Process act_order
         if self.quant_config.desc_act:
             # Get sorting based on g_idx
@@ -1068,6 +1107,28 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         # Delay the import to avoid circular dependency
 
         assert activation == "silu", "Only SiLU activation is supported."
+
+        if use_intel_amx_backend(layer):
+            topk_weights, topk_ids, _ = topk_output
+            return torch.ops.sgl_kernel.fused_experts_cpu(
+                x,
+                layer.w13_qweight,
+                layer.w2_qweight,
+                topk_weights,
+                topk_ids,
+                False,  # inplace See [Note] inplace should be False in fused_experts.
+                False,  # use_int8_w8a8
+                False,  # use_fp8_w8a16
+                True,  # use_int4_w4a16
+                layer.w13_scales,  # w1_scale
+                layer.w2_scales,  # w2_scale
+                layer.w13_qzeros,
+                layer.w2_qzeros,
+                None,  # block_size
+                None,  # a1_scale
+                None,  # a2_scale
+                True,  # is_vnni
+            )
 
         # The input must currently be float16
         orig_dtype = x.dtype
