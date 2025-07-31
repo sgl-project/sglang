@@ -169,7 +169,7 @@ def flashinfer_gemm_w8a8_block_fp8_linear(
         weight_scale,
         scale_major_mode="MN",
         out_dtype=input_2d.dtype,
-        backend="trtllm"
+        backend="trtllm",
     )
 
     if bias is not None:
