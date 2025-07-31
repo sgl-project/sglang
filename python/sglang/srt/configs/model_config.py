@@ -335,6 +335,8 @@ class ModelConfig:
             "num_key_value_heads",
             # For ChatGLM:
             "multi_query_group_num",
+            # For Step3
+            "num_attention_groups",
         ]
         for attr in attributes:
             num_kv_heads = getattr(self.hf_text_config, attr, None)
@@ -644,6 +646,7 @@ multimodal_model_archs = [
     "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
+    "Step3VLForConditionalGeneration",
 ]
 
 
