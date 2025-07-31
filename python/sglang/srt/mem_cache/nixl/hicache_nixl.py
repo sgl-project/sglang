@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 class HiCacheNixl(HiCacheStorage):
     """HiCacheNixl provides high-performance storage using NIXL plugins."""
 
-    def __init__(self, file_path: str = "", plugin: str = "auto"):
+    def __init__(self, file_path: str = "/tmp/hicache_storage", plugin: str = "auto"):
         """Initialize NIXL storage connector."""
         self.file_manager = (
             NixlFileManager(file_path)
@@ -96,7 +96,7 @@ class HiCacheNixl(HiCacheStorage):
                 if state == "ERR":
                     logger.error("Transfer failed")
                     return False
-            time.sleep(0.0001) # Can be changed to os.sched_yield() or parametrized
+            time.sleep(0.0001)  # Can be changed to os.sched_yield() or parametrized
             return True
 
         except Exception as e:
@@ -125,8 +125,10 @@ class HiCacheNixl(HiCacheStorage):
     def set(self, key: str, value: torch.Tensor) -> bool:
         return self.batch_set([key], [value])
 
-    def get(self, key: str, dst_tensor: Optional[torch.Tensor] = None) -> torch.Tensor | None:
-        if dst_tensor is None: # To be removed, being compatible with the current API
+    def get(
+        self, key: str, dst_tensor: Optional[torch.Tensor] = None
+    ) -> torch.Tensor | None:
+        if dst_tensor is None:  # To be removed, being compatible with the current API
             return None
         result = self.batch_get([key], [dst_tensor])
         return result[0] if result else None

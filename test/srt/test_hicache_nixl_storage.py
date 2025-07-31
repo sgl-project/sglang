@@ -182,9 +182,7 @@ class TestNixlUnified(unittest.TestCase):
         )  # Returns True if file doesn't exist
 
         # Test invalid file path
-        self.assertFalse(
-            self.file_manager.create_file("")
-        )  # Empty path should fail
+        self.assertFalse(self.file_manager.create_file(""))  # Empty path should fail
 
     def test_register_buffers(self):
         """Test registration of memory buffers."""
@@ -200,9 +198,7 @@ class TestNixlUnified(unittest.TestCase):
 
     def test_register_files_with_tuples(self):
         """Test registration of files using NIXL tuples."""
-        files = [
-            os.path.join(self.test_dir, f"test_file_{i}.bin") for i in range(3)
-        ]
+        files = [os.path.join(self.test_dir, f"test_file_{i}.bin") for i in range(3)]
         for file in files:
             self.file_manager.create_file(file)
 
