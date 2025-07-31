@@ -437,6 +437,11 @@ class ServerArgs:
                 self.quantization == "modelopt_fp4"
             ), "modelopt_fp4 quantization is required for Flashinfer MOE"
             os.environ["TRTLLM_ENABLE_PDL"] = "1"
+            if self.enable_ep_moe:
+                self.ep_size = self.tp_size
+                logger.warning(
+                    f"Flashinfer cutlass MoE and EP MoE are enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+                )
 
         if self.enable_flashinfer_trtllm_moe:
             assert self.enable_ep_moe, "EP MoE is required for Flashinfer TRTLLM MOE"
