@@ -8,7 +8,10 @@ from typing import List, Optional, Set, Tuple
 import torch
 from torch import nn
 from transformers import Llama4Config, Llama4VisionConfig
-from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
+from transformers.models.llama4.modeling_llama4 import (
+    Llama4MultiModalProjector,
+    vision_apply_rotary_emb,
+)
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import (
@@ -33,7 +36,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cpu
 
 _is_cpu = is_cpu()
-import pdb
 
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -142,6 +144,17 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
         return self.mlp(encoded_patches)
 
 
+def apply_position_embedding(q, k, freqs_ci, shape):
+    # [batch_size_times_num_tiles, num_channels]
+    input_shape = shape[:2]
+    # [batch_size_times_num_tiles, num_channels, num_heads, head_dim]
+    hidden_shape = (*input_shape, *q.shape[-2:])
+    q = q.view(hidden_shape)
+    k = k.view(hidden_shape)
+    q, k = vision_apply_rotary_emb(q, k, freqs_ci)
+    return q, k
+
+
 class Llama4VisionEncoderLayer(nn.Module):
 
     def __init__(
@@ -167,6 +180,7 @@ class Llama4VisionEncoderLayer(nn.Module):
             softmax_in_single_precision=False,
             flatten_batch=False,
             prefix=add_prefix("self_attn", prefix),
+            customized_position_embedding_applier=apply_position_embedding,
         )
         self.mlp = Llama4VisionMLP(
             input_size=config.hidden_size,
@@ -185,11 +199,12 @@ class Llama4VisionEncoderLayer(nn.Module):
     def forward(
         self,
         hidden_state: torch.Tensor,
+        freqs_ci: torch.Tensor,
     ):
         # Self Attention
         residual = hidden_state
         hidden_state = self.input_layernorm(hidden_state)
-        hidden_state = self.self_attn(hidden_state)
+        hidden_state = self.self_attn(hidden_state, position_embeddings=freqs_ci)
         hidden_state = residual + hidden_state
 
         # Feed forward
@@ -228,6 +243,7 @@ class Llama4VisionEncoder(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        freqs_ci: torch.Tensor,  # TODO: move this to an attribute instead of keeping it around
     ) -> torch.Tensor:
         r"""
         Args:
@@ -241,7 +257,7 @@ class Llama4VisionEncoder(nn.Module):
         """
 
         for encoder_layer in self.layers:
-            layer_outputs = encoder_layer(hidden_states)
+            layer_outputs = encoder_layer(hidden_states, freqs_ci=freqs_ci)
             hidden_states = layer_outputs
 
         return hidden_states
@@ -282,6 +298,37 @@ class Llama4UnfoldConvolution(nn.Module):
         return hidden_states
 
 
+class Llama4VisionRotaryEmbedding(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        idx = config.image_size // config.patch_size
+        img_idx = torch.arange(idx**2, dtype=torch.int32).reshape(idx**2, 1)
+        img_idx = torch.cat([img_idx, img_idx[:1]], dim=0)
+        img_idx[-1, -1] = -2  # ID_CLS_TOKEN
+        frequencies_x = img_idx % idx  # get the coordinates of the 2d matrix along x
+        frequencies_y = img_idx // idx  # get the coordinates of the 2d matrix along y
+        freq_dim = config.hidden_size // config.num_attention_heads // 2
+        rope_freq = 1.0 / (
+            config.rope_theta
+            ** (torch.arange(0, freq_dim, 2)[: (freq_dim // 2)].float() / freq_dim)
+        )
+        freqs_x = (
+            (frequencies_x + 1)[..., None] * rope_freq[None, None, :]
+        ).repeat_interleave(2, dim=-1)
+        freqs_y = (
+            (frequencies_y + 1)[..., None] * rope_freq[None, None, :]
+        ).repeat_interleave(2, dim=-1)
+        freqs = torch.cat([freqs_x, freqs_y], dim=-1).float().contiguous()[..., ::2]
+        freqs = freqs.masked_fill(img_idx.reshape(-1, 1, 1) < 0, 0)
+        freq_cis = torch.view_as_complex(
+            torch.stack([torch.cos(freqs), torch.sin(freqs)], dim=-1)
+        )
+        self.freqs_ci = freq_cis  # idx**2, idx**2, idx * 2
+
+    def forward(self, hidden_states):
+        return self.freqs_ci.to(hidden_states.device)
+
+
 class Llama4VisionModel(nn.Module):
 
     def __init__(
@@ -311,6 +358,8 @@ class Llama4VisionModel(nn.Module):
             self.scale * torch.randn(self.num_patches, self.hidden_size)
         )
 
+        self.rotary_embedding = Llama4VisionRotaryEmbedding(config)
+
         # layer norms
         self.layernorm_pre = nn.LayerNorm(self.hidden_size, eps=1e-5)
         self.layernorm_post = nn.LayerNorm(self.hidden_size, eps=1e-5)
@@ -329,10 +378,10 @@ class Llama4VisionModel(nn.Module):
 
     def forward(
         self,
-        images_flattened: torch.Tensor,
+        pixel_values: torch.Tensor,
     ) -> torch.Tensor:
         # Patch embedding
-        hidden_state = self.patch_embedding(images_flattened)
+        hidden_state = self.patch_embedding(pixel_values)
         num_tiles, num_patches, hidden_dim = hidden_state.shape
 
         # Add cls token
@@ -355,9 +404,9 @@ class Llama4VisionModel(nn.Module):
         hidden_state = hidden_state + positional_embedding
         hidden_state = self.layernorm_pre(hidden_state)
         hidden_state = hidden_state.view(num_tiles, -1, hidden_dim)
-
+        freqs_ci = self.rotary_embedding(pixel_values)
         # Apply encoder
-        hidden_state = self.model(hidden_state)
+        hidden_state = self.model(hidden_state, freqs_ci=freqs_ci)
         hidden_state = self.layernorm_post(hidden_state)
 
         # Remove CLS token output
@@ -390,7 +439,8 @@ class Llama4ForConditionalGeneration(nn.Module):
         if not self.has_vision_weights:
             logger.warning(
                 "No vision weights found in checkpoint. Model will run in text-only mode. "
-                "Multimodal capabilities (image processing) will be unavailable."
+                "Multimodal capabilities (image processing) will be unavailable. "
+                "Please not that this warning might be inaccurate if the weights haven't been fully downloaded"
             )
 
         self.has_vision = (
@@ -403,6 +453,7 @@ class Llama4ForConditionalGeneration(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("vision_model", prefix),
             )
+
             self.multi_modal_projector = Llama4MultiModalProjector(config)
         else:
             self.vision_model = None
@@ -446,7 +497,6 @@ class Llama4ForConditionalGeneration(nn.Module):
                 filename="model.safetensors.index.json",
                 cache_dir=None,
             )
-
             if index_file_path and os.path.exists(index_file_path):
                 return self._check_vision_weights_in_index(index_file_path)
 
@@ -454,7 +504,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             # If we can't access the cache, fall back to config-based detection
             pass
 
-        # Fallback， assume text-only
+        # Fallback, assume text-only
         return False
 
     def _check_vision_weights_in_index(self, index_file: str) -> bool:
@@ -465,7 +515,6 @@ class Llama4ForConditionalGeneration(nn.Module):
 
             vision_patterns = ["vision_model", "vision_tower", "multi_modal_projector"]
             weight_names = index_data.get("weight_map", {}).keys()
-
             return any(
                 pattern in weight_name
                 for weight_name in weight_names
@@ -491,10 +540,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             .type(next(self.vision_model.parameters()).dtype)
         )
 
-        # pdb.set_trace()
-
         image_features = self.vision_model(pixel_values)
-        # pdb.set_trace()
         vision_flat = image_features.view(-1, image_features.size(-1))
         projected_vision_flat = self.multi_modal_projector(vision_flat)
         return projected_vision_flat
@@ -588,7 +634,10 @@ class Llama4ForConditionalGeneration(nn.Module):
 
             name = self._transform_weight_name(name)
 
-            if "vision" not in name:
+            if "vision" in name:
+                name = name.replace(".self_attn.o_proj", ".self_attn.proj")
+            else:
+                # if "vision" not in name:
                 name, loaded_weight = self.permute_qk_weight_for_rotary(
                     name, loaded_weight
                 )
@@ -640,7 +689,8 @@ class Llama4ForConditionalGeneration(nn.Module):
     ) -> bool:
         """Handle stacked parameter loading. Returns True if handled."""
         for param_name, weight_name, shard_id in stacked_params_mapping:
-            if weight_name in name and "vision" not in name:
+            if weight_name in name:
+                # if weight_name in name and "vision" not in name:
                 transformed_name = name.replace(weight_name, param_name)
                 param = params_dict[transformed_name]
                 param.weight_loader(param, loaded_weight, shard_id)
