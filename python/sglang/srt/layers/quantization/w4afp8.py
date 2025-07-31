@@ -8,7 +8,7 @@ from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 
-from python.sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 
 from sglang.srt.layers.quantization.base_config import (
