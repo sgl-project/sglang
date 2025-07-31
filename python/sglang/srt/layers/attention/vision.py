@@ -518,7 +518,7 @@ class VisionAttention(nn.Module):
         if position_embeddings is not None:
             original_shape = q.shape
 
-            if self.customized_rotary_emb_applier is not None:
+            if self.customized_position_embedding_applier is not None:
                 q, k = self.customized_position_embedding_applier(
                     q, k, position_embeddings, x_shape
                 )
