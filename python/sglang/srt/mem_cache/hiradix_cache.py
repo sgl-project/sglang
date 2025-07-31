@@ -2,6 +2,7 @@ import heapq
 import logging
 import threading
 import time
+from collections import deque
 from typing import List, Optional
 
 import torch
@@ -36,6 +37,7 @@ class HiRadixCache(RadixCache):
         hicache_write_policy: str,
         hicache_io_backend: str,
         hicache_storage_backend: Optional[str] = None,
+        historage_prefetch_start_policy: Optional[str] = "immediate",
         historage_prefetch_stop_policy: Optional[str] = "best_effort",
     ):
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
@@ -55,6 +57,25 @@ class HiRadixCache(RadixCache):
         self.enable_storage = hicache_storage_backend is not None
         # todo: customizable storage prefetch threshold
         self.prefetch_threshold = 256
+
+        self.prefetch_start_policy = historage_prefetch_start_policy
+        # todo: customizable storage prefetch tokens threshold
+        self.prefetch_tokens_threshold = int(
+            0.8
+            * (
+                self.cache_controller.mem_pool_host.size
+                - self.cache_controller.mem_pool.size
+            )
+        )
+        self.prefetch_tokens_occupied = 0
+
+        self.prefetch_throttle_queue = deque()
+        self.stop_event = threading.Event()
+        self.prefetch_throttle_thread = threading.Thread(
+            target=self._prefetch_throttle_thread, daemon=True
+        )
+        self.prefetch_throttle_thread.start()
+
         self.prefetch_stop_policy = historage_prefetch_stop_policy
         # todo: customizable storage prefetch timeout
         self.prefetch_timeout = 3  # seconds
@@ -92,10 +113,21 @@ class HiRadixCache(RadixCache):
         )
 
     def reset(self):
+        self.stop_event.set()
+        self.prefetch_throttle_thread.join()
+        self.prefetch_throttle_queue.clear()
+        self.prefetch_tokens_occupied = 0
+
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
         super().reset()
+
+        self.stop_event.clear()
+        self.prefetch_throttle_thread = threading.Thread(
+            target=self._prefetch_throttle_thread, daemon=True
+        )
+        self.prefetch_throttle_thread.start()
 
     def get_height(self, node: TreeNode):
         height = 0
@@ -372,9 +404,10 @@ class HiRadixCache(RadixCache):
         for _ in range(queue_size.item()):
             req_id = self.cache_controller.prefetch_revoke_queue.get()
             if req_id in self.ongoing_prefetch:
-                last_host_node, _, _, _ = self.ongoing_prefetch[req_id]
+                last_host_node, token_ids, _, _ = self.ongoing_prefetch[req_id]
                 last_host_node.release_host()
                 del self.ongoing_prefetch[req_id]
+                self.prefetch_tokens_occupied -= len(token_ids)
             else:
                 # the revoked operation already got terminated
                 pass
@@ -478,6 +511,7 @@ class HiRadixCache(RadixCache):
         )
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
+        self.prefetch_tokens_occupied -= len(token_ids)
 
         return True
 
@@ -514,7 +548,48 @@ class HiRadixCache(RadixCache):
             host_hit_length=host_hit_length,
         )
 
+    def can_start_prefetch(self, len_new_tokens):
+        if self.prefetch_start_policy == "immediate":
+            return True
+        elif self.prefetch_start_policy == "threshold_based":
+            return (
+                self.prefetch_tokens_occupied + len_new_tokens
+                < self.prefetch_tokens_threshold
+            )
+
+    def _prefetch_throttle_thread(self):
+        while not self.stop_event.is_set():
+            try:
+                req_id, last_host_node, new_input_tokens, last_hash = (
+                    self.prefetch_throttle_queue.get()
+                )
+                if not self.can_start_prefetch(len(new_input_tokens)):
+                    self.prefetch_throttle_queue.appendleft(
+                        (req_id, last_host_node, new_input_tokens, last_hash)
+                    )
+                    time.sleep(0.05)
+                    continue
+
+                self._prefetch_from_storage(
+                    req_id, last_host_node, new_input_tokens, last_hash
+                )
+            except Empty:
+                continue
+            except Exception as e:
+                logger.error(e)
+
     def prefetch_from_storage(
+        self,
+        req_id: str,
+        last_host_node: TreeNode,
+        new_input_tokens: List[int],
+        last_hash: Optional[str] = None,
+    ):
+        self.prefetch_throttle_queue.add(
+            (req_id, last_host_node, new_input_tokens, last_hash)
+        )
+
+    def _prefetch_from_storage(
         self,
         req_id: str,
         last_host_node: TreeNode,
@@ -547,6 +622,7 @@ class HiRadixCache(RadixCache):
             host_indices,
             operation,
         )
+        self.prefetch_tokens_occupied += len(new_input_tokens)
 
     def _insert_helper_host(self, node: TreeNode, key: List, host_value, hash_value):
         node.last_access_time = time.monotonic()
