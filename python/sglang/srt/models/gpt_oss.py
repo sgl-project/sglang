@@ -950,7 +950,6 @@ class OpenAIMoeForCausalLM(nn.Module):
         self.config.hidden_act = "swiglu"
         # Todo: remove this, currently set as True (Gate and up/down bias are True)
         self.config.mlp_bias = True
-        self.config.attention_chunk_size = self.config.sliding_window if hasattr(self.config, "sliding_window") else None
         ###########################################################################
 
         self.quant_config = quant_config

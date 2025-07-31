@@ -93,7 +93,7 @@ class ModelConfig:
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.attention_chunk_size = getattr(
-            self.hf_text_config, "attention_chunk_size", None
+            self.hf_text_config, "attention_chunk_size", 128
         )
         self.is_hybrid = is_hybrid_model(
             self.hf_config.architectures,
