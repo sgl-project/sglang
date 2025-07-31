@@ -30,6 +30,7 @@ class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
     DECODE = "decode"
+    ENCODE = "encode"
 
 
 #########################
@@ -322,9 +323,11 @@ class PDRegistryRequest:
             raise ValueError("Bootstrap port must be set in PREFILL mode.")
         elif self.mode == "decode" and self.bootstrap_port is not None:
             raise ValueError("Bootstrap port must not be set in DECODE mode.")
-        elif self.mode not in ["prefill", "decode"]:
+        elif self.mode == "encode" and self.bootstrap_port is not None:
+            raise ValueError("Bootstrap port must not be set in ENCODE mode.")
+        elif self.mode not in ["prefill", "decode", "encode"]:
             raise ValueError(
-                f"Invalid mode: {self.mode}. Must be 'prefill' or 'decode'."
+                f"Invalid mode: {self.mode}. Must be 'prefill', 'decode', or 'encode'."
             )
 
 
