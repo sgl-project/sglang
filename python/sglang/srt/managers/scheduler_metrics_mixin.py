@@ -230,6 +230,7 @@ class SchedulerMetricsMixin:
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.spec_accept_length = spec_accept_length
             self.stats.total_retracted_reqs = self.total_retracted_reqs
+            self.stats.avg_request_queue_latency = 0.0
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = len(
                     self.disagg_decode_prealloc_queue.queue
