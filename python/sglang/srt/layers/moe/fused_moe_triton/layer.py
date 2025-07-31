@@ -434,8 +434,7 @@ class FusedMoE(torch.nn.Module):
         expert_id: int,
     ) -> None:
 
-        # TP rank is set to 0 if EP is enabled
-        tp_rank = 0 if self.moe_ep_size > 1 else get_tensor_model_parallel_rank()
+        tp_rank = self.moe_tp_rank
 
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
