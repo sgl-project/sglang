@@ -49,7 +49,8 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 )
 from sglang.srt.utils import mxfp_supported
 
-if mxfp_supported():
+is_mxfp_supported = mxfp_supported()
+if is_mxfp_supported:
     from sglang.srt.layers.quantization.fp4 import MxFp4Config
 
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -88,10 +89,14 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "qoq": QoQConfig,
     "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
-    "quark": MxFp4Config,  # FIXIT(AMD): refer to modelopt with quark_quant.py
-    "mxfp4": MxFp4Config,
 }
-
+if is_mxfp_supported:
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "quark": MxFp4Config,
+            "mxfp4": MxFp4Config,
+        }
+    )
 # VLLM-dependent quantization methods
 VLLM_QUANTIZATION_METHODS = {
     "aqlm": AQLMConfig,
