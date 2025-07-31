@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.mooncake_store.mooncake_store import (
     MooncakeStore,
     get_hash_str_mooncake,
 )
+from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import HiCacheHF3FS
 
 logger = logging.getLogger(__name__)
 
@@ -254,7 +255,12 @@ class HiCacheController:
             self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
             if self.tp_world_size > 1:
                 group_ranks = torch.distributed.get_process_group_ranks(tp_group)
-                self.tp_group = torch.distributed.new_group(group_ranks, backend="gloo")
+                self.prefetch_tp_group = torch.distributed.new_group(
+                    group_ranks, backend="gloo"
+                )
+                self.backup_tp_group = torch.distributed.new_group(
+                    group_ranks, backend="gloo"
+                )
 
             if storage_backend == "file":
                 self.storage_backend = HiCacheFile()
@@ -263,6 +269,18 @@ class HiCacheController:
                 self.storage_backend = MooncakeStore()
                 self.get_hash_str = get_hash_str_mooncake
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
+            elif storage_backend == "hf3fs":
+                from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+                rank = get_tensor_model_parallel_rank()
+                bytes_per_page = (
+                    mem_pool_host.get_size_per_token() * mem_pool_host.page_size
+                )
+                dtype = mem_pool_host.dtype
+                self.storage_backend = HiCacheHF3FS.from_env_config(
+                    rank, bytes_per_page, dtype
+                )
+                self.get_hash_str = get_hash_str
             else:
                 raise NotImplementedError(
                     f"Unsupported storage backend: {storage_backend}"
@@ -524,19 +542,23 @@ class HiCacheController:
         operation.mark_done()
         return operation.completed_tokens, operation.hash_value
 
-    def generic_page_transfer(self, operation):
-        for h in operation.hash_value:
-            page_data = self.storage_backend.get(h)
+    def generic_page_transfer(self, operation, batch_size=8):
+        for i in range(0, len(operation.hash_value), batch_size):
+            page_hashes = operation.hash_value[i : i + batch_size]
+            page_data = self.storage_backend.batch_get(page_hashes)
             if page_data is None:
                 logger.warning(
-                    f"Prefetch operation {operation.request_id} failed to retrieve page {h}."
+                    f"Prefetch operation {operation.request_id} failed to retrieve page {page_hashes}."
                 )
                 break
-            if operation.increment(self.page_size):
-                self.mem_pool_host.set_from_flat_data_page(
-                    operation.host_indices[operation.completed_tokens],
-                    page_data,
-                )
+            completed_tokens = operation.completed_tokens
+            if operation.increment(self.page_size * len(page_hashes)):
+                for i in range(len(page_hashes)):
+                    self.mem_pool_host.set_from_flat_data_page(
+                        operation.host_indices[completed_tokens],
+                        page_data[i],
+                    )
+                    completed_tokens += self.page_size
             else:
                 # operation terminated by controller, release pre-allocated memory
                 self.mem_pool_host.free(
@@ -619,7 +641,7 @@ class HiCacheController:
                     torch.distributed.all_reduce(
                         storage_hit_count_tensor,
                         op=torch.distributed.ReduceOp.MIN,
-                        group=self.tp_group,
+                        group=self.prefetch_tp_group,
                     )
                     storage_hit_count = storage_hit_count_tensor.item()
 
@@ -658,17 +680,20 @@ class HiCacheController:
         self.backup_queue.put(operation)
         return operation.id
 
-    def generic_page_backup(self, operation):
-        for i in range(0, len(operation.token_ids), self.page_size):
-            last_hash = operation.hash_value[i // self.page_size]
-            success = self.storage_backend.set(
-                last_hash,
-                self.mem_pool_host.get_flat_data_page(operation.host_indices[i]),
-            )
+    def generic_page_backup(self, operation, batch_size=8):
+        for i in range(0, len(operation.hash_value), batch_size):
+            page_hashes = operation.hash_value[i : i + batch_size]
+            page_data = [
+                self.mem_pool_host.get_flat_data_pages(
+                    operation.host_indices[j * self.page_size]
+                )
+                for j in range(i, i + len(page_hashes))
+            ]
+            success = self.storage_backend.batch_set(page_hashes, page_data)
             if not success:
-                logger.warning(f"Failed to write page {last_hash} to storage.")
+                logger.warning(f"Failed to write page {page_hashes} to storage.")
                 break
-            operation.completed_tokens += self.page_size
+            operation.completed_tokens += self.page_size * len(page_hashes)
 
     def mooncake_page_backup(self, operation):
         if len(operation.hash_value):
@@ -737,7 +762,7 @@ class HiCacheController:
                     torch.distributed.all_reduce(
                         completed_tokens_tensor,
                         op=torch.distributed.ReduceOp.MIN,
-                        group=self.tp_group,
+                        group=self.backup_tp_group,
                     )
                     min_completed_tokens = completed_tokens_tensor.item()
 
