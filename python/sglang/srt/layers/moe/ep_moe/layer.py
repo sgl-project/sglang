@@ -473,7 +473,7 @@ class EPMoE(FusedMoE):
             m_max * self.start_expert_id,
             BLOCK_SIZE=512,
         )
-        return output
+        return output * self.routed_scaling_factor
 
     def forward_normal(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         return self.quant_method.apply(self, hidden_states, topk_output)
