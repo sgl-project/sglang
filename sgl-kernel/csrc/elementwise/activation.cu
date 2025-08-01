@@ -190,4 +190,3 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
     return true;
   });
 }
-#endif
