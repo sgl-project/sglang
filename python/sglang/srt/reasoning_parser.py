@@ -105,7 +105,7 @@ class BaseReasoningFormatDetector:
         # If we're not in a reasoning block return as normal text
         if not self._in_reasoning:
             self._buffer = ""
-            return StreamingParseResult(normal_text=new_text)
+            return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult()
 
@@ -202,6 +202,7 @@ class ReasoningParser:
         "qwen3-thinking": Qwen3Detector,
         "glm45": Qwen3Detector,
         "kimi": KimiDetector,
+        "step3": DeepSeekR1Detector,
     }
 
     def __init__(
