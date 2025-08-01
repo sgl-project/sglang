@@ -147,8 +147,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             block_kv_indices,
             self.req_to_token.stride(0),
             max_blocks,
-            TRITON_PAD_NUM_PAGE_PER_BLOCK,
-            self.page_size,
+            NUM_PAGE_PER_BLOCK=TRITON_PAD_NUM_PAGE_PER_BLOCK,
+            PAGED_SIZE=self.page_size,
         )
 
         return block_kv_indices
@@ -204,8 +204,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             block_kv_indices,
             self.req_to_token.stride(0),
             max_seqlen_pad,
-            TRITON_PAD_NUM_PAGE_PER_BLOCK,
-            self.page_size,
+            NUM_PAGE_PER_BLOCK=TRITON_PAD_NUM_PAGE_PER_BLOCK,
+            PAGED_SIZE=self.page_size,
         )
 
         metadata = TRTLLMMLADecodeMetadata(self.cuda_graph_workspace, block_kv_indices)
@@ -248,8 +248,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.block_kv_indices,
             self.req_to_token.stride(0),
             metadata.block_kv_indices.shape[1],
-            TRITON_PAD_NUM_PAGE_PER_BLOCK,
-            self.page_size,
+            NUM_PAGE_PER_BLOCK=TRITON_PAD_NUM_PAGE_PER_BLOCK,
+            PAGED_SIZE=self.page_size,
         )
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
