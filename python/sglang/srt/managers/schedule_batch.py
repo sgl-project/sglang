@@ -65,6 +65,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list, support_triton
+from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -85,7 +86,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_dp_attention",
     "enable_two_batch_overlap",
     "enable_dp_lm_head",
-    "enable_deepep_moe",
+    "moe_a2a_backend",
     "deepep_mode",
     "enable_flashinfer_cutlass_moe",
     "enable_flashinfer_trtllm_moe",
@@ -111,6 +112,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
 
 # Put some global args for easy access
 global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
+global_server_args_dict["moe_a2a_backend"] = MoeA2ABackend(global_server_args_dict["moe_a2a_backend"])
+global_server_args_dict["deepep_mode"] = DeepEPMode(global_server_args_dict["deepep_mode"])
 
 logger = logging.getLogger(__name__)
 

@@ -44,7 +44,6 @@ from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import (
-    DeepEPMode,
     ceil_div,
     dispose_tensor,
     get_bool_env_var,
@@ -52,6 +51,7 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
+from sglang.srt.layers.moe.utils import DeepEPMode
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -340,7 +340,7 @@ class DeepEPMoE(EPMoE):
         prefix: str = "",
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
-        deepep_mode: DeepEPMode = DeepEPMode.auto,
+        deepep_mode: DeepEPMode = DeepEPMode.AUTO,
     ):
         super().__init__(
             num_experts=num_experts,

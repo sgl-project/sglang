@@ -84,7 +84,6 @@ from sglang.srt.two_batch_overlap import (
 )
 from sglang.srt.utils import (
     BumpAllocator,
-    DeepEPMode,
     LazyValue,
     add_prefix,
     bind_or_assign,
@@ -444,8 +443,8 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
             **(
-                dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
-                if global_server_args_dict["enable_deepep_moe"]
+                dict(deepep_mode=global_server_args_dict["deepep_mode"])
+                if global_server_args_dict["moe_a2a_backend"].is_deepep()
                 else {}
             ),
             # Additional args for FusedMoE
@@ -484,7 +483,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if global_server_args_dict["enable_deepep_moe"]
+                    if global_server_args_dict["moe_a2a_backend"].is_deepep()
                     else {}
                 ),
             )
@@ -502,7 +501,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
 
         self.top_k = config.num_experts_per_tok
 
-        if global_server_args_dict["enable_deepep_moe"]:
+        if global_server_args_dict["moe_a2a_backend"].is_deepep():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -526,12 +525,12 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                 num_local_experts=config.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
-                deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
+                deepep_mode=global_server_args_dict["deepep_mode"],
                 async_finish=True,
                 return_recv_hook=True,
             )
 
-        self._enable_deepep_moe = global_server_args_dict["enable_deepep_moe"]
+        self._enable_deepep_moe = global_server_args_dict["moe_a2a_backend"].is_deepep()
 
 
 class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):

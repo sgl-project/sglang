@@ -137,7 +137,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils import (
-    DeepEPMode,
     DynamicGradMode,
     broadcast_pyobj,
     configure_gc_logger,
@@ -156,6 +155,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
+from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -1761,8 +1761,8 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
             enable_two_batch_overlap=self.server_args.enable_two_batch_overlap,
-            enable_deepep_moe=self.server_args.enable_deepep_moe,
-            deepep_mode=DeepEPMode[self.server_args.deepep_mode],
+            enable_deepep_moe=MoeA2ABackend(self.server_args.moe_a2a_backend).is_deepep(),
+            deepep_mode=DeepEPMode(self.server_args.deepep_mode),
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
         )

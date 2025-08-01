@@ -72,7 +72,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
-from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_non_idle_and_non_empty
+from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty
 
 Qwen3MoeConfig = None
 
@@ -113,8 +113,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
             **(
-                dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
-                if global_server_args_dict["enable_deepep_moe"]
+                dict(deepep_mode=global_server_args_dict["deepep_mode"])
+                if global_server_args_dict["moe_a2a_backend"].is_deepep()
                 else {}
             ),
             # Additional args for FusedMoE
@@ -135,7 +135,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
 
-        if global_server_args_dict["enable_deepep_moe"]:
+        if global_server_args_dict["moe_a2a_backend"].is_deepep():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -147,7 +147,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
     ) -> torch.Tensor:
 
-        if not global_server_args_dict["enable_deepep_moe"]:
+        if not global_server_args_dict["moe_a2a_backend"].is_deepep():
             return self.forward_normal(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)

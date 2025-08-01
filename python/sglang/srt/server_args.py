@@ -278,9 +278,10 @@ class ServerArgs:
         # Check deprecated arguments
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
-            logger.warning("enable_ep_moe is deprecated. Please set `--ep-size` to the same value as `--tp-size` instead.")
+            logger.warning("--enable-ep-moe is deprecated. Please set `--ep-size` to the same value as `--tp-size` instead.")
         if self.enable_deepep_moe:
-            logger.warning("enable_deepep_moe is deprecated. Please set `--moe-a2a-backend` to 'deepep' instead.")
+            self.moe_a2a_backend = "deepep"
+            logger.warning("--enable-deepep-moe is deprecated. Please set `--moe-a2a-backend` to 'deepep' instead.")
         
         # Set missing default values
         if self.tokenizer_path is None:

@@ -20,7 +20,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import BumpAllocator, DeepEPMode, get_bool_env_var
+from sglang.srt.utils import BumpAllocator, get_bool_env_var
+from sglang.srt.layers.moe.utils import DeepEPMode
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
@@ -310,7 +311,7 @@ class TboDPAttentionPreparer:
                     and not local_batch.forward_mode.is_target_verify()
                 )
                 and enable_deepep_moe
-                and (resolved_deepep_mode == DeepEPMode.low_latency)
+                and (resolved_deepep_mode == DeepEPMode.LOW_LATENCY)
             )
         else:
             self.local_tbo_split_seq_index = 0
