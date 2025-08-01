@@ -92,6 +92,8 @@ class TemplateManager:
                 # Try HuggingFace template first
                 hf_template = self._resolve_hf_chat_template(tokenizer_manager)
                 if hf_template:
+                    # override the chat template
+                    tokenizer_manager.tokenizer.chat_template = hf_template
                     self._jinja_template_content_format = (
                         detect_jinja_template_content_format(hf_template)
                     )
@@ -258,15 +260,10 @@ class TemplateManager:
         """
         try:
             if processor := tokenizer_manager.processor:
-                if hasattr(processor, "chat_template"):
-                    # Override the chat template with the one from the processor
-                    if processor.chat_template:
-                        tokenizer_manager.tokenizer.chat_template = (
-                            processor.chat_template
-                        )
+                if hasattr(processor, "chat_template") and processor.chat_template:
                     return processor.chat_template
-            elif tokenizer := tokenizer_manager.tokenizer:
-                if hasattr(tokenizer, "chat_template"):
+            if tokenizer := tokenizer_manager.tokenizer:
+                if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
                     return tokenizer.chat_template
         except Exception as e:
             logger.debug(f"Error getting chat template: {e}")
