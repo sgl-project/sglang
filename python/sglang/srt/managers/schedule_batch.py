@@ -110,6 +110,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_multimodal",
     "enable_symm_mem",
     "quantization",
+    "disaggregation_mode",
 ]
 
 # Put some global args for easy access

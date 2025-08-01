@@ -93,7 +93,7 @@ class FlashInferMhaChunkKVRunner:
             self.fmha_backend = "cutlass"
 
         self.chunk_ragger_wrappers = []
-        init_chunk_wrappers = 16
+        init_chunk_wrappers = 1
         self.update_prefix_chunks(init_chunk_wrappers)
         self.ragger_wrapper = attn_backend.prefill_wrapper_ragged
 
@@ -200,6 +200,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
+        self.enable_chunk_kv = (
+            not skip_prefill
+            and global_server_args_dict["attention_backend"] == "flashinfer"
+            and global_server_args_dict["disaggregation_mode"] != "decode"
+            and not global_server_args_dict["disable_chunked_prefix_cache"]
+        )
 
         # Allocate buffers
         global global_workspace_buffer
@@ -259,7 +265,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             self.indices_updater_prefill = FlashInferMLAIndicesUpdaterPrefill(
                 model_runner, self
             )
-            self.mha_chunk_kv_cache = FlashInferMhaChunkKVRunner(model_runner, self)
+            if self.enable_chunk_kv:
+                self.mha_chunk_kv_cache = FlashInferMhaChunkKVRunner(model_runner, self)
 
         self.indices_updater_decode = FlashInferMLAIndicesUpdaterDecode(
             model_runner, self
@@ -508,7 +515,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        if forward_batch.mha_return_lse:  # MHA Chunk
+        if self.enable_chunk_kv and forward_batch.mha_return_lse:  # MHA Chunk
             assert q_rope is None
             assert k_rope is None
             o1, s1 = self.mha_chunk_kv_cache.forward(q, k, v, layer, forward_batch)
