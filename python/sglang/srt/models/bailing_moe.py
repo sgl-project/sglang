@@ -6,12 +6,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 
-from sglang.python.sglang.srt.layers.moe.ep_moe import layer
-from sglang.python.sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.python.sglang.srt.layers.moe.topk import TopK
-from sglang.python.sglang.srt.layers.utils import PPMissingLayer
-from sglang.python.sglang.srt.models.transformers import maybe_prefix
-from sglang.python.sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -28,15 +22,21 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.moe.ep_moe import layer
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.transformers import maybe_prefix
+from sglang.srt.utils import add_prefix, make_layers
 
 
 class BailingAttention(nn.Module):
@@ -173,34 +173,25 @@ class BailingMLP(nn.Module):
 
 
 class BailingMoE(nn.Module):
-
     def __init__(
         self,
-        intermediate_size: int,
-        layer_id: int,
         config: PretrainedConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
-        reduce_results: Optional[bool] = True,
         prefix: str = "",
     ):
         super().__init__()
-
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
-        self.norm_expert_prob = config.norm_topk_prob
         self.hidden_size = config.hidden_size
-        self.quant_config = quant_config
         self.num_shared_experts = config.num_shared_experts
-        # Gate always runs at half / full precision for now.
+        self.norm_expert_prob = config.norm_topk_prob
+
         self.gate = ReplicatedLinear(
             self.hidden_size, self.num_experts, bias=False, quant_config=None
         )
-        self.topk = TopK(
-            top_k=self.top_k,
-            renormalize=False,
-        )
+        self.topk = TopK(top_k=self.top_k, renormalize=self.norm_expert_prob)
 
         self.experts = FusedMoE(
             num_experts=self.num_experts,
@@ -208,10 +199,8 @@ class BailingMoE(nn.Module):
             layer_id=layer_id,
             hidden_size=self.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
-            renormalize=self.norm_expert_prob,
             quant_config=quant_config,
-            prefix=f"{prefix}.experts",
+            prefix=add_prefix("experts", prefix),
         )
 
         if self.num_shared_experts > 0:
@@ -220,28 +209,29 @@ class BailingMoE(nn.Module):
                 intermediate_size=intermediate_size,
                 config=config,
                 quant_config=quant_config,
-                reduce_results=False,
-                prefix=f"{prefix}.shared_experts",
+                prefix=add_prefix("shared_experts", prefix),
             )
         else:
             self.shared_experts = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        num_tokens, hidden_size = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_size)
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, self.hidden_size)
+
+        shared_output = None
         if self.num_shared_experts > 0:
             shared_output = self.shared_experts(hidden_states)
-        # router_logits: (num_tokens, n_experts)
+
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.num_shared_experts > 0:
+        if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-        return final_hidden_states.view(num_tokens, hidden_size)
+        return final_hidden_states.view(orig_shape)
 
 
 class BailingMoeBlock(nn.Module):
@@ -322,7 +312,7 @@ class BailingMoeModel(nn.Module):
 
         self.embedding_dropout = torch.nn.Dropout(config.embedding_dropout)
 
-        self.start_layer, self.end_layer, self.layers = make_layers(
+        self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: BailingMoeBlock(
                 config=config,
