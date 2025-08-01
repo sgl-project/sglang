@@ -59,7 +59,7 @@ CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) python -m uv build --wheel -Cbuild-dir=build
 ```
 
 ### FlashAttention on Hopper
-To ensure that FlashAttention compiles correctly on Hopper GPU Architecture(sm90), it is strongly [recommended](https://github.com/Dao-AILab/flash-attention/issues/1453) to use:
+⚠️ **Note**: To ensure that FlashAttention compiles correctly on Hopper GPU Architecture(sm90), it is strongly [recommended](https://github.com/Dao-AILab/flash-attention/issues/1453) to use:
 - nvcc version: 12.6
 - ptxas version: 12.8
 
@@ -72,7 +72,7 @@ ptxas --version
 ```
 **2. Update ptxas to 12.8 (if needed)**
 
-Save the following script to a file (e.g., `update_ptxas.sh`).
+1. Save the following script to a file (e.g., `update_ptxas.sh`).
 ```bash
 #!/usr/bin/env bash
 # Source: https://github.com/Dao-AILab/flash-attention/blob/7ff1b621112ba8b538e2fc6a316f2a6b6f22e518/hopper/setup.py#L404
@@ -90,10 +90,10 @@ if awk "BEGIN {exit !("$CUDA_VERSION" >= 12.6 && "$CUDA_VERSION" < 12.8)}"; then
     NVCC_ARCHIVE_NAME="cuda_nvcc-linux-x86_64-${NVCC_ARCHIVE_VERSION}-archive"
     NVCC_ARCHIVE_TAR="${NVCC_ARCHIVE_NAME}.tar.xz"
     NVCC_ARCHIVE_URL="https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/linux-x86_64/${NVCC_ARCHIVE_TAR}"
-    
+
     wget "$NVCC_ARCHIVE_URL"
     tar -xf "$NVCC_ARCHIVE_TAR"
-    
+
     mkdir -p /usr/local/cuda/bin
     cp "${NVCC_ARCHIVE_NAME}/bin/ptxas" /usr/local/cuda/bin/
 
@@ -102,7 +102,7 @@ if awk "BEGIN {exit !("$CUDA_VERSION" >= 12.6 && "$CUDA_VERSION" < 12.8)}"; then
     rm -rf "${NVCC_ARCHIVE_NAME}"
 fi
 ```
-Run the script with your CUDA version as the argument, using `sudo`:
+2. Run the script with your CUDA version as the argument, using `sudo`:
 ```bash
 sudo bash update_ptxas.sh 12.6
 # Check the version
