@@ -453,7 +453,7 @@ class HiRadixCache(RadixCache):
             last_host_node,
             fetched_token_ids,
             written_indices,
-            hash_value[:min_completed_tokens],
+            hash_value[: min_completed_tokens // self.page_size],
         )
         if len(written_indices):
             self.cache_controller.mem_pool_host.update_prefetch(written_indices)
@@ -546,7 +546,7 @@ class HiRadixCache(RadixCache):
             prefix_len = self.key_match_fn(node.key, key)
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
-            hash_value = hash_value[prefix_len:]
+            hash_value = hash_value[prefix_len // self.page_size :]
             matched_length += prefix_len
 
             if prefix_len < len(node.key):
