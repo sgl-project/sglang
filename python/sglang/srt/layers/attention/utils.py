@@ -93,26 +93,3 @@ def create_flashmla_kv_indices_triton(
             data // PAGED_SIZE,
             mask=mask_out,
         )
-
-def create_torch_native_kv_indices(
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    paged_kernel_lens: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    kv_start_idx: torch.Tensor,
-) -> torch.Tensor:
-    bs = req_pool_indices.shape[0]
-
-    for i in range(bs):
-        req_pool_index = req_pool_indices[i].item()
-        kv_offset = kv_indptr[i].item()
-        kv_start = 0
-        kv_end = 0
-        if kv_start_idx is not None:
-            kv_start = kv_start_idx[i].item()
-            kv_end = kv_start
-        kv_end += paged_kernel_lens[i].item()
-
-        data = req_to_token[req_pool_index, kv_start:kv_end]
-        kv_indices[kv_offset:kv_offset + kv_end - kv_start] = data
