@@ -21,6 +21,10 @@ pub struct RouterConfig {
     pub worker_startup_timeout_secs: u64,
     /// Worker health check interval in seconds
     pub worker_startup_check_interval_secs: u64,
+    /// Enable data parallelism aware schedule
+    pub dp_aware: bool,
+    /// The api key used for the authorization with the worker
+    pub api_key: Option<String>,
     /// Service discovery configuration (optional)
     pub discovery: Option<DiscoveryConfig>,
     /// Metrics configuration (optional)
@@ -31,6 +35,10 @@ pub struct RouterConfig {
     pub log_level: Option<String>,
     /// Custom request ID headers to check (defaults to common headers)
     pub request_id_headers: Option<Vec<String>>,
+    /// Maximum concurrent requests allowed (for rate limiting)
+    pub max_concurrent_requests: usize,
+    /// CORS allowed origins
+    pub cors_allowed_origins: Vec<String>,
 }
 
 /// Routing mode configuration
@@ -205,11 +213,15 @@ impl Default for RouterConfig {
             request_timeout_secs: 600,
             worker_startup_timeout_secs: 300,
             worker_startup_check_interval_secs: 10,
+            dp_aware: false,
+            api_key: None,
             discovery: None,
             metrics: None,
             log_dir: None,
             log_level: None,
             request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
         }
     }
 }
@@ -311,11 +323,15 @@ mod tests {
             request_timeout_secs: 30,
             worker_startup_timeout_secs: 60,
             worker_startup_check_interval_secs: 5,
+            dp_aware: false,
+            api_key: None,
             discovery: Some(DiscoveryConfig::default()),
             metrics: Some(MetricsConfig::default()),
             log_dir: Some("/var/log".to_string()),
             log_level: Some("debug".to_string()),
             request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -727,6 +743,8 @@ mod tests {
             request_timeout_secs: 120,
             worker_startup_timeout_secs: 60,
             worker_startup_check_interval_secs: 5,
+            dp_aware: false,
+            api_key: None,
             discovery: Some(DiscoveryConfig {
                 enabled: true,
                 namespace: Some("sglang".to_string()),
@@ -739,6 +757,8 @@ mod tests {
             log_dir: Some("/var/log/sglang".to_string()),
             log_level: Some("info".to_string()),
             request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
         };
 
         assert!(config.mode.is_pd_mode());
@@ -774,6 +794,8 @@ mod tests {
             request_timeout_secs: 300,
             worker_startup_timeout_secs: 180,
             worker_startup_check_interval_secs: 15,
+            dp_aware: false,
+            api_key: None,
             discovery: Some(DiscoveryConfig {
                 enabled: true,
                 namespace: None,
@@ -786,6 +808,8 @@ mod tests {
             log_dir: None,
             log_level: Some("debug".to_string()),
             request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -812,6 +836,8 @@ mod tests {
             request_timeout_secs: 900,
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 20,
+            dp_aware: false,
+            api_key: None,
             discovery: Some(DiscoveryConfig {
                 enabled: true,
                 namespace: Some("production".to_string()),
@@ -829,6 +855,8 @@ mod tests {
             log_dir: Some("/opt/logs/sglang".to_string()),
             log_level: Some("trace".to_string()),
             request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
         };
 
         assert!(config.has_service_discovery());
