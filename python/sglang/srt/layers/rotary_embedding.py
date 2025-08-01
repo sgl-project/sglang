@@ -1603,7 +1603,8 @@ def apply_rotary_pos_emb(
     sin: torch.Tensor,
     unsqueeze_dim=1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if _is_npu:
+    if not _is_npu:
+        orig_q_dtype = q.dtype
         orig_k_dtype = k.dtype
         q, k = q.float(), k.float()
 
@@ -1615,7 +1616,6 @@ def apply_rotary_pos_emb(
 
         q_embed = q_embed.to(orig_q_dtype)
         k_embed = k_embed.to(orig_k_dtype)
-        orig_q_dtype = q.dtype
 
         return q_embed, k_embed
     else:
