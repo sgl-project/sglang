@@ -49,7 +49,7 @@ runtime_common = [
     "timm==1.0.16",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.21",
+    "xgrammar==0.1.22",
 ]
 
 srt = [
