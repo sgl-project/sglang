@@ -145,10 +145,11 @@ class RouterArgs:
         )
         parser.add_argument(
             f"--{prefix}prefill",
-            nargs=2,
+            nargs="+",
             action="append",
-            metavar=("URL", "BOOTSTRAP_PORT"),
-            help="Prefill server URL and bootstrap port. Can be specified multiple times. BOOTSTRAP_PORT can be 'none' for no bootstrap port.",
+            help="Prefill server URL and optional bootstrap port. Can be specified multiple times. "
+            "Format: --prefill URL [BOOTSTRAP_PORT]. "
+            "BOOTSTRAP_PORT can be a port number, 'none', or omitted (defaults to none).",
         )
         parser.add_argument(
             f"--{prefix}decode",
@@ -389,24 +390,36 @@ class RouterArgs:
     def _parse_prefill_urls(prefill_list):
         """Parse prefill URLs from --prefill arguments.
 
-        Format: --prefill URL BOOTSTRAP_PORT
-        Example: --prefill http://prefill1:8080 9000 --prefill http://prefill2:8080 none
+        Format: --prefill URL [BOOTSTRAP_PORT]
+        Example:
+            --prefill http://prefill1:8080 9000  # With bootstrap port
+            --prefill http://prefill2:8080 none  # Explicitly no bootstrap port
+            --prefill http://prefill3:8080       # Defaults to no bootstrap port
         """
         if not prefill_list:
             return []
 
         prefill_urls = []
-        for url, bootstrap_port_str in prefill_list:
-            # Handle 'none' as None
-            if bootstrap_port_str.lower() == "none":
-                bootstrap_port = None
+        for prefill_args in prefill_list:
+
+            url = prefill_args[0]
+
+            # Handle optional bootstrap port
+            if len(prefill_args) >= 2:
+                bootstrap_port_str = prefill_args[1]
+                # Handle 'none' as None
+                if bootstrap_port_str.lower() == "none":
+                    bootstrap_port = None
+                else:
+                    try:
+                        bootstrap_port = int(bootstrap_port_str)
+                    except ValueError:
+                        raise ValueError(
+                            f"Invalid bootstrap port: {bootstrap_port_str}. Must be a number or 'none'"
+                        )
             else:
-                try:
-                    bootstrap_port = int(bootstrap_port_str)
-                except ValueError:
-                    raise ValueError(
-                        f"Invalid bootstrap port: {bootstrap_port_str}. Must be a number or 'none'"
-                    )
+                # No bootstrap port specified, default to None
+                bootstrap_port = None
 
             prefill_urls.append((url, bootstrap_port))
 
@@ -578,13 +591,20 @@ Examples:
 
   # PD disaggregated mode with same policy for both
   python -m sglang_router.launch_router --pd-disaggregation \\
-    --prefill http://prefill1:8000 9000 --prefill http://prefill2:8000 none \\
+    --prefill http://prefill1:8000 9000 --prefill http://prefill2:8000 \\
     --decode http://decode1:8001 --decode http://decode2:8001 \\
     --policy cache_aware
 
+  # PD mode with optional bootstrap ports
+  python -m sglang_router.launch_router --pd-disaggregation \\
+    --prefill http://prefill1:8000 9000 \\    # With bootstrap port
+    --prefill http://prefill2:8000 none \\    # Explicitly no bootstrap port
+    --prefill http://prefill3:8000 \\         # Defaults to no bootstrap port
+    --decode http://decode1:8001 --decode http://decode2:8001
+
   # PD mode with different policies for prefill and decode
   python -m sglang_router.launch_router --pd-disaggregation \\
-    --prefill http://prefill1:8000 9000 --prefill http://prefill2:8000 none \\
+    --prefill http://prefill1:8000 --prefill http://prefill2:8000 \\
     --decode http://decode1:8001 --decode http://decode2:8001 \\
     --prefill-policy cache_aware --decode-policy power_of_two
 
