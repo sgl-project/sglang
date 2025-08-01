@@ -994,6 +994,23 @@ register_conv_template(
     )
 )
 
+register_conv_template(
+    Conversation(
+        name="step3-vl",
+        system_message="<｜begin▁of▁sentence｜>You are a helpful assistant",
+        system_template="{system_message}\n",
+        roles=(
+            "<|BOT|>user\n",
+            "<|BOT|>assistant\n<think>\n",
+        ),
+        sep="<|EOT|>",
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
+        stop_str="<|EOT|>",
+        image_token="<im_patch>",
+        # add_bos=True,
+    )
+)
+
 
 @register_conv_template_matching_function
 def match_internvl(model_path: str):
@@ -1103,3 +1120,9 @@ def match_vila(model_path: str):
 def match_mimo_vl(model_path: str):
     if re.search(r"mimo.*vl", model_path, re.IGNORECASE):
         return "mimo-vl"
+
+
+# @register_conv_template_matching_function
+# def match_step3(model_path: str):
+#     if re.search(r"step3", model_path, re.IGNORECASE):
+#         return "step3-vl"
