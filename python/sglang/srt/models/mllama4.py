@@ -623,7 +623,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-        print(f"{params_dict.keys()=}")
+        # print(f"{params_dict.keys()=}")
         num_experts = (
             self.config.text_config.num_local_experts
             if hasattr(self.config, "text_config")
