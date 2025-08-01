@@ -428,12 +428,6 @@ class ServerArgs:
                 raise ValueError(
                     "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
                 )
-
-            if self.page_size not in [32, 64]:
-                logger.warning(
-                    f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
-                )
-                self.page_size = 64
             if self.speculative_algorithm is not None:
                 raise ValueError(
                     "trtllm_mla backend does not support speculative decoding yet."
@@ -443,6 +437,12 @@ class ServerArgs:
                 raise ValueError(
                     "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3 or fp16/auto."
                 )
+
+            if self.page_size not in [32, 64]:
+                logger.warning(
+                    f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
+                )
+                self.page_size = 64
 
         # Set page size
         if self.page_size is None:
