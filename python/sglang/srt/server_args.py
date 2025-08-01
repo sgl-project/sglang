@@ -268,21 +268,25 @@ class ServerArgs:
     # For PD-Multiplexing
     enable_pdmux: bool = False
     sm_group_num: int = 3
-    
+
     # Deprecated arguments
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
 
     def __post_init__(self):
-        
+
         # Check deprecated arguments
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
-            logger.warning("--enable-ep-moe is deprecated. Please set `--ep-size` to the same value as `--tp-size` instead.")
+            logger.warning(
+                "--enable-ep-moe is deprecated. Please set `--ep-size` to the same value as `--tp-size` instead."
+            )
         if self.enable_deepep_moe:
             self.moe_a2a_backend = "deepep"
-            logger.warning("--enable-deepep-moe is deprecated. Please set `--moe-a2a-backend` to 'deepep' instead.")
-        
+            logger.warning(
+                "--enable-deepep-moe is deprecated. Please set `--moe-a2a-backend` to 'deepep' instead."
+            )
+
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -449,10 +453,15 @@ class ServerArgs:
                 self.quantization == "modelopt_fp4"
             ), "modelopt_fp4 quantization is required for Flashinfer MOE"
             os.environ["TRTLLM_ENABLE_PDL"] = "1"
-            assert self.ep_size in [1, self.tp_size], "The expert parallel size must be 1 or the same as the tensor parallel size"
+            assert self.ep_size in [
+                1,
+                self.tp_size,
+            ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if self.enable_flashinfer_trtllm_moe:
-            assert self.ep_size == self.tp_size, "The expert parallel size must be the same as the tensor parallel size"
+            assert (
+                self.ep_size == self.tp_size
+            ), "The expert parallel size must be the same as the tensor parallel size"
 
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":

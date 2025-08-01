@@ -1,12 +1,12 @@
 from enum import Enum, auto
-from typing import Union, Tuple
+from typing import Tuple, Union
 
 
 class MoeA2ABackend(Enum):
-    
+
     STANDARD = ("standard", "none")
     DEEPEP = "deepep"
-    
+
     @classmethod
     def _missing_(cls, value):
         if value is None:

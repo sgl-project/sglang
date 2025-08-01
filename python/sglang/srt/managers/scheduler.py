@@ -64,6 +64,7 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -155,7 +156,6 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -1761,7 +1761,9 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
             enable_two_batch_overlap=self.server_args.enable_two_batch_overlap,
-            enable_deepep_moe=MoeA2ABackend(self.server_args.moe_a2a_backend).is_deepep(),
+            enable_deepep_moe=MoeA2ABackend(
+                self.server_args.moe_a2a_backend
+            ).is_deepep(),
             deepep_mode=DeepEPMode(self.server_args.deepep_mode),
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,

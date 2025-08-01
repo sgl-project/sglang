@@ -5,11 +5,11 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from python.sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
@@ -28,6 +28,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -51,7 +52,6 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
-from sglang.srt.layers.moe.utils import DeepEPMode
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -64,9 +64,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-use_flashinfer_trtllm_moe = (
-    global_server_args_dict["enable_flashinfer_trtllm_moe"]
-)
+use_flashinfer_trtllm_moe = global_server_args_dict["enable_flashinfer_trtllm_moe"]
 
 if not (_is_npu or _is_hip):
     from sgl_kernel import silu_and_mul
@@ -773,7 +771,7 @@ class FlashInferEPMoE(EPMoE):
 
 
 def get_moe_impl_class():
-    if global_server_args_dict["enable_deepep_moe"]:
+    if global_server_args_dict["moe_a2a_backend"].is_deepep():
         return DeepEPMoE
     if global_server_args_dict["enable_flashinfer_cutlass_moe"]:
         return FusedMoE
