@@ -108,6 +108,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "weight_loader_disable_mmap",
     "enable_triton_kernel_moe",
     "enable_multimodal",
+    "enable_symm_mem",
 ]
 
 # Put some global args for easy access
