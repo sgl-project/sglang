@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from python.sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -65,7 +66,6 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 use_flashinfer_trtllm_moe = (
     global_server_args_dict["enable_flashinfer_trtllm_moe"]
-    and global_server_args_dict["enable_ep_moe"]
 )
 
 if not (_is_npu or _is_hip):
@@ -132,7 +132,6 @@ class EPMoE(FusedMoE):
             activation=activation,
             # apply_router_weight_on_input=apply_router_weight_on_input,
             routed_scaling_factor=routed_scaling_factor,
-            enable_ep_moe=True,
         )
 
         self.start_expert_id = self.moe_ep_rank * self.num_local_experts
@@ -777,11 +776,9 @@ def get_moe_impl_class():
     if global_server_args_dict["enable_deepep_moe"]:
         return DeepEPMoE
     if global_server_args_dict["enable_flashinfer_cutlass_moe"]:
-        # Must come before EPMoE because FusedMoE also supports enable_ep_moe
         return FusedMoE
     if use_flashinfer_trtllm_moe:
-        # Must come before EPMoE because FusedMoE also supports enable_ep_moe
         return FlashInferEPMoE
-    if global_server_args_dict["enable_ep_moe"]:
+    if get_moe_expert_parallel_world_size() > 1:
         return EPMoE
     return FusedMoE

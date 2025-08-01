@@ -29,6 +29,7 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
     parallel_state,
     tensor_model_parallel_all_reduce,
@@ -341,7 +342,6 @@ class DeepseekV2MoE(nn.Module):
             **(
                 dict(
                     enable_flashinfer_cutlass_moe=True,
-                    enable_ep_moe=global_server_args_dict["enable_ep_moe"],
                 )
                 if global_server_args_dict["enable_flashinfer_cutlass_moe"]
                 else {}
@@ -407,7 +407,7 @@ class DeepseekV2MoE(nn.Module):
 
         if global_server_args_dict["enable_deepep_moe"]:
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_tensor_model_parallel_world_size()
+            self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
                 config.n_routed_experts
                 + global_server_args_dict["ep_num_redundant_experts"]
@@ -2104,11 +2104,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
-        elif (
-            global_server_args_dict["enable_deepep_moe"]
-            or global_server_args_dict["enable_ep_moe"]
-        ):
-            disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization when in deepep_moe or ep_moe mode."
+        elif get_moe_expert_parallel_world_size() > 1:
+            disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under expert parallelism."
 
         if disable_reason is not None:
             global_server_args_dict["disable_shared_experts_fusion"] = True

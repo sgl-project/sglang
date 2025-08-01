@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed import (
+    get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -120,7 +121,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             **(
                 dict(
                     enable_flashinfer_cutlass_moe=True,
-                    enable_ep_moe=global_server_args_dict["enable_ep_moe"],
                 )
                 if global_server_args_dict["enable_flashinfer_cutlass_moe"]
                 else {}
@@ -137,7 +137,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         if global_server_args_dict["enable_deepep_moe"]:
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_tensor_model_parallel_world_size()
+            self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
                 config.num_experts + global_server_args_dict["ep_num_redundant_experts"]
             )

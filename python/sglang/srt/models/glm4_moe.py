@@ -25,6 +25,7 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_moe_expert_parallel_world_size,
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
@@ -451,7 +452,6 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
             **(
                 dict(
                     enable_flashinfer_cutlass_moe=True,
-                    enable_ep_moe=global_server_args_dict["enable_ep_moe"],
                 )
                 if global_server_args_dict["enable_flashinfer_cutlass_moe"]
                 else {}
@@ -504,7 +504,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
 
         if global_server_args_dict["enable_deepep_moe"]:
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_tensor_model_parallel_world_size()
+            self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
                 config.n_routed_experts
                 + global_server_args_dict["ep_num_redundant_experts"]
@@ -737,11 +737,8 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Only GLM-4.5 on NV-platform with capability >= 80 can use shared experts fusion optimization."
-        elif (
-            global_server_args_dict["enable_deepep_moe"]
-            or global_server_args_dict["enable_ep_moe"]
-        ):
-            disable_reason = "Deepseek and GLM-4.5 can not use shared experts fusion optimization when in deepep_moe or ep_moe mode."
+        elif get_moe_expert_parallel_world_size() > 1:
+            disable_reason = "Deepseek and GLM-4.5 can not use shared experts fusion optimization under expert parallelism."
 
         if disable_reason is not None:
             global_server_args_dict["disable_shared_experts_fusion"] = True

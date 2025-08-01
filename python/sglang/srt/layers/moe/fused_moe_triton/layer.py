@@ -82,7 +82,6 @@ class FusedMoE(torch.nn.Module):
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
         enable_flashinfer_cutlass_moe: Optional[bool] = False,
-        enable_ep_moe: Optional[bool] = False,
     ):
         super().__init__()
 
@@ -100,7 +99,6 @@ class FusedMoE(torch.nn.Module):
         if enable_flashinfer_cutlass_moe and quant_config is None:
             logger.warning("Disable flashinfer MoE when quantization config is None.")
             enable_flashinfer_cutlass_moe = False
-            enable_ep_moe = False
 
         self.enable_flashinfer_cutlass_moe = enable_flashinfer_cutlass_moe
         self.moe_ep_size = get_moe_expert_parallel_world_size()
@@ -109,7 +107,7 @@ class FusedMoE(torch.nn.Module):
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
         assert num_experts % self.moe_ep_size == 0
         self.num_local_experts = num_experts // self.moe_ep_size
-        if enable_ep_moe:
+        if self.moe_ep_size > 1:
             # TODO(ch-wan): support shared experts fusion
             # Create a tensor of size num_experts filled with -1
             self.expert_map_cpu = torch.full((self.num_experts,), -1, dtype=torch.int32)

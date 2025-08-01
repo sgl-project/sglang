@@ -448,18 +448,13 @@ class ServerArgs:
                 self.quantization == "modelopt_fp4"
             ), "modelopt_fp4 quantization is required for Flashinfer MOE"
             os.environ["TRTLLM_ENABLE_PDL"] = "1"
-            if self.enable_ep_moe:
-                self.ep_size = self.tp_size
-                logger.warning(
-                    f"Flashinfer cutlass MoE and EP MoE are enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-                )
+            assert self.ep_size in [1, self.tp_size], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if self.enable_flashinfer_trtllm_moe:
-            assert self.enable_ep_moe, "EP MoE is required for Flashinfer TRTLLM MOE"
-            logger.warning(f"Flashinfer TRTLLM MoE is enabled.")
+            assert self.ep_size == self.tp_size, "The expert parallel size must be the same as the tensor parallel size"
 
         # DeepEP MoE
-        if self.enable_deepep_moe:
+        if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
@@ -483,7 +478,7 @@ class ServerArgs:
             )
 
         if self.enable_eplb:
-            assert self.enable_ep_moe or self.enable_deepep_moe
+            assert self.ep_size > 1 or self.moe_a2a_backend != "none"
 
         if self.enable_expert_distribution_metrics and (
             self.expert_distribution_recorder_mode is None
