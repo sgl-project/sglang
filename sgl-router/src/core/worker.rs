@@ -360,24 +360,35 @@ impl Worker for DPAwareWorker {
         let timeout =
             std::time::Duration::from_secs(self.base_worker.metadata.health_config.timeout_secs);
 
-        match WORKER_CLIENT.get(&health_url).timeout(timeout).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    self.set_healthy(true);
-                    Ok(())
-                } else {
-                    self.set_healthy(false);
-                    Err(WorkerError::HealthCheckFailed {
-                        url: self.base_url.clone(),
-                        reason: format!("Health check returned status: {}", response.status()),
-                    })
-                }
+        let health_result = async {
+            let response = WORKER_CLIENT
+                .get(&health_url)
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(|e| format!("Health check request failed: {}", e))?;
+
+            if response.status().is_success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Health check returned status: {}",
+                    response.status()
+                ))
             }
-            Err(e) => {
+        }
+        .await;
+
+        match health_result {
+            Ok(()) => {
+                self.set_healthy(true);
+                Ok(())
+            }
+            Err(reason) => {
                 self.set_healthy(false);
                 Err(WorkerError::HealthCheckFailed {
                     url: self.base_url.clone(),
-                    reason: format!("Health check request failed: {}", e),
+                    reason,
                 })
             }
         }
