@@ -986,22 +986,6 @@ def match_vicuna(model_path: str):
         return "vicuna_v1.1"
 
 
-# @register_conv_template_matching_function
-# def match_llama2_chat(model_path: str):
-#     if re.search(
-#         r"llama-2.*chat|codellama.*instruct",
-#         model_path,
-#         re.IGNORECASE,
-#     ):
-#         return "llama-2"
-
-
-# @register_conv_template_matching_function
-# def match_mistral(model_path: str):
-#     if re.search(r"pixtral|(mistral|mixtral).*instruct", model_path, re.IGNORECASE):
-#         return "mistral"
-
-
 @register_conv_template_matching_function
 def match_deepseek_vl(model_path: str):
     if re.search(r"deepseek.*vl2", model_path, re.IGNORECASE):
@@ -1010,24 +994,12 @@ def match_deepseek_vl(model_path: str):
 
 @register_conv_template_matching_function
 def match_qwen_chat_ml(model_path: str):
-    #     if re.search(r"gme.*qwen.*vl", model_path, re.IGNORECASE):
-    #         return "gme-qwen2-vl"
-    #     if re.search(r"qwen.*vl", model_path, re.IGNORECASE):
-    #         return "qwen2-vl"
-    #     if re.search(r"qwen.*audio", model_path, re.IGNORECASE):
-    #         return "qwen2-audio"
     if re.search(
         r"llava-v1\.6-34b|llava-v1\.6-yi-34b|llava-next-video-34b|llava-onevision-qwen2",
         model_path,
         re.IGNORECASE,
     ):
         return "chatml-llava"
-
-
-# @register_conv_template_matching_function
-# def match_gemma3_instruct(model_path: str):
-#     if re.search(r"gemma-3.*it", model_path, re.IGNORECASE):
-#         return "gemma-it"
 
 
 @register_conv_template_matching_function
@@ -1038,37 +1010,7 @@ def match_openbmb_minicpm(model_path: str):
         return "minicpmo"
 
 
-# @register_conv_template_matching_function
-# def match_moonshot_kimivl(model_path: str):
-#     if re.search(r"kimi.*vl", model_path, re.IGNORECASE):
-#         return "kimi-vl"
-
-
-# @register_conv_template_matching_function
-# def match_devstral(model_path: str):
-#     if re.search(r"devstral", model_path, re.IGNORECASE):
-#         return "devstral"
-
-
 @register_conv_template_matching_function
 def match_phi_4_mm(model_path: str):
     if "phi-4-multimodal" in model_path.lower():
         return "phi-4-mm"
-
-
-@register_conv_template_matching_function
-def match_vila(model_path: str):
-    if re.search(r"vila", model_path, re.IGNORECASE):
-        return "chatml"
-
-
-# @register_conv_template_matching_function
-# def match_mimo_vl(model_path: str):
-#     if re.search(r"mimo.*vl", model_path, re.IGNORECASE):
-#         return "mimo-vl"
-
-
-# # @register_conv_template_matching_function
-# # def match_step3(model_path: str):
-# #     if re.search(r"step3", model_path, re.IGNORECASE):
-# #         return "step3-vl"
