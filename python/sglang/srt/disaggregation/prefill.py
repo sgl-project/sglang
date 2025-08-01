@@ -295,9 +295,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.process_disagg_prefill_inflight_queue()
 
             if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -349,9 +347,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.process_disagg_prefill_inflight_queue()
 
             if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -445,7 +441,19 @@ class SchedulerDisaggregationPrefillMixin:
                 self.send_kv_chunk(req, last_chunk=True)
 
                 if req.grammar is not None:
-                    req.grammar.accept_token(next_token_id)
+                    # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                    try:
+                        req.grammar.accept_token(next_token_id)
+                    except ValueError as e:
+                        # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                        # This can happen if the grammar is not set correctly or the token is invalid.
+                        error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                        self.tree_cache.cache_finished_req(req)
+                        prepare_abort(
+                            req,
+                            error_message,
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
                     req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished

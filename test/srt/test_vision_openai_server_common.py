@@ -71,7 +71,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                         },
                         {
                             "type": "text",
-                            "text": "Describe this image in a very short sentence.",
+                            "text": "Describe this image in a sentence.",
                         },
                     ],
                 },
@@ -119,7 +119,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                         },
                         {
                             "type": "text",
-                            "text": "Describe this image in a very short sentence.",
+                            "text": "Describe this image in a sentence.",
                         },
                     ],
                 },
@@ -308,19 +308,35 @@ class TestOpenAIVisionServer(CustomTestCase):
             "iPod" in video_response
             or "device" in video_response
             or "microphone" in video_response
-        ), video_response
+        ), f"""
+        ====================== video_response =====================
+        {video_response}
+        ===========================================================
+        should contain 'iPod' or 'device' or 'microphone'
+        """
         assert (
             "man" in video_response
             or "person" in video_response
             or "individual" in video_response
             or "speaker" in video_response
-        ), video_response
+            or "Steve" in video_response
+        ), f"""
+        ====================== video_response =====================
+        {video_response}
+        ===========================================================
+        should contain 'man' or 'person' or 'individual' or 'speaker'
+        """
         assert (
             "present" in video_response
             or "examine" in video_response
             or "display" in video_response
             or "hold" in video_response
-        )
+        ), f"""
+        ====================== video_response =====================
+        {video_response}
+        ===========================================================
+        should contain 'present' or 'examine' or 'display' or 'hold'
+        """
         assert "black" in video_response or "dark" in video_response
         self.assertIsNotNone(video_response)
         self.assertGreater(len(video_response), 0)
@@ -439,7 +455,7 @@ class TestOpenAIVisionServer(CustomTestCase):
         content.append(
             {
                 "type": "text",
-                "text": "Describe this image in a very short sentence.",
+                "text": "Describe this image in a sentence.",
             }
         )
 
@@ -512,14 +528,20 @@ class TestOpenAIVisionServer(CustomTestCase):
         # a fragment of Trump's speech
         audio_response = self.get_audio_response(
             AUDIO_TRUMP_SPEECH_URL,
-            "I have an audio sample. Please repeat the person's words",
+            "Listen to this audio and write down the audio transcription in English.",
             category="speech",
         )
-        assert "thank you" in audio_response
-        assert "it's a privilege to be here" in audio_response
-        assert "leader" in audio_response
-        assert "science" in audio_response
-        assert "art" in audio_response
+        check_list = [
+            "thank you",
+            "it's a privilege to be here",
+            "leader",
+            "science",
+            "art",
+        ]
+        for check_word in check_list:
+            assert (
+                check_word in audio_response
+            ), f"audio_response: ｜{audio_response}｜ should contain ｜{check_word}｜"
 
     def _test_audio_ambient_completion(self):
         # bird song

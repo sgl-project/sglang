@@ -14,8 +14,8 @@ from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTok
 class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
     models = [Gemma3ForConditionalGeneration]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.IM_START_TOKEN_ID = hf_config.boi_token_index
         self.IM_END_TOKEN_ID = hf_config.eoi_token_index
         self.mm_tokens = MultimodalSpecialTokens(
@@ -33,7 +33,6 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         image_data: List[Union[str, bytes, Dict]],
         input_text,
         request_obj,
-        max_req_input_len,
         *args,
         **kwargs,
     ):
@@ -41,7 +40,6 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
-            max_req_input_len=max_req_input_len,
             discard_alpha_channel=True,
         )
 
