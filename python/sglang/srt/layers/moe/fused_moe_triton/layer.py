@@ -1,10 +1,13 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
+import importlib.util
 import logging
 from enum import Enum
+from functools import lru_cache
 from typing import List, Optional, Tuple
 
 import torch
+from packaging import version as pkg_version
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
@@ -31,6 +34,15 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def should_use_flashinfer_trtllm_moe():
+    return global_server_args_dict["enable_flashinfer_trtllm_moe"] and (
+        not importlib.util.find_spec("flashinfer")
+        or pkg_version.parse(__import__("flashinfer").__version__)
+        >= pkg_version.parse("0.2.9rc1")
+    )
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -455,7 +467,7 @@ class FusedMoE(torch.nn.Module):
             )
 
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
-        if getattr(self, "use_flashinfer_trtllm_moe", False):
+        if should_use_flashinfer_trtllm_moe():
             shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
 
         WEIGHT_SCALE_SUPPORTED = [e.value for e in FusedMoeWeightScaleSupported]
@@ -687,3 +699,44 @@ class FusedMoE(torch.nn.Module):
             for expert_id in range(num_experts)
             for shard_id in ["w1", "w2", "w3"]
         ]
+
+
+class FlashInferFusedMoE(FusedMoE):
+    def __init__(self, *args, **kwargs):
+        renormalize = kwargs.pop("renormalize", True)
+        num_fused_shared_experts = kwargs.pop("num_fused_shared_experts", 0)
+        use_grouped_topk = kwargs.pop("use_grouped_topk", False)
+        num_expert_group = kwargs.pop("num_expert_group", None)
+        topk_group = kwargs.pop("topk_group", None)
+        correction_bias = kwargs.pop("correction_bias", None)
+        super().__init__(*args, **kwargs)
+        self.renormalize = renormalize
+        self.num_fused_shared_experts = num_fused_shared_experts
+        self.use_grouped_topk = use_grouped_topk
+        if self.use_grouped_topk:
+            assert num_expert_group is not None and topk_group is not None
+        self.num_expert_group = num_expert_group
+        self.topk_group = topk_group
+        self.correction_bias = correction_bias
+
+    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        assert self.quant_method is not None
+        assert (
+            self.renormalize
+        ), "Renormalize is required for flashinfer blockscale fp8 moe"
+        assert (
+            self.num_fused_shared_experts == 0
+        ), "Fused shared experts are not supported for flashinfer blockscale fp8 moe"
+        # Matrix multiply.
+        final_hidden_states = self.quant_method.apply_with_router_logits(
+            layer=self,
+            x=hidden_states,
+            router_logits=router_logits,
+            activation=self.activation,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
+
+        if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        return final_hidden_states

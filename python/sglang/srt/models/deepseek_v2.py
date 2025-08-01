@@ -59,7 +59,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import (
     DeepEPMoE,
     get_moe_impl_class,
-    use_flashinfer_trtllm_moe,
+    should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import TopK
@@ -317,7 +317,7 @@ class DeepseekV2MoE(nn.Module):
                 correction_bias=self.gate.e_score_correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
             )
-            if not use_flashinfer_trtllm_moe
+            if not should_use_flashinfer_trtllm_moe()
             else None
         )
 
@@ -352,11 +352,10 @@ class DeepseekV2MoE(nn.Module):
                     renormalize=config.norm_topk_prob,
                     use_grouped_topk=True,
                     num_expert_group=config.n_group,
-                    num_fused_shared_experts=self.num_fused_shared_experts,
                     topk_group=config.topk_group,
                     correction_bias=self.gate.e_score_correction_bias,
                 )
-                if use_flashinfer_trtllm_moe
+                if should_use_flashinfer_trtllm_moe()
                 else {}
             ),
         )
