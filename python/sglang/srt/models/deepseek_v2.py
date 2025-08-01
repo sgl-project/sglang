@@ -59,7 +59,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import (
     DeepEPMoE,
     get_moe_impl_class,
-    use_flashinfer_trtllm_moe,
+    should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import TopK
@@ -252,8 +252,7 @@ class MoEGate(nn.Module):
         # NOTE: For some unknown reason, router_gemm seems degrade accept length.
         if (
             _is_cuda
-            and not self.is_nextn
-            and hidden_states.shape[0] < 4
+            and hidden_states.shape[0] <= 16
             and hidden_states.shape[1] == 7168
             and self.weight.shape[0] == 256
             and _device_sm >= 90
@@ -317,7 +316,7 @@ class DeepseekV2MoE(nn.Module):
                 correction_bias=self.gate.e_score_correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
             )
-            if not use_flashinfer_trtllm_moe
+            if not should_use_flashinfer_trtllm_moe()
             else None
         )
 
@@ -352,11 +351,10 @@ class DeepseekV2MoE(nn.Module):
                     renormalize=config.norm_topk_prob,
                     use_grouped_topk=True,
                     num_expert_group=config.n_group,
-                    num_fused_shared_experts=self.num_fused_shared_experts,
                     topk_group=config.topk_group,
                     correction_bias=self.gate.e_score_correction_bias,
                 )
-                if use_flashinfer_trtllm_moe
+                if should_use_flashinfer_trtllm_moe()
                 else {}
             ),
         )
@@ -1259,6 +1257,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.current_attention_backend == "fa3"
             or self.current_attention_backend == "flashinfer"
             or self.current_attention_backend == "cutlass_mla"
+            or self.current_attention_backend == "trtllm_mla"
         ):
             attn_output = self.attn_mqa(
                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
