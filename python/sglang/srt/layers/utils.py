@@ -39,7 +39,8 @@ def is_sm100_supported(device=None) -> bool:
     return (torch.cuda.get_device_capability(device)[0] == 10) and (
         torch.version.cuda >= "12.8"
     )
-    
+
+
 def is_sm90_supported(device=None) -> bool:
     return (torch.cuda.get_device_capability(device)[0] == 9) and (
         torch.version.cuda >= "12.3"
