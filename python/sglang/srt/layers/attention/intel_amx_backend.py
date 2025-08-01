@@ -314,7 +314,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
-        if False and k is not None:
+        if k is not None:
             assert v is not None
             self.decode_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -330,15 +330,9 @@ class IntelAMXAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 layer.scaling,
                 layer.logit_cap,
+                forward_batch.encoder_lens,
             )
         else:
-            if save_kv_cache:
-                if k is not None:
-                    assert v is not None
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v
-                    )
-
             use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
             q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
