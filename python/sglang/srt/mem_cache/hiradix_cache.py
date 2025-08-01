@@ -2,7 +2,7 @@ import heapq
 import logging
 import threading
 import time
-from collections import deque
+from queue import Queue
 from typing import List, Optional
 
 import torch
@@ -58,28 +58,6 @@ class HiRadixCache(RadixCache):
         # todo: customizable storage prefetch threshold
         self.prefetch_threshold = 256
 
-        self.prefetch_start_policy = historage_prefetch_start_policy
-        # todo: customizable storage prefetch tokens threshold
-        self.prefetch_tokens_threshold = int(
-            0.8
-            * (
-                self.cache_controller.mem_pool_host.size
-                - self.cache_controller.mem_pool.size
-            )
-        )
-        self.prefetch_tokens_occupied = 0
-
-        self.prefetch_throttle_queue = deque()
-        self.stop_event = threading.Event()
-        self.prefetch_throttle_thread = threading.Thread(
-            target=self._prefetch_throttle_thread, daemon=True
-        )
-        self.prefetch_throttle_thread.start()
-
-        self.prefetch_stop_policy = historage_prefetch_stop_policy
-        # todo: customizable storage prefetch timeout
-        self.prefetch_timeout = 3  # seconds
-
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator,
@@ -91,6 +69,21 @@ class HiRadixCache(RadixCache):
             io_backend=hicache_io_backend,
             storage_backend=hicache_storage_backend,
             prefetch_threshold=self.prefetch_threshold,
+        )
+
+        self.prefetch_start_policy = historage_prefetch_start_policy
+        self.prefetch_throttle_queue = Queue()
+        # todo: customizable storage prefetch tokens threshold
+        self.prefetch_tokens_threshold = int(
+            0.8 * (self.cache_controller.mem_pool_host.size - self.kv_cache.size)
+        )
+        self.prefetch_tokens_occupied = 0
+
+        self.prefetch_stop_policy = historage_prefetch_stop_policy
+        # todo: customizable storage prefetch timeout
+        self.prefetch_timeout = 3  # seconds
+        logger.info(
+            f"{historage_prefetch_start_policy=}, {historage_prefetch_stop_policy=}"
         )
 
         # record the nodes with ongoing write through
@@ -113,21 +106,13 @@ class HiRadixCache(RadixCache):
         )
 
     def reset(self):
-        self.stop_event.set()
-        self.prefetch_throttle_thread.join()
-        self.prefetch_throttle_queue.clear()
+        self.prefetch_throttle_queue.queue.clear()
         self.prefetch_tokens_occupied = 0
 
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
         super().reset()
-
-        self.stop_event.clear()
-        self.prefetch_throttle_thread = threading.Thread(
-            target=self._prefetch_throttle_thread, daemon=True
-        )
-        self.prefetch_throttle_thread.start()
 
     def get_height(self, node: TreeNode):
         height = 0
@@ -408,6 +393,7 @@ class HiRadixCache(RadixCache):
                 last_host_node.release_host()
                 del self.ongoing_prefetch[req_id]
                 self.prefetch_tokens_occupied -= len(token_ids)
+                self.try_prefetch_from_storage()
             else:
                 # the revoked operation already got terminated
                 pass
@@ -446,11 +432,13 @@ class HiRadixCache(RadixCache):
             return can_terminate
 
         if self.prefetch_stop_policy == "wait_complete":
-            can_terminate = operation.completed_tokens == len(operation.token_ids)
+            can_terminate = (
+                operation.completed_tokens == len(operation.hash_value) * self.page_size
+            )
         elif self.prefetch_stop_policy == "timeout":
             can_terminate = (
-                time.monotonic() - operation.start_time > self.prefetch_timeout
-            )
+                operation.completed_tokens == len(operation.hash_value) * self.page_size
+            ) or (time.monotonic() - operation.start_time > self.prefetch_timeout)
 
         if self.tp_world_size > 1:
             can_terminate = torch.tensor(can_terminate, dtype=torch.int)
@@ -512,6 +500,7 @@ class HiRadixCache(RadixCache):
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
         self.prefetch_tokens_occupied -= len(token_ids)
+        self.try_prefetch_from_storage()
 
         return True
 
@@ -548,35 +537,11 @@ class HiRadixCache(RadixCache):
             host_hit_length=host_hit_length,
         )
 
-    def can_start_prefetch(self, len_new_tokens):
+    def can_start_prefetch(self):
         if self.prefetch_start_policy == "immediate":
             return True
         elif self.prefetch_start_policy == "threshold_based":
-            return (
-                self.prefetch_tokens_occupied + len_new_tokens
-                < self.prefetch_tokens_threshold
-            )
-
-    def _prefetch_throttle_thread(self):
-        while not self.stop_event.is_set():
-            try:
-                req_id, last_host_node, new_input_tokens, last_hash = (
-                    self.prefetch_throttle_queue.get()
-                )
-                if not self.can_start_prefetch(len(new_input_tokens)):
-                    self.prefetch_throttle_queue.appendleft(
-                        (req_id, last_host_node, new_input_tokens, last_hash)
-                    )
-                    time.sleep(0.05)
-                    continue
-
-                self._prefetch_from_storage(
-                    req_id, last_host_node, new_input_tokens, last_hash
-                )
-            except Empty:
-                continue
-            except Exception as e:
-                logger.error(e)
+            return self.prefetch_tokens_occupied < self.prefetch_tokens_threshold
 
     def prefetch_from_storage(
         self,
@@ -585,9 +550,19 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
     ):
-        self.prefetch_throttle_queue.add(
+        self.prefetch_throttle_queue.put(
             (req_id, last_host_node, new_input_tokens, last_hash)
         )
+        self.try_prefetch_from_storage()
+
+    def try_prefetch_from_storage(self):
+        while self.can_start_prefetch() and not self.prefetch_throttle_queue.empty():
+            (req_id, last_host_node, new_input_tokens, last_hash) = (
+                self.prefetch_throttle_queue.get()
+            )
+            self._prefetch_from_storage(
+                req_id, last_host_node, new_input_tokens, last_hash
+            )
 
     def _prefetch_from_storage(
         self,

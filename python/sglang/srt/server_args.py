@@ -199,8 +199,8 @@ class ServerArgs:
     hicache_write_policy: str = "write_through_selective"
     hicache_io_backend: str = ""
     hicache_storage_backend: Optional[str] = None
-    historage_prefetch_start_policy: Optional[str] = None
-    historage_prefetch_stop_policy: Optional[str] = None
+    historage_prefetch_start_policy: str = "immediate"
+    historage_prefetch_stop_policy: str = "best_effort"
 
     # Double Sparsity
     enable_double_sparsity: bool = False

@@ -69,7 +69,6 @@ class RequestFuncInput:
     api_url: str
     prompt_len: int
     output_len: int
-    cached_tokens: int
     model: str
     lora_name: str
     image_data: str
@@ -86,6 +85,7 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
+    cached_tokens: int = 0
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -203,6 +203,8 @@ async def async_request_openai_completions(
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
+        if not args.disable_stream:
+            payload["stream_options"] = {"include_usage": not args.disable_stream}
         headers = get_auth_headers()
 
         output = RequestFuncOutput.init_new(request_func_input)
@@ -217,6 +219,8 @@ async def async_request_openai_completions(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
+                    prompt_len = 0
+                    cached_tokens = 0
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
@@ -232,7 +236,11 @@ async def async_request_openai_completions(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            if (
+                                len(data["choices"]) > 0
+                                and "text" in data["choices"][0]
+                                and data["choices"][0]["text"]
+                            ):
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -249,10 +257,23 @@ async def async_request_openai_completions(
                                     "completion_tokens", output_len
                                 )
 
+                            prompt_len = max(
+                                prompt_len,
+                                (data.get("usage") or {}).get("prompt_tokens", 0),
+                            )
+                            cached_tokens = max(
+                                cached_tokens,
+                                (data.get("usage") or {})
+                                .get("prompt_tokens_details", {})
+                                .get("cached_tokens", 0),
+                            )
+
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
                     output.output_len = output_len
+                    output.prompt_len = prompt_len
+                    output.cached_tokens = cached_tokens
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -731,6 +752,7 @@ class BenchmarkMetrics:
     std_e2e_latency_ms: float
     p99_e2e_latency_ms: float
     concurrency: float
+    cache_hit_rate: float
 
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -1247,6 +1269,8 @@ def calculate_metrics(
     tpots: List[float] = []
     ttfts: List[float] = []
     e2e_latencies: List[float] = []
+    sum_prompt_len = 0
+    sum_cached_tokens = 0
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_len
@@ -1263,10 +1287,15 @@ def calculate_metrics(
 
             e2e_latencies.append(outputs[i].latency)
 
+            sum_prompt_len += outputs[i].prompt_len
+            sum_cached_tokens += outputs[i].cached_tokens
+
             completed += 1
         else:
             output_lens.append(0)
             retokenized_output_lens.append(0)
+
+    cache_hit_rate = 0 if sum_prompt_len == 0 else sum_cached_tokens / sum_prompt_len
 
     if completed == 0:
         warnings.warn(
@@ -1306,6 +1335,7 @@ def calculate_metrics(
         std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
         p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
         concurrency=np.sum(e2e_latencies) / dur_s,
+        cache_hit_rate=cache_hit_rate,
     )
 
     return metrics, output_lens
@@ -1525,6 +1555,8 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
     print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
+    print("{s:{c}^{n}}".format(s="Cache Hit Rate", n=50, c="-"))
+    print("{:<40} {:<10.2f}".format("Cache Hit Rate:", metrics.cache_hit_rate))
     print("=" * 50)
 
     if (

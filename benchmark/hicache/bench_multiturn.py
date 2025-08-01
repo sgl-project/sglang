@@ -20,6 +20,8 @@ from sglang.bench_serving import (
     sample_random_requests,
 )
 
+AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -139,7 +141,7 @@ async def async_request_sglang_generate(
     """
     Sends a streaming request to the server. Gathers text token-by-token.
     """
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         headers = {}
         generated_text = ""
         ttft = 0.0

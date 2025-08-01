@@ -585,6 +585,8 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if isinstance(self.storage_backend, MooncakeStore):
                     self.mooncake_page_transfer(operation)
+                elif isinstance(self.storage_backend, HiCacheHF3FS):
+                    self.generic_page_transfer(operation, batch_size=128)
                 else:
                     self.generic_page_transfer(operation)
             except Empty:
@@ -682,7 +684,7 @@ class HiCacheController:
         for i in range(0, len(operation.hash_value), batch_size):
             page_hashes = operation.hash_value[i : i + batch_size]
             page_data = [
-                self.mem_pool_host.get_flat_data_pages(
+                self.mem_pool_host.get_flat_data_page(
                     operation.host_indices[j * self.page_size]
                 )
                 for j in range(i, i + len(page_hashes))
@@ -749,6 +751,8 @@ class HiCacheController:
 
                 if isinstance(self.storage_backend, MooncakeStore):
                     self.mooncake_page_backup(operation)
+                elif isinstance(self.storage_backend, HiCacheHF3FS):
+                    self.generic_page_backup(operation, batch_size=128)
                 else:
                     self.generic_page_backup(operation)
 
