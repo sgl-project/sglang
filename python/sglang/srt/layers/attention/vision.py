@@ -396,6 +396,7 @@ class VisionAttention(nn.Module):
                 self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
             )
 
+        # priority: server_args > passed qkv_backend > sdpa
         if global_server_args_dict["mm_attention_backend"] is None:
             if qkv_backend is None:
                 qkv_backend = "sdpa"
