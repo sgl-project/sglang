@@ -249,7 +249,7 @@ class BaseMultimodalProcessor(ABC):
         from decord import VideoReader, cpu
 
         # Before processing inputs
-        if not image_data:
+        if not image_data or len(image_data) == 0:
             return []
         estimated_frames_list = []
         for image in image_data:
