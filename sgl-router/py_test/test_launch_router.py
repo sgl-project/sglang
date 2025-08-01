@@ -33,7 +33,7 @@ class TestLaunchRouter(unittest.TestCase):
             cache_threshold=0.5,
             balance_abs_threshold=32,
             balance_rel_threshold=1.0001,
-            eviction_interval=60,
+            eviction_interval_secs=60,
             max_tree_size=2**24,
             max_payload_size=256 * 1024 * 1024,  # 256MB
             verbose=False,
@@ -43,14 +43,29 @@ class TestLaunchRouter(unittest.TestCase):
             selector=None,
             service_discovery_port=80,
             service_discovery_namespace=None,
+            dp_aware=False,
             prometheus_port=None,
             prometheus_host=None,
-            # PD-specific attributes
+            request_timeout_secs=60,
+            max_concurrent_requests=64,
+            cors_allowed_origins=[],
             pd_disaggregation=False,
             prefill=None,
             decode=None,
-            # Keep worker_urls for regular mode
             worker_urls=[],
+            retry_max_retries=3,
+            retry_initial_backoff_ms=100,
+            retry_max_backoff_ms=10_000,
+            retry_backoff_multiplier=2.0,
+            retry_jitter_factor=0.1,
+            cb_failure_threshold=5,
+            cb_success_threshold=2,
+            cb_timeout_duration_secs=30,
+            cb_window_duration_secs=60,
+            disable_retries=False,
+            disable_circuit_breaker=False,
+            model_path=None,
+            tokenizer_path=None,
         )
 
     def create_router_args(self, **kwargs):
@@ -111,13 +126,58 @@ class TestLaunchRouter(unittest.TestCase):
         )
         self.run_router_process(args)
 
+    def test_launch_router_common_with_dp_aware(self):
+        args = self.create_router_args(
+            worker_urls=["http://localhost:8000"],
+            dp_aware=True,
+        )
+        self.run_router_process(args)
+
+    def test_launch_router_with_empty_worker_urls_with_dp_aware(self):
+        args = self.create_router_args(
+            worker_urls=[],
+            dp_aware=True,
+        )
+        self.run_router_process(args)
+
+    def test_launch_router_common_with_dp_aware_service_discovery(self):
+        # Test launch router with bot srevice_discovery and dp_aware enabled
+        # Should fail since service_discovery and dp_aware is conflict
+        args = self.create_router_args(
+            worker_urls=["http://localhost:8000"],
+            dp_aware=True,
+            service_discovery=True,
+            selector=["app=test-worker"],
+        )
+
+        def run_router():
+            try:
+                from sglang_router.launch_router import launch_router
+
+                router = launch_router(args)
+                if router is None:
+                    return 1
+                return 0
+            except Exception as e:
+                print(e)
+                return 1
+
+        process = multiprocessing.Process(target=run_router)
+        try:
+            process.start()
+            # Wait 3 seconds
+            time.sleep(3)
+            # Should fail since service_discovery and dp_aware is conflict
+            self.assertFalse(process.is_alive())
+        finally:
+            terminate_process(process)
+
     def test_launch_router_pd_mode_basic(self):
         """Test basic PD router functionality without actually starting servers."""
         # This test just verifies the PD router can be created and configured
         # without actually starting it (which would require real prefill/decode servers)
-        from sglang_router import Router
         from sglang_router.launch_router import RouterArgs
-        from sglang_router_rs import PolicyType
+        from sglang_router.router import PolicyType, Router
 
         # Test RouterArgs parsing for PD mode
         # Simulate the parsed args structure from argparse with action="append"
@@ -148,18 +208,7 @@ class TestLaunchRouter(unittest.TestCase):
         self.assertEqual(router_args.decode_urls[1], "http://decode2:8081")
 
         # Test Router creation in PD mode
-        router = Router(
-            worker_urls=[],  # Empty for PD mode
-            pd_disaggregation=True,
-            prefill_urls=[
-                ("http://prefill1:8080", 9000),
-                ("http://prefill2:8080", None),
-            ],
-            decode_urls=["http://decode1:8081", "http://decode2:8081"],
-            policy=PolicyType.CacheAware,
-            host="127.0.0.1",
-            port=3001,
-        )
+        router = Router.from_args(router_args)
         self.assertIsNotNone(router)
 
     def test_policy_validation(self):

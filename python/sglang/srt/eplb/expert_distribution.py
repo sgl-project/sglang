@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 import logging
+import math
 import os
 import time
 from abc import ABC
@@ -25,7 +26,6 @@ import torch
 import torch.distributed
 
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_bool_env_var
@@ -288,12 +288,14 @@ class _SinglePassGatherer(ABC):
             )
 
         if server_args.expert_distribution_recorder_mode == "stat_approx":
-            if server_args.enable_deepep_moe and (server_args.deepep_mode == "normal"):
+            if server_args.moe_a2a_backend != "none" and (
+                server_args.deepep_mode == "normal"
+            ):
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
-        if server_args.enable_deepep_moe:
+        if server_args.moe_a2a_backend != "none":
             if server_args.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif server_args.deepep_mode == "low_latency":
@@ -613,8 +615,8 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         self._enable = self._server_args.enable_expert_distribution_metrics
 
         if self._enable:
-            window_sizes = [10, 100, 1000]
-            self._history = _DequeCollection(maxlens=window_sizes)
+            self.window_sizes = [10, 100, 1000]
+            self._history = _DequeCollection(maxlens=self.window_sizes)
             self._rank = torch.distributed.get_rank()
 
     def append(
@@ -786,6 +788,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         output = dict(
             rank=self._rank,
             logical_count=logical_count_of_buffered_step,
+            average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
 
         if output_mode == "file":
@@ -795,6 +798,31 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             return output
         else:
             raise NotImplementedError
+
+    def _get_global_average_utilization_rate(self):
+        if not self._enable or math.isclose(
+            self._server_args.eplb_min_rebalancing_utilization_threshold, 1.0
+        ):
+            return None
+
+        if self._rank == 0:
+            utilization_mean_rates = self._history.mean()
+            window_index = self.window_sizes[-1]
+            average_utilization_rate_over_window = (
+                utilization_mean_rates[window_index]
+                if window_index in utilization_mean_rates
+                else 0
+            )
+
+            avg_rate_tensor = torch.tensor(
+                [average_utilization_rate_over_window],
+                dtype=torch.float32,
+                device="cuda",
+            )
+        else:
+            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
+        torch.distributed.broadcast(avg_rate_tensor, src=0)
+        return avg_rate_tensor.item()
 
 
 def _dump_to_file(name, data):

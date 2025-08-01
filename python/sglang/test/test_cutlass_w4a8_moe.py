@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
+from typing import Literal, Optional
 
 import pytest
 import torch
 
 from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 
 
 def pack_int4_values_to_int8(int4_values_interleaved: torch.Tensor) -> torch.Tensor:
@@ -25,7 +25,7 @@ def pack_int4_values_to_int8(int4_values_interleaved: torch.Tensor) -> torch.Ten
     return packed_tensor.to(torch.int8)
 
 
-def pack_interleave(num_experts, ref_weight, ref_scale):
+def pack_interleave(num_experts, ref_weight, ref_scale, alignment=4):
     n, k = ref_weight.shape[1], ref_weight.shape[2]
 
     weight = pack_int4_values_to_int8(ref_weight.cpu()).cuda()
@@ -33,11 +33,16 @@ def pack_interleave(num_experts, ref_weight, ref_scale):
     w_q = w_q.contiguous()
 
     scale_interleaved = ref_scale.reshape(
-        ref_scale.shape[0], ref_scale.shape[1], (ref_scale.shape[2] // 4), 4
+        ref_scale.shape[0],
+        ref_scale.shape[1],
+        (ref_scale.shape[2] // alignment),
+        alignment,
     )  # [E, N, K/4, 4]
     scale_interleaved = scale_interleaved.permute(0, 2, 1, 3)  # [E, K/4, N, 4]
     scale_interleaved = scale_interleaved.reshape(
-        ref_scale.shape[0], ref_scale.shape[2] // 4, ref_scale.shape[1] * 4
+        ref_scale.shape[0],
+        ref_scale.shape[2] // alignment,
+        ref_scale.shape[1] * alignment,
     )  # [E, K/4, N*4]
     w_scale = scale_interleaved.contiguous()
 
@@ -48,12 +53,17 @@ def pack_interleave(num_experts, ref_weight, ref_scale):
 @pytest.mark.parametrize("N", [2048])
 @pytest.mark.parametrize("K", [7168])
 @pytest.mark.parametrize("E", [256])
-@pytest.mark.parametrize("ep_size", [8])
+@pytest.mark.parametrize("tp_size", [8])
+@pytest.mark.parametrize("use_ep_moe", [True, False])
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("group_size", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_cutlass_w4a8_moe(M, N, K, E, ep_size, topk, group_size, dtype):
-    local_e = E // ep_size
+def test_cutlass_w4a8_moe(M, N, K, E, tp_size, use_ep_moe, topk, group_size, dtype):
+    if use_ep_moe:
+        local_e = E // tp_size
+    else:  # tp mode
+        local_e = E
+        N = N // tp_size
 
     debug = False
     if debug:
@@ -87,7 +97,10 @@ def test_cutlass_w4a8_moe(M, N, K, E, ep_size, topk, group_size, dtype):
         )
 
     w1_q, w1_scale = pack_interleave(local_e, ref_weight_1, scale_1)
-    w2_q, w2_scale = pack_interleave(local_e, ref_weight_2, scale_2)
+    if use_ep_moe:
+        w2_q, w2_scale = pack_interleave(local_e, ref_weight_2, scale_2)
+    else:
+        w2_q, w2_scale = pack_interleave(local_e, ref_weight_2, scale_2, 1)
 
     device = "cuda"
     a_strides1 = torch.full((local_e, 3), K, device=device, dtype=torch.int64)
@@ -100,11 +113,12 @@ def test_cutlass_w4a8_moe(M, N, K, E, ep_size, topk, group_size, dtype):
     s_strides2 = c_strides2
 
     score = torch.randn((M, E), dtype=dtype, device=device)
-    topk_weights, topk_ids, _ = select_experts(
+    topk_output = select_experts(
         hidden_states=a,
         router_logits=score,
-        top_k=topk,
+        topk_config=TopKConfig(top_k=topk, renormalize=False),
     )
+    topk_weights, topk_ids, _ = topk_output
     expert_map = torch.arange(E, dtype=torch.int32, device=device)
     expert_map[local_e:] = E
 
@@ -264,7 +278,9 @@ def ref(
 
         gate, fc1 = fc1.chunk(2, dim=-1)
         fc1 = fc1 * torch.nn.functional.silu(gate)
-        act = (fc1 / pre_quant_scale_2.float()).to(torch.float8_e4m3fn)
+        act = torch.clamp((fc1 / pre_quant_scale_2.float()), -448.0, 448.0).to(
+            torch.float8_e4m3fn
+        )
         act = act.to(dtype)
 
         w2 = ref_weight_2[e_idx]
