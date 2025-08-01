@@ -146,7 +146,7 @@ class Step3TextMoEMLP(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
 
-        if global_server_args_dict["enable_deepep_moe"]:
+        if global_server_args_dict["moe_a2a_backend"].is_deepep():
             raise NotImplementedError("DeepEP MoE is not supported yet in Step3 model.")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
