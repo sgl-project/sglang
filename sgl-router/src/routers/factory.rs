@@ -45,6 +45,8 @@ impl RouterFactory {
             policy,
             router_config.worker_startup_timeout_secs,
             router_config.worker_startup_check_interval_secs,
+            router_config.dp_aware,
+            router_config.api_key.clone(),
         )?;
 
         Ok(Box::new(router))

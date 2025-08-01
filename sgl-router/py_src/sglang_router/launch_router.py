@@ -50,6 +50,8 @@ class RouterArgs:
     eviction_interval: int = 60
     max_tree_size: int = 2**24
     max_payload_size: int = 256 * 1024 * 1024  # 256MB default for large batches
+    dp_aware: bool = False
+    api_key: Optional[str] = None
     log_dir: Optional[str] = None
     log_level: Optional[str] = None
     # Service discovery configuration
@@ -66,6 +68,12 @@ class RouterArgs:
     prometheus_host: Optional[str] = None
     # Request ID headers configuration
     request_id_headers: Optional[List[str]] = None
+    # Request timeout in seconds
+    request_timeout_secs: int = 600
+    # Max concurrent requests for rate limiting
+    max_concurrent_requests: int = 64
+    # CORS allowed origins
+    cors_allowed_origins: List[str] = dataclasses.field(default_factory=list)
 
     @staticmethod
     def add_cli_args(
@@ -137,10 +145,11 @@ class RouterArgs:
         )
         parser.add_argument(
             f"--{prefix}prefill",
-            nargs=2,
+            nargs="+",
             action="append",
-            metavar=("URL", "BOOTSTRAP_PORT"),
-            help="Prefill server URL and bootstrap port. Can be specified multiple times. BOOTSTRAP_PORT can be 'none' for no bootstrap port.",
+            help="Prefill server URL and optional bootstrap port. Can be specified multiple times. "
+            "Format: --prefill URL [BOOTSTRAP_PORT]. "
+            "BOOTSTRAP_PORT can be a port number, 'none', or omitted (defaults to none).",
         )
         parser.add_argument(
             f"--{prefix}decode",
@@ -196,6 +205,17 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_payload_size,
             help="Maximum payload size in bytes",
+        )
+        parser.add_argument(
+            f"--{prefix}dp-aware",
+            action="store_true",
+            help="Enable data parallelism aware schedule",
+        )
+        parser.add_argument(
+            f"--{prefix}api-key",
+            type=str,
+            default=None,
+            help="The api key used for the authorization with the worker.  Useful when the dp aware scheduling strategy is enaled.",
         )
         parser.add_argument(
             f"--{prefix}log-dir",
@@ -263,6 +283,25 @@ class RouterArgs:
             nargs="*",
             help="Custom HTTP headers to check for request IDs (e.g., x-request-id x-trace-id). If not specified, uses common defaults.",
         )
+        parser.add_argument(
+            f"--{prefix}request-timeout-secs",
+            type=int,
+            default=RouterArgs.request_timeout_secs,
+            help="Request timeout in seconds",
+        )
+        parser.add_argument(
+            f"--{prefix}max-concurrent-requests",
+            type=int,
+            default=RouterArgs.max_concurrent_requests,
+            help="Maximum number of concurrent requests allowed (for rate limiting)",
+        )
+        parser.add_argument(
+            f"--{prefix}cors-allowed-origins",
+            type=str,
+            nargs="*",
+            default=[],
+            help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
+        )
 
     @classmethod
     def from_cli_args(
@@ -304,6 +343,8 @@ class RouterArgs:
             eviction_interval=getattr(args, f"{prefix}eviction_interval"),
             max_tree_size=getattr(args, f"{prefix}max_tree_size"),
             max_payload_size=getattr(args, f"{prefix}max_payload_size"),
+            dp_aware=getattr(args, f"{prefix}dp_aware", False),
+            api_key=getattr(args, f"{prefix}api_key", None),
             log_dir=getattr(args, f"{prefix}log_dir", None),
             log_level=getattr(args, f"{prefix}log_level", None),
             service_discovery=getattr(args, f"{prefix}service_discovery", False),
@@ -322,6 +363,15 @@ class RouterArgs:
             prometheus_port=getattr(args, f"{prefix}prometheus_port", None),
             prometheus_host=getattr(args, f"{prefix}prometheus_host", None),
             request_id_headers=getattr(args, f"{prefix}request_id_headers", None),
+            request_timeout_secs=getattr(
+                args, f"{prefix}request_timeout_secs", RouterArgs.request_timeout_secs
+            ),
+            max_concurrent_requests=getattr(
+                args,
+                f"{prefix}max_concurrent_requests",
+                RouterArgs.max_concurrent_requests,
+            ),
+            cors_allowed_origins=getattr(args, f"{prefix}cors_allowed_origins", []),
         )
 
     @staticmethod
@@ -340,24 +390,36 @@ class RouterArgs:
     def _parse_prefill_urls(prefill_list):
         """Parse prefill URLs from --prefill arguments.
 
-        Format: --prefill URL BOOTSTRAP_PORT
-        Example: --prefill http://prefill1:8080 9000 --prefill http://prefill2:8080 none
+        Format: --prefill URL [BOOTSTRAP_PORT]
+        Example:
+            --prefill http://prefill1:8080 9000  # With bootstrap port
+            --prefill http://prefill2:8080 none  # Explicitly no bootstrap port
+            --prefill http://prefill3:8080       # Defaults to no bootstrap port
         """
         if not prefill_list:
             return []
 
         prefill_urls = []
-        for url, bootstrap_port_str in prefill_list:
-            # Handle 'none' as None
-            if bootstrap_port_str.lower() == "none":
-                bootstrap_port = None
+        for prefill_args in prefill_list:
+
+            url = prefill_args[0]
+
+            # Handle optional bootstrap port
+            if len(prefill_args) >= 2:
+                bootstrap_port_str = prefill_args[1]
+                # Handle 'none' as None
+                if bootstrap_port_str.lower() == "none":
+                    bootstrap_port = None
+                else:
+                    try:
+                        bootstrap_port = int(bootstrap_port_str)
+                    except ValueError:
+                        raise ValueError(
+                            f"Invalid bootstrap port: {bootstrap_port_str}. Must be a number or 'none'"
+                        )
             else:
-                try:
-                    bootstrap_port = int(bootstrap_port_str)
-                except ValueError:
-                    raise ValueError(
-                        f"Invalid bootstrap port: {bootstrap_port_str}. Must be a number or 'none'"
-                    )
+                # No bootstrap port specified, default to None
+                bootstrap_port = None
 
             prefill_urls.append((url, bootstrap_port))
 
@@ -463,6 +525,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             eviction_interval_secs=router_args.eviction_interval,
             max_tree_size=router_args.max_tree_size,
             max_payload_size=router_args.max_payload_size,
+            dp_aware=router_args.dp_aware,
+            api_key=router_args.api_key,
             log_dir=router_args.log_dir,
             log_level=router_args.log_level,
             service_discovery=router_args.service_discovery,
@@ -473,6 +537,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             decode_selector=router_args.decode_selector,
             prometheus_port=router_args.prometheus_port,
             prometheus_host=router_args.prometheus_host,
+            request_timeout_secs=router_args.request_timeout_secs,
             pd_disaggregation=router_args.pd_disaggregation,
             prefill_urls=(
                 router_args.prefill_urls if router_args.pd_disaggregation else None
@@ -491,6 +556,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
                 else None
             ),
             request_id_headers=router_args.request_id_headers,
+            max_concurrent_requests=router_args.max_concurrent_requests,
+            cors_allowed_origins=router_args.cors_allowed_origins,
         )
 
         router.start()
@@ -524,13 +591,20 @@ Examples:
 
   # PD disaggregated mode with same policy for both
   python -m sglang_router.launch_router --pd-disaggregation \\
-    --prefill http://prefill1:8000 9000 --prefill http://prefill2:8000 none \\
+    --prefill http://prefill1:8000 9000 --prefill http://prefill2:8000 \\
     --decode http://decode1:8001 --decode http://decode2:8001 \\
     --policy cache_aware
 
+  # PD mode with optional bootstrap ports
+  python -m sglang_router.launch_router --pd-disaggregation \\
+    --prefill http://prefill1:8000 9000 \\    # With bootstrap port
+    --prefill http://prefill2:8000 none \\    # Explicitly no bootstrap port
+    --prefill http://prefill3:8000 \\         # Defaults to no bootstrap port
+    --decode http://decode1:8001 --decode http://decode2:8001
+
   # PD mode with different policies for prefill and decode
   python -m sglang_router.launch_router --pd-disaggregation \\
-    --prefill http://prefill1:8000 9000 --prefill http://prefill2:8000 none \\
+    --prefill http://prefill1:8000 --prefill http://prefill2:8000 \\
     --decode http://decode1:8001 --decode http://decode2:8001 \\
     --prefill-policy cache_aware --decode-policy power_of_two
 

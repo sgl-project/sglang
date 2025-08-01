@@ -176,6 +176,8 @@ class BaseMultimodalProcessor(ABC):
             "image_grid_hws": Modality.IMAGE,
             "aspect_ratio_ids": Modality.IMAGE,
             "aspect_ratio_mask": Modality.IMAGE,
+            "num_patches": Modality.IMAGE,
+            "patch_pixel_values": Modality.IMAGE,
             # Audio-related attributes
             "audio_features": Modality.AUDIO,
             "audio_feature_lens": Modality.AUDIO,
@@ -192,7 +194,12 @@ class BaseMultimodalProcessor(ABC):
 
         # name of the feature filed
         # TODO: pass from processors
-        self.FEATURE_NAMES = ["pixel_values", "pixel_values_videos", "audio_features"]
+        self.FEATURE_NAMES = [
+            "pixel_values",
+            "pixel_values_videos",
+            "audio_features",
+            "input_features",
+        ]
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs

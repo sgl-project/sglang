@@ -1,10 +1,18 @@
-use actix_web::{middleware, web, App, HttpRequest, HttpResponse, HttpServer};
-use futures_util::StreamExt;
+use axum::{
+    extract::{Json, State},
+    http::StatusCode,
+    response::sse::{Event, KeepAlive},
+    response::{IntoResponse, Response, Sse},
+    routing::{get, post},
+    Router,
+};
+use futures_util::stream::{self, StreamExt};
 use serde_json::json;
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use uuid;
+use uuid::Uuid;
 
 /// Configuration for mock worker behavior
 #[derive(Clone)]
@@ -17,6 +25,7 @@ pub struct MockWorkerConfig {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum WorkerType {
     Regular,
     Prefill,
@@ -24,6 +33,7 @@ pub enum WorkerType {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum HealthStatus {
     Healthy,
     Unhealthy,
@@ -33,14 +43,16 @@ pub enum HealthStatus {
 /// Mock worker server for testing
 pub struct MockWorker {
     config: Arc<RwLock<MockWorkerConfig>>,
-    server_handle: Option<actix_web::dev::ServerHandle>,
+    shutdown_handle: Option<tokio::task::JoinHandle<()>>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl MockWorker {
     pub fn new(config: MockWorkerConfig) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
-            server_handle: None,
+            shutdown_handle: None,
+            shutdown_tx: None,
         }
     }
 
@@ -49,51 +61,79 @@ impl MockWorker {
         let config = self.config.clone();
         let port = config.read().await.port;
 
-        let server = HttpServer::new(move || {
-            App::new()
-                .app_data(web::Data::new(config.clone()))
-                .wrap(middleware::Logger::default())
-                .route("/health", web::get().to(health_handler))
-                .route("/health_generate", web::get().to(health_generate_handler))
-                .route("/get_server_info", web::get().to(server_info_handler))
-                .route("/get_model_info", web::get().to(model_info_handler))
-                .route("/generate", web::post().to(generate_handler))
-                .route(
-                    "/v1/chat/completions",
-                    web::post().to(chat_completions_handler),
-                )
-                .route("/v1/completions", web::post().to(completions_handler))
-                .route("/flush_cache", web::post().to(flush_cache_handler))
-                .route("/v1/models", web::get().to(v1_models_handler))
-        })
-        .bind(("127.0.0.1", port))?
-        .run();
+        // If port is 0, find an available port
+        let port = if port == 0 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let port = listener.local_addr()?.port();
+            drop(listener);
+            config.write().await.port = port;
+            port
+        } else {
+            port
+        };
 
-        let handle = server.handle();
-        self.server_handle = Some(handle);
+        let app = Router::new()
+            .route("/health", get(health_handler))
+            .route("/health_generate", get(health_generate_handler))
+            .route("/get_server_info", get(server_info_handler))
+            .route("/get_model_info", get(model_info_handler))
+            .route("/generate", post(generate_handler))
+            .route("/v1/chat/completions", post(chat_completions_handler))
+            .route("/v1/completions", post(completions_handler))
+            .route("/flush_cache", post(flush_cache_handler))
+            .route("/v1/models", get(v1_models_handler))
+            .with_state(config);
 
-        tokio::spawn(server);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        self.shutdown_tx = Some(shutdown_tx);
 
-        Ok(format!("http://127.0.0.1:{}", port))
+        // Spawn the server in a separate task
+        let handle = tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Failed to bind to port {}: {}", port, e);
+                    return;
+                }
+            };
+
+            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            });
+
+            if let Err(e) = server.await {
+                eprintln!("Server error: {}", e);
+            }
+        });
+
+        self.shutdown_handle = Some(handle);
+
+        // Wait for the server to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("http://127.0.0.1:{}", port);
+        Ok(url)
     }
 
     /// Stop the mock worker server
     pub async fn stop(&mut self) {
-        if let Some(handle) = self.server_handle.take() {
-            // First try graceful stop with short timeout
-            handle.stop(false);
-            // Give it a moment to stop gracefully
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+
+        if let Some(handle) = self.shutdown_handle.take() {
+            // Wait for the server to shut down
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), handle).await;
         }
     }
+}
 
-    /// Update the mock worker configuration
-    pub async fn update_config<F>(&self, updater: F)
-    where
-        F: FnOnce(&mut MockWorkerConfig),
-    {
-        let mut config = self.config.write().await;
-        updater(&mut *config);
+impl Drop for MockWorker {
+    fn drop(&mut self) {
+        // Clean shutdown when dropped
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
     }
 }
 
@@ -104,65 +144,77 @@ async fn should_fail(config: &MockWorkerConfig) -> bool {
     rand::random::<f32>() < config.fail_rate
 }
 
-async fn health_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> HttpResponse {
+async fn health_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
     let config = config.read().await;
 
-    // Note: We don't apply fail_rate to health endpoint to allow workers to be added successfully
-    // fail_rate is only applied to actual request endpoints
-
     match config.health_status {
-        HealthStatus::Healthy => HttpResponse::Ok().json(json!({
+        HealthStatus::Healthy => Json(json!({
             "status": "healthy",
             "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
             "worker_type": format!("{:?}", config.worker_type),
-        })),
-        HealthStatus::Unhealthy => HttpResponse::ServiceUnavailable().json(json!({
-            "status": "unhealthy",
-            "error": "Worker is not responding"
-        })),
-        HealthStatus::Degraded => HttpResponse::Ok().json(json!({
+        }))
+        .into_response(),
+        HealthStatus::Unhealthy => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "unhealthy",
+                "error": "Worker is not responding"
+            })),
+        )
+            .into_response(),
+        HealthStatus::Degraded => Json(json!({
             "status": "degraded",
             "warning": "High load detected"
-        })),
+        }))
+        .into_response(),
     }
 }
 
-async fn health_generate_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> HttpResponse {
+async fn health_generate_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
     let config = config.read().await;
 
-    // Simulate failure based on fail_rate
     if should_fail(&config).await {
-        return HttpResponse::InternalServerError().json(json!({
-            "error": "Random failure for testing"
-        }));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "Random failure for testing"
+            })),
+        )
+            .into_response();
     }
 
     if matches!(config.health_status, HealthStatus::Healthy) {
-        HttpResponse::Ok().json(json!({
+        Json(json!({
             "status": "ok",
             "queue_length": 0,
             "processing_time_ms": config.response_delay_ms
         }))
+        .into_response()
     } else {
-        HttpResponse::ServiceUnavailable().json(json!({
-            "error": "Generation service unavailable"
-        }))
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "Generation service unavailable"
+            })),
+        )
+            .into_response()
     }
 }
 
-async fn server_info_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> HttpResponse {
+async fn server_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
     let config = config.read().await;
 
-    // Simulate failure based on fail_rate
     if should_fail(&config).await {
-        return HttpResponse::InternalServerError().json(json!({
-            "error": "Random failure for testing"
-        }));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "Random failure for testing"
+            })),
+        )
+            .into_response();
     }
 
-    // Return response matching actual sglang server implementation
-    HttpResponse::Ok().json(json!({
-        // Server args fields
+    Json(json!({
         "model_path": "mock-model-path",
         "tokenizer_path": "mock-tokenizer-path",
         "port": config.port,
@@ -183,8 +235,6 @@ async fn server_info_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -
         "enable_torch_compile": false,
         "trust_remote_code": false,
         "show_time_cost": false,
-
-        // Scheduler info fields
         "waiting_queue_size": 0,
         "running_queue_size": 0,
         "req_to_token_ratio": 1.2,
@@ -194,28 +244,29 @@ async fn server_info_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -
         "max_batch_tokens": 32768,
         "schedule_policy": "lpm",
         "schedule_conservativeness": 1.0,
-
-        // Additional fields
         "version": "0.3.0",
         "internal_states": [{
             "waiting_queue_size": 0,
             "running_queue_size": 0
         }]
     }))
+    .into_response()
 }
 
-async fn model_info_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> HttpResponse {
+async fn model_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
     let config = config.read().await;
 
-    // Simulate failure based on fail_rate
     if should_fail(&config).await {
-        return HttpResponse::InternalServerError().json(json!({
-            "error": "Random failure for testing"
-        }));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "Random failure for testing"
+            })),
+        )
+            .into_response();
     }
 
-    // Return response matching actual sglang server implementation
-    HttpResponse::Ok().json(json!({
+    Json(json!({
         "model_path": "mock-model-path",
         "tokenizer_path": "mock-tokenizer-path",
         "is_generation": true,
@@ -226,23 +277,25 @@ async fn model_info_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) ->
             "max_tokens": 2048
         }
     }))
+    .into_response()
 }
 
 async fn generate_handler(
-    config: web::Data<Arc<RwLock<MockWorkerConfig>>>,
-    _req: HttpRequest,
-    payload: web::Json<serde_json::Value>,
-) -> HttpResponse {
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
     let config = config.read().await;
 
-    // Simulate failure based on fail_rate
     if should_fail(&config).await {
-        return HttpResponse::InternalServerError().json(json!({
-            "error": "Random failure for testing"
-        }));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "Random failure for testing"
+            })),
+        )
+            .into_response();
     }
 
-    // Simulate processing delay
     if config.response_delay_ms > 0 {
         tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
     }
@@ -253,92 +306,106 @@ async fn generate_handler(
         .unwrap_or(false);
 
     if is_stream {
-        // Return streaming response matching sglang format
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
         let stream_delay = config.response_delay_ms;
-        let request_id = format!("mock-req-{}", rand::random::<u32>());
 
-        tokio::spawn(async move {
-            let tokens = vec!["This ", "is ", "a ", "mock ", "response."];
+        // Check if it's a batch request
+        let is_batch = payload.get("text").and_then(|t| t.as_array()).is_some();
+
+        let batch_size = if is_batch {
+            payload
+                .get("text")
+                .and_then(|t| t.as_array())
+                .map(|arr| arr.len())
+                .unwrap_or(1)
+        } else {
+            1
+        };
+
+        let mut events = Vec::new();
+
+        // Generate events for each item in batch
+        for i in 0..batch_size {
             let timestamp_start = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs_f64();
 
-            for (i, token) in tokens.iter().enumerate() {
-                let chunk = json!({
-                    "text": token,
-                    "meta_info": {
-                        "id": &request_id,
-                        "finish_reason": if i == tokens.len() - 1 {
-                            json!({"type": "stop", "matched_stop": null})
-                        } else {
-                            json!(null)
-                        },
-                        "prompt_tokens": 10,
-                        "completion_tokens": i + 1,
-                        "cached_tokens": 0,
-                        "e2e_latency": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64() - timestamp_start
+            let data = json!({
+                "text": format!("Mock response {}", i + 1),
+                "meta_info": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "completion_tokens_wo_jump_forward": 5,
+                    "input_token_logprobs": null,
+                    "output_token_logprobs": null,
+                    "first_token_latency": stream_delay as f64 / 1000.0,
+                    "time_to_first_token": stream_delay as f64 / 1000.0,
+                    "time_per_output_token": 0.01,
+                    "end_time": timestamp_start + (stream_delay as f64 / 1000.0),
+                    "start_time": timestamp_start,
+                    "finish_reason": {
+                        "type": "stop",
+                        "reason": "length"
                     }
-                });
+                },
+                "stage": "mid"
+            });
 
-                if tx
-                    .send(format!(
-                        "data: {}\n\n",
-                        serde_json::to_string(&chunk).unwrap()
-                    ))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
+            events.push(Ok::<_, Infallible>(Event::default().data(data.to_string())));
+        }
 
-                if stream_delay > 0 {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(stream_delay)).await;
-                }
-            }
+        // Add [DONE] event
+        events.push(Ok(Event::default().data("[DONE]")));
 
-            let _ = tx.send("data: [DONE]\n\n".to_string()).await;
-        });
+        let stream = stream::iter(events);
 
-        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-
-        HttpResponse::Ok()
-            .content_type("text/event-stream")
-            .insert_header(("Cache-Control", "no-cache"))
-            .streaming(stream.map(|chunk| Ok::<_, actix_web::Error>(bytes::Bytes::from(chunk))))
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
     } else {
-        // Return non-streaming response matching sglang format
-        let request_id = format!("mock-req-{}", rand::random::<u32>());
-
-        HttpResponse::Ok().json(json!({
-            "text": "Mock generated response for the input",
+        Json(json!({
+            "text": "This is a mock response.",
             "meta_info": {
-                "id": request_id,
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "completion_tokens_wo_jump_forward": 5,
+                "input_token_logprobs": null,
+                "output_token_logprobs": null,
+                "first_token_latency": config.response_delay_ms as f64 / 1000.0,
+                "time_to_first_token": config.response_delay_ms as f64 / 1000.0,
+                "time_per_output_token": 0.01,
                 "finish_reason": {
                     "type": "stop",
-                    "matched_stop": null
-                },
-                "prompt_tokens": 10,
-                "completion_tokens": 7,
-                "cached_tokens": 0,
-                "e2e_latency": 0.042
+                    "reason": "length"
+                }
             }
         }))
+        .into_response()
     }
 }
 
 async fn chat_completions_handler(
-    config: web::Data<Arc<RwLock<MockWorkerConfig>>>,
-    payload: web::Json<serde_json::Value>,
-) -> HttpResponse {
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
     let config = config.read().await;
 
-    // Simulate failure
-    if rand::random::<f32>() < config.fail_rate {
-        return HttpResponse::InternalServerError().json(json!({
-            "error": "Chat completion failed"
-        }));
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "message": "Random failure for testing",
+                    "type": "internal_error",
+                    "code": "internal_error"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
     }
 
     let is_stream = payload
@@ -346,363 +413,201 @@ async fn chat_completions_handler(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
     if is_stream {
-        // Return proper streaming response for chat completions
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
-        let stream_delay = config.response_delay_ms;
-        let model = payload
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or("mock-model")
-            .to_string();
+        let request_id = format!("chatcmpl-{}", Uuid::new_v4());
 
-        tokio::spawn(async move {
-            let chat_id = format!("chatcmpl-mock{}", rand::random::<u32>());
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-
-            // Send initial chunk with role
-            let initial_chunk = json!({
-                "id": &chat_id,
+        let stream = stream::once(async move {
+            let chunk = json!({
+                "id": request_id,
                 "object": "chat.completion.chunk",
                 "created": timestamp,
-                "model": &model,
+                "model": "mock-model",
                 "choices": [{
                     "index": 0,
                     "delta": {
-                        "role": "assistant"
+                        "content": "This is a mock chat response."
                     },
                     "finish_reason": null
                 }]
             });
 
-            let _ = tx
-                .send(format!(
-                    "data: {}\n\n",
-                    serde_json::to_string(&initial_chunk).unwrap()
-                ))
-                .await;
+            Ok::<_, Infallible>(Event::default().data(chunk.to_string()))
+        })
+        .chain(stream::once(async { Ok(Event::default().data("[DONE]")) }));
 
-            // Send content chunks
-            let content_chunks = [
-                "This ",
-                "is ",
-                "a ",
-                "mock ",
-                "streaming ",
-                "chat ",
-                "response.",
-            ];
-            for chunk in content_chunks.iter() {
-                let data = json!({
-                    "id": &chat_id,
-                    "object": "chat.completion.chunk",
-                    "created": timestamp,
-                    "model": &model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "content": chunk
-                        },
-                        "finish_reason": null
-                    }]
-                });
-
-                if tx
-                    .send(format!(
-                        "data: {}\n\n",
-                        serde_json::to_string(&data).unwrap()
-                    ))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-
-                if stream_delay > 0 {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(stream_delay)).await;
-                }
-            }
-
-            // Send final chunk with finish_reason
-            let final_chunk = json!({
-                "id": &chat_id,
-                "object": "chat.completion.chunk",
-                "created": timestamp,
-                "model": &model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop"
-                }]
-            });
-
-            let _ = tx
-                .send(format!(
-                    "data: {}\n\n",
-                    serde_json::to_string(&final_chunk).unwrap()
-                ))
-                .await;
-            let _ = tx.send("data: [DONE]\n\n".to_string()).await;
-        });
-
-        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-
-        HttpResponse::Ok()
-            .content_type("text/event-stream")
-            .insert_header(("Cache-Control", "no-cache"))
-            .streaming(stream.map(|chunk| Ok::<_, actix_web::Error>(bytes::Bytes::from(chunk))))
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
     } else {
-        // Non-streaming response matching OpenAI format
-        let model = payload
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or("mock-model")
-            .to_string();
-
-        HttpResponse::Ok().json(json!({
-            "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+        Json(json!({
+            "id": format!("chatcmpl-{}", Uuid::new_v4()),
             "object": "chat.completion",
-            "created": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            "model": model,
+            "created": timestamp,
+            "model": "mock-model",
             "choices": [{
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": "This is a mock chat completion response."
+                    "content": "This is a mock chat response."
                 },
-                "logprobs": null,
-                "finish_reason": "stop",
-                "matched_stop": null
+                "finish_reason": "stop"
             }],
             "usage": {
                 "prompt_tokens": 10,
-                "completion_tokens": 8,
-                "total_tokens": 18,
-                "prompt_tokens_details": {
-                    "cached_tokens": 0
-                }
+                "completion_tokens": 5,
+                "total_tokens": 15
             }
         }))
+        .into_response()
     }
 }
 
 async fn completions_handler(
-    config: web::Data<Arc<RwLock<MockWorkerConfig>>>,
-    payload: web::Json<serde_json::Value>,
-) -> HttpResponse {
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
     let config = config.read().await;
 
-    if rand::random::<f32>() < config.fail_rate {
-        return HttpResponse::InternalServerError().json(json!({
-            "error": "Completion failed"
-        }));
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "message": "Random failure for testing",
+                    "type": "internal_error",
+                    "code": "internal_error"
+                }
+            })),
+        )
+            .into_response();
     }
 
-    // Check if streaming is requested
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+
     let is_stream = payload
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let prompts = payload
-        .get("prompt")
-        .map(|p| {
-            if p.is_array() {
-                p.as_array().unwrap().len()
-            } else {
-                1
-            }
-        })
-        .unwrap_or(1);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
 
     if is_stream {
-        // Return streaming response for completions
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
-        let stream_delay = config.response_delay_ms;
-        let model = payload
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or("mock-model")
-            .to_string();
+        let request_id = format!("cmpl-{}", Uuid::new_v4());
 
-        tokio::spawn(async move {
-            let completion_id = format!("cmpl-mock{}", rand::random::<u32>());
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+        let stream = stream::once(async move {
+            let chunk = json!({
+                "id": request_id,
+                "object": "text_completion",
+                "created": timestamp,
+                "model": "mock-model",
+                "choices": [{
+                    "text": "This is a mock completion.",
+                    "index": 0,
+                    "logprobs": null,
+                    "finish_reason": null
+                }]
+            });
 
-            // Stream completions for each prompt
-            for prompt_idx in 0..prompts {
-                let prompt_suffix = format!("{} ", prompt_idx);
-                let tokens = vec!["This ", "is ", "mock ", "completion ", &prompt_suffix];
+            Ok::<_, Infallible>(Event::default().data(chunk.to_string()))
+        })
+        .chain(stream::once(async { Ok(Event::default().data("[DONE]")) }));
 
-                for (token_idx, token) in tokens.iter().enumerate() {
-                    let data = json!({
-                        "id": &completion_id,
-                        "object": "text_completion",
-                        "created": timestamp,
-                        "model": &model,
-                        "choices": [{
-                            "text": token,
-                            "index": prompt_idx,
-                            "logprobs": null,
-                            "finish_reason": if token_idx == tokens.len() - 1 { Some("stop") } else { None }
-                        }]
-                    });
-
-                    if tx
-                        .send(format!(
-                            "data: {}\n\n",
-                            serde_json::to_string(&data).unwrap()
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-
-                    if stream_delay > 0 {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(stream_delay)).await;
-                    }
-                }
-            }
-
-            let _ = tx.send("data: [DONE]\n\n".to_string()).await;
-        });
-
-        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-
-        HttpResponse::Ok()
-            .content_type("text/event-stream")
-            .insert_header(("Cache-Control", "no-cache"))
-            .streaming(stream.map(|chunk| Ok::<_, actix_web::Error>(bytes::Bytes::from(chunk))))
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
     } else {
-        // Return non-streaming response
-        let mut choices = vec![];
-        for i in 0..prompts {
-            choices.push(json!({
-                "text": format!("Mock completion {}", i),
-                "index": i,
+        Json(json!({
+            "id": format!("cmpl-{}", Uuid::new_v4()),
+            "object": "text_completion",
+            "created": timestamp,
+            "model": "mock-model",
+            "choices": [{
+                "text": "This is a mock completion.",
+                "index": 0,
                 "logprobs": null,
                 "finish_reason": "stop"
-            }));
-        }
-
-        HttpResponse::Ok().json(json!({
-            "id": format!("cmpl-mock{}", rand::random::<u32>()),
-            "object": "text_completion",
-            "created": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            "model": payload.get("model").and_then(|m| m.as_str()).unwrap_or("mock-model"),
-            "choices": choices,
+            }],
             "usage": {
-                "prompt_tokens": 5 * prompts,
-                "completion_tokens": 10 * prompts,
-                "total_tokens": 15 * prompts
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
             }
         }))
+        .into_response()
     }
 }
 
-async fn flush_cache_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> HttpResponse {
+async fn flush_cache_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
     let config = config.read().await;
 
-    // Simulate failure based on fail_rate
     if should_fail(&config).await {
-        return HttpResponse::InternalServerError().json(json!({
-            "error": "Random failure for testing"
-        }));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "Random failure for testing"
+            })),
+        )
+            .into_response();
     }
 
-    HttpResponse::Ok().json(json!({
-        "status": "success",
-        "message": "Cache flushed",
-        "freed_entries": 42
+    Json(json!({
+        "message": "Cache flushed successfully"
     }))
+    .into_response()
 }
 
-async fn v1_models_handler(config: web::Data<Arc<RwLock<MockWorkerConfig>>>) -> HttpResponse {
+async fn v1_models_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
     let config = config.read().await;
 
-    // Simulate failure based on fail_rate
     if should_fail(&config).await {
-        return HttpResponse::InternalServerError().json(json!({
-            "error": "Random failure for testing"
-        }));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "message": "Random failure for testing",
+                    "type": "internal_error",
+                    "code": "internal_error"
+                }
+            })),
+        )
+            .into_response();
     }
 
-    HttpResponse::Ok().json(json!({
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    Json(json!({
         "object": "list",
         "data": [{
-            "id": "mock-model-v1",
+            "id": "mock-model",
             "object": "model",
-            "created": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            "owned_by": "sglang",
-            "permission": [{
-                "id": "modelperm-mock",
-                "object": "model_permission",
-                "created": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-                "allow_create_engine": false,
-                "allow_sampling": true,
-                "allow_logprobs": true,
-                "allow_search_indices": false,
-                "allow_view": true,
-                "allow_fine_tuning": false,
-                "organization": "*",
-                "group": null,
-                "is_blocking": false
-            }],
-            "root": "mock-model-v1",
-            "parent": null
+            "created": timestamp,
+            "owned_by": "organization-owner"
         }]
     }))
+    .into_response()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_mock_worker_lifecycle() {
-        let config = MockWorkerConfig {
-            port: 18080,
+impl Default for MockWorkerConfig {
+    fn default() -> Self {
+        Self {
+            port: 0,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
-        };
-
-        let mut worker = MockWorker::new(config);
-
-        // Start the worker
-        let url = worker.start().await.unwrap();
-        assert_eq!(url, "http://127.0.0.1:18080");
-
-        // Give server time to start
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Test health endpoint
-        let client = reqwest::Client::new();
-        let resp = client.get(&format!("{}/health", url)).send().await.unwrap();
-
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["status"], "healthy");
-
-        // Update config to unhealthy
-        worker
-            .update_config(|c| c.health_status = HealthStatus::Unhealthy)
-            .await;
-
-        // Test health again
-        let resp = client.get(&format!("{}/health", url)).send().await.unwrap();
-
-        assert_eq!(resp.status(), 503);
-
-        // Stop the worker
-        worker.stop().await;
+        }
     }
 }

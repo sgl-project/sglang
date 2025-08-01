@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import bisect
+import gc
 import inspect
 import logging
 import os
@@ -73,6 +74,24 @@ def model_capture_mode():
     yield
 
     is_capture_mode = False
+
+
+@contextmanager
+def freeze_gc(enable_cudagraph_gc: bool):
+    """
+    Optimize garbage collection during CUDA graph capture.
+    Clean up, then freeze all remaining objects from being included
+    in future collections if GC is disabled during capture.
+    """
+    gc.collect()
+    should_freeze = not enable_cudagraph_gc
+    if should_freeze:
+        gc.freeze()
+    try:
+        yield
+    finally:
+        if should_freeze:
+            gc.unfreeze()
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
@@ -423,7 +442,12 @@ class CudaGraphRunner:
                 record_shapes=True,
             )
 
-        with graph_capture() as graph_capture_context:
+        # Trigger CUDA graph capture for specific shapes.
+        # Capture the large shapes first so that the smaller shapes
+        # can reuse the memory pool allocated for the large shapes.
+        with freeze_gc(
+            self.model_runner.server_args.enable_cudagraph_gc
+        ), graph_capture() as graph_capture_context:
             with profile_context as prof:
                 self.stream = graph_capture_context.stream
                 avail_mem = get_available_gpu_memory(

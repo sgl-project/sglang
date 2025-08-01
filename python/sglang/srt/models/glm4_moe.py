@@ -52,7 +52,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import (
     DeepEPMoE,
     get_moe_impl_class,
-    use_flashinfer_trtllm_moe,
+    should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -426,7 +426,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                 correction_bias=self.gate.e_score_correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
             )
-            if not use_flashinfer_trtllm_moe
+            if not should_use_flashinfer_trtllm_moe()
             else None
         )
 
@@ -465,7 +465,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                     topk_group=config.topk_group,
                     correction_bias=self.gate.e_score_correction_bias,
                 )
-                if use_flashinfer_trtllm_moe
+                if should_use_flashinfer_trtllm_moe()
                 else {}
             ),
         )

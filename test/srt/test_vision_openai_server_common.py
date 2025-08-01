@@ -71,7 +71,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                         },
                         {
                             "type": "text",
-                            "text": "Describe this image in a very short sentence.",
+                            "text": "Describe this image in a sentence.",
                         },
                     ],
                 },
@@ -119,7 +119,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                         },
                         {
                             "type": "text",
-                            "text": "Describe this image in a very short sentence.",
+                            "text": "Describe this image in a sentence.",
                         },
                     ],
                 },
@@ -455,7 +455,7 @@ class TestOpenAIVisionServer(CustomTestCase):
         content.append(
             {
                 "type": "text",
-                "text": "Describe this image in a very short sentence.",
+                "text": "Describe this image in a sentence.",
             }
         )
 
@@ -528,14 +528,20 @@ class TestOpenAIVisionServer(CustomTestCase):
         # a fragment of Trump's speech
         audio_response = self.get_audio_response(
             AUDIO_TRUMP_SPEECH_URL,
-            "I have an audio sample. Please repeat the person's words",
+            "Listen to this audio and write down the audio transcription in English.",
             category="speech",
         )
-        assert "thank you" in audio_response
-        assert "it's a privilege to be here" in audio_response
-        assert "leader" in audio_response
-        assert "science" in audio_response
-        assert "art" in audio_response
+        check_list = [
+            "thank you",
+            "it's a privilege to be here",
+            "leader",
+            "science",
+            "art",
+        ]
+        for check_word in check_list:
+            assert (
+                check_word in audio_response
+            ), f"audio_response: ｜{audio_response}｜ should contain ｜{check_word}｜"
 
     def _test_audio_ambient_completion(self):
         # bird song

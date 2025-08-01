@@ -94,6 +94,7 @@ jobs:
 
   upload:
     name: Upload to PyPI
+    if: github.repository == 'sgl-project/sglang'  # Ensure this job only runs for the sgl-project/sglang repository
     needs: [build, build-sdist]
     runs-on: ubuntu-latest
     steps:
