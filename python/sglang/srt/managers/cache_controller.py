@@ -236,6 +236,7 @@ class HiCacheController:
         self.enable_storage = False
         # todo: move backend initialization to storage backend module
         if storage_backend is not None:
+            self.storage_backend_type = storage_backend
             from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
 
             if storage_backend == "file":
@@ -573,6 +574,9 @@ class HiCacheController:
         self.storage_backend.batch_get(key_strs, buffer_ptrs, buffer_sizes)
         operation.increment(len(operation.hash_value) * self.page_size)
 
+    def is_mooncake_backend(self):
+        return self.storage_backend_type == "mooncake"
+
     def prefetch_io_aux_func(self):
         """
         Auxiliary function conducting IO operations for prefetching.
@@ -580,7 +584,7 @@ class HiCacheController:
         while not self.stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
-                if isinstance(self.storage_backend, MooncakeStore):
+                if self.is_mooncake_backend():
                     self.mooncake_page_transfer(operation)
                 else:
                     self.generic_page_transfer(operation)
@@ -615,14 +619,14 @@ class HiCacheController:
                     )
 
                     # todo, more unified interface
-                    if not isinstance(self.storage_backend, MooncakeStore):
+                    if not self.is_mooncake_backend():
                         if not self.storage_backend.exists(last_hash):
                             break
                     hash_value.append(last_hash)
                     storage_hit_count += self.page_size
                     remaining_tokens -= self.page_size
 
-                if isinstance(self.storage_backend, MooncakeStore):
+                if self.is_mooncake_backend():
                     # deferring to batch exists for mooncake store
                     exist_result = self.storage_backend.exists(hash_value)
                     storage_hit_count = (
@@ -744,7 +748,7 @@ class HiCacheController:
                     remaining_tokens -= self.page_size
                 operation.hash_value = hash_value
 
-                if isinstance(self.storage_backend, MooncakeStore):
+                if self.is_mooncake_backend():
                     self.mooncake_page_backup(operation)
                 else:
                     self.generic_page_backup(operation)
