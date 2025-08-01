@@ -51,7 +51,6 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import (
-    DeepEPMoE,
     get_moe_impl_class,
     should_use_flashinfer_trtllm_moe,
 )

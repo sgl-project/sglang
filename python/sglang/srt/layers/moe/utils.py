@@ -1,5 +1,4 @@
-from enum import Enum, auto
-from typing import Tuple, Union
+from enum import Enum
 
 
 class MoeA2ABackend(Enum):

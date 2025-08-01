@@ -278,15 +278,18 @@ class ServerArgs:
     def __post_init__(self):
 
         # Check deprecated arguments
+        def print_deprecated_warning(message: str):
+            logger.warning(f"\033[33m{message}\033[0m")
+
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
-            logger.warning(
-                "--enable-ep-moe is deprecated. Please set `--ep-size` to the same value as `--tp-size` instead."
+            print_deprecated_warning(
+                "NOTE: --enable-ep-moe is deprecated. Please set `--ep-size` to the same value as `--tp-size` instead."
             )
         if self.enable_deepep_moe:
             self.moe_a2a_backend = "deepep"
-            logger.warning(
-                "--enable-deepep-moe is deprecated. Please set `--moe-a2a-backend` to 'deepep' instead."
+            print_deprecated_warning(
+                "NOTE: --enable-deepep-moe is deprecated. Please set `--moe-a2a-backend` to 'deepep' instead."
             )
 
         # Set missing default values
