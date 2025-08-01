@@ -76,7 +76,7 @@ class Hf3fsMetadataInterface(ABC):
         pass
 
     @abstractmethod
-    def exists(self, rank: int, key: List[str]) -> List[bool]:
+    def exists(self, rank: int, keys: List[str]) -> List[bool]:
         """Check if the specified keys exist."""
         pass
 

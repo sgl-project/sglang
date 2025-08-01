@@ -148,10 +148,7 @@ async def exists(rank: int, request: Request):
     keys = data["keys"]
     metadata = get_rank_metadata(rank)
     with metadata.lock:
-        results = []
-        for key in keys:
-            key_exists = key in metadata.key_to_index
-            results.append(key_exists)
+        results = [key in metadata.key_to_index for key in keys]
         return {"exists": results}
 
 
@@ -231,11 +228,7 @@ async def get_page_indices(rank: int, request: Request):
     metadata = get_rank_metadata(rank)
     with metadata.lock:
         keys = data["keys"]
-        results = [None] * len(keys)
-
-        for i, key in enumerate(keys):
-            if key in metadata.key_to_index:
-                results[i] = metadata.key_to_index[key]
+        results = [metadata.key_to_index.get(key) for key in keys]
 
         return {"indices": results}
 
