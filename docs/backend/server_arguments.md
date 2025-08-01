@@ -148,7 +148,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--file-storage-path` | The path of the file storage in backend. | sglang_storage |
 | `--enable-cache-report` | Return number of cached tokens in usage.prompt_tokens_details for each openai request. | False |
 | `--reasoning-parser` | Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}. | None |
-| `--tool-call-parser` | Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', and 'kimi_k2'. | None |
+| `--tool-call-parser` | Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'. | None |
 
 ## Data parallelism
 
@@ -212,8 +212,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--ep-size` | The expert parallelism size. | 1 |
-| `--enable-ep-moe` | Enabling expert parallelism for moe. The ep size is equal to the tp size. | False |
-| `--enable-deepep-moe` | Enabling DeepEP MoE implementation for EP MoE. | False |
+| `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | None |
 | `--enable-flashinfer-cutlass-moe` | Enabling Flashinfer Cutlass MoE implementation for high throughput. | False |
 | `--enable-flashinfer-trtllm-moe` | Enabling Flashinfer Trtllm MoE implementation for low latency. | False |
 | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | auto |
