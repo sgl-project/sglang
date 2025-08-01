@@ -23,6 +23,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     parallel_state,
@@ -50,7 +51,6 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import (
-    DeepEPMoE,
     get_moe_impl_class,
     should_use_flashinfer_trtllm_moe,
 )
@@ -83,7 +83,6 @@ from sglang.srt.two_batch_overlap import (
 )
 from sglang.srt.utils import (
     BumpAllocator,
-    DeepEPMode,
     LazyValue,
     add_prefix,
     bind_or_assign,
@@ -443,15 +442,14 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
             **(
-                dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
-                if global_server_args_dict["enable_deepep_moe"]
+                dict(deepep_mode=global_server_args_dict["deepep_mode"])
+                if global_server_args_dict["moe_a2a_backend"].is_deepep()
                 else {}
             ),
             # Additional args for FusedMoE
             **(
                 dict(
                     enable_flashinfer_cutlass_moe=True,
-                    enable_ep_moe=global_server_args_dict["enable_ep_moe"],
                 )
                 if global_server_args_dict["enable_flashinfer_cutlass_moe"]
                 else {}
@@ -484,7 +482,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if global_server_args_dict["enable_deepep_moe"]
+                    if global_server_args_dict["moe_a2a_backend"].is_deepep()
                     else {}
                 ),
             )
@@ -502,9 +500,9 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
 
         self.top_k = config.num_experts_per_tok
 
-        if global_server_args_dict["enable_deepep_moe"]:
+        if global_server_args_dict["moe_a2a_backend"].is_deepep():
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_tensor_model_parallel_world_size()
+            self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
                 config.n_routed_experts
                 + global_server_args_dict["ep_num_redundant_experts"]
@@ -526,12 +524,12 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                 num_local_experts=config.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
-                deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
+                deepep_mode=global_server_args_dict["deepep_mode"],
                 async_finish=True,
                 return_recv_hook=True,
             )
 
-        self._enable_deepep_moe = global_server_args_dict["enable_deepep_moe"]
+        self._enable_deepep_moe = global_server_args_dict["moe_a2a_backend"].is_deepep()
 
 
 class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
@@ -737,11 +735,8 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Only GLM-4.5 on NV-platform with capability >= 80 can use shared experts fusion optimization."
-        elif (
-            global_server_args_dict["enable_deepep_moe"]
-            or global_server_args_dict["enable_ep_moe"]
-        ):
-            disable_reason = "Deepseek and GLM-4.5 can not use shared experts fusion optimization when in deepep_moe or ep_moe mode."
+        elif get_moe_expert_parallel_world_size() > 1:
+            disable_reason = "Deepseek and GLM-4.5 can not use shared experts fusion optimization under expert parallelism."
 
         if disable_reason is not None:
             global_server_args_dict["disable_shared_experts_fusion"] = True
