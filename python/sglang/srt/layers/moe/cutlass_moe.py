@@ -154,11 +154,11 @@ def cutlass_fused_experts_fp8(
     
     if is_sm100_supported():
         a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
+        rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
+        rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
     else:
-        a_q, a1_scale = per_token_group_quant_fp8_hopper_moe_mn_major(a, expert_offsets, problem_sizes1)
-
-    rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
-    rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
+        rep_a = shuffle_rows(a, a_map, (m * topk, k))
+        rep_a_q, rep_a1_scales = per_token_group_quant_fp8_hopper_moe_mn_major(rep_a, expert_offsets, problem_sizes1, 128)
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
     c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
@@ -193,7 +193,7 @@ def cutlass_fused_experts_fp8(
     if is_sm100_supported():
         intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
     else:
-        intemediate_q, a2_scale = per_token_group_quant_fp8_hopper_moe_mn_major(intermediate, expert_offsets, problem_sizes2)
+        intemediate_q, a2_scale = per_token_group_quant_fp8_hopper_moe_mn_major(intermediate, expert_offsets, problem_sizes2, 128)
 
     fp8_blockwise_scaled_grouped_mm(
         c2,
@@ -215,7 +215,7 @@ def cutlass_fused_experts_fp8(
         expert_offsets[:-1],
         workspace,
     )
-
+    print("topk_weights: ", topk_weights.dtype)
     result = torch.empty((m, k), device=device, dtype=out_dtype)
     apply_shuffle_mul_sum(c2, result, c_map, topk_weights.to(out_dtype))
     return result
