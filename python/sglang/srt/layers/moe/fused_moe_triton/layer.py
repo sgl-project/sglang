@@ -645,7 +645,8 @@ class FusedMoE(torch.nn.Module):
                         ep_rank=self.moe_ep_rank,
                         ep_size=self.moe_ep_size,
                     )
-                    if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod"
+                    if self.quant_method.__class__.__name__
+                    == "ModelOptNvFp4FusedMoEMethod"
                     else {}
                 ),
             )
