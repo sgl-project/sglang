@@ -31,6 +31,8 @@ class TestAscendTp2Bf16(CustomTestCase):
         cls.url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.common_args = [
             "--trust-remote-code",
+            "--disable-radix-cache",
+            "--disable-cuda-graph",
             "--mem-fraction-static",
             0.8,
             "--attention-backend",
