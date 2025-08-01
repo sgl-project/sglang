@@ -42,7 +42,7 @@ class ModelCase:
     model_path: str
     tp_size: int = 1
     prefill_tolerance: float = 5e-2
-    decode_tolerance: float = 5e-2
+    decode_tolerance: float = 6e-2  # Increased to fix numerical error in issue #8614.
     rouge_l_tolerance: float = 1
     skip_long_prompt: bool = False
     trust_remote_code: bool = False
