@@ -272,6 +272,9 @@ class ServerArgs:
     enable_pdmux: bool = False
     sm_group_num: int = 3
 
+    # Multimodal settings
+    max_num_image: Optional[int] = None
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -1837,6 +1840,12 @@ class ServerArgs:
             "--weight-loader-disable-mmap",
             action="store_true",
             help="Disable mmap while loading weight using safetensors.",
+        )
+        parser.add_argument(
+            "--max-num-images",
+            type=int,
+            default=None,
+            help="The maximum number of images allowed in a single multimodal request to prevent OOM errors.",
         )
 
     @classmethod
