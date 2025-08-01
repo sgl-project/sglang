@@ -506,7 +506,7 @@ class DeepseekV2MoE(nn.Module):
         else:
             kwargs["router_logits"] = router_logits
         final_hidden_states = self.experts(**kwargs)
-        if not _is_cuda and not _use_aiter or global_server_args_dict["enable_ep_moe"]:
+        if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
             # TODO: please fix me
             # However, biased_grouped_topk is not guaranteed to run *=self.routed_scaling_factor when not _is_cuda and not _use_aiter
