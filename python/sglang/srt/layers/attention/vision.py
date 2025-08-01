@@ -11,9 +11,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.srt.utils import is_cuda, print_info_once
+from sglang.srt.utils import is_cuda, print_info_once,is_hip
 
 _is_cuda = is_cuda()
+
+_is_hip = is_hip()
 
 if _is_cuda:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
@@ -398,6 +400,9 @@ class VisionAttention(nn.Module):
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         else:
             qkv_backend = global_server_args_dict["mm_attention_backend"]
+
+        if (qkv_backend == "fa3") and _is_hip:
+            qkv_backend = "triton_attn"
 
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
