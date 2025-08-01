@@ -266,6 +266,9 @@ class ModelConfig:
             self.hf_text_config, "num_nextn_predict_layers", None
         )
         self.vocab_size = self.hf_text_config.vocab_size
+        self.sliding_window_size = getattr(
+            self.hf_text_config, "sliding_window_size", None
+        ) or getattr(self.hf_text_config, "sliding_window", None)
 
         # Verify quantization
         self._verify_quantization()

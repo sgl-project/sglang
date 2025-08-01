@@ -1170,7 +1170,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
                 if isinstance(self.tree_cache, SWAChunkCache):
                     self.tree_cache.evict_swa(
-                        req, pre_len, self.model_config.attention_chunk_size
+                        req,
+                        pre_len,
+                        self.model_config.attention_chunk_size,
+                        self.model_config.sliding_window_size,
                     )
 
             # If input_embeds are available, store them
@@ -1566,7 +1569,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if isinstance(self.tree_cache, SWAChunkCache):
             for req in self.reqs:
                 self.tree_cache.evict_swa(
-                    req, req.seqlen - 1, self.model_config.attention_chunk_size
+                    req,
+                    req.seqlen - 1,
+                    self.model_config.attention_chunk_size,
+                    self.model_config.sliding_window_size,
                 )
 
         # Allocate memory
