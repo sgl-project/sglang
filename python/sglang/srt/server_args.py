@@ -270,7 +270,7 @@ class ServerArgs:
     sm_group_num: int = 3
 
     # Multimodal settings
-    max_num_image: Optional[int] = None
+    max_num_images: Optional[int] = None
 
     def __post_init__(self):
         # Expert parallelism
