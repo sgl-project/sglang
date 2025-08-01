@@ -25,12 +25,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
-from sglang.srt.mem_cache.mooncake_store.mooncake_store import (
-    MooncakeStore,
-    get_hash_str_mooncake,
-)
-from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import HiCacheHF3FS
 
 logger = logging.getLogger(__name__)
 
@@ -237,40 +231,35 @@ class HiCacheController:
         self.mem_pool_host = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
-        # using kernel for small page KV cache transfer and DMA for large pages
-        if not io_backend:
-            IO_BACKEND_PAGE_SIZE_THRESHOLD = 64
-            self.io_backend = (
-                "direct"
-                if self.page_size >= IO_BACKEND_PAGE_SIZE_THRESHOLD
-                else "kernel"
-            )
-        else:
-            self.io_backend = io_backend
+        self.io_backend = io_backend
 
         self.enable_storage = False
         # todo: move backend initialization to storage backend module
         if storage_backend is not None:
-            # create a new communication group for synchronizing storage operations across TP workers
-            self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
-            if self.tp_world_size > 1:
-                group_ranks = torch.distributed.get_process_group_ranks(tp_group)
-                self.prefetch_tp_group = torch.distributed.new_group(
-                    group_ranks, backend="gloo"
-                )
-                self.backup_tp_group = torch.distributed.new_group(
-                    group_ranks, backend="gloo"
-                )
+            from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
 
             if storage_backend == "file":
                 self.storage_backend = HiCacheFile()
                 self.get_hash_str = get_hash_str
+            elif storage_backend == "nixl":
+                from sglang.srt.mem_cache.nixl.hicache_nixl import HiCacheNixl
+
+                self.storage_backend = HiCacheNixl()
+                self.get_hash_str = get_hash_str
             elif storage_backend == "mooncake":
+                from sglang.srt.mem_cache.mooncake_store.mooncake_store import (
+                    MooncakeStore,
+                    get_hash_str_mooncake,
+                )
+
                 self.storage_backend = MooncakeStore()
                 self.get_hash_str = get_hash_str_mooncake
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
             elif storage_backend == "hf3fs":
                 from sglang.srt.distributed import get_tensor_model_parallel_rank
+                from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import (
+                    HiCacheHF3FS,
+                )
 
                 rank = get_tensor_model_parallel_rank()
                 bytes_per_page = (
@@ -288,6 +277,16 @@ class HiCacheController:
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
+            # create a new communication group for synchronizing storage operations across TP workers
+            self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
+            if self.tp_world_size > 1:
+                group_ranks = torch.distributed.get_process_group_ranks(tp_group)
+                self.prefetch_tp_group = torch.distributed.new_group(
+                    group_ranks, backend="gloo"
+                )
+                self.backup_tp_group = torch.distributed.new_group(
+                    group_ranks, backend="gloo"
+                )
 
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
@@ -439,11 +438,8 @@ class HiCacheController:
                 host_indices, device_indices = self.move_indices(
                     operation.host_indices, operation.device_indices
                 )
-                self.mem_pool_device.backup_to_host_all_layer(
-                    self.mem_pool_host,
-                    host_indices,
-                    device_indices,
-                    self.io_backend,
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device, host_indices, device_indices, self.io_backend
                 )
                 self.write_stream.synchronize()
                 self.mem_pool_host.complete_io(operation.host_indices)
@@ -483,8 +479,8 @@ class HiCacheController:
                 batch_operation.host_indices, batch_operation.device_indices
             )
             for i in range(self.mem_pool_host.layer_num):
-                self.mem_pool_device.load_from_host_per_layer(
-                    self.mem_pool_host,
+                self.mem_pool_host.load_to_device_per_layer(
+                    self.mem_pool_device,
                     host_indices,
                     device_indices,
                     i,
@@ -545,7 +541,11 @@ class HiCacheController:
     def generic_page_transfer(self, operation, batch_size=8):
         for i in range(0, len(operation.hash_value), batch_size):
             page_hashes = operation.hash_value[i : i + batch_size]
-            page_data = self.storage_backend.batch_get(page_hashes)
+            # todo: zero copy
+            dummy_page_dst = [self.mem_pool_host.get_dummy_flat_data_page()] * len(
+                page_hashes
+            )
+            page_data = self.storage_backend.batch_get(page_hashes, dummy_page_dst)
             if page_data is None:
                 logger.warning(
                     f"Prefetch operation {operation.request_id} failed to retrieve page {page_hashes}."
@@ -679,7 +679,7 @@ class HiCacheController:
         for i in range(0, len(operation.hash_value), batch_size):
             page_hashes = operation.hash_value[i : i + batch_size]
             page_data = [
-                self.mem_pool_host.get_flat_data_pages(
+                self.mem_pool_host.get_flat_data_page(
                     operation.host_indices[j * self.page_size]
                 )
                 for j in range(i, i + len(page_hashes))
