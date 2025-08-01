@@ -171,14 +171,12 @@ class HiCacheHF3FS(HiCacheStorage):
         rank: int, bytes_per_page: int, dtype: torch.dtype
     ) -> "HiCacheHF3FS":
         from sglang.srt.mem_cache.storage.hf3fs.mini_3fs_metadata_server import (
-            Hf3fsMetadataClient,
+            Hf3fsGlobalMetadataClient,
+            Hf3fsLocalMetadataClient,
         )
 
         config_path = os.getenv(HiCacheHF3FS.default_env_var)
         if not config_path:
-            metadata_client = Hf3fsMetadataClient(
-                HiCacheHF3FS.default_metadata_server_url
-            )
             return HiCacheHF3FS(
                 rank=rank,
                 file_path=f"/data/hicache.{rank}.bin",
@@ -187,7 +185,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 bytes_per_page=bytes_per_page,
                 entries=8,
                 dtype=dtype,
-                metadata_client=metadata_client,
+                metadata_client=Hf3fsLocalMetadataClient(),
             )
 
         try:
@@ -196,21 +194,27 @@ class HiCacheHF3FS(HiCacheStorage):
         except Exception as e:
             raise RuntimeError(f"Failed to load config from {config_path}: {str(e)}")
 
+        # Check required keys (metadata_server_url is now optional)
         required_keys = {
             "file_path_prefix",
             "file_size",
             "numjobs",
             "entries",
-            "metadata_server_url",
         }
         missing_keys = required_keys - set(config.keys())
         if missing_keys:
             raise ValueError(f"Missing required keys in config: {missing_keys}")
 
-        metadata_server_url = config.get(
-            "metadata_server_url", HiCacheHF3FS.default_metadata_server_url
-        )
-        metadata_client = Hf3fsMetadataClient(metadata_server_url)
+        # Choose metadata client based on configuration
+        if "metadata_server_url" in config and config["metadata_server_url"]:
+            # Use HTTP client to connect to metadata server
+            metadata_server_url = config["metadata_server_url"]
+            metadata_client = Hf3fsGlobalMetadataClient(metadata_server_url)
+            logger.info(f"Using global metadata client with server url: {metadata_server_url}")
+        else:
+            # Use local metadata client for single-machine deployment
+            metadata_client = Hf3fsLocalMetadataClient()
+            logger.info("Using local metadata client for single-machine deployment")
 
         return HiCacheHF3FS(
             rank=rank,

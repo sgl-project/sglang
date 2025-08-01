@@ -16,7 +16,6 @@ from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import Hf3fsMetadataInterf
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
-app = FastAPI()
 
 
 # --- Data Models ---
@@ -29,6 +28,72 @@ class RankMetadata:
         self.free_pages: List[int] = list(range(num_pages))
         self.key_to_index: Dict[str, int] = {}
         # Todo: Support multi files for HF3FS
+
+    def exists_keys(self, keys: List[str]) -> List[bool]:
+        """Check if keys exist in metadata."""
+        with self.lock:
+            return [key in self.key_to_index for key in keys]
+
+    def reserve_and_allocate_page_indices(
+        self, keys: List[Tuple[str, str]]
+    ) -> List[Tuple[bool, int]]:
+        """Reserve and allocate page indices for keys."""
+        with self.lock:
+            results = [None] * len(keys)
+            new_keys_to_process = []
+
+            for i, (key, prefix_key) in enumerate(keys):
+                if key in self.key_to_index:
+                    results[i] = (True, self.key_to_index[key])
+                else:
+                    new_keys_to_process.append((i, key, prefix_key))
+
+            # Todo: Implementing data eviction logic after HiCache supports prefix information pass-through
+            for i, key, prefix_key in new_keys_to_process:
+                if len(self.free_pages) > 0:
+                    page_idx = self.free_pages.pop()
+                    results[i] = (False, page_idx)
+                else:
+                    results[i] = (False, -1)
+
+            return results
+
+    def confirm_write(
+        self,
+        written_keys_to_confirm: List[Tuple[str, int]],
+        pages_to_release: List[int],
+    ) -> None:
+        """Confirm write operations and release pages."""
+        with self.lock:
+            for key, page_index in written_keys_to_confirm:
+                self.key_to_index[key] = page_index
+
+            for page_index in pages_to_release:
+                if page_index not in self.free_pages:
+                    self.free_pages.append(page_index)
+
+    def delete_keys(self, keys: List[str]) -> int:
+        """Delete keys and return count of deleted keys."""
+        with self.lock:
+            count = 0
+            for key in keys:
+                if key in self.key_to_index:
+                    page_index = self.key_to_index.pop(key)
+                    if page_index not in self.free_pages:
+                        self.free_pages.append(page_index)
+                    count += 1
+            return count
+
+    def clear_all(self) -> None:
+        """Clear all metadata."""
+        with self.lock:
+            self.free_pages = list(range(self.num_pages))
+            self.key_to_index.clear()
+
+    def get_page_indices(self, keys: List[str]) -> List[Optional[int]]:
+        """Get page indices for keys."""
+        with self.lock:
+            return [self.key_to_index.get(key) for key in keys]
 
 
 class GlobalMetadataState:
@@ -110,130 +175,129 @@ class GlobalMetadataState:
         logging.info("Shutdown complete.")
 
 
-# --- Global State Initialization ---
-state = GlobalMetadataState(persistence_path=None, save_interval=60)
+# --- Global MetadataServer implementation ---
+class Hf3fsMetadataServer:
+    """HF3FS Metadata Server that manages metadata for multiple ranks."""
 
+    def __init__(self, persistence_path: Optional[str] = None, save_interval: int = 60):
+        self.state = GlobalMetadataState(persistence_path, save_interval)
+        self.app = FastAPI()
+        self._setup_routes()
 
-def get_rank_metadata(rank: int) -> RankMetadata:
-    with state.global_lock:
-        if rank not in state.ranks:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Rank {rank} not initialized. Please call /{{rank}}/initialize first.",
-            )
-        return state.ranks[rank]
+    def _setup_routes(self):
+        """Setup FastAPI routes."""
+        self.app.post("/{rank}/initialize")(self.initialize)
+        self.app.post("/{rank}/exists")(self.exists)
+        self.app.post("/{rank}/reserve_and_allocate_page_indices")(
+            self.reserve_and_allocate_page_indices
+        )
+        self.app.post("/{rank}/confirm_write")(self.confirm_write)
+        self.app.post("/{rank}/delete_keys")(self.delete_keys)
+        self.app.post("/{rank}/clear")(self.clear)
+        self.app.post("/{rank}/get_page_indices")(self.get_page_indices)
 
-
-# --- API Endpoints ---
-@app.post("/{rank}/initialize")
-async def initialize(rank: int, request: Request):
-    data = await request.json()
-    num_pages = data["num_pages"]
-    with state.global_lock:
-        if rank in state.ranks:
-            logging.info(f"Rank {rank} already exists. Initialization request ignored.")
-            if state.ranks[rank].num_pages != num_pages:
-                logging.warning(
-                    f"Rank {rank} initialized with different num_pages. Existing: {state.ranks[rank].num_pages}, New: {num_pages}"
+    def get_rank_metadata(self, rank: int) -> RankMetadata:
+        """Get rank metadata with proper error handling."""
+        with self.state.global_lock:
+            if rank not in self.state.ranks:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Rank {rank} not initialized. Please call /{{rank}}/initialize first.",
                 )
-        else:
-            logging.info(f"Initializing new Rank {rank} with {num_pages} pages.")
-            state.ranks[rank] = RankMetadata(num_pages)
-    return {"message": f"Rank {rank} is ready."}
+            return self.state.ranks[rank]
 
+    async def initialize(self, rank: int, request: Request):
+        """Initialize a rank with specified number of pages."""
+        data = await request.json()
+        num_pages = data["num_pages"]
+        with self.state.global_lock:
+            if rank in self.state.ranks:
+                logging.info(
+                    f"Rank {rank} already exists. Initialization request ignored."
+                )
+                if self.state.ranks[rank].num_pages != num_pages:
+                    logging.warning(
+                        f"Rank {rank} initialized with different num_pages. Existing: {self.state.ranks[rank].num_pages}, New: {num_pages}"
+                    )
+            else:
+                logging.info(f"Initializing new Rank {rank} with {num_pages} pages.")
+                self.state.ranks[rank] = RankMetadata(num_pages)
+        return {"message": f"Rank {rank} is ready."}
 
-@app.post("/{rank}/exists")
-async def exists(rank: int, request: Request):
-    data = await request.json()
-    keys = data["keys"]
-    metadata = get_rank_metadata(rank)
-    with metadata.lock:
-        results = [key in metadata.key_to_index for key in keys]
+    async def exists(self, rank: int, request: Request):
+        """Check if keys exist in metadata."""
+        data = await request.json()
+        keys = data["keys"]
+        metadata = self.get_rank_metadata(rank)
+        results = metadata.exists_keys(keys)
         return {"exists": results}
 
-
-@app.post("/{rank}/reserve_and_allocate_page_indices")
-async def reserve_and_allocate_page_indices(rank: int, request: Request):
-    data = await request.json()
-    metadata = get_rank_metadata(rank)
-    with metadata.lock:
+    async def reserve_and_allocate_page_indices(self, rank: int, request: Request):
+        """Reserve and allocate page indices for keys."""
+        data = await request.json()
+        metadata = self.get_rank_metadata(rank)
         keys = data["keys"]
-        results = [None] * len(keys)
-
-        new_keys_to_process = []
-        for i, (key, prefix_key) in enumerate(keys):
-            if key in metadata.key_to_index:
-                results[i] = (True, metadata.key_to_index[key])
-            else:
-                new_keys_to_process.append((i, key, prefix_key))
-
-        # Todo: Implementing data eviction logic after HiCache supports prefix information pass-through
-        for i, key, prefix_key in new_keys_to_process:
-            if len(metadata.free_pages) > 0:
-                page_idx = metadata.free_pages.pop()
-                results[i] = (False, page_idx)
-            else:
-                results[i] = (False, -1)
-
+        results = metadata.reserve_and_allocate_page_indices(keys)
         return {"indices": results}
 
-
-@app.post("/{rank}/confirm_write")
-async def confirm_write(rank: int, request: Request):
-    data = await request.json()
-    metadata = get_rank_metadata(rank)
-    with metadata.lock:
+    async def confirm_write(self, rank: int, request: Request):
+        """Confirm write operations and release pages."""
+        data = await request.json()
+        metadata = self.get_rank_metadata(rank)
         success_written_keys = data.get("written_keys_to_confirm", [])
         released_pages = data.get("pages_to_release", [])
 
-        for key, page_index in success_written_keys:
-            metadata.key_to_index[key] = page_index
+        metadata.confirm_write(success_written_keys, released_pages)
 
-        for page_index in released_pages:
-            if page_index not in metadata.free_pages:
-                metadata.free_pages.append(page_index)
+        return {
+            "message": f"Rank {rank}: Write confirmed for {len(success_written_keys)} keys. {len(released_pages)} pages released."
+        }
 
-    return {
-        "message": f"Rank {rank}: Write confirmed for {len(success_written_keys)} keys. {len(released_pages)} pages released."
-    }
+    async def delete_keys(self, rank: int, request: Request):
+        """Delete keys from metadata."""
+        data = await request.json()
+        metadata = self.get_rank_metadata(rank)
+        count = metadata.delete_keys(data["keys"])
+        return {"message": f"Rank {rank}: {count} keys deleted."}
 
+    async def clear(self, rank: int):
+        """Clear all metadata for a rank."""
+        metadata = self.get_rank_metadata(rank)
+        metadata.clear_all()
+        return {"message": f"Rank {rank}: Metadata cleared."}
 
-@app.post("/{rank}/delete_keys")
-async def delete_keys(rank: int, request: Request):
-    data = await request.json()
-    metadata = get_rank_metadata(rank)
-    with metadata.lock:
-        count = 0
-        for key in data["keys"]:
-            if key in metadata.key_to_index:
-                page_index = metadata.key_to_index.pop(key)
-                if page_index not in metadata.free_pages:
-                    metadata.free_pages.append(page_index)
-                count += 1
-    return {"message": f"Rank {rank}: {count} keys deleted."}
-
-
-@app.post("/{rank}/clear")
-async def clear(rank: int):
-    metadata = get_rank_metadata(rank)
-    with metadata.lock:
-        metadata.free_pages = list(range(metadata.num_pages))
-        metadata.key_to_index.clear()
-    return {"message": f"Rank {rank}: Metadata cleared."}
-
-
-@app.post("/{rank}/get_page_indices")
-async def get_page_indices(rank: int, request: Request):
-    data = await request.json()
-    metadata = get_rank_metadata(rank)
-    with metadata.lock:
+    async def get_page_indices(self, rank: int, request: Request):
+        """Get page indices for keys."""
+        data = await request.json()
+        metadata = self.get_rank_metadata(rank)
         keys = data["keys"]
-        results = [metadata.key_to_index.get(key) for key in keys]
-
+        results = metadata.get_page_indices(keys)
         return {"indices": results}
 
+    def run(self, host: str = "0.0.0.0", port: int = 18000):
+        """Run the metadata server."""
+        self.state.load_from_disk()
+        if self.state.persistence_path:
+            self.state.schedule_save()
+            atexit.register(self.state.shutdown)
 
-class Hf3fsMetadataClient(Hf3fsMetadataInterface):
+        import uvicorn
+
+        logging.info(f"Starting metadata server on http://{host}:{port}")
+        if self.state.persistence_path:
+            logging.info(
+                f"Persistence is ENABLED. Saving to '{self.state.persistence_path}' every {self.state.save_interval} seconds."
+            )
+        else:
+            logging.info("Persistence is DISABLED.")
+
+        uvicorn.run(self.app, host=host, port=port)
+
+
+# --- Client implementation ---
+class Hf3fsGlobalMetadataClient(Hf3fsMetadataInterface):
+    """Global http metadata client for HF3FS."""
+
     def __init__(self, base_url: str, max_retries: int = 3):
         self.base_url = base_url.rstrip("/")
         self._session = requests.Session()
@@ -254,15 +318,6 @@ class Hf3fsMetadataClient(Hf3fsMetadataInterface):
             return response.json()
         except requests.exceptions.RequestException as e:
             logging.error(f"Failed to POST to {endpoint} after retries: {e}")
-            raise RuntimeError(f"Failed to connect to metadata server: {e}") from e
-
-    def _get(self, endpoint: str) -> dict:
-        try:
-            response = self._session.get(f"{self.base_url}/{endpoint}")
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Failed to GET from {endpoint} after retries: {e}")
             raise RuntimeError(f"Failed to connect to metadata server: {e}") from e
 
     def initialize(self, rank: int, num_pages: int) -> None:
@@ -305,32 +360,60 @@ class Hf3fsMetadataClient(Hf3fsMetadataInterface):
         return response.get("indices")
 
 
-def run(
+class Hf3fsLocalMetadataClient(Hf3fsMetadataInterface):
+    """Local metadata client that directly operates on RankMetadata in memory without server."""
+
+    def __init__(self):
+        self.rank_metadata = None
+
+    def initialize(self, rank: int, num_pages: int) -> None:
+        self.rank_metadata = RankMetadata(num_pages)
+
+    def reserve_and_allocate_page_indices(
+        self, rank: int, keys: List[Tuple[str, str]]
+    ) -> List[Tuple[bool, int]]:
+        """Reserve and allocate page indices for keys."""
+        return self.rank_metadata.reserve_and_allocate_page_indices(keys)
+
+    def confirm_write(
+        self,
+        rank: int,
+        written_keys_to_confirm: List[Tuple[str, int]],
+        pages_to_release: List[int],
+    ) -> None:
+        """Confirm write operations."""
+        self.rank_metadata.confirm_write(written_keys_to_confirm, pages_to_release)
+
+    def delete_keys(self, rank: int, keys: List[str]) -> None:
+        """Delete keys."""
+        self.rank_metadata.delete_keys(keys)
+
+    def exists(self, rank: int, keys: List[str]) -> List[bool]:
+        """Check if keys exist."""
+        return self.rank_metadata.exists_keys(keys)
+
+    def clear(self, rank: int) -> None:
+        """Clear all metadata for rank."""
+        self.rank_metadata.clear_all()
+
+    def get_page_indices(self, rank: int, keys: List[str]) -> List[Optional[int]]:
+        """Get page indices for keys."""
+        return self.rank_metadata.get_page_indices(keys)
+
+
+def run_metadata_server(
     host: str = "0.0.0.0",
     port: int = 18000,
     persistence_path: Optional[str] = None,
     save_interval: int = 60,
 ):
     """Run the HF3FS metadata server."""
-    state.persistence_path = Path(persistence_path) if persistence_path else None
-    state.save_interval = save_interval
+    global server
+    server = Hf3fsMetadataServer(
+        persistence_path=persistence_path, save_interval=save_interval
+    )
 
-    state.load_from_disk()
-    if state.persistence_path:
-        state.schedule_save()
-        atexit.register(state.shutdown)
-
-    import uvicorn
-
-    logging.info(f"Starting metadata server on http://{host}:{port}")
-    if state.persistence_path:
-        logging.info(
-            f"Persistence is ENABLED. Saving to '{persistence_path}' every {save_interval} seconds."
-        )
-    else:
-        logging.info("Persistence is DISABLED.")
-
-    uvicorn.run(app, host=host, port=port)
+    server.run(host=host, port=port)
 
 
 # --- Main Execution ---
@@ -356,4 +439,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    run(args.host, args.port, args.persistence_path, args.save_interval)
+    run_metadata_server(args.host, args.port, args.persistence_path, args.save_interval)
