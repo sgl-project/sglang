@@ -14,7 +14,9 @@ from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.mm_utils import TransportProxyTensor
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.utils import load_audio, load_image, load_video, logger
+from sglang.srt.utils import is_npu, load_audio, load_image, load_video, logger
+
+_is_npu = is_npu()
 
 
 @dataclasses.dataclass
@@ -221,7 +223,7 @@ class BaseMultimodalProcessor(ABC):
         if hasattr(processor, "image_processor") and isinstance(
             processor.image_processor, BaseImageProcessorFast
         ):
-            kwargs["device"] = "cuda"
+            kwargs["device"] = "cuda" if not _is_npu else "npu"
         result = processor.__call__(
             text=[input_text],
             padding=True,

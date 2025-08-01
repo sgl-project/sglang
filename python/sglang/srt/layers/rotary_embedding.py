@@ -1379,20 +1379,32 @@ def apply_rotary_pos_emb(
     sin: torch.Tensor,
     unsqueeze_dim=1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.float(), k.float()
+    if _is_npu:
+        orig_k_dtype = k.dtype
+        q, k = q.float(), k.float()
 
-    # embedding is performed in float
-    cos = cos.unsqueeze(unsqueeze_dim).float()
-    sin = sin.unsqueeze(unsqueeze_dim).float()
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+        # embedding is performed in float
+        cos = cos.unsqueeze(unsqueeze_dim).float()
+        sin = sin.unsqueeze(unsqueeze_dim).float()
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
 
-    q_embed = q_embed.to(orig_q_dtype)
-    k_embed = k_embed.to(orig_k_dtype)
+        q_embed = q_embed.to(orig_q_dtype)
+        k_embed = k_embed.to(orig_k_dtype)
+        orig_q_dtype = q.dtype
 
-    return q_embed, k_embed
+        return q_embed, k_embed
+    else:
+        cos = cos.unsqueeze(unsqueeze_dim)
+        cos = torch.transpose(cos, 1, 2)
+        sin = sin.unsqueeze(unsqueeze_dim)
+        sin = torch.transpose(sin, 1, 2)
+        q = torch.transpose(q, 1, 2)
+        k = torch.transpose(k, 1, 2)
+        q_embed, k_embed = torch_npu.npu_apply_rotary_pos_emb(q, k, cos, sin)
+        q_embed = torch.transpose(q_embed, 1, 2)
+        k_embed = torch.transpose(k_embed, 1, 2)
+        return q_embed, k_embed
 
 
 def get_rope_cpu(
