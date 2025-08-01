@@ -14,6 +14,7 @@ hf3fs_utils = load(name="hf3fs_utils", sources=[f"{root}/hf3fs_utils.cpp"])
 
 logger = logging.getLogger(__name__)
 
+HF3FS_AVAILABLE = True
 try:
     from hf3fs_fuse.io import (
         deregister_fd,
@@ -22,8 +23,8 @@ try:
         make_iovec,
         register_fd,
     )
-except ImportError as e:
-    logger.warning(f"hf3fs_fuse.io is not available: {e}")
+except ImportError:
+    HF3FS_AVAILABLE = False
 
 
 def rsynchronized():
@@ -52,6 +53,11 @@ def wsynchronized():
 
 class Hf3fsClient:
     def __init__(self, path: str, size: int, bytes_per_page: int, entries: int):
+        if not HF3FS_AVAILABLE:
+            raise ImportError(
+                "hf3fs_fuse.io is not available. Please install the hf3fs_fuse package."
+            )
+
         self.path = path
         self.size = size
         self.bytes_per_page = bytes_per_page
