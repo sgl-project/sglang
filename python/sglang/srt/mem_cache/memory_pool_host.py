@@ -8,7 +8,6 @@ import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
-from sglang.srt.utils import debug_timing
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +25,6 @@ def synchronized(debug_only=False):
         @wraps(func)
         def wrapper(self, *args, **kwargs):
             if (not debug_only) or self.debug:
-                return func(self, *args, **kwargs)
                 with self.lock:
                     return func(self, *args, **kwargs)
             else:
@@ -72,11 +70,12 @@ class HostKVCache(abc.ABC):
         requested_bytes = self.size * self.size_per_token
         # preserve at least 10GB for other usage
         ten_gb = 10 * (1024**3)
-        if requested_bytes > host_mem.available - ten_gb:
+        available_bytes = host_mem.available - ten_gb
+        if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
                 f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{host_mem.available / 1e9:.2f} GB free. Please reduce the "
+                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
                 f"size of the hierarchical cache."
             )
         else:
@@ -100,19 +99,17 @@ class HostKVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def transfer(self, indices, flat_data):
+    def get_flat_data_page(self, index) -> torch.Tensor:
+        """
+        Get a flat data page from the host memory pool.
+        """
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def get_flat_data(self, indices):
-        raise NotImplementedError()
-
-    @abc.abstractmethod
-    def get_flat_data_by_layer(self, indices, layer_id):
-        raise NotImplementedError()
-
-    @abc.abstractmethod
-    def assign_flat_data(self, indices, flat_data):
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        """
+        Set a flat data page to the host memory pool.
+        """
         raise NotImplementedError()
 
     @synchronized()
@@ -128,6 +125,9 @@ class HostKVCache(abc.ABC):
 
     @synchronized()
     def alloc(self, need_size: int) -> torch.Tensor:
+        assert (
+            need_size % self.page_size == 0
+        ), "The requested size should be a multiple of the page size."
         if need_size > self.available_size():
             return None
 
@@ -176,6 +176,15 @@ class HostKVCache(abc.ABC):
         if not self.is_synced(indices):
             raise ValueError(
                 f"The host memory slots should be in SYNCED state before turning into BACKUP. "
+                f"Current state: {self.get_state(indices)}"
+            )
+        self.mem_state[indices] = MemoryStateInt.BACKUP
+
+    @synchronized(debug_only=True)
+    def update_prefetch(self, indices: torch.Tensor):
+        if not self.is_reserved(indices):
+            raise ValueError(
+                f"The host memory slots should be in RESERVED state before turning into BACKUP. "
                 f"Current state: {self.get_state(indices)}"
             )
         self.mem_state[indices] = MemoryStateInt.BACKUP
@@ -243,58 +252,63 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
         )
 
-    @debug_timing
-    def transfer(self, indices, flat_data):
-        # backup prepared data from device to host
-        self.kv_buffer[:, :, indices] = flat_data.to(
-            device=self.device, non_blocking=False
+    # todo, page first memory layout
+    def get_flat_data_page(self, index) -> torch.Tensor:
+        return self.kv_buffer[:, :, index : index + self.page_size, :, :].flatten()
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        self.kv_buffer[:, :, index : index + self.page_size, :, :] = data_page.reshape(
+            2,
+            self.layer_num,
+            self.page_size,
+            self.head_num,
+            self.head_dim,
         )
 
-    def get_flat_data(self, indices):
-        return self.kv_buffer[:, :, indices]
-
-    def get_flat_data_by_layer(self, indices, layer_id):
-        return self.kv_buffer[:, layer_id - self.start_layer, indices]
-
-    def assign_flat_data(self, indices, flat_data):
-        self.kv_buffer[:, :, indices] = flat_data
-
-    def write_page_all_layers(self, host_indices, device_indices, device_pool):
-        device_indices_cpu = device_indices[:: self.page_size].cpu()
-        for i in range(len(device_indices_cpu)):
-            h_index = host_indices[i * self.page_size]
-            d_index = device_indices_cpu[i]
-            for j in range(self.layer_num):
-                self.kv_buffer[0, j, h_index : h_index + self.page_size].copy_(
-                    device_pool.k_buffer[j][d_index : d_index + self.page_size],
-                    non_blocking=True,
+    def get_buffer_meta(self, keys, indices):
+        ptr_list = []
+        key_list = []
+        kv_buffer_data_ptr = self.kv_buffer.data_ptr()
+        v_offset = (
+            self.layer_num
+            * self.size
+            * self.head_num
+            * self.head_dim
+            * self.dtype.itemsize
+        )
+        for index in range(0, len(indices), self.page_size):
+            for layer_id in range(self.layer_num):
+                k_ptr = (
+                    kv_buffer_data_ptr
+                    + indices[index]
+                    * self.head_num
+                    * self.head_dim
+                    * self.dtype.itemsize
+                    + layer_id
+                    * self.size
+                    * self.head_num
+                    * self.head_dim
+                    * self.dtype.itemsize
                 )
-                self.kv_buffer[1, j, h_index : h_index + self.page_size].copy_(
-                    device_pool.v_buffer[j][d_index : d_index + self.page_size],
-                    non_blocking=True,
-                )
+                v_ptr = k_ptr + v_offset
+                ptr_list.append(k_ptr)
+                ptr_list.append(v_ptr)
+                key_ = keys[index // self.page_size]
+                key_list.append(f"{key_}_{layer_id}_k")
+                key_list.append(f"{key_}_{layer_id}_v")
+        element_size = (
+            self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
+        )
+        element_size_list = [element_size] * len(key_list)
+        return key_list, ptr_list, element_size_list
 
-    def load_page_per_layer(self, host_indices, device_indices, device_pool, layer_id):
-        device_indices_cpu = device_indices[:: self.page_size].cpu()
-        for i in range(len(device_indices_cpu)):
-            h_index = host_indices[i * self.page_size]
-            d_index = device_indices_cpu[i]
-            device_pool.k_buffer[layer_id - self.start_layer][
-                d_index : d_index + self.page_size
-            ].copy_(
-                self.kv_buffer[
-                    0, layer_id - self.start_layer, h_index : h_index + self.page_size
-                ],
-                non_blocking=True,
-            )
-            device_pool.v_buffer[layer_id - self.start_layer][
-                d_index : d_index + self.page_size
-            ].copy_(
-                self.kv_buffer[
-                    1, layer_id - self.start_layer, h_index : h_index + self.page_size
-                ],
-                non_blocking=True,
-            )
+    @property
+    def k_buffer(self):
+        return self.kv_buffer[0]
+
+    @property
+    def v_buffer(self):
+        return self.kv_buffer[1]
 
 
 class MLATokenToKVPoolHost(HostKVCache):
@@ -338,43 +352,40 @@ class MLATokenToKVPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
         )
 
-    @debug_timing
-    def transfer(self, indices, flat_data):
-        # backup prepared data from device to host
-        self.kv_buffer[:, indices] = flat_data.to(
-            device=self.device, non_blocking=False
+    def get_flat_data_page(self, index) -> torch.Tensor:
+        return self.kv_buffer[:, index : index + self.page_size, :, :].flatten()
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        self.kv_buffer[:, index : index + self.page_size, :, :] = data_page.reshape(
+            self.layer_num,
+            self.page_size,
+            1,
+            self.kv_lora_rank + self.qk_rope_head_dim,
         )
 
-    def get_flat_data(self, indices):
-        return self.kv_buffer[:, indices]
-
-    def get_flat_data_by_layer(self, indices, layer_id):
-        return self.kv_buffer[layer_id - self.start_layer, indices]
-
-    def assign_flat_data(self, indices, flat_data):
-        self.kv_buffer[:, indices] = flat_data
-
-    def write_page_all_layers(self, host_indices, device_indices, device_pool):
-        device_indices_cpu = device_indices[:: self.page_size].cpu()
-        for i in range(len(device_indices_cpu)):
-            h_index = host_indices[i * self.page_size]
-            d_index = device_indices_cpu[i]
-            for j in range(self.layer_num):
-                self.kv_buffer[j, h_index : h_index + self.page_size].copy_(
-                    device_pool.kv_buffer[j][d_index : d_index + self.page_size],
-                    non_blocking=True,
+    def get_buffer_meta(self, keys, indices):
+        ptr_list = []
+        key_list = []
+        kv_buffer_data_ptr = self.kv_buffer.data_ptr()
+        for index in range(0, len(indices), self.page_size):
+            for layer_id in range(self.layer_num):
+                k_ptr = (
+                    kv_buffer_data_ptr
+                    + indices[index]
+                    * (self.kv_lora_rank + self.qk_rope_head_dim)
+                    * self.dtype.itemsize
+                    + layer_id
+                    * self.size
+                    * (self.kv_lora_rank + self.qk_rope_head_dim)
+                    * self.dtype.itemsize
                 )
-
-    def load_page_per_layer(self, host_indices, device_indices, device_pool, layer_id):
-        device_indices_cpu = device_indices[:: self.page_size].cpu()
-        for i in range(len(device_indices_cpu)):
-            h_index = host_indices[i * self.page_size]
-            d_index = device_indices_cpu[i]
-            device_pool.kv_buffer[layer_id - self.start_layer][
-                d_index : d_index + self.page_size
-            ].copy_(
-                self.kv_buffer[
-                    layer_id - self.start_layer, h_index : h_index + self.page_size
-                ],
-                non_blocking=True,
-            )
+                ptr_list.append(k_ptr)
+                key_ = keys[index // self.page_size]
+                key_list.append(f"{key_}_{layer_id}_k")
+        element_size = (
+            self.dtype.itemsize
+            * self.page_size
+            * (self.kv_lora_rank + self.qk_rope_head_dim)
+        )
+        element_size_list = [element_size] * len(key_list)
+        return key_list, ptr_list, element_size_list

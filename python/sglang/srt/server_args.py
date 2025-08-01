@@ -19,12 +19,16 @@ import json
 import logging
 import os
 import random
+import sys
 import tempfile
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Union
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
+from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
+    LORA_TARGET_ALL_MODULES,
+    SUPPORTED_LORA_TARGET_MODULES,
     configure_ipv6,
     get_device,
     get_device_memory_capacity,
@@ -49,36 +53,42 @@ class ServerArgs:
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
-    dtype: str = "auto"
-    kv_cache_dtype: str = "auto"
-    quantization: Optional[str] = None
-    quantization_param_path: Optional[str] = None
     context_length: Optional[int] = None
-    device: Optional[str] = None
-    served_model_name: Optional[str] = None
-    chat_template: Optional[str] = None
-    completion_template: Optional[str] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
-    impl: str = "auto"
+    model_impl: str = "auto"
 
-    # Port for the HTTP server
+    # HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
+    skip_server_warmup: bool = False
+    warmups: Optional[str] = None
+    nccl_port: Optional[int] = None
+
+    # Quantization and data type
+    dtype: str = "auto"
+    quantization: Optional[str] = None
+    quantization_param_path: Optional[str] = None
+    kv_cache_dtype: str = "auto"
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
+    max_queued_requests: Optional[int] = sys.maxsize
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
-    page_size: int = 1
+    page_size: Optional[int] = None
+    hybrid_kvcache_ratio: Optional[float] = None
+    swa_full_tokens_ratio: float = 0.8
+    disable_hybrid_swa_memory: bool = False
 
-    # Other runtime options
+    # Runtime options
+    device: Optional[str] = None
     tp_size: int = 1
     pp_size: int = 1
     max_micro_batch_size: Optional[int] = None
@@ -98,11 +108,13 @@ class ServerArgs:
     log_level_http: Optional[str] = None
     log_requests: bool = False
     log_requests_level: int = 0
+    crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
+    enable_metrics_for_all_schedulers: bool = False
     bucket_time_to_first_token: Optional[List[float]] = None
-    bucket_e2e_request_latency: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
+    bucket_e2e_request_latency: Optional[List[float]] = None
     collect_tokens_histogram: bool = False
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
@@ -110,6 +122,9 @@ class ServerArgs:
 
     # API related
     api_key: Optional[str] = None
+    served_model_name: Optional[str] = None
+    chat_template: Optional[str] = None
+    completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
@@ -129,12 +144,17 @@ class ServerArgs:
     preferred_sampling_params: Optional[str] = None
 
     # LoRA
-    lora_paths: Optional[List[str]] = None
+    enable_lora: Optional[bool] = None
+    max_lora_rank: Optional[int] = None
+    lora_target_modules: Optional[Union[set[str], List[str]]] = None
+    lora_paths: Optional[Union[dict[str, str], dict[str, LoRARef], List[str]]] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
 
     # Kernel backend
     attention_backend: Optional[str] = None
+    decode_attention_backend: Optional[str] = None
+    prefill_attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
@@ -153,7 +173,9 @@ class ServerArgs:
     ep_size: int = 1
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
-    enable_flashinfer_moe: bool = False
+    enable_flashinfer_cutlass_moe: bool = False
+    enable_flashinfer_trtllm_moe: bool = False
+    enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -169,6 +191,14 @@ class ServerArgs:
     enable_expert_distribution_metrics: bool = False
     deepep_config: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
+
+    # Hierarchical cache
+    enable_hierarchical_cache: bool = False
+    hicache_ratio: float = 2.0
+    hicache_size: int = 0
+    hicache_write_policy: str = "write_through_selective"
+    hicache_io_backend: str = ""
+    hicache_storage_backend: Optional[str] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -191,7 +221,6 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     enable_mscclpp: bool = False
     disable_overlap_schedule: bool = False
-    disable_overlap_cg_plan: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
@@ -208,16 +237,12 @@ class ServerArgs:
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
-    enable_hierarchical_cache: bool = False
-    hicache_ratio: float = 2.0
-    hicache_size: int = 0
-    hicache_write_policy: str = "write_through_selective"
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
-    warmups: Optional[str] = None
+    enable_triton_kernel_moe: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -225,7 +250,7 @@ class ServerArgs:
     debug_tensor_dump_inject: bool = False
     debug_tensor_dump_prefill_only: bool = False
 
-    # For PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
+    # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: str = "null"
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
@@ -240,32 +265,26 @@ class ServerArgs:
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
 
+    # For PD-Multiplexing
+    enable_pdmux: bool = False
+    sm_group_num: int = 3
+
     def __post_init__(self):
         # Expert parallelism
+        # We put it here first due to some internal ckpt conversation issues.
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
             logger.warning(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
-        if self.enable_flashinfer_moe:
-            assert (
-                self.quantization == "modelopt_fp4"
-            ), "modelopt_fp4 quantization is required for Flashinfer MOE"
-            os.environ["TRTLLM_ENABLE_PDL"] = "1"
-            self.disable_shared_experts_fusion = True
-            logger.warning(
-                f"Flashinfer MoE is enabled. Shared expert fusion is disabled."
-            )
+
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
-
-        if self.device is None:
-            self.device = get_device()
-
         if self.served_model_name is None:
             self.served_model_name = self.model_path
-
+        if self.device is None:
+            self.device = get_device()
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
@@ -315,6 +334,14 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
+            # Lazy init to avoid circular import
+            # Multimodal models need more memory for the image processor
+            from sglang.srt.configs.model_config import ModelConfig
+
+            model_config = ModelConfig.from_server_args(self)
+            if model_config.is_multimodal:
+                self.adjust_mem_fraction_for_vlm(model_config)
+
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
             if gpu_mem is not None:
@@ -326,7 +353,6 @@ class ServerArgs:
                     self.chunked_prefill_size = 16384
             else:
                 self.chunked_prefill_size = 4096
-        assert self.chunked_prefill_size % self.page_size == 0
 
         # Set cuda graph max batch size
         if self.cuda_graph_max_bs is None:
@@ -336,23 +362,6 @@ class ServerArgs:
                     self.cuda_graph_max_bs = 8
                 else:
                     self.cuda_graph_max_bs = 80
-
-        assert self.moe_dense_tp_size in {
-            1,
-            None,
-        }, "moe_dense_tp_size only support 1 and None currently"
-
-        if self.attention_backend == "flashmla":
-            logger.warning(
-                "FlashMLA only supports a page_size of 64, change page_size to 64."
-            )
-            self.page_size = 64
-
-        if self.attention_backend == "cutlass_mla":
-            logger.warning(
-                "Cutlass MLA only supports a page_size of 128, change page_size to 128."
-            )
-            self.page_size = 128
 
         # Set kernel backends for hpu device
         if self.device == "hpu":
@@ -376,6 +385,38 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
 
+        if self.attention_backend == "ascend":
+            logger.warning(
+                "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
+            )
+            self.page_size = 128
+
+        if (
+            self.attention_backend == "flashmla"
+            or self.decode_attention_backend == "flashmla"
+        ):
+            logger.warning(
+                "FlashMLA only supports a page_size of 64, change page_size to 64."
+            )
+            self.page_size = 64
+
+        if (
+            self.attention_backend == "cutlass_mla"
+            or self.decode_attention_backend == "cutlass_mla"
+        ):
+            logger.warning(
+                "Cutlass MLA only supports a page_size of 128, change page_size to 128."
+            )
+            self.page_size = 128
+
+        # Set page size
+        if self.page_size is None:
+            self.page_size = 1
+
+        # AMD-specific Triton attention KV splits default number
+        if is_hip():
+            self.triton_attention_num_kv_splits = 16
+
         # Choose grammar backend
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
@@ -395,26 +436,27 @@ class ServerArgs:
         if self.enable_dp_lm_head:
             assert (
                 self.enable_dp_attention
-            ), "Please enable dp attention when setting enable_dp_attention. "
+            ), "Please enable dp attention when setting enable_dp_lm_head. "
+
+        # MoE kernel
+        if self.enable_flashinfer_cutlass_moe:
+            assert (
+                self.quantization == "modelopt_fp4"
+            ), "modelopt_fp4 quantization is required for Flashinfer MOE"
+            os.environ["TRTLLM_ENABLE_PDL"] = "1"
+
+        if self.enable_flashinfer_trtllm_moe:
+            assert self.enable_ep_moe, "EP MoE is required for Flashinfer TRTLLM MOE"
+            logger.warning(f"Flashinfer TRTLLM MoE is enabled.")
 
         # DeepEP MoE
         if self.enable_deepep_moe:
-            if self.deepep_mode == "auto":
-                assert (
-                    not self.enable_dp_attention
-                ), "DeepEP MoE `auto` mode is not supported with DP Attention."
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
             self.ep_size = self.tp_size
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
-
-        if self.pp_size > 1:
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Pipeline parallelism is incompatible with overlap schedule."
             )
 
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
@@ -431,6 +473,9 @@ class ServerArgs:
                 "EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
             )
 
+        if self.enable_eplb:
+            assert self.enable_ep_moe or self.enable_deepep_moe
+
         if self.enable_expert_distribution_metrics and (
             self.expert_distribution_recorder_mode is None
         ):
@@ -441,6 +486,13 @@ class ServerArgs:
                 self.expert_distribution_recorder_buffer_size = x
             elif self.expert_distribution_recorder_mode is not None:
                 self.expert_distribution_recorder_buffer_size = 1000
+
+        # Pipeline parallelism
+        if self.pp_size > 1:
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Pipeline parallelism is incompatible with overlap schedule."
+            )
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -462,10 +514,9 @@ class ServerArgs:
                     "eagle speculative decoding."
                 )
 
-            model_arch = get_model_arch(self)
-
-            # Auto set draft_model_path DeepSeek-V3/R1
-            if model_arch == "DeepseekV3ForCausalLM":
+            model_arch = self.get_hf_config().architectures[0]
+            if model_arch in ["DeepseekV3ForCausalLM", "Glm4MoeForCausalLM"]:
+                # Auto set draft_model_path DeepSeek-V3/R1
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
                 else:
@@ -484,12 +535,6 @@ class ServerArgs:
                     self.speculative_eagle_topk,
                     self.speculative_num_draft_tokens,
                 ) = auto_choose_speculative_params(self)
-
-            if self.page_size > 1 and self.speculative_eagle_topk > 1:
-                self.speculative_eagle_topk = 1
-                logger.warning(
-                    "speculative_eagle_topk is adjusted to 1 when page_size > 1"
-                )
 
             if (
                 self.speculative_eagle_topk == 1
@@ -510,12 +555,11 @@ class ServerArgs:
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
 
+        # Model loading
         if is_remote_url(self.model_path):
             self.load_format = "remote"
-
-        # AMD-specific Triton attention KV splits default number
-        if is_hip():
-            self.triton_attention_num_kv_splits = 16
+        if self.custom_weight_loader is None:
+            self.custom_weight_loader = []
 
         # PD disaggregation
         if self.disaggregation_mode == "decode":
@@ -540,6 +584,7 @@ class ServerArgs:
             self.disable_cuda_graph = True
             logger.warning("Cuda graph is disabled for prefill server")
 
+        # Propagate env vars
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
         )
@@ -548,20 +593,9 @@ class ServerArgs:
             "1" if self.disable_outlines_disk_cache else "0"
         )
 
-        if self.custom_weight_loader is None:
-            self.custom_weight_loader = []
-
-    def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
-        larger_tp = max(decode_tp, prefill_tp)
-        smaller_tp = min(decode_tp, prefill_tp)
-        assert larger_tp % smaller_tp == 0, (
-            "Different tp size is supported only when one tp is multiple of the other. "
-            f"decode_tp={decode_tp}, prefill_tp={prefill_tp}"
-        )
-
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-        # Model and port args
+        # Model and tokenizer
         parser.add_argument(
             "--model-path",
             "--model",
@@ -574,18 +608,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.tokenizer_path,
             help="The path of the tokenizer.",
-        )
-        parser.add_argument(
-            "--host",
-            type=str,
-            default=ServerArgs.host,
-            help="The host of the HTTP server.",
-        )
-        parser.add_argument(
-            "--port",
-            type=int,
-            default=ServerArgs.port,
-            help="The port of the HTTP server.",
         )
         parser.add_argument(
             "--tokenizer-mode",
@@ -647,86 +669,10 @@ class ServerArgs:
             help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
         )
         parser.add_argument(
-            "--dtype",
-            type=str,
-            default=ServerArgs.dtype,
-            choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
-            help="Data type for model weights and activations.\n\n"
-            '* "auto" will use FP16 precision for FP32 and FP16 models, and '
-            "BF16 precision for BF16 models.\n"
-            '* "half" for FP16. Recommended for AWQ quantization.\n'
-            '* "float16" is the same as "half".\n'
-            '* "bfloat16" for a balance between precision and range.\n'
-            '* "float" is shorthand for FP32 precision.\n'
-            '* "float32" for FP32 precision.',
-        )
-        parser.add_argument(
-            "--kv-cache-dtype",
-            type=str,
-            default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
-        )
-        parser.add_argument(
-            "--quantization",
-            type=str,
-            default=ServerArgs.quantization,
-            choices=[
-                "awq",
-                "fp8",
-                "gptq",
-                "marlin",
-                "gptq_marlin",
-                "awq_marlin",
-                "bitsandbytes",
-                "gguf",
-                "modelopt",
-                "modelopt_fp4",
-                "w8a8_int8",
-                "w8a8_fp8",
-                "moe_wna16",
-                "qoq",
-            ],
-            help="The quantization method.",
-        )
-        parser.add_argument(
-            "--quantization-param-path",
-            type=nullable_str,
-            default=None,
-            help="Path to the JSON file containing the KV cache "
-            "scaling factors. This should generally be supplied, when "
-            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
-            "default to 1.0, which may cause accuracy issues. ",
-        )
-        parser.add_argument(
             "--context-length",
             type=int,
             default=ServerArgs.context_length,
             help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead).",
-        )
-        parser.add_argument(
-            "--device",
-            type=str,
-            default=ServerArgs.device,
-            help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
-        )
-        parser.add_argument(
-            "--served-model-name",
-            type=str,
-            default=ServerArgs.served_model_name,
-            help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
-        )
-        parser.add_argument(
-            "--chat-template",
-            type=str,
-            default=ServerArgs.chat_template,
-            help="The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
-        )
-        parser.add_argument(
-            "--completion-template",
-            type=str,
-            default=ServerArgs.completion_template,
-            help="The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.",
         )
         parser.add_argument(
             "--is-embedding",
@@ -748,9 +694,9 @@ class ServerArgs:
             "the default version.",
         )
         parser.add_argument(
-            "--impl",
+            "--model-impl",
             type=str,
-            default=ServerArgs.impl,
+            default=ServerArgs.model_impl,
             help="Which implementation of the model to use.\n\n"
             '* "auto" will try to use the SGLang implementation if it exists '
             "and fall back to the Transformers implementation if no SGLang "
@@ -758,6 +704,94 @@ class ServerArgs:
             '* "sglang" will use the SGLang model implementation.\n'
             '* "transformers" will use the Transformers model '
             "implementation.\n",
+        )
+
+        # HTTP server
+        parser.add_argument(
+            "--host",
+            type=str,
+            default=ServerArgs.host,
+            help="The host of the HTTP server.",
+        )
+        parser.add_argument(
+            "--port",
+            type=int,
+            default=ServerArgs.port,
+            help="The port of the HTTP server.",
+        )
+        parser.add_argument(
+            "--skip-server-warmup",
+            action="store_true",
+            help="If set, skip warmup.",
+        )
+        parser.add_argument(
+            "--warmups",
+            type=str,
+            required=False,
+            help="Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 "
+            "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
+        )
+        parser.add_argument(
+            "--nccl-port",
+            type=int,
+            default=ServerArgs.nccl_port,
+            help="The port for NCCL distributed environment setup. Defaults to a random port.",
+        )
+
+        # Quantization and data type
+        parser.add_argument(
+            "--dtype",
+            type=str,
+            default=ServerArgs.dtype,
+            choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
+            help="Data type for model weights and activations.\n\n"
+            '* "auto" will use FP16 precision for FP32 and FP16 models, and '
+            "BF16 precision for BF16 models.\n"
+            '* "half" for FP16. Recommended for AWQ quantization.\n'
+            '* "float16" is the same as "half".\n'
+            '* "bfloat16" for a balance between precision and range.\n'
+            '* "float" is shorthand for FP32 precision.\n'
+            '* "float32" for FP32 precision.',
+        )
+        parser.add_argument(
+            "--quantization",
+            type=str,
+            default=ServerArgs.quantization,
+            choices=[
+                "awq",
+                "fp8",
+                "gptq",
+                "marlin",
+                "gptq_marlin",
+                "awq_marlin",
+                "bitsandbytes",
+                "gguf",
+                "modelopt",
+                "modelopt_fp4",
+                "petit_nvfp4",
+                "w8a8_int8",
+                "w8a8_fp8",
+                "moe_wna16",
+                "qoq",
+                "w4afp8",
+            ],
+            help="The quantization method.",
+        )
+        parser.add_argument(
+            "--quantization-param-path",
+            type=nullable_str,
+            default=None,
+            help="Path to the JSON file containing the KV cache "
+            "scaling factors. This should generally be supplied, when "
+            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
+            "default to 1.0, which may cause accuracy issues. ",
+        )
+        parser.add_argument(
+            "--kv-cache-dtype",
+            type=str,
+            default=ServerArgs.kv_cache_dtype,
+            choices=["auto", "fp8_e5m2", "fp8_e4m3"],
+            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
         )
 
         # Memory and scheduling
@@ -772,6 +806,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_running_requests,
             help="The maximum number of running requests.",
+        )
+        parser.add_argument(
+            "--max-queued-requests",
+            type=int,
+            default=ServerArgs.max_queued_requests,
+            help="The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
         )
         parser.add_argument(
             "--max-total-tokens",
@@ -817,8 +857,38 @@ class ServerArgs:
             default=ServerArgs.page_size,
             help="The number of tokens in a page.",
         )
+        parser.add_argument(
+            "--hybrid-kvcache-ratio",
+            nargs="?",
+            const=0.5,
+            type=float,
+            default=ServerArgs.hybrid_kvcache_ratio,
+            help=(
+                "Mix ratio in [0,1] between uniform and hybrid kv buffers "
+                "(0.0 = pure uniform: swa_size / full_size = 1)"
+                "(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length)"
+            ),
+        )
+        parser.add_argument(
+            "--swa-full-tokens-ratio",
+            type=float,
+            default=ServerArgs.swa_full_tokens_ratio,
+            help="The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. "
+            "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.",
+        )
+        parser.add_argument(
+            "--disable-hybrid-swa-memory",
+            action="store_true",
+            help="Disable the hybrid SWA memory.",
+        )
 
-        # Other runtime options
+        # Runtime options
+        parser.add_argument(
+            "--device",
+            type=str,
+            default=ServerArgs.device,
+            help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
+        )
         parser.add_argument(
             "--tensor-parallel-size",
             "--tp-size",
@@ -860,7 +930,7 @@ class ServerArgs:
             "--constrained-json-whitespace-pattern",
             type=str,
             default=ServerArgs.constrained_json_whitespace_pattern,
-            help=r"Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
+            help="(outlines backend only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
         )
         parser.add_argument(
             "--watchdog-timeout",
@@ -920,8 +990,14 @@ class ServerArgs:
             "--log-requests-level",
             type=int,
             default=0,
-            help="0: Log metadata. 1. Log metadata and partial input/output. 2. Log every input/output.",
-            choices=[0, 1, 2],
+            help="0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial input/output. 3: Log every input/output.",
+            choices=[0, 1, 2, 3],
+        )
+        parser.add_argument(
+            "--crash-dump-folder",
+            type=str,
+            default=ServerArgs.crash_dump_folder,
+            help="Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled.",
         )
         parser.add_argument(
             "--show-time-cost",
@@ -932,6 +1008,13 @@ class ServerArgs:
             "--enable-metrics",
             action="store_true",
             help="Enable log prometheus metrics.",
+        )
+        parser.add_argument(
+            "--enable-metrics-for-all-schedulers",
+            action="store_true",
+            help="Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) "
+            "to record request metrics separately. This is especially useful when dp_attention is enabled, as "
+            "otherwise all metrics appear to come from TP 0.",
         )
         parser.add_argument(
             "--bucket-time-to-first-token",
@@ -961,12 +1044,6 @@ class ServerArgs:
             help="Collect prompt/generation tokens histogram.",
         )
         parser.add_argument(
-            "--kv-events-config",
-            type=str,
-            default=None,
-            help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
-        )
-        parser.add_argument(
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
@@ -978,6 +1055,12 @@ class ServerArgs:
             default=ServerArgs.enable_request_time_stats_logging,
             help="Enable per request time stats logging",
         )
+        parser.add_argument(
+            "--kv-events-config",
+            type=str,
+            default=None,
+            help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
+        )
 
         # API related
         parser.add_argument(
@@ -985,6 +1068,24 @@ class ServerArgs:
             type=str,
             default=ServerArgs.api_key,
             help="Set API key of the server. It is also used in the OpenAI API compatible server.",
+        )
+        parser.add_argument(
+            "--served-model-name",
+            type=str,
+            default=ServerArgs.served_model_name,
+            help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
+        )
+        parser.add_argument(
+            "--chat-template",
+            type=str,
+            default=ServerArgs.chat_template,
+            help="The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
+        )
+        parser.add_argument(
+            "--completion-template",
+            type=str,
+            default=ServerArgs.completion_template,
+            help="The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.",
         )
         parser.add_argument(
             "--file-storage-path",
@@ -1007,9 +1108,18 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=["qwen25", "mistral", "llama3", "deepseekv3", "pythonic"],
+            choices=[
+                "qwen25",
+                "mistral",
+                "llama3",
+                "deepseekv3",
+                "pythonic",
+                "kimi_k2",
+                "qwen3_coder",
+                "glm45",
+            ],
             default=ServerArgs.tool_call_parser,
-            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', and 'pythonic'.",
+            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', and 'qwen3_coder'.",
         )
 
         # Data parallelism
@@ -1060,6 +1170,28 @@ class ServerArgs:
 
         # LoRA
         parser.add_argument(
+            "--enable-lora",
+            default=ServerArgs.enable_lora,
+            action="store_true",
+            help="Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility.",
+        )
+        parser.add_argument(
+            "--max-lora-rank",
+            default=ServerArgs.max_lora_rank,
+            type=int,
+            help="The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+        )
+        parser.add_argument(
+            "--lora-target-modules",
+            type=str,
+            choices=SUPPORTED_LORA_TARGET_MODULES + [LORA_TARGET_ALL_MODULES],
+            nargs="*",
+            default=None,
+            help="The union set of all target modules where LoRA should be applied. If not specified, "
+            "it will be automatically inferred from the adapters provided in --lora-paths. If 'all' is specified, "
+            "all supported modules will be targeted.",
+        )
+        parser.add_argument(
             "--lora-paths",
             type=str,
             nargs="*",
@@ -1092,10 +1224,40 @@ class ServerArgs:
                 "flashmla",
                 "intel_amx",
                 "torch_native",
+                "ascend",
                 "triton",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
+        )
+        parser.add_argument(
+            "--decode-attention-backend",
+            type=str,
+            choices=[
+                "flashinfer",
+                "triton",
+                "torch_native",
+                "fa3",
+                "flashmla",
+                "cutlass_mla",
+            ],
+            default=ServerArgs.decode_attention_backend,
+            help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
+        )
+
+        parser.add_argument(
+            "--prefill-attention-backend",
+            type=str,
+            choices=[
+                "flashinfer",
+                "triton",
+                "torch_native",
+                "fa3",
+                "flashmla",
+                "cutlass_mla",
+            ],
+            default=ServerArgs.prefill_attention_backend,
+            help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
         )
         parser.add_argument(
             "--sampling-backend",
@@ -1110,6 +1272,13 @@ class ServerArgs:
             choices=["xgrammar", "outlines", "llguidance", "none"],
             default=ServerArgs.grammar_backend,
             help="Choose the backend for grammar-guided decoding.",
+        )
+        parser.add_argument(
+            "--mm-attention-backend",
+            type=str,
+            choices=["sdpa", "fa3", "triton_attn"],
+            default=ServerArgs.mm_attention_backend,
+            help="Set multimodal attention backend.",
         )
 
         # Speculative decoding
@@ -1160,13 +1329,6 @@ class ServerArgs:
             help="The path of the draft model's small vocab table.",
             default=ServerArgs.speculative_token_map,
         )
-        parser.add_argument(
-            "--mm-attention-backend",
-            type=str,
-            choices=["sdpa", "fa3", "triton_attn"],
-            default=ServerArgs.mm_attention_backend,
-            help="Set multimodal attention backend.",
-        )
 
         # Expert parallelism
         parser.add_argument(
@@ -1182,9 +1344,19 @@ class ServerArgs:
             help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
         )
         parser.add_argument(
-            "--enable-flashinfer-moe",
+            "--enable-flashinfer-cutlass-moe",
             action="store_true",
             help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP with --enable-ep-moe",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-trtllm-moe",
+            action="store_true",
+            help="Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP with --enable-ep-moe",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-allreduce-fusion",
+            action="store_true",
+            help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
         )
         parser.add_argument(
             "--enable-deepep-moe",
@@ -1267,6 +1439,46 @@ class ServerArgs:
             type=int,
             default=ServerArgs.moe_dense_tp_size,
             help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
+        )
+
+        # Hierarchical cache
+        parser.add_argument(
+            "--enable-hierarchical-cache",
+            action="store_true",
+            help="Enable hierarchical cache",
+        )
+        parser.add_argument(
+            "--hicache-ratio",
+            type=float,
+            default=ServerArgs.hicache_ratio,
+            help="The ratio of the size of host KV cache memory pool to the size of device pool.",
+        )
+        parser.add_argument(
+            "--hicache-size",
+            type=int,
+            default=ServerArgs.hicache_size,
+            help="The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
+        )
+        parser.add_argument(
+            "--hicache-write-policy",
+            type=str,
+            choices=["write_back", "write_through", "write_through_selective"],
+            default=ServerArgs.hicache_write_policy,
+            help="The write policy of hierarchical cache.",
+        )
+        parser.add_argument(
+            "--hicache-io-backend",
+            type=str,
+            choices=["direct", "kernel"],
+            default=ServerArgs.hicache_io_backend,
+            help="The IO backend for KV cache transfer between CPU and GPU",
+        )
+        parser.add_argument(
+            "--hicache-storage-backend",
+            type=str,
+            choices=["file", "mooncake", "hf3fs"],
+            default=ServerArgs.hicache_storage_backend,
+            help="The storage backend for hierarchical KV cache.",
         )
 
         # Double Sparsity
@@ -1370,11 +1582,6 @@ class ServerArgs:
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
         )
         parser.add_argument(
-            "--disable-overlap-cg-plan",
-            action="store_true",
-            help="Disable the overlap optimization for cudagraph preparation in eagle verify.",
-        )
-        parser.add_argument(
             "--enable-mixed-chunk",
             action="store_true",
             help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
@@ -1462,30 +1669,6 @@ class ServerArgs:
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
         )
         parser.add_argument(
-            "--enable-hierarchical-cache",
-            action="store_true",
-            help="Enable hierarchical cache",
-        )
-        parser.add_argument(
-            "--hicache-ratio",
-            type=float,
-            default=ServerArgs.hicache_ratio,
-            help="The ratio of the size of host KV cache memory pool to the size of device pool.",
-        )
-        parser.add_argument(
-            "--hicache-size",
-            type=int,
-            default=ServerArgs.hicache_size,
-            help="The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
-        )
-        parser.add_argument(
-            "--hicache-write-policy",
-            type=str,
-            choices=["write_back", "write_through", "write_through_selective"],
-            default=ServerArgs.hicache_write_policy,
-            help="The write policy of hierarchical cache.",
-        )
-        parser.add_argument(
             "--flashinfer-mla-disable-ragged",
             action="store_true",
             help="Not using ragged prefill wrapper when running flashinfer mla",
@@ -1511,11 +1694,9 @@ class ServerArgs:
             help="Enable returning hidden states with responses.",
         )
         parser.add_argument(
-            "--warmups",
-            type=str,
-            required=False,
-            help="Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 "
-            "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
+            "--enable-triton-kernel-moe",
+            action="store_true",
+            help="Use triton moe grouped gemm kernel.",
         )
 
         # Debug tensor dumps
@@ -1543,7 +1724,7 @@ class ServerArgs:
             help="Only dump the tensors for prefill requests (i.e. batch size > 1).",
         )
 
-        # Disaggregation
+        # PD disaggregation
         parser.add_argument(
             "--disaggregation-mode",
             type=str,
@@ -1555,7 +1736,7 @@ class ServerArgs:
             "--disaggregation-transfer-backend",
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
-            choices=["mooncake", "nixl"],
+            choices=["mooncake", "nixl", "ascend"],
             help="The backend for disaggregation transfer. Default is mooncake.",
         )
         parser.add_argument(
@@ -1602,12 +1783,27 @@ class ServerArgs:
             default=None,
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
+
+        # Custom weight loader
         parser.add_argument(
             "--custom-weight-loader",
             type=str,
             nargs="*",
             default=None,
             help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
+        )
+        parser.add_argument(
+            "--enable-pdmux",
+            action="store_true",
+            help="Enable PD-Multiplexing, PD running on greenctx stream.",
+        )
+
+        # For PD-Multiplexing
+        parser.add_argument(
+            "--sm-group-num",
+            type=int,
+            default=ServerArgs.sm_group_num,
+            help="Number of sm partition groups.",
         )
         parser.add_argument(
             "--weight-loader-disable-mmap",
@@ -1630,12 +1826,23 @@ class ServerArgs:
         else:
             return f"http://{self.host}:{self.port}"
 
+    def get_hf_config(self):
+        kwargs = {}
+        hf_config = get_config(
+            self.model_path,
+            trust_remote_code=self.trust_remote_code,
+            revision=self.revision,
+            model_override_args=json.loads(self.json_model_override_args),
+            **kwargs,
+        )
+        return hf_config
+
     def check_server_args(self):
+        # Check parallel size constraints
         assert (
             self.tp_size * self.pp_size
         ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
-        # FIXME pp constraints
         if self.pp_size > 1:
             assert (
                 self.disable_overlap_schedule
@@ -1646,23 +1853,143 @@ class ServerArgs:
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
         ), "multi-node data parallel is not supported unless dp attention!"
+
+        assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
+        assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
+
+        assert self.moe_dense_tp_size in {
+            1,
+            None,
+        }, "moe_dense_tp_size only support 1 and None currently"
+
+        # Check model architecture
+        model_arch = self.get_hf_config().architectures[0]
+        if "Llama4" in model_arch:
+            assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
+
+        # Check LoRA
+        self.check_lora_server_args()
+
+        # Check speculative decoding
+        if self.speculative_algorithm is not None:
+            assert (
+                not self.enable_mixed_chunk
+            ), "enable_mixed_chunk is required for speculative decoding"
+
+        # Check chunked prefill
+        assert (
+            self.chunked_prefill_size % self.page_size == 0
+        ), "chunked_prefill_size must be divisible by page_size"
+
+    def check_lora_server_args(self):
         assert (
             self.max_loras_per_batch > 0
             # FIXME
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and radix attention is in progress"
-        assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
-        assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
-        if isinstance(self.lora_paths, list):
-            lora_paths = self.lora_paths
-            self.lora_paths = {}
-            for lora_path in lora_paths:
-                if "=" in lora_path:
-                    name, path = lora_path.split("=", 1)
-                    self.lora_paths[name] = path
-                else:
-                    self.lora_paths[lora_path] = lora_path
+        # Enable LoRA if any LoRA paths are provided for backward compatibility.
+        if self.lora_paths:
+            if self.enable_lora is None:
+                self.enable_lora = True
+                logger.info(
+                    "--enable-lora is set to True because --lora-paths is provided."
+                )
+            elif self.enable_lora is False:
+                logger.warning(
+                    "--enable-lora is set to False, any provided lora_paths will be ignored."
+                )
+
+        if self.enable_lora:
+            # Normalize lora_paths to a dictionary if it is a list.
+            if isinstance(self.lora_paths, list):
+                lora_paths = self.lora_paths
+                self.lora_paths = {}
+                for lora_path in lora_paths:
+                    if "=" in lora_path:
+                        name, path = lora_path.split("=", 1)
+                        self.lora_paths[name] = LoRARef(lora_name=name, lora_path=path)
+                    else:
+                        self.lora_paths[lora_path] = LoRARef(
+                            lora_name=lora_path,
+                            lora_path=lora_path,
+                        )
+            elif isinstance(self.lora_paths, dict):
+                self.lora_paths = {
+                    k: LoRARef(lora_name=k, lora_path=v)
+                    for k, v in self.lora_paths.items()
+                }
+            elif self.lora_paths is None:
+                self.lora_paths = {}
+            else:
+                raise ValueError(
+                    f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
+                    "Expected a list or a dictionary."
+                )
+
+            # Expand target modules
+            if self.lora_target_modules:
+                self.lora_target_modules = set(self.lora_target_modules)
+                if "all" in self.lora_target_modules:
+                    assert (
+                        len(self.lora_target_modules) == 1
+                    ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                    self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
+
+            # Ensure sufficient information is provided for LoRA initialization.
+            assert self.lora_paths or (
+                self.max_lora_rank and self.lora_target_modules
+            ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+
+    def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
+        larger_tp = max(decode_tp, prefill_tp)
+        smaller_tp = min(decode_tp, prefill_tp)
+        assert larger_tp % smaller_tp == 0, (
+            "Different tp size is supported only when one tp is multiple of the other. "
+            f"decode_tp={decode_tp}, prefill_tp={prefill_tp}"
+        )
+
+    def adjust_mem_fraction_for_vlm(self, model_config):
+        vision_config = getattr(model_config.hf_config, "vision_config", None)
+        if vision_config is None:
+            return
+
+        # roughly reduce the mem_fraction_static base on params of Vit
+        original_server_arg_mem_fraction = self.mem_fraction_static
+        # a base mem_fraction_static factor for regular Vit
+        base_mem_fraction_reduction_ratio = 0.95
+
+        vit_num_layers = getattr(vision_config, "num_hidden_layers", 24)
+        vit_hidden_size = getattr(vision_config, "hidden_size", 1024)
+
+        # baseline ViT params (ViT-L/14)
+        baseline_vit_layers = 24
+        baseline_vit_hidden_size = 1024
+
+        # weight params count
+        current_complexity_score = vit_num_layers * (vit_hidden_size**2)
+        baseline_complexity_score = baseline_vit_layers * (baseline_vit_hidden_size**2)
+        complexity_ratio = (
+            current_complexity_score / baseline_complexity_score
+            if baseline_complexity_score > 0
+            else 1.0
+        )
+
+        # every time the complexity grows 100%, adjust final factor for 10%
+        sensitivity_scale = 0.1
+        dynamic_adjustment_factor = 1.0 - sensitivity_scale * (complexity_ratio - 1.0)
+        dynamic_adjustment_factor = max(0.8, min(1.05, dynamic_adjustment_factor))
+
+        final_overall_factor = (
+            base_mem_fraction_reduction_ratio * dynamic_adjustment_factor
+        )
+        self.mem_fraction_static = (
+            original_server_arg_mem_fraction * final_overall_factor
+        )
+        logger.warning(
+            f"Multimodal model: Dynamically adjusted --mem-fraction-static "
+            f"from: {original_server_arg_mem_fraction:.3f} to: {self.mem_fraction_static:.3f}."
+        )
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
@@ -1706,14 +2033,17 @@ class PortArgs:
 
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
-        port = server_args.port + random.randint(100, 1000)
-        while True:
-            if is_port_available(port):
-                break
-            if port < 60000:
-                port += 42
-            else:
-                port -= 43
+        if server_args.nccl_port is None:
+            nccl_port = server_args.port + random.randint(100, 1000)
+            while True:
+                if is_port_available(nccl_port):
+                    break
+                if nccl_port < 60000:
+                    nccl_port += 42
+                else:
+                    nccl_port -= 43
+        else:
+            nccl_port = server_args.nccl_port
 
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
@@ -1721,7 +2051,7 @@ class PortArgs:
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-                nccl_port=port,
+                nccl_port=nccl_port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             )
@@ -1741,6 +2071,9 @@ class PortArgs:
 
             dist_init_host, dist_init_port = dist_init_addr
             port_base = int(dist_init_port) + 1
+            detokenizer_port = port_base + 1
+            rpc_port = port_base + 2
+            metrics_ipc_name = port_base + 3
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
@@ -1750,10 +2083,10 @@ class PortArgs:
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
-                detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
-                nccl_port=port,
-                rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
-                metrics_ipc_name=f"tcp://{dist_init_host}:{port_base + 3}",
+                detokenizer_ipc_name=f"tcp://{dist_init_host}:{detokenizer_port}",
+                nccl_port=nccl_port,
+                rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
+                metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
             )
 
 
@@ -1778,31 +2111,13 @@ class DeprecatedAction(argparse.Action):
         raise ValueError(self.help)
 
 
-def get_model_arch(args: ServerArgs):
-    hf_config = get_config(
-        args.model_path,
-        trust_remote_code=args.trust_remote_code,
-        revision=args.revision,
-        model_override_args=json.loads(args.json_model_override_args),
-    )
-    return hf_config.architectures[0]
-
-
 def auto_choose_speculative_params(self: ServerArgs):
     """
     Automatically choose the parameters for speculative decoding.
 
     You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
     """
-    kwargs = {}
-
-    hf_config = get_config(
-        self.model_path,
-        trust_remote_code=self.trust_remote_code,
-        revision=self.revision,
-        model_override_args=json.loads(self.json_model_override_args),
-        **kwargs,
-    )
+    hf_config = self.get_hf_config()
     arch = hf_config.architectures[0]
 
     if arch in ["LlamaForCausalLM"]:

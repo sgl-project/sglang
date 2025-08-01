@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import BatchEmbeddingOut, BatchTokenIDOut
+from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 
 if TYPE_CHECKING:
@@ -126,7 +126,16 @@ class SchedulerOutputProcessorMixin:
                         )
 
                     if req.grammar is not None:
-                        req.grammar.accept_token(next_token_id)
+                        # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                        try:
+                            req.grammar.accept_token(next_token_id)
+                        except ValueError as e:
+                            # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                            # This can happen if the grammar is not set correctly or the token is invalid.
+                            logger.error(
+                                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                            )
+                            self.abort_request(AbortReq(req.rid))
                         req.grammar.finished = req.finished()
                 else:
                     # being chunked reqs' prefill is not finished
@@ -263,7 +272,16 @@ class SchedulerOutputProcessorMixin:
                 )
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
-                req.grammar.accept_token(next_token_id)
+                # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                try:
+                    req.grammar.accept_token(next_token_id)
+                except ValueError as e:
+                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                    # This can happen if the grammar is not set correctly or the token is invalid.
+                    logger.error(
+                        f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                    )
+                    self.abort_request(AbortReq(req.rid))
                 req.grammar.finished = req.finished()
 
         self.set_next_batch_sampling_info_done(batch)
@@ -272,7 +290,7 @@ class SchedulerOutputProcessorMixin:
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         if (
-            self.attn_tp_rank == 0
+            self.current_scheduler_metrics_enabled()
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
             self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
@@ -521,11 +539,17 @@ class SchedulerOutputProcessorMixin:
                     stream_interval = (
                         req.sampling_params.stream_interval or self.stream_interval
                     )
-                    should_output = len(req.output_ids) % stream_interval == 0
+                    should_output = (
+                        len(req.output_ids) % stream_interval == 1
+                        if not self.model_config.is_multimodal_gen
+                        and stream_interval > 1
+                        else len(req.output_ids) % stream_interval == 0
+                    )
                 else:
                     should_output = (
                         len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
-                        and not self.model_config.is_multimodal_gen
+                        if not self.model_config.is_multimodal_gen
+                        else False
                     )
 
             if should_output:
