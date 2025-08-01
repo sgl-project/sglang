@@ -817,6 +817,7 @@ def sample_mmmu_requests(
         import io
 
         import pybase64
+
         from datasets import load_dataset
     except ImportError:
         raise ImportError("Please install datasets: pip install datasets")
@@ -886,7 +887,7 @@ def sample_mmmu_requests(
                                         "role": "user",
                                         "content": [
                                             {"type": "image", "image": image_data},
-                                            {"type": "text", "text": prompt}
+                                            {"type": "text", "text": prompt},
                                         ],
                                     }
                                 ],

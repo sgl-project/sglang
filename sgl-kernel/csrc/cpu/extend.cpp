@@ -731,8 +731,7 @@ void extend_attention_cpu(
           max_len_extend,
           size_per_thread,
           is_prefix_skipped,
-          has_encoder_lens
-        );
+          has_encoder_lens);
     });
   });
 }
