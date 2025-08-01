@@ -186,17 +186,17 @@ class TpModelWorkerClient:
             # Copy results to the CPU
             if model_worker_batch.return_logprob:
                 logits_output.next_token_logprobs = (
-                    logits_output.next_token_logprobs.to("cpu", non_blocking=True)
+                    logits_output.next_token_logprobs.to("cpu", non_blocking=False)
                 )
                 if logits_output.input_token_logprobs is not None:
                     logits_output.input_token_logprobs = (
-                        logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                        logits_output.input_token_logprobs.to("cpu", non_blocking=False)
                     )
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states.to(
-                    "cpu", non_blocking=True
+                    "cpu", non_blocking=False
                 )
-            next_token_ids = next_token_ids.to("cpu", non_blocking=True)
+            next_token_ids = next_token_ids.to("cpu", non_blocking=False)
             copy_done.record()
 
             self.output_queue.put(

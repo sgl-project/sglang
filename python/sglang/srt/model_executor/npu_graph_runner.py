@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
+import threading
 
 import torch
 
@@ -69,3 +70,36 @@ class NPUGraphRunner(CudaGraphRunner):
         self.graphs[self.bs].update(
             cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
         )
+
+    def replay(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        if not skip_attn_backend_init:
+            self.replay_prepare(forward_batch, pp_proxy_tensors)
+        else:
+            # In speculative decoding, these two fields are still needed.
+            self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+            self.positions[: self.raw_num_token].copy_(forward_batch.positions)
+
+        # Replay
+        thread = threading.Thread(target=self._update_inputs, args=(forward_batch, ))
+        thread.start()
+        self.graphs[self.bs].replay()
+        thread.join()
+
+        output = self.output_buffers[self.bs]
+        if isinstance(output, LogitsProcessorOutput):
+            return LogitsProcessorOutput(
+                next_token_logits=output.next_token_logits[: self.raw_num_token],
+                hidden_states=(
+                    output.hidden_states[: self.raw_num_token]
+                    if output.hidden_states is not None
+                    else None
+                ),
+            )
+        else:
+            assert isinstance(output, PPProxyTensors)
+            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
