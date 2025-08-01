@@ -51,16 +51,6 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
-        if tokenizer_manager.processor is not None and hasattr(
-            tokenizer_manager.processor, "apply_chat_template"
-        ):
-            self.chat_template_apply_func = (
-                tokenizer_manager.processor.apply_chat_template
-            )
-        else:
-            self.chat_template_apply_func = (
-                tokenizer_manager.tokenizer.apply_chat_template
-            )
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -199,8 +189,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.continue_final_message:
                 assistant_prefix = openai_compatible_messages[-1]["content"]
                 openai_compatible_messages = openai_compatible_messages[:-1]
+
         try:
-            prompt_ids = self.chat_template_apply_func(
+            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                 openai_compatible_messages,
                 tokenize=True,
                 add_generation_prompt=True,
@@ -209,10 +200,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.chat_template_kwargs if request.chat_template_kwargs else {}
                 ),
             )
-        except Exception as e:
-            logger.warning(
-                f"Error applying chat template: {e}, no worries if different tool call format detected"
-            )
+        except Exception:
             #  This except branch will be triggered when the chosen model
             #  has a different tools input format that is not compatible
             #  with openAI's apply_chat_template tool_call format, like Mistral.
@@ -221,7 +209,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 if tools
                 else None
             )
-            prompt_ids = self.chat_template_apply_func(
+            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                 openai_compatible_messages,
                 tokenize=True,
                 add_generation_prompt=True,
@@ -230,9 +218,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.chat_template_kwargs if request.chat_template_kwargs else {}
                 ),
             )
-
-        if isinstance(prompt_ids[0], list):
-            prompt_ids = prompt_ids[0]
 
         if assistant_prefix:
             encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)

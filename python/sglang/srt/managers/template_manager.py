@@ -87,7 +87,7 @@ class TemplateManager:
             # Guess chat template from model path
             self.guess_chat_template_from_model_path(model_path)
 
-            # If pre-defined template was found, fallback to HuggingFace template
+            # If no pre-defined template was found, fallback to HuggingFace template
             if self._chat_template_name is None:
                 # Try HuggingFace template first
                 hf_template = self._resolve_hf_chat_template(tokenizer_manager)
@@ -259,12 +259,14 @@ class TemplateManager:
         try:
             if processor := tokenizer_manager.processor:
                 if hasattr(processor, "chat_template"):
+                    # Override the chat template with the one from the processor
+                    tokenizer_manager.tokenizer.chat_template = processor.chat_template
                     return processor.chat_template
             elif tokenizer := tokenizer_manager.tokenizer:
                 if hasattr(tokenizer, "chat_template"):
                     return tokenizer.chat_template
         except Exception as e:
-            logger.debug(f"Error getting chat template via get_chat_template(): {e}")
+            logger.debug(f"Error getting chat template: {e}")
 
         logger.debug("No HuggingFace chat template found")
         return None
