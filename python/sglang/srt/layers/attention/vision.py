@@ -485,13 +485,9 @@ class VisionAttention(nn.Module):
         bsz, s, _ = x_shape
         head = self.num_attention_heads_per_partition
         kv_head = self.num_attention_kv_heads_per_partition
-        if self.tp_rank == 0:
-            print(f"{x=}")
         if self.use_qkv_parallel:
             # [b, s, embed_dim] --> [b, s, embed_dim]
             qkv, _ = self.qkv_proj(x)
-            if self.tp_rank == 0:
-                print(f"{qkv=}")
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
             # [b, s, embed_dim] --> [b * s, head, head_size]
@@ -540,8 +536,6 @@ class VisionAttention(nn.Module):
                 q = q.view(original_shape)
                 k = k.view(original_shape)
 
-        if self.tp_rank == 0:
-            print(f"544 {q=} {k=}")
         if q.dim() == 4:
             # [b, s, head, head_size] --> [b * s, head, head_size]
             q = rearrange(q, "b s ... -> (b s) ...")
@@ -569,8 +563,6 @@ class VisionAttention(nn.Module):
             cu_seqlens=cu_seqlens,
             attention_mask=attention_mask,
         )
-        if self.tp_rank == 0:
-            print(f"573 {output=}")
 
         assert output.dim() == 3, output.shape
 
@@ -591,8 +583,5 @@ class VisionAttention(nn.Module):
 
             # [s, b, h * head_size] --> [b, s, h * head_size]
             output = output.view(bsz, s, -1)
-
-        if self.tp_rank == 0:
-            print(f"595 {output=}")
 
         return output
