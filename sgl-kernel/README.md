@@ -71,6 +71,8 @@ nvcc --version
 ptxas --version
 ```
 **2. Update ptxas to 12.8 (if needed)**
+
+Save the following script to a file (e.g., `update_ptxas.sh`).
 ```bash
 #!/usr/bin/env bash
 # Source: https://github.com/Dao-AILab/flash-attention/blob/7ff1b621112ba8b538e2fc6a316f2a6b6f22e518/hopper/setup.py#L404
@@ -83,7 +85,7 @@ fi
 
 CUDA_VERSION=$1
 
-if awk "BEGIN {exit !($CUDA_VERSION >= 12.6 && $CUDA_VERSION < 12.8)}"; then
+if awk "BEGIN {exit !("$CUDA_VERSION" >= 12.6 && "$CUDA_VERSION" < 12.8)}"; then
     NVCC_ARCHIVE_VERSION="12.8.93"
     NVCC_ARCHIVE_NAME="cuda_nvcc-linux-x86_64-${NVCC_ARCHIVE_VERSION}-archive"
     NVCC_ARCHIVE_TAR="${NVCC_ARCHIVE_NAME}.tar.xz"
@@ -94,11 +96,15 @@ if awk "BEGIN {exit !($CUDA_VERSION >= 12.6 && $CUDA_VERSION < 12.8)}"; then
     
     mkdir -p /usr/local/cuda/bin
     cp "${NVCC_ARCHIVE_NAME}/bin/ptxas" /usr/local/cuda/bin/
+
+    # Clean up temporary files
+    rm -f "${NVCC_ARCHIVE_TAR}"
+    rm -rf "${NVCC_ARCHIVE_NAME}"
 fi
 ```
-Run the script with your CUDA version as the argument:
+Run the script with your CUDA version as the argument, using `sudo`:
 ```bash
-bash update_ptxas.sh 12.6
+sudo bash update_ptxas.sh 12.6
 # Check the version
 ptxas --version
 ```
