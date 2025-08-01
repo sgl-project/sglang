@@ -74,6 +74,10 @@ class AnthropicTool(BaseModel):
             v["type"] = "object"  # Default to object type
         return v
 
+class AnthropicToolChoice(BaseModel):
+    """Tool Choice definition"""
+    type: Literal["auto", "any", "tool"]
+    name: Optional[str]
 
 class AnthropicMessagesRequest(BaseModel):
     """Anthropic Messages API request"""
@@ -85,7 +89,7 @@ class AnthropicMessagesRequest(BaseModel):
     stream: Optional[bool] = False
     system: Optional[str] = None
     temperature: Optional[float] = None
-    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
+    tool_choice: Optional[AnthropicToolChoice] = None
     tools: Optional[List[AnthropicTool]] = None
     top_k: Optional[int] = None
     top_p: Optional[float] = None

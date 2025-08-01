@@ -182,24 +182,11 @@ class AnthropicServingMessages(OpenAIServingBase):
         self, request: AnthropicMessagesRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
-        tool_call_constraint = None
 
         # Apply chat template and its stop strings
         tools = None
-        if request.tools and request.tool_choice != "none":
-            request.skip_special_tokens = False
-            if not isinstance(request.tool_choice, str):
-                tools = [
-                    item.model_dump()
-                    for item in request.tools
-                    if item.function.name == request.tool_choice.function.name
-                ]
-            else:
-                tools = [item.model_dump() for item in request.tools]
-
-            tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
-            parser = FunctionCallParser(request.tools, tool_call_parser)
-            tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
+        if request.tools and request.tool_choice:
+            tools = [item.model_dump() for item in request.tools]
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
@@ -207,7 +194,6 @@ class AnthropicServingMessages(OpenAIServingBase):
         else:
             result = self._apply_conversation_template(request, is_multimodal)
 
-        result.tool_call_constraint = tool_call_constraint
         return result
 
     def _apply_jinja_template(
@@ -249,9 +235,8 @@ class AnthropicServingMessages(OpenAIServingBase):
             openai_compatible_messages
             and openai_compatible_messages[-1]["role"] == "assistant"
         ):
-            if request.continue_final_message:
-                assistant_prefix = openai_compatible_messages[-1]["content"]
-                openai_compatible_messages = openai_compatible_messages[:-1]
+            assistant_prefix = openai_compatible_messages[-1]["content"]
+            openai_compatible_messages = openai_compatible_messages[:-1]
 
         try:
             prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
@@ -291,7 +276,7 @@ class AnthropicServingMessages(OpenAIServingBase):
         if is_multimodal:
             prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
-        stop = request.stop
+        stop = request.stop_sequences
         image_data = image_data if image_data else None
         audio_data = audio_data if audio_data else None
         video_data = video_data if video_data else None
@@ -318,8 +303,7 @@ class AnthropicServingMessages(OpenAIServingBase):
 
         # If we should continue the final assistant message, adjust the conversation.
         if (
-            request.continue_final_message
-            and request.messages
+            request.messages
             and request.messages[-1].role == "assistant"
         ):
             # Remove the auto-added blank assistant turn, if present.
@@ -345,13 +329,13 @@ class AnthropicServingMessages(OpenAIServingBase):
         video_data = conv.video_data if conv.video_data else None
         audio_data = conv.audio_data if conv.audio_data else None
         modalities = conv.modalities if conv.modalities else []
-        stop = copy.copy(conv.stop_str or [] if not request.ignore_eos else [])
+        stop = []
 
-        if request.stop:
-            if isinstance(request.stop, str):
-                stop.append(request.stop)
+        if request.stop_sequences:
+            if isinstance(request.stop_sequences, str):
+                stop.append(request.stop_sequences)
             else:
-                stop.extend(request.stop)
+                stop.extend(request.stop_sequences)
 
         if not is_multimodal:
             prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
