@@ -1056,10 +1056,10 @@ def match_phi_4_mm(model_path: str):
         return "phi-4-mm"
 
 
-# @register_conv_template_matching_function
-# def match_vila(model_path: str):
-#     if re.search(r"vila", model_path, re.IGNORECASE):
-#         return "chatml"
+@register_conv_template_matching_function
+def match_vila(model_path: str):
+    if re.search(r"vila", model_path, re.IGNORECASE):
+        return "chatml"
 
 
 # @register_conv_template_matching_function

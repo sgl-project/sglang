@@ -260,7 +260,10 @@ class TemplateManager:
             if processor := tokenizer_manager.processor:
                 if hasattr(processor, "chat_template"):
                     # Override the chat template with the one from the processor
-                    tokenizer_manager.tokenizer.chat_template = processor.chat_template
+                    if processor.chat_template:
+                        tokenizer_manager.tokenizer.chat_template = (
+                            processor.chat_template
+                        )
                     return processor.chat_template
             elif tokenizer := tokenizer_manager.tokenizer:
                 if hasattr(tokenizer, "chat_template"):
