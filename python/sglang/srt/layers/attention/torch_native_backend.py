@@ -6,10 +6,8 @@ import torch
 from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import create_torch_native_kv_indices
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -21,15 +19,6 @@ class TorchNativeAttnBackend(AttentionBackend):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
-        max_bs = model_runner.req_to_token_pool.size
-        self.kv_indptr = [
-            torch.zeros(
-                (max_bs + 1,), dtype=torch.int32, device=model_runner.device
-            ),  # encoder
-            torch.zeros(
-                (max_bs + 1,), dtype=torch.int32, device=model_runner.device
-            ),  # decoder
-        ]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -41,8 +30,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         output: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        kv_indices: torch.Tensor,
-        kv_indptr: torch.Tensor,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
         encoder_lens: torch.Tensor,
         seq_lens: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
@@ -59,8 +48,8 @@ class TorchNativeAttnBackend(AttentionBackend):
             output: [num_tokens, num_heads, head_size]
             k_cache: [max_total_num_tokens, num_heads, head_size]
             v_cache: [max_total_num_tokens, num_heads, head_size]
-            kv_indices: [max_context_len]
-            kv_indptr: [num_seqs]
+            req_to_token: [max_num_reqs, max_context_len]
+            req_pool_indices: [num_seqs]
             encoder_lens: [num_seqs]
             seq_lens: [num_seqs]
             extend_prefix_lens: [num_seqs]
@@ -90,9 +79,8 @@ class TorchNativeAttnBackend(AttentionBackend):
 
             seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + extend_seq_len_q
-            start_kv = kv_indptr[seq_idx]
-            end_kv = start_kv + encoder_lens[seq_idx] if is_cross_attn else start_kv + seq_len_kv
-
+            start_kv = 0 if is_cross_attn else encoder_lens[seq_idx]
+            end_kv = encoder_lens[seq_idx] if is_cross_attn else start_kv + seq_len_kv
             per_req_query = query[:, start_q:end_q, :]
             per_req_query_redudant = torch.empty(
                 (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
@@ -104,7 +92,8 @@ class TorchNativeAttnBackend(AttentionBackend):
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
-            per_req_tokens = kv_indices[start_kv:end_kv]
+            req_pool_idx = req_pool_indices[seq_idx]
+            per_req_tokens = req_to_token[req_pool_idx, start_kv:end_kv]
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
@@ -130,8 +119,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         output: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        kv_indices: torch.Tensor,
-        kv_indptr: torch.Tensor,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
         encoder_lens: torch.Tensor,
         seq_lens: torch.Tensor,
         scaling=None,
@@ -146,8 +135,8 @@ class TorchNativeAttnBackend(AttentionBackend):
             output: [num_tokens, num_heads, head_size]
             k_cache: [max_total_num_tokens, num_heads, head_size]
             v_cache: [max_total_num_tokens, num_heads, head_size]
-            kv_indices: [max_context_len]
-            kv_indptr: [num_seqs]
+            req_to_token: torch.Tensor,
+            req_pool_indices: torch.Tensor,
             encoder_lens: [num_seqs]
             seq_lens: [num_seqs]
             scaling: float or None
@@ -162,7 +151,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
 
-        start_q = 0
+        start_q, start_kv = 0, 0
         for seq_idx in range(seq_lens.shape[0]):
             # TODO: this loop process a sequence per iter, this is inefficient.
             # Need optimize the performance later.
@@ -170,15 +159,16 @@ class TorchNativeAttnBackend(AttentionBackend):
             seq_len_q = 1
             seq_len_kv = encoder_lens[seq_idx] if is_cross_attn else seq_lens[seq_idx]
             end_q = start_q + seq_len_q
-            start_kv = kv_indptr[seq_idx]
-            end_kv = start_kv + seq_len_kv
+            start_kv = 0 if is_cross_attn else encoder_lens[seq_idx]
+            end_kv = encoder_lens[seq_idx] if is_cross_attn else start_kv + seq_len_kv
 
             per_req_query = query[:, start_q:end_q, :]
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
 
-            per_req_tokens = kv_indices[start_kv:end_kv]
+            req_pool_idx = req_pool_indices[seq_idx]
+            per_req_tokens = req_to_token[req_pool_idx, start_kv:end_kv]
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
@@ -195,7 +185,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                 .movedim(query.dim() - 2, 0)
             )
             output[start_q:end_q, :, :] = per_req_out
-            start_q = end_q
+            start_q, start_kv = end_q, end_kv
 
         return output
 
@@ -208,9 +198,6 @@ class TorchNativeAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        kv_indices, kv_indptr = self.update_kv_indices_encode(
-            forward_batch, layer.is_cross_attention
-        )
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
@@ -239,8 +226,8 @@ class TorchNativeAttnBackend(AttentionBackend):
             o_,
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            kv_indices,
-            kv_indptr,
+            forward_batch.req_to_token_pool.req_to_token,
+            forward_batch.req_pool_indices,
             forward_batch.encoder_lens,
             forward_batch.seq_lens,
             forward_batch.extend_prefix_lens,
@@ -263,9 +250,6 @@ class TorchNativeAttnBackend(AttentionBackend):
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
-        kv_indices, kv_indptr = self.update_kv_indices_decode(
-            forward_batch, layer.is_cross_attention
-        )
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         if layer.qk_head_dim != layer.v_head_dim:
@@ -293,8 +277,8 @@ class TorchNativeAttnBackend(AttentionBackend):
             o_,
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            kv_indices,
-            kv_indptr,
+            forward_batch.req_to_token_pool.req_to_token,
+            forward_batch.req_pool_indices,
             forward_batch.encoder_lens,
             forward_batch.seq_lens,
             scaling=layer.scaling,
@@ -307,90 +291,3 @@ class TorchNativeAttnBackend(AttentionBackend):
 
     def support_triton(self):
         return False
-
-    def update_kv_indices_encode(
-        self,
-        forward_batch: ForwardBatch,
-        is_cross_attn=False,
-    ):
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
-        seq_lens_sum = forward_batch.seq_lens_sum
-        encoder_lens = forward_batch.encoder_lens
-        spec_info = forward_batch.spec_info
-        kv_indptr = self.kv_indptr[0]
-        req_to_token = forward_batch.req_to_token_pool.req_to_token
-        if is_cross_attn:
-            paged_kernel_lens = encoder_lens
-            kv_start_idx = torch.zeros_like(encoder_lens)
-            paged_kernel_lens_sum = paged_kernel_lens.sum()
-        else:
-            paged_kernel_lens = seq_lens
-            kv_start_idx = encoder_lens
-            paged_kernel_lens_sum = seq_lens_sum
-        bs = len(seq_lens)
-        if spec_info is None:
-            assert len(seq_lens) == len(req_pool_indices)
-            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
-            kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.empty(
-                paged_kernel_lens_sum + 256,
-                dtype=torch.int32,
-                device=req_pool_indices.device,
-            )
-            create_torch_native_kv_indices(
-                req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_indices,
-                kv_start_idx,
-            )
-        else:
-            assert isinstance(spec_info, EagleDraftInput) or isinstance(
-                spec_info, EagleVerifyInput
-            )
-            kv_indices, kv_indptr, _, _ = spec_info.generate_attn_arg_prefill(
-                req_pool_indices,
-                paged_kernel_lens,
-                paged_kernel_lens_sum,
-                req_to_token,
-            )
-        return kv_indices, kv_indptr
-
-    def update_kv_indices_decode(
-        self,
-        forward_batch: ForwardBatch,
-        is_cross_attn=False,
-    ):
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
-        seq_lens_sum = forward_batch.seq_lens_sum
-        encoder_lens = forward_batch.encoder_lens
-        spec_info = forward_batch.spec_info
-        kv_indptr = self.kv_indptr[1]
-        req_to_token = forward_batch.req_to_token_pool.req_to_token
-        if is_cross_attn:
-            paged_kernel_lens = encoder_lens
-            kv_start_idx = torch.zeros_like(encoder_lens)
-            seq_lens_sum = encoder_lens.sum()
-        else:
-            paged_kernel_lens = seq_lens
-            kv_start_idx = encoder_lens
-        if spec_info is None:
-            bs = len(req_pool_indices)
-            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
-            kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.empty(seq_lens_sum, dtype=torch.int32)
-            create_torch_native_kv_indices(
-                req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_indices,
-                kv_start_idx,
-            )
-        else:
-            kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
-            bs = kv_indptr.shape[0] - 1
-        return kv_indices, kv_indptr
