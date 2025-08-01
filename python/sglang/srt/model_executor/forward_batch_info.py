@@ -298,6 +298,10 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # For MiniMax cache management (similar to vLLM)
+    request_ids_to_seq_ids: Optional[Dict[str, List[int]]] = None
+    finished_requests_ids: Optional[List[str]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -337,6 +341,9 @@ class ForwardBatch:
             input_embeds=batch.input_embeds,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            # Pass through real request IDs information
+            request_ids_to_seq_ids=batch.request_ids_to_seq_ids,
+            finished_requests_ids=batch.finished_requests_ids,
         )
         device = model_runner.device
 
