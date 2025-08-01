@@ -21,6 +21,7 @@ import logging
 import os
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
+import threading
 
 import torch
 import tqdm
@@ -730,8 +731,10 @@ class CudaGraphRunner:
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
-        self._update_inputs(forward_batch)
+        thread = threading.Thread(target=self._update_inputs, args=(forward_batch, ))
+        thread.start()
         self.graphs[self.bs].replay()
+        thread.join()
 
         output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):
