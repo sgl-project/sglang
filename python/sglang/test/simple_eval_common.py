@@ -91,6 +91,7 @@ class ChatCompletionSampler(SamplerBase):
         model: Optional[str] = None,
         system_message: Optional[str] = None,
         temperature: float = 0.0,
+        top_p: float = 1.0,
         max_tokens: int = 2048,
     ):
         self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
@@ -101,8 +102,12 @@ class ChatCompletionSampler(SamplerBase):
         self.model = model
         self.system_message = system_message
         self.temperature = temperature
+        self.top_p = top_p
         self.max_tokens = max_tokens
         self.image_format = "url"
+        print("***********************ChatCompletionSampler***************************")
+        print(f"\n[Model] {self.model}\n[System Message] {self.system_message}\n[Temperature] {self.temperature}\n[Top P] {self.top_p}\n[Max Tokens] {self.max_tokens}")
+        print("***********************************************************************")
 
     def _handle_image(
         self,
@@ -137,9 +142,13 @@ class ChatCompletionSampler(SamplerBase):
                     model=self.model,
                     messages=message_list,
                     temperature=self.temperature,
+                    top_p=self.top_p,
                     max_tokens=self.max_tokens,
                 )
-                return response.choices[0].message.content
+                content = response.choices[0].message.content
+                # print(f"Message list: {message_list}")
+                # print(f"Response: {content}")
+                return content
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:
                 print("Bad Request Error", e)
@@ -155,19 +164,30 @@ class ChatCompletionSampler(SamplerBase):
             # unknown error shall throw exception
 
 
-QUERY_TEMPLATE_MULTICHOICE = """
-Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD. Think step by step before answering.
+# QUERY_TEMPLATE_MULTICHOICE = """
+# Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD. Think step by step before answering.
 
-{Question}
+# {Question}
 
-A) {A}
-B) {B}
-C) {C}
-D) {D}
-""".strip()
+# A) {A}
+# B) {B}
+# C) {C}
+# D) {D}
+# """.strip()
 
-ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer\s*:\s*([A-D])"
+QUERY_TEMPLATE_MULTICHOICE = """{Question}
+
+(A) {A}
+(B) {B}
+(C) {C}
+(D) {D}
+
+Express your final answer as the corresponding option 'A', 'B', 'C', or 'D'.""".strip()
+
+# ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer\s*:\s*([A-D])"
+ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer[ \t]*:[^a-zA-Z]*\$?([A-D])\$?"
 ANSWER_PATTERN = r"(?i)Answer\s*:\s*([^\n]+)"
+
 
 
 EQUALITY_TEMPLATE = r"""

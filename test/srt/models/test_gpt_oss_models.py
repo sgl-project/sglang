@@ -12,8 +12,13 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+REASONING_EFFORT = "low" # "low" / "medium" / "high"
+OPENAI_SYSTEM_MESSAGE = (
+    f"You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2025-07-13\n\nReasoning: {REASONING_EFFORT}\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message."
+)
 DEFAULT_MODEL_NAME_FOR_TEST = "path-to/Orangina"
 CHAT_TEMPLATE = DEFAULT_MODEL_NAME_FOR_TEST + "/chat_template.jinja"
+
 
 class TestOpenAIMoE(CustomTestCase):
     @classmethod
@@ -29,8 +34,8 @@ class TestOpenAIMoE(CustomTestCase):
                 "--tp",
                 "4",
                 "--attention-backend",
-                "torch_native_sink", # "triton",
-                "--enable-w4a8-mxfp4-moe", # MoE W4A8
+                "torch_native_sink", # "flashinfer / triton / torch_native_sink",
+                # "--enable-w4a8-mxfp4-moe", # MoE W4A8
                 # "--enable-w4-mxfp4-moe", # MoE W4A16
                 "--cuda-graph-bs",
                 "128",
@@ -74,6 +79,24 @@ class TestOpenAIMoE(CustomTestCase):
         metrics = run_eval(args)
         print(f"Eval accuracy of MMLU: {metrics=}")
         self.assertGreaterEqual(metrics["score"], 0.74) # target
+
+    def test_gpqa(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gpqa",
+            num_examples=198,
+            max_tokens=98304,
+            num_threads=128,
+            temperature=1.0,
+            top_p=1.0,
+            top_k=0.0,
+            system_message=OPENAI_SYSTEM_MESSAGE,
+        )
+
+        metrics = run_eval(args)
+        print(f"Eval accuracy of GPQA: {metrics=}")
+        # self.assertGreaterEqual(metrics["score"], 0.60) # target
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=32, prompt="Human: What is the capital of France?\n\nAssistant:")

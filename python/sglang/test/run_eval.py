@@ -64,10 +64,12 @@ def run_eval(args):
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
     sampler = ChatCompletionSampler(
-        model=args.model,
-        max_tokens=2048,
         base_url=base_url,
+        model=args.model,
+        system_message=getattr(args, "system_message", None),
         temperature=getattr(args, "temperature", 0.0),
+        top_p=getattr(args, "top_p", 1.0),
+        max_tokens=getattr(args, "max_tokens", 2048),
     )
 
     # Run eval
@@ -120,7 +122,10 @@ if __name__ == "__main__":
     parser.add_argument("--eval-name", type=str, default="mmlu")
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
+    parser.add_argument("--system-message", type=str, default=None)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--max-tokens", type=int, default=2048)
     args = parser.parse_args()
 
     run_eval(args)

@@ -70,18 +70,40 @@ class GPQAEval(Eval):
                     content=format_multichoice_question(choices_dict), role="user"
                 )
             ]
-            response_text = sampler(prompt_messages)
-            match = re.search(ANSWER_PATTERN_MULTICHOICE, response_text)
-            extracted_answer = match.group(1) if match else None
+            # response_text = sampler(prompt_messages)
+            sampler_response = sampler(prompt_messages)
+            response_text = sampler_response.response_text
+            # print(f"Response text: {response_text}")
+            actual_queried_prompt_messages = sampler_response.actual_queried_message_list
+            # match = re.search(ANSWER_PATTERN_MULTICHOICE, response_text)
+            # extracted_answer = match.group(1) if match else None
+            pattern_list = [
+                r"(?i)Answer[ \t]*:[^a-zA-Z]*\$?([A-D])\$?",
+                r"(?i)assistantfinal[ \t]*[^a-zA-Z]*\$?([A-D])\$?",
+                r"(?i)assistantfinal\*\*Option [^a-zA-Z]*\$?([A-D])\*\*\$?",
+                r"(?i)assistantfinal\*\*[^a-zA-Z]*\$?([A-D])\*\*\$?",
+                r"(?i)text{[^a-zA-Z]*\$?([A-D])}}\$?",
+                r"(?i)text{Option [^a-zA-Z]*\$?([A-D])}}\$?",
+                r"(?i)option\*\*[^a-zA-Z]*\$?([A-D])\*\*\$?",
+                r"(?i)option \*\*[^a-zA-Z]*\$?([A-D])\*\*\$?",
+                r"(?i)option \*\*\([^a-zA-Z]*\$?([A-D])\)\$?",
+                r"(?i)\*\*option [^a-zA-Z]*\$?([A-D])\*\*\$?",
+            ]
+            extracted_answer = None
+            for pattern in pattern_list:
+                match = re.findall(pattern, response_text)
+                if match:
+                    extracted_answer = match[-1]
+                    break
             score = 1.0 if extracted_answer == correct_answer else 0.0
             html = common.jinja_env.from_string(HTML_JINJA).render(
-                prompt_messages=prompt_messages,
+                prompt_messages=actual_queried_prompt_messages,
                 next_message=dict(content=response_text, role="assistant"),
                 score=score,
                 correct_answer=correct_answer,
                 extracted_answer=extracted_answer,
             )
-            convo = prompt_messages + [dict(content=response_text, role="assistant")]
+            convo = actual_queried_prompt_messages + [dict(content=response_text, role="assistant")]
             return SingleEvalResult(
                 html=html,
                 score=score,

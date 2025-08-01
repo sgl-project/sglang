@@ -761,10 +761,10 @@ class OpenAIMoeDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
+        # TODO: Remove direct call to forward_native, currently WA for gpt-oss
         # hidden_states, residual = self.layer_communicator.prepare_mlp(
         #     hidden_states, residual, forward_batch
         # )
-        # TODO: Remove this, currently WA for got-oss
         hidden_states, residual = self.post_attention_layernorm.forward_native(hidden_states, residual)
 
         hidden_states = self.mlp(hidden_states, forward_batch)
