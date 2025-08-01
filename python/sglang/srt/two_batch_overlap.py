@@ -13,7 +13,7 @@ from sglang.srt.layers.communicator import (
     CommunicateSummableTensorPairFn,
     ScatterMode,
 )
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
+from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -23,7 +23,7 @@ from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import BumpAllocator, DeepEPMode, get_bool_env_var
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.ep_moe.token_dispatcher import DispatchOutput
+    from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
 
 _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 

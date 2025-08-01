@@ -53,7 +53,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.ep_moe.token_dispatcher import (
+    from sglang.srt.layers.moe.token_dispatcher import (
         DeepEPLLOutput,
         DeepEPNormalOutput,
         DispatchOutput,

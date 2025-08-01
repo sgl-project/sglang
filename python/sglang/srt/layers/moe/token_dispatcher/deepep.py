@@ -1,5 +1,3 @@
-# TODO(ch-wan): this file will be moved to sglang/srt/layers/moe/token_dispatcher/deepep.py
-
 from __future__ import annotations
 
 import logging

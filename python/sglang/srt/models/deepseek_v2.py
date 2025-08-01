@@ -61,7 +61,6 @@ from sglang.srt.layers.moe.ep_moe.layer import (
     get_moe_impl_class,
     use_flashinfer_trtllm_moe,
 )
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
