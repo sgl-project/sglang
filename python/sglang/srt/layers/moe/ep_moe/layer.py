@@ -26,7 +26,11 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     silu_and_mul_triton_kernel,
     tma_align_input_scale,
 )
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    FlashInferFusedMoE,
+    FusedMoE,
+    should_use_flashinfer_trtllm_moe,
+)
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization import deep_gemm_wrapper
@@ -34,7 +38,11 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from sglang.srt.layers.quantization.fp8 import (
+    Fp8Config,
+    Fp8MoEMethod,
+    get_tile_tokens_dim,
+)
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     sglang_per_token_group_quant_fp8,
@@ -44,14 +52,7 @@ from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import (
-    ceil_div,
-    dispose_tensor,
-    get_bool_env_var,
-    is_hip,
-    is_npu,
-    next_power_of_2,
-)
+from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -64,7 +65,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-use_flashinfer_trtllm_moe = global_server_args_dict["enable_flashinfer_trtllm_moe"]
+
 
 if not (_is_npu or _is_hip):
     from sgl_kernel import silu_and_mul
@@ -74,24 +75,7 @@ if _use_aiter:
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
-if use_flashinfer_trtllm_moe:
-    try:
-        import flashinfer.fused_moe as fi_fused_moe
-    except ImportError:
-        fi_fused_moe = None
-        use_flashinfer_trtllm_moe = False
-
 logger = logging.getLogger(__name__)
-
-
-def _get_tile_tokens_dim(num_tokens, top_k, num_experts):
-    # Guess tokens per expert assuming perfect expert distribution first.
-    num_tokens_per_expert = (num_tokens * top_k) // num_experts
-    # And pad the number to the next power of 2.
-    tile_tokens_dim = next_power_of_2(num_tokens_per_expert)
-    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
-    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-    return tile_tokens_dim
 
 
 class EPMoE(FusedMoE):
@@ -728,10 +712,10 @@ class FlashInferEPMoE(EPMoE):
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
         self.correction_bias = correction_bias
-        self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
+        self.use_flashinfer_trtllm_moe = should_use_flashinfer_trtllm_moe()
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        assert use_flashinfer_trtllm_moe
+        assert self.use_flashinfer_trtllm_moe
         assert (
             self.activation == "silu"
         ), "Only silu is supported for flashinfer blockscale fp8 moe"
@@ -744,8 +728,9 @@ class FlashInferEPMoE(EPMoE):
         a_q, a_sf = sglang_per_token_group_quant_fp8(hidden_states, self.block_shape[1])
         # NOTE: scales of hidden states have to be transposed!
         a_sf_t = a_sf.t().contiguous()
-        assert fi_fused_moe is not None
-        return fi_fused_moe.trtllm_fp8_block_scale_moe(
+        from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+
+        return trtllm_fp8_block_scale_moe(
             routing_logits=router_logits.to(torch.float32),
             routing_bias=self.correction_bias.to(hidden_states.dtype),
             hidden_states=a_q,
@@ -762,7 +747,7 @@ class FlashInferEPMoE(EPMoE):
             local_expert_offset=self.start_expert_id,
             local_num_experts=self.num_local_experts,
             routed_scaling_factor=self.routed_scaling_factor,
-            tile_tokens_dim=_get_tile_tokens_dim(
+            tile_tokens_dim=get_tile_tokens_dim(
                 hidden_states.shape[0], self.top_k, self.num_experts
             ),
             routing_method_type=2,  # DeepSeek-styled routing method
@@ -775,8 +760,6 @@ def get_moe_impl_class():
         return DeepEPMoE
     if global_server_args_dict["enable_flashinfer_cutlass_moe"]:
         return FusedMoE
-    if use_flashinfer_trtllm_moe:
-        return FlashInferEPMoE
     if get_moe_expert_parallel_world_size() > 1:
-        return EPMoE
-    return FusedMoE
+        return FlashInferEPMoE if should_use_flashinfer_trtllm_moe() else EPMoE
+    return FlashInferFusedMoE if should_use_flashinfer_trtllm_moe() else FusedMoE

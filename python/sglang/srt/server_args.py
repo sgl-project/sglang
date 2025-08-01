@@ -24,6 +24,7 @@ import tempfile
 from typing import List, Literal, Optional, Union
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
@@ -196,7 +197,8 @@ class ServerArgs:
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
-    hicache_io_backend: str = ""
+    hicache_io_backend: str = "kernel"
+    hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
 
     # Double Sparsity
@@ -418,6 +420,22 @@ class ServerArgs:
             )
             self.page_size = 128
 
+        if self.attention_backend == "trtllm_mla":
+            if not is_sm100_supported():
+                raise ValueError(
+                    "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
+                )
+
+            if self.page_size not in [32, 64]:
+                logger.warning(
+                    f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
+                )
+                self.page_size = 64
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "trtllm_mla backend does not support speculative decoding yet."
+                )
+
         # Set page size
         if self.page_size is None:
             self.page_size = 1
@@ -457,11 +475,6 @@ class ServerArgs:
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
-
-        if self.enable_flashinfer_trtllm_moe:
-            assert (
-                self.ep_size == self.tp_size
-            ), "The expert parallel size must be the same as the tensor parallel size"
 
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":
@@ -1241,6 +1254,7 @@ class ServerArgs:
                 "torch_native",
                 "ascend",
                 "triton",
+                "trtllm_mla",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
@@ -1486,6 +1500,14 @@ class ServerArgs:
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
         )
+        parser.add_argument(
+            "--hicache-mem-layout",
+            type=str,
+            choices=["layer_first", "page_first"],
+            default=ServerArgs.hicache_mem_layout,
+            help="The layout of host memory pool for hierarchical cache.",
+        )
+
         parser.add_argument(
             "--hicache-storage-backend",
             type=str,

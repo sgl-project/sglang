@@ -588,6 +588,7 @@ class Scheduler(
                         == "fa3"  # hot fix for incompatibility
                         else server_args.hicache_io_backend
                     ),
+                    hicache_mem_layout=server_args.hicache_mem_layout,
                     hicache_storage_backend=server_args.hicache_storage_backend,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(

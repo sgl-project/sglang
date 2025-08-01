@@ -231,16 +231,7 @@ class HiCacheController:
         self.mem_pool_host = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
-        # using kernel for small page KV cache transfer and DMA for large pages
-        if not io_backend:
-            IO_BACKEND_PAGE_SIZE_THRESHOLD = 64
-            self.io_backend = (
-                "direct"
-                if self.page_size >= IO_BACKEND_PAGE_SIZE_THRESHOLD
-                else "kernel"
-            )
-        else:
-            self.io_backend = io_backend
+        self.io_backend = io_backend
 
         self.enable_storage = False
         # todo: move backend initialization to storage backend module
@@ -447,11 +438,8 @@ class HiCacheController:
                 host_indices, device_indices = self.move_indices(
                     operation.host_indices, operation.device_indices
                 )
-                self.mem_pool_device.backup_to_host_all_layer(
-                    self.mem_pool_host,
-                    host_indices,
-                    device_indices,
-                    self.io_backend,
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device, host_indices, device_indices, self.io_backend
                 )
                 self.write_stream.synchronize()
                 self.mem_pool_host.complete_io(operation.host_indices)
@@ -491,8 +479,8 @@ class HiCacheController:
                 batch_operation.host_indices, batch_operation.device_indices
             )
             for i in range(self.mem_pool_host.layer_num):
-                self.mem_pool_device.load_from_host_per_layer(
-                    self.mem_pool_host,
+                self.mem_pool_host.load_to_device_per_layer(
+                    self.mem_pool_device,
                     host_indices,
                     device_indices,
                     i,
