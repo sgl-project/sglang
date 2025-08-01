@@ -171,7 +171,7 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep"] = "none"
+    moe_a2a_backend: Optional[Literal["deepep"]] = None
     enable_flashinfer_cutlass_moe: bool = False
     enable_flashinfer_trtllm_moe: bool = False
     enable_flashinfer_allreduce_fusion: bool = False
@@ -478,7 +478,7 @@ class ServerArgs:
             )
 
         if self.enable_eplb:
-            assert self.ep_size > 1 or self.moe_a2a_backend != "none"
+            assert self.ep_size > 1 or self.moe_a2a_backend is not None
 
         if self.enable_expert_distribution_metrics and (
             self.expert_distribution_recorder_mode is None
@@ -1347,7 +1347,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep"],
+            choices=["deepep"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
