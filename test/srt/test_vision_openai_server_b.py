@@ -167,7 +167,7 @@ class TestGemma3itServer(TestOpenAIVisionServer):
 class TestGemma3nServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
-        cls.model = "google/gemma-3n-E2B-it"
+        cls.model = "google/gemma-3n-E4B-it"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
