@@ -806,7 +806,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
         if self._rank == 0:
             utilization_mean_rates = self._history.mean()
-            window_index = self.window_sizes[0]
+            window_index = self.window_sizes[-1]
             average_utilization_rate_over_window = (
                 utilization_mean_rates[window_index]
                 if window_index in utilization_mean_rates
