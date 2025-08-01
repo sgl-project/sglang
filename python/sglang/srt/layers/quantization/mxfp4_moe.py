@@ -16,7 +16,7 @@ try:
                                    'triton_kernels')
     else:
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        triton_path = os.path.join(current_dir, '..', '..', '..', '..', '..', '..',
+        triton_path = os.path.join(current_dir, '..', '..', '..', '..', '..',
                                    '3rdparty', 'triton', 'python',
                                    'triton_kernels')
     triton_path = os.path.abspath(triton_path)

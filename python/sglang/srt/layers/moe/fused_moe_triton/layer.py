@@ -206,7 +206,7 @@ class UnquantizedFusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
                 hidden_states=x,
                 w13=layer.w13_weight,
                 w2=layer.w2_weight,
-                topk_output=topk_output,
+                expert_logits=topk_output.expert_logits,
                 top_k=top_k,
                 activation=activation,
                 w1_bias=getattr(layer, 'w13_bias', None),
@@ -407,7 +407,7 @@ class MXFP4FusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
             hidden_states=x,
             w13=layer.w13_weight.data,
             w2=layer.w2_weight.data,
-            topk_output=topk_output,
+            expert_logits=topk_output.expert_logits,
             top_k=top_k,
             fc31_input_dequant=getattr(layer, 'fc31_input_dequant', None),
             fc2_input_dequant=getattr(layer, 'fc2_input_dequant', None),
@@ -542,6 +542,7 @@ class FusedMoE(torch.nn.Module):
         self.no_combine = no_combine
         self.bias = bias
         self.pair_wise_act = pair_wise_act
+        self.activation_dtype = torch.bfloat16 if not enable_fp8_activation else torch.float8_e4m3fn
 
         self.use_triton_kernels = (
             not _is_cpu and global_server_args_dict["enable_triton_kernel_moe"]
@@ -566,13 +567,12 @@ class FusedMoE(torch.nn.Module):
                         shuffle_weight=shuffle_weight,
                     )
                 elif enable_mxfp4_moe: # TODO: move to quant_method
-                    activation_dtype = torch.bfloat16 if not enable_fp8_activation else torch.float8_e4m3fn
-                    logger.info("use mxfp4 fused moe method, activation_dtype: %s", activation_dtype)
+                    logger.info("use mxfp4 fused moe method, activation_dtype: %s", self.activation_dtype)
                     self.quant_method = MXFP4FusedMoEMethodOpenAI(
                         swiglu_alpha=swiglu_alpha or 1.0,
                         swiglu_beta=swiglu_beta or 0.0,
                         bias=bias,
-                        activation_dtype=activation_dtype,
+                        activation_dtype=self.activation_dtype,
                         shuffle_weight=shuffle_weight,
                     )
                 else:
@@ -581,6 +581,12 @@ class FusedMoE(torch.nn.Module):
             self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod":
                 self.quant_method.enable_flashinfer_moe = self.enable_flashinfer_moe
+            elif self.quant_method.__class__.__name__ == "Mxfp4MoEMethod":
+                self.quant_method.swiglu_alpha = swiglu_alpha
+                self.quant_method.swiglu_beta = swiglu_beta
+                self.quant_method.bias = bias
+                self.quant_method.activation_dtype = self.activation_dtype
+                self.quant_method.shuffle_weight = shuffle_weight
         assert self.quant_method is not None
 
         self.quant_config = quant_config
@@ -633,6 +639,14 @@ class FusedMoE(torch.nn.Module):
                 tp_rank=tp_rank,
             )
         elif shard_id in ("w1", "w3"):
+            self._load_w1_w3(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=tp_rank,
+            )
+        elif shard_id == "w13":
             self._load_w13(
                 shard_id=shard_id,
                 shard_dim=shard_dim,
@@ -653,7 +667,7 @@ class FusedMoE(torch.nn.Module):
         if shard_id == "w2":
             expert_data.copy_(loaded_weight)
         elif shard_id in ("w1", "w3"):
-            self._load_w13(
+            self._load_w1_w3(
                 shard_id=shard_id,
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
@@ -662,6 +676,19 @@ class FusedMoE(torch.nn.Module):
             )
 
     def _load_w13(
+        self,
+        expert_data: torch.Tensor,
+        shard_dim: int,
+        shard_id: str,
+        loaded_weight: torch.Tensor,
+        tp_rank: int,
+    ):
+        shard_size = expert_data.shape[shard_dim]
+        assert shard_id == "w13"
+        loaded_weight = loaded_weight.narrow(shard_dim, shard_size * tp_rank, shard_size)
+        expert_data.copy_(loaded_weight)
+
+    def _load_w1_w3(
         self,
         expert_data: torch.Tensor,
         shard_dim: int,
@@ -977,13 +1004,15 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-        is_weight = "weight" in weight_name or weight_name.endswith(
+        is_weight = "weight" in weight_name or "blocks" in weight_name or weight_name.endswith(
             ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
         )
         is_bias = "bias" in weight_name
 
         # Case model weights
         if is_weight and not is_bias:
+            if loaded_weight.ndim > 2:
+                loaded_weight = loaded_weight.reshape(loaded_weight.shape[0], -1)
             if checkpoint_weights_transposed:
                 loaded_weight = loaded_weight.t().contiguous() # Oai model weight: [:, input channel, output channel]
             if shard_id == "w13":
@@ -1079,7 +1108,6 @@ class FusedMoE(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         assert self.quant_method is not None
-
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
             layer=self,
@@ -1097,7 +1125,7 @@ class FusedMoE(torch.nn.Module):
                 )
                 if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod"
                 else (dict(top_k=self.top_k,)
-                      if self.quant_method.__class__.__name__ in ("UnquantizedFusedMoEMethodOpenAI", "MXFP4FusedMoEMethodOpenAI")
+                      if self.quant_method.__class__.__name__ in ("UnquantizedFusedMoEMethodOpenAI", "Mxfp4MoEMethod")
                       else {})
             ),
         )

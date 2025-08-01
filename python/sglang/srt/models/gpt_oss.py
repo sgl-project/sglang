@@ -1085,6 +1085,10 @@ class OpenAIMoeForCausalLM(nn.Module):
                     # Handle batched gate_up_proj weights and bias
                     if name.endswith("_bias"):
                         param_name = name.replace(".experts.gate_up_proj_bias", ".experts.w13_bias")
+                    elif name.endswith("_blocks"):
+                        param_name = name.replace(".experts.gate_up_proj_blocks", ".experts.w13_weight")
+                    elif name.endswith("_scales"):
+                        param_name = name.replace(".experts.gate_up_proj_scales", ".experts.w13_scale")
                     else:
                         param_name = name.replace(".experts.gate_up_proj", ".experts.w13_weight")
 
@@ -1101,11 +1105,15 @@ class OpenAIMoeForCausalLM(nn.Module):
                                 # Weight case - pass the full weight and let weight_loader handle TP sharding
                                 expert_weight = loaded_weight[expert_id]  # Shape: (2*moe_intermediate_size, hidden_size)
                                 # Pass the full weight to weight_loader, it will handle TP sharding internally
-                                weight_loader(param, expert_weight, name, shard_id="w13", expert_id=expert_id, checkpoint_weights_transposed=True)
+                                weight_loader(param, expert_weight, name, shard_id="w13", expert_id=expert_id, checkpoint_weights_transposed=False)
                 elif ".experts.down_proj" in name:
                     # Handle batched down_proj weights and bias
                     if name.endswith("_bias"):
                         param_name = name.replace(".experts.down_proj_bias", ".experts.w2_bias")
+                    elif name.endswith("_blocks"):
+                        param_name = name.replace(".experts.down_proj_blocks", ".experts.w2_weight")
+                    elif name.endswith("_scales"):
+                        param_name = name.replace(".experts.down_proj_scales", ".experts.w2_scale")
                     else:
                         param_name = name.replace(".experts.down_proj", ".experts.w2_weight")
 
@@ -1114,7 +1122,7 @@ class OpenAIMoeForCausalLM(nn.Module):
                         weight_loader = param.weight_loader
                         for expert_id in range(self.config.num_experts):
                             expert_data = loaded_weight[expert_id]
-                            weight_loader(param, expert_data, name, shard_id="w2", expert_id=expert_id, checkpoint_weights_transposed=True)
+                            weight_loader(param, expert_data, name, shard_id="w2", expert_id=expert_id, checkpoint_weights_transposed=False)
                 else:
                     # Handle individual expert weights (traditional format)
                     for mapping in expert_params_mapping:
