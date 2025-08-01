@@ -32,13 +32,14 @@ try:
         mha_batch_prefill_func,
         paged_attention_ragged,
     )
-    from aiter.mla import mla_decode_fwd
+    from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 except ImportError:
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 
 class WrapperDispatch(Enum):
@@ -148,6 +149,8 @@ class AiterAttnBackend(AttentionBackend):
             self.qo_indptr_ = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
             )
+
+            self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
@@ -293,11 +296,35 @@ class AiterAttnBackend(AttentionBackend):
                     encoder_lens=forward_batch.encoder_lens,
                     spec_info=None,
                 )
+
+                if (
+                    sum(forward_batch.extend_prefix_lens_cpu) != 0
+                    and self.enable_dp_attention
+                ):
+                    prefix_kv_indices = self.mla_indices_updater_prefill.kv_indices
+                    extend_kv_indices = forward_batch.out_cache_loc
+                    prefix = torch.split(
+                        prefix_kv_indices, forward_batch.extend_prefix_lens_cpu
+                    )
+                    extend = torch.split(
+                        extend_kv_indices, forward_batch.extend_seq_lens_cpu
+                    )
+                    kv_indices = torch.cat(
+                        [x for el in zip(prefix, extend) for x in el]
+                    ).to(torch.int)
+
+                    kv_last_page_len = torch.ones(bs, dtype=torch.int)
+                else:
+                    kv_indices = self.mla_indices_updater_prefill.kv_indices
+                    kv_last_page_len = self.mla_indices_updater_prefill.kv_last_page_len
+
                 self.forward_metadata = ForwardMetadata(
                     self.mla_indices_updater_prefill.kv_indptr,
-                    self.mla_indices_updater_prefill.kv_indices,
+                    # self.mla_indices_updater_prefill.kv_indices,
+                    kv_indices,
                     self.mla_indices_updater_prefill.qo_indptr,
-                    self.mla_indices_updater_prefill.kv_last_page_len,
+                    # self.mla_indices_updater_prefill.kv_last_page_len,
+                    kv_last_page_len,
                     self.mla_indices_updater_prefill.max_extend_len,
                     self.mla_indices_updater_prefill.max_prefix_extend_len,
                     None,
@@ -605,6 +632,30 @@ class AiterAttnBackend(AttentionBackend):
                     causal=True,
                 )
                 return o
+            else:
+                if layer.qk_head_dim != layer.v_head_dim:
+                    o = q.new_empty(
+                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                    )
+                else:
+                    o = torch.empty_like(q)
+                token_num = forward_batch.extend_num_tokens
+
+                mla_prefill_fwd(
+                    q.view(token_num, layer.tp_q_head_num, layer.qk_head_dim),
+                    K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                    o.view(token_num, layer.tp_q_head_num, layer.v_head_dim),
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    kv_last_page_lens,
+                    max_extend_len,
+                    layer.scaling,
+                    layer.logit_cap,
+                )
+                K_Buffer = K_Buffer.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                return o
+
         else:
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
