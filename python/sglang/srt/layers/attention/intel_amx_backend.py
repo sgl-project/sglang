@@ -250,7 +250,7 @@ class IntelAMXAttnBackend(AttentionBackend):
                 )
 
         _, max_extend_len = self.forward_metadata
-        if False and k is not None:
+        if k is not None:
             assert v is not None
             self.extend_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -267,6 +267,7 @@ class IntelAMXAttnBackend(AttentionBackend):
                 max_extend_len,
                 layer.scaling,
                 layer.logit_cap,
+                forward_batch.encoder_lens,
             )
         else:
             use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
