@@ -630,16 +630,23 @@ class Req:
         return self.finished_reason is not None
 
     def release_mm_resources(self):
-        if self.multimodal_inputs and self.multimodal_inputs.mm_items:
-            for mm_item in self.multimodal_inputs.mm_items:
-                if mm_item is None:
-                    continue
-                pixel_values = getattr(mm_item, "pixel_values", None)
-                if not isinstance(pixel_values, torch.Tensor):
-                    continue
-                del mm_item.pixel_values
-            del self.multimodal_inputs.mm_items
-        self.multimodal_inputs = None
+        """Release multimodal resources to free memory."""
+        if not self.multimodal_inputs:
+            return
+            
+        try:
+            if mm_items := getattr(self.multimodal_inputs, 'mm_items', None):
+                # Clean up feature from each mm_item
+                for mm_item in mm_items:
+                    if mm_item is not None:
+                        delattr(mm_item, 'feature')
+                
+                # Clean up the mm_items list
+                del self.multimodal_inputs.mm_items
+        except (AttributeError, TypeError):
+            pass
+        finally:
+            self.multimodal_inputs = None
 
     def init_next_round_input(
         self,
