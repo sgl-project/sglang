@@ -57,7 +57,7 @@ jobs:
         run: |
           docker exec -w /sglang-checkout/ ci_sglang_xeon \
             bash -c "cd ./test/srt && python3 run_suite.py --suite per-commit-cpu"
-            
+
       - name: Change permission
         timeout-minutes: 20
         run: |
@@ -65,7 +65,7 @@ jobs:
             rm -rf /tmp/ci-home  &&
             chown -R  $(id -u):$(id -g) /sglang-checkout/ 2>/dev/null || true
           "
-     
+
       - name: Cleanup container
         if: always()
         run: |
