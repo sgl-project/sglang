@@ -361,7 +361,7 @@ class Hf3fsGlobalMetadataClient(Hf3fsMetadataInterface):
 
 
 class Hf3fsLocalMetadataClient(Hf3fsMetadataInterface):
-    """Local metadata client that directly operates on RankMetadata in memory without server."""
+    """Local metadata client that directly operates on single RankMetadata in memory without metadata server."""
 
     def __init__(self):
         self.rank_metadata = None

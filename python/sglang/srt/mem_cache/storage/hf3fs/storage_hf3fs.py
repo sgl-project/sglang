@@ -114,7 +114,6 @@ def synchronized():
 
 class HiCacheHF3FS(HiCacheStorage):
     default_env_var: str = "SGLANG_HICACHE_HF3FS_CONFIG_PATH"
-    default_metadata_server_url: str = "http://127.0.0.1:18000"
 
     def __init__(
         self,
@@ -207,14 +206,13 @@ class HiCacheHF3FS(HiCacheStorage):
 
         # Choose metadata client based on configuration
         if "metadata_server_url" in config and config["metadata_server_url"]:
-            # Use HTTP client to connect to metadata server
+            # Use global metadata client to connect to metadata server
             metadata_server_url = config["metadata_server_url"]
             metadata_client = Hf3fsGlobalMetadataClient(metadata_server_url)
             logger.info(f"Using global metadata client with server url: {metadata_server_url}")
         else:
             # Use local metadata client for single-machine deployment
             metadata_client = Hf3fsLocalMetadataClient()
-            logger.info("Using local metadata client for single-machine deployment")
 
         return HiCacheHF3FS(
             rank=rank,
