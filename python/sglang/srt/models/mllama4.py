@@ -666,18 +666,22 @@ class Llama4ForConditionalGeneration(nn.Module):
                 continue
 
             if self._handle_expert_weights(
-                name, loaded_weight, expert_params_mapping, params_dict, num_experts
+                name,
+                loaded_weight,
+                expert_params_mapping,
+                params_dict,
+                num_experts,
+                loaded_params,
             ):
-                loaded_params.add(name)
                 continue
 
             loaded_params.add(name)
             self._handle_default_weight(name, loaded_weight, params_dict)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
-            for name in unloaded_params:
-                print(f"{name=}")
-            # raise RuntimeError(f"Some weights are not initialized from checkpoints")
+            raise RuntimeError(
+                f"Some weights are not initialized from checkpoints {unloaded_params}"
+            )
 
     def _should_skip_weight(self, name: str) -> bool:
         """Check if we should skip loading this weight."""
@@ -727,6 +731,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         expert_params_mapping: list,
         params_dict: dict,
         num_experts: int,
+        loaded_params: set,
     ) -> bool:
         """Handle expert weight loading for MoE (Mixture of Experts) layers.
 
@@ -745,16 +750,16 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         if "experts.gate_up_proj" not in name and "experts.down_proj" not in name:
             return self._handle_other_expert_params(
-                name, loaded_weight, expert_params_mapping, params_dict
+                name, loaded_weight, expert_params_mapping, params_dict, loaded_params
             )
 
         if "scale" in name:
             return self._handle_expert_scale_params(
-                name, loaded_weight, params_dict, num_experts
+                name, loaded_weight, params_dict, num_experts, loaded_params
             )
         else:
             return self._handle_expert_weight_params(
-                name, loaded_weight, params_dict, num_experts
+                name, loaded_weight, params_dict, num_experts, loaded_params
             )
 
     def _handle_other_expert_params(
@@ -763,6 +768,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         loaded_weight: torch.Tensor,
         expert_params_mapping: list,
         params_dict: dict,
+        loaded_params: set,
     ) -> bool:
         """Handle expert parameters that are not gate_up_proj or down_proj weights.
 
@@ -771,6 +777,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             loaded_weight: The weight tensor to be loaded
             expert_params_mapping: List of tuples mapping checkpoint names to model parameters
             params_dict: Dictionary of model parameters
+            loaded_params: Set of loaded parameter names
 
         Returns:
             bool: True if parameter was found and handled, False otherwise
@@ -782,6 +789,7 @@ class Llama4ForConditionalGeneration(nn.Module):
                 param.weight_loader(
                     param, loaded_weight, name, shard_id=shard_id, expert_id=expert_id
                 )
+                loaded_params.add(transformed_name)
                 return True
         return False
 
@@ -820,6 +828,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         loaded_weight: torch.Tensor,
         params_dict: dict,
         num_experts: int,
+        loaded_params: set,
     ) -> bool:
         """Handle quantization scale parameters for expert weights.
 
@@ -828,6 +837,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             loaded_weight: Scale tensor to be loaded
             params_dict: Dictionary of model parameters
             num_experts: Total number of experts for broadcast operations
+            loaded_params: Set of loaded parameter names
 
         Returns:
             bool: True (always handles scale parameters)
@@ -856,6 +866,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             # Load the same scale for all experts
             for expert_id in range(num_experts):
                 param.data[expert_id] = loaded_weight
+        loaded_params.add(transformed_name)
 
         return True
 
@@ -865,6 +876,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         loaded_weight: torch.Tensor,
         params_dict: dict,
         num_experts: int,
+        loaded_params: set,
     ) -> bool:
         """Handle actual weight tensors for expert layers (gate_up_proj and down_proj).
 
@@ -873,6 +885,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             loaded_weight: Weight tensor(s) to be loaded
             params_dict: Dictionary of model parameters
             num_experts: Total number of experts for tensor distribution
+            loaded_params: Set of loaded parameter names
 
         Returns:
             bool: True (always handles weight parameters)
@@ -895,6 +908,7 @@ class Llama4ForConditionalGeneration(nn.Module):
 
             param = params_dict[param_name]
             weight_loader = param.weight_loader
+            loaded_params.add(param_name)
 
             # Handle the case where loaded_weight might be a single tensor for all experts
             if weight_chunk.dim() == 2:
