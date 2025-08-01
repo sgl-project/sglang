@@ -209,11 +209,11 @@ class HiPAttentionBackend(AttentionBackend):
         # cu_seqlens_k = cu_seqlens_q.clone()
         # cu_seqlens_k[1:] = cache_seqlens.cumsum(-1)
         
-        fa3_cache_seqlens=self.flashattention_backend.forward_metadata.cache_seqlens_int32[:bs]
-        fa3_cu_seqlens_q=self.flashattention_backend.forward_metadata.cu_seqlens_q[:bs+1]
-        fa3_cu_seqlens_k=self.flashattention_backend.forward_metadata.cu_seqlens_k[:bs+1]
+        # fa3_cache_seqlens=self.flashattention_backend.forward_metadata.cache_seqlens_int32[:bs]
+        # fa3_cu_seqlens_q=self.flashattention_backend.forward_metadata.cu_seqlens_q[:bs+1]
+        # fa3_cu_seqlens_k=self.flashattention_backend.forward_metadata.cu_seqlens_k[:bs+1]
         
-        print(seq_lens[:bs], fa3_cache_seqlens, fa3_cu_seqlens_q, fa3_cu_seqlens_k)
+        # print(seq_lens[:bs], fa3_cache_seqlens, fa3_cu_seqlens_q, fa3_cu_seqlens_k)
         
         # assert torch.all(fa3_cache_seqlens == cache_seqlens)
         # assert torch.all(fa3_cu_seqlens_q == cu_seqlens_q)
@@ -700,8 +700,8 @@ class HiPAttentionBackend(AttentionBackend):
                 self.cu_seqlens_q = torch.arange(
                     0, 
                     forward_batch.batch_size + 1, 
-                    q_reshaped.shape[0] // forward_batch.batch_size, 
-                    device=q_reshaped.device, 
+                    q.shape[0] // forward_batch.batch_size, 
+                    device=q.device, 
                     dtype=torch.int32
                 )
                 self.cu_seqlens_k = self.cu_seqlens_q.clone()
