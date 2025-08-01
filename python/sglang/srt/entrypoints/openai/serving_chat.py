@@ -69,6 +69,20 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return None
 
+    def _validate_image_count(self, image_data: List[Any]) -> None:
+        """Validate that the number of images doesn't exceed the configured limit"""
+        max_num_images = self.tokenizer_manager.server_args.max_num_images
+        if max_num_images is None:
+            return
+        
+        num_images = len(image_data)
+        if num_images > max_num_images:
+            raise ValueError(
+                f"The number of images in the request ({num_images}) "
+                f"exceeds the configured limit ({max_num_images}). "
+                f"Please reduce the number of images or increase the '--max-num-images' server argument."
+            )
+
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
@@ -78,6 +92,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
+
+        # Validate image count for multimodal requests
+        if is_multimodal and processed_messages.image_data:
+            self._validate_image_count(processed_messages.image_data)
 
         # Build sampling parameters
         sampling_params = self._build_sampling_params(
