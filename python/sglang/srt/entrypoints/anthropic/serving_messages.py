@@ -244,9 +244,6 @@ class AnthropicServingMessages(OpenAIServingBase):
                 tokenize=True,
                 add_generation_prompt=True,
                 tools=tools,
-                **(
-                    request.chat_template_kwargs if request.chat_template_kwargs else {}
-                ),
             )
         except Exception:
             #  This except branch will be triggered when the chosen model
@@ -262,9 +259,6 @@ class AnthropicServingMessages(OpenAIServingBase):
                 tokenize=True,
                 add_generation_prompt=True,
                 tools=tools,
-                **(
-                    request.chat_template_kwargs if request.chat_template_kwargs else {}
-                ),
             )
 
         if assistant_prefix:
