@@ -7,7 +7,6 @@ from typing import List, Optional, Set, Tuple
 
 import torch
 from torch import nn
-from transformers import Llama4Config, Llama4VisionConfig
 from transformers.models.llama4.modeling_llama4 import (
     Llama4MultiModalProjector,
     vision_apply_rotary_emb,
@@ -34,6 +33,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cpu
+from transformers import Llama4Config, Llama4VisionConfig
 
 _is_cpu = is_cpu()
 
@@ -105,7 +105,7 @@ def pixel_shuffle(input_tensor, shuffle_ratio):
         batch_size,
         int(height * shuffle_ratio),
         int(width * shuffle_ratio),
-        int(channels / (shuffle_ratio**2)),
+        int(channels / (shuffle_ratio ** 2)),
     )
     reshaped_tensor = reshaped_tensor.permute(0, 2, 1, 3).contiguous()
 
@@ -125,7 +125,7 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
         super().__init__()
         self.pixel_shuffle_ratio = config.pixel_shuffle_ratio
         self.inner_dim = int(
-            config.projector_input_dim // (self.pixel_shuffle_ratio**2)
+            config.projector_input_dim // (self.pixel_shuffle_ratio ** 2)
         )
         self.output_dim = config.projector_output_dim
         self.mlp = Llama4VisionMLP(
@@ -304,7 +304,7 @@ class Llama4VisionRotaryEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
         idx = config.image_size // config.patch_size
-        img_idx = torch.arange(idx**2, dtype=torch.int32).reshape(idx**2, 1)
+        img_idx = torch.arange(idx ** 2, dtype=torch.int32).reshape(idx ** 2, 1)
         img_idx = torch.cat([img_idx, img_idx[:1]], dim=0)
         img_idx[-1, -1] = -2  # ID_CLS_TOKEN
         frequencies_x = img_idx % idx  # get the coordinates of the 2d matrix along x
@@ -347,7 +347,7 @@ class Llama4VisionModel(nn.Module):
         self.num_channels = config.num_channels
 
         self.num_patches = (self.image_size // self.patch_size) ** 2 + 1
-        self.scale = config.hidden_size**-0.5
+        self.scale = config.hidden_size ** -0.5
 
         self.patch_embedding = Llama4UnfoldConvolution(
             config,
@@ -535,22 +535,17 @@ class Llama4ForConditionalGeneration(nn.Module):
         # For text-only models, return None or raise an error
         if not self.has_vision or self.vision_model is None:
             raise ValueError("Vision model not available for text-only checkpoint")
-        # print(f"{items=}")
         pixel_values = (
             torch.concat([item.feature for item in items])
             .to(next(self.vision_model.parameters()).device)
             .type(next(self.vision_model.parameters()).dtype)
         )
-        # print(f"{pixel_values=}")
         image_features = self.vision_model(pixel_values)
-        # print(f"{image_features=}")
 
         vision_flat = image_features.view(-1, image_features.size(-1))
-        # print(f"{vision_flat=}")
 
         projected_vision_flat = self.multi_modal_projector(vision_flat)
 
-        # print(f"{projected_vision_flat=}")
         return projected_vision_flat
 
     def forward(
@@ -623,7 +618,6 @@ class Llama4ForConditionalGeneration(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-        # print(f"{params_dict.keys()=}")
         num_experts = (
             self.config.text_config.num_local_experts
             if hasattr(self.config, "text_config")
@@ -638,13 +632,9 @@ class Llama4ForConditionalGeneration(nn.Module):
         )
 
         loaded_params = set()
-        # print(f"{self.has_vision=}")
-        # print(f"{self.has_vision_weights=}")
 
         for name, loaded_weight in weights:
-            # print(f"weight name: {name=}")
             if self._should_skip_weight(name):
-                print(f"param {name} got skipped")
                 continue
 
             name = self._transform_weight_name(name)
