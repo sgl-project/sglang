@@ -198,7 +198,8 @@ class ServerArgs:
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
-    hicache_io_backend: str = ""
+    hicache_io_backend: str = "kernel"
+    hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
 
     # Double Sparsity
@@ -459,10 +460,6 @@ class ServerArgs:
                 logger.warning(
                     f"Flashinfer cutlass MoE and EP MoE are enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
                 )
-
-        if self.enable_flashinfer_trtllm_moe:
-            assert self.enable_ep_moe, "EP MoE is required for Flashinfer TRTLLM MOE"
-            logger.warning(f"Flashinfer TRTLLM MoE is enabled.")
 
         # DeepEP MoE
         if self.enable_deepep_moe:
@@ -1491,6 +1488,14 @@ class ServerArgs:
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
         )
+        parser.add_argument(
+            "--hicache-mem-layout",
+            type=str,
+            choices=["layer_first", "page_first"],
+            default=ServerArgs.hicache_mem_layout,
+            help="The layout of host memory pool for hierarchical cache.",
+        )
+
         parser.add_argument(
             "--hicache-storage-backend",
             type=str,
