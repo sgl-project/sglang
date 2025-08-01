@@ -528,7 +528,7 @@ class TestOpenAIVisionServer(CustomTestCase):
         # a fragment of Trump's speech
         audio_response = self.get_audio_response(
             AUDIO_TRUMP_SPEECH_URL,
-            "Listen to this audio and transcribe it in English.",
+            "Listen to this audio and write down the audio transcription in English.",
             category="speech",
         )
         check_list = [
