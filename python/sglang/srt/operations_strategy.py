@@ -4,7 +4,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt import operations
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPConfig
+from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.operations import Operation
 

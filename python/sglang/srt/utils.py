@@ -2205,27 +2205,6 @@ def flatten_nested_list(nested_list):
         return [nested_list]
 
 
-class DeepEPMode(Enum):
-    normal = "normal"
-    low_latency = "low_latency"
-    auto = "auto"
-
-    def enable_normal(self):
-        return self in [DeepEPMode.normal, DeepEPMode.auto]
-
-    def enable_low_latency(self):
-        return self in [DeepEPMode.low_latency, DeepEPMode.auto]
-
-    def resolve(self, is_extend_in_batch: bool):
-        if self != DeepEPMode.auto:
-            return self
-
-        if is_extend_in_batch:
-            return DeepEPMode.normal
-        else:
-            return DeepEPMode.low_latency
-
-
 def is_non_idle_and_non_empty(forward_mode, hidden_states):
     return (
         (forward_mode is not None)
@@ -2414,7 +2393,7 @@ def require_mlp_tp_gather(server_args):
             return True
         elif not server_args.enable_dp_lm_head:
             return True
-        elif not server_args.enable_deepep_moe:
+        elif server_args.moe_a2a_backend is None:
             return True
         else:
             return (
@@ -2430,7 +2409,7 @@ def require_attn_tp_gather(server_args):
     Check if the input of attention is scattered.
     """
     assert server_args.moe_dense_tp_size in [1, None]
-    if server_args.enable_deepep_moe or server_args.moe_dense_tp_size == 1:
+    if server_args.moe_a2a_backend is not None or server_args.moe_dense_tp_size == 1:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:

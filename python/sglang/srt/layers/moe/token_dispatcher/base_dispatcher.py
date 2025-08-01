@@ -2,9 +2,20 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import Enum, auto
-from typing import TYPE_CHECKING, NamedTuple, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 import torch
+
+
+class MoEA2ABackend(Enum):
+    none = "none"
+    deepep = "deepep"
+
+    def is_none(self):
+        return self == MoEA2ABackend.none
+
+    def is_deepep(self):
+        return self == MoEA2ABackend.deepep
 
 
 class DispatchOutputFormat(Enum):

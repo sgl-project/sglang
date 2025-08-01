@@ -212,8 +212,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--ep-size` | The expert parallelism size. | 1 |
-| `--enable-ep-moe` | Enabling expert parallelism for moe. The ep size is equal to the tp size. | False |
-| `--enable-deepep-moe` | Enabling DeepEP MoE implementation for EP MoE. | False |
+| `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | None |
 | `--enable-flashinfer-cutlass-moe` | Enabling Flashinfer Cutlass MoE implementation for high throughput. | False |
 | `--enable-flashinfer-trtllm-moe` | Enabling Flashinfer Trtllm MoE implementation for low latency. | False |
 | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | auto |
