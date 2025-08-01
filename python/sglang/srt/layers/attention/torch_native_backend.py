@@ -32,10 +32,10 @@ class TorchNativeAttnBackend(AttentionBackend):
         v_cache: torch.Tensor,
         req_to_token: torch.Tensor,
         req_pool_indices: torch.Tensor,
-        encoder_lens: torch.Tensor,
         seq_lens: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
+        encoder_lens=None,
         scaling=None,
         enable_gqa=False,
         causal=False,
@@ -50,7 +50,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             v_cache: [max_total_num_tokens, num_heads, head_size]
             req_to_token: [max_num_reqs, max_context_len]
             req_pool_indices: [num_seqs]
-            encoder_lens: [num_seqs]
+            encoder_lens: [num_seqs] or None
             seq_lens: [num_seqs]
             extend_prefix_lens: [num_seqs]
             extend_seq_lens: [num_seqs]
@@ -69,7 +69,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
 
-        start_q = 0
+        start_q, start_kv = 0, 0
         for seq_idx in range(seq_lens.shape[0]):
             # TODO: this loop process a sequence per iter, this is inefficient.
             # Need optimize the performance later.
@@ -79,8 +79,12 @@ class TorchNativeAttnBackend(AttentionBackend):
 
             seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + extend_seq_len_q
-            start_kv = 0 if is_cross_attn else encoder_lens[seq_idx]
-            end_kv = encoder_lens[seq_idx] if is_cross_attn else start_kv + seq_len_kv
+            if encoder_lens is not None:
+                start_kv = 0 if is_cross_attn else encoder_lens[seq_idx]
+                end_kv = encoder_lens[seq_idx] if is_cross_attn else start_kv + seq_len_kv
+            else:
+                start_kv = 0
+                end_kv = start_kv + seq_len_kv
             per_req_query = query[:, start_q:end_q, :]
             per_req_query_redudant = torch.empty(
                 (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
@@ -110,7 +114,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                 .movedim(query.dim() - 2, 0)
             )
             output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
-            start_q = end_q
+            start_q, start_kv = end_q, end_kv
         return output
 
     def _run_sdpa_forward_decode(
@@ -121,8 +125,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         v_cache: torch.Tensor,
         req_to_token: torch.Tensor,
         req_pool_indices: torch.Tensor,
-        encoder_lens: torch.Tensor,
         seq_lens: torch.Tensor,
+        encoder_lens=None,
         scaling=None,
         enable_gqa=False,
         causal=False,
@@ -137,8 +141,8 @@ class TorchNativeAttnBackend(AttentionBackend):
             v_cache: [max_total_num_tokens, num_heads, head_size]
             req_to_token: torch.Tensor,
             req_pool_indices: torch.Tensor,
-            encoder_lens: [num_seqs]
             seq_lens: [num_seqs]
+            encoder_lens: [num_seqs] or None
             scaling: float or None
             enable_gqa: bool
             causal: bool
@@ -159,8 +163,12 @@ class TorchNativeAttnBackend(AttentionBackend):
             seq_len_q = 1
             seq_len_kv = encoder_lens[seq_idx] if is_cross_attn else seq_lens[seq_idx]
             end_q = start_q + seq_len_q
-            start_kv = 0 if is_cross_attn else encoder_lens[seq_idx]
-            end_kv = encoder_lens[seq_idx] if is_cross_attn else start_kv + seq_len_kv
+            if encoder_lens is not None:
+                start_kv = 0 if is_cross_attn else encoder_lens[seq_idx]
+                end_kv = encoder_lens[seq_idx] if is_cross_attn else start_kv + seq_len_kv
+            else:
+                start_kv = 0
+                end_kv = start_kv + seq_len_kv
 
             per_req_query = query[:, start_q:end_q, :]
 
@@ -228,10 +236,10 @@ class TorchNativeAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
-            forward_batch.encoder_lens,
             forward_batch.seq_lens,
             forward_batch.extend_prefix_lens,
             forward_batch.extend_seq_lens,
+            encoder_lens=forward_batch.encoder_lens,
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=causal,
@@ -279,8 +287,8 @@ class TorchNativeAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
-            forward_batch.encoder_lens,
             forward_batch.seq_lens,
+            encoder_lens=forward_batch.encoder_lens,
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=False,
