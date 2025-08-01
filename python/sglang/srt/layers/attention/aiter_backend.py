@@ -320,10 +320,8 @@ class AiterAttnBackend(AttentionBackend):
 
                 self.forward_metadata = ForwardMetadata(
                     self.mla_indices_updater_prefill.kv_indptr,
-                    # self.mla_indices_updater_prefill.kv_indices,
                     kv_indices,
                     self.mla_indices_updater_prefill.qo_indptr,
-                    # self.mla_indices_updater_prefill.kv_last_page_len,
                     kv_last_page_len,
                     self.mla_indices_updater_prefill.max_extend_len,
                     self.mla_indices_updater_prefill.max_prefix_extend_len,
