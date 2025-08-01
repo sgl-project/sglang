@@ -231,7 +231,10 @@ class W8A8Int8Config(QuantizationConfig):
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
-        return []
+        filenames = []
+        if _is_npu:
+            filenames.append("quant_model_description.json")
+        return filenames
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> W8A8Int8Config:
