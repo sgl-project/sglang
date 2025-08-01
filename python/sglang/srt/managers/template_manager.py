@@ -84,26 +84,27 @@ class TemplateManager:
         if chat_template_arg:
             self._load_explicit_chat_template(tokenizer_manager, chat_template_arg)
         else:
-            # Try HuggingFace template first
-            hf_template = self._resolve_hf_chat_template(tokenizer_manager)
-            if hf_template:
-                self._jinja_template_content_format = (
-                    detect_jinja_template_content_format(hf_template)
-                )
-                logger.info(
-                    f"Using default HuggingFace chat template with detected content format: {self._jinja_template_content_format}"
-                )
-                return
-
-            # Fallback to SGLang template guessing
+            # Guess chat template from model path
             self.guess_chat_template_from_model_path(model_path)
 
-            # Set default format if no template was found
+            # If no pre-defined template was found, fallback to HuggingFace template
             if self._chat_template_name is None:
-                self._jinja_template_content_format = "string"
-                logger.info(
-                    "No chat template found, defaulting to 'string' content format"
-                )
+                # Try HuggingFace template first
+                hf_template = self._resolve_hf_chat_template(tokenizer_manager)
+                if hf_template:
+                    # override the chat template
+                    tokenizer_manager.tokenizer.chat_template = hf_template
+                    self._jinja_template_content_format = (
+                        detect_jinja_template_content_format(hf_template)
+                    )
+                    logger.info(
+                        f"Using default HuggingFace chat template with detected content format: {self._jinja_template_content_format}"
+                    )
+                    return
+
+            # Default to string content format if no template was found
+            self._jinja_template_content_format = "string"
+            logger.info("No chat template found, defaulting to 'string' content format")
 
     def _load_explicit_chat_template(
         self, tokenizer_manager, chat_template_arg: str
@@ -257,13 +258,15 @@ class TemplateManager:
 
         Returns the chat template string if found, None otherwise.
         """
-        tokenizer = tokenizer_manager.tokenizer
-
-        # Try to get AutoTokenizer chat template
         try:
-            return tokenizer.get_chat_template()
+            if processor := tokenizer_manager.processor:
+                if hasattr(processor, "chat_template") and processor.chat_template:
+                    return processor.chat_template
+            if tokenizer := tokenizer_manager.tokenizer:
+                if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+                    return tokenizer.chat_template
         except Exception as e:
-            logger.debug(f"Error getting chat template via get_chat_template(): {e}")
+            logger.debug(f"Error getting chat template: {e}")
 
         logger.debug("No HuggingFace chat template found")
         return None

@@ -23,6 +23,8 @@ class TestPixtralServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--mem-fraction-static",
                 "0.70",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -45,6 +47,8 @@ class TestMistral3_1Server(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--mem-fraction-static",
                 "0.75",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -67,7 +71,8 @@ class TestDeepseekVL2Server(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--context-length",
                 "4096",
-                "--disable-cuda-graph",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -90,6 +95,8 @@ class TestJanusProServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--mem-fraction-static",
                 "0.35",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -120,6 +127,10 @@ class TestJanusProServer(TestOpenAIVisionServer):
 #                 "0.8",
 #                 "--tp-size=8",
 #                 "--context-length=8192",
+#                 "--mm-attention-backend",
+#                 "fa3",
+#                 "--cuda-graph-max-bs",
+#                 "4",
 #             ],
 #         )
 #         cls.base_url += "/v1"
@@ -143,6 +154,8 @@ class TestGemma3itServer(TestOpenAIVisionServer):
                 "--mem-fraction-static",
                 "0.70",
                 "--enable-multimodal",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -154,7 +167,7 @@ class TestGemma3itServer(TestOpenAIVisionServer):
 class TestGemma3nServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
-        cls.model = "google/gemma-3n-E2B-it"
+        cls.model = "google/gemma-3n-E4B-it"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
@@ -166,7 +179,7 @@ class TestGemma3nServer(TestOpenAIVisionServer):
                 "--mem-fraction-static",
                 "0.70",
                 "--cuda-graph-max-bs",
-                "1",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -193,6 +206,8 @@ class TestKimiVLServer(TestOpenAIVisionServer):
                 "4096",
                 "--dtype",
                 "bfloat16",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -233,6 +248,8 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
                 "--lora-paths",
                 f"vision={constants.HF_HUB_CACHE}/models--microsoft--Phi-4-multimodal-instruct/snapshots/{revision}/vision-lora",
                 f"speech={constants.HF_HUB_CACHE}/models--microsoft--Phi-4-multimodal-instruct/snapshots/{revision}/speech-lora",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -277,10 +294,13 @@ class TestVILAServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--context-length=65536",
                 f"--revision={cls.revision}",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
 
 
 if __name__ == "__main__":
+    del TestOpenAIVisionServer
     unittest.main()
