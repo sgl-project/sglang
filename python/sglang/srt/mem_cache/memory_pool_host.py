@@ -25,7 +25,6 @@ def synchronized(debug_only=False):
         @wraps(func)
         def wrapper(self, *args, **kwargs):
             if (not debug_only) or self.debug:
-                return func(self, *args, **kwargs)
                 with self.lock:
                     return func(self, *args, **kwargs)
             else:
@@ -107,6 +106,14 @@ class HostKVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        """
+        Get a dummy flat data page from the host memory pool.
+        This is used for prefetching or initializing empty pages.
+        """
+        raise NotImplementedError()
+
+    @abc.abstractmethod
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         """
         Set a flat data page to the host memory pool.
@@ -182,6 +189,15 @@ class HostKVCache(abc.ABC):
         self.mem_state[indices] = MemoryStateInt.BACKUP
 
     @synchronized(debug_only=True)
+    def update_prefetch(self, indices: torch.Tensor):
+        if not self.is_reserved(indices):
+            raise ValueError(
+                f"The host memory slots should be in RESERVED state before turning into BACKUP. "
+                f"Current state: {self.get_state(indices)}"
+            )
+        self.mem_state[indices] = MemoryStateInt.BACKUP
+
+    @synchronized(debug_only=True)
     def update_synced(self, indices: torch.Tensor):
         self.mem_state[indices] = MemoryStateInt.SYNCED
 
@@ -248,6 +264,14 @@ class MHATokenToKVPoolHost(HostKVCache):
     def get_flat_data_page(self, index) -> torch.Tensor:
         return self.kv_buffer[:, :, index : index + self.page_size, :, :].flatten()
 
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        return torch.zeros(
+            (2, self.layer_num, self.page_size, self.head_num, self.head_dim),
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        ).flatten()
+
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         self.kv_buffer[:, :, index : index + self.page_size, :, :] = data_page.reshape(
             2,
@@ -256,6 +280,43 @@ class MHATokenToKVPoolHost(HostKVCache):
             self.head_num,
             self.head_dim,
         )
+
+    def get_buffer_meta(self, keys, indices):
+        ptr_list = []
+        key_list = []
+        kv_buffer_data_ptr = self.kv_buffer.data_ptr()
+        v_offset = (
+            self.layer_num
+            * self.size
+            * self.head_num
+            * self.head_dim
+            * self.dtype.itemsize
+        )
+        for index in range(0, len(indices), self.page_size):
+            for layer_id in range(self.layer_num):
+                k_ptr = (
+                    kv_buffer_data_ptr
+                    + indices[index]
+                    * self.head_num
+                    * self.head_dim
+                    * self.dtype.itemsize
+                    + layer_id
+                    * self.size
+                    * self.head_num
+                    * self.head_dim
+                    * self.dtype.itemsize
+                )
+                v_ptr = k_ptr + v_offset
+                ptr_list.append(k_ptr)
+                ptr_list.append(v_ptr)
+                key_ = keys[index // self.page_size]
+                key_list.append(f"{key_}_{layer_id}_k")
+                key_list.append(f"{key_}_{layer_id}_v")
+        element_size = (
+            self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
+        )
+        element_size_list = [element_size] * len(key_list)
+        return key_list, ptr_list, element_size_list
 
     @property
     def k_buffer(self):
@@ -310,6 +371,19 @@ class MLATokenToKVPoolHost(HostKVCache):
     def get_flat_data_page(self, index) -> torch.Tensor:
         return self.kv_buffer[:, index : index + self.page_size, :, :].flatten()
 
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        return torch.zeros(
+            (
+                self.layer_num,
+                self.page_size,
+                1,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ),
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        ).flatten()
+
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         self.kv_buffer[:, index : index + self.page_size, :, :] = data_page.reshape(
             self.layer_num,
@@ -317,3 +391,30 @@ class MLATokenToKVPoolHost(HostKVCache):
             1,
             self.kv_lora_rank + self.qk_rope_head_dim,
         )
+
+    def get_buffer_meta(self, keys, indices):
+        ptr_list = []
+        key_list = []
+        kv_buffer_data_ptr = self.kv_buffer.data_ptr()
+        for index in range(0, len(indices), self.page_size):
+            for layer_id in range(self.layer_num):
+                k_ptr = (
+                    kv_buffer_data_ptr
+                    + indices[index]
+                    * (self.kv_lora_rank + self.qk_rope_head_dim)
+                    * self.dtype.itemsize
+                    + layer_id
+                    * self.size
+                    * (self.kv_lora_rank + self.qk_rope_head_dim)
+                    * self.dtype.itemsize
+                )
+                ptr_list.append(k_ptr)
+                key_ = keys[index // self.page_size]
+                key_list.append(f"{key_}_{layer_id}_k")
+        element_size = (
+            self.dtype.itemsize
+            * self.page_size
+            * (self.kv_lora_rank + self.qk_rope_head_dim)
+        )
+        element_size_list = [element_size] * len(key_list)
+        return key_list, ptr_list, element_size_list
