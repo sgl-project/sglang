@@ -174,12 +174,14 @@ class Llama4VisionEncoderLayer(nn.Module):
             self.num_attention_heads,
             self.hidden_size,
             use_qkv_parallel=True,
-            quant_config=quant_config,
+            # vision_model is explicitly ignored in Maverick-17B-128E-Instruct-FP8
+            quant_config=None,
             dropout=0.0,
             qkv_backend="sdpa",
             softmax_in_single_precision=False,
             flatten_batch=False,
             prefix=add_prefix("self_attn", prefix),
+            qkv_bias=True,
             customized_position_embedding_applier=apply_position_embedding,
         )
         self.mlp = Llama4VisionMLP(
@@ -533,16 +535,22 @@ class Llama4ForConditionalGeneration(nn.Module):
         # For text-only models, return None or raise an error
         if not self.has_vision or self.vision_model is None:
             raise ValueError("Vision model not available for text-only checkpoint")
-
+        # print(f"{items=}")
         pixel_values = (
             torch.concat([item.feature for item in items])
             .to(next(self.vision_model.parameters()).device)
             .type(next(self.vision_model.parameters()).dtype)
         )
-
+        # print(f"{pixel_values=}")
         image_features = self.vision_model(pixel_values)
+        # print(f"{image_features=}")
+
         vision_flat = image_features.view(-1, image_features.size(-1))
+        # print(f"{vision_flat=}")
+
         projected_vision_flat = self.multi_modal_projector(vision_flat)
+
+        # print(f"{projected_vision_flat=}")
         return projected_vision_flat
 
     def forward(
@@ -628,8 +636,14 @@ class Llama4ForConditionalGeneration(nn.Module):
             num_experts=num_experts,
         )
 
+        loaded_params = set()
+        # print(f"{self.has_vision=}")
+        # print(f"{self.has_vision_weights=}")
+
         for name, loaded_weight in weights:
+            # print(f"weight name: {name=}")
             if self._should_skip_weight(name):
+                print(f"param {name} got skipped")
                 continue
 
             name = self._transform_weight_name(name)
@@ -642,19 +656,27 @@ class Llama4ForConditionalGeneration(nn.Module):
                 )
 
             if self._handle_scale_remapping(name, params_dict):
+                loaded_params.add(name)
                 continue
 
             if self._handle_stacked_params(
-                name, loaded_weight, stacked_params_mapping, params_dict
+                name, loaded_weight, stacked_params_mapping, params_dict, loaded_params
             ):
                 continue
 
             if self._handle_expert_weights(
                 name, loaded_weight, expert_params_mapping, params_dict, num_experts
             ):
+                loaded_params.add(name)
                 continue
 
+            loaded_params.add(name)
             self._handle_default_weight(name, loaded_weight, params_dict)
+        unloaded_params = params_dict.keys() - loaded_params
+        if unloaded_params:
+            for name in unloaded_params:
+                print(f"{name=}")
+            # raise RuntimeError(f"Some weights are not initialized from checkpoints")
 
     def _should_skip_weight(self, name: str) -> bool:
         """Check if we should skip loading this weight."""
@@ -685,11 +707,13 @@ class Llama4ForConditionalGeneration(nn.Module):
         loaded_weight: torch.Tensor,
         stacked_params_mapping: list,
         params_dict: dict,
+        loaded_params: set,
     ) -> bool:
         """Handle stacked parameter loading. Returns True if handled."""
         for param_name, weight_name, shard_id in stacked_params_mapping:
             if weight_name in name:
                 transformed_name = name.replace(weight_name, param_name)
+                loaded_params.add(transformed_name)
                 param = params_dict[transformed_name]
                 param.weight_loader(param, loaded_weight, shard_id)
                 return True
