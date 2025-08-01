@@ -835,7 +835,8 @@ class Test20(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
             ],
         )
 
@@ -873,7 +874,8 @@ class Test21(CustomTestCase):
                 "--enable-dp-attention",
                 "--dp",
                 "4",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
             ],
         )
 
@@ -911,7 +913,8 @@ class Test22(CustomTestCase):
                 "--enable-dp-attention",
                 "--dp",
                 "8",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
             ],
         )
 
@@ -948,7 +951,8 @@ class Test23(CustomTestCase):
                 "8",
                 "--moe-dense-tp-size",
                 "1",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
             ],
         )
 
@@ -988,7 +992,8 @@ class Test24(CustomTestCase):
                 "4",
                 "--moe-dense-tp-size",
                 "1",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
             ],
         )
 
@@ -1028,7 +1033,8 @@ class Test25(CustomTestCase):
                 "8",
                 "--moe-dense-tp-size",
                 "1",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
             ],
         )
 
@@ -1067,7 +1073,8 @@ class Test26(CustomTestCase):
                 "--dp",
                 "4",
                 "--enable-dp-lm-head",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
             ],
         )
 
@@ -1106,7 +1113,8 @@ class Test27(CustomTestCase):
                 "--dp",
                 "8",
                 "--enable-dp-lm-head",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
             ],
         )
 
@@ -1147,7 +1155,8 @@ class Test28(CustomTestCase):
                 "--moe-dense-tp-size",
                 "1",
                 "--enable-dp-lm-head",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
             ],
         )
 
@@ -1188,7 +1197,8 @@ class Test29(CustomTestCase):
                 "--moe-dense-tp-size",
                 "1",
                 "--enable-dp-lm-head",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
             ],
         )
 
@@ -2249,7 +2259,8 @@ class Test50(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
                 "--speculative-algo",
                 "EAGLE",
                 "--speculative-draft",
@@ -2297,7 +2308,8 @@ class Test51(CustomTestCase):
                 "--enable-dp-attention",
                 "--dp",
                 "4",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
                 "--speculative-algo",
                 "EAGLE",
                 "--speculative-draft",
@@ -2345,7 +2357,8 @@ class Test52(CustomTestCase):
                 "--enable-dp-attention",
                 "--dp",
                 "8",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
                 "--speculative-algo",
                 "EAGLE",
                 "--speculative-draft",
@@ -2392,7 +2405,8 @@ class Test53(CustomTestCase):
                 "8",
                 "--moe-dense-tp-size",
                 "1",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
                 "--speculative-algo",
                 "EAGLE",
                 "--speculative-draft",
@@ -2442,7 +2456,8 @@ class Test54(CustomTestCase):
                 "4",
                 "--moe-dense-tp-size",
                 "1",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
                 "--speculative-algo",
                 "EAGLE",
                 "--speculative-draft",
@@ -2492,7 +2507,8 @@ class Test55(CustomTestCase):
                 "8",
                 "--moe-dense-tp-size",
                 "1",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
                 "--speculative-algo",
                 "EAGLE",
                 "--speculative-draft",
@@ -2541,7 +2557,8 @@ class Test56(CustomTestCase):
                 "--dp",
                 "4",
                 "--enable-dp-lm-head",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
                 "--speculative-algo",
                 "EAGLE",
                 "--speculative-draft",
@@ -2590,7 +2607,8 @@ class Test57(CustomTestCase):
                 "--dp",
                 "8",
                 "--enable-dp-lm-head",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
                 "--speculative-algo",
                 "EAGLE",
                 "--speculative-draft",
@@ -2641,7 +2659,8 @@ class Test58(CustomTestCase):
                 "--moe-dense-tp-size",
                 "1",
                 "--enable-dp-lm-head",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
                 "--speculative-algo",
                 "EAGLE",
                 "--speculative-draft",
@@ -2692,7 +2711,8 @@ class Test59(CustomTestCase):
                 "--moe-dense-tp-size",
                 "1",
                 "--enable-dp-lm-head",
-                "--enable-ep-moe",
+                "--ep",
+                "8",
                 "--speculative-algo",
                 "EAGLE",
                 "--speculative-draft",

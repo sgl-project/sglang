@@ -171,12 +171,11 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    enable_ep_moe: bool = False
-    enable_deepep_moe: bool = False
+    moe_a2a_backend: Literal["none", "deepep"] = "none"
     enable_flashinfer_cutlass_moe: bool = False
     enable_flashinfer_trtllm_moe: bool = False
     enable_flashinfer_allreduce_fusion: bool = False
-    deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
+    deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
@@ -269,8 +268,20 @@ class ServerArgs:
     # For PD-Multiplexing
     enable_pdmux: bool = False
     sm_group_num: int = 3
+    
+    # Deprecated arguments
+    enable_ep_moe: bool = False
+    enable_deepep_moe: bool = False
 
     def __post_init__(self):
+        
+        # Check deprecated arguments
+        if self.enable_ep_moe:
+            self.ep_size = self.tp_size
+            logger.warning("enable_ep_moe is deprecated. Please set `--ep-size` to the same value as `--tp-size` instead.")
+        if self.enable_deepep_moe:
+            logger.warning("enable_deepep_moe is deprecated. Please set `--moe-a2a-backend` to 'deepep' instead.")
+        
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -1339,29 +1350,26 @@ class ServerArgs:
             help="The expert parallelism size.",
         )
         parser.add_argument(
-            "--enable-ep-moe",
-            action="store_true",
-            help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
+            "--moe-a2a-backend",
+            type=str,
+            choices=["none", "deepep"],
+            default=ServerArgs.moe_a2a_backend,
+            help="Choose the backend for MoE A2A.",
         )
         parser.add_argument(
             "--enable-flashinfer-cutlass-moe",
             action="store_true",
-            help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP with --enable-ep-moe",
+            help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
         )
         parser.add_argument(
             "--enable-flashinfer-trtllm-moe",
             action="store_true",
-            help="Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP with --enable-ep-moe",
+            help="Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
-        )
-        parser.add_argument(
-            "--enable-deepep-moe",
-            action="store_true",
-            help="Enabling DeepEP MoE implementation for EP MoE.",
         )
         parser.add_argument(
             "--deepep-mode",
@@ -1814,6 +1822,18 @@ class ServerArgs:
             "--weight-loader-disable-mmap",
             action="store_true",
             help="Disable mmap while loading weight using safetensors.",
+        )
+
+        # Deprecated arguments
+        parser.add_argument(
+            "--enable-ep-moe",
+            action="store_true",
+            help="(Deprecated) Enabling expert parallelism for moe. The ep size is equal to the tp size.",
+        )
+        parser.add_argument(
+            "--enable-deepep-moe",
+            action="store_true",
+            help="(Deprecated) Enabling DeepEP MoE implementation for EP MoE.",
         )
 
     @classmethod
