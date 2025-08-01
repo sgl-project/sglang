@@ -79,15 +79,30 @@ class GPQAEval(Eval):
             # extracted_answer = match.group(1) if match else None
             pattern_list = [
                 r"(?i)Answer[ \t]*:[^a-zA-Z]*\$?([A-D])\$?",
+                r"(?i)Answer[ \t]*: Option \([^a-zA-Z]*\$?([A-D])\)\$?",
+                r"(?i)Answer[ \t]*: Option [^a-zA-Z]*\$?([A-D])\$?",
                 r"(?i)assistantfinal[ \t]*[^a-zA-Z]*\$?([A-D])\$?",
+                r"(?i)assistantfinal[ \t]*Option [^a-zA-Z]*\$?([A-D])\$?",
                 r"(?i)assistantfinal\*\*Option [^a-zA-Z]*\$?([A-D])\*\*\$?",
                 r"(?i)assistantfinal\*\*[^a-zA-Z]*\$?([A-D])\*\*\$?",
                 r"(?i)text{[^a-zA-Z]*\$?([A-D])}}\$?",
                 r"(?i)text{Option [^a-zA-Z]*\$?([A-D])}}\$?",
+                r"(?i)text{\([^a-zA-Z]*\$?([A-D])\)\$?",
+                r"(?i)text{[^a-zA-Z]*\$?([A-D])}\$?",
+                r"(?i)\text{[^a-zA-Z]*\$?([A-D])}\$?",
+                r"(?i)\text{\([^a-zA-Z]*\$?([A-D])\)\$?",
+                r"(?i)\text{Option [^a-zA-Z]*\$?([A-D])}}\$?",
+                r"(?i)\text{Option [^a-zA-Z]*\$?([A-D])\$?",
+                r"(?i)\boxed{[^a-zA-Z]*\$?([A-D])}\$?",
                 r"(?i)option\*\*[^a-zA-Z]*\$?([A-D])\*\*\$?",
                 r"(?i)option \*\*[^a-zA-Z]*\$?([A-D])\*\*\$?",
                 r"(?i)option \*\*\([^a-zA-Z]*\$?([A-D])\)\$?",
                 r"(?i)\*\*option [^a-zA-Z]*\$?([A-D])\*\*\$?",
+                r"(?i)option [^a-zA-Z]*\$?([A-D])\*\*\$?",
+                r"(?i)correct choice is \*\*[^a-zA-Z]*\$?([A-D])\$?",
+                r"(?i)option is \*\*[^a-zA-Z]*\$?([A-D])\$?",
+                r"(?i)correct option is \*\*[^a-zA-Z]*\$?([A-D])\$?",
+                r"(?i)closest option is \*\*\([^a-zA-Z]*\$?([A-D])\)\$?",
             ]
             extracted_answer = None
             for pattern in pattern_list:
