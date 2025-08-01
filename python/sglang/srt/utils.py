@@ -2344,6 +2344,7 @@ def is_fa3_default_architecture(hf_config):
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Glm4MoeForCausalLM",
+        "Step3VLForConditionalGeneration",
     }
     return architectures[0] in default_archs
 

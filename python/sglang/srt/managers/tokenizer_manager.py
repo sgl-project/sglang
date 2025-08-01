@@ -234,10 +234,10 @@ class TokenizerManager:
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
         else:
-            self.mm_processor = None
+            self.mm_processor = self.processor = None
 
             if server_args.skip_tokenizer_init:
-                self.tokenizer = self.processor = None
+                self.tokenizer = None
             else:
                 self.tokenizer = get_tokenizer(
                     server_args.tokenizer_path,

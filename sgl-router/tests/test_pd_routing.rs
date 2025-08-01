@@ -169,11 +169,15 @@ mod test_pd_routing {
                 request_timeout_secs: 60,
                 worker_startup_timeout_secs: 10,
                 worker_startup_check_interval_secs: 1,
+                dp_aware: false,
+                api_key: None,
                 discovery: None,
                 metrics: None,
                 log_dir: None,
                 log_level: None,
                 request_id_headers: None,
+                max_concurrent_requests: 64,
+                cors_allowed_origins: vec![],
             };
 
             // Router creation will fail due to health checks, but config should be valid

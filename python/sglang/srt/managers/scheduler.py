@@ -201,15 +201,18 @@ class Scheduler(
         port_args: PortArgs,
         gpu_id: int,
         tp_rank: int,
+        moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
     ):
         # Parse args
         self.server_args = server_args
         self.tp_rank = tp_rank
+        self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
         self.dp_rank = dp_rank
         self.tp_size = server_args.tp_size
+        self.moe_ep_size = server_args.ep_size
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
@@ -310,6 +313,7 @@ class Scheduler(
             server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
+            moe_ep_rank=moe_ep_rank,
             pp_rank=pp_rank,
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
@@ -322,6 +326,7 @@ class Scheduler(
             self.draft_worker = EAGLEWorker(
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
                 server_args=server_args,
                 nccl_port=port_args.nccl_port,
                 target_worker=self.tp_worker,
@@ -584,6 +589,7 @@ class Scheduler(
                         == "fa3"  # hot fix for incompatibility
                         else server_args.hicache_io_backend
                     ),
+                    hicache_mem_layout=server_args.hicache_mem_layout,
                     hicache_storage_backend=server_args.hicache_storage_backend,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
@@ -1188,22 +1194,27 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
-            if self.enable_hicache_storage:
-                req.init_next_round_input(self.tree_cache)
-                last_hash = req.last_host_node.get_last_hash_value()
-                matched_len = len(req.prefix_indices) + req.host_hit_length
-                if (matched_len > 0 and last_hash is not None) or matched_len == 0:
-                    new_input_tokens = req.fill_ids[matched_len:]
-                    self.tree_cache.prefetch_from_storage(
-                        req.rid, req.last_host_node, new_input_tokens, last_hash
-                    )
+            self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
+
+    def _prefetch_kvcache(self, req: Req):
+        if self.enable_hicache_storage:
+            req.init_next_round_input(self.tree_cache)
+            last_hash = req.last_host_node.get_last_hash_value()
+            matched_len = len(req.prefix_indices) + req.host_hit_length
+            # todo, free-form fetching, calculating hash keys on the fly
+            if (matched_len > 0 and last_hash is not None) or matched_len == 0:
+                new_input_tokens = req.fill_ids[matched_len:]
+                self.tree_cache.prefetch_from_storage(
+                    req.rid, req.last_host_node, new_input_tokens, last_hash
+                )
 
     def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -2360,6 +2371,7 @@ def run_scheduler_process(
     port_args: PortArgs,
     gpu_id: int,
     tp_rank: int,
+    moe_ep_rank: int,
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
@@ -2370,6 +2382,8 @@ def run_scheduler_process(
         prefix += f" DP{dp_rank}"
     if server_args.tp_size > 1:
         prefix += f" TP{tp_rank}"
+    if server_args.ep_size > 1:
+        prefix += f" EP{moe_ep_rank}"
     if server_args.pp_size > 1:
         prefix += f" PP{pp_rank}"
 
@@ -2393,7 +2407,9 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, pp_rank, dp_rank)
+        scheduler = Scheduler(
+            server_args, port_args, gpu_id, tp_rank, moe_ep_rank, pp_rank, dp_rank
+        )
         pipe_writer.send(
             {
                 "status": "ready",
