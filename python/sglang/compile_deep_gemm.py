@@ -53,7 +53,9 @@ class CompileArgs:
 
 
 @warmup("compile-deep-gemm")
-async def warm_up_compile(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
+async def warm_up_compile(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
     print("\nGenerate warm up request for compiling DeepGEMM...\n")
     generate_req_input = GenerateReqInput(
         input_ids=[0, 1, 2, 3],
