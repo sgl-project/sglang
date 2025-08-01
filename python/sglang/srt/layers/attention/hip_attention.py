@@ -118,6 +118,15 @@ class HiPAttentionBackend(AttentionBackend):
         self._block_table: torch.Tensor = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        _table = self.flashattention_backend.req_to_token.index_select(
+            dim=0, index=forward_batch.req_pool_indices
+        )
+        
+        if self._block_table is not None:
+            self._block_table[: _table.shape[0]] = _table
+        else:
+            self._block_table = _table
+        
         self.flashattention_backend.init_forward_metadata(forward_batch=forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int):
@@ -185,6 +194,30 @@ class HiPAttentionBackend(AttentionBackend):
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
         )
+        
+        # print(seq_lens)
+        # cache_seqlens = seq_lens[:bs].to(torch.int32)
+        # print(cache_seqlens.shape)
+        # cu_seqlens_q = torch.arange(
+        #     0, 
+        #     bs + 1, 
+        #     1, 
+        #     device=seq_lens.device, 
+        #     dtype=torch.int32
+        # )
+        # print(cu_seqlens_q.shape)
+        # cu_seqlens_k = cu_seqlens_q.clone()
+        # cu_seqlens_k[1:] = cache_seqlens.cumsum(-1)
+        
+        fa3_cache_seqlens=self.flashattention_backend.forward_metadata.cache_seqlens_int32[:bs]
+        fa3_cu_seqlens_q=self.flashattention_backend.forward_metadata.cu_seqlens_q[:bs+1]
+        fa3_cu_seqlens_k=self.flashattention_backend.forward_metadata.cu_seqlens_k[:bs+1]
+        
+        print(seq_lens[:bs], fa3_cache_seqlens, fa3_cu_seqlens_q, fa3_cu_seqlens_k)
+        
+        # assert torch.all(fa3_cache_seqlens == cache_seqlens)
+        # assert torch.all(fa3_cu_seqlens_q == cu_seqlens_q)
+        # assert torch.all(fa3_cu_seqlens_k == cu_seqlens_k)
 
     def get_cuda_graph_seq_len_fill_value(self):
         assert self.flashattention_backend.get_cuda_graph_seq_len_fill_value() == 0
@@ -662,6 +695,18 @@ class HiPAttentionBackend(AttentionBackend):
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
                 )
 
+            if layer.layer_id == 0:
+                self.cache_seqlens = (forward_batch.positions.view(forward_batch.batch_size, -1)[:, -1] + 1).to(torch.int32)
+                self.cu_seqlens_q = torch.arange(
+                    0, 
+                    forward_batch.batch_size + 1, 
+                    q_reshaped.shape[0] // forward_batch.batch_size, 
+                    device=q_reshaped.device, 
+                    dtype=torch.int32
+                )
+                self.cu_seqlens_k = self.cu_seqlens_q.clone()
+                self.cu_seqlens_k[1:] = self.cache_seqlens.cumsum(-1)
+            
             if not self.use_mla:
                 k_descale = v_descale = None
                 if k_cache is not None:
@@ -687,6 +732,14 @@ class HiPAttentionBackend(AttentionBackend):
                 q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
                 k_reshaped = k.reshape(-1, layer.tp_k_head_num, layer.head_dim)
                 v_reshaped = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
+                    
+                # fa3_cache_seqlens=self.flashattention_backend.forward_metadata.cache_seqlens_int32
+                # fa3_cu_seqlens_q=self.flashattention_backend.forward_metadata.cu_seqlens_q
+                # fa3_cu_seqlens_k=self.flashattention_backend.forward_metadata.cu_seqlens_k
+                
+                # assert torch.all(fa3_cache_seqlens == cache_seqlens)
+                # assert torch.all(fa3_cu_seqlens_q == cu_seqlens_q)
+                # assert torch.all(fa3_cu_seqlens_k == cu_seqlens_k)
 
                 o, metadata = self.forward_paged_hip(
                     query=q_reshaped,
@@ -701,7 +754,6 @@ class HiPAttentionBackend(AttentionBackend):
                     seq_lens=forward_batch.seq_lens,
                     req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
                     req_pool_indices=forward_batch.req_pool_indices,
-                    # block_table=self._block_table,
                     block_table=self._block_table[: forward_batch.batch_size],
                     rope_cos=layer.rope_cos,
                     rope_sin=layer.rope_sin,
@@ -725,9 +777,12 @@ class HiPAttentionBackend(AttentionBackend):
                     using_chunked_sliding_window=using_chunked_sw,
                     k_descale=k_descale,
                     v_descale=v_descale,
-                    cache_seqlens=self.flashattention_backend.forward_metadata.cache_seqlens_int32,
-                    cu_seqlens_q=self.flashattention_backend.forward_metadata.cu_seqlens_q,
-                    cu_seqlens_k=self.flashattention_backend.forward_metadata.cu_seqlens_k,
+                    # cache_seqlens=self.flashattention_backend.forward_metadata.cache_seqlens_int32[:forward_batch.batch_size],
+                    # cu_seqlens_q=self.flashattention_backend.forward_metadata.cu_seqlens_k[:forward_batch.batch_size + 1],
+                    # cu_seqlens_k=self.flashattention_backend.forward_metadata.cu_seqlens_q[:forward_batch.batch_size + 1],
+                    cache_seqlens=self.cache_seqlens,
+                    cu_seqlens_q=self.cu_seqlens_q,
+                    cu_seqlens_k=self.cu_seqlens_k,
                     self_extend_scale=self.hip_config.self_extend_scale,
                 )
             else:
@@ -812,9 +867,9 @@ class HiPAttentionBackend(AttentionBackend):
                     offloading_metadata=offloading_metadata,
                     sliding_window_size=sw_size,
                     using_chunked_sliding_window=using_chunked_sw,
-                    cache_seqlens=self.flashattention_backend.forward_metadata.cache_seqlens_int32,
-                    cu_seqlens_q=self.flashattention_backend.forward_metadata.cu_seqlens_q,
-                    cu_seqlens_k=self.flashattention_backend.forward_metadata.cu_seqlens_k,
+                    cache_seqlens=self.cache_seqlens,
+                    cu_seqlens_q=self.cu_seqlens_q,
+                    cu_seqlens_k=self.cu_seqlens_k,
                     self_extend_scale=self.hip_config.self_extend_scale,
                 )
 
