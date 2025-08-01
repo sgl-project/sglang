@@ -522,6 +522,7 @@ class Scheduler(
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (ConvertDisaggregationRoleReqInput, self.convert_disaggregation_role),
             ]
         )
 
