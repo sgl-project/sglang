@@ -159,6 +159,7 @@ def cutlass_fused_experts_fp8(
     else:
         rep_a = shuffle_rows(a, a_map, (m * topk, k))
         rep_a_q, rep_a1_scales = per_token_group_quant_fp8_hopper_moe_mn_major(rep_a, expert_offsets, problem_sizes1, 128)
+        w1_scale = w1_scale.contiguous()
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
     c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
@@ -194,6 +195,7 @@ def cutlass_fused_experts_fp8(
         intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
     else:
         intemediate_q, a2_scale = per_token_group_quant_fp8_hopper_moe_mn_major(intermediate, expert_offsets, problem_sizes2, 128)
+        w2_scale = w2_scale.contiguous()
 
     fp8_blockwise_scaled_grouped_mm(
         c2,
@@ -215,7 +217,7 @@ def cutlass_fused_experts_fp8(
         expert_offsets[:-1],
         workspace,
     )
-    print("topk_weights: ", topk_weights.dtype)
+
     result = torch.empty((m, k), device=device, dtype=out_dtype)
     apply_shuffle_mul_sum(c2, result, c_map, topk_weights.to(out_dtype))
     return result
