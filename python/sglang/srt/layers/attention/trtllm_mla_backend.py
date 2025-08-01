@@ -334,7 +334,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         kv_cache = pages.unsqueeze(1)
 
         # Quantize query to fp8 if kv is already set to fp8_e4m3 using --kv-cache-dtype fp8_e4m3
-        # TODO: add an assert to server args to make sure kv-cache-dtype is either fp8_em4m3 or fp16/auto
         if query.dtype != k_cache.dtype:
             query = query.to(k_cache.dtype)
 
@@ -345,9 +344,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         # Scale computation for TRTLLM MLA kernel BMM1 operation:
-        # 
+        #
         # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale
-        # 
+        #
         # Scale components:
         # - q_scale: Query scaling factor (set to 1.0 for both FP16/FP8 paths)
         # - k_scale: Key scaling factor from model checkpoint (defaults to 1.0 if not available)
