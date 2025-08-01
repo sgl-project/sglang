@@ -7,6 +7,7 @@ from typing import List, Optional, Set, Tuple
 
 import torch
 from torch import nn
+from transformers import Llama4Config, Llama4VisionConfig
 from transformers.models.llama4.modeling_llama4 import (
     Llama4MultiModalProjector,
     vision_apply_rotary_emb,
@@ -33,7 +34,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cpu
-from transformers import Llama4Config, Llama4VisionConfig
 
 _is_cpu = is_cpu()
 
@@ -105,7 +105,7 @@ def pixel_shuffle(input_tensor, shuffle_ratio):
         batch_size,
         int(height * shuffle_ratio),
         int(width * shuffle_ratio),
-        int(channels / (shuffle_ratio ** 2)),
+        int(channels / (shuffle_ratio**2)),
     )
     reshaped_tensor = reshaped_tensor.permute(0, 2, 1, 3).contiguous()
 
@@ -125,7 +125,7 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
         super().__init__()
         self.pixel_shuffle_ratio = config.pixel_shuffle_ratio
         self.inner_dim = int(
-            config.projector_input_dim // (self.pixel_shuffle_ratio ** 2)
+            config.projector_input_dim // (self.pixel_shuffle_ratio**2)
         )
         self.output_dim = config.projector_output_dim
         self.mlp = Llama4VisionMLP(
@@ -304,7 +304,7 @@ class Llama4VisionRotaryEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
         idx = config.image_size // config.patch_size
-        img_idx = torch.arange(idx ** 2, dtype=torch.int32).reshape(idx ** 2, 1)
+        img_idx = torch.arange(idx**2, dtype=torch.int32).reshape(idx**2, 1)
         img_idx = torch.cat([img_idx, img_idx[:1]], dim=0)
         img_idx[-1, -1] = -2  # ID_CLS_TOKEN
         frequencies_x = img_idx % idx  # get the coordinates of the 2d matrix along x
@@ -347,7 +347,7 @@ class Llama4VisionModel(nn.Module):
         self.num_channels = config.num_channels
 
         self.num_patches = (self.image_size // self.patch_size) ** 2 + 1
-        self.scale = config.hidden_size ** -0.5
+        self.scale = config.hidden_size**-0.5
 
         self.patch_embedding = Llama4UnfoldConvolution(
             config,
