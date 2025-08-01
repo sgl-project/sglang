@@ -441,7 +441,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         if not self.has_vision_weights:
             logger.warning(
                 "No vision weights found in checkpoint. Model will run in text-only mode. "
-                "Multimodal capabilities (image processing) will be unavailable. "
+                "Multimodal capabilities (vision understanding) will be unavailable. "
                 "Please not that this warning might be inaccurate if the weights haven't been fully downloaded"
             )
 
@@ -669,7 +669,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             self._handle_default_weight(name, loaded_weight, params_dict)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
-            raise RuntimeError(
+            logger.warning(
                 f"Some weights are not initialized from checkpoints {unloaded_params}"
             )
 
