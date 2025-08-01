@@ -6,8 +6,11 @@ from typing import List, Optional, Set, Tuple
 
 import torch
 from torch import nn
-from transformers import Llama4Config, Llama4VisionModel
-from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
+from transformers import Llama4Config
+from transformers.models.llama4.modeling_llama4 import (
+    Llama4MultiModalProjector,
+    Llama4VisionModel,
+)
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -16,7 +19,12 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    global_server_args_dict,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_cpu
@@ -48,12 +56,16 @@ class Llama4ForConditionalGeneration(nn.Module):
         self.quant_config = quant_config
 
         # Check if this is a text-only model (modelopt fp8 llama4 has no vision components)
-        self.has_vision = self._has_vision_weights(config)
-        if not self.has_vision:
+        self.has_vision_weights = self._has_vision_weights(config)
+        if not self.has_vision_weights:
             logger.warning(
                 "No vision weights found in checkpoint. Model will run in text-only mode. "
                 "Multimodal capabilities (image processing) will be unavailable."
             )
+
+        self.has_vision = (
+            self.has_vision_weights and global_server_args_dict["enable_multimodal"]
+        )
 
         if self.has_vision:
             self.vision_model = Llama4VisionModel(config.vision_config)
@@ -74,6 +86,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(
             config.text_config if hasattr(config, "text_config") else config
         )
+        self.padding_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
     def _has_vision_weights(self, config) -> bool:
         """Check if the model has vision components by examining the checkpoint."""
@@ -128,8 +141,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             return False
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return self.padding_pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(
         self,
@@ -140,7 +152,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             raise ValueError("Vision model not available for text-only checkpoint")
 
         pixel_values = (
-            torch.concat([item.pixel_values for item in items])
+            torch.concat([item.feature for item in items])
             .to(next(self.vision_model.parameters()).device)
             .type(next(self.vision_model.parameters()).dtype)
         )
@@ -166,7 +178,9 @@ class Llama4ForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
-            image_data_embedding_func=image_embedding_func,
+            data_embedding_funcs={
+                Modality.IMAGE: self.get_image_feature,
+            },
             positions=positions,
         )
 
@@ -260,7 +274,9 @@ class Llama4ForConditionalGeneration(nn.Module):
 
     def _should_skip_weight(self, name: str) -> bool:
         """Check if we should skip loading this weight."""
-        return "vision" in name and not self.has_vision
+        return not self.has_vision and (
+            "vision" in name or "multi_modal_projector" in name
+        )
 
     def _transform_weight_name(self, name: str) -> str:
         """Transform weight name by adding language_model prefix if needed."""

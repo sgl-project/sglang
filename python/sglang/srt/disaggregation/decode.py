@@ -439,7 +439,15 @@ class DecodePreallocQueue:
             else 0
         )
 
-        allocatable_tokens = self.token_to_kv_pool_allocator.available_size() - max(
+        if self.scheduler.model_config.is_hybrid:
+            available_size = min(
+                self.token_to_kv_pool_allocator.full_available_size(),
+                self.token_to_kv_pool_allocator.swa_available_size(),
+            )
+        else:
+            available_size = self.token_to_kv_pool_allocator.available_size()
+
+        allocatable_tokens = available_size - max(
             # preserve some space for future decode
             self.num_reserved_decode_tokens
             * (
@@ -686,10 +694,7 @@ class SchedulerDisaggregationDecodeMixin:
                 + len(self.disagg_decode_prealloc_queue.queue)
                 == 0
             ):
-                # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
 
@@ -763,10 +768,7 @@ class SchedulerDisaggregationDecodeMixin:
                 + len(self.disagg_decode_prealloc_queue.queue)
                 == 0
             ):
-                # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
             self.last_batch_in_queue = last_batch_in_queue

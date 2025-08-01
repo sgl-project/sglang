@@ -14,6 +14,7 @@
 """Utilities for Huggingface Transformers."""
 
 import contextlib
+import logging
 import os
 import warnings
 from pathlib import Path
@@ -25,6 +26,7 @@ from transformers import (
     AutoConfig,
     AutoProcessor,
     AutoTokenizer,
+    GenerationConfig,
     PretrainedConfig,
     PreTrainedTokenizer,
     PreTrainedTokenizerBase,
@@ -39,6 +41,7 @@ from sglang.srt.configs import (
     ExaoneConfig,
     KimiVLConfig,
     MultiModalityConfig,
+    Step3VLConfig,
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
@@ -52,6 +55,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     MultiModalityConfig.model_type: MultiModalityConfig,
     KimiVLConfig.model_type: KimiVLConfig,
     InternVLChatConfig.model_type: InternVLChatConfig,
+    Step3VLConfig.model_type: Step3VLConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
@@ -151,6 +155,21 @@ def get_config(
         config.update({"architectures": [model_type]})
 
     return config
+
+
+@lru_cache_frozenset(maxsize=32)
+def get_generation_config(
+    model: str,
+    trust_remote_code: bool,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    try:
+        return GenerationConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+    except OSError as e:
+        return None
 
 
 # Models don't use the same configuration key for determining the maximum
