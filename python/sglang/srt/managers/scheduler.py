@@ -1517,14 +1517,10 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if (
-                self.enable_lora
-                and len(
-                    lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
-                )
-                > self.max_loras_per_batch
+            if self.enable_lora and not self.tp_worker.can_run_lora_batch(
+                lora_set
+                | set([req.lora_path for req in adder.can_run_list])
+                | set([req.lora_path])
             ):
                 self.running_batch.batch_is_full = True
                 break

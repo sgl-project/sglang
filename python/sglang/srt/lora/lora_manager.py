@@ -144,6 +144,7 @@ class LoRAManager:
 
             # keep metadata for displayed messages
             self.lora_refs[lora_ref.lora_id] = lora_ref
+            self.num_pinned_loras += int(lora_ref.pinned)
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,
@@ -157,6 +158,7 @@ class LoRAManager:
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
         """
 
+        # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
         incompatible = memory_pool and not memory_pool.can_support(lora_config)
         if incompatible:
@@ -166,21 +168,41 @@ class LoRAManager:
                 "included in `--enable_lora_modules`."
             )
 
+        # Ensure pinned LoRA adapters does not exceed maximal limit or cause starvation.
+        if lora_ref.pinned:
+            mem_pool_vacancy = self.max_loras_per_batch - self.num_pinned_loras
+            if mem_pool_vacancy <= 0:
+                raise ValueError(
+                    f"Cannot load pinned LoRA adapter {lora_ref.lora_name} as the maximum number of pinned LoRA adapters "
+                    f"({self.max_loras_per_batch}) is reached. Please unload some pinned LoRA adapters or "
+                    f"load {lora_ref.lora_name} as an unpinned adapter."
+                )
+            elif mem_pool_vacancy == 1:
+                unpinned_adapters = len(self.lora_refs) - self.num_pinned_loras
+                if unpinned_adapters > 0:
+                    raise ValueError(
+                        f"Cannot load pinned LoRA adapter {lora_ref.lora_name} as this would use up all slots in "
+                        f"max_loras_per_batch, while there are still {unpinned_adapters} unpinned LoRA adapters "
+                        f"loaded. Please unload some adapters or load {lora_ref.lora_name} as an unpinned adapter."
+                    )
+
     def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateResult:
         """
         Unload LoRA adapters by their names. This will remove the adapters from the memory pool and
         delete the corresponding LoRA modules.
         """
 
-        adapter = self.configs.get(lora_ref.lora_id, None)
+        adapter = self.configs.get(lora_ref.lora_id)
+        lora_ref = self.lora_refs.get(lora_ref.lora_id)
         assert (
-            adapter is not None
+            adapter is not None and lora_ref is not None
         ), f"LoRA adapter with ID {lora_ref.lora_id} is not loaded. This should have been verified before request is sent to the backend."
 
         try:
             del self.configs[lora_ref.lora_id]
             del self.loras[lora_ref.lora_id]
             del self.lora_refs[lora_ref.lora_id]
+            self.num_pinned_loras -= int()
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,
@@ -189,15 +211,52 @@ class LoRAManager:
 
         return self.create_lora_update_result(success=True)
 
+    def validate_lora_batch(self, lora_ids: set[str]) -> bool:
+        """
+        Validate if the LoRA IDs in the batch can be loaded into the current LoRA memory pool.
+        """
+        if len(lora_ids) > self.max_loras_per_batch:
+            return False
+
+        # skip pinned LoRA check if no pinned LoRA adapters are loaded.
+        if self.num_pinned_loras == 0:
+            return True
+
+        # counting the number of pinned LoRA adapters in the batch.
+        pinned_loras_in_batch = 0
+        for lora_id in lora_ids:
+            lora_ref = self.lora_refs.get(lora_id, None)
+            assert lora_ref is not None, f"LoRA ID {lora_id} not found in lora_refs."
+            pinned_loras_in_batch += int(lora_ref.pinned)
+
+        assert pinned_loras_in_batch <= self.num_pinned_loras, (
+            f"Number of pinned LoRA adapters in the batch ({pinned_loras_in_batch}) exceeds the total number of pinned adapters "
+            f"({self.num_pinned_loras}). This indicates a bug in the LoRA loading logic."
+        )
+
+        required_slots = len(lora_ids) - pinned_loras_in_batch
+        mem_pool_vacancy = self.memory_pool.max_loras_per_batch - self.num_pinned_loras
+
+        return required_slots <= mem_pool_vacancy
+
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
-        # Load active loras into lora memory pool
-        # TODO (lifuhuang): The naming of `forward_batch.lora_paths` is confusing. It actually contains a set of unique
-        # LoRA IDs, not LoRA paths. While unfortunately we cannot change the name in API for backward compatibility, we
-        # should consider (1) renaming the incorrect usage within the system, and (2) deprecating the parameter name in
-        # the current API schema and introducing a better request schema in the future (e.g., use `model_name`).
+        """
+        Load active loras into lora memory pool.
+
+        TODO (lifuhuang): The naming of `forward_batch.lora_paths` is confusing. It actually contains a set of unique
+        LoRA IDs, not LoRA paths. While unfortunately we cannot change the name in API for backward compatibility, we
+        should consider (1) renaming the incorrect usage within the system, and (2) deprecating the parameter name in
+        the current API schema and introducing a better request schema in the future (e.g., use `model_name`).
+        """
+
         cur_uids = set(forward_batch.lora_paths)
         assert len(cur_uids) <= self.max_loras_per_batch
-        self.memory_pool.prepare_lora_batch(cur_uids, self.loras, self.lora_modules)
+        self.memory_pool.prepare_lora_batch(
+            cur_uids=cur_uids,
+            lora_adapters=self.loras,
+            lora_modules=self.lora_modules,
+            lora_refs=self.lora_refs.copy(),  # copy snapshot of current lora_refs to avoid mutation during the batch preparation.
+        )
 
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
@@ -370,6 +429,9 @@ class LoRAManager:
         # Mapping from LoRA ID to LoRARef object.
         self.lora_refs: Dict[str, LoRARef] = {}
 
+        # Count of pinned LoRA adapters.
+        self.num_pinned_loras: int = 0
+
         if lora_paths:
             for lora_ref in lora_paths.values():
                 result = self.load_lora_adapter(lora_ref)
@@ -396,7 +458,7 @@ class LoRAManager:
             self.max_lora_rank = max_lora_rank
         else:
             self.max_lora_rank = max(
-                [x.hf_config["r"] for x in self.configs.values()],
+                [x.r for x in self.configs.values()],
                 default=0,
             )
 

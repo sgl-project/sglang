@@ -1976,21 +1976,23 @@ class ServerArgs:
 
         if self.enable_lora:
             # Normalize lora_paths to a dictionary if it is a list.
+            # TODO (lifuhuang): support specifying pinned adapters in server_args.
             if isinstance(self.lora_paths, list):
                 lora_paths = self.lora_paths
                 self.lora_paths = {}
                 for lora_path in lora_paths:
                     if "=" in lora_path:
                         name, path = lora_path.split("=", 1)
-                        self.lora_paths[name] = LoRARef(lora_name=name, lora_path=path)
+                        self.lora_paths[name] = LoRARef(
+                            lora_name=name, lora_path=path, pinned=False
+                        )
                     else:
                         self.lora_paths[lora_path] = LoRARef(
-                            lora_name=lora_path,
-                            lora_path=lora_path,
+                            lora_name=lora_path, lora_path=lora_path, pinned=False
                         )
             elif isinstance(self.lora_paths, dict):
                 self.lora_paths = {
-                    k: LoRARef(lora_name=k, lora_path=v)
+                    k: LoRARef(lora_name=k, lora_path=v, pinned=False)
                     for k, v in self.lora_paths.items()
                 }
             elif self.lora_paths is None:

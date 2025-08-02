@@ -1118,6 +1118,7 @@ class TokenizerManager:
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
                     lora_path=obj.lora_path,
+                    pinned=obj.pinned,
                 )
 
                 # Trigger the actual loading operation at the backend processes.
