@@ -51,7 +51,15 @@ using AccessType = AlignedArray<T, MAX_VPT>;
 template <typename T>
 __device__ inline T recalculate_sigmoid(int expert_idx, T* input_ptr) {
   T val = input_ptr[expert_idx];
-  return static_cast<T>(1.0f / (1.0f + expf(-float(val))));
+  float fval = static_cast<float>(val);
+  float sigmoid;
+  if (fval >= 0) {
+    sigmoid = 1.0f / (1.0f + expf(-fval));
+  } else {
+    float exp_val = expf(fval);
+    sigmoid = exp_val / (1.0f + exp_val);
+  }
+  return static_cast<T>(sigmoid);
 }
 
 // Helper function to handle shared experts and output rescaling
@@ -212,8 +220,8 @@ __device__ void moe_fused_gate_impl(
       #pragma unroll
       for (int ii = 0; ii < tile_size; ++ii) {
         int global_idx = tile_offset + ii;
-        row_chunk[ii] = vec_thread_read_ptr[0][global_idx];
-        bias_chunk[ii] = vec_bias_thread_read_ptr[0][global_idx];
+        row_chunk[ii] = thread_read_ptr[global_idx];
+        bias_chunk[ii] = bias_thread_read_ptr[global_idx];
       }
 
       // Process current tile
@@ -221,17 +229,26 @@ __device__ void moe_fused_gate_impl(
       for (int ii = 0; ii < tile_size; ++ii) {
         int global_idx = tile_offset + ii;
         
-        // Calculate Sigmoid
-        T sigmoid_val = static_cast<T>(1.0f / (1.0f + expf(-float(row_chunk[ii]))));
-        // Add bias
-        T val_with_bias = sigmoid_val + bias_chunk[ii];
+        // Calculate sigmoid
+        float input_val = static_cast<float>(row_chunk[ii]);
+        float sigmoid_val;
+        // sigmoid
+        if (input_val >= 0) {
+          sigmoid_val = 1.0f / (1.0f + expf(-input_val));
+        } else {
+          float exp_val = expf(input_val);
+          sigmoid_val = exp_val / (1.0f + exp_val);
+        }
+        T sigmoid_t = static_cast<T>(sigmoid_val);
+        // add bias
+        T val_with_bias = sigmoid_t + bias_chunk[ii];
         
-        // Store results in shared memory
-        int shared_idx = thread_shared_offset + ii * (WARP_SIZE + 1);
-        shared_sigmoid[shared_idx] = sigmoid_val;
+        // Store the results using linear indexing
+        int shared_idx = thread_shared_offset + ii * WARP_SIZE;
+        shared_sigmoid[shared_idx] = sigmoid_t;
         shared_bias[shared_idx] = val_with_bias;
         
-        // Track global maximums
+        // Update global maximum tracking
         if (cmp_gt(val_with_bias, global_max_val)) {
           global_max_val_second = global_max_val;
           global_max_second_idx = global_max_idx;
@@ -389,10 +406,19 @@ __device__ void moe_fused_gate_impl(
         
         T val;
         if (tile_idx == current_tile_idx) {
-          int shared_idx = thread_shared_offset + local_idx * (WARP_SIZE + 1);
+          int shared_idx = thread_shared_offset + local_idx * WARP_SIZE;
           val = shared_bias[shared_idx];
         } else {
-          val = recalculate_sigmoid(i, thread_read_ptr) + bias_thread_read_ptr[i];
+          int global_idx = tile_idx * 32 + local_idx;
+          float input_val = static_cast<float>(thread_read_ptr[global_idx]);
+          float sigmoid_val;
+          if (input_val >= 0) {
+            sigmoid_val = 1.0f / (1.0f + expf(-input_val));
+          } else {
+            float exp_val = expf(input_val);
+            sigmoid_val = exp_val / (1.0f + exp_val);
+          }
+          val = static_cast<T>(sigmoid_val) + bias_thread_read_ptr[global_idx];
         }
 
         if (cmp_gt(val, local_max_val) && !cmp_eq(val, static_cast<T>(FLT_MAX)) &&
@@ -439,11 +465,20 @@ __device__ void moe_fused_gate_impl(
         int local_idx = expert_to_clear_in_thread % 32;
 
         if (tile_idx == current_tile_idx) {
-          int shared_idx = thread_shared_offset + local_idx * (WARP_SIZE + 1);
+          int shared_idx = thread_shared_offset + local_idx * WARP_SIZE;
           shared_bias[shared_idx] = static_cast<T>(-FLT_MAX);
           output_ptr[idx] = static_cast<float>(shared_sigmoid[shared_idx]);
         } else {
-          output_ptr[idx] = static_cast<float>(recalculate_sigmoid(expert_to_clear_in_thread, thread_read_ptr));
+          int global_idx = expert_to_clear_in_thread;
+          float input_val = static_cast<float>(thread_read_ptr[global_idx]);
+          float sigmoid_val;
+          if (input_val >= 0) {
+            sigmoid_val = 1.0f / (1.0f + expf(-input_val));
+          } else {
+            float exp_val = expf(input_val);
+            sigmoid_val = exp_val / (1.0f + exp_val);
+          }
+          output_ptr[idx] = sigmoid_val;
         }
       }
 
