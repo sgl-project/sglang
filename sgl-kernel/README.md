@@ -58,7 +58,15 @@ And if you build the sgl-kernel with cmake, you need to add `CMAKE_BUILD_PARALLE
 CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) python -m uv build --wheel -Cbuild-dir=build --color=always .
 ```
 
-### FlashAttention on Hopper
+### ⚠️⚠️⚠️ Compile sgl-kernel on cu126 problem
+
+sgl-kernel compile FA, compile FlashAttention on Hopper with cu126 will meet some core dumped:
+
+```bash
+kernel/build/_deps/repo-flash-attention-src/hopper/instantiations/flash_fwd_hdimall_bf16_paged_softcap_sm90.cu -o CMakeFiles/flash_ops.dir/_deps/repo-flash-attention-src/hopper/instantiations/flash_fwd_hdimall_bf16_paged_softcap_sm90.cu.o
+Segmentation fault (core dumped)
+```
+
 ⚠️ **Note**: To ensure that FlashAttention compiles correctly on Hopper GPU Architecture(sm90), it is strongly [recommended](https://github.com/Dao-AILab/flash-attention/issues/1453) to use:
 - nvcc version: 12.6
 - ptxas version: 12.8
