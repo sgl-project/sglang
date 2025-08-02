@@ -230,7 +230,6 @@ void moe_align_block_size(
     torch::Tensor sorted_token_ids,
     torch::Tensor experts_ids,
     torch::Tensor num_tokens_post_pad,
-    torch::Tensor token_cnts_buffer,
     torch::Tensor cumsum_buffer,
     bool pad_sorted_token_ids);
 
@@ -244,7 +243,8 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
-    double routed_scaling_factor);
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output);
 
 void fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
