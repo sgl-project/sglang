@@ -24,6 +24,9 @@ import psutil
 import setproctitle
 import zmq
 
+from fastapi import FastAPI, Request, HTTPException
+import uvicorn
+
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     BlockReqInput,
@@ -54,6 +57,58 @@ class LoadBalanceMethod(Enum):
         except KeyError as exc:
             raise ValueError(f"Invalid load balance method: {method}") from exc
 
+class LoadTable:
+    def __init__(self,dp_size):
+        self._table = {
+            rank:{
+                "num_tokens":0,
+                "gen_throughput(tok/s)": float('inf'),
+                "estimated_completed_time":0,
+            } for rank in range(dp_size)
+        }
+    
+    def update_add(self, rank, num_tokens):
+        self._table[rank]["num_tokens"] += num_tokens
+        throughput = self._table[rank]["gen_throughput(tok/s)"]
+        if not isinstance(throughput, (float, int)):
+            if str(throughput).lower() in ("inf", "+inf"):
+                throughput = float('inf')
+            else:
+                try:
+                    throughput = float(throughput)
+                except Exception as e:
+                    raise ValueError(f"gen_throughput(tok/s)类型异常: {throughput} {type(throughput)}") from e
+            self._table[rank]["gen_throughput(tok/s)"] = throughput 
+        if throughput != float('inf'):
+            self._table[rank]["estimated_completed_time"] = self._table[rank]["num_tokens"] / throughput
+        else:
+            self._table[rank]["estimated_completed_time"] = 0
+    
+    def update_sub(self,num_input_tokens,rank,time):
+        if time >0:
+            self._table[rank]["num_tokens"] -= num_input_tokens
+            self._table[rank]["gen_throughput(tok/s)"] = num_input_tokens / time
+            self._table[rank]["estimated_completed_time"] = self._table[rank]["num_tokens"] / self._table[rank]["gen_throughput(tok/s)"]
+        else:
+            raise KeyError(f"time error")
+        
+    def get_shortest_queue(self):
+        inf_items = [(rank, info) for rank, info in self._table.items()
+                    if info["gen_throughput(tok/s)"] == float('inf')]
+        if inf_items:
+	        # 在inf节点之间选num_tokens最少的，如果有多个再选rank最小
+	        return min(
+	            inf_items,
+	            key=lambda x: (x[1]["num_tokens"], x[0])
+	        )[0]
+        return min(
+            self._table.items(),
+            key=lambda x: (
+                x[1]["estimated_completed_time"],
+                x[1]["num_tokens"],
+            )
+        )[0]
+    
 
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
@@ -104,6 +159,38 @@ class DataParallelController:
                 )
 
         self.max_req_input_len = None
+        
+        if server_args.dp_size!=1 and server_args.load_balance_method=="shortest_queue":
+            self.load_table = LoadTable(server_args.dp_size)   
+            self.app = FastAPI()
+            @self.app.post("/update_load")
+            async def update_load(request:Request):
+                try:
+                    data = await request.json()
+                    rank = data["dp_rank"]
+                    nums_token = data["num_tokens"]
+                    time = data["time"]
+                
+                    self.load_table.update_sub(rank=rank,num_input_tokens=nums_token,time=time)
+                
+                    return {"status":"success"}
+                except Exception as e:
+                    raise HTTPException(status_code=400,detail=str(e))
+            if server_args.dist_init_addr is not None:
+                self.master_ip = server_args.dist_init_addr.split(":")[0]
+            else:
+                raise NotImplementedError()
+            self.master_port = 8001
+            self.http_thread = threading.Thread(
+                target=self._run_http_server,
+                args=(self.master_port,),
+                daemon=True
+                )
+            self.http_thread.start() 
+    
+    def _run_http_server(self, port):
+        uvicorn.run(self.app, host="0.0.0.0", port=port, log_level="warning")
+                
 
     def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
@@ -267,8 +354,15 @@ class DataParallelController:
                 self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, input_requests):
-        raise NotImplementedError()
-
+        if input_requests.data_parallel_rank is not None:
+            logger.debug(f"Direct routing to DP rank {input_requests.data_parallel_rank}")
+            self.workers[input_requests.data_parallel_rank].send_pyobj(input_requests)
+            return
+        
+        seq_len = len(input_requests.input_ids)
+        selected_rank = self.load_table.get_shortest_queue()
+        self.load_table.update_add(selected_rank,seq_len)
+        self.workers[selected_rank].send_pyobj(input_requests)
     def event_loop(self):
         while True:
             while True:

@@ -25,6 +25,8 @@ from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+import time
+import requests
 
 import torch
 from torch.distributed import ProcessGroup
@@ -48,6 +50,11 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    KVCache,
+    ReqToTokenPool,
+    TokenToKVPoolAllocator,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import require_mlp_sync
@@ -632,7 +639,6 @@ class DecodeTransferQueue:
                     self.tree_cache.cache_finished_req(decode_req.req)
                 else:
                     transferred_reqs.append(decode_req.req)
-
                 indices_to_remove.add(i)
             elif poll in [
                 KVPoll.Bootstrapping,
@@ -660,6 +666,28 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
+        
+        if self.server_args.dp_size != 1 and self.server_args.load_balance_method == "shortest_queue":
+            master_ip = self.server_args.dist_init_addr.split(":")[0]
+        else:
+            raise NotImplementedError()
+        master_port = 8001
+        controller_url = f"http://{master_ip}:{master_port}/update_load" 
+        self.pending_updates = { "num_tokens": 0,"time":0}
+            
+        async def _send_load_update_async(dp_rank):
+            """异步发送负载更新"""
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=0.5)) as session:
+                    payload = {
+                        "dp_rank": dp_rank,
+                        "num_tokens": self.pending_updates["num_tokens"],
+                        "time": self.pending_updates["time"],
+                    }
+                    async with session.post(controller_url, json=payload) as response:
+                        if response.status == 200:
+                            self.pending_updates = { "num_tokens": 0,"time":0} # cho
+                            return True
 
         while True:
             recv_reqs = self.recv_requests()
@@ -683,8 +711,17 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     if prepare_mlp_sync_flag:
                         self.prepare_mlp_sync_batch(batch)
+                    start_time = time.perf_counter()
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
+                    cost_time = time.perf_counter()-start_time
+                    
+                    if self.server_args.dp_size != 1 and self.server_args.load_balance_method == "shortest_queue":
+                        completed_tokens = sum(len(req.origin_input_ids) for req in batch.reqs)
+                        self.pending_updates["time"]+=cost_time
+                        self.pending_updates["num_tokens"] += completed_tokens
+                        _send_load_update_async(self.dp_rank) 
+                    
             elif prepare_mlp_sync_flag:
                 batch, _ = self._prepare_idle_batch_and_run(None)
 
@@ -700,6 +737,30 @@ class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
+        if self.server_args.dp_size != 1 and self.server_args.load_balance_method == "shortest_queue":
+            master_ip = self.server_args.dist_init_addr.split(":")[0]
+        else:
+            raise NotImplementedError()
+        master_port = 8001
+        controller_url = f"http://{master_ip}:{master_port}/update_load" 
+        self.pending_updates = { "num_tokens": 0,"time":0}
+            
+        async def _send_load_update_async(dp_rank):
+            """异步发送负载更新"""
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=0.5)) as session:
+                    payload = {
+                        "dp_rank": dp_rank,
+                        "num_tokens": self.pending_updates["num_tokens"],
+                        "time": self.pending_updates["time"],
+                    }
+                    async with session.post(controller_url, json=payload) as response:
+                        if response.status == 200:
+                            self.pending_updates = { "num_tokens": 0,"time":0} # cho
+                            return True
+            except Exception as e:
+                logger.debug(f"Load update failed: {e}")
+            return False
         result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
         self.last_batch_in_queue = False  # last batch is modified in-place, so we need another variable to track if it's extend
@@ -732,8 +793,17 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     if prepare_mlp_sync_flag:
                         self.prepare_mlp_sync_batch(batch)
+                    start_time = time.perf_counter()
                     result = self.run_batch(batch)
+                    cost_time = time.perf_counter()-start_time
                     result_queue.append((batch.copy(), result))
+                    
+                    if self.server_args.dp_size != 1 and self.server_args.load_balance_method == "shortest_queue":
+                        completed_tokens = sum(len(req.origin_input_ids) for req in batch.reqs)
+                        self.pending_updates["time"]+=cost_time
+                        self.pending_updates["num_tokens"] += completed_tokens
+                        _send_load_update_async(self.dp_rank) 
+                    
 
                     if (self.last_batch is None) or (not self.last_batch_in_queue):
                         # Create a dummy first batch to start the pipeline for overlap schedule.
