@@ -102,10 +102,8 @@ pub trait Bootstrap: Send + Sync {
                 BootstrapRoom::Batch(
                     (0..batch_size)
                         .map(|_| {
-                            // Combine multiple sources of randomness for better distribution
-                            let r1 = rand::random::<u64>();
-                            let r2 = rand::random::<u64>();
-                            r1.wrapping_add(r2.rotate_left(32))
+                            // Generate a value in the range [0, 2^63 - 1] to match Python's random.randint(0, 2**63 - 1)
+                            rand::random::<u64>() & (i64::MAX as u64)
                         })
                         .collect(),
                 ),
@@ -114,12 +112,10 @@ pub trait Bootstrap: Send + Sync {
             self.set_bootstrap_info(
                 BootstrapHost::Single(hostname),
                 BootstrapPort::Single(bootstrap_port),
-                BootstrapRoom::Single({
-                    // Use high-quality random number for single requests too
-                    let r1 = rand::random::<u64>();
-                    let r2 = rand::random::<u64>();
-                    r1.wrapping_add(r2.rotate_left(32))
-                }),
+                BootstrapRoom::Single(
+                    // Generate a value in the range [0, 2^63 - 1] to match Python's random.randint(0, 2**63 - 1)
+                    rand::random::<u64>() & (i64::MAX as u64),
+                ),
             );
         }
         Ok(())
@@ -279,6 +275,7 @@ impl Bootstrap for CompletionRequest {
 #[cfg(test)]
 mod bootstrap_tests {
     use super::*;
+    use crate::core::BasicWorker;
     use crate::openai_api_types::StringOrArray;
 
     #[test]
@@ -464,5 +461,63 @@ mod bootstrap_tests {
         assert_eq!(rooms.len(), 2);
         assert_eq!(rooms[0].as_u64().unwrap(), 12345);
         assert_eq!(rooms[1].as_u64().unwrap(), 67890);
+    }
+
+    #[test]
+    fn test_bootstrap_room_range() {
+        // Test that bootstrap_room values are within the expected range [0, 2^63 - 1]
+        let worker = BasicWorker::new(
+            "http://test:8000".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: Some(8080),
+            },
+        );
+
+        // Test single request
+        let mut single_req = GenerateReqInput {
+            text: Some(InputText::Single("test".to_string())),
+            input_ids: None,
+            stream: false,
+            bootstrap_host: None,
+            bootstrap_port: None,
+            bootstrap_room: None,
+            other: Value::Object(serde_json::Map::new()),
+        };
+
+        for _ in 0..200000 {
+            single_req.add_bootstrap_info(&worker).unwrap();
+            if let Some(BootstrapRoom::Single(room)) = single_req.bootstrap_room {
+                // Verify the room value is within signed 64-bit range
+                assert!(room <= i64::MAX as u64, "Room {} exceeds i64::MAX", room);
+            } else {
+                panic!("Expected single bootstrap room");
+            }
+        }
+
+        // Test batch request
+        let mut batch_req = GenerateReqInput {
+            text: Some(InputText::Batch(vec![
+                "test1".to_string(),
+                "test2".to_string(),
+            ])),
+            input_ids: None,
+            stream: false,
+            bootstrap_host: None,
+            bootstrap_port: None,
+            bootstrap_room: None,
+            other: Value::Object(serde_json::Map::new()),
+        };
+
+        for _ in 0..200000 {
+            batch_req.add_bootstrap_info(&worker).unwrap();
+            if let Some(BootstrapRoom::Batch(rooms)) = &batch_req.bootstrap_room {
+                for room in rooms {
+                    // Verify each room value is within signed 64-bit range
+                    assert!(*room <= i64::MAX as u64, "Room {} exceeds i64::MAX", room);
+                }
+            } else {
+                panic!("Expected batch bootstrap rooms");
+            }
+        }
     }
 }
