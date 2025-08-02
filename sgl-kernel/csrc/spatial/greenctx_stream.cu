@@ -7,6 +7,8 @@
 #include "cuda_utils.h"
 #include "greenctx_stream.h"
 
+#if CUDA_VERSION >= 12040
+
 static std::vector<int64_t> create_greenctx_stream_fallback(CUgreenCtx gctx[2]) {
   CUstream streamA, streamB;
   CUcontext ctx;
@@ -94,3 +96,18 @@ std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, i
 
   return vec;
 }
+
+#else
+
+std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, int64_t device) {
+  TORCH_CHECK(
+      false,
+      "Green Contexts feature requires CUDA Toolkit 12.4 or newer. Current CUDA version: " +
+          std::to_string(CUDA_VERSION));
+
+  // This is a stub function that should never be reached
+  // Return empty vector to satisfy return type requirement
+  return {};
+}
+
+#endif
