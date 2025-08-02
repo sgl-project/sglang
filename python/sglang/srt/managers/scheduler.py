@@ -2346,14 +2346,14 @@ class IdleSleeper:
 
     def __init__(self, sockets):
         self.poller = zmq.Poller()
-        self.last_defrag_time = time.time()
+        self.last_empty_time = time.time()
         for s in sockets:
             self.poller.register(s, zmq.POLLIN)
 
     def maybe_sleep(self):
         self.poller.poll(1000)
-        if time.time() - self.last_defrag_time > 3600:
-            self.last_defrag_time = time.time()
+        if time.time() - self.last_empty_time > global_config.empty_cache_interval:
+            self.last_empty_time = time.time()
             torch.cuda.empty_cache()
 
 

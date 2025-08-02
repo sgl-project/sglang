@@ -30,7 +30,9 @@ class GlobalConfig:
         self.default_new_token_ratio_decay_steps = float(
             os.environ.get("SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS", 600)
         )
-
+        self.empty_cache_interval = float(
+            os.environ.get("SGLANG_EMPTY_CACHE_INTERVAL", 3600)
+        )
         # Runtime constants: others
         self.retract_decode_steps = 20
         self.flashinfer_workspace_size = os.environ.get(
