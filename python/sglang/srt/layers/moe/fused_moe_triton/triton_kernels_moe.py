@@ -169,11 +169,3 @@ def triton_kernel_moe_forward_fake(
     block_shape: Optional[list[int]] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
-
-
-direct_register_custom_op(
-    op_name="forward_cuda_triton",
-    op_func=triton_kernel_moe_forward,
-    mutates_args=[],
-    fake_impl=triton_kernel_moe_forward_fake,
-)
