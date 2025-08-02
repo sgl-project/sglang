@@ -50,6 +50,7 @@ import logging
 import multiprocessing
 import os
 import time
+import copy
 from typing import Tuple
 
 import numpy as np
@@ -521,13 +522,32 @@ def latency_test(
 
     custom_inputs = read_prompts(bench_args.prompt_filename, rank_print)
     custom_inputs = [tokenizer.encode(p.strip()) for p in custom_inputs]
+    custom_input_len = len(custom_inputs)
 
     # Run the sweep
     result_list = []
     for bs, il, ol in itertools.product(
         bench_args.batch_size, bench_args.input_len, bench_args.output_len
     ):
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, custom_inputs)
+        bs_aligned_inputs = []
+        if custom_inputs:
+            if custom_input_len == bs:
+                bs_aligned_inputs = custom_inputs
+            elif custom_input_len > bs:
+                rank_print(
+                    f"Custom input size ({custom_input_len}) is larger than batch_size ({bs}). "
+                    f"Using the first {bs} prompts."
+                )
+                bs_aligned_inputs = copy.deepcopy(custom_inputs[ : bs])
+            else:
+                rank_print(
+                    f"Custom input size ({custom_input_len}) is smaller than batch_size ({bs}). "
+                    f"Pad to the desired batch_size with the last prompt."
+                )
+                bs_aligned_inputs = copy.deepcopy(custom_inputs)
+                bs_aligned_inputs.extend([bs_aligned_inputs[-1]] * (bs - custom_input_len))
+
+        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,
