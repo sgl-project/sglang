@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import dataclasses
 import logging
 from dataclasses import replace
-from typing import Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
 
 import torch
 
@@ -11,14 +13,18 @@ from sglang.srt.layers.communicator import (
     CommunicateSummableTensorPairFn,
     ScatterMode,
 )
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
+from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
+from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import BumpAllocator, DeepEPMode, get_bool_env_var
+from sglang.srt.utils import BumpAllocator, get_bool_env_var
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
 
 _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 
@@ -305,7 +311,7 @@ class TboDPAttentionPreparer:
                     and not local_batch.forward_mode.is_target_verify()
                 )
                 and enable_deepep_moe
-                and (resolved_deepep_mode == DeepEPMode.low_latency)
+                and (resolved_deepep_mode == DeepEPMode.LOW_LATENCY)
             )
         else:
             self.local_tbo_split_seq_index = 0
@@ -341,15 +347,18 @@ class TboDPAttentionPreparer:
 
     @staticmethod
     def _compute_global_forward_mode(forward_modes):
-        converted_forward_modes = [
-            ForwardMode.DECODE.value if x == ForwardMode.IDLE.value else x
-            for x in forward_modes
+        forward_modes_excluding_idle = [
+            x for x in forward_modes if x != ForwardMode.IDLE.value
         ]
+
+        if not forward_modes_excluding_idle:
+            return ForwardMode.IDLE, False
+
         forward_mode_agree = TboDPAttentionPreparer._is_all_same(
-            converted_forward_modes
+            forward_modes_excluding_idle
         )
         global_forward_mode = (
-            ForwardMode(converted_forward_modes[0]) if forward_mode_agree else None
+            ForwardMode(forward_modes_excluding_idle[0]) if forward_mode_agree else None
         )
         return global_forward_mode, forward_mode_agree
 
@@ -542,6 +551,7 @@ class TboForwardBatchPreparer:
                 tbo_children=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
+                dp_padding_mode=None,
                 gathered_buffer=gathered_buffer,
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
@@ -798,7 +808,7 @@ class MaybeTboDeepEPDispatcher:
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):
         return getattr(self._inners[tbo_subbatch_index or 0], name)(**kwargs)
 
-    def dispatch(self, **kwargs):
+    def dispatch(self, **kwargs) -> DispatchOutput:
         return self._execute("dispatch", **kwargs)
 
     def dispatch_a(self, **kwargs):
@@ -807,7 +817,7 @@ class MaybeTboDeepEPDispatcher:
     def dispatch_b(self, **kwargs):
         return self._execute("dispatch_b", **kwargs)
 
-    def combine(self, **kwargs):
+    def combine(self, **kwargs) -> torch.Tensor:
         return self._execute("combine", **kwargs)
 
     def combine_a(self, **kwargs):
