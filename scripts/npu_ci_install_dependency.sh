@@ -30,7 +30,7 @@ python3 -m ${PIP_INSTALL} --upgrade pip
 
 ### Download MemFabricV2
 MF_WHL_NAME="mf_adapter-1.0.0-cp311-cp311-linux_aarch64.whl"
-MEMFABRIC_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com:443/sglang/${MF_WHL_NAME}"
+MEMFABRIC_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/${MF_WHL_NAME}"
 wget "${MEMFABRIC_URL}" && ${PIP_INSTALL} "./${MF_WHL_NAME}"
 
 
@@ -49,15 +49,11 @@ ${PIP_INSTALL} torch_npu==$PTA_VERSION
 
 
 ### Install Triton-Ascend
-TRITON_ASCEND_VERSION=3.2.0rc2
+TRITON_ASCEND_NAME="triton_ascend-3.2.0.dev20250729-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl"
+TRITON_ASCEND_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/${TRITON_ASCEND_NAME}"
 ${PIP_INSTALL} attrs==24.2.0 numpy==1.26.4 scipy==1.13.1 decorator==5.1.1 psutil==6.0.0 pytest==8.3.2 pytest-xdist==3.6.1 pyyaml pybind11
-${PIP_INSTALL} triton-ascend==$TRITON_ASCEND_VERSION
+wget "${TRITON_ASCEND_URL}" && ${PIP_INSTALL} "./${TRITON_ASCEND_NAME}"
 
 
 ### Install SGLang
 ${PIP_INSTALL} -v -e "python[srt_npu]"
-
-
-### Modify PyTorch TODO: to be removed later
-TORCH_LOCATION=$(pip show torch | grep Location | awk -F' ' '{print $2}')
-sed -i 's/from triton.runtime.autotuner import OutOfResources/from triton.runtime.errors import OutOfResources/' "${TORCH_LOCATION}/torch/_inductor/runtime/triton_heuristics.py"
