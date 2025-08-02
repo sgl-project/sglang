@@ -976,6 +976,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             torch.cuda.empty_cache()
 
+    def should_use_cutlass_fused_experts_fp8(self):
+        return (
+            get_bool_env_var("SGLANG_CUTLASS_MOE")
+            and self.cutlass_fp8_supported
+            and self.block_quant
+            and (is_sm100_supported() or is_sm90_supported())
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1021,12 +1029,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if ret is not None:
                 return ret
 
-        if (
-            get_bool_env_var("SGLANG_CUTLASS_MOE")
-            and self.cutlass_fp8_supported
-            and self.block_quant
-            and (is_sm100_supported() or is_sm90_supported())
-        ):
+        if self.should_use_cutlass_fused_experts_fp8():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             topk_weights, topk_ids, _ = topk_output
@@ -1053,9 +1056,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.problem_sizes2,
                 use_fp8_blockscale=True,
             )
-            # TODO: Fuse into select_experts
-            if moe_runner_config.routed_scaling_factor is not None:
-                output *= moe_runner_config.routed_scaling_factor
+            # Scale by routed_scaling_factor is fused into select_experts.
             return output
         # Expert fusion with FP8 quantization
         return fused_experts(
