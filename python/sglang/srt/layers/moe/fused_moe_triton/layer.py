@@ -14,7 +14,11 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_rank,
     get_moe_tensor_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -626,24 +630,27 @@ class FusedMoE(torch.nn.Module):
             )
 
         # Matrix multiply.
-        final_hidden_states = self.quant_method.apply(
-            layer=self,
-            x=hidden_states,
-            topk_output=topk_output,
-            activation=self.activation,
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
-            routed_scaling_factor=self.routed_scaling_factor,
-            **(
-                dict(
-                    tp_rank=self.moe_tp_rank,
-                    tp_size=self.moe_tp_size,
-                    ep_rank=self.moe_ep_rank,
-                    ep_size=self.moe_ep_size,
-                )
-                if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod"
-                else {}
-            ),
-        )
+        with use_symmetric_memory(get_tp_group()) as sm:
+            final_hidden_states = self.quant_method.apply(
+                layer=self,
+                x=hidden_states,
+                topk_output=topk_output,
+                activation=self.activation,
+                apply_router_weight_on_input=self.apply_router_weight_on_input,
+                routed_scaling_factor=self.routed_scaling_factor,
+                **(
+                    dict(
+                        tp_rank=self.moe_tp_rank,
+                        tp_size=self.moe_tp_size,
+                        ep_rank=self.moe_ep_rank,
+                        ep_size=self.moe_ep_size,
+                    )
+                    if self.quant_method.__class__.__name__
+                    == "ModelOptNvFp4FusedMoEMethod"
+                    else {}
+                ),
+            )
+            sm.tag(final_hidden_states)
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

@@ -497,6 +497,17 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
+        if (
+            self.pynccl_comm is not None
+            and hasattr(input_, "symmetric_memory")
+            and input_.symmetric_memory
+        ):
+            with self.pynccl_comm.change_state(
+                enable=True, stream=torch.cuda.current_stream()
+            ):
+                self.pynccl_comm.all_reduce(input_)
+                return input_
+
         outplace_all_reduce_method = None
         if (
             self.qr_comm is not None
