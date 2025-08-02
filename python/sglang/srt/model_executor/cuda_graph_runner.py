@@ -585,6 +585,7 @@ class CudaGraphRunner:
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
+            next_token_logits_buffer=next_token_logits_buffer,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
@@ -604,7 +605,6 @@ class CudaGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_paths=lora_paths,
-            next_token_logits_buffer=next_token_logits_buffer,
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
