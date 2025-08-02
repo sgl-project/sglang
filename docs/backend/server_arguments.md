@@ -130,7 +130,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--log-requests-level` | 0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial input/output. 3: Log every input/output. | 0 |
 | `--show-time-cost` | Show time cost of custom marks. | False |
 | `--enable-metrics` | Enable log prometheus metrics. | False |
-| `--enable-metrics-for-all-schedulers` | Enable to record request metrics separately on all TP ranks (not just TP 0)." | False |
+| `--enable-metrics-for-all-schedulers` | Enable to record request metrics separately on all TP ranks (not just TP 0). | False |
 | `--bucket-time-to-first-token` | The buckets of time to first token, specified as a list of floats. | None |
 | `--bucket-inter-token-latency` | The buckets of inter-token latency, specified as a list of floats. | None |
 | `--bucket-e2e-request-latency` | The buckets of end-to-end request latency, specified as a list of floats. | None |
