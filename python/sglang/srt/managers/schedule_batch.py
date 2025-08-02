@@ -1207,8 +1207,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # If req.input_embeds is already a list, append its content directly
                 input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
 
-            if req.multimodal_inputs:
-                multimodal_inputs.append(req.multimodal_inputs)
+            multimodal_inputs.append(req.multimodal_inputs)
 
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
@@ -1293,6 +1292,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else None
         )
         for mm_input in multimodal_inputs:
+            if mm_input is None:
+                continue
             for mm_item in mm_input.mm_items:
                 # Move both feature and precomputed_embeddings to device if they exist
                 if isinstance(mm_item.feature, torch.Tensor):
