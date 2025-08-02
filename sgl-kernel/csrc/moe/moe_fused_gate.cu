@@ -75,7 +75,7 @@ __device__ void process_shared_experts_and_rescale(
     float* output_ptr,
     int32_t* indices_ptr,
     Params params) {
-    
+
   // Process shared experts
   if (thread_group_idx == 0 && num_fused_shared_experts > 0) {
     int64_t last_idx = topk * thread_row + topk_excluding_share_expert_fusion;
@@ -149,13 +149,13 @@ __device__ void moe_fused_gate_impl(
   __shared__ T shared_bias[WARP_SIZE * (32 + 1)];
   __shared__ int current_tile_idx;
   int thread_shared_offset = tidx % WARP_SIZE;
-  
+
   // Variables to track global maximum values (used in large VPT case)
   T global_max_val = static_cast<T>(-FLT_MAX);
   T global_max_val_second = static_cast<T>(-FLT_MAX);
   int global_max_idx = -1;
   int global_max_second_idx = -1;
-  
+
   Array<T, 32> row_chunk;  // Used for both small and large VPT cases
   Array<T, 32> bias_chunk; // Used for both small and large VPT cases
 
@@ -193,7 +193,7 @@ __device__ void moe_fused_gate_impl(
         current_tile_idx = tile;
       }
       __syncthreads();
-      
+
       int tile_offset = tile * 32;
       int tile_size = min(32, params.VPT - tile_offset);
       if (tile_size <= 0) break;
@@ -228,7 +228,7 @@ __device__ void moe_fused_gate_impl(
       #pragma unroll
       for (int ii = 0; ii < tile_size; ++ii) {
         int global_idx = tile_offset + ii;
-        
+
         // Calculate sigmoid
         float input_val = static_cast<float>(row_chunk[ii]);
         float sigmoid_val;
@@ -242,12 +242,12 @@ __device__ void moe_fused_gate_impl(
         T sigmoid_t = static_cast<T>(sigmoid_val);
         // add bias
         T val_with_bias = sigmoid_t + bias_chunk[ii];
-        
+
         // Store the results using linear indexing
         int shared_idx = thread_shared_offset + ii * WARP_SIZE;
         shared_sigmoid[shared_idx] = sigmoid_t;
         shared_bias[shared_idx] = val_with_bias;
-        
+
         // Update global maximum tracking
         if (cmp_gt(val_with_bias, global_max_val)) {
           global_max_val_second = global_max_val;
@@ -267,15 +267,15 @@ __device__ void moe_fused_gate_impl(
   // Exclude Groups
   //-------------------------------------------------------------------------
   #pragma unroll
-  for (int k_idx = 0; k_idx < params.THREADS_PER_ROW - topk_group; ++k_idx) {  
+  for (int k_idx = 0; k_idx < params.THREADS_PER_ROW - topk_group; ++k_idx) {
     int expert = first_elt_read_by_thread;
     T max_val, max_val_second, max_sum;
-    
+
     if (params.VPT <= 32) {
       // Small VPT: Find local maximums from bias_chunk
       max_val = static_cast<T>(-FLT_MAX);
       max_val_second = static_cast<T>(-FLT_MAX);
-      
+
       #pragma unroll
       for (int ii = 0; ii < params.VPT; ++ii) {
         T val = bias_chunk[ii];
@@ -291,7 +291,7 @@ __device__ void moe_fused_gate_impl(
       max_val = global_max_val;
       max_val_second = global_max_val_second;
     }
-    
+
     // Sum top2 sigmoid weight values as the group weight
     max_sum = max_val + max_val_second;
 
@@ -326,19 +326,19 @@ __device__ void moe_fused_gate_impl(
           if (expert_mod == global_max_idx || expert_mod == global_max_second_idx) {
             int tile_idx = expert_mod / 32;
             int local_idx = expert_mod % 32;
-            
+
             // Clear in shared memory if in current tile
             if (tile_idx == current_tile_idx) {
               int shared_idx = thread_shared_offset + local_idx * (WARP_SIZE + 1);
               shared_bias[shared_idx] = static_cast<T>(FLT_MAX);
             }
-            
+
             // Reset and recalculate global maximums
             global_max_val = static_cast<T>(-FLT_MAX);
             global_max_val_second = static_cast<T>(-FLT_MAX);
             global_max_idx = -1;
             global_max_second_idx = -1;
-            
+
             #pragma unroll
             for (int i = 0; i < params.VPT; ++i) {
               int tile_idx = i / 32;
@@ -381,7 +381,7 @@ __device__ void moe_fused_gate_impl(
     if (params.VPT <= 32) {
       // Small VPT: Find local max directly from bias_chunk
       max_val = bias_chunk[0];
-      
+
       if (!cmp_eq(max_val, static_cast<T>(FLT_MAX))) {
         #pragma unroll
         for (int ii = 1; ii < params.VPT; ++ii) {
@@ -398,12 +398,12 @@ __device__ void moe_fused_gate_impl(
       // Large VPT: Scan through all tiles to find maximum
       T local_max_val = static_cast<T>(-FLT_MAX);
       int local_max_idx = -1;
-      
+
       #pragma unroll
       for (int i = 0; i < params.VPT; ++i) {
         int tile_idx = i / 32;
         int local_idx = i % 32;
-        
+
         T val;
         if (tile_idx == current_tile_idx) {
           int shared_idx = thread_shared_offset + local_idx * WARP_SIZE;
@@ -427,7 +427,7 @@ __device__ void moe_fused_gate_impl(
           local_max_idx = i;
         }
       }
-      
+
       if (local_max_idx == -1) {
         max_val = static_cast<T>(-FLT_MAX);
       } else {
