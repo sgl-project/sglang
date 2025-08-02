@@ -824,7 +824,6 @@ class FlashInferIndicesUpdaterDecode:
             data_type=self.data_type,
             q_data_type=self.q_data_type,
             non_blocking=True,
-            logits_soft_cap=0.1,  # a dummy value to select the template with logits_soft_cap=true
         )
 
 
