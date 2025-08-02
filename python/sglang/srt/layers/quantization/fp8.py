@@ -1039,7 +1039,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             topk_weights, topk_ids, _ = topk_output
-            return cutlass_fused_experts_fp8(
+            output = cutlass_fused_experts_fp8(
                 x,
                 layer.w13_weight.transpose(1, 2),
                 layer.w2_weight.transpose(1, 2),
@@ -1062,6 +1062,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.problem_sizes2,
                 use_fp8_blockscale=True,
             )
+            # TODO: Fuse into select_experts
+            if routed_scaling_factor is not None:
+                output *= routed_scaling_factor
+            return output
         # Expert fusion with FP8 quantization
         return fused_experts(
             x,
