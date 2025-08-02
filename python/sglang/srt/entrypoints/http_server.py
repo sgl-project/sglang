@@ -23,7 +23,6 @@ import json
 import logging
 import multiprocessing as multiprocessing
 import os
-import random
 import threading
 import time
 from http import HTTPStatus
@@ -263,9 +262,7 @@ async def health_generate(request: Request) -> Response:
             != DisaggregationMode.NULL
         ):
             gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
-            gri.bootstrap_room = random.randint(
-                0, _global_state.tokenizer_manager.server_args.dp_size
-            )
+            gri.bootstrap_room = 0
     else:
         gri = EmbeddingReqInput(
             rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
