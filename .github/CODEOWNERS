@@ -5,8 +5,8 @@
 /python/sglang/srt/constrained @hnyls2002
 /python/sglang/srt/disaggregation @ByronHsu @hnyls2002
 /python/sglang/srt/disaggregation/mooncake @ShangmingCai
-/python/sglang/srt/distributed @yizhang2077
-/python/sglang/srt/entrypoints @ispobock @CatherineSue @slin1237
+/python/sglang/srt/distributed @yizhang2077 @merrymercy
+/python/sglang/srt/entrypoints @ispobock @CatherineSue @slin1237 @merrymercy
 /python/sglang/srt/eplb @fzyzcjy
 /python/sglang/srt/function_call @CatherineSue
 /python/sglang/srt/layers @merrymercy @Ying1123 @zhyncs @ispobock @HaiShaw @ch-wan @BBuf @kushanam
