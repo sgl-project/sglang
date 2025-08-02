@@ -241,6 +241,16 @@ class MultimodalDataItem:
     def set(self, key: str, value: Any):
         self.__setitem__(key, value)
 
+    def release_resources(self):
+        """
+        Releases large attributes like feature and precomputed_embeddings to free up memory immediately.
+        This is crucial for high-performance systems to prevent out-of-memory errors.
+        """
+        if self.feature is not None:
+            del self.feature
+        if self.precomputed_embeddings is not None:
+            del self.precomputed_embeddings
+
     @staticmethod
     def is_empty_list(l):
         if l is None:
@@ -305,7 +315,7 @@ class MultimodalInputs:
     # items of data
     mm_items: List[MultimodalDataItem]
     image_pad_len: Optional[list] = None
-    num_image_tokens: Optional[int] = None
+    num_mm_tokens: Optional[int] = None
 
     # image
     im_token_id: Optional[int] = None
@@ -634,17 +644,16 @@ class Req:
         """Release multimodal resources to free memory."""
         if not self.multimodal_inputs:
             return
-            
+
         try:
-            if mm_items := getattr(self.multimodal_inputs, 'mm_items', None):
+            if mm_items := getattr(self.multimodal_inputs, "mm_items", None):
                 # Clean up feature from each mm_item
                 for mm_item in mm_items:
-                    if mm_item is not None:
-                        delattr(mm_item, 'feature')
-                
+                    mm_item.release_resources()
+
                 # Clean up the mm_items list
                 del self.multimodal_inputs.mm_items
-        except (AttributeError, TypeError):
+        except AttributeError:
             pass
         finally:
             self.multimodal_inputs = None
@@ -1067,16 +1076,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.encoder_cached = []
 
         for req in self.reqs:
-            im = req.multimodal_inputs
-            if im is None or im.num_image_tokens is None:
+            mm_inputs = req.multimodal_inputs
+            if mm_inputs is None or mm_inputs.num_mm_tokens is None:
                 # No image input
                 self.encoder_lens_cpu.append(0)
                 self.encoder_cached.append(True)
             else:
-                self.encoder_lens_cpu.append(im.num_image_tokens)
+                self.encoder_lens_cpu.append(mm_inputs.num_mm_tokens)
                 self.encoder_cached.append(
                     self.forward_mode.is_decode()
-                    or len(req.prefix_indices) >= im.num_image_tokens
+                    or len(req.prefix_indices) >= mm_inputs.num_mm_tokens
                 )
 
         self.encoder_lens = torch.tensor(self.encoder_lens_cpu, dtype=torch.int64).to(
@@ -1178,7 +1187,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Copy prefix and do some basic check
         input_embeds = []
         extend_input_logprob_token_ids = []
-        multimodal_inputs = []
+        multimodal_inputs: List[MultimodalInputs] = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
@@ -1198,7 +1207,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # If req.input_embeds is already a list, append its content directly
                 input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
 
-            multimodal_inputs.append(req.multimodal_inputs)
+            if req.multimodal_inputs:
+                multimodal_inputs.append(req.multimodal_inputs)
 
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
@@ -1283,12 +1293,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else None
         )
         for mm_input in multimodal_inputs:
-            if mm_input is None:
-                continue
             for mm_item in mm_input.mm_items:
-                pixel_values = getattr(mm_item, "feature", None)
-                if isinstance(pixel_values, torch.Tensor):
-                    mm_item.feature = pixel_values.to(self.device, non_blocking=True)
+                # Move both feature and precomputed_embeddings to device if they exist
+                if isinstance(mm_item.feature, torch.Tensor):
+                    mm_item.feature = mm_item.feature.to(self.device, non_blocking=True)
+                if isinstance(mm_item.precomputed_embeddings, torch.Tensor):
+                    mm_item.precomputed_embeddings = mm_item.precomputed_embeddings.to(
+                        self.device, non_blocking=True
+                    )
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
