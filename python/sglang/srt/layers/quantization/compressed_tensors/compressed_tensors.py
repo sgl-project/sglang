@@ -509,7 +509,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                 else self.config
             )
 
-            cfg = HfCompressedTensorsConfig.from_dict(model_compression_config)
+            if model_compression_config is not None:
+                cfg = HfCompressedTensorsConfig.from_dict(model_compression_config)
+            else:
+                raise ValueError(
+                    "model_compression_config is expected for a 2:4 sparse model, but None is found."
+                )
 
             scheme = CompressedTensors24(
                 quantized=weight_quant is not None or input_quant is not None,
