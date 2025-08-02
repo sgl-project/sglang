@@ -120,11 +120,6 @@ class Ernie4Moe(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
-                **(
-                    {"tp_rank": 0, "tp_size": 1}
-                    if global_server_args_dict["enable_deepep_moe"]
-                    else {}
-                ),
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
