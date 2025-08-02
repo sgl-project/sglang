@@ -320,8 +320,17 @@ impl Router {
                     if name.to_lowercase() != "content-type"
                         && name.to_lowercase() != "content-length"
                     {
+                        // Skip Authorization header if we have our own API key
+                        if name.to_lowercase() == "authorization" && self.api_key.is_some() {
+                            continue;
+                        }
                         request_builder = request_builder.header(name, value);
                     }
+                }
+
+                // Add router's API key if configured
+                if let Some(key) = &self.api_key {
+                    request_builder = request_builder.bearer_auth(key);
                 }
 
                 match request_builder.send().await {
@@ -552,9 +561,19 @@ impl Router {
                 if name.to_string().to_lowercase() != "content-type"
                     && name.to_string().to_lowercase() != "content-length"
                 {
+                    // Skip Authorization header if we have our own API key
+                    if name.to_string().to_lowercase() == "authorization" && self.api_key.is_some()
+                    {
+                        continue;
+                    }
                     request_builder = request_builder.header(name, value);
                 }
             }
+        }
+
+        // Add router's API key if configured
+        if let Some(key) = &self.api_key {
+            request_builder = request_builder.bearer_auth(key);
         }
 
         let res = match request_builder.send().await {

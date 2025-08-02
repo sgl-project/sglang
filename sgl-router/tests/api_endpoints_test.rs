@@ -1449,6 +1449,505 @@ mod pd_mode_tests {
 }
 
 #[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use axum::http::header;
+
+    #[tokio::test]
+    async fn test_api_key_authentication_validates_requests() {
+        // Create config with API key
+        let config = RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            policy: PolicyConfig::Random,
+            host: "127.0.0.1".to_string(),
+            port: 3012,
+            max_payload_size: 256 * 1024 * 1024,
+            request_timeout_secs: 600,
+            worker_startup_timeout_secs: 1,
+            worker_startup_check_interval_secs: 1,
+            discovery: None,
+            metrics: None,
+            dp_aware: false,
+            api_key: Some("test-api-key-123".to_string()),
+            log_dir: None,
+            log_level: None,
+            request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
+        };
+
+        let ctx = TestContext::new_with_config(
+            config,
+            vec![MockWorkerConfig {
+                port: 18801,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            }],
+        )
+        .await;
+
+        let app = ctx.create_app().await;
+
+        // Test 1: Request without auth header should be rejected
+        let payload = json!({
+            "text": "Test request",
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Test 2: Request with wrong Bearer token should be rejected
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer wrong-key")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Test 3: Request with correct Bearer token should pass
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer test-api-key-123")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Test 4: Non-Bearer auth should be rejected
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Basic dGVzdDp0ZXN0")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Test 5: Public endpoints should also require auth when API key is configured
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Test 6: Health check with correct auth should pass
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .header(header::AUTHORIZATION, "Bearer test-api-key-123")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_no_auth_when_api_key_not_configured() {
+        // Create config without API key (passthrough mode)
+        let config = RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            policy: PolicyConfig::Random,
+            host: "127.0.0.1".to_string(),
+            port: 3013,
+            max_payload_size: 256 * 1024 * 1024,
+            request_timeout_secs: 600,
+            worker_startup_timeout_secs: 1,
+            worker_startup_check_interval_secs: 1,
+            discovery: None,
+            metrics: None,
+            dp_aware: false,
+            api_key: None, // No API key configured
+            log_dir: None,
+            log_level: None,
+            request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
+        };
+
+        let ctx = TestContext::new_with_config(
+            config,
+            vec![MockWorkerConfig {
+                port: 18802,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            }],
+        )
+        .await;
+
+        let app = ctx.create_app().await;
+
+        // Test 1: Request without auth header should pass through
+        let payload = json!({
+            "text": "Test request",
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Test 2: Request with auth header should also pass through
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer client-token-456")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Test 3: Public endpoints should be accessible without auth
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_case_insensitive_authorization_header() {
+        // Create config with API key
+        let config = RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            policy: PolicyConfig::Random,
+            host: "127.0.0.1".to_string(),
+            port: 3015,
+            max_payload_size: 256 * 1024 * 1024,
+            request_timeout_secs: 600,
+            worker_startup_timeout_secs: 1,
+            worker_startup_check_interval_secs: 1,
+            discovery: None,
+            metrics: None,
+            dp_aware: false,
+            api_key: Some("test-key-case-insensitive".to_string()),
+            log_dir: None,
+            log_level: None,
+            request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
+        };
+
+        let ctx = TestContext::new_with_config(
+            config,
+            vec![MockWorkerConfig {
+                port: 18805,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            }],
+        )
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "text": "Test request",
+            "stream": false
+        });
+
+        // Test 1: Lowercase "authorization" header
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .header("authorization", "Bearer test-key-case-insensitive")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Test 2: Uppercase "AUTHORIZATION" header
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .header("AUTHORIZATION", "Bearer test-key-case-insensitive")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Test 3: Mixed case "Authorization" header
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .header("Authorization", "Bearer test-key-case-insensitive")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Test 4: Weird case "aUtHoRiZaTiOn" header
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .header("aUtHoRiZaTiOn", "Bearer test-key-case-insensitive")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_pd_router_api_key_authentication() {
+        // Start PD mode workers
+        let mut prefill_worker = MockWorker::new(MockWorkerConfig {
+            port: 18803,
+            worker_type: WorkerType::Prefill,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+
+        let mut decode_worker = MockWorker::new(MockWorkerConfig {
+            port: 18804,
+            worker_type: WorkerType::Decode,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+
+        let prefill_url = prefill_worker.start().await.unwrap();
+        let decode_url = decode_worker.start().await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Extract port from prefill URL
+        let prefill_port = prefill_url
+            .split(':')
+            .last()
+            .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+            .unwrap_or(9000);
+
+        // Create PD mode config with API key
+        let config = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![(prefill_url, Some(prefill_port))],
+                decode_urls: vec![decode_url],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            policy: PolicyConfig::Random,
+            host: "127.0.0.1".to_string(),
+            port: 3014,
+            max_payload_size: 256 * 1024 * 1024,
+            request_timeout_secs: 600,
+            worker_startup_timeout_secs: 1,
+            worker_startup_check_interval_secs: 1,
+            discovery: None,
+            metrics: None,
+            log_dir: None,
+            dp_aware: false,
+            api_key: Some("pd-router-key-789".to_string()),
+            log_level: None,
+            request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
+        };
+
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(config.request_timeout_secs))
+            .build()
+            .unwrap();
+
+        // Create router
+        let router_result = tokio::task::spawn_blocking({
+            let config = config.clone();
+            move || RouterFactory::create_router(&config)
+        })
+        .await
+        .unwrap();
+
+        if let Ok(router) = router_result {
+            let ctx = TestContext {
+                workers: vec![],
+                router: Arc::from(router),
+                client,
+                config,
+            };
+
+            let app = ctx.create_app().await;
+
+            // Test: Request without auth should be rejected
+            let payload = json!({
+                "text": "Test PD request",
+                "stream": false
+            });
+
+            let req = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+            // Test: Request with correct auth should pass
+            let req = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer pd-router-key-789")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            // Should be OK or a worker-related error, not UNAUTHORIZED
+            assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // Clean up
+        prefill_worker.stop().await;
+        decode_worker.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_constant_time_api_key_comparison() {
+        // This test verifies that the API key comparison works correctly
+        // We can't test the timing aspect in a unit test, but we can verify functionality
+        let config = RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            policy: PolicyConfig::Random,
+            host: "127.0.0.1".to_string(),
+            port: 3016,
+            max_payload_size: 256 * 1024 * 1024,
+            request_timeout_secs: 600,
+            worker_startup_timeout_secs: 1,
+            worker_startup_check_interval_secs: 1,
+            discovery: None,
+            metrics: None,
+            dp_aware: false,
+            api_key: Some("correct-api-key-12345".to_string()),
+            log_dir: None,
+            log_level: None,
+            request_id_headers: None,
+            max_concurrent_requests: 64,
+            cors_allowed_origins: vec![],
+        };
+
+        let ctx = TestContext::new_with_config(
+            config,
+            vec![MockWorkerConfig {
+                port: 18806,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            }],
+        )
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "text": "Test request",
+            "stream": false
+        });
+
+        // Test various incorrect keys that might be used in timing attacks
+        let incorrect_keys = vec![
+            "wrong-api-key-12345",    // Same length, different content
+            "correct-api-key-1234",   // One character shorter
+            "correct-api-key-123456", // One character longer
+            "dorrect-api-key-12345",  // First character different
+            "correct-api-key-12344",  // Last character different
+            "",                       // Empty string
+        ];
+
+        for wrong_key in incorrect_keys {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", wrong_key))
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "Wrong key '{}' should be rejected",
+                wrong_key
+            );
+        }
+
+        // Test correct key still works
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer correct-api-key-12345")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
 mod request_id_tests {
     use super::*;
 
