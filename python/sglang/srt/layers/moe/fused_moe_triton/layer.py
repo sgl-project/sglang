@@ -134,7 +134,9 @@ class FusedMoE(torch.nn.Module):
             if not self.enable_flashinfer_cutlass_moe:
                 self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
 
-        self.routed_scaling_factor = routed_scaling_factor
+        self.routed_scaling_factor = (
+            routed_scaling_factor if routed_scaling_factor is not None else 1.0
+        )
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
         self.reduce_results = reduce_results
