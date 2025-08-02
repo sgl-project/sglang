@@ -644,12 +644,6 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
         the necessary parameters for the layer. See LinearMethodBase for param
         details
         """
-
-        if hasattr(layer, "prefix") and layer.prefix == "model.layers.0.mlp.down_proj":
-            # from remote_pdb import set_trace
-            # set_trace()
-            pass
-
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.scheme.create_weights(
             layer=layer,
