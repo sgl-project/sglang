@@ -31,7 +31,7 @@ class GlobalConfig:
             os.environ.get("SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS", 600)
         )
         self.empty_cache_interval = float(
-            os.environ.get("SGLANG_EMPTY_CACHE_INTERVAL", 3600)
+            os.environ.get("SGLANG_EMPTY_CACHE_INTERVAL", 3600)  # in seconds
         )
         # Runtime constants: others
         self.retract_decode_steps = 20
