@@ -251,6 +251,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disable-cuda-graph-padding` | Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed. | False |
 | `--enable-profile-cuda-graph` | Enable profiling of cuda graph capture. | False |
 | `--enable-nccl-nvls` | Enable NCCL NVLS for prefill heavy requests when available. | False |
+| `--enable-symm-mem` | Enable NCCL symmetric memory for fast collectives. | False |
 | `--enable-tokenizer-batch-encode` | Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds. | False |
 | `--disable-outlines-disk-cache` | Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency. | False |
 | `--disable-custom-all-reduce` | Disable the custom all-reduce kernel and fall back to NCCL. | False |
