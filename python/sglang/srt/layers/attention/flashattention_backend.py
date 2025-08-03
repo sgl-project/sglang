@@ -1411,7 +1411,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                     metadata.page_table = self.decode_cuda_graph_metadata[
                         "page_table_draft_decode"
-                    ][req_pool_indices, :]
+                    ][:bs, :]
                     self.decode_cuda_graph_metadata[bs] = metadata
                 else:
                     # When top k > 1, we need two specific draft decode metadata, and then merge states
@@ -1429,7 +1429,7 @@ class FlashAttentionBackend(AttentionBackend):
                     ][: bs + 1]
                     metadata.page_table = self.draft_decode_metadata_topk_normal[
                         "page_table"
-                    ][req_pool_indices, :]
+                    ][:bs, :]
 
                     # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                     metadata_expand.cache_seqlens_int32 = (
@@ -1466,7 +1466,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_k = seq_lens.max().item()
                 # Precompute page table
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
-                    req_pool_indices, :
+                    :bs, :
                 ]
                 # Precompute cumulative sequence lengths
                 metadata.cu_seqlens_q = torch.arange(
@@ -1503,9 +1503,7 @@ class FlashAttentionBackend(AttentionBackend):
                     : (bs + 1)
                 ]
 
-                metadata.page_table = self.target_verify_metadata["page_table"][
-                    req_pool_indices, :
-                ]
+                metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
 
                 self.target_verify_metadata[bs] = metadata
             else:
@@ -1524,7 +1522,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ][: bs + 1]
                 metadata.page_table = self.target_verify_metadata_topk_normal[
                     "page_table"
-                ][req_pool_indices, :]
+                ][:bs, :]
 
                 # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                 metadata_expand.cache_seqlens_int32 = (
@@ -1567,9 +1565,7 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][
                 : (bs + 1)
             ]
-            metadata.page_table = self.draft_extend_metadata["page_table"][
-                req_pool_indices, :
-            ]
+            metadata.page_table = self.draft_extend_metadata["page_table"][:bs, :]
 
             self.draft_extend_metadata[bs] = metadata
 
@@ -1583,7 +1579,7 @@ class FlashAttentionBackend(AttentionBackend):
             ][: (encoder_bs + 1)]
 
             metadata.encoder_page_table = self.encoder_metadata["encoder_page_table"][
-                req_pool_indices, :
+                :bs, :
             ]
 
         self.forward_metadata = metadata
