@@ -1,0 +1,66 @@
+name: PR Test (Ascend NPU)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/**"
+      - "scripts/**"
+      - "test/**"
+      - ".github/workflows/pr-test-npu.yml"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "python/**"
+      - "scripts/**"
+      - "test/**"
+      - ".github/workflows/pr-test-npu.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: pr-test-npu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-test-basic:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    runs-on: linux-arm64-npu-1
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1.alpha003-910b-ubuntu22.04-py3.11
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/npu_ci_install_dependency.sh
+          # copy required file from our daily cache
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          # copy download through proxy
+          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+
+      - name: Run test
+        timeout-minutes: 30
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          HF_ENDPOINT: https://hf-mirror.com
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-npu
+  finish:
+    if: always()
+    needs: [ unit-test-basic ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          results=(${{ join(needs.*.result, ' ') }})
+          for result in "${results[@]}"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "Job failed with result: $result"
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0
