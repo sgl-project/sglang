@@ -2,7 +2,6 @@ import atexit
 import concurrent.futures
 import json
 import logging
-import os
 import signal
 import threading
 from collections import OrderedDict
@@ -11,6 +10,7 @@ from typing import List, Optional
 
 import torch
 
+from sglang.environ import EnvStr
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
 from sglang.srt.mem_cache.storage.hf3fs.client_hf3fs import Hf3fsClient
 
@@ -44,7 +44,7 @@ def synchronized():
 
 
 class HiCacheHF3FS(HiCacheStorage):
-    default_env_var: str = "SGLANG_HICACHE_HF3FS_CONFIG_PATH"
+    SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(default=None)
 
     def __init__(
         self,
@@ -104,7 +104,7 @@ class HiCacheHF3FS(HiCacheStorage):
     def from_env_config(
         rank: int, bytes_per_page: int, dtype: torch.dtype
     ) -> "HiCacheHF3FS":
-        config_path = os.getenv(HiCacheHF3FS.default_env_var)
+        config_path = HiCacheHF3FS.SGLANG_HICACHE_HF3FS_CONFIG_PATH.value
         if not config_path:
             return HiCacheHF3FS(
                 file_path=f"/data/hicache.{rank}.bin",

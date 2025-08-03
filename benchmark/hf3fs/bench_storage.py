@@ -39,7 +39,7 @@ def test():
     entries = 2
     dtype = store_dtype
 
-    config_path = os.getenv(HiCacheHF3FS.default_env_var)
+    config_path = HiCacheHF3FS.SGLANG_HICACHE_HF3FS_CONFIG_PATH.value
     assert config_path
     try:
         with open(config_path, "w") as f:
