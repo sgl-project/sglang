@@ -310,7 +310,7 @@ class DataParallelController:
             # 2. write the new onfly info to the shm
             self.balance_meta.set_shared_onfly_info(onfly_info)
 
-        logger.info(f"dp workers {local_tokens=}, {onfly_info=}, {target_worker=}")
+        # logger.info(f"dp workers {local_tokens=}, {onfly_info=}, {target_worker=}")
         self.workers[target_worker].send_pyobj(req)
 
     def event_loop(self):
