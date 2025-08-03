@@ -2352,7 +2352,10 @@ class IdleSleeper:
 
     def maybe_sleep(self):
         self.poller.poll(1000)
-        if time.time() - self.last_empty_time > global_config.empty_cache_interval:
+        if (
+            global_config.empty_cache_interval is not None
+            and time.time() - self.last_empty_time > global_config.empty_cache_interval
+        ):
             self.last_empty_time = time.time()
             torch.cuda.empty_cache()
 
