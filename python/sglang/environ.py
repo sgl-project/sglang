@@ -105,9 +105,10 @@ class Envs:
     SGLANG_USE_AITER = EnvBool(False)
 
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
-
     SGLANG_MOE_PADDING = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
+    DISABLE_OPENAPI_DOC = EnvBool(False)
+
     # fmt: on
 
 

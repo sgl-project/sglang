@@ -28,6 +28,8 @@ import time
 from http import HTTPStatus
 from typing import AsyncIterator, Callable, Dict, Optional
 
+from sglang.environ import envs
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -163,7 +165,7 @@ async def lifespan(fast_api_app: FastAPI):
 # Fast API
 app = FastAPI(
     lifespan=lifespan,
-    openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
+    openapi_url=None if envs.DISABLE_OPENAPI_DOC.value else "/openapi.json",
 )
 app.add_middleware(
     CORSMiddleware,
