@@ -1,5 +1,3 @@
-# TODO(ch-wan): this file will be moved to sglang/srt/layers/moe/token_dispatcher/deepep.py
-
 from __future__ import annotations
 
 import logging
@@ -22,15 +20,10 @@ from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
     DispatchOutput,
     DispatchOutputFormat,
 )
+from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import (
-    DeepEPMode,
-    get_bool_env_var,
-    get_int_env_var,
-    is_hip,
-    load_json_config,
-)
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, load_json_config
 
 try:
     from deep_ep import Buffer, Config
@@ -150,9 +143,9 @@ class DeepEPBuffer:
                 num_rdma_bytes,
             )
 
-        if deepep_mode == DeepEPMode.normal:
+        if deepep_mode == DeepEPMode.NORMAL:
             num_qps_per_rank = DeepEPConfig.get_instance().num_sms // 2
-        elif deepep_mode in [DeepEPMode.low_latency, DeepEPMode.auto]:
+        elif deepep_mode in [DeepEPMode.LOW_LATENCY, DeepEPMode.AUTO]:
             num_qps_per_rank = num_experts // group.size()
         else:
             raise NotImplementedError
@@ -161,7 +154,7 @@ class DeepEPBuffer:
             device="cuda"
         ).multi_processor_count
         if (
-            (deepep_mode != DeepEPMode.low_latency)
+            (deepep_mode != DeepEPMode.LOW_LATENCY)
             and not global_server_args_dict["enable_two_batch_overlap"]
             and (DeepEPConfig.get_instance().num_sms < total_num_sms // 2)
         ):
@@ -611,7 +604,7 @@ class DeepEPDispatcher(BaseDispatcher):
         num_local_experts: int = None,
         hidden_size: int = None,
         params_dtype: torch.dtype = None,
-        deepep_mode: DeepEPMode = DeepEPMode.auto,
+        deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
@@ -697,9 +690,9 @@ class DeepEPDispatcher(BaseDispatcher):
         resolved_deepep_mode = self.deepep_mode.resolve(
             forward_batch.is_extend_in_batch
         )
-        if resolved_deepep_mode == DeepEPMode.normal:
+        if resolved_deepep_mode == DeepEPMode.NORMAL:
             return self._normal_dispatcher
-        elif resolved_deepep_mode == DeepEPMode.low_latency:
+        elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
             return self._low_latency_dispatcher
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")

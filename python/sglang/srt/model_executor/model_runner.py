@@ -60,6 +60,7 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.layers.quantization import (
     deep_gemm_wrapper,
     monkey_patch_isinstance_for_vllm_base_layer,
@@ -157,6 +158,8 @@ class ModelRunner:
         gpu_id: int,
         tp_rank: int,
         tp_size: int,
+        moe_ep_rank: int,
+        moe_ep_size: int,
         pp_rank: int,
         pp_size: int,
         nccl_port: int,
@@ -175,6 +178,8 @@ class ModelRunner:
             logger.addFilter(RankZeroFilter(tp_rank == 0))
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.moe_ep_rank = moe_ep_rank
+        self.moe_ep_size = moe_ep_size
         self.dp_size = server_args.dp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
@@ -212,6 +217,10 @@ class ModelRunner:
                 # TODO it is indeed not a "server args"
                 "use_mla_backend": self.use_mla_backend,
                 "speculative_algorithm": self.spec_algorithm,
+            }
+            | {
+                "moe_a2a_backend": MoeA2ABackend(server_args.moe_a2a_backend),
+                "deepep_mode": DeepEPMode(server_args.deepep_mode),
             }
         )
 
@@ -432,6 +441,7 @@ class ModelRunner:
                     "triton",
                     "flashmla",
                     "cutlass_mla",
+                    "trtllm_mla",
                     "ascend",
                 ]:
                     logger.info(
@@ -549,6 +559,7 @@ class ModelRunner:
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
+                expert_model_parallel_size=self.moe_ep_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
             )
             initialize_dp_attention(
@@ -666,7 +677,7 @@ class ModelRunner:
             self.sliding_window_size = self.model.get_attention_sliding_window_size()
         elif self.model_config.attention_chunk_size is not None:
             self.sliding_window_size = self.model_config.attention_chunk_size
-            print(
+            logger.info(
                 f"Setting sliding_window_size to be attention_chunk_size: {self.sliding_window_size}"
             )
 
@@ -1432,6 +1443,12 @@ class ModelRunner:
             )
 
             return CutlassMLABackend(self)
+        elif self.server_args.attention_backend == "trtllm_mla":
+            if not self.use_mla_backend:
+                raise ValueError("trtllm_mla backend can only be used with MLA models.")
+            from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+
+            return TRTLLMMLABackend(self)
         elif self.server_args.attention_backend == "intel_amx":
             from sglang.srt.layers.attention.intel_amx_backend import (
                 IntelAMXAttnBackend,

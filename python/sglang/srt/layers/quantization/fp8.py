@@ -72,6 +72,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     log_info_on_rank0,
+    next_power_of_2,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -172,7 +173,6 @@ class Fp8Config(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
-        from sglang.srt.layers.moe.ep_moe.layer import EPMoE
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
@@ -181,8 +181,6 @@ class Fp8Config(QuantizationConfig):
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return Fp8MoEMethod(self)
-        elif isinstance(layer, EPMoE):
-            return Fp8EPMoEMethod(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -491,6 +489,16 @@ class Fp8LinearMethod(LinearMethodBase):
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=False,
         )
+
+
+def get_tile_tokens_dim(num_tokens, top_k, num_experts):
+    # Guess tokens per expert assuming perfect expert distribution first.
+    num_tokens_per_expert = (num_tokens * top_k) // num_experts
+    # And pad the number to the next power of 2.
+    tile_tokens_dim = next_power_of_2(num_tokens_per_expert)
+    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
+    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
+    return tile_tokens_dim
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):
@@ -984,22 +992,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.ep_moe.layer import EPMoE
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-
-        if isinstance(layer, EPMoE):
-            layer.w13_weight_scale = (
-                layer.w13_weight_scale_inv
-                if self.block_quant
-                else layer.w13_weight_scale
-            )
-            layer.w2_weight_scale = (
-                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
-            )
-            return layer.run_moe(
-                hidden_states=x,
-                topk_output=topk_output,
-            )
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
@@ -1046,7 +1039,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             topk_weights, topk_ids, _ = topk_output
-            return cutlass_fused_experts_fp8(
+            output = cutlass_fused_experts_fp8(
                 x,
                 layer.w13_weight.transpose(1, 2),
                 layer.w2_weight.transpose(1, 2),
@@ -1069,6 +1062,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.problem_sizes2,
                 use_fp8_blockscale=True,
             )
+            # TODO: Fuse into select_experts
+            if routed_scaling_factor is not None:
+                output *= routed_scaling_factor
+            return output
         # Expert fusion with FP8 quantization
         return fused_experts(
             x,
@@ -1092,6 +1089,47 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             block_shape=self.quant_config.weight_block_size,
             no_combine=no_combine,
             routed_scaling_factor=routed_scaling_factor,
+        )
+
+    def apply_with_router_logits(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+    ) -> torch.Tensor:
+        assert (
+            activation == "silu"
+        ), "Only silu is supported for flashinfer blockscale fp8 moe"
+        a_q, a_sf = per_token_group_quant_fp8(x, self.quant_config.weight_block_size[1])
+        # NOTE: scales of hidden states have to be transposed!
+        a_sf_t = a_sf.t().contiguous()
+        from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+
+        return trtllm_fp8_block_scale_moe(
+            routing_logits=router_logits.to(torch.float32),
+            routing_bias=layer.correction_bias.to(x.dtype),
+            hidden_states=a_q,
+            hidden_states_scale=a_sf_t,
+            gemm1_weights=layer.w13_weight,
+            gemm1_weights_scale=layer.w13_weight_scale_inv,
+            gemm2_weights=layer.w2_weight,
+            gemm2_weights_scale=layer.w2_weight_scale_inv,
+            num_experts=layer.num_experts,
+            top_k=layer.top_k,
+            n_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            intermediate_size=layer.w2_weight.shape[2],
+            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+            local_num_experts=layer.num_local_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            tile_tokens_dim=get_tile_tokens_dim(
+                x.shape[0], layer.top_k, layer.num_experts
+            ),
+            routing_method_type=2,  # DeepSeek-styled routing method
+            use_shuffled_weight=False,
         )
 
     def maybe_apply_hip_fused_experts(

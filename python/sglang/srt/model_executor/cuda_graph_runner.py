@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import bisect
+import gc
 import inspect
 import logging
 import os
@@ -28,6 +29,9 @@ from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    set_graph_pool_id,
+)
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
 from sglang.srt.layers.dp_attention import DPPaddingMode, get_attention_tp_size
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -73,6 +77,24 @@ def model_capture_mode():
     yield
 
     is_capture_mode = False
+
+
+@contextmanager
+def freeze_gc(enable_cudagraph_gc: bool):
+    """
+    Optimize garbage collection during CUDA graph capture.
+    Clean up, then freeze all remaining objects from being included
+    in future collections if GC is disabled during capture.
+    """
+    gc.collect()
+    should_freeze = not enable_cudagraph_gc
+    if should_freeze:
+        gc.freeze()
+    try:
+        yield
+    finally:
+        if should_freeze:
+            gc.unfreeze()
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
@@ -423,7 +445,12 @@ class CudaGraphRunner:
                 record_shapes=True,
             )
 
-        with graph_capture() as graph_capture_context:
+        # Trigger CUDA graph capture for specific shapes.
+        # Capture the large shapes first so that the smaller shapes
+        # can reuse the memory pool allocated for the large shapes.
+        with freeze_gc(
+            self.model_runner.server_args.enable_cudagraph_gc
+        ), graph_capture() as graph_capture_context:
             with profile_context as prof:
                 self.stream = graph_capture_context.stream
                 avail_mem = get_available_gpu_memory(
@@ -619,11 +646,15 @@ class CudaGraphRunner:
 
             run_once()
 
-        global global_graph_memory_pool
-        with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=stream):
+        if get_global_graph_memory_pool() is None:
+            set_global_graph_memory_pool(torch.cuda.graph_pool_handle())
+        # Set graph pool id globally to be able to use symmetric memory
+        set_graph_pool_id(get_global_graph_memory_pool())
+        with torch.cuda.graph(
+            graph, pool=get_global_graph_memory_pool(), stream=stream
+        ):
             out = run_once()
 
-        global_graph_memory_pool = graph.pool()
         return graph, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
