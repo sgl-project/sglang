@@ -150,6 +150,7 @@ class ServerArgs:
     lora_target_modules: Optional[Union[set[str], List[str]]] = None
     lora_paths: Optional[Union[dict[str, str], dict[str, LoRARef], List[str]]] = None
     max_loras_per_batch: int = 8
+    lora_extra_vocab_size: int = 0
     lora_backend: str = "triton"
 
     # Kernel backend
@@ -1242,6 +1243,12 @@ class ServerArgs:
             type=str,
             default="triton",
             help="Choose the kernel backend for multi-LoRA serving.",
+        )
+        parser.add_argument(
+            "--lora-extra-vocab-size",
+            type=int,
+            default=0,
+            help="Maximum size of extra vocabulary that can be present in a LoRA adapter (added to the base model vocabulary).",
         )
 
         # Kernel backend

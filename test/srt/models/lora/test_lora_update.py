@@ -70,6 +70,8 @@ class TestCase:
     max_lora_rank: Optional[int] = None
     lora_target_modules: Optional[List] = None
     max_new_tokens: int = 32
+    disable_cuda_graph: bool = False
+    lora_extra_vocab_size: Optional[int] = None
 
 
 def create_batch_data(adapters: Union[str, list]) -> List[tuple[str, str]]:
@@ -559,7 +561,45 @@ MAX_LORA_RANK_TESTS = [
         ],
     ),
 ]
-ALL_TESTS = BASIC_TESTS + TARGET_MODULE_TESTS + MAX_LORA_RANK_TESTS
+EMBEDDING_TESTS = [
+    TestCase(
+        description="test embedding layer with LoRA works with dynamic update",
+        base="meta-llama/Llama-2-7b-hf",
+        max_lora_rank=16,
+        lora_extra_vocab_size=4,
+        disable_cuda_graph=False,
+        max_loras_per_batch=3,
+        all_adapters=[
+            "yard1/llama-2-7b-sql-lora-test",  # extra_vocab_size = 4
+            "winddude/wizardLM-LlaMA-LoRA-7B",
+        ],
+        initial_adapters=["yard1/llama-2-7b-sql-lora-test"],
+        op_sequence=[
+            Operation(
+                type=OperationType.LOAD,
+                data="winddude/wizardLM-LlaMA-LoRA-7B",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        "winddude/wizardLM-LlaMA-LoRA-7B",
+                        "yard1/llama-2-7b-sql-lora-test",
+                    ]
+                ),
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="yard1/llama-2-7b-sql-lora-test",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(["winddude/wizardLM-LlaMA-LoRA-7B"]),
+            ),
+        ],
+    ),
+]
+ALL_TESTS = BASIC_TESTS + TARGET_MODULE_TESTS + MAX_LORA_RANK_TESTS + EMBEDDING_TESTS
 
 
 class LoRAUpdateTestSessionMode(Enum):
@@ -585,6 +625,7 @@ class LoRAUpdateTestSessionBase:
         lora_backend: str = "triton",
         disable_cuda_graph: bool = False,
         cuda_graph_max_bs: int = 4,
+        lora_extra_vocab_size: Optional[int] = None,
     ):
         self.testcase = testcase
         self.model_path = model_path
@@ -596,7 +637,7 @@ class LoRAUpdateTestSessionBase:
         self.disable_cuda_graph = disable_cuda_graph
         self.cuda_graph_max_bs = cuda_graph_max_bs
         self.enable_lora = enable_lora
-
+        self.lora_extra_vocab_size = lora_extra_vocab_size
         self.expected_adapters = set(lora_paths or [])
         self.handle = None  # Will be set in __enter__
 
@@ -650,6 +691,7 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
             lora_paths=self.lora_paths,
             max_lora_rank=self.max_lora_rank,
             lora_target_modules=self.lora_target_modules,
+            lora_extra_vocab_size=self.lora_extra_vocab_size,
             lora_backend=self.lora_backend,
             torch_dtype=torch.float16,
             mem_fraction_static=MEM_FRACTION_STATIC,
@@ -900,10 +942,12 @@ class TestLoRADynamicUpdate(CustomTestCase):
         initial_adapters: List[str],
         max_loras_per_batch: int,
         op_sequence: List[Operation],
+        lora_extra_vocab_size: Optional[int] = 0,
         enable_lora: Optional[bool] = None,
         max_lora_rank: Optional[int] = None,
         lora_target_modules: Optional[List[str]] = None,
         max_new_tokens: int = 32,
+        disable_cuda_graph: bool = False,
     ) -> List[tuple]:
         """
         Runs a sequence of operations on the SRT runner, including loading and unloading LoRA adapters,
@@ -919,7 +963,9 @@ class TestLoRADynamicUpdate(CustomTestCase):
             max_loras_per_batch=max_loras_per_batch,
             max_lora_rank=max_lora_rank,
             lora_target_modules=lora_target_modules,
+            lora_extra_vocab_size=lora_extra_vocab_size,
             enable_lora=enable_lora,
+            disable_cuda_graph=disable_cuda_graph,
         ) as session:
             for op in op_sequence:
                 op_type = op.type
@@ -976,6 +1022,8 @@ class TestLoRADynamicUpdate(CustomTestCase):
                 max_new_tokens=test_case.max_new_tokens,
                 max_lora_rank=test_case.max_lora_rank,
                 lora_target_modules=test_case.lora_target_modules,
+                lora_extra_vocab_size=test_case.lora_extra_vocab_size,
+                disable_cuda_graph=test_case.disable_cuda_graph,
             )
 
             # static loading
@@ -995,6 +1043,10 @@ class TestLoRADynamicUpdate(CustomTestCase):
                 max_loras_per_batch=test_case.max_loras_per_batch,
                 op_sequence=forward_ops,
                 max_new_tokens=test_case.max_new_tokens,
+                max_lora_rank=test_case.max_lora_rank,
+                lora_target_modules=test_case.lora_target_modules,
+                lora_extra_vocab_size=test_case.lora_extra_vocab_size,
+                disable_cuda_graph=test_case.disable_cuda_graph,
             )
 
             print(f"Dynamic output: {dynamic_output}")

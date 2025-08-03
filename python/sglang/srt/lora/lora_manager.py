@@ -54,9 +54,11 @@ class LoRAManager:
         lora_backend: str = "triton",
         tp_size: int = 1,
         tp_rank: int = 0,
+        lora_extra_vocab_size: int = 0,
         max_lora_rank: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
         lora_paths: Optional[Dict[str, LoRARef]] = None,
+        enable_cuda_graph: bool = True,
     ):
         self.base_model: torch.nn.Module = base_model
         self.base_hf_config: AutoConfig = base_hf_config
@@ -66,6 +68,7 @@ class LoRAManager:
         self.device: torch.device = next(self.base_model.parameters()).device
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
+        self.lora_extra_vocab_size: int = lora_extra_vocab_size
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -78,6 +81,17 @@ class LoRAManager:
             target_modules=target_modules,
             lora_paths=lora_paths,
         )
+
+        # Validate CUDA graph compatibility (TODO: remove this after supporting embedding LoRA in CUDA graph)
+        if enable_cuda_graph:
+            self._validate_cuda_graph_compatibility()
+
+    def _validate_cuda_graph_compatibility(self):
+        if "embed_tokens" in self.target_modules:
+            raise ValueError(
+                "The current version does not yet support embedding LoRA in CUDA graph. "
+                "Please use `--disable-cuda-graph`."
+            )
 
     def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
@@ -161,7 +175,7 @@ class LoRAManager:
         incompatible = memory_pool and not memory_pool.can_support(lora_config)
         if incompatible:
             raise ValueError(
-                f"LoRA adapter {lora_ref.lora_name} with rank {lora_config.r} is incompatible with the current LoRA memory pool configuration. "
+                f"LoRA adapter {lora_ref.lora_name} with rank {lora_config.r} and lora extra vocab size {lora_config.lora_extra_vocab_size}is incompatible with the current LoRA memory pool configuration. "
                 "Please ensure that the LoRA adapter's rank is within the configured `--max_lora_rank` and that the target modules are "
                 "included in `--enable_lora_modules`."
             )
@@ -197,7 +211,9 @@ class LoRAManager:
         # the current API schema and introducing a better request schema in the future (e.g., use `model_name`).
         cur_uids = set(forward_batch.lora_paths)
         assert len(cur_uids) <= self.max_loras_per_batch
-        self.memory_pool.prepare_lora_batch(cur_uids, self.loras, self.lora_modules)
+        self.memory_pool.prepare_lora_batch(
+            cur_uids, self.loras, self.lora_modules, self.lora_embeddings_modules
+        )
 
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
@@ -275,7 +291,7 @@ class LoRAManager:
             seg_lens = (
                 forward_batch.extend_seq_lens
                 if forward_batch.forward_mode.is_extend()
-                else torch.ones(bs, device=self.device)
+                else torch.ones(bs, device=self.device, dtype=torch.int32)
             )
 
             max_len = (
@@ -333,6 +349,17 @@ class LoRAManager:
                             weight_name, layer_id, LoRAType.LORA_B
                         ),
                     )
+        # call set_lora_info for embeddings
+        for module_name, module in self.lora_embeddings_modules.items():
+            if self.lora_extra_vocab_size > 0:
+                new_embeddings_buffer = self.memory_pool.get_embedding_tensor(
+                    module_name
+                )
+            module.set_lora_info(
+                new_embeddings_buffer,
+                self.memory_pool.get_embedding_tensor(module_name, LoRAType.LORA_A),
+                self.memory_pool.get_embedding_tensor(module_name, LoRAType.LORA_B),
+            )
 
     def init_state(
         self,
@@ -443,6 +470,7 @@ class LoRAManager:
             max_lora_rank=self.max_lora_rank,
             lora_weight_names=self.lora_weight_names,
             base_model=self.base_model,
+            lora_extra_vocab_size=self.lora_extra_vocab_size,
         )
 
     def set_lora_module(self, module_name, module):
@@ -455,6 +483,8 @@ class LoRAManager:
         self.lora_modules: List[Dict[str, BaseLayerWithLoRA]] = [
             {} for _ in range(self.base_hf_config.num_hidden_layers)
         ]
+        # Look-up table that essentially maps (layer_name, module_name) to the corresponding LoRA embeddings module.
+        self.lora_embeddings_modules: Dict[str, BaseLayerWithLoRA] = {}
 
         # Target module names of customized layers defined in python/sglang/srt/layers
         # e.g., {"qkv_proj", "o_proj"}
@@ -475,7 +505,13 @@ class LoRAManager:
 
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in customized_target_names:
-                layer_id = get_layer_id(module_name)
-                self.lora_modules[layer_id][module_name] = self.set_lora_module(
-                    module_name, module
-                )
+                if "embed_tokens" in module_name:
+                    self.lora_embeddings_modules["embed_tokens"] = self.set_lora_module(
+                        module_name, module
+                    )
+                else:
+                    layer_id = get_layer_id(module_name)
+                    if module_name not in self.lora_modules[layer_id]:
+                        self.lora_modules[layer_id][module_name] = self.set_lora_module(
+                            module_name, module
+                        )
