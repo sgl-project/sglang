@@ -20,6 +20,7 @@ import requests
 import zmq
 from aiohttp import web
 
+from sglang.environ import envs
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
@@ -200,9 +201,7 @@ class MooncakeKVManager(BaseKVManager):
                 "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 300
             )
 
-            self.enable_custom_mem_pool = get_bool_env_var(
-                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
-            )
+            self.enable_custom_mem_pool = envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.value
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.heartbeat_failures = {}
             self.session_pool = defaultdict(requests.Session)

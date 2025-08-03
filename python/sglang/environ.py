@@ -95,6 +95,9 @@ class Envs:
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
 
+    # Mooncake KV Transfer
+    SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvBool(False)
+
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
 
     # fmt: on
