@@ -39,6 +39,7 @@ class EnvField:
             self._set_to_none = True
             os.environ.pop(self.name, None)
         else:
+            self._set_to_none = False
             os.environ[self.name] = str(value)
 
     def clear(self):
@@ -105,7 +106,7 @@ if __name__ == "__main__":
     # Example usage for envs
     envs.SGLANG_TEST_RETRACT.clear()
     print(f"{envs.SGLANG_TEST_RETRACT.value=}")
-    envs.SGLANG_TEST_RETRACT.set(not envs.SGLANG_TEST_RETRACT.value)
-    print(f"{envs.SGLANG_TEST_RETRACT.value=}")
     envs.SGLANG_TEST_RETRACT.set(None)
+    print(f"{envs.SGLANG_TEST_RETRACT.value=}")
+    envs.SGLANG_TEST_RETRACT.set(True)
     print(f"{envs.SGLANG_TEST_RETRACT.value=}")
