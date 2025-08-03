@@ -133,6 +133,11 @@ class TemplateManager:
             self._jinja_template_content_format = "string"
             logger.info("No chat template found, defaulting to 'string' content format")
 
+        # Detect reasoning pattern from chat template
+        self._force_reasoning = self._detect_reasoning_pattern(
+            tokenizer_manager.tokenizer.chat_template
+        )
+
     def _load_explicit_chat_template(
         self, tokenizer_manager, chat_template_arg: str
     ) -> None:
@@ -208,12 +213,6 @@ class TemplateManager:
         # Load completion template
         if completion_template:
             self.load_completion_template(completion_template)
-
-        # Detect reasoning pattern from chat template
-        if tokenizer_manager.tokenizer:
-            self._force_reasoning = self._detect_reasoning_pattern(
-                tokenizer_manager.tokenizer.chat_template
-            )
 
     def _load_jinja_template(self, tokenizer_manager, template_path: str) -> None:
         """Load a Jinja template file."""

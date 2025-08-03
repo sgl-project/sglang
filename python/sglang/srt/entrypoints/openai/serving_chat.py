@@ -831,7 +831,7 @@ class OpenAIServingChat(OpenAIServingBase):
         Args:
             request_obj: The request object (or an item from a list of requests).
         Returns:
-            The boolean value of 'enable_thinking' if found and not True, otherwise True.
+            The boolean value of 'enable_thinking' if found, otherwise False.
         """
         if (
             hasattr(request, "chat_template_kwargs")
@@ -839,7 +839,7 @@ class OpenAIServingChat(OpenAIServingBase):
             and request.chat_template_kwargs.get("enable_thinking") is not None
         ):
             return request.chat_template_kwargs.get("enable_thinking")
-        return True
+        return False
 
     async def _process_tool_call_stream(
         self,
