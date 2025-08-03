@@ -169,6 +169,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             for model in model_group:
                 with self.subTest(model=model):
                     envs.SGLANG_MOE_PADDING.set(model not in NO_MOE_PADDING_MODELS)
+                    envs.HF_HUB_DISABLE_XET.set(model in DISABLE_HF_XET_MODELS)
                     os.environ["HF_HUB_DISABLE_XET"] = (
                         "1" if model in DISABLE_HF_XET_MODELS else "0"
                     )

@@ -102,6 +102,7 @@ class Envs:
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
 
     SGLANG_MOE_PADDING = EnvBool(False)
+    HF_HUB_DISABLE_XET = EnvBool(False)
 
     # fmt: on
 
