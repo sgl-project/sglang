@@ -649,11 +649,12 @@ def biased_grouped_topk_cpu(
 
 def triton_kernels_topk(
     router_logits: torch.Tensor,
-    topk: torch.Tensor,
+    topk: int,
     renormalize: bool = False,
     sm_first: bool = False,
-):
-    assert renormalize == False, "Triton kernels topk doesn't support renormalize"
+) -> TritonKernelTopKOutput:
+    """Top-k routing for Triton kernels."""
+    assert not renormalize, "Triton kernels topk doesn't support renormalize"
     routing_data, gather_idx, scatter_idx = routing(
         logits=router_logits,
         n_expts_act=topk,
