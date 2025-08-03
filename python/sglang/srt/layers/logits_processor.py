@@ -83,6 +83,7 @@ class LogitsProcessorOutput:
 class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+    next_token_logits_buffer: Optional[torch.Tensor] = None
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -148,6 +149,7 @@ class LogitsMetadata:
         return cls(
             forward_mode=forward_batch.forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
+            next_token_logits_buffer=forward_batch.next_token_logits_buffer,
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
@@ -508,7 +510,13 @@ class LogitsProcessor(nn.Module):
             )
             dp_scatter(logits, global_logits, logits_metadata)
 
-        logits = logits[:, : self.config.vocab_size].float()
+        if logits_metadata.next_token_logits_buffer is not None:
+            logits_buffer = logits_metadata.next_token_logits_buffer
+            assert logits_buffer.dtype == torch.float
+            logits_buffer.copy_(logits[:, : self.config.vocab_size])
+            logits = logits_buffer
+        else:
+            logits = logits[:, : self.config.vocab_size].float()
 
         if self.final_logit_softcapping:
             fused_softcap(logits, self.final_logit_softcapping)
