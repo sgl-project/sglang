@@ -388,7 +388,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
         )
-
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
@@ -419,7 +418,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
-
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
             num_recv_tokens_per_expert,
             num_tokens_per_rank=num_tokens_per_rank,
@@ -442,10 +440,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
         overlap_args: Optional["CombineOverlapArgs"],
     ):
-        if (
-            not get_bool_env_var("SGLANG_USE_W4A8")
-            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-        ) or _use_aiter:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter:
             output = hidden_states
         else:
             if hidden_states.shape[0] > 0:

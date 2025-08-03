@@ -11,10 +11,14 @@ from sgl_kernel import (
 )
 
 from sglang.srt.layers.moe.ep_moe.kernels import (
-    post_reorder_triton_kernel_for_cutlass_moe,
+    deepep_permute_triton_kernel,
+    deepep_post_reorder_triton_kernel,
+    deepep_run_moe_deep_preprocess,
+    post_reorder_triton_kernel,
     pre_reorder_triton_kernel_for_cutlass_moe,
     run_moe_ep_preproess,
 )
+from sglang.srt.layers.moe.utils import DeepEPMode
 
 
 def cutlass_w4a8_moe(
@@ -39,7 +43,7 @@ def cutlass_w4a8_moe(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     apply_router_weight_on_input: bool = False,
-    ep_mode: str = "ep",
+    deepep_mode: str = None,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -98,7 +102,7 @@ def cutlass_w4a8_moe(
     m = a.size(0)
     k = w1_q.size(2) * 2  # w1_q is transposed and packed
     n = w2_q.size(2) * 2  # w2_q is transposed and packed
-    topk = topk_ids_.size(1) if ep_mode == "ep" else 8
+    topk = topk_ids_.size(1) if not deepep_mode else 8
 
     if apply_router_weight_on_input:
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
@@ -106,7 +110,7 @@ def cutlass_w4a8_moe(
     device = a.device
     topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
 
-    if ep_mode == "ep":
+    if not deepep_mode:
         _, src2dst, _ = run_cutlass_moe_ep_preproess(
             local_topk_ids,
             num_experts,
@@ -129,11 +133,44 @@ def cutlass_w4a8_moe(
             k,
             BLOCK_SIZE=512,
         )
-    elif ep_mode == "deepep_normal":
+    elif deepep_mode == DeepEPMode.NORMAL:
+        reorder_topk_ids, src2dst, _ = deepep_run_moe_deep_preprocess(
+            topk_ids_, num_experts
+        )
+        num_total_tokens = reorder_topk_ids.numel()
+        gateup_input_pre_reorder = torch.empty(
+            (int(num_total_tokens), a.shape[1]),
+            device=a.device,
+            dtype=a.dtype,
+        )
+        # PreReorder
+        deepep_permute_triton_kernel[(a.shape[0],)](
+            a,
+            gateup_input_pre_reorder,
+            src2dst,
+            topk_ids_,
+            None,
+            topk,
+            a.shape[1],
+            BLOCK_SIZE=512,
+        )
         gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=device)
-        sgl_per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
+        sgl_per_tensor_quant_fp8(
+            gateup_input.to(torch.half),
+            gateup_input_pre_reorder,
+            a1_scale.float(),
+            True,
+        )
+        del gateup_input_pre_reorder
+        local_topk_ids = topk_ids_
+        local_topk_ids = (
+            torch.where(local_topk_ids == -1, num_experts, topk_ids_)
+            .to(torch.int32)
+            .contiguous()
+        )
+
     else:
-        raise ValueError(f"Invalid ep_mode: {ep_mode}")
+        raise ValueError(f"Invalid deepep_mode: {deepep_mode}")
 
     # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
     # they are kept to allow for a quick switch of the permutation logic
@@ -194,7 +231,8 @@ def cutlass_w4a8_moe(
         128,
         topk,
     )
-    if ep_mode == "ep":
+
+    if not deepep_mode:
         output = torch.empty_like(a)
         post_reorder_triton_kernel[(m,)](
             c2,
@@ -209,6 +247,24 @@ def cutlass_w4a8_moe(
             0,
             BLOCK_SIZE=512,
         )
+    elif deepep_mode == DeepEPMode.NORMAL:
+        num_tokens = src2dst.shape[0] // topk
+        output = torch.empty(
+            (num_tokens, c2.shape[1]),
+            device=c2.device,
+            dtype=c2.dtype,
+        )
+        deepep_post_reorder_triton_kernel[(m,)](
+            c2,
+            output,
+            src2dst,
+            topk_ids_,
+            topk_weights,
+            topk,
+            c2.shape[1],
+            BLOCK_SIZE=512,
+        )
     else:
-        output = c2
+        raise ValueError(f"Invalid deepep_mode: {deepep_mode}")
+
     return output
