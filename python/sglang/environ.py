@@ -37,6 +37,11 @@ class EnvField:
         return self.get()
 
 
+class EnvStr(EnvField):
+    def parse(self, value: str) -> str:
+        return value
+
+
 class EnvBool(EnvField):
     def parse(self, value: str) -> bool:
         value = value.lower()
