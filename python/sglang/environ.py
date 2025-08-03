@@ -16,7 +16,7 @@ class EnvField:
     def get(self, default: Any = None) -> Any:
         value = os.getenv(self.name)
         if value is None:
-            return default or self.default
+            return default if default is not None else self.default
         try:
             return self.parse(value)
         except ValueError as e:
