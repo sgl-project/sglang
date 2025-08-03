@@ -80,7 +80,10 @@ class _Dumper:
 
 
 def _get_partial_name():
-    rank = dist.get_rank()
+    try:
+        rank = dist.get_rank()
+    except ValueError:
+        rank = 0
     object_list = [str(time.time()) if rank == 0 else None]
     dist.broadcast_object_list(object_list, device="cuda")
     return object_list[0]
