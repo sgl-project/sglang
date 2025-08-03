@@ -163,7 +163,7 @@ logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.value
-GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
+GRAMMAR_TIMEOUT = envs.SGLANG_GRAMMAR_TIMEOUT.value
 
 _is_cpu = is_cpu()
 
