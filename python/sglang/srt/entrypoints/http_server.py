@@ -26,7 +26,7 @@ import os
 import threading
 import time
 from http import HTTPStatus
-from typing import AsyncIterator, Callable, Dict, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -82,6 +82,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
+    UpdateModelVersionReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -116,6 +117,7 @@ class _GlobalState:
     tokenizer_manager: TokenizerManager
     template_manager: TemplateManager
     scheduler_info: Dict
+    model_version: str = "version_0"
 
 
 _global_state: Optional[_GlobalState] = None
@@ -301,8 +303,15 @@ async def get_model_info():
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
+        "model_version": _global_state.model_version,
     }
     return result
+
+
+@app.get("/get_model_version")
+async def get_model_version():
+    """Get the current model version."""
+    return {"model_version": _global_state.model_version}
 
 
 @app.get("/get_server_info")
@@ -563,6 +572,38 @@ async def update_weights_from_distributed(
         return ORJSONResponse(content, status_code=200)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/update_model_version")
+async def update_model_version(obj: UpdateModelVersionReqInput, request: Request):
+    """Update the model version. This operation requires no active requests."""
+    if obj.abort_all_requests:
+        _global_state.tokenizer_manager.abort_request(abort_all=True)
+
+    # Use a simple approach without the complex lock mechanism for now
+    # since model_version update is a simple operation that doesn't affect model weights
+    try:
+        # Update the global state
+        _global_state.model_version = obj.new_version
+        # Also update the server args so it's consistent
+        _global_state.tokenizer_manager.server_args.model_version = obj.new_version
+
+        return ORJSONResponse(
+            {
+                "success": True,
+                "message": f"Model version updated to {obj.new_version}",
+                "new_version": obj.new_version,
+            },
+            status_code=HTTPStatus.OK,
+        )
+    except Exception as e:
+        return ORJSONResponse(
+            {
+                "success": False,
+                "message": f"Failed to update model version: {str(e)}",
+            },
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
 
 @app.api_route("/get_weights_by_name", methods=["GET", "POST"])
@@ -923,6 +964,7 @@ def launch_server(
             tokenizer_manager=tokenizer_manager,
             template_manager=template_manager,
             scheduler_info=scheduler_info,
+            model_version=server_args.model_version,
         )
     )
 

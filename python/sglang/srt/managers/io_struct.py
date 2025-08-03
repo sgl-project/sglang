@@ -859,6 +859,14 @@ class InitWeightsUpdateGroupReqOutput:
 
 
 @dataclass
+class UpdateModelVersionReqInput:
+    # The new model version
+    new_version: str
+    # Whether to abort all running requests before updating
+    abort_all_requests: bool = True
+
+
+@dataclass
 class GetWeightsByNameReqInput:
     name: str
     truncate_size: int = 100

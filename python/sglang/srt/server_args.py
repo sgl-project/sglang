@@ -124,6 +124,7 @@ class ServerArgs:
     # API related
     api_key: Optional[str] = None
     served_model_name: Optional[str] = None
+    model_version: str = "version_0"
     chat_template: Optional[str] = None
     completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
@@ -1105,6 +1106,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.served_model_name,
             help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
+        )
+        parser.add_argument(
+            "--model-version",
+            type=str,
+            default=ServerArgs.model_version,
+            help="Version identifier for the deployed model. Defaults to 'version_0' if not specified.",
         )
         parser.add_argument(
             "--chat-template",
