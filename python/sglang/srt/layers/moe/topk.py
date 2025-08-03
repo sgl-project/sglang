@@ -653,7 +653,7 @@ def triton_kernels_topk(
     renormalize: bool = False,
     sm_first: bool = False,
 ) -> TritonKernelTopKOutput:
-    """Top-k routing for Triton kernels."""
+    """Top-K routing for Triton kernels MoE."""
     assert not renormalize, "Triton kernels topk doesn't support renormalize"
     routing_data, gather_idx, scatter_idx = routing(
         logits=router_logits,
