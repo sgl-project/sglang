@@ -56,6 +56,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.environ import envs
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
@@ -441,7 +442,7 @@ def latency_test(
     tp_rank,
 ):
     # Set CPU affinity
-    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
+    if envs.SGLANG_SET_CPU_AFFINITY.value:
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, tp_rank)
 
     # Configure the logger
