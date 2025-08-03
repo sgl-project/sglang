@@ -26,7 +26,12 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, set_weight_attrs
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_compiler_backend,
+    is_cpu,
+    set_weight_attrs,
+)
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
@@ -117,7 +122,7 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_added_elements <= self.num_added_elements_padded
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def get_masked_input_and_mask(
     input_: torch.Tensor,
     org_vocab_start_index: int,
