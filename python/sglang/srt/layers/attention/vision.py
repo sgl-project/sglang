@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.utils import is_cuda, print_info_once
 
 _is_cuda = is_cuda()
@@ -365,19 +366,20 @@ class VisionAttention(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
-        self.tp_size = world_size
-        self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+        self.tp_size = attn_tp_size
+        self.tp_rank = attn_tp_rank
         self.dropout = dropout
         self.head_size = embed_dim // num_heads
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
         self.num_attention_heads_per_partition = dist_utils.divide(
-            num_dummy_heads + num_heads, world_size
+            num_dummy_heads + num_heads, self.tp_size
         )
         self.num_attention_kv_heads_per_partition = dist_utils.divide(
-            num_dummy_heads + num_heads, world_size
+            num_dummy_heads + num_heads, self.tp_size
         )
 
         self.q_size = self.num_attention_heads_per_partition * self.head_size
@@ -427,6 +429,8 @@ class VisionAttention(nn.Module):
                 total_num_kv_heads=num_dummy_heads + num_heads,
                 bias=qkv_bias,
                 quant_config=quant_config,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
                 prefix=add_prefix("qkv_proj", prefix),
             )
         else:
@@ -435,6 +439,8 @@ class VisionAttention(nn.Module):
                 output_size=3 * self.dummy_dim,
                 bias=qkv_bias,
                 quant_config=quant_config,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
                 prefix=add_prefix("qkv_proj", prefix),
             )
         self.proj = RowParallelLinear(
@@ -442,6 +448,8 @@ class VisionAttention(nn.Module):
             output_size=embed_dim,
             bias=proj_bias,
             quant_config=quant_config,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
             prefix=add_prefix("proj", prefix),
         )
 
