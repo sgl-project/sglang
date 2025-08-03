@@ -136,6 +136,12 @@ class Envs:
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
+
+    # EPLB
+    SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT = EnvBool(False)
+    SGLANG_EXPERT_LOCATION_UPDATER_CANARY = EnvBool(False)
+    SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
+
     SGLANG_MOE_PADDING = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
