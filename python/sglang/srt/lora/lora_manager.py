@@ -163,28 +163,18 @@ class LoRAManager:
         incompatible = memory_pool and not memory_pool.can_support(lora_config)
         if incompatible:
             raise ValueError(
-                f"LoRA adapter {lora_ref.lora_name} with rank {lora_config.r} is incompatible with the current LoRA memory pool configuration. "
-                "Please ensure that the LoRA adapter's rank is within the configured `--max_lora_rank` and that the target modules are "
-                "included in `--enable_lora_modules`."
+                f"LoRA adapter {lora_ref.lora_name} with rank {lora_config.r} is incompatible with the current "
+                "LoRA memory pool configuration. Please ensure that the LoRA adapter's rank is within the configured "
+                "`--max-lora-rank` and that the target modules are included in `--lora-target-modules`."
             )
 
         # Ensure pinned LoRA adapters does not exceed maximal limit or cause starvation.
-        if lora_ref.pinned:
-            mem_pool_vacancy = self.max_loras_per_batch - self.num_pinned_loras
-            if mem_pool_vacancy <= 0:
-                raise ValueError(
-                    f"Cannot load pinned LoRA adapter {lora_ref.lora_name} as the maximum number of pinned LoRA adapters "
-                    f"({self.max_loras_per_batch}) is reached. Please unload some pinned LoRA adapters or "
-                    f"load {lora_ref.lora_name} as an unpinned adapter."
-                )
-            elif mem_pool_vacancy == 1:
-                unpinned_adapters = len(self.lora_refs) - self.num_pinned_loras
-                if unpinned_adapters > 0:
-                    raise ValueError(
-                        f"Cannot load pinned LoRA adapter {lora_ref.lora_name} as this would use up all slots in "
-                        f"max_loras_per_batch, while there are still {unpinned_adapters} unpinned LoRA adapters "
-                        f"loaded. Please unload some adapters or load {lora_ref.lora_name} as an unpinned adapter."
-                    )
+        if lora_ref.pinned and self.num_pinned_loras >= self.max_loras_per_batch - 1:
+            raise ValueError(
+                f"Failed to load LoRA adapter {lora_ref.lora_name} as a pinned adapter. It is not allowed to pin all slots "
+                "in the LoRA memory pool to avoid starvation for unpinned adapters and base models. Please increase your "
+                "`--max-loras-per-batch` or load it as unpinned LoRA adapters."
+            )
 
     def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateResult:
         """
@@ -202,7 +192,7 @@ class LoRAManager:
             del self.configs[lora_ref.lora_id]
             del self.loras[lora_ref.lora_id]
             del self.lora_refs[lora_ref.lora_id]
-            self.num_pinned_loras -= int()
+            self.num_pinned_loras -= int(lora_ref.pinned)
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,
@@ -225,9 +215,12 @@ class LoRAManager:
         # counting the number of pinned LoRA adapters in the batch.
         pinned_loras_in_batch = 0
         for lora_id in lora_ids:
-            lora_ref = self.lora_refs.get(lora_id, None)
-            assert lora_ref is not None, f"LoRA ID {lora_id} not found in lora_refs."
-            pinned_loras_in_batch += int(lora_ref.pinned)
+            if lora_id is not None:
+                lora_ref = self.lora_refs.get(lora_id)
+                assert (
+                    lora_ref is not None
+                ), f"LoRA ID {lora_id} not found in lora_refs."
+                pinned_loras_in_batch += int(lora_ref.pinned)
 
         assert pinned_loras_in_batch <= self.num_pinned_loras, (
             f"Number of pinned LoRA adapters in the batch ({pinned_loras_in_batch}) exceeds the total number of pinned adapters "

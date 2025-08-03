@@ -189,14 +189,17 @@ class LoRAMemoryPool:
                     return buffer_id
 
             for buffer_id in range(self.max_loras_per_batch):
-                # Skip pinned LoRAs
-                lora_ref = lora_refs.get(buffer_id)
-                if lora_ref is not None and lora_ref.pinned:
-                    continue
+                uid = self.buffer_id_to_uid[buffer_id]
 
                 # Evict unneeded lora
-                uid = self.buffer_id_to_uid[buffer_id]
                 if uid not in cur_uids:
+                    # Skip pinned LoRAs
+                    # TODO (lifuhuang): we might consider supporting pinning base model (uid == None) in the future.
+                    if uid is not None:
+                        lora_ref = lora_refs.get(uid)
+                        if lora_ref is not None and lora_ref.pinned:
+                            continue
+
                     self.uid_to_buffer_id.pop(uid)
                     logger.debug(f"Evicting LoRA {uid} from buffer slot {buffer_id}.")
                     self.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
