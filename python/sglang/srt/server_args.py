@@ -218,6 +218,7 @@ class ServerArgs:
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
+    enable_symm_mem: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
@@ -1600,6 +1601,11 @@ class ServerArgs:
             help="Enable NCCL NVLS for prefill heavy requests when available.",
         )
         parser.add_argument(
+            "--enable-symm-mem",
+            action="store_true",
+            help="Enable NCCL symmetric memory for fast collectives.",
+        )
+        parser.add_argument(
             "--enable-tokenizer-batch-encode",
             action="store_true",
             help="Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
@@ -1921,6 +1927,12 @@ class ServerArgs:
         model_arch = self.get_hf_config().architectures[0]
         if "Llama4" in model_arch:
             assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
+
+        if "Gemma2ForCausalLM" in model_arch:
+            # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
+            # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
+            logger.warning("Disable hybrid SWA memory for Gemma2ForCausalLM.")
+            self.disable_hybrid_swa_memory = True
 
         # Check LoRA
         self.check_lora_server_args()
