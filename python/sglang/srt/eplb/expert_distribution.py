@@ -25,10 +25,8 @@ import torch
 import torch.distributed
 
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import Withable, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
