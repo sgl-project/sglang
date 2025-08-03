@@ -98,6 +98,7 @@ class Envs:
 
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvBool(False)
+    ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)

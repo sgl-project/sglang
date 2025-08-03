@@ -38,7 +38,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     format_tcp_address,
-    get_bool_env_var,
     get_free_port,
     get_int_env_var,
     get_ip,
