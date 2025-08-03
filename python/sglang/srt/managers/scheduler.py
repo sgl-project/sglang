@@ -2362,11 +2362,19 @@ class IdleSleeper:
 
     def __init__(self, sockets):
         self.poller = zmq.Poller()
+        self.last_empty_time = time.time()
         for s in sockets:
             self.poller.register(s, zmq.POLLIN)
 
     def maybe_sleep(self):
         self.poller.poll(1000)
+        if (
+            global_config.torch_empty_cache_interval > 0
+            and time.time() - self.last_empty_time
+            > global_config.torch_empty_cache_interval
+        ):
+            self.last_empty_time = time.time()
+            torch.cuda.empty_cache()
 
 
 def is_health_check_generate_req(recv_req):
