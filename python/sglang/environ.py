@@ -83,7 +83,18 @@ class EnvFloat(EnvField):
 
 class Envs:
     # fmt: off
+
+    # Test & Debug
     SGLANG_TEST_RETRACT = EnvBool(False)
+
+    # Constrained Decoding
+    SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
+
+    # Hi-Cache
+    SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(default=None)
+
+    SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
+
     # fmt: on
 
 

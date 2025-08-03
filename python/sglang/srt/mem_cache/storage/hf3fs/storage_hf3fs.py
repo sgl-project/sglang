@@ -10,7 +10,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.environ import EnvStr
+from sglang.environ import envs
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
 from sglang.srt.mem_cache.storage.hf3fs.client_hf3fs import Hf3fsClient
 
@@ -44,8 +44,6 @@ def synchronized():
 
 
 class HiCacheHF3FS(HiCacheStorage):
-    SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(default=None)
-
     def __init__(
         self,
         file_path: str,
@@ -104,7 +102,7 @@ class HiCacheHF3FS(HiCacheStorage):
     def from_env_config(
         rank: int, bytes_per_page: int, dtype: torch.dtype
     ) -> "HiCacheHF3FS":
-        config_path = HiCacheHF3FS.SGLANG_HICACHE_HF3FS_CONFIG_PATH.value
+        config_path = envs.SGLANG_HICACHE_HF3FS_CONFIG_PATH.value
         if not config_path:
             return HiCacheHF3FS(
                 file_path=f"/data/hicache.{rank}.bin",

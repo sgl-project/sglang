@@ -8,6 +8,7 @@ from typing import List
 import torch
 from tqdm import tqdm
 
+from sglang.environ import envs
 from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import HiCacheHF3FS
 
 
@@ -39,7 +40,7 @@ def test():
     entries = 2
     dtype = store_dtype
 
-    config_path = HiCacheHF3FS.SGLANG_HICACHE_HF3FS_CONFIG_PATH.value
+    config_path = envs.SGLANG_HICACHE_HF3FS_CONFIG_PATH.value
     assert config_path
     try:
         with open(config_path, "w") as f:
