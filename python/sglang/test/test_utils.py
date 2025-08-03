@@ -27,9 +27,6 @@ import torch.nn.functional as F
 
 from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
-from sglang.lang.backend.openai import OpenAI
-from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.lang.interpreter import ProgramState
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
@@ -358,6 +355,9 @@ def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
 
 
 def select_sglang_backend(args: argparse.Namespace):
+    from sglang.lang.backend.openai import OpenAI
+    from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+
     if args.backend.startswith("srt"):
         if args.backend == "srt-no-parallel":
             global_config.enable_parallel_encoding = False

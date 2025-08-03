@@ -1928,6 +1928,12 @@ class ServerArgs:
         if "Llama4" in model_arch:
             assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
 
+        if "Gemma2ForCausalLM" in model_arch:
+            # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
+            # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
+            logger.warning("Disable hybrid SWA memory for Gemma2ForCausalLM.")
+            self.disable_hybrid_swa_memory = True
+
         # Check LoRA
         self.check_lora_server_args()
 
