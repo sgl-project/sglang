@@ -1084,38 +1084,56 @@ class TokenizerManager:
         _: Optional[fastapi.Request] = None,
     ) -> LoadLoRAAdapterReqOutput:
         self.auto_create_handle_loop()
-        if not self.server_args.enable_lora:
-            raise ValueError(
-                "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+
+        try:
+            if not self.server_args.enable_lora:
+                raise ValueError(
+                    "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+                )
+
+            # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+            # with dp_size > 1.
+            assert (
+                self.server_args.dp_size == 1
+            ), "dp_size must be 1 for dynamic lora loading"
+            logger.info(
+                "Start load Lora adapter. Lora name=%s, path=%s",
+                obj.lora_name,
+                obj.lora_path,
             )
 
-        # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
-        # with dp_size > 1.
-        assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for dynamic lora loading"
-        logger.info(
-            "Start load Lora adapter. Lora name=%s, path=%s",
-            obj.lora_name,
-            obj.lora_path,
-        )
+            async with self.lora_update_lock:
+                if (
+                    self.server_args.max_loaded_loras is not None
+                    and self.lora_registry.num_registered_loras
+                    >= self.server_args.max_loaded_loras
+                ):
+                    raise ValueError(
+                        f"Cannot load LoRA adapter {obj.lora_name} at path {obj.lora_path}. "
+                        f"Maximum number of loaded LoRA adapters is {self.server_args.max_loaded_loras}. "
+                        "Please unload some LoRA adapters before loading new ones."
+                    )
 
-        async with self.lora_update_lock:
-            # Generate new uniquely identifiable LoRARef object.
-            new_adapter = LoRARef(
-                lora_name=obj.lora_name,
-                lora_path=obj.lora_path,
+                # Generate new uniquely identifiable LoRARef object.
+                new_adapter = LoRARef(
+                    lora_name=obj.lora_name,
+                    lora_path=obj.lora_path,
+                )
+
+                # Trigger the actual loading operation at the backend processes.
+                obj.lora_id = new_adapter.lora_id
+                result = (await self.update_lora_adapter_communicator(obj))[0]
+
+                # Register the LoRA adapter only after loading is successful.
+                if result.success:
+                    await self.lora_registry.register(new_adapter)
+
+                return result
+        except ValueError as e:
+            return LoadLoRAAdapterReqOutput(
+                success=False,
+                error_message=str(e),
             )
-
-            # Trigger the actual loading operation at the backend processes.
-            obj.lora_id = new_adapter.lora_id
-            result = (await self.update_lora_adapter_communicator(obj))[0]
-
-            # Register the LoRA adapter only after loading is successful.
-            if result.success:
-                await self.lora_registry.register(new_adapter)
-
-            return result
 
     async def unload_lora_adapter(
         self,
@@ -1123,37 +1141,41 @@ class TokenizerManager:
         _: Optional[fastapi.Request] = None,
     ) -> UnloadLoRAAdapterReqOutput:
         self.auto_create_handle_loop()
-        if not self.server_args.enable_lora:
-            raise ValueError(
-                "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+
+        try:
+            if not self.server_args.enable_lora:
+                raise ValueError(
+                    "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+                )
+
+            assert (
+                obj.lora_name is not None
+            ), "lora_name must be provided to unload LoRA adapter"
+
+            # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+            # with dp_size > 1.
+            assert (
+                self.server_args.dp_size == 1
+            ), "dp_size must be 1 for dynamic lora loading"
+            logger.info(
+                "Start unload Lora adapter. Lora name=%s",
+                obj.lora_name,
             )
 
-        assert (
-            obj.lora_name is not None
-        ), "lora_name must be provided to unload LoRA adapter"
+            async with self.lora_update_lock:
+                # Unregister the LoRA adapter from the registry to stop new requests for this adapter
+                # from being started.
+                lora_id = await self.lora_registry.unregister(obj.lora_name)
+                obj.lora_id = lora_id
 
-        # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
-        # with dp_size > 1.
-        assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for dynamic lora loading"
-        logger.info(
-            "Start unload Lora adapter. Lora name=%s",
-            obj.lora_name,
-        )
+                # Initiate the actual unloading operation at the backend processes only after all
+                # ongoing requests using this LoRA adapter are finished.
+                await self.lora_registry.wait_for_unload(lora_id)
+                result = (await self.update_lora_adapter_communicator(obj))[0]
 
-        async with self.lora_update_lock:
-            # Unregister the LoRA adapter from the registry to stop new requests for this adapter
-            # from being started.
-            lora_id = await self.lora_registry.unregister(obj.lora_name)
-            obj.lora_id = lora_id
-
-            # Initiate the actual unloading operation at the backend processes only after all
-            # ongoing requests using this LoRA adapter are finished.
-            await self.lora_registry.wait_for_unload(lora_id)
-            result = (await self.update_lora_adapter_communicator(obj))[0]
-
-            return result
+                return result
+        except ValueError as e:
+            return UnloadLoRAAdapterReqOutput(success=False, rror_message=str(e))
 
     async def get_weights_by_name(
         self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
