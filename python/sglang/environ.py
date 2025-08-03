@@ -6,6 +6,10 @@ from typing import Any
 class EnvField:
     def __init__(self, default: Any):
         self.default = default
+        # NOTE: we use None to indicate whether the value is set or not
+        # If the value is manually set to None, we need mark it as _set_to_none.
+        # Always use clear() to reset the value, which leads to the default fallback.
+        self._set_to_none = False
 
     def __set_name__(self, owner, name):
         self.name = name
@@ -13,10 +17,15 @@ class EnvField:
     def parse(self, value: str) -> Any:
         raise NotImplementedError()
 
-    def get(self, default: Any = None) -> Any:
+    def get(self) -> Any:
         value = os.getenv(self.name)
+        if self._set_to_none:
+            assert value is None
+            return None
+
         if value is None:
-            return default if default is not None else self.default
+            return self.default
+
         try:
             return self.parse(value)
         except ValueError as e:
@@ -26,8 +35,11 @@ class EnvField:
             return self.default
 
     def set(self, value: Any):
-        assert value is not None, "Cannot set None value for environment variable"
-        os.environ[self.name] = str(value)
+        if value is None:
+            self._set_to_none = True
+            os.environ.pop(self.name, None)
+        else:
+            os.environ[self.name] = str(value)
 
     def clear(self):
         os.environ.pop(self.name, None)
@@ -94,4 +106,6 @@ if __name__ == "__main__":
     envs.SGLANG_TEST_RETRACT.clear()
     print(f"{envs.SGLANG_TEST_RETRACT.value=}")
     envs.SGLANG_TEST_RETRACT.set(not envs.SGLANG_TEST_RETRACT.value)
+    print(f"{envs.SGLANG_TEST_RETRACT.value=}")
+    envs.SGLANG_TEST_RETRACT.set(None)
     print(f"{envs.SGLANG_TEST_RETRACT.value=}")
