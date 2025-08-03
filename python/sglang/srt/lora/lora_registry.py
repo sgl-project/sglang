@@ -186,3 +186,10 @@ class LoRARegistry:
         self._registry[lora_ref.lora_name] = lora_ref
         self._counters[lora_ref.lora_id] = ConcurrentCounter()
         return lora_ref
+
+    @property
+    def num_registered_loras(self) -> int:
+        """
+        Returns the total number of LoRA adapters currently registered.
+        """
+        return len(self._registry)
