@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
 
 import torch
 
+from sglang.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.communicator import (
     CommunicateContext,
@@ -21,12 +22,12 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import BumpAllocator, get_bool_env_var
+from sglang.srt.utils import BumpAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
 
-_tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
+_tbo_debug = envs.SGLANG_TBO_DEBUG.value
 
 logger = logging.getLogger(__name__)
 

@@ -142,6 +142,9 @@ class Envs:
     SGLANG_EXPERT_LOCATION_UPDATER_CANARY = EnvBool(False)
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
 
+    # TBO
+    SGLANG_TBO_DEBUG = EnvBool(False)
+
     SGLANG_MOE_PADDING = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
