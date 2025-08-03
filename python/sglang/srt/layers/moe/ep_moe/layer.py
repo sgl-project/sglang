@@ -280,7 +280,9 @@ class EPMoE(FusedMoE):
             m_max * self.start_expert_id,
             BLOCK_SIZE=512,
         )
-        return output * self.routed_scaling_factor
+        if self.routed_scaling_factor is not None:
+            output *= self.routed_scaling_factor
+        return output
 
 
 class DeepEPMoE(EPMoE):
