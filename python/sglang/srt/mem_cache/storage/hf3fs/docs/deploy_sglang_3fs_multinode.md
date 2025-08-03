@@ -45,7 +45,7 @@ nohup python3 -m sglang.launch_server \
     --hicache-ratio 2 --hicache-size 0 \
     --hicache-write-policy write_through \
     --hicache-storage-backend hf3fs --tp 2 > instance2.out &
-```    
+```
 
 # 3. Startup router
 ```bash

@@ -209,7 +209,9 @@ class HiCacheHF3FS(HiCacheStorage):
             # Use global metadata client to connect to metadata server
             metadata_server_url = config["metadata_server_url"]
             metadata_client = Hf3fsGlobalMetadataClient(metadata_server_url)
-            logger.info(f"Using global metadata client with server url: {metadata_server_url}")
+            logger.info(
+                f"Using global metadata client with server url: {metadata_server_url}"
+            )
         else:
             # Use local metadata client for single-machine deployment
             metadata_client = Hf3fsLocalMetadataClient()
@@ -319,7 +321,9 @@ class HiCacheHF3FS(HiCacheStorage):
             results[batch_index] = write_result
 
         if len(written_keys_to_confirm) > 0 or len(pages_to_release) > 0:
-            self.metadata_client.confirm_write(self.rank, written_keys_to_confirm, pages_to_release)
+            self.metadata_client.confirm_write(
+                self.rank, written_keys_to_confirm, pages_to_release
+            )
 
         return all(results)
 

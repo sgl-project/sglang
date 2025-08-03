@@ -4,7 +4,7 @@ This document describes how to use deepseek-hf3fs as the L3 KV cache for SGLang.
 
 ## Step1: Install deepseek-3fs by 3fs-Operator (Coming Soon)
 
-## Step2: Setup usrbio client 
+## Step2: Setup usrbio client
 
 Please follow the document [setup_usrbio_client.md](setup_usrbio_client.md) to setup usrbio client.
 
