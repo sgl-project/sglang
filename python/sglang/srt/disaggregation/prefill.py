@@ -460,6 +460,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         # We need to remove the sync in the following function for overlap schedule.
         self.set_next_batch_sampling_info_done(batch)
+        self.maybe_send_health_check_signal()
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None

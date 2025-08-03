@@ -29,6 +29,7 @@ import uuid
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
+from enum import Enum
 from http import HTTPStatus
 from typing import (
     Any,
@@ -115,6 +116,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -270,6 +272,7 @@ class TokenizerManager:
         self.health_check_failed = False
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
+        self.server_status = ServerStatus.Starting
 
         # Dumping
         self.dump_requests_folder = ""  # By default do not dump
@@ -1804,6 +1807,8 @@ class TokenizerManager:
         asyncio.create_task(asyncio.to_thread(background_task))
 
     def _handle_abort_req(self, recv_obj):
+        if is_health_check_generate_req(recv_obj):
+            return
         state = self.rid_to_state[recv_obj.rid]
         state.finished = True
         if recv_obj.finished_reason:
@@ -1936,6 +1941,16 @@ class TokenizerManager:
             scores.append(score_list)
 
         return scores
+
+
+class ServerStatus(Enum):
+    Up = "Up"
+    Starting = "Starting"
+    UnHealthy = "UnHealthy"
+    Crashed = "Crashed"
+
+    def is_healthy(self) -> bool:
+        return self == ServerStatus.Up
 
 
 def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
