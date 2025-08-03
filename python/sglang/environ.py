@@ -86,6 +86,7 @@ class Envs:
 
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
+    SGLANG_AMD_CI = EnvBool(False)
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
