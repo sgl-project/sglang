@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -123,6 +124,7 @@ def cutlass_fused_experts_fp8(
 
     if is_cuda:
         from sglang.srt.layers.quantization.fp8_kernel import (
+            per_token_group_quant_fp8_hopper_moe_mn_major,
             sglang_per_token_group_quant_fp8,
         )
 
@@ -133,9 +135,7 @@ def cutlass_fused_experts_fp8(
     n = w2_q.size(1)
 
     topk = topk_ids.size(1)
-
-    a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
-    device = a_q.device
+    device = a.device
 
     a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
     c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
@@ -152,8 +152,16 @@ def cutlass_fused_experts_fp8(
         k,
     )
 
-    rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
-    rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
+    if is_sm100_supported():
+        a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
+        rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
+        rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
+    else:
+        rep_a = shuffle_rows(a, a_map, (m * topk, k))
+        rep_a_q, rep_a1_scales = per_token_group_quant_fp8_hopper_moe_mn_major(
+            rep_a, expert_offsets, problem_sizes1, 128
+        )
+        w1_scale = w1_scale.contiguous()
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
     c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
@@ -185,7 +193,13 @@ def cutlass_fused_experts_fp8(
     intermediate = torch.empty((m * topk, n), device=device, dtype=out_dtype)
     silu_and_mul(c1, intermediate)
 
-    intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
+    if is_sm100_supported():
+        intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
+    else:
+        intemediate_q, a2_scale = per_token_group_quant_fp8_hopper_moe_mn_major(
+            intermediate, expert_offsets, problem_sizes2, 128
+        )
+        w2_scale = w2_scale.contiguous()
 
     fp8_blockwise_scaled_grouped_mm(
         c2,
