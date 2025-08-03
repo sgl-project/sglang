@@ -42,6 +42,19 @@ class EnvField:
             self._set_to_none = False
             os.environ[self.name] = str(value)
 
+    @contextmanager
+    def override(self, value: Any):
+        backup_present = self.name in os.environ
+        backup_value = os.environ.get(self.name)
+        backup_set_to_none = self._set_to_none
+        self.set(value)
+        yield
+        if backup_present:
+            os.environ[self.name] = backup_value
+        else:
+            os.environ.pop(self.name, None)
+        self._set_to_none = backup_set_to_none
+
     def clear(self):
         os.environ.pop(self.name, None)
 
@@ -131,8 +144,21 @@ _convert_SGL_to_SGLANG()
 if __name__ == "__main__":
     # Example usage for envs
     envs.SGLANG_TEST_RETRACT.clear()
-    print(f"{envs.SGLANG_TEST_RETRACT.value=}")
+    assert envs.SGLANG_TEST_RETRACT.value is False
+
     envs.SGLANG_TEST_RETRACT.set(None)
-    print(f"{envs.SGLANG_TEST_RETRACT.value=}")
+    assert envs.SGLANG_TEST_RETRACT.value is None
+
     envs.SGLANG_TEST_RETRACT.set(True)
-    print(f"{envs.SGLANG_TEST_RETRACT.value=}")
+    assert envs.SGLANG_TEST_RETRACT.value is True
+
+    with envs.SGLANG_TEST_RETRACT.override(None):
+        assert envs.SGLANG_TEST_RETRACT.value is None
+
+    assert envs.SGLANG_TEST_RETRACT.value is True
+
+    envs.SGLANG_TEST_RETRACT.set(None)
+    with envs.SGLANG_TEST_RETRACT.override(True):
+        assert envs.SGLANG_TEST_RETRACT.value is True
+
+    assert envs.SGLANG_TEST_RETRACT.value is None
