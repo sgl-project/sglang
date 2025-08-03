@@ -39,9 +39,9 @@ import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
+from sglang.environ import envs
 from sglang.srt.utils import (
     direct_register_custom_op,
-    get_bool_env_var,
     get_int_env_var,
     is_cuda_alike,
     is_hip,
@@ -58,9 +58,11 @@ class GraphCaptureContext:
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
+USE_MESSAGE_QUEUE_BROADCASTER = envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.value
+
 
 def _split_tensor_dict(
-    tensor_dict: Dict[str, Union[torch.Tensor, Any]]
+    tensor_dict: Dict[str, Union[torch.Tensor, Any]],
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
     """Split the tensor dictionary into two parts:
     1. A list of (key, value) pairs. If the value is a tensor, it is replaced
@@ -1337,9 +1339,7 @@ def initialize_model_parallel(
         group_ranks,
         get_world_group().local_rank,
         backend,
-        use_message_queue_broadcaster=get_bool_env_var(
-            "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
-        ),
+        use_message_queue_broadcaster=USE_MESSAGE_QUEUE_BROADCASTER,
         group_name="tp",
     )
 
@@ -1352,9 +1352,7 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_message_queue_broadcaster=get_bool_env_var(
-                "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
-            ),
+            use_message_queue_broadcaster=USE_MESSAGE_QUEUE_BROADCASTER,
             group_name="pdmux_prefill_tp",
         )
         _TP.pynccl_comm.disabled = False

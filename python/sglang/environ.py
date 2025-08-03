@@ -108,6 +108,9 @@ class Envs:
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
 
+    # Model Parallel
+    SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
+
     # Constrained Decoding
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
     SGLANG_GRAMMAR_TIMEOUT = EnvFloat(300)
