@@ -35,16 +35,33 @@ class HiRadixCache(RadixCache):
         hicache_size: int,
         hicache_write_policy: str,
         hicache_io_backend: str,
+        hicache_mem_layout: str,
         hicache_storage_backend: Optional[str] = None,
     ):
+
+        if hicache_io_backend == "direct":
+            if hicache_mem_layout == "page_first":
+                hicache_mem_layout = "layer_first"
+                logger.warning(
+                    "Page first layout is not supported with direct IO backend, switching to layer first layout"
+                )
+
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
-                self.kv_cache, hicache_ratio, hicache_size, page_size
+                self.kv_cache,
+                hicache_ratio,
+                hicache_size,
+                page_size,
+                hicache_mem_layout,
             )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
-                self.kv_cache, hicache_ratio, hicache_size, page_size
+                self.kv_cache,
+                hicache_ratio,
+                hicache_size,
+                page_size,
+                hicache_mem_layout,
             )
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
@@ -436,7 +453,7 @@ class HiRadixCache(RadixCache):
             last_host_node,
             fetched_token_ids,
             written_indices,
-            hash_value[:min_completed_tokens],
+            hash_value[: min_completed_tokens // self.page_size],
         )
         if len(written_indices):
             self.cache_controller.mem_pool_host.update_prefetch(written_indices)
@@ -529,7 +546,7 @@ class HiRadixCache(RadixCache):
             prefix_len = self.key_match_fn(node.key, key)
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
-            hash_value = hash_value[prefix_len:]
+            hash_value = hash_value[prefix_len // self.page_size :]
             matched_length += prefix_len
 
             if prefix_len < len(node.key):

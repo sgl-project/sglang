@@ -53,12 +53,10 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
 
 # Clone and install SGLang
-# NOTE: flashinfer v0.2.9rc1 is not installing for aarch64
 WORKDIR /sgl-workspace
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
- && git clone https://github.com/sgl-project/sglang.git \
+ && git clone --depth 1 https://github.com/sgl-project/sglang.git \
  && cd sglang \
- && git checkout a167fd0bcb9ef4b0f4331a109e40c8cdc770b026 \
  && case "$CUDA_VERSION" in \
       12.6.1) CUINDEX=126 ;; \
       12.8.1) CUINDEX=128 ;; \
@@ -93,7 +91,7 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
     datamodel_code_generator \
-    mooncake_transfer_engine==0.3.5 \
+    mooncake-transfer-engine==0.3.5 \
     pre-commit \
     pytest \
     black \
@@ -102,6 +100,15 @@ RUN python3 -m pip install --no-cache-dir \
     uv \
     wheel \
     scikit-build-core
+
+# These will be automatically installed by future versions of flashinfer after 0.2.9rc2
+RUN python3 -m pip install --no-cache-dir \
+    nvidia-cudnn-cu12 \
+    nvidia-cudnn-frontend
+
+# Allows for FP4 disaggregation
+RUN python3 -m pip install --no-cache-dir \
+    nixl
 
 # Install development tools and utilities
 RUN apt-get update && apt-get install -y \

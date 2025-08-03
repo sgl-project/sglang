@@ -181,7 +181,10 @@ mod test_pd_routing {
             };
 
             // Router creation will fail due to health checks, but config should be valid
-            let result = RouterFactory::create_router(&config);
+            let app_context =
+                sglang_router_rs::server::AppContext::new(config, reqwest::Client::new(), 64);
+            let app_context = std::sync::Arc::new(app_context);
+            let result = RouterFactory::create_router(&app_context);
             assert!(result.is_err());
             let error_msg = result.unwrap_err();
             // Error should be about health/timeout, not configuration
