@@ -29,6 +29,7 @@ import uuid
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
+from enum import Enum
 from http import HTTPStatus
 from typing import (
     Any,
@@ -122,7 +123,6 @@ from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    ServerStatus,
     dataclass_to_string_truncated,
     get_bool_env_var,
     get_zmq_socket,
@@ -180,7 +180,6 @@ class TokenizerManager:
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
-        self.server_status = ServerStatus.Starting
         # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
@@ -258,6 +257,7 @@ class TokenizerManager:
         self.health_check_failed = False
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
+        self.server_status = ServerStatus.Starting
 
         # Dumping
         self.dump_requests_folder = ""  # By default do not dump
@@ -1904,6 +1904,16 @@ class TokenizerManager:
             scores.append(score_list)
 
         return scores
+
+
+class ServerStatus(Enum):
+    Up = "Up"
+    Starting = "Starting"
+    UnHealthy = "UnHealthy"
+    Crashed = "Crashed"
+
+    def is_healthy(self) -> bool:
+        return self == ServerStatus.Up
 
 
 def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:

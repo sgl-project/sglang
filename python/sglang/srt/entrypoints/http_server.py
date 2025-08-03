@@ -234,8 +234,13 @@ async def validate_json_request(raw_request: Request):
 @app.get("/health")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
-    """Two Step Check the health of the server."""
-    """Step1: Check the health of the server."""
+    """
+    Check the health of the inference server by sending a special request to generate one token.
+
+    If the server is running something, this request will be ignored, so it creates zero overhead.
+    If the server is not running anything, this request will be run, so we know whether the server is healthy.
+    """
+
     if _global_state.tokenizer_manager.gracefully_exit:
         logger.info("Health check request received during shutdown. Returning 503.")
         return Response(status_code=503)
@@ -243,14 +248,13 @@ async def health_generate(request: Request) -> Response:
     if not _global_state.tokenizer_manager.server_status.is_healthy():
         return Response(status_code=503)
 
-    if _global_state.tokenizer_manager.is_image_gen:
-        return Response(status_code=200)
-
-    """Step2: Check the health of the inference server by generating one token."""
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     rid = f"HEALTH_CHECK_{time.time()}"
 
-    if _global_state.tokenizer_manager.is_generation:
+    if _global_state.tokenizer_manager.is_image_gen:
+        # Keep this branch for some internal use cases.
+        raise NotImplementedError("Image generation is not supported yet.")
+    elif _global_state.tokenizer_manager.is_generation:
         gri = GenerateReqInput(
             rid=rid,
             input_ids=[0],
@@ -272,9 +276,6 @@ async def health_generate(request: Request) -> Response:
         async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
             break
 
-    # This request is a special request.
-    # If the server already has something running, this request will be ignored, so it creates zero overhead.
-    # If the server is not running, this request will be run, so we know whether the server is healthy.
     task = asyncio.create_task(gen())
 
     # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
