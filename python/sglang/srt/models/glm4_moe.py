@@ -156,13 +156,13 @@ class Glm4MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, forward_batch=None, can_fuse_mlp_allreduce=False):
+    def forward(self, x, forward_batch=None, should_fuse_allreduce_residual_rmsnorm=False):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x, can_fuse_mlp_allreduce=can_fuse_mlp_allreduce)
+        x, _ = self.down_proj(x, should_fuse_allreduce_residual_rmsnorm=should_fuse_allreduce_residual_rmsnorm)
         return x
 
 
@@ -529,7 +529,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         self._enable_deepep_moe = global_server_args_dict["moe_a2a_backend"].is_deepep()
 
     def forward_normal_dual_stream(
-        self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False
+        self, hidden_states: torch.Tensor, should_fuse_allreduce_residual_rmsnorm: bool = False
     ) -> torch.Tensor:
 
         current_stream = torch.cuda.current_stream()
@@ -550,26 +550,26 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         current_stream.wait_stream(self.alt_stream)
 
         if self.ep_size > 1:
-            if self.tp_size > 1 and not can_fuse_mlp_allreduce:
+            if self.tp_size > 1 and not should_fuse_allreduce_residual_rmsnorm:
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
                 )
             final_hidden_states += shared_output
         else:
             final_hidden_states += shared_output
-            if self.tp_size > 1 and not can_fuse_mlp_allreduce:
+            if self.tp_size > 1 and not should_fuse_allreduce_residual_rmsnorm:
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
                 )
         return final_hidden_states
 
     def forward_normal(
-        self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False
+        self, hidden_states: torch.Tensor, should_fuse_allreduce_residual_rmsnorm: bool = False
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
-            return self.forward_cpu(hidden_states, can_fuse_mlp_allreduce)
+            return self.forward_cpu(hidden_states, should_fuse_allreduce_residual_rmsnorm)
 
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
@@ -584,7 +584,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
         if self.ep_size > 1:
-            if self.tp_size > 1 and not can_fuse_mlp_allreduce:
+            if self.tp_size > 1 and not should_fuse_allreduce_residual_rmsnorm:
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
                 )
@@ -593,7 +593,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         else:
             if shared_output is not None:
                 final_hidden_states += shared_output
-            if self.tp_size > 1 and not can_fuse_mlp_allreduce:
+            if self.tp_size > 1 and not should_fuse_allreduce_residual_rmsnorm:
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
                 )

@@ -1392,7 +1392,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
-            help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
+            help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
         parser.add_argument(
             "--deepep-mode",
