@@ -772,12 +772,15 @@ class FusedMoE(torch.nn.Module):
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
 
+        tp_size = get_tensor_model_parallel_world_size()
+        shard_start = int(tp_rank *loaded_weight.shape[shard_dim] / tp_size)
+
         if _is_cpu:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
                 0,  # param_data_start
-                shard_size * tp_rank,
+                shard_start,
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
@@ -786,12 +789,12 @@ class FusedMoE(torch.nn.Module):
             if not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
-                if shard_size * tp_rank + shard_size > loaded_weight.shape[shard_dim]:
+                if shard_start + shard_size > loaded_weight.shape[shard_dim]:
                     raise ValueError(
                         f"Shard size {shard_size} at rank {tp_rank} exceeds loaded_weight dimension {loaded_weight.shape[shard_dim]}"
                     )
                 loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
+                    shard_dim, shard_start, shard_size
                 )
 
         # w2, down_proj: Load into only logical weight of w2.

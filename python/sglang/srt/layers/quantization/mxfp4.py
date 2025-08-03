@@ -150,7 +150,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase, CustomOp):
 
             w2_scale = torch.nn.Parameter(
                 torch.empty(
-                    num_experts, hidden_size, intermediate_size // 32, dtype=torch.uint8
+                    num_experts, hidden_size, (intermediate_size + 31) // 32, dtype=torch.uint8
                 ),
                 requires_grad=False,
             )
@@ -213,8 +213,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase, CustomOp):
             w2_weight_fp4 = layer.w2_weight.data
             w2_weight_scale = layer.w2_scale.data
 
-        # (num_experts, 2 * intermediate_size, hidden_size // 2)
-        w13_weight_fp4 = torch.transpose(w13_weight_fp4, 1, 2) # (num_experts, hidden_size // 2, 2 * intermediate_size)
+        w13_weight_fp4 = torch.transpose(w13_weight_fp4, 1, 2)
         if self.shuffle_weight:
             w13_weight_fp4 = shuffle_for_activation_kernel(w13_weight_fp4)
 
@@ -260,13 +259,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase, CustomOp):
         x: torch.Tensor,
         topk_output,
         top_k: int,
-        # renormalize: bool,
-        # use_grouped_topk: bool,
-        # topk_group: Optional[int] = None,
-        # num_expert_group: Optional[int] = None,
-        # num_fused_shared_experts: int = 0,
-        # custom_routing_function: Optional[Callable] = None,
-        # correction_bias: Optional[torch.Tensor] = None,
         activation: str = "swiglu",
         apply_router_weight_on_input: bool = False,
         inplace: bool = True,
@@ -278,13 +270,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase, CustomOp):
             layer=layer,
             expert_logits=topk_output.router_logits,
             top_k=top_k,
-            # renormalize=renormalize,
-            # use_grouped_topk=use_grouped_topk,
-            # topk_group=topk_group,
-            # num_expert_group=num_expert_group,
-            # num_fused_shared_experts=num_fused_shared_experts,
-            # custom_routing_function=custom_routing_function,
-            # correction_bias=correction_bias,
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             inplace=inplace,
@@ -298,13 +283,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase, CustomOp):
         x: torch.Tensor,
         expert_logits: torch.Tensor,
         top_k: int,
-        # use_grouped_topk: bool,
-        # renormalize: bool,
-        # topk_group: Optional[int] = None,
-        # num_expert_group: Optional[int] = None,
-        # num_fused_shared_experts: int = 0,
-        # custom_routing_function: Optional[Callable] = None,
-        # correction_bias: Optional[torch.Tensor] = None,
         activation: str = "swiglu",
         apply_router_weight_on_input: bool = False,
         inplace: bool = True,
