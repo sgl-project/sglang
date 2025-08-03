@@ -11,7 +11,6 @@ import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
@@ -24,6 +23,7 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
     from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
