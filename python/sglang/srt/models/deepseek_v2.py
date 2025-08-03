@@ -1995,9 +1995,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         return output
 
-    def clear_fuse_mlp_allreduce_cache(self):
-        self._should_fuse_allreduce_residual_rmsnorm_cache.clear()
-
 
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
@@ -2090,11 +2087,6 @@ class DeepseekV2Model(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
-
-    def clear_all_layers_cache(self):
-        for layer in self.layers:
-            if hasattr(layer, 'clear_fuse_mlp_allreduce_cache'):
-                layer.clear_fuse_mlp_allreduce_cache()
 
 
 class DeepseekV2ForCausalLM(nn.Module):
