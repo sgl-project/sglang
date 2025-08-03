@@ -1,24 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/marlin_utils.py
 
+from __future__ import annotations
+
 import logging
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy
 import torch
 
-from sglang.srt.layers.linear import LinearBase, LinearMethodBase
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
     PackedvLLMParameter,
 )
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.base_config import (
+    LinearMethodBase,
+    QuantizationConfig,
+)
 from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
 from sglang.srt.layers.quantization.utils import pack_cols, unpack_cols
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.utils import get_device_capability
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.linear import LinearBase
 
 try:
     from vllm import _custom_ops as ops
@@ -617,7 +623,10 @@ class MarlinConfig(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["MarlinLinearMethod"]:
+    ) -> Optional[MarlinLinearMethod]:
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
         if isinstance(layer, LinearBase) or (
             isinstance(layer, ParallelLMHead) and self.lm_head_quantized
         ):
