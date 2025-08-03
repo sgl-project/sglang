@@ -101,6 +101,8 @@ class Envs:
 
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
 
+    SGLANG_MOE_PADDING = EnvBool(False)
+
     # fmt: on
 
 

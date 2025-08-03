@@ -12,6 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.environ import envs
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -24,7 +25,6 @@ from sglang.srt.layers.quantization.int8_kernel import (
     sglang_per_token_group_quant_int8,
 )
 from sglang.srt.utils import (
-    ceil_div,
     cpu_has_amx_support,
     direct_register_custom_op,
     get_bool_env_var,
@@ -32,7 +32,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
-    next_power_of_2,
 )
 
 _is_hip = is_hip()
@@ -60,7 +59,7 @@ if _is_cuda or _is_hip:
 
 
 logger = logging.getLogger(__name__)
-padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+padding_size = 128 if envs.SGLANG_MOE_PADDING.value else 0
 
 
 @triton.jit

@@ -5,6 +5,7 @@ import warnings
 from datetime import datetime
 from types import SimpleNamespace
 
+from sglang.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -167,9 +168,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
                 with self.subTest(model=model):
-                    os.environ["SGLANG_MOE_PADDING"] = (
-                        "0" if model in NO_MOE_PADDING_MODELS else "1"
-                    )
+                    envs.SGLANG_MOE_PADDING.set(model not in NO_MOE_PADDING_MODELS)
                     os.environ["HF_HUB_DISABLE_XET"] = (
                         "1" if model in DISABLE_HF_XET_MODELS else "0"
                     )

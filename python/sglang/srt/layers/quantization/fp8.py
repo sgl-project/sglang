@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.environ import envs
+
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
         apply_fp8_marlin_linear,
@@ -967,7 +969,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # ROCm (_use_aiter): using column-wise scaling
             layer.w13_weight_scale1 *= layer.w13_weight_scale.unsqueeze(-1)
             layer.w2_weight_scale1 *= layer.w2_weight_scale.unsqueeze(-1)
-        elif get_bool_env_var("SGLANG_MOE_PADDING"):
+        elif envs.SGLANG_MOE_PADDING.value:
             # If ROCm, apply weight padding (min. Mem channel contention) only if set
             layer.w13_weight = torch.nn.Parameter(
                 F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
