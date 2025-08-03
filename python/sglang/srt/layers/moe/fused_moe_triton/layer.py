@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 import torch
 from packaging import version as pkg_version
 
+from sglang.environ import envs
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -29,7 +30,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
-from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var, is_cpu, is_hip
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_hip
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -491,7 +492,7 @@ class FusedMoE(torch.nn.Module):
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:
             # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust input_scale for e4m3fnuz (AMD)
-            if _is_hip and get_bool_env_var("SGLANG_INT4_WEIGHT"):
+            if _is_hip and envs.SGLANG_INT4_WEIGHT.value:
                 loaded_weight = loaded_weight * 2.0
 
             # this is needed for compressed-tensors only
@@ -564,7 +565,7 @@ class FusedMoE(torch.nn.Module):
             quant_method = getattr(param, "quant_method", None)
             if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust INT4 column-wise scaling number to e4m3fnuz (AMD)
-                if _is_hip and get_bool_env_var("SGLANG_INT4_WEIGHT"):
+                if _is_hip and envs.SGLANG_INT4_WEIGHT.value:
                     loaded_weight = loaded_weight * 0.5
 
                 self._load_per_channel_weight_scale(
@@ -587,7 +588,7 @@ class FusedMoE(torch.nn.Module):
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust FP8 per-tensor scaling number for e4m3fnuz (AMD)
-                if _is_hip and get_bool_env_var("SGLANG_INT4_WEIGHT"):
+                if _is_hip and envs.SGLANG_INT4_WEIGHT.value:
                     loaded_weight = loaded_weight * 2.0
 
                 self._load_per_tensor_weight_scale(

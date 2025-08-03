@@ -93,7 +93,7 @@ _is_cpu = is_cpu()
 
 _is_fp8_fnuz = is_fp8_fnuz()
 
-_use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT")
+_use_hip_int4 = envs.SGLANG_INT4_WEIGHT.value
 _use_aiter = is_use_aiter()
 
 if _is_hip and (_use_aiter or _use_hip_int4):

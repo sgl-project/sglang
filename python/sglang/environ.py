@@ -122,6 +122,9 @@ class Envs:
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
 
+    # Quantization
+    SGLANG_INT4_WEIGHT = EnvBool(False)
+
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
 
