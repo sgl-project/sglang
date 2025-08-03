@@ -85,7 +85,7 @@ jobs:
       - name: Install
         run: |
           bash scripts/ci_install_dependency.sh
-          pip3 install torch==2.7.1 torchvision && pip3 install pytest
+          pip3 install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126 && pip3 install pytest
           pip3 uninstall sgl-kernel -y || true
           pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
           pip3 list | grep sgl-kernel
@@ -117,7 +117,7 @@ jobs:
       - name: Install
         run: |
           bash scripts/ci_install_dependency.sh
-          pip3 install torch==2.7.1 torchvision
+          pip3 install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126
           pip3 uninstall sgl-kernel -y || true
           pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
           pip3 list | grep sgl-kernel
