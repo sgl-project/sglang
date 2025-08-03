@@ -985,7 +985,7 @@ def add_api_key_middleware(app, api_key: str):
 
 
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
-    if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+    if envs.SGLANG_USE_MODELSCOPE.value:
         if not os.path.exists(model_path):
             from modelscope import snapshot_download
 

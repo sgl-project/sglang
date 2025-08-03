@@ -1,5 +1,6 @@
 import os
 import warnings
+from contextlib import contextmanager
 from typing import Any
 
 
@@ -96,6 +97,9 @@ class EnvFloat(EnvField):
 
 class Envs:
     # fmt: off
+
+    # Model & File Download
+    SGLANG_USE_MODELSCOPE = EnvBool(False)
 
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)

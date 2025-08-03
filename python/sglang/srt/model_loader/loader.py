@@ -2,7 +2,6 @@
 
 # ruff: noqa: SIM117
 import collections
-import concurrent
 import dataclasses
 import fnmatch
 import glob
@@ -12,20 +11,18 @@ import math
 import os
 import time
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
 
 import huggingface_hub
 import numpy as np
-import safetensors.torch
 import torch
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
-from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
+from sglang.environ import envs
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelConfig
@@ -45,7 +42,6 @@ from sglang.srt.model_loader.utils import (
     set_default_torch_dtype,
 )
 from sglang.srt.model_loader.weight_utils import (
-    _BAR_FORMAT,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
@@ -250,7 +246,7 @@ class DefaultModelLoader(BaseModelLoader):
 
         Returns the path to the downloaded model, or None if the model is not
         downloaded from ModelScope."""
-        if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+        if envs.SGLANG_USE_MODELSCOPE.value:
             # download model from ModelScope hub,
             # lazy import so that modelscope is not required for normal use.
             # pylint: disable=C.
