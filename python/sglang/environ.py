@@ -149,6 +149,7 @@ class Envs:
     SGLANG_MOE_PADDING = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
+    SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
 
     # fmt: on
 

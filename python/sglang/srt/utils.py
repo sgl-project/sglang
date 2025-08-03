@@ -237,9 +237,7 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
-_ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
-    "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
-)
+_ENABLE_TORCH_INFERENCE_MODE = envs.SGLANG_ENABLE_TORCH_INFERENCE_MODE.value
 
 
 class DynamicGradMode(_DecoratorContextManager):

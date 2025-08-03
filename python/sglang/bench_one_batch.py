@@ -70,7 +70,6 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_logger,
-    get_bool_env_var,
     kill_process_tree,
     require_mlp_sync,
     require_mlp_tp_gather,

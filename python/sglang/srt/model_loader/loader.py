@@ -58,7 +58,6 @@ from sglang.srt.model_loader.weight_utils import (
     set_runai_streamer_env,
 )
 from sglang.srt.utils import (
-    get_bool_env_var,
     get_device_capability,
     is_npu,
     is_pin_memory_available,

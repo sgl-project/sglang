@@ -20,7 +20,6 @@ Page-aligned memory pool.
 """
 
 import abc
-import weakref
 from typing import TYPE_CHECKING
 
 import torch
