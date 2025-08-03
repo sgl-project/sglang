@@ -31,12 +31,12 @@ from sglang.srt.eplb.expert_location_dispatch import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     get_compiler_backend,
     is_cpu,
     is_cuda,
     is_hip,
     is_npu,
+    is_use_aiter,
 )
 
 try:
@@ -50,7 +50,7 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = is_use_aiter()
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate

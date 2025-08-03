@@ -34,7 +34,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import ceil_div, dispose_tensor, is_hip, is_npu, is_use_aiter
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = is_use_aiter()
 
 
 if not (_is_npu or _is_hip):

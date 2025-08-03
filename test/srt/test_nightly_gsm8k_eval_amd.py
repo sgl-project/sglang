@@ -170,9 +170,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                 with self.subTest(model=model):
                     envs.SGLANG_MOE_PADDING.set(model not in NO_MOE_PADDING_MODELS)
                     envs.HF_HUB_DISABLE_XET.set(model in DISABLE_HF_XET_MODELS)
-                    os.environ["SGLANG_USE_AITER"] = (
-                        "0" if model in TRITON_MOE_MODELS else "1"
-                    )
+                    envs.SGLANG_USE_AITER.set(model not in TRITON_MOE_MODELS)
 
                     process = popen_launch_server_wrapper(self.base_url, model, is_tp2)
 

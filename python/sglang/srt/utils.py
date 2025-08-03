@@ -102,10 +102,15 @@ def is_hip() -> bool:
     return torch.version.hip is not None
 
 
+def is_use_aiter() -> bool:
+    return envs.SGLANG_USE_AITER.value and is_hip()
+
+
 if is_hip():
     FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
 else:
     FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+
 
 FP8_E4M3_MIN = -FP8_E4M3_MAX
 

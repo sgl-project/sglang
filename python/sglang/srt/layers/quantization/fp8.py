@@ -73,6 +73,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_use_aiter,
     log_info_on_rank0,
     next_power_of_2,
     print_warning_once,
@@ -93,7 +94,7 @@ _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT")
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = is_use_aiter()
 
 if _is_hip and (_use_aiter or _use_hip_int4):
     from aiter import ActivationType, QuantType

@@ -99,11 +99,13 @@ class Envs:
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvBool(False)
 
+    # AMD & ROCm
+    SGLANG_USE_AITER = EnvBool(False)
+
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
 
     SGLANG_MOE_PADDING = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
-
     # fmt: on
 
 

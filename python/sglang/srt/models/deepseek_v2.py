@@ -25,7 +25,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
-from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -47,11 +46,7 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     enable_moe_dense_fully_dp,
 )
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
-    get_local_attention_dp_size,
-)
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -84,7 +79,7 @@ from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope, get_rope_wrapper
+from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -111,6 +106,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_non_idle_and_non_empty,
+    is_use_aiter,
     log_info_on_rank0,
     use_intel_amx_backend,
 )
@@ -118,7 +114,7 @@ from sglang.srt.utils import (
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = is_use_aiter()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _device_sm = get_device_sm()
