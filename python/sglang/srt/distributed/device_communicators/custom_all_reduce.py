@@ -145,6 +145,13 @@ class CustomAllreduce:
         if _is_cuda or _is_hip:
             full_nvlink = is_full_nvlink(physical_device_ids, world_size)
 
+        # Check if full_nvlink should be forced via environment variable
+        if os.getenv("SGLANG_FORCE_FULL_NVLINK", "0") == "1":
+            logger.warning(
+                "Forcing full_nvlink to True via SGLANG_FORCE_FULL_NVLINK environment variable."
+            )
+            full_nvlink = True
+
         if world_size > 2 and not full_nvlink:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
