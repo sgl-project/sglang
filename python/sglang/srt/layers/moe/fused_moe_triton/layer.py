@@ -127,6 +127,9 @@ class FusedMoE(torch.nn.Module):
             self.expert_map_cpu = torch.full(
                 (self.num_experts,), -1, dtype=torch.int32, device="cpu"
             )
+            self.expert_map_cpu = torch.full(
+                (self.num_experts,), -1, dtype=torch.int32, device="cpu"
+            )
             # Create a expert map for the local experts
             self.expert_map_cpu[
                 self.moe_ep_rank
@@ -624,15 +627,15 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, topk_output: StandardTopKOutput):
         assert self.quant_method is not None
 
-        if not self.enable_flashinfer_cutlass_moe:
+        if self.moe_ep_size > 1 and not self.enable_flashinfer_cutlass_moe:
             if self.expert_map_cpu is not None and self.expert_map_gpu is None:
                 # If we are in EP mode, we need to move the expert map to GPU.
                 self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
 
-            if self.expert_map_gpu is not None:
-                topk_output = topk_output._replace(
-                    topk_ids=self.expert_map_gpu[topk_output.topk_ids]
-                )
+        if self.expert_map_gpu is not None:
+            topk_output = topk_output._replace(
+                topk_ids=self.expert_map_gpu[topk_output.topk_ids]
+            )
 
         # Matrix multiply.
         with use_symmetric_memory(get_tp_group()) as sm:
