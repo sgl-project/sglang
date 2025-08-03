@@ -211,13 +211,18 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, forward_batch=None, should_fuse_allreduce_residual_rmsnorm=False):
+    def forward(
+        self, x, forward_batch=None, should_fuse_allreduce_residual_rmsnorm=False
+    ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x, should_fuse_allreduce_residual_rmsnorm=should_fuse_allreduce_residual_rmsnorm)
+        x, _ = self.down_proj(
+            x,
+            should_fuse_allreduce_residual_rmsnorm=should_fuse_allreduce_residual_rmsnorm,
+        )
         return x
 
 
@@ -460,12 +465,16 @@ class DeepseekV2MoE(nn.Module):
                     hidden_states, should_fuse_allreduce_residual_rmsnorm
                 )
             else:
-                return self.forward_normal(hidden_states, should_fuse_allreduce_residual_rmsnorm)
+                return self.forward_normal(
+                    hidden_states, should_fuse_allreduce_residual_rmsnorm
+                )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal_dual_stream(
-        self, hidden_states: torch.Tensor, should_fuse_allreduce_residual_rmsnorm: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        should_fuse_allreduce_residual_rmsnorm: bool = False,
     ) -> torch.Tensor:
 
         current_stream = torch.cuda.current_stream()
@@ -494,12 +503,16 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_normal(
-        self, hidden_states: torch.Tensor, should_fuse_allreduce_residual_rmsnorm: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        should_fuse_allreduce_residual_rmsnorm: bool = False,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
-            return self.forward_cpu(hidden_states, should_fuse_allreduce_residual_rmsnorm)
+            return self.forward_cpu(
+                hidden_states, should_fuse_allreduce_residual_rmsnorm
+            )
 
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
@@ -524,7 +537,9 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_cpu(
-        self, hidden_states: torch.Tensor, should_fuse_allreduce_residual_rmsnorm: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        should_fuse_allreduce_residual_rmsnorm: bool = False,
     ) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
@@ -1842,7 +1857,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 or get_tensor_model_parallel_world_size() <= 1
             ):
                 self._should_fuse_allreduce_residual_rmsnorm_static = False
-            elif not global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False):
+            elif not global_server_args_dict.get(
+                "enable_flashinfer_allreduce_fusion", False
+            ):
                 self._should_fuse_allreduce_residual_rmsnorm_static = False
             elif not _is_sm100_supported or not _is_flashinfer_available:
                 self._should_fuse_allreduce_residual_rmsnorm_static = False
@@ -1852,10 +1869,14 @@ class DeepseekV2DecoderLayer(nn.Module):
         if not self._should_fuse_allreduce_residual_rmsnorm_static:
             return False
 
-        batch_size = forward_batch.input_ids.shape[0] if hasattr(forward_batch, "input_ids") else 0
-        is_last_layer = (self.layer_id == self.config.num_hidden_layers - 1)
+        batch_size = (
+            forward_batch.input_ids.shape[0]
+            if hasattr(forward_batch, "input_ids")
+            else 0
+        )
+        is_last_layer = self.layer_id == self.config.num_hidden_layers - 1
         cache_key = (is_last_layer, batch_size)
-        
+
         if cache_key in self._should_fuse_allreduce_residual_rmsnorm_cache:
             return self._should_fuse_allreduce_residual_rmsnorm_cache[cache_key]
 
@@ -1868,7 +1889,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             result = True
 
         self._should_fuse_allreduce_residual_rmsnorm_cache[cache_key] = result
-        
+
         if len(self._should_fuse_allreduce_residual_rmsnorm_cache) > 100:
             oldest_key = next(iter(self._should_fuse_allreduce_residual_rmsnorm_cache))
             del self._should_fuse_allreduce_residual_rmsnorm_cache[oldest_key]
@@ -1899,21 +1920,33 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        batch_size = forward_batch.input_ids.shape[0] if hasattr(forward_batch, "input_ids") else 0
-        is_last_layer = (self.layer_id == self.config.num_hidden_layers - 1)
+        batch_size = (
+            forward_batch.input_ids.shape[0]
+            if hasattr(forward_batch, "input_ids")
+            else 0
+        )
+        is_last_layer = self.layer_id == self.config.num_hidden_layers - 1
         cache_key = (is_last_layer, batch_size)
-        
+
         if cache_key in self._should_fuse_allreduce_residual_rmsnorm_cache:
-            should_fuse_allreduce_residual_rmsnorm = self._should_fuse_allreduce_residual_rmsnorm_cache[cache_key]
+            should_fuse_allreduce_residual_rmsnorm = (
+                self._should_fuse_allreduce_residual_rmsnorm_cache[cache_key]
+            )
         else:
             should_fuse_allreduce_residual_rmsnorm = (
                 self._should_fuse_mlp_allreduce_with_next_layer(forward_batch)
-                and not (self.enable_dp_attention and self.speculative_algorithm.is_eagle())
+                and not (
+                    self.enable_dp_attention and self.speculative_algorithm.is_eagle()
+                )
                 and not self.is_nextn
             )
-            self._should_fuse_allreduce_residual_rmsnorm_cache[cache_key] = should_fuse_allreduce_residual_rmsnorm
+            self._should_fuse_allreduce_residual_rmsnorm_cache[cache_key] = (
+                should_fuse_allreduce_residual_rmsnorm
+            )
 
-        hidden_states = self.mlp(hidden_states, forward_batch, should_fuse_allreduce_residual_rmsnorm)
+        hidden_states = self.mlp(
+            hidden_states, forward_batch, should_fuse_allreduce_residual_rmsnorm
+        )
 
         if should_fuse_allreduce_residual_rmsnorm:
             hidden_states._sglang_needs_allreduce_fusion = True

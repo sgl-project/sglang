@@ -1299,7 +1299,11 @@ class RowParallelLinear(LinearBase):
         with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
             sm.tag(output_parallel)
-        if self.reduce_results and self.tp_size > 1 and not should_fuse_allreduce_residual_rmsnorm:
+        if (
+            self.reduce_results
+            and self.tp_size > 1
+            and not should_fuse_allreduce_residual_rmsnorm
+        ):
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel

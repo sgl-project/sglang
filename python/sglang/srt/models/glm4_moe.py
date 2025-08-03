@@ -156,13 +156,18 @@ class Glm4MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, forward_batch=None, should_fuse_allreduce_residual_rmsnorm=False):
+    def forward(
+        self, x, forward_batch=None, should_fuse_allreduce_residual_rmsnorm=False
+    ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x, should_fuse_allreduce_residual_rmsnorm=should_fuse_allreduce_residual_rmsnorm)
+        x, _ = self.down_proj(
+            x,
+            should_fuse_allreduce_residual_rmsnorm=should_fuse_allreduce_residual_rmsnorm,
+        )
         return x
 
 
@@ -529,7 +534,9 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         self._enable_deepep_moe = global_server_args_dict["moe_a2a_backend"].is_deepep()
 
     def forward_normal_dual_stream(
-        self, hidden_states: torch.Tensor, should_fuse_allreduce_residual_rmsnorm: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        should_fuse_allreduce_residual_rmsnorm: bool = False,
     ) -> torch.Tensor:
 
         current_stream = torch.cuda.current_stream()
@@ -564,12 +571,16 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         return final_hidden_states
 
     def forward_normal(
-        self, hidden_states: torch.Tensor, should_fuse_allreduce_residual_rmsnorm: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        should_fuse_allreduce_residual_rmsnorm: bool = False,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
-            return self.forward_cpu(hidden_states, should_fuse_allreduce_residual_rmsnorm)
+            return self.forward_cpu(
+                hidden_states, should_fuse_allreduce_residual_rmsnorm
+            )
 
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
