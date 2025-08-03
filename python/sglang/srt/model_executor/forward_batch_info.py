@@ -38,6 +38,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.dp_attention import (
     DPPaddingMode,
     get_attention_dp_rank,
@@ -188,6 +189,7 @@ class ForwardBatch:
     token_ids_logprobs: Optional[List[List[int]]] = None
 
     # For logits and logprobs post processing
+    next_token_logits_buffer: torch.Tensor = None
     temp_scaled_logprobs: bool = False
     temperature: torch.Tensor = None
     top_p_normalized_logprobs: bool = False
@@ -644,11 +646,16 @@ class ForwardBatch:
             device=model_runner.device,
         )
 
-        bs = self.batch_size
         if len(global_num_tokens) > 1:
             num_tokens = global_num_tokens[get_attention_dp_rank()]
         else:
             num_tokens = global_num_tokens[0]
+
+        if self.forward_mode.is_decode():
+            setattr(self, "raw_bs", self.batch_size)
+            self.batch_size = num_tokens
+
+        bs = self.batch_size
 
         # padding
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
@@ -656,6 +663,9 @@ class ForwardBatch:
 
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+        )
+        self.seq_lens_sum = self.seq_lens_sum + seq_len_fill_value * (
+            bs - self.seq_lens.shape[0]
         )
         self.seq_lens = self._pad_tensor_to_size(
             self.seq_lens, bs, value=seq_len_fill_value
@@ -700,7 +710,7 @@ class ForwardBatch:
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
 
-        bs = self.batch_size
+        bs = getattr(self, "raw_bs", self.batch_size)
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
@@ -839,7 +849,7 @@ class ForwardBatch:
 
 
 def enable_num_token_non_padded(server_args):
-    return server_args.enable_ep_moe or server_args.enable_deepep_moe
+    return get_moe_expert_parallel_world_size() > 1
 
 
 class PPProxyTensors:

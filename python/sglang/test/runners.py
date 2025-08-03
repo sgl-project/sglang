@@ -499,7 +499,6 @@ class SRTRunner:
         chunked_prefill_size: Optional[int] = None,
         dp_size: int = 1,
         tokenizer_path: Optional[str] = None,
-        enable_ep_moe: bool = False,
         mem_fraction_static: float = 0.65,
         trust_remote_code: bool = False,
         speculative_draft_model_path: Optional[str] = None,
@@ -515,6 +514,7 @@ class SRTRunner:
         max_lora_rank: Optional[int] = None,
         lora_target_modules: Optional[List[str]] = None,
         enable_lora: Optional[bool] = None,
+        max_loaded_loras: Optional[int] = None,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -550,7 +550,6 @@ class SRTRunner:
             enable_dp_attention=enable_dp_attention,
             dp_size=dp_size,
             tokenizer_path=tokenizer_path,
-            enable_ep_moe=enable_ep_moe,
             disable_overlap_schedule=disable_overlap_schedule,
             cuda_graph_max_bs=cuda_graph_max_bs,
             disable_custom_all_reduce=disable_custom_all_reduce,
@@ -558,6 +557,7 @@ class SRTRunner:
             max_lora_rank=max_lora_rank,
             lora_target_modules=lora_target_modules,
             enable_lora=enable_lora,
+            max_loaded_loras=max_loaded_loras,
             **spec_kwargs,
         )
 
