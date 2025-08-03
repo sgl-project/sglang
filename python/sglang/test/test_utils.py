@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.bench_serving import run_benchmark
+from sglang.environ import envs
 from sglang.global_config import global_config
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -96,7 +97,7 @@ DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 
 def is_in_ci():
     """Return whether it is in CI runner."""
-    return get_bool_env_var("SGLANG_IS_IN_CI")
+    return envs.SGLANG_IS_IN_CI.value
 
 
 def is_in_amd_ci():

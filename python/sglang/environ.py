@@ -85,6 +85,7 @@ class Envs:
     # fmt: off
 
     # Test & Debug
+    SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_TEST_RETRACT = EnvBool(False)
 
     # Constrained Decoding

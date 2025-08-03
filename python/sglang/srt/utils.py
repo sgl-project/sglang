@@ -86,6 +86,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager
 
+from sglang.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
 logger = logging.getLogger(__name__)
@@ -1512,7 +1513,7 @@ def init_custom_process_group(
 
 def crash_on_warnings():
     # Crash on warning if we are running CI tests
-    return get_bool_env_var("SGLANG_IS_IN_CI")
+    return envs.SGLANG_IS_IN_CI.value
 
 
 def print_warning_once(msg: str) -> None:
