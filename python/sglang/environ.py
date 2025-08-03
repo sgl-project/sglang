@@ -127,6 +127,7 @@ class Envs:
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
+    SGLANG_CPU_QUANTIZATION = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)

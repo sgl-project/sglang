@@ -545,7 +545,7 @@ class DummyModelLoader(BaseModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
 
-        if get_bool_env_var("SGL_CPU_QUANTIZATION"):
+        if envs.SGLANG_CPU_QUANTIZATION.value:
             return load_model_with_cpu_quantization(
                 self, model_config=model_config, device_config=device_config
             )
