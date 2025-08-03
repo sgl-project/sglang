@@ -88,6 +88,7 @@ class Envs:
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    SGLANG_PROFILE_WITH_STACK = EnvBool(True)
 
     # Constrained Decoding
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
