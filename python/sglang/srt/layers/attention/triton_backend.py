@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -108,9 +109,7 @@ class TritonAttnBackend(AttentionBackend):
             get_attention_tp_size()
         )
 
-        self.static_kv_splits = get_bool_env_var(
-            "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
-        )
+        self.static_kv_splits = envs.SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS.value
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
 

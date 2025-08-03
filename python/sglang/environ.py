@@ -131,6 +131,9 @@ class Envs:
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
 
+    # Triton
+    SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
+
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
