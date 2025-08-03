@@ -146,6 +146,9 @@ class Envs:
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
 
+    # DeepGemm
+    SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(False)
+
     SGLANG_MOE_PADDING = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)

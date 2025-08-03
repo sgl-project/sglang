@@ -56,7 +56,7 @@ class _BaseTestDynamicEPLB(CustomTestCase):
                 *cls.extra_args,
             ],
             env={
-                "SGL_ENABLE_JIT_DEEPGEMM": "0",
+                "SGLANG_ENABLE_JIT_DEEPGEMM": "0",
                 "SGLANG_EXPERT_LOCATION_UPDATER_CANARY": "1",
                 **os.environ,
             },
@@ -89,7 +89,7 @@ class TestDynamicEPLBMultiChunk(_BaseTestDynamicEPLB):
 
 class TestStaticEPLB(CustomTestCase):
     def test_save_expert_distribution_and_init_expert_location(self):
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "0"
+        os.environ["SGLANG_ENABLE_JIT_DEEPGEMM"] = "0"
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             engine_kwargs = dict(
