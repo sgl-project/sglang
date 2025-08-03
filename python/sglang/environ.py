@@ -122,6 +122,10 @@ class Envs:
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
 
+    # Flashinfer
+    SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
+
+    # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)

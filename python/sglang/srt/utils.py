@@ -232,7 +232,7 @@ def is_flashinfer_available():
     Check whether flashinfer is available.
     As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
     """
-    if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
+    if not envs.SGLANG_IS_FLASHINFER_AVAILABLE.value:
         return False
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
