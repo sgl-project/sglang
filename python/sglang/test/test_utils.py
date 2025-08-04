@@ -1357,10 +1357,11 @@ async def send_concurrent_generate_requests(
 
 
 async def send_concurrent_generate_requests_with_custom_params(
-        base_url: str, custom_params: List[dict[str, Any]],
+    base_url: str,
+    custom_params: List[dict[str, Any]],
 ) -> Tuple[int, Any]:
     """Sends generate request concurrently with custom parameters and returns status code and response json tuple. Max concurrency is num_requests."""
-    
+
     base_payload = {
         "text": """
                 System: You are a helpful assistant.
@@ -1381,7 +1382,7 @@ async def send_concurrent_generate_requests_with_custom_params(
             ) as response:
                 resp_json = await response.json()
                 return (response.status, resp_json)
-                
+
     tasks = []
     for c in custom_params:
         req = base_payload.copy()

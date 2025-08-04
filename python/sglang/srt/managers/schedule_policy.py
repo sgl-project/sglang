@@ -72,7 +72,7 @@ class CacheAgnosticPolicy(Enum):
     FCFS = "fcfs"  # first come first serve
     LOF = "lof"  # longest output first
     RANDOM = "random"
-    PRIORITY = "priority" # higher priority first
+    PRIORITY = "priority"  # higher priority first
 
 
 class SchedulePolicy:
@@ -100,9 +100,6 @@ class SchedulePolicy:
         if self.policy == CacheAgnosticPolicy.FCFS:
             # A shortcut for FCFS
             return False
-        if self.policy == CacheAgnosticPolicy.PRIORITY:
-            # We use sorted array for priority scheduling instead
-            return False
 
         policy = self._determine_active_policy(waiting_queue)
 
@@ -128,7 +125,7 @@ class SchedulePolicy:
             elif policy == CacheAgnosticPolicy.RANDOM:
                 SchedulePolicy._sort_randomly(waiting_queue)
             elif policy == CacheAgnosticPolicy.PRIORITY:
-                pass
+                SchedulePolicy._sort_by_priority(waiting_queue)
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
@@ -245,6 +242,11 @@ class SchedulePolicy:
     def _sort_randomly(waiting_queue: List[Req]) -> None:
         """Shuffles the waiting queue randomly."""
         random.shuffle(waiting_queue)
+
+    @staticmethod
+    def _sort_by_priority(waiting_queue: List[Req]) -> None:
+        """Sorts the waiting queue based on the request priority then received titmestamp."""
+        waiting_queue.sort(key=lambda x: (-x.priority, x.queue_time_start))
 
     @staticmethod
     def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:

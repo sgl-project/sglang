@@ -797,6 +797,13 @@ class Req:
             f"{self.sampling_params=})"
         )
 
+    def __lt__(self, other):
+        # Order based on priority and queue timestamp.
+        return self.priority < other.priority or (
+            self.priority == other.priority
+            and other.queue_time_start < self.queue_time_start
+        )
+
 
 # Batch id
 bid = 0
