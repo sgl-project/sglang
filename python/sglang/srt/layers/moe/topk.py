@@ -185,8 +185,9 @@ class TopK(CustomOp):
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
         if self.use_triton_kernels:
+            # renormalize=True is equivalent to sm_first=False
             routing_data, gather_idx, scatter_idx = routing(
-                router_logits, self.top_k, self.renormalize
+                router_logits, self.top_k, sm_first=not self.renormalize
             )
             return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
         else:
