@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  unit-test-basic:
+  per-commit-1-ascend-npu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
     runs-on: linux-arm64-npu-1
@@ -44,13 +44,77 @@ jobs:
         timeout-minutes: 30
         env:
           SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-npu
+          python3 run_suite.py --suite per-commit-1-ascend-npu
+
+  per-commit-2-ascend-npu:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    runs-on: linux-arm64-npu-2
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1.alpha003-910b-ubuntu22.04-py3.11
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/npu_ci_install_dependency.sh
+          # copy required file from our daily cache
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          # copy download through proxy
+          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+
+      - name: Run test
+        timeout-minutes: 30
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-2-ascend-npu
+
+  per-commit-4-ascend-npu:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    runs-on: linux-arm64-npu-4
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1.alpha003-910b-ubuntu22.04-py3.11
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/npu_ci_install_dependency.sh
+          # copy required file from our daily cache
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          # copy download through proxy
+          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+
+      - name: Run test
+        timeout-minutes: 30
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-4-ascend-npu --timeout-per-file 3600
+
   finish:
     if: always()
-    needs: [ unit-test-basic ]
+    needs:
+      - per-commit-1-ascend-npu
+      - per-commit-2-ascend-npu
+      - per-commit-4-ascend-npu
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

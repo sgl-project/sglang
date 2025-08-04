@@ -149,6 +149,7 @@ class ServerArgs:
     max_lora_rank: Optional[int] = None
     lora_target_modules: Optional[Union[set[str], List[str]]] = None
     lora_paths: Optional[Union[dict[str, str], dict[str, LoRARef], List[str]]] = None
+    max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
 
@@ -218,6 +219,7 @@ class ServerArgs:
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
+    enable_symm_mem: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
@@ -867,7 +869,7 @@ class ServerArgs:
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
-            choices=["lpm", "random", "fcfs", "dfs-weight"],
+            choices=["lpm", "random", "fcfs", "dfs-weight", "lof"],
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
@@ -1170,6 +1172,7 @@ class ServerArgs:
             choices=[
                 "round_robin",
                 "shortest_queue",
+                "minimum_tokens",
             ],
         )
 
@@ -1236,6 +1239,12 @@ class ServerArgs:
             type=int,
             default=8,
             help="Maximum number of adapters for a running batch, include base-only request.",
+        )
+        parser.add_argument(
+            "--max-loaded-loras",
+            type=int,
+            default=ServerArgs.max_loaded_loras,
+            help="If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`.",
         )
         parser.add_argument(
             "--lora-backend",
@@ -1601,6 +1610,11 @@ class ServerArgs:
             help="Enable NCCL NVLS for prefill heavy requests when available.",
         )
         parser.add_argument(
+            "--enable-symm-mem",
+            action="store_true",
+            help="Enable NCCL symmetric memory for fast collectives.",
+        )
+        parser.add_argument(
             "--enable-tokenizer-batch-encode",
             action="store_true",
             help="Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
@@ -1929,6 +1943,12 @@ class ServerArgs:
         if "Llama4" in model_arch:
             assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
 
+        if "Gemma2ForCausalLM" in model_arch:
+            # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
+            # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
+            logger.warning("Disable hybrid SWA memory for Gemma2ForCausalLM.")
+            self.disable_hybrid_swa_memory = True
+
         # Check LoRA
         self.check_lora_server_args()
 
@@ -2002,6 +2022,19 @@ class ServerArgs:
             assert self.lora_paths or (
                 self.max_lora_rank and self.lora_target_modules
             ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+
+            # Validate max_loaded_loras
+            if self.max_loaded_loras is not None:
+                assert self.max_loaded_loras >= self.max_loras_per_batch, (
+                    "max_loaded_loras should be greater than or equal to max_loras_per_batch. "
+                    f"max_loaded_loras={self.max_loaded_loras}, max_loras_per_batch={self.max_loras_per_batch}"
+                )
+                assert (
+                    not self.lora_paths or len(self.lora_paths) <= self.max_loaded_loras
+                ), (
+                    "The number of LoRA paths should not exceed max_loaded_loras. "
+                    f"max_loaded_loras={self.max_loaded_loras}, lora_paths={len(self.lora_paths)}"
+                )
 
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
         larger_tp = max(decode_tp, prefill_tp)
