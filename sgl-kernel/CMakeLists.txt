@@ -51,18 +51,25 @@ FetchContent_Declare(
 FetchContent_Populate(repo-cutlass)
 
 # DeepGEMM
-if("${CUDA_VERSION}" VERSION_EQUAL "12.8")
-  set(DeepGEMM_REPO "https://github.com/sgl-project/DeepGEMM")
-  set(DeepGEMM_TAG "blackwell")
-else()
-  set(DeepGEMM_REPO "https://github.com/deepseek-ai/DeepGEMM")
-  set(DeepGEMM_TAG "391755ada0ffefa9a6a52b6f14dcaf22d1a463e0")
-endif()
+# if("${CUDA_VERSION}" VERSION_EQUAL "12.8")
+#   set(DeepGEMM_REPO "https://github.com/sgl-project/DeepGEMM")
+#   set(DeepGEMM_TAG "blackwell")
+# else()
+#   set(DeepGEMM_REPO "https://github.com/deepseek-ai/DeepGEMM")
+#   set(DeepGEMM_TAG "391755ada0ffefa9a6a52b6f14dcaf22d1a463e0")
+# endif()
 
 FetchContent_Declare(
+    repo-fmt
+    GIT_REPOSITORY https://github.com/fmtlib/fmt
+    GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
+    GIT_SHALLOW    OFF
+)
+FetchContent_Populate(repo-fmt)
+FetchContent_Declare(
     repo-deepgemm
-    GIT_REPOSITORY ${DeepGEMM_REPO}
-    GIT_TAG        ${DeepGEMM_TAG}
+    GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM
+    GIT_TAG        3979c0576e09e28b575a69cd639f8200a195d77d
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -400,16 +407,49 @@ if (SGL_KERNEL_ENABLE_FA3)
     target_compile_definitions(flash_ops PRIVATE ${FLASH_OPS_COMPILE_DEFS})
 endif()
 
-# JIT Logic
-# DeepGEMM
+# ============================ DeepGEMM (JIT) ============================= #
+# Create a separate library for DeepGEMM's Python API.
+# This keeps its compilation isolated from the main common_ops.
+set(DEEPGEMM_SOURCES
+    "${repo-deepgemm_SOURCE_DIR}/csrc/python_api.cpp"
+)
 
-install(DIRECTORY "${repo-deepgemm_SOURCE_DIR}/deep_gemm/"
-        DESTINATION "deep_gemm"
-        PATTERN ".git*" EXCLUDE
-        PATTERN "__pycache__" EXCLUDE)
+Python_add_library(deepgemm_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
 
-install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
-        DESTINATION "deep_gemm/include/cute")
+# Link against necessary libraries, including nvrtc for JIT compilation.
+target_link_libraries(deepgemm_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc)
 
-install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
-        DESTINATION "deep_gemm/include/cutlass")
+# Add include directories needed by DeepGEMM.
+target_include_directories(deepgemm_ops PRIVATE
+    ${repo-deepgemm_SOURCE_DIR}/deep_gemm/include
+    ${repo-cutlass_SOURCE_DIR}/include
+    ${repo-fmt_SOURCE_DIR}/include
+)
+
+# Apply the same compile options as common_ops.
+target_compile_options(deepgemm_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
+
+# Create an empty __init__.py to make `deepgemm` a Python package.
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py "")
+install(
+    FILES ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py
+    DESTINATION deepgemm
+    RENAME __init__.py
+)
+
+# Install the compiled DeepGEMM API library.
+install(TARGETS deepgemm_ops LIBRARY DESTINATION deepgemm)
+
+# Install the source files required by DeepGEMM for runtime JIT compilation.
+install(
+    DIRECTORY ${repo-deepgemm_SOURCE_DIR}/csrc/
+    DESTINATION sgl_kernel/deep_gemm/csrc
+)
+install(
+    DIRECTORY ${repo-deepgemm_SOURCE_DIR}/deep_gemm/
+    DESTINATION sgl_kernel/deep_gemm/deep_gemm
+)
+install(
+    DIRECTORY ${repo-deepgemm_SOURCE_DIR}/third-party/
+    DESTINATION sgl_kernel/deep_gemm/third-party
+)
