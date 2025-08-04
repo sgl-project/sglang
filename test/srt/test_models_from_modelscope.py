@@ -12,7 +12,8 @@ class TestDownloadFromModelScope(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "iic/nlp_lstmcrf_word-segmentation_chinese-news"
+        # Use a small model to keep test time short.
+        cls.model = "LLM-Research/tinyllama-15M-stories"
         stat, output = subprocess.getstatusoutput("pip install modelscope")
 
         cls.with_modelscope_environ = {k: v for k, v in os.environ.items()}
@@ -28,12 +29,16 @@ class TestDownloadFromModelScope(CustomTestCase):
         model_cache_root = get_model_cache_root()
         if os.path.exists(model_cache_root):
             shutil.rmtree(model_cache_root)
+
         with mock.patch.dict(os.environ, self.with_modelscope_environ, clear=True):
-            model_path, tokenizer_path = prepare_model_and_tokenizer(
-                self.model, self.model
+            from sglang.srt.server_args import ServerArgs
+
+            args = ServerArgs(self.model)
+            safetensors_path = os.path.join(args.model_path, "model.safetensors")
+            self.assertTrue(
+                os.path.exists(safetensors_path),
+                f"prepare modelscope model failed, {safetensors_path} not found",
             )
-            assert os.path.exists(os.path.join(model_path, "pytorch_model.bin"))
-            assert os.path.exists(os.path.join(tokenizer_path, "config.json"))
 
 
 if __name__ == "__main__":
