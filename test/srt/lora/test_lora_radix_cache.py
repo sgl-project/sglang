@@ -58,7 +58,7 @@ class TestLoRARadixCache(CustomTestCase):
             torch_dtype,
             max_new_tokens=max_new_tokens,
             backend=backend,
-            disable_radix_cache=True,
+            disable_radix_cache=False,
             test_tag="lora-with-radix-cache",
         )
 
@@ -69,7 +69,7 @@ class TestLoRARadixCache(CustomTestCase):
             torch_dtype,
             max_new_tokens=max_new_tokens,
             backend=backend,
-            disable_radix_cache=False,
+            disable_radix_cache=True,
             test_tag="lora-without-radix-cache",
         )
 
