@@ -43,24 +43,18 @@ class TestModelVersion(CustomTestCase):
     def test_model_version_comprehensive(self):
         """Comprehensive test for all model_version functionality."""
 
-        # 1. Test initial custom model_version from args
-        print("1. Testing custom model_version from server args...")
         response = requests.get(f"{self.base_url}/get_model_info")
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertIn("model_version", data)
         self.assertEqual(data["model_version"], "test_version_1.0")
 
-        # 2. Test /get_model_version endpoint
-        print("2. Testing /get_model_version endpoint...")
         response = requests.get(f"{self.base_url}/get_model_version")
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertIn("model_version", data)
         self.assertEqual(data["model_version"], "test_version_1.0")
 
-        # 3. Test /generate response includes model_version in meta_info
-        print("3. Testing /generate response includes model_version...")
         request_data = {
             "text": "Hello, how are you?",
             "sampling_params": {
@@ -75,8 +69,6 @@ class TestModelVersion(CustomTestCase):
         self.assertIn("model_version", data["meta_info"])
         self.assertEqual(data["meta_info"]["model_version"], "test_version_1.0")
 
-        # 4. Test OpenAI chat completion includes metadata with model_version
-        print("4. Testing OpenAI chat completion metadata...")
         request_data = {
             "model": self.model,
             "messages": [{"role": "user", "content": "Hello"}],
@@ -92,8 +84,6 @@ class TestModelVersion(CustomTestCase):
         self.assertIn("model_version", data["metadata"])
         self.assertEqual(data["metadata"]["model_version"], "test_version_1.0")
 
-        # 5. Test OpenAI text completion includes metadata with model_version
-        print("5. Testing OpenAI text completion metadata...")
         request_data = {
             "model": self.model,
             "prompt": "Hello",
@@ -107,8 +97,6 @@ class TestModelVersion(CustomTestCase):
         self.assertIn("model_version", data["metadata"])
         self.assertEqual(data["metadata"]["model_version"], "test_version_1.0")
 
-        # 6. Test /update_model_version endpoint without abort
-        print("6. Testing /update_model_version endpoint...")
         update_data = {
             "new_version": "updated_version_2.0",
             "abort_all_requests": False,
@@ -121,15 +109,11 @@ class TestModelVersion(CustomTestCase):
         self.assertTrue(data["success"])
         self.assertEqual(data["new_version"], "updated_version_2.0")
 
-        # 7. Verify the update worked by checking get_model_version
-        print("7. Verifying model version update...")
         response = requests.get(f"{self.base_url}/get_model_version")
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertEqual(data["model_version"], "updated_version_2.0")
 
-        # 8. Test persistence: /generate should now return updated version
-        print("8. Testing model_version persistence in /generate...")
         gen_data = {
             "text": "Test persistence",
             "sampling_params": {"temperature": 0.0, "max_new_tokens": 3},
@@ -139,8 +123,6 @@ class TestModelVersion(CustomTestCase):
         data = response.json()
         self.assertEqual(data["meta_info"]["model_version"], "updated_version_2.0")
 
-        # 9. Test persistence: OpenAI chat should now return updated version
-        print("9. Testing model_version persistence in OpenAI chat...")
         chat_data = {
             "model": self.model,
             "messages": [{"role": "user", "content": "Test"}],
@@ -152,8 +134,6 @@ class TestModelVersion(CustomTestCase):
         data = response.json()
         self.assertEqual(data["metadata"]["model_version"], "updated_version_2.0")
 
-        # 10. Test update with abort_all_requests=True
-        print("10. Testing update with abort_all_requests=True...")
         update_data = {"new_version": "final_version_3.0", "abort_all_requests": True}
         response = requests.post(
             f"{self.base_url}/update_model_version", json=update_data
@@ -162,9 +142,6 @@ class TestModelVersion(CustomTestCase):
         data = response.json()
         self.assertTrue(data["success"])
         self.assertEqual(data["new_version"], "final_version_3.0")
-
-        # 11. Final verification: all endpoints should now return final version
-        print("11. Final verification of updated model_version...")
 
         # Check /get_model_version
         response = requests.get(f"{self.base_url}/get_model_version")
@@ -214,7 +191,6 @@ class TestModelVersion(CustomTestCase):
         model_info_response = requests.get(f"{self.base_url}/get_model_info")
         self.assertEqual(model_info_response.status_code, 200)
         current_model_path = model_info_response.json()["model_path"]
-        print(f"Current model path: {current_model_path}")
 
         update_data = {
             "model_path": current_model_path,
@@ -232,13 +208,10 @@ class TestModelVersion(CustomTestCase):
             f"update_weights_from_disk failed with status {response.status_code}",
         )
 
-        print("   ✓ update_weights_from_disk with model_version succeeded")
-
         # Verify version was updated
         version_response = requests.get(f"{self.base_url}/get_model_version")
         self.assertEqual(version_response.status_code, 200)
         self.assertEqual(version_response.json()["model_version"], "disk_update_v2.0.0")
-        print("   ✓ Model version was updated successfully")
 
         print("✅ Weight update with model_version test completed!")
 
