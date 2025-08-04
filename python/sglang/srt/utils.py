@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import builtins
 import ctypes
 import dataclasses
@@ -43,7 +44,6 @@ import traceback
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
-from enum import Enum
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -85,10 +85,13 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager
 
+from sglang.srt.metrics.func_timer import enable_func_timer
+
 logger = logging.getLogger(__name__)
 
 show_time_cost = False
 time_infos = {}
+
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
@@ -935,71 +938,6 @@ def monkey_patch_vllm_gguf_config():
         return None
 
     setattr(GGUFConfig, "get_quant_method", get_quant_method_with_embedding_replaced)
-
-
-def maybe_set_triton_cache_manager() -> None:
-    """Set environment variable to tell Triton to use a
-    custom cache manager"""
-    cache_manger = os.environ.get("TRITON_CACHE_MANAGER", None)
-    if cache_manger is None:
-        manager = "sglang.srt.utils:CustomCacheManager"
-        logger.debug("Setting Triton cache manager to: %s", manager)
-        os.environ["TRITON_CACHE_MANAGER"] = manager
-
-
-class CustomCacheManager(FileCacheManager):
-    # Adapted from: https://github.com/tdoublep/vllm/blob/3307522289fdfefe323b6c00d0db696651989a2f/vllm/triton_utils/custom_cache_manager.py
-    def __init__(self, key, override=False, dump=False):
-        from sglang.srt.distributed.parallel_state import get_tp_group
-
-        self.key = key
-        self.lock_path = None
-
-        try:
-            module_path = "triton.runtime.cache"
-            cache_module = importlib.import_module(module_path)
-
-            default_cache_dir = getattr(cache_module, "default_cache_dir", None)
-            default_dump_dir = getattr(cache_module, "default_dump_dir", None)
-            default_override_dir = getattr(cache_module, "default_override_dir", None)
-        except (ModuleNotFoundError, AttributeError) as e:
-            default_cache_dir = None
-            default_dump_dir = None
-            default_override_dir = None
-
-        if dump:
-            self.cache_dir = (
-                default_dump_dir()
-                if default_dump_dir is not None
-                else os.path.join(Path.home(), ".triton", "dump")
-            )
-            self.cache_dir = os.path.join(self.cache_dir, self.key)
-            self.lock_path = os.path.join(self.cache_dir, "lock")
-            os.makedirs(self.cache_dir, exist_ok=True)
-        elif override:
-            self.cache_dir = (
-                default_override_dir()
-                if default_override_dir is not None
-                else os.path.join(Path.home(), ".triton", "override")
-            )
-            self.cache_dir = os.path.join(self.cache_dir, self.key)
-        else:
-            # create cache directory if it doesn't exist
-            self.cache_dir = os.getenv("TRITON_CACHE_DIR", "").strip() or (
-                default_cache_dir()
-                if default_cache_dir is not None
-                else os.path.join(Path.home(), ".triton", "cache")
-            )
-            if self.cache_dir:
-                try:
-                    self.cache_dir = f"{self.cache_dir}_{get_tp_group().local_rank}"
-                except:
-                    self.cache_dir = f"{self.cache_dir}_{os.getpid()}"
-                self.cache_dir = os.path.join(self.cache_dir, self.key)
-                self.lock_path = os.path.join(self.cache_dir, "lock")
-                os.makedirs(self.cache_dir, exist_ok=True)
-            else:
-                raise RuntimeError("Could not create or locate cache dir")
 
 
 def set_ulimit(target_soft_limit=65535):
@@ -2065,6 +2003,16 @@ def is_valid_ipv6_address(address: str) -> bool:
         return False
 
 
+def maybe_wrap_ipv6_address(address: str) -> str:
+    if is_valid_ipv6_address(address):
+        return f"[{address}]"
+    return address
+
+
+def format_tcp_address(ip: str, port: int) -> str:
+    return f"tcp://{maybe_wrap_ipv6_address(ip)}:{port}"
+
+
 def configure_ipv6(dist_init_addr):
     addr = dist_init_addr
     end = addr.find("]")
@@ -2104,7 +2052,7 @@ def rank0_log(msg: str):
         logger.info(msg)
 
 
-def launch_dummy_health_check_server(host, port):
+def launch_dummy_health_check_server(host, port, enable_metrics):
     import asyncio
 
     import uvicorn
@@ -2121,6 +2069,11 @@ def launch_dummy_health_check_server(host, port):
     async def health_generate():
         """Check the health of the http server."""
         return Response(status_code=200)
+
+    # Add prometheus middleware
+    if enable_metrics:
+        add_prometheus_middleware(app)
+        enable_func_timer()
 
     config = uvicorn.Config(
         app,
@@ -2252,27 +2205,6 @@ def flatten_nested_list(nested_list):
         return [nested_list]
 
 
-class DeepEPMode(Enum):
-    normal = "normal"
-    low_latency = "low_latency"
-    auto = "auto"
-
-    def enable_normal(self):
-        return self in [DeepEPMode.normal, DeepEPMode.auto]
-
-    def enable_low_latency(self):
-        return self in [DeepEPMode.low_latency, DeepEPMode.auto]
-
-    def resolve(self, is_extend_in_batch: bool):
-        if self != DeepEPMode.auto:
-            return self
-
-        if is_extend_in_batch:
-            return DeepEPMode.normal
-        else:
-            return DeepEPMode.low_latency
-
-
 def is_non_idle_and_non_empty(forward_mode, hidden_states):
     return (
         (forward_mode is not None)
@@ -2390,6 +2322,8 @@ def is_fa3_default_architecture(hf_config):
         "Gemma3ForConditionalGeneration",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
+        "Glm4MoeForCausalLM",
+        "Step3VLForConditionalGeneration",
     }
     return architectures[0] in default_archs
 
@@ -2459,7 +2393,7 @@ def require_mlp_tp_gather(server_args):
             return True
         elif not server_args.enable_dp_lm_head:
             return True
-        elif not server_args.enable_deepep_moe:
+        elif server_args.moe_a2a_backend is None:
             return True
         else:
             return (
@@ -2475,7 +2409,7 @@ def require_attn_tp_gather(server_args):
     Check if the input of attention is scattered.
     """
     assert server_args.moe_dense_tp_size in [1, None]
-    if server_args.enable_deepep_moe or server_args.moe_dense_tp_size == 1:
+    if server_args.moe_a2a_backend is not None or server_args.moe_dense_tp_size == 1:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
@@ -2910,3 +2844,89 @@ SUPPORTED_LORA_TARGET_MODULES = [
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
+
+
+class ConcurrentCounter:
+    """
+    An asynchronous counter for managing concurrent tasks that need
+    coordinated increments, decrements, and waiting until the count reaches zero.
+
+    This class is useful for scenarios like tracking the number of in-flight tasks
+    and waiting for them to complete.
+    """
+
+    def __init__(self, initial: int = 0):
+        """
+        Initialize the counter with an optional initial value.
+
+        Args:
+            initial (int): The initial value of the counter. Default is 0.
+        """
+        self._count = initial
+        self._condition = asyncio.Condition()
+
+    def value(self) -> int:
+        """
+        Return the current value of the counter.
+
+        Note:
+            This method is not synchronized. It may return a stale value
+            if other coroutines are concurrently modifying the counter.
+
+        Returns:
+            int: The current counter value.
+        """
+        return self._count
+
+    def __repr__(self) -> str:
+        """Return an informative string representation of the counter."""
+        return f"<ConcurrentCounter value={self.value()}>"
+
+    async def increment(self, n: int = 1, notify_all: bool = True):
+        """
+        Atomically increment the counter by a given amount and notify all waiters.
+
+        Args:
+            n (int): The amount to increment the counter by. Default is 1.
+            notify_all (bool): Whether to notify all waiters after incrementing. Default is True.
+        """
+        async with self._condition:
+            self._count += n
+            if notify_all:
+                self._condition.notify_all()
+
+    async def decrement(self, n: int = 1, notify_all: bool = True):
+        """
+        Atomically decrement the counter by a given amount and notify all waiters.
+
+        Args:
+            n (int): The amount to decrement the counter by. Default is 1.
+            notify_all (bool): Whether to notify all waiters after decrementing. Default is True.
+        """
+        async with self._condition:
+            self._count -= n
+            if notify_all:
+                self._condition.notify_all()
+
+    async def wait_for(self, condition: Callable[[int], bool]):
+        """
+        Asynchronously wait until the counter satisfies a given condition.
+
+        This suspends the calling coroutine without blocking the thread, allowing
+        other tasks to run while waiting. When the condition is met, the coroutine resumes.
+
+        Args:
+            condition (Callable[[int], bool]): A function that takes the current counter value
+                and returns True when the condition is satisfied.
+        """
+        async with self._condition:
+            await self._condition.wait_for(lambda: condition(self._count))
+
+    async def wait_for_zero(self):
+        """
+        Asynchronously wait until the counter reaches zero.
+
+        This suspends the calling coroutine without blocking the thread, allowing
+        other tasks to run while waiting. When the counter becomes zero, the coroutine resumes.
+        """
+        self.wait_for(lambda count: count == 0)

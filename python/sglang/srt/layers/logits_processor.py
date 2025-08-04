@@ -83,6 +83,7 @@ class LogitsProcessorOutput:
 class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+    next_token_logits_buffer: Optional[torch.Tensor] = None
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -148,6 +149,7 @@ class LogitsMetadata:
         return cls(
             forward_mode=forward_batch.forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
+            next_token_logits_buffer=forward_batch.next_token_logits_buffer,
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
@@ -170,8 +172,6 @@ class LogitsMetadata:
         )
 
     def compute_dp_attention_metadata(self):
-        # TODO(ch-wan): gathered_buffer here is larger than the actual required size in draft extend,
-        # we may use a smaller buffer in draft extend.
 
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
         dp_rank = get_attention_dp_rank()
@@ -185,6 +185,19 @@ class LogitsMetadata:
 
         self.dp_local_start_pos = dp_local_start_pos
         self.dp_local_num_tokens = dp_local_num_tokens
+
+        if self.global_num_tokens_for_logprob_cpu is not None:
+            # create a smaller buffer to reduce peak memory usage
+            self.gathered_buffer = torch.empty(
+                (
+                    sum(self.global_num_tokens_for_logprob_cpu),
+                    self.gathered_buffer.shape[1],
+                ),
+                dtype=self.gathered_buffer.dtype,
+                device=self.gathered_buffer.device,
+            )
+        else:
+            self.gathered_buffer = torch.empty_like(self.gathered_buffer)
 
 
 class LogitsProcessor(nn.Module):
@@ -430,7 +443,7 @@ class LogitsProcessor(nn.Module):
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits_metadata.compute_dp_attention_metadata()
             hidden_states, local_hidden_states = (
-                torch.empty_like(logits_metadata.gathered_buffer),
+                logits_metadata.gathered_buffer,
                 hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
@@ -497,7 +510,13 @@ class LogitsProcessor(nn.Module):
             )
             dp_scatter(logits, global_logits, logits_metadata)
 
-        logits = logits[:, : self.config.vocab_size].float()
+        if logits_metadata.next_token_logits_buffer is not None:
+            logits_buffer = logits_metadata.next_token_logits_buffer
+            assert logits_buffer.dtype == torch.float
+            logits_buffer.copy_(logits[:, : self.config.vocab_size])
+            logits = logits_buffer
+        else:
+            logits = logits[:, : self.config.vocab_size].float()
 
         if self.final_logit_softcapping:
             fused_softcap(logits, self.final_logit_softcapping)
