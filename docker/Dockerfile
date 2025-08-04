@@ -33,7 +33,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     libczmq4 libczmq-dev \
     libfabric-dev \
     patchelf \
-    nvidia-dkms-570 \
+    nvidia-dkms-575 \
     devscripts debhelper fakeroot dkms check libsubunit0 libsubunit-dev \
 # Install development tools and utilities
  && apt-get update && apt-get install -y \
@@ -88,11 +88,12 @@ RUN python3 -m pip install --no-cache-dir --upgrade setuptools html5lib six --br
  && case "$CUDA_VERSION" in \
       12.6.1) CUINDEX=126 ;; \
       12.8.1) CUINDEX=128 ;; \
+      12.9.1) CUINDEX=129 ;; \
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
- && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url "https://download.pytorch.org/whl/cu${CUINDEX}" --break-system-packages \
+ && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url "https://download.pytorch.org/whl/test/cu${CUINDEX}" --break-system-packages \
  && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps --break-system-packages \
- && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
+ && if [ "$CUDA_VERSION" = "12.9.1" ]; then \
       python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.2.9/sgl_kernel-0.2.9+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps --break-system-packages; \
     fi
 
