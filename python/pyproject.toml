@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.9.post6"
+version = "0.4.10.post2"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -49,12 +49,12 @@ runtime_common = [
     "timm==1.0.16",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.21",
+    "xgrammar==0.1.22",
 ]
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.2.7",
+    "sgl-kernel==0.2.8",
     "torch==2.7.1",
     "torchaudio==2.7.1",
     "torchvision==0.22.1",
@@ -108,6 +108,7 @@ test = [
     "pandas",
     "peft",
     "sentence_transformers",
+    "pytest",
 ]
 all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[torch_memory_saver]", "sglang[decord]"]
 all_hip = ["sglang[srt_hip]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
@@ -130,6 +131,7 @@ dev_cpu = ["sglang[all_cpu]", "sglang[test]"]
 "sglang" = [
     "srt/layers/moe/fused_moe_triton/configs/*/*.json",
     "srt/layers/quantization/configs/*.json",
+    "srt/mem_cache/storage/hf3fs/hf3fs_utils.cpp",
 ]
 
 [tool.setuptools.packages.find]
