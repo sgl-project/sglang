@@ -8,6 +8,11 @@ try:
 except:
     raise ImportError("Can not import sgl_kernel. Please check your installation.")
 
+try:
+    from flash_attn.cute.interface import FlashAttnFunc
+except ImportError:
+    FlashAttnFunc = None
+
 
 def is_fa3_supported(device=None) -> bool:
     #  There some fa3 FYI
@@ -21,6 +26,11 @@ def is_fa3_supported(device=None) -> bool:
     return (torch.cuda.get_device_capability(device)[0] >= 8) and (
         torch.version.cuda >= "12.3"
     )
+
+
+def is_sm90_or_higher(device=None) -> bool:
+    """Check if device supports sm90 or higher (compute capability 9.0+)"""
+    return torch.cuda.get_device_capability(device)[0] >= 9
 
 
 def maybe_contiguous(x):
@@ -235,6 +245,27 @@ def flash_attn_varlen_func(
     sm_margin=0,
     return_softmax_lse=False,
 ):
+    # Use FlashAttnFunc for sm90 and above when available and conditions are met
+    if (is_sm90_or_higher() and FlashAttnFunc is not None and 
+        qv is None and q_descale is None and k_descale is None and v_descale is None and
+        cu_seqlens_q is None and cu_seqlens_k is None and seqused_q is None and seqused_k is None):
+        
+        # Convert window_size format from (-1, -1) to (None, None) for FlashAttnFunc
+        window_size_converted = tuple(None if w == -1 else w for w in window_size)
+        
+        out, lse = FlashAttnFunc.forward(
+            None,  # ctx (not needed for forward call)
+            q,
+            k, 
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size_converted,
+            softcap=softcap,
+        )
+        
+        return (out, lse) if return_softmax_lse else out
+    
     if not is_fa3_supported():
         raise NotImplementedError(
             "flash_attn at sgl-kernel is only supported on sm90 and above"
