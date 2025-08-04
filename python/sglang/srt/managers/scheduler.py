@@ -656,22 +656,6 @@ class Scheduler(
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
         init_embedding_cache(embedding_cache_size * 1024 * 1024)
 
-    def init_profier(self):
-        self.torch_profiler = None
-        self.torch_profiler_output_dir: Optional[str] = None
-        self.profiler_activities: Optional[List[str]] = None
-        self.profile_id: Optional[str] = None
-        self.profiler_start_forward_ct: Optional[int] = None
-        self.profiler_target_forward_ct: Optional[int] = None
-        self.profiler_target_prefill_ct: Optional[int] = None
-        self.profiler_target_decode_ct: Optional[int] = None
-        self.profiler_prefill_ct: Optional[int] = None
-        self.profiler_decode_ct: Optional[int] = None
-        self.profile_by_stage: bool = False
-        self.profile_steps: Optional[int] = None
-        self.profile_in_progress: bool = False
-        self.rpd_profiler = None
-
     def init_disaggregation(self):
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
