@@ -1475,7 +1475,7 @@ class TokenizerManager:
                 self.dump_requests_before_crash()
                 break
 
-            elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
+            elif get_bool_env_var("SGLANG_FORCE_SHUTDOWN"):
                 # if force shutdown flag set, exit immediately
                 logger.error(
                     "Signal SIGTERM received while force shutdown flag set. Force exiting... remaining number of requests: %d",

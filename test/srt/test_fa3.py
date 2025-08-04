@@ -77,7 +77,7 @@ class BaseFlashAttentionTest(CustomTestCase):
     def setUpClass(cls):
         # disable deep gemm precompile to make launch server faster
         # please don't do this if you want to make your inference workload faster
-        os.environ["SGL_JIT_DEEPGEMM_PRECOMPILE"] = "false"
+        os.environ["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "false"
         os.environ["SGLANG_ENABLE_JIT_DEEPGEMM"] = "false"
         cls.process = popen_launch_server(
             cls.model,

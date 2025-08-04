@@ -896,7 +896,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         # TODO: Design a finer way to determine the threshold
         self.chunked_prefix_cache_threshold = get_int_env_var(
-            "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
+            "SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
         )
 
         # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
@@ -2214,7 +2214,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         if (
                             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                             and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
-                            and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
+                            and get_bool_env_var("SGLANG_USE_DEEPGEMM_BMM", "false")
                         ):
                             block_scale = weight_scale
                             use_deep_gemm_bmm = True
