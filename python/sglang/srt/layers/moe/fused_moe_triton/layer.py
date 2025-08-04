@@ -412,7 +412,6 @@ class FusedMoE(torch.nn.Module):
         weight_name: str,
         shard_id: str,
         expert_id: int,
-        checkpoint_weights_transposed: bool = False,
     ) -> None:
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
         if expert_id == -1:
@@ -587,8 +586,6 @@ class FusedMoE(torch.nn.Module):
         if is_weight and not is_bias:
             if loaded_weight.ndim > 2:
                 loaded_weight = loaded_weight.reshape(loaded_weight.shape[0], -1)
-            if checkpoint_weights_transposed:
-                loaded_weight = loaded_weight.t().contiguous() # Oai model weight: [:, input channel, output channel]
             if shard_id == "w13":
                 # Handle full gate_up_proj weight (w13)
                 weight_param = param
