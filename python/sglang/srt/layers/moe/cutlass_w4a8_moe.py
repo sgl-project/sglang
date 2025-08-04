@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cutlass W4A8 MoE kernel."""
+import logging
 from typing import Optional
 
 import torch
@@ -19,6 +20,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     run_cutlass_moe_ep_preproess,
 )
 from sglang.srt.layers.moe.utils import DeepEPMode
+
+logger = logging.getLogger(__name__)
 
 
 def cutlass_w4a8_moe(
@@ -113,6 +116,11 @@ def cutlass_w4a8_moe(
     device = a.device
 
     if not deepep_mode:
+        local_topk_ids = topk_ids_
+        local_topk_ids = (
+            torch.where(local_topk_ids == -1, num_experts, topk_ids_).to(torch.int32)
+        ).contiguous()
+
         _, src2dst, _ = run_cutlass_moe_ep_preproess(
             local_topk_ids,
             num_experts,
@@ -150,26 +158,23 @@ def cutlass_w4a8_moe(
             a,
             gateup_input_pre_reorder,
             src2dst,
-            topk_ids_,
+            topk_ids_.to(torch.int64),
             None,
             topk,
             a.shape[1],
             BLOCK_SIZE=512,
         )
-        gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=device)
+        gateup_input = torch.empty(
+            gateup_input_pre_reorder.shape, dtype=torch.float8_e4m3fn, device=device
+        )
         sgl_per_tensor_quant_fp8(
-            gateup_input.to(torch.half),
-            gateup_input_pre_reorder,
-            a1_scale.float(),
-            True,
+            gateup_input_pre_reorder, gateup_input, a1_scale.float(), True
         )
         del gateup_input_pre_reorder
         local_topk_ids = topk_ids_
         local_topk_ids = (
-            torch.where(local_topk_ids == -1, num_experts, topk_ids_)
-            .to(torch.int32)
-            .contiguous()
-        )
+            torch.where(local_topk_ids == -1, num_experts, topk_ids_).to(torch.int32)
+        ).contiguous()
 
     else:
         raise ValueError(f"Invalid deepep_mode: {deepep_mode}")
@@ -209,7 +214,6 @@ def cutlass_w4a8_moe(
         128,
         topk,
     )
-
     intermediate = torch.empty((m * topk, n), device=device, dtype=torch.half)
     silu_and_mul(c1, intermediate)
 
@@ -254,9 +258,9 @@ def cutlass_w4a8_moe(
         output = torch.empty(
             (num_tokens, c2.shape[1]),
             device=c2.device,
-            dtype=c2.dtype,
+            dtype=torch.bfloat16,
         )
-        deepep_post_reorder_triton_kernel[(m,)](
+        deepep_post_reorder_triton_kernel[(num_tokens,)](
             c2,
             output,
             src2dst,
