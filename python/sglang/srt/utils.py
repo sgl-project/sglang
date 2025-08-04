@@ -45,7 +45,6 @@ import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from enum import Enum
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -94,6 +93,7 @@ logger = logging.getLogger(__name__)
 
 show_time_cost = False
 time_infos = {}
+
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 

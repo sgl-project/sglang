@@ -343,7 +343,7 @@ class Glm4MoeGate(nn.Module):
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
         self.e_score_correction_bias = nn.Parameter(
-            torch.empty((config.n_routed_experts))
+            torch.empty((config.n_routed_experts), dtype=torch.float32)
         )
         if _is_cpu and _is_cpu_amx_available:
             self.quant_method = PackWeightMethod(weight_names=["weight"])
