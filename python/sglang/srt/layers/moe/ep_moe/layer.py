@@ -46,15 +46,9 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-use_flashinfer_trtllm_moe = (
-    global_server_args_dict["enable_flashinfer_trtllm_moe"]
-    and global_server_args_dict["enable_ep_moe"]
-)
 
 if not (_is_npu or _is_hip):
     from sgl_kernel import silu_and_mul
-
-    from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 
 if _use_aiter:
     from aiter import ActivationType, QuantType
@@ -242,6 +236,8 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: DeepEPLLOutput,
     ):
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+
         hidden_states, _, _, masked_m, _ = dispatch_output
         output = cutlass_w4a8_moe(
             self.start_expert_id,
