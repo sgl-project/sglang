@@ -764,7 +764,7 @@ class FlashInferFusedMoE(FusedMoE):
         self.topk_group = topk_group
         self.correction_bias = correction_bias
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, topk_output: tuple):
         assert self.quant_method is not None
         assert (
             self.renormalize
@@ -772,6 +772,14 @@ class FlashInferFusedMoE(FusedMoE):
         assert (
             self.num_fused_shared_experts == 0
         ), "Fused shared experts are not supported for flashinfer blockscale fp8 moe"
+
+        # TRTLLM mode expects (TopK_config, router_logits) tuple
+        if not isinstance(topk_output, tuple) or len(topk_output) != 2:
+            raise ValueError(
+                f"FlashInferFusedMoE expects (TopK_config, router_logits) tuple, got {type(topk_output)}"
+            )
+        _, router_logits = topk_output
+
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply_with_router_logits(
             layer=self,

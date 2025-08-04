@@ -692,7 +692,7 @@ class FlashInferEPMoE(EPMoE):
         self.correction_bias = correction_bias
         self.use_flashinfer_trtllm_moe = should_use_flashinfer_trtllm_moe()
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, topk_output: tuple):
         assert self.use_flashinfer_trtllm_moe
         assert (
             self.activation == "silu"
@@ -703,6 +703,14 @@ class FlashInferEPMoE(EPMoE):
         assert (
             self.num_fused_shared_experts == 0
         ), "Fused shared experts are not supported for flashinfer blockscale fp8 moe"
+
+        # TRTLLM mode expects (TopK_config, router_logits) tuple
+        if not isinstance(topk_output, tuple) or len(topk_output) != 2:
+            raise ValueError(
+                f"FlashInferEPMoE expects (TopK_config, router_logits) tuple, got {type(topk_output)}"
+            )
+        _, router_logits = topk_output
+
         a_q, a_sf = sglang_per_token_group_quant_fp8(hidden_states, self.block_shape[1])
         # NOTE: scales of hidden states have to be transposed!
         a_sf_t = a_sf.t().contiguous()
