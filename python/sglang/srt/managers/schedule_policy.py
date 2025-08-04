@@ -103,6 +103,7 @@ class SchedulePolicy:
         if self.policy == CacheAgnosticPolicy.PRIORITY:
             # We use sorted array for priority scheduling instead
             return False
+
         policy = self._determine_active_policy(waiting_queue)
 
         prefix_computed = False

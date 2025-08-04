@@ -64,7 +64,6 @@ class TestMaxQueuedRequests(CustomTestCase):
         status_codes = asyncio.run(
             send_concurrent_generate_requests(self.base_url, num_requests=10)
         )
-        print(status_codes)
 
         expected_status_codes = [200, 200, 503, 503, 503, 503, 503, 503, 503, 503]
         assert status_codes == expected_status_codes
