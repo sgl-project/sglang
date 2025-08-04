@@ -1,6 +1,8 @@
 import logging
 from typing import List, Optional
 
+import torch
+
 from sglang.srt.utils import get_bool_env_var, get_free_port, maybe_wrap_ipv6_address
 
 logger = logging.getLogger(__name__)
@@ -86,6 +88,7 @@ class MooncakeTransferEngine:
             ret = self.engine.transfer_sync_write(
                 session_id, buffer, peer_buffer_address, length
             )
+            torch.cuda.synchronize()  # Ensure the transfer is complete before proceeding
         except Exception:
             # Mark transfer request as failed
             ret = -1
@@ -113,6 +116,7 @@ class MooncakeTransferEngine:
             ret = self.engine.batch_transfer_sync_write(
                 session_id, buffers, peer_buffer_addresses, lengths
             )
+            torch.cuda.synchronize()  # Ensure the transfer is complete before proceeding
         except Exception:
             ret = -1
             # Inform user to upgrade mooncake-transfer-engine >= 0.3.4.post2
