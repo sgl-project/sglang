@@ -152,8 +152,6 @@ class GenerateReqInput:
         else:
             self._normalize_batch_inputs()
 
-        self._validate_session_params()
-
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
         if (
@@ -525,6 +523,9 @@ class TokenizedGenerateReqInput:
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+    # For dp balance
+    dp_balance_id: int = -1
+
 
 @dataclass
 class EmbeddingReqInput:
@@ -650,6 +651,8 @@ class TokenizedEmbeddingReqInput:
     token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
+    # For dp balance
+    dp_balance_id: int = -1
 
 
 @dataclass
@@ -1099,7 +1102,7 @@ class UnloadLoRAAdapterReqInput:
 class LoRAUpdateResult:
     success: bool
     error_message: Optional[str] = None
-    loaded_adapters: Dict[str, LoRARef] = field(default_factory=dict)
+    loaded_adapters: Optional[Dict[str, LoRARef]] = None
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
