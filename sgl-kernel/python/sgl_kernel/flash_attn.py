@@ -9,7 +9,7 @@ except:
     raise ImportError("Can not import sgl_kernel. Please check your installation.")
 
 try:
-    from flash_attn.cute.interface import FlashAttnFunc
+    from sgl_kernel.flash_attn.cute.interface import FlashAttnFunc
 except ImportError:
     FlashAttnFunc = None
 
