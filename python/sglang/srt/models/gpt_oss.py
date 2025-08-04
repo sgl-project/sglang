@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only OpenAIMoE model."""
+"""Inference-only GptOssMoE model."""
 import logging
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 import einops
@@ -73,7 +73,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher, model_forward_maybe_tbo
 from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
 
-OpenAIMoeConfig = None
+GptOssMoeConfig = None
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -165,10 +165,10 @@ def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
 
-class OpenAIMoeMLP(nn.Module):
+class GptOssMoeMLP(nn.Module):
     def __init__(
         self,
-        config: OpenAIMoeConfig,
+        config: GptOssMoeConfig,
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
@@ -205,10 +205,10 @@ class OpenAIMoeMLP(nn.Module):
         return x
 
 
-class OpenAIMoeSparseMoeBlock(nn.Module):
+class GptOssMoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
-        config: OpenAIMoeConfig,
+        config: GptOssMoeConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -305,7 +305,7 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        # Todo: to use topk_output for both UnquantizedFusedMoEMethodOpenAI and MXFP4FusedMoEMethodOpenAI
+        # Todo: to use topk_output for mxfp4 moe
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
         # final_hidden_states = self.experts(hidden_states, router_logits)
@@ -474,10 +474,10 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
         state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
 
 
-class OpenAIMoeAttention(nn.Module):
+class GptOssMoeAttention(nn.Module):
     def __init__(
         self,
-        config: OpenAIMoeConfig,
+        config: GptOssMoeConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -660,10 +660,10 @@ class OpenAIMoeAttention(nn.Module):
         return self.forward_core(s)
 
 
-class OpenAIMoeDecoderLayer(nn.Module):
+class GptOssMoeDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: OpenAIMoeConfig,
+        config: GptOssMoeConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -679,7 +679,7 @@ class OpenAIMoeDecoderLayer(nn.Module):
         )
         rms_norm_eps = config.rms_norm_eps
         attention_bias = config.attention_bias
-        self.self_attn = OpenAIMoeAttention(
+        self.self_attn = GptOssMoeAttention(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -701,7 +701,7 @@ class OpenAIMoeDecoderLayer(nn.Module):
         self.attn_tp_rank = get_attention_tp_rank()
         self.local_dp_size = get_local_attention_dp_size()
 
-        # OpenAIMoE all layers are sparse and have no nextn now
+        # GptOssMoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True
         is_previous_layer_sparse = True
 
@@ -713,14 +713,14 @@ class OpenAIMoeDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = OpenAIMoeSparseMoeBlock(
+            self.mlp = GptOssMoeSparseMoeBlock(
                 config=config,
                 layer_id=self.layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            self.mlp = OpenAIMoeMLP(
+            self.mlp = GptOssMoeMLP(
                 config=config,
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -829,13 +829,13 @@ class OpenAIMoeDecoderLayer(nn.Module):
         return output
 
 
-class OpenAIMoeModel(nn.Module):
+class GptOssMoeModel(nn.Module):
     def __init__(
         self,
-        config: OpenAIMoeConfig,
+        config: GptOssMoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        decoder_layer_type: type[nn.Module] = OpenAIMoeDecoderLayer,
+        decoder_layer_type: type[nn.Module] = GptOssMoeDecoderLayer,
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -852,7 +852,7 @@ class OpenAIMoeModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        decoder_layer_type = decoder_layer_type or OpenAIMoeDecoderLayer
+        decoder_layer_type = decoder_layer_type or GptOssMoeDecoderLayer
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
@@ -923,12 +923,12 @@ class OpenAIMoeModel(nn.Module):
         return hidden_states
 
 
-class OpenAIMoeForCausalLM(nn.Module):
+class GptOssForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
     def __init__(
         self,
-        config: OpenAIMoeConfig,
+        config: GptOssMoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -949,7 +949,7 @@ class OpenAIMoeForCausalLM(nn.Module):
         ###########################################################################
 
         self.quant_config = quant_config
-        self.model = OpenAIMoeModel(
+        self.model = GptOssMoeModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = ParallelLMHead(
@@ -1029,7 +1029,7 @@ class OpenAIMoeForCausalLM(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            # OpenAIMoe use router to name gate
+            # GptOssMoe use router to name gate
             if ".mlp.router." in name:
                 name = name.replace(".mlp.router.", ".mlp.gate.")
                 if name in params_dict:
@@ -1156,7 +1156,7 @@ class OpenAIMoeForCausalLM(nn.Module):
         self.routed_experts_weights_of_layer = {
             layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
             for layer_id in range(self.start_layer, self.end_layer)
-            if isinstance(self.model.layers[layer_id].mlp, OpenAIMoeSparseMoeBlock)
+            if isinstance(self.model.layers[layer_id].mlp, GptOssMoeSparseMoeBlock)
         }
 
     @classmethod
@@ -1168,4 +1168,4 @@ class OpenAIMoeForCausalLM(nn.Module):
         )
 
 
-EntryClass = OpenAIMoeForCausalLM
+EntryClass = GptOssForCausalLM
