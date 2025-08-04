@@ -3,16 +3,14 @@
 import heapq
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, List, Optional
+from typing import List, Optional
 
 import torch
 
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
 
 
 class LoRAKey:
