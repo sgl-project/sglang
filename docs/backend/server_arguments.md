@@ -155,7 +155,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--dp-size` | The data parallelism size. | 1 |
-| `--load-balance-method` | The load balancing strategy for data parallelism. | round_robin |
+| `--load-balance-method` | The load balancing strategy for data parallelism. Options include: 'round_robin', 'minimum_tokens'. The Minimum Token algorithm can only be used when DP attention is applied. This algorithm performs load balancing based on the real-time token load of the DP workers. | round_robin |
 
 ## Multi-node distributed serving
 
