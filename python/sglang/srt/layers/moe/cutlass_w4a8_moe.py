@@ -44,7 +44,7 @@ def cutlass_w4a8_moe(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     apply_router_weight_on_input: bool = False,
-    ep_mode: str = "ep",
+    deepep_mode: str = None,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -90,7 +90,7 @@ def cutlass_w4a8_moe(
     assert w1_q.dtype == torch.int8
     assert w2_q.dtype == torch.int8
     assert (
-        a.shape[1] // 2 == w1_q.shape[2] if ep_mode != "deepep_ll" else True
+        a.shape[1] // 2 == w1_q.shape[2] if not deepep_mode else True
     ), "Hidden size mismatch w1"
     assert w1_q.shape[2] * 2 == w2_q.shape[1], "Hidden size mismatch w2"
     assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
