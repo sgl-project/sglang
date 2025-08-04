@@ -68,8 +68,8 @@ FetchContent_Declare(
 FetchContent_Populate(repo-fmt)
 FetchContent_Declare(
     repo-deepgemm
-    GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM
-    GIT_TAG        3979c0576e09e28b575a69cd639f8200a195d77d
+    GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
+    GIT_TAG        cabi
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -414,42 +414,34 @@ set(DEEPGEMM_SOURCES
     "${repo-deepgemm_SOURCE_DIR}/csrc/python_api.cpp"
 )
 
-Python_add_library(deepgemm_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
+Python_add_library(deep_gemm_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
 
 # Link against necessary libraries, including nvrtc for JIT compilation.
-target_link_libraries(deepgemm_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc)
+target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc)
 
 # Add include directories needed by DeepGEMM.
-target_include_directories(deepgemm_ops PRIVATE
+target_include_directories(deep_gemm_cpp PRIVATE
     ${repo-deepgemm_SOURCE_DIR}/deep_gemm/include
     ${repo-cutlass_SOURCE_DIR}/include
     ${repo-fmt_SOURCE_DIR}/include
 )
 
 # Apply the same compile options as common_ops.
-target_compile_options(deepgemm_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
+target_compile_options(deep_gemm_cpp PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
 
 # Create an empty __init__.py to make `deepgemm` a Python package.
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py "")
 install(
     FILES ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py
-    DESTINATION deepgemm
+    DESTINATION deep_gemm
     RENAME __init__.py
 )
 
 # Install the compiled DeepGEMM API library.
-install(TARGETS deepgemm_ops LIBRARY DESTINATION deepgemm)
+install(TARGETS deep_gemm_cpp LIBRARY DESTINATION deep_gemm)
 
 # Install the source files required by DeepGEMM for runtime JIT compilation.
 install(
-    DIRECTORY ${repo-deepgemm_SOURCE_DIR}/csrc/
-    DESTINATION sgl_kernel/deep_gemm/csrc
-)
-install(
     DIRECTORY ${repo-deepgemm_SOURCE_DIR}/deep_gemm/
-    DESTINATION sgl_kernel/deep_gemm/deep_gemm
-)
-install(
-    DIRECTORY ${repo-deepgemm_SOURCE_DIR}/third-party/
-    DESTINATION sgl_kernel/deep_gemm/third-party
+    DESTINATION deep_gemm
 )
