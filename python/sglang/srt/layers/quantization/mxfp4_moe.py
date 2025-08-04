@@ -16,7 +16,7 @@ try:
                                    'triton_kernels')
     else:
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        triton_path = os.path.join(current_dir, '..', '..', '..', '..', '..', '..',
+        triton_path = os.path.join(current_dir, '..', '..', '..', '..', '..',
                                    '3rdparty', 'triton', 'python',
                                    'triton_kernels')
     triton_path = os.path.abspath(triton_path)
@@ -182,9 +182,6 @@ def fused_experts_oai(
     else:
         rdata, gather_indx, scatter_indx = None, None, None
 
-    # print(f">>> topk_weights: {topk_weights.shape}, topk_ids: {topk_ids.shape}, expert_logits: {expert_logits.shape}")
-    # print(f">>> rdata: {rdata}, gather_indx: {gather_indx}, scatter_indx: {scatter_indx}")
-
     pc1 = PrecisionConfig(flex_ctx=FlexCtx(),
                         allow_tf32=False,
                         out_dtype=dtype)
@@ -223,7 +220,6 @@ def fused_experts_mxfp4_oai(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
     w2: torch.Tensor,
-    # expert_logits: torch.Tensor,
     expert_logits: torch.Tensor, # (num_tokens, num_experts)
     top_k: int,
     fc31_input_dequant: torch.Tensor,
@@ -310,9 +306,9 @@ def fused_experts_mxfp4_oai(
     else:
         flex_ctx_2 = FlexCtx()
     pc2 = PrecisionConfig(mx_ctx=mx_ctx_2,
-                            flex_ctx=flex_ctx_2,
-                            allow_tf32=False,
-                            out_dtype=dtype)
+                          flex_ctx=flex_ctx_2,
+                          allow_tf32=False,
+                          out_dtype=dtype)
 
     # Call the Triton kernel, which also does finalization
     gemm2_output = matmul_ogs(
@@ -325,5 +321,5 @@ def fused_experts_mxfp4_oai(
         gammas=rdata.gate_scal if rdata else None)
     gemm2_output = maybe_remove_padding(gemm2_output,
                                         hidden_size,
-                                        swizzle_scale)
+                                        swizzle_scale).contiguous()
     return gemm2_output

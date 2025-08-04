@@ -9,8 +9,6 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
-    UnquantizedFusedMoEMethodOpenAI,
-    MXFP4FusedMoEMethodOpenAI,
     FusedMoeWeightScaleSupported,
 )
 
@@ -32,8 +30,6 @@ def get_config() -> Optional[Dict[str, Any]]:
 __all__ = [
     "FusedMoE",
     "FusedMoEMethodBase",
-    "UnquantizedFusedMoEMethodOpenAI",
-    "MXFP4FusedMoEMethodOpenAI",
     "FusedMoeWeightScaleSupported",
     "override_config",
     "get_config",
