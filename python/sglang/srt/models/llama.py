@@ -131,9 +131,9 @@ class LlamaAttention(nn.Module):
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         # MistralConfig has an optional head_dim introduced by Mistral-Nemo
-        self.head_dim = getattr(
-            config, "head_dim", self.hidden_size // self.total_num_heads
-        )
+        self.head_dim = getattr(config, "head_dim", None)
+        if self.head_dim is None:
+            self.head_dim = self.hidden_size // self.total_num_heads
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1)
         self.rotary_dim = int(partial_rotary_factor * self.head_dim)
         self.q_size = self.num_heads * self.head_dim
