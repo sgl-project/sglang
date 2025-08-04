@@ -145,7 +145,7 @@ def process_content_for_template_format(
                     image_data.append(
                         ImageData(
                             url=chunk["image_url"]["url"],
-                            detail=chunk["image_url"]["detail"],
+                            detail=chunk["image_url"].get("detail", "auto"),
                         )
                     )
                     if chunk.get("modalities"):
