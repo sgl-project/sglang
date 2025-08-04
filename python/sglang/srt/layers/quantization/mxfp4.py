@@ -92,7 +92,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase, CustomOp):
         swiglu_beta: Optional[float] = None,
         bias: bool = False,
         activation_dtype: torch.dtype = torch.bfloat16,
-        shuffle_weight: bool = True,
     ):
         super().__init__()
         self.is_checkpoint_mxfp4_serialized = quant_config.is_checkpoint_mxfp4_serialized
@@ -102,7 +101,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase, CustomOp):
         self.swiglu_beta = swiglu_beta
         self.bias = bias
         self.activation_dtype = activation_dtype
-        self.shuffle_weight = shuffle_weight
         self.swizzle_value, self.swizzle_scale = get_swizzle_type(activation_dtype)
 
     def set_activation_dtype(self, activation_dtype: torch.dtype):
@@ -218,12 +216,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase, CustomOp):
             w2_weight_scale = layer.w2_scale.data
 
         w13_weight_fp4 = torch.transpose(w13_weight_fp4, 1, 2)
-        if self.shuffle_weight:
-            w13_weight_fp4 = shuffle_for_activation_kernel(w13_weight_fp4)
+        # if self.shuffle_weight:
+        #     w13_weight_fp4 = shuffle_for_activation_kernel(w13_weight_fp4)
 
         w13_weight_scale = torch.transpose(w13_weight_scale, 1, 2)
-        if self.shuffle_weight:
-            w13_weight_scale = shuffle_for_activation_kernel(w13_weight_scale)
+        # if self.shuffle_weight:
+        #     w13_weight_scale = shuffle_for_activation_kernel(w13_weight_scale)
 
         w2_weight_fp4 = torch.transpose(w2_weight_fp4, 1, 2)
         w2_weight_scale = torch.transpose(w2_weight_scale, 1, 2)
@@ -248,8 +246,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase, CustomOp):
         if self.bias:
             w13_bias = layer.w13_bias.data.to(torch.float32)
             w2_bias = layer.w2_bias.data.to(torch.float32)
-            if self.shuffle_weight:
-                w13_bias = shuffle_for_activation_kernel(w13_bias)
+            # if self.shuffle_weight:
+            #     w13_bias = shuffle_for_activation_kernel(w13_bias)
             layer.w13_bias.data = w13_bias
             torch.cuda.empty_cache()
             layer.w2_bias.data = w2_bias

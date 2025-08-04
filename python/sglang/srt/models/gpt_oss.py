@@ -54,7 +54,6 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE, UnquantizedFusedMoEMethodOpenAI, MXFP4FusedMoEMethodOpenAI
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -228,12 +227,9 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
                 deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]]
             )
         else:
-            extra_args = dict(is_openai_moe=True,
-                              swiglu_alpha=1.702,
+            extra_args = dict(swiglu_alpha=1.702,
                               swiglu_beta=1.0,
-                              enable_mxfp4_moe=global_server_args_dict["enable_w4_mxfp4_moe"] or global_server_args_dict["enable_w4a8_mxfp4_moe"],
                               enable_fp8_activation=global_server_args_dict["enable_w4a8_mxfp4_moe"],
-                              shuffle_weight=False,
                               pair_wise_act=True)
 
         self.topk = TopK(
