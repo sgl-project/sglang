@@ -1,5 +1,5 @@
 ARG CUDA_VERSION=12.6.1
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04
 
 ARG BUILD_TYPE=all
 ARG DEEPEP_COMMIT=b6ce310bb0b75079682d09bc2ebc063a074fbd58
@@ -26,15 +26,29 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     librdmacm1 libnl-3-200 libnl-route-3-200 libnl-route-3-dev libnl-3-dev \
     ibverbs-providers infiniband-diags perftest \
     libgoogle-glog-dev libgtest-dev libjsoncpp-dev libunwind-dev \
-    libboost-all-dev libssl-dev \
+    libboost-all-dev libssl-dev linux-libc-dev\
     libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
     pybind11-dev \
     libhiredis-dev libcurl4-openssl-dev \
     libczmq4 libczmq-dev \
     libfabric-dev \
     patchelf \
-    nvidia-dkms-550 \
+    nvidia-dkms-570 \
     devscripts debhelper fakeroot dkms check libsubunit0 libsubunit-dev \
+# Install development tools and utilities
+ && apt-get update && apt-get install -y \
+    gdb \
+    ninja-build \
+    vim \
+    locales \
+    git \
+    silversearcher-ag \
+    cloc \
+    pkg-config \
+    libssl-dev \
+    bear \
+    less \
+ && apt install -y rdma-core \
  && ln -sf /usr/bin/python3 /usr/bin/python \
  && rm -rf /var/lib/apt/lists/* \
  && apt-get clean
@@ -50,9 +64,25 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
 # Fix DeepEP IBGDA symlink
 RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
 
-# Clone and install SGLang
+# Clone and install SGLang and python tools
 WORKDIR /sgl-workspace
-RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
+RUN python3 -m pip install --no-cache-dir --upgrade setuptools html5lib six --break-system-packages \
+ # Python tools
+ && python3 -m pip install --no-cache-dir \
+    datamodel_code_generator \
+    mooncake-transfer-engine==0.3.5 \
+    pre-commit \
+    pytest \
+    black \
+    isort \
+    icdiff \
+    uv \
+    wheel \
+    scikit-build-core \
+    pandas \
+    matplotlib \
+    tabulate \
+    --break-system-packages \
  && git clone --depth=1 https://github.com/sgl-project/sglang.git \
  && cd sglang \
  && case "$CUDA_VERSION" in \
@@ -60,10 +90,10 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
       12.8.1) CUINDEX=128 ;; \
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
- && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
- && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
+ && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url "https://download.pytorch.org/whl/cu${CUINDEX}" --break-system-packages \
+ && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps --break-system-packages \
  && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.2.9/sgl_kernel-0.2.9+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.2.9/sgl_kernel-0.2.9+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps --break-system-packages; \
     fi
 
 # Build and install NVSHMEM + DeepEP
@@ -84,51 +114,11 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
     cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=90 \
  && cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL} \
  && cd /sgl-workspace/DeepEP \
- && NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
-
-# Python tools
-RUN python3 -m pip install --no-cache-dir \
-    datamodel_code_generator \
-    mooncake-transfer-engine==0.3.5 \
-    pre-commit \
-    pytest \
-    black \
-    isort \
-    icdiff \
-    uv \
-    wheel \
-    scikit-build-core
-
-# Install development tools and utilities
-RUN apt-get update && apt-get install -y \
-    gdb \
-    ninja-build \
-    vim \
-    tmux \
-    htop \
-    wget \
-    curl \
-    locales \
-    lsof \
-    git \
-    git-lfs \
-    zsh \
-    tree \
-    silversearcher-ag \
-    cloc \
-    unzip \
-    pkg-config \
-    libssl-dev \
-    bear \
-    ccache \
-    less \
-    && apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+ && NVSHMEM_DIR=${NVSHMEM_DIR} pip install . --break-system-packages
 
 RUN apt update -y \
     && apt install -y --no-install-recommends gnupg \
-    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/amd64 /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
+    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2404/amd64 /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
     && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub \
     && apt update -y \
     && apt install nsight-systems-cli -y
@@ -139,18 +129,6 @@ ENV LANG en_US.UTF-8
 ENV LANGUAGE en_US:en
 ENV LC_ALL en_US.UTF-8
 
-# Install minimal Python packages
-RUN python3 -m pip install --no-cache-dir --break-system-packages \
-    pytest \
-    black \
-    isort \
-    icdiff \
-    scikit_build_core \
-    uv \
-    pre-commit \
-    pandas \
-    matplotlib \
-    tabulate
 
 # Install diff-so-fancy
 RUN curl -LSso /usr/local/bin/diff-so-fancy https://github.com/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
