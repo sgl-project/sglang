@@ -48,7 +48,7 @@ void cutlass_int8_scaled_mm(
     const torch::Tensor& mat_b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   using ElementAccumulator = int32_t;
   using ElementCompute = float;
   using ElementInputA = int8_t;
@@ -159,7 +159,7 @@ void sm75_dispatch_shape(
     const torch::Tensor& mat_b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   int m = mat_a.size(0);
   if (m <= 32) {
     cutlass_int8_scaled_mm<
@@ -203,7 +203,7 @@ void sm80_dispatch_shape(
     const torch::Tensor& mat_b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   int m = mat_a.size(0);
   int n = mat_b.size(1);
   if (m <= 16) {
@@ -288,7 +288,7 @@ void sm89_dispatch_shape(
     const torch::Tensor& mat_b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   int m = mat_a.size(0);
   int n = mat_b.size(1);
   if (m <= 16) {
@@ -428,7 +428,7 @@ void cutlass_int8_scaled_mm_sm90(
     const torch::Tensor& mat_b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   using ArchTag = cutlass::arch::Sm90;
 
   using ElementAccumulator = int32_t;
@@ -589,7 +589,7 @@ void sm90_dispatch_bias(
     const torch::Tensor& mat_b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   if (bias) {
     cutlass_int8_scaled_mm_sm90<ElementOutput, TileShape, ClusterShape, MainloopScheduleType, true>(
         out, mat_a, mat_b, scales_a, scales_b, bias);
@@ -606,7 +606,7 @@ void sm90_dispatch_shape(
     const torch::Tensor& mat_b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   int m = mat_a.size(0);
   int n = mat_b.size(1);
   if (m <= 32) {
@@ -666,7 +666,7 @@ torch::Tensor int8_scaled_mm(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   TORCH_CHECK(mat_a.is_cuda(), "mat_a must be a CUDA tensor");
   TORCH_CHECK(mat_b.is_cuda(), "mat_b must be a CUDA tensor");
   TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
