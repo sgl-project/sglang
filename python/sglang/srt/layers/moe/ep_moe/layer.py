@@ -342,7 +342,8 @@ class DeepEPMoE(EPMoE):
             return_recv_hook=True,
         )
 
-        if self.deepep_mode.enable_low_latency():
+        if self.deepep_mode.enable_low_latency() and not _is_npu:
+            # NPU supports low_latency deepep without deepgemm
             assert (
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
