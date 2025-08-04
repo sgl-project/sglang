@@ -1307,7 +1307,7 @@ class ModelRunner:
     def init_attention_backend(self):
         """Init attention kernel backend."""
         if self.server_args.enable_pdmux:
-            self.attn_backend = self._get_attention_backend()
+            self.attn_backend = self._get_attention_backend(init_new_workspace=True)
             self.decode_attn_backend_group = []
             for _ in range(self.server_args.sm_group_num):
                 self.decode_attn_backend_group.append(self._get_attention_backend())
@@ -1318,7 +1318,7 @@ class ModelRunner:
             self.attn_backend = self._get_attention_backend()
 
     # TODO unify with 6338
-    def _get_attention_backend(self):
+    def _get_attention_backend(self, init_new_workspace: bool = False):
         if self.server_args.attention_backend == "flashinfer":
             if not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -1328,7 +1328,7 @@ class ModelRunner:
                 # Init streams
                 if self.server_args.speculative_algorithm == "EAGLE":
                     self.plan_stream_for_flashinfer = torch.cuda.Stream()
-                return FlashInferAttnBackend(self)
+                return FlashInferAttnBackend(self, init_new_workspace=init_new_workspace)
             else:
                 from sglang.srt.layers.attention.flashinfer_mla_backend import (
                     FlashInferMLAAttnBackend,
