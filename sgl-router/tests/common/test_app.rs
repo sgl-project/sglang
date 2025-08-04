@@ -3,7 +3,7 @@ use reqwest::Client;
 use sglang_router_rs::{
     config::RouterConfig,
     routers::RouterTrait,
-    server::{build_app, AppState},
+    server::{build_app, AppContext, AppState},
 };
 use std::sync::Arc;
 
@@ -13,13 +13,17 @@ pub fn create_test_app(
     client: Client,
     router_config: &RouterConfig,
 ) -> Router {
-    // Create AppState with the test router
+    // Create AppContext
+    let app_context = Arc::new(AppContext::new(
+        router_config.clone(),
+        client,
+        router_config.max_concurrent_requests,
+    ));
+
+    // Create AppState with the test router and context
     let app_state = Arc::new(AppState {
         router,
-        client,
-        _concurrency_limiter: Arc::new(tokio::sync::Semaphore::new(
-            router_config.max_concurrent_requests,
-        )),
+        context: app_context,
     });
 
     // Configure request ID headers (use defaults if not specified)
