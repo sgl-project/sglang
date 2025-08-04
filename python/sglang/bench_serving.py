@@ -45,7 +45,7 @@ global args
 
 
 # don't want to import sglang package here
-def _get_bool_env_var(name: str, default: str = "false") -> bool:
+def get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
     return value.lower() in ("true", "1")
 
@@ -1386,7 +1386,7 @@ async def benchmark(
         )
 
     # Flush cache
-    if ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")) or flush_cache:
+    if ("sglang" in backend and get_bool_env_var("SGLANG_IS_IN_CI")) or flush_cache:
         requests.post(base_url + "/flush_cache", headers=get_auth_headers())
 
     time.sleep(1.0)
