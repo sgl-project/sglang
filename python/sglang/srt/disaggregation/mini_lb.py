@@ -17,7 +17,8 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
-from sglang.srt.disaggregation.utils import PDRegistryRequest, PDConvertRequest
+from sglang.srt.disaggregation.utils import PDRegistryRequest
+from sglang.srt.managers.io_struct import ConvertDisaggregationRoleReqInput
 from sglang.srt.utils import maybe_wrap_ipv6_address
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
@@ -410,7 +411,7 @@ async def register(obj: PDRegistryRequest):
     return Response(status_code=200)
 
 @app.post("/convert_pd_role")
-async def convert_pd_role(obj: PDConvertRequest):
+async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
     """ Convert identity of a PD server """
     start_time = time.perf_counter()
 

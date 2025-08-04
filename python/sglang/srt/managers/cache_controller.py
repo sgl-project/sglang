@@ -243,12 +243,12 @@ class HiCacheController:
                 self.storage_backend = HiCacheFile()
                 self.get_hash_str = get_hash_str
             elif storage_backend == "nixl":
-                from sglang.srt.mem_cache.nixl.hicache_nixl import HiCacheNixl
+                from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 
                 self.storage_backend = HiCacheNixl()
                 self.get_hash_str = get_hash_str
             elif storage_backend == "mooncake":
-                from sglang.srt.mem_cache.mooncake_store.mooncake_store import (
+                from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
                     MooncakeStore,
                     get_hash_str_mooncake,
                 )
@@ -341,7 +341,7 @@ class HiCacheController:
             self.prefetch_thread.start()
             self.backup_thread.start()
 
-    def reset(self):
+    def reset(self, del_controller = False):
         self.stop_event.set()
         self.write_thread.join()
         self.load_thread.join()
@@ -360,6 +360,9 @@ class HiCacheController:
             self.prefetch_revoke_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
 
+        if del_controller:
+            return
+        
         self.write_thread = threading.Thread(
             target=self.write_thread_func_direct, daemon=True
         )
@@ -775,3 +778,8 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+    def __del__(self):
+        print("CacheController is being deleted.")
+        if hasattr(self.storage_backend,"unregister_buffer"):
+            self.storage_backend.unregister_buffer(self.mem_pool_host.kv_buffer)

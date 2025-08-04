@@ -819,6 +819,9 @@ class UpdateWeightsFromDistributedReqOutput:
 
 @dataclass
 class ConvertDisaggregationRoleReqInput:
+    # the server url to convert
+    server_url: str
+
     # convert decode to prefill
     bootstrap_port:Optional[int] = None
     disaggregation_decode_tp:Optional[int] = None
@@ -830,6 +833,8 @@ class ConvertDisaggregationRoleReqInput:
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
     hicache_io_backend: str = ""
+    hicache_mem_layout: str = "layer_first"
+    hicache_storage_backend: Optional[str] = None
     # environ for prefill
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE: Optional[int] = None
     SGLANG_DISAGGREGATION_QUEUE_SIZE: Optional[int] = None

@@ -697,3 +697,7 @@ class HiRadixCache(RadixCache):
                     if not cur_child.evicted:
                         stack.append(cur_child)
         return ret_list
+
+    def __del__(self):
+        # Stop the threads in cache controller
+        self.cache_controller.reset(del_controller=True)

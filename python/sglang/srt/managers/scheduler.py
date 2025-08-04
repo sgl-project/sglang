@@ -2476,12 +2476,15 @@ class Scheduler(
             # tree cache
             self.server_args.disable_radix_cache = recv_req.disable_radix_cache
             self.enable_hierarchical_cache = recv_req.enable_hierarchical_cache
+            self.server_args.enable_hierarchical_cache = recv_req.enable_hierarchical_cache
             if self.enable_hierarchical_cache:
                 self.server_args.hicache_ratio = recv_req.hicache_ratio
                 self.server_args.hicache_size = recv_req.hicache_size
                 self.server_args.hicache_write_policy = recv_req.hicache_write_policy
                 self.server_args.hicache_io_backend = recv_req.hicache_io_backend
-                self.server_args.hicache_write_policy = recv_req.hicache_write_policy
+                self.enable_hicache_storage = recv_req.hicache_storage_backend
+                self.server_args.hicache_storage_backend = recv_req.hicache_storage_backend
+                self.server_args.hicache_mem_layout = recv_req.hicache_mem_layout
             # cuda graph
             self.server_args.disable_cuda_graph = True 
             # stop decode event loop

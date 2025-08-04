@@ -327,44 +327,6 @@ class PDRegistryRequest:
                 f"Invalid mode: {self.mode}. Must be 'prefill' or 'decode'."
             )
 
-@dataclasses.dataclass
-class PDConvertRequest:
-    """A request to convert identity of a PD server"""
-    # the server url to convert
-    server_url: str
-
-    # convert decode to prefill
-    disaggregation_decode_tp: Optional[int] = None
-    disaggregation_decode_dp: Optional[int] = None
-    disaggregation_prefill_pp: Optional[int] = 1
-    disable_radix_cache: bool = False # defalut open radix cache in prefill
-    enable_hierarchical_cache: bool = False
-    hicache_ratio: float = 2.0
-    hicache_size: int = 0
-    hicache_write_policy: str = "write_through_selective"
-    hicache_io_backend: str = ""
-    # environ for prefill
-    SGLANG_DISAGGREGATION_THREAD_POOL_SIZE: Optional[int] = None
-    SGLANG_DISAGGREGATION_QUEUE_SIZE: Optional[int] = None
-    SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT: Optional[int] = None
-
-    # convert prefill to decode
-    cuda_graph_max_bs: Optional[int] = None
-    cuda_graph_bs: Optional[List[int]] = None
-    disable_cuda_graph: bool = False # defalut open cuda graph in decode
-    disable_cuda_graph_padding: bool = False
-    enable_profile_cuda_graph: bool = False
-    # environ for decode
-    SGLANG_DISAGGREGATION_WAITING_TIMEOUT: Optional[int] = None
-    SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES: Optional[int] = None
-    SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL: Optional[float] = None
-
-    def __post_init__(self):
-        if not self.server_url:
-            raise ValueError("URL must be provided for PDConvertRequest.")
-        if not isinstance(self.server_url, str):
-            raise TypeError("URL must be a string.")
-
 def register_disaggregation_server(
     mode: str, server_port: int, bootstrap_port: int, pdlb_url: str
 ):

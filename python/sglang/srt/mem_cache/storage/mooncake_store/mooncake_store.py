@@ -156,6 +156,16 @@ class MooncakeStore(HiCacheStorage):
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
 
+    def unregister_buffer(self, buffer: torch.Tensor) -> None:
+        try:
+            buffer_ptr = buffer.data_ptr()
+            ret_code = self.store.unregister_buffer(buffer_ptr)
+            if ret_code:
+                logger.error(f"failed to unregister buffer, error code: {ret_code}")
+        except TypeError as err:
+            logger.error("Failed to unregister buffer from Mooncake Store: %s", err)
+            raise TypeError("Mooncake Store Unregister Buffer Error.") from err
+
     def set(
         self,
         key,
