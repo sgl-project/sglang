@@ -270,9 +270,14 @@ class ExpertLocationMetadata:
     def logical_to_all_physical(
         self, layer_id: int, logical_expert_id: int
     ) -> List[int]:
+        # Use CPU copy to avoid GPU→CPU sync on every call, which is expensive in update weights scenario
+        if not hasattr(self, "_logical_to_all_physical_map_cpu"):
+            self._logical_to_all_physical_map_cpu = (
+                self.logical_to_all_physical_map.cpu()
+            )
         return [
             physical_expert_id
-            for physical_expert_id in self.logical_to_all_physical_map[
+            for physical_expert_id in self._logical_to_all_physical_map_cpu[
                 layer_id, logical_expert_id
             ].tolist()
             if physical_expert_id != -1
