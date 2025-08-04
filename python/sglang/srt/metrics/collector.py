@@ -272,7 +272,7 @@ class SchedulerMetricsCollector:
         self.request_latency_seconds = Histogram(
             name="sglang:request_latency_seconds",
             documentation="The latency of each stage of requests.",
-            # captures latency in range [1ms - ~1917s]
+            # captures latency in range [1ms - ~1191s]
             buckets=exponential_buckets(start=0.001, width=1.62, length=30),
             labelnames=list(labels.keys()) + ["stage"],
         )

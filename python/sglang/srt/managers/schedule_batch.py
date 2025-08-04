@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import enum
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -410,6 +412,23 @@ class MultimodalInputs:
         # other args would be kept intact
 
 
+class RequestStage(str, enum.Enum):
+    # prefill
+    PREFILL_WAITING = "prefill_waiting"
+
+    # disaggregation prefill
+    PREFILL_PREPARE = "prefill_prepare"
+    PREFILL_BOOTSTRAP = "prefill_bootstrap"
+    PREFILL_FORWARD = "prefill_forward"
+    PREFILL_TRANSFER_KV_CACHE = "prefill_transfer_kv_cache"
+
+    # disaggregation decode
+    DECODE_PREPARE = "decode_prepare"
+    DECODE_BOOTSTRAP = "decode_bootstrap"
+    DECODE_WAITING = "decode_waiting"
+    DECODE_TRANSFERRED = "decode_transferred"
+
+
 class Req:
     """The input and output status of a request."""
 
@@ -624,12 +643,13 @@ class Req:
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
 
-    def add_latency(self, name: str):
+    def add_latency(self, stage: RequestStage):
         if self.metrics_collector is None:
             return
+        assert stage.name in RequestStage.__members__, f"{stage=} is invalid"
         now = time.monotonic()
         self.metrics_collector.observe_request_latency_seconds(
-            name, now - self.last_tic
+            stage.value, now - self.last_tic
         )
         self.last_tic = now
 
