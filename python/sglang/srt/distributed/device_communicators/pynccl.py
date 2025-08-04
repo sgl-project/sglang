@@ -77,6 +77,7 @@ class PyNcclCommunicator:
         self.disabled = False
         self.use_current_stream = use_current_stream
 
+        self.nccl_version = self.nccl.ncclGetRawVersion()
         if self.rank == 0:
             logger.info("sglang is using nccl==%s", self.nccl.ncclGetVersion())
 
@@ -284,6 +285,12 @@ class PyNcclCommunicator:
             self.comm,
             cudaStream_t(stream.cuda_stream),
         )
+
+    def register_comm_window_raw(self, ptr: int, size: int):
+        return self.nccl.ncclCommWindowRegister(self.comm, buffer_type(ptr), size, 1)
+
+    def deregister_comm_window(self, window):
+        return self.nccl.ncclCommWindowDeregister(self.comm, window)
 
     @contextmanager
     def change_state(
