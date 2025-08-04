@@ -107,12 +107,3 @@ class TestCreateKvIndices(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-# List of things to do:
-# Modify the expected flashinfer kv indices doc string based on what we understand
-# of req_to_token and req_pool_indices
-# the page number of the kernel is computed by using token_id // PAGE_SIZE
-# the token is located at the index of token_id % PAGE_SIZE
-# using the actual seq_len, we can compute the pages with the req_to_tokenpool_stride
-# continue the small test case and debug further.

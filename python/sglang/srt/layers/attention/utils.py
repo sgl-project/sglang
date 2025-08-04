@@ -68,7 +68,6 @@ def create_flashinfer_kv_indices_triton(
         - req_to_token = [[10, 11, 12, -1], [20, 21, -1, -1]] (tokens are the elements
          in radix tree, use them as a pointer to the token location in the kv_indices_ptr)
 
-        # needs to be revised     
         The kernel will output:
         If PAGE_SIZE = 1:
         packed
@@ -91,9 +90,8 @@ def create_flashinfer_kv_indices_triton(
         entries for each request's tokens.
     """
     BLOCK_SIZE: tl.constexpr = 512
-    NUM_PAGES_PER_BLOCK: tl.constexpr = 512
+    NUM_PAGES_PER_BLOCK: tl.constexpr = BLOCK_SIZE // PAGE_SIZE
     pid = tl.program_id(axis=0)
-
     req_pool_index = tl.load(req_pool_indices_ptr + pid)
     kv_indices_offset = tl.load(kv_indptr + pid)
 
@@ -103,26 +101,19 @@ def create_flashinfer_kv_indices_triton(
         kv_start = tl.load(kv_start_idx + pid).to(tl.int32)
         kv_end = kv_start
     kv_end += tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
-    num_pages = tl.cdiv(kv_end - kv_start, PAGE_SIZE)
-    num_pages_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
     
+    kv_range = kv_end - kv_start
+    num_pages = tl.cdiv(kv_range, PAGE_SIZE)
+    num_pages_loop = tl.cdiv(kv_range, BLOCK_SIZE)
+    base_ptr = req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + kv_start 
     for i in range(num_pages_loop):
-        page_offsets = (
+        page_offsets_int64 = (
             tl.arange(0, NUM_PAGES_PER_BLOCK).to(tl.int64) + i * NUM_PAGES_PER_BLOCK
             ) * PAGE_SIZE
-        
         out_page_offsets = tl.arange(0, NUM_PAGES_PER_BLOCK) + i * NUM_PAGES_PER_BLOCK
-
-        mask = page_offsets < (kv_end - kv_start)
+        mask_page_range = page_offsets_int64 < (kv_range)
         mask_out = out_page_offsets < num_pages 
-
-        data = tl.load(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + kv_start
-            + page_offsets,
-            mask=mask,
-        )
+        data = tl.load(base_ptr + page_offsets_int64, mask=mask_page_range)
         tl.store(kv_indices_ptr + kv_indices_offset + out_page_offsets, data // PAGE_SIZE, mask=mask_out)
 
 
@@ -138,23 +129,25 @@ def create_flashmla_kv_indices_triton(
     NUM_PAGE_PER_BLOCK: tl.constexpr = TRITON_PAD_NUM_PAGE_PER_BLOCK,
     PAGED_SIZE: tl.constexpr = 64,
 ):
-    
     BLOCK_SIZE: tl.constexpr = 4096
-    NUM_PAGE_PER_BLOCK: tl.constexpr = 64
     pid = tl.program_id(axis=0)
 
+    # find the req pool idx, this is for batch to token
     req_pool_index = tl.load(req_pool_indices_ptr + pid)
+
     kv_start = 0
     kv_end = 0
     if kv_start_idx:
         kv_start = tl.load(kv_start_idx + pid).to(tl.int32)
         kv_end = kv_start
+
     kv_end += tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
 
     num_paged = tl.cdiv(kv_end - kv_start, PAGED_SIZE)
     num_pages_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
 
     for i in range(num_pages_loop):
+        # index into req_to_token_ptr needs to be int64
         paged_offset = (
             tl.arange(0, NUM_PAGE_PER_BLOCK).to(tl.int64) + i * NUM_PAGE_PER_BLOCK
         ) * PAGED_SIZE
@@ -165,14 +158,13 @@ def create_flashmla_kv_indices_triton(
 
         data = tl.load(
             req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride  # Move to correct pool row
-            + kv_start                                  # Move to start of this request's tokens
-            + paged_offset,                             # Move to page-aligned token positions
-            mask=mask,                                  # Only load valid positions
+            + req_pool_index * req_to_token_ptr_stride
+            + kv_start
+            + paged_offset,
+            mask=mask,
         )
-        
         tl.store(
             kv_indices_ptr + pid * kv_indices_ptr_stride + paged_offset_out,
-            data // PAGED_SIZE,  # Convert token location to page index
-            mask=mask_out,       # Only store valid page positions
+            data // PAGED_SIZE,
+            mask=mask_out,
         )

@@ -27,9 +27,7 @@ if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.flashinfer_backend import (
-    create_flashinfer_kv_indices_triton,
-)
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -46,7 +44,9 @@ if is_flashinfer_available():
     from flashinfer import (
         BatchMLAPagedAttentionWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
+
     )
+
 
 
 @dataclass
@@ -155,17 +155,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}  # For verify
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        # if forward_batch.seq_lens.device == torch.device("cuda:3"):
-        #     self.num_update_calls += 1
-        #     print(f"Updating metadata for #{self.num_update_calls}th time")
-        #     print(f"forward_batch: {forward_batch}")
-        #     print(f"forward_batch.forward_mode: {forward_batch.forward_mode}")
-        #     print(f"forward_batch.spec_info: {forward_batch.spec_info}")
-        #     print(f"forward_batch.req_pool_indices: {forward_batch.req_pool_indices}")
-        #     print(f"forward_batch.seq_lens: {forward_batch.seq_lens}")
-        #     print(f"forward_batch.seq_lens_sum: {forward_batch.seq_lens_sum}")
-        #     print(f"forward_batch.extend_prefix_lens: {forward_batch.extend_prefix_lens}")
-        #     print(f"forward_batch.extend_prefix_lens_cpu: {forward_batch.extend_prefix_lens_cpu}")
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -410,22 +399,16 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
-                    # if k.device == torch.device("cuda:3") and layer.layer_id == 8:
-                    #     print(f"Extend writing to mla layer {layer.layer_id} kv cache: {k.shape}, {k_rope.shape}")
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer, cache_loc, k, k_rope
                     )
                 else:
-                    # if k.device == torch.device("cuda:3") and layer.layer_id == 8:
-                    #     print(f"Extend writing to layer {layer.layer_id} kv cache: {k.shape}, {v.shape}")
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
         if q_rope is not None:
             q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-        # if q.device == torch.device("cuda:3") and layer.layer_id == 8:
-        #     print(f"forward_metadata.use_ragged: {self.forward_metadata.use_ragged}, for layer: {layer.layer_id}")
         if self.forward_metadata.use_ragged:
             # ragged prefill
             if q_rope is not None:
@@ -446,16 +429,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
                 q.dtype
             )
-            # if layer.layer_id == 0:
-                # print(f"page size in forward_extend: {self.page_size}")
-            
             k_buf = k_buf.view(-1, self.page_size, k_buf.shape[-1])
-            # if q.device == torch.device("cuda:3") and layer.layer_id == 8:
-            # if layer.layer_id == 0:
-            #      print(f"q: {q.shape}")
-            #      print(f"k_buf: {k_buf.shape}")
-                #  for pgidx  in range(prefill_wrapper_paged.kv_len_arr):
-                #     print(f"k_buf[{pgidx}]: {k_buf[pgidx]}")
+            
             if q_rope is None:
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 q, q_rope = (
@@ -492,8 +467,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
-                    # if k.device == torch.device("cuda:3") and layer.layer_id == 8:
-                    #     print(f"Decode writing to mla layer {layer.layer_id} kv cache: {k.shape}, {k_rope.shape}")
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
@@ -501,8 +474,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                         k_rope,
                     )
                 else:
-                    # if k.device == torch.device("cuda:3") and layer.layer_id == 8:
-                    #     print(f"Decode writing to layer {layer.layer_id} kv cache: {k.shape}, {v.shape}")
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer,
                         cache_loc,
@@ -521,24 +492,17 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_nope = reshaped_q[:, :, : layer.v_head_dim]
             q_rope = reshaped_q[:, :, layer.v_head_dim :]
         
-        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
+        k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
             q.dtype
         )
-        if self.page_size > 1:
-            # Reshape k_buffer to work with page-based indexing
-            k_buffer = k_buffer.view(-1, self.page_size, k_buffer.shape[-1])
-
-        # if q.device == torch.device("cuda:3") and layer.layer_id == 8:
-        #     print(f"k_buffer: {k_buffer.shape}")
-        #     print(f"k_buffer: {k_buffer}")
+        k_buf = k_buf.view(-1, self.page_size, k_buf.shape[-1])
 
         o = q_nope.new_empty(q_nope.shape)
-        # Direct call to run without the wrapper
         o = decode_wrapper.run(
             q_nope,
             q_rope,
-            k_buffer[:, :, : layer.v_head_dim],
-            k_buffer[:, :, layer.v_head_dim :],
+            k_buf[:, :, : layer.v_head_dim],
+            k_buf[:, :, layer.v_head_dim :],
             out=o,
         )
 
@@ -558,7 +522,6 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.data_type = model_runner.dtype
         self.attn_backend = attn_backend
         self.page_size = model_runner.page_size
-        # print(f"FlashInferMLAIndicesUpdaterDecode: {self.page_size=}")
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -609,11 +572,10 @@ class FlashInferMLAIndicesUpdaterDecode:
             kv_indptr[1:] = torch.cumsum(num_pages_per_req, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = (
-                torch.empty(kv_indptr[-1], dtype=torch.int32, device="cuda")
+                torch.empty(kv_indptr[-1], dtype=torch.int32, device=q_indptr.device)
                 if not init_metadata_replay
                 else fast_decode_kwargs["kv_indices"]
             )
-
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
@@ -624,40 +586,25 @@ class FlashInferMLAIndicesUpdaterDecode:
                 self.req_to_token.shape[1],
                 self.page_size,
             )
-            # if kv_indices.device == torch.device("cuda:3"):
-            #     for i in range(bs):
-            #         print(f"req_to_token[{i}]: {self.req_to_token[i]}")
-            #         print(f"req_pool_indices[{i}]: {req_pool_indices[i]}")
-            #     print(f"After kv_indices update:")
-            #     print(f"kv_indices: {kv_indices}")
-            #     print(f"After kv_indptr update:")
-            #     print(f"kv_indptr: {kv_indptr}")
-        else:
             
+        else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
+
         if not init_metadata_replay:
-           # print("="*100)
-           # print(f"DECODE BATCH bs: {bs}")
-           # print(f"paged_kernel_lens: {paged_kernel_lens}")
-           # print(f"kv_indptr: {kv_indptr}")
-           # print(f"kv_indices: {kv_indices}")
-           # print(f"qo_indptr: {q_indptr}")
-           # print(f"page_size: {self.page_size}")
-           # print(f"Plan executed for Device{kv_indptr.device} ------------")
-            wrapper.plan(
-                qo_indptr=q_indptr,
-                kv_indptr=kv_indptr,
-                kv_indices=kv_indices,
-                kv_len_arr=kv_lens,
-                num_heads=self.num_local_heads,
-                head_dim_ckv=self.kv_lora_rank,
-                head_dim_kpe=self.qk_rope_head_dim,
-                page_size=self.page_size,
-                causal=False,
-                sm_scale=sm_scale,
-                q_data_type=self.data_type,
-                kv_data_type=self.data_type,
-            )
+           wrapper.plan(
+               qo_indptr=q_indptr,
+               kv_indptr=kv_indptr,
+               kv_indices=kv_indices,
+               kv_len_arr=kv_lens,
+               num_heads=self.num_local_heads,
+               head_dim_ckv=self.kv_lora_rank,
+               head_dim_kpe=self.qk_rope_head_dim,
+               page_size=self.page_size,
+               causal=False,
+               sm_scale=sm_scale,
+               q_data_type=self.data_type,
+               kv_data_type=self.data_type,
+           )
         else:
             wrapper.plan(
                 qo_indptr=fast_decode_kwargs["qo_indptr_cpu"],
@@ -696,6 +643,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
         self.page_size = model_runner.page_size
+    
     def update(
         self,
         req_pool_indices: torch.Tnesor,
@@ -763,16 +711,10 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 self.req_to_token.size(1),
                 self.page_size,
             )
-            # if seq_lens.device == torch.device("cuda:3"):
-            #     print(f"After kv_indices update:")
-            #     print(f"kv_indices: {kv_indices}")
-                
+           
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
-            
-            # if seq_lens.device == torch.device("cuda:3"):
-            #     print(f"After qo_indptr update:")
-            #     print(f"qo_indptr: {qo_indptr}")
+          
             custom_mask = None
         else:
             assert isinstance(spec_info, EagleDraftInput) or isinstance(
@@ -801,19 +743,11 @@ class FlashInferMLAIndicesUpdaterPrefill:
             )
         else:
             # mla paged prefill
-            # print("="*100)
-            # print(f"PREFILL BATCH bs: {bs}")
-            # print(f"paged_kernel_lens: {paged_kernel_lens}")
-            # print(f"kv_indptr: {kv_indptr}")
-            # print(f"kv_indices: {kv_indices}")
-            # print(f"qo_indptr: {qo_indptr}")
-            # print(f"page_size: {self.page_size}")
-            # print(f"Plan executed for Device{kv_indptr.device} ------------")
             wrapper_paged.plan(
                 qo_indptr=qo_indptr,
                 kv_indptr=kv_indptr,
                 kv_indices=kv_indices,
-                kv_len_arr=paged_kernel_lens,
+                kv_len_arr=paged_kernel_lens.to(torch.int32),
                 num_heads=self.num_local_heads,
                 head_dim_ckv=self.kv_lora_rank,
                 head_dim_kpe=self.qk_rope_head_dim,
