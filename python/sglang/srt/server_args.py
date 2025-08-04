@@ -70,6 +70,7 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
+    enable_act8: bool = False
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -170,8 +171,6 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     enable_flashinfer_moe: bool = False
-    enable_w4_mxfp4_moe: bool = False
-    enable_w4a8_mxfp4_moe: bool = False
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
@@ -1316,14 +1315,9 @@ class ServerArgs:
             help="Enabling DeepEP MoE implementation for EP MoE.",
         )
         parser.add_argument(
-            "--enable-w4-mxfp4-moe",
+            "--enable-act8",
             action="store_true",
-            help="Enable w4_mxfp4 MoE implementation.",
-        )
-        parser.add_argument(
-            "--enable-w4a8-mxfp4-moe",
-            action="store_true",
-            help="Enable w4a8_mxfp4 MoE implementation.",
+            help="Enable fp8 activation for MoE",
         )
         parser.add_argument(
             "--deepep-mode",
