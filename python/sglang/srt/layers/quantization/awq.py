@@ -118,7 +118,10 @@ class AWQConfig(QuantizationConfig):
         return "awq"
 
     def get_supported_act_dtypes(self) -> List[torch.dtype]:
-        return [torch.half, torch.bfloat16]
+        if _is_cpu and _is_cpu_amx_available:
+            return [torch.half, torch.bfloat16]
+        else:
+            return [torch.half]
 
     @classmethod
     def get_min_capability(cls) -> int:

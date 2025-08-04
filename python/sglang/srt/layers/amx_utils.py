@@ -2,14 +2,13 @@ import logging
 
 import torch
 
-from sglang.srt.utils import cpu_has_amx_support
+from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
 import os
 
-SGLANG_USE_CPU_INT4_W4A8 = os.getenv("SGLANG_USE_CPU_INT4_W4A8", "0") == "1"
-
+SGLANG_USE_CPU_INT4_W4A8 = get_bool_env_var("SGLANG_USE_CPU_INT4_W4A8")
 
 def amx_process_weight_after_loading(weight):
     if weight.device != torch.device("cpu"):
