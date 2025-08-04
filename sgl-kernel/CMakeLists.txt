@@ -16,6 +16,7 @@ find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COM
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 
+
 # CUDA
 enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
@@ -178,6 +179,7 @@ endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" OR SGL_KERNEL_ENABLE_SM90A)
     set(SGL_KERNEL_ENABLE_FA3 ON)
+    set(SGL_KERNEL_ENABLE_FLASHMLA ON)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
@@ -400,6 +402,48 @@ if (SGL_KERNEL_ENABLE_FA3)
     target_compile_definitions(flash_ops PRIVATE ${FLASH_OPS_COMPILE_DEFS})
 endif()
 
+# set flash-mla sources file (fp8 kv supported)
+# FlashMLA FP8 issue: https://github.com/deepseek-ai/FlashMLA/issues/56
+if (SGL_KERNEL_ENABLE_FLASHMLA)
+    set(SGL_FLASHMLA_KERNEL_CUDA_FLAGS
+        "-DNDEBUG"
+        "-DOPERATOR_NAMESPACE=sgl-kernel"
+        "-O3"
+        "-Xcompiler"
+        "-std=c++17"
+        "-gencode"
+        "arch=compute_90a,code=sm_90a"
+        "-D_USE_MATH_DEFINES"
+        "-Wno-deprecated-declarations"
+        "-U__CUDA_NO_HALF_OPERATORS__"
+        "-U__CUDA_NO_HALF_CONVERSIONS__"
+        "-U__CUDA_NO_HALF2_OPERATORS__"
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__"
+        "--expt-relaxed-constexpr"
+        "--expt-extended-lambda"
+        "--use_fast_math"
+        "--ptxas-options=-v,--register-usage-level=10"
+        "--ftemplate-backtrace-limit=0"
+        "--threads=32"
+        "-Xcompiler=-Wconversion"
+        "-Xcompiler=-fno-strict-aliasing"
+    )
+
+    file(GLOB FLASHMLA_CU_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/flashmla/*.cu")
+    set(FLASHMLA_SOURCES
+        ${FLASHMLA_CU_SRCS}
+        "csrc/flashmla_extension.cc"
+    )
+
+    Python_add_library(flashmla_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${FLASHMLA_SOURCES})
+    target_compile_options(flashmla_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_FLASHMLA_KERNEL_CUDA_FLAGS}>)
+    target_include_directories(flashmla_ops PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/flashmla
+        ${repo-cutlass_SOURCE_DIR}/include
+    )
+    target_link_libraries(flashmla_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+    install(TARGETS flashmla_ops LIBRARY DESTINATION "sgl_kernel")
+endif()
 # JIT Logic
 # DeepGEMM
 
