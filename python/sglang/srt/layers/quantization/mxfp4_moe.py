@@ -3,7 +3,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from sgl_kernel import sgl_per_tensor_quant_fp8
-
+import triton
+import triton.language as tl
 
 IS_TRITON_KERNELS_AVAILABLE = False
 try:
@@ -57,6 +58,13 @@ def quantize_to_mxfp4(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     tensor_scales = tensor_scales.transpose(1, 2).contiguous()
     return tensor_fp4, tensor_scales
 
+@triton.jit
+def set_to_zero_kernel(output_ptr):
+    """
+    Triton kernel to set a single-element tensor to 0.0.
+    """
+    tl.store(output_ptr, 0.0)
+
 def quantize_fp8_per_tensor(
                 input_q: torch.Tensor,
                 scale: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -64,7 +72,8 @@ def quantize_fp8_per_tensor(
     output_q = torch.empty_like(input_q, dtype=fp8_type_, device=input_q.device)
     is_static = True
     if scale is None:
-        scale = torch.tensor(1.0, dtype=torch.float32, device=input_q.device)
+        scale = torch.empty(1, dtype=torch.float32, device=input_q.device)
+        set_to_zero_kernel[(1,)](scale,)
         is_static = False
     sgl_per_tensor_quant_fp8(input_q, output_q, scale, is_static)
     return output_q, scale
