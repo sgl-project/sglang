@@ -14,9 +14,11 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_rank,
     get_moe_tensor_parallel_world_size,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -94,7 +96,6 @@ class FusedMoE(torch.nn.Module):
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
         enable_flashinfer_cutlass_moe: Optional[bool] = False,
-        enable_ep_moe: Optional[bool] = False,
     ):
         super().__init__()
 
@@ -112,7 +113,6 @@ class FusedMoE(torch.nn.Module):
         if enable_flashinfer_cutlass_moe and quant_config is None:
             logger.warning("Disable flashinfer MoE when quantization config is None.")
             enable_flashinfer_cutlass_moe = False
-            enable_ep_moe = False
 
         self.enable_flashinfer_cutlass_moe = enable_flashinfer_cutlass_moe
         self.moe_ep_size = get_moe_expert_parallel_world_size()
@@ -121,18 +121,21 @@ class FusedMoE(torch.nn.Module):
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
         assert num_experts % self.moe_ep_size == 0
         self.num_local_experts = num_experts // self.moe_ep_size
-        if enable_ep_moe:
+        if self.moe_ep_size > 1:
             # TODO(ch-wan): support shared experts fusion
             # Create a tensor of size num_experts filled with -1
-            self.expert_map_cpu = torch.full((self.num_experts,), -1, dtype=torch.int32)
+            self.expert_map_cpu = torch.full(
+                (self.num_experts,), -1, dtype=torch.int32, device="cpu"
+            )
+            self.expert_map_cpu = torch.full(
+                (self.num_experts,), -1, dtype=torch.int32, device="cpu"
+            )
             # Create a expert map for the local experts
             self.expert_map_cpu[
                 self.moe_ep_rank
                 * self.num_local_experts : (self.moe_ep_rank + 1)
                 * self.num_local_experts
             ] = torch.arange(0, self.num_local_experts, dtype=torch.int32, device="cpu")
-            if not self.enable_flashinfer_cutlass_moe:
-                self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
 
         self.routed_scaling_factor = routed_scaling_factor
         assert intermediate_size % self.moe_tp_size == 0
@@ -624,30 +627,38 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, topk_output: StandardTopKOutput):
         assert self.quant_method is not None
 
+        if self.moe_ep_size > 1 and not self.enable_flashinfer_cutlass_moe:
+            if self.expert_map_cpu is not None and self.expert_map_gpu is None:
+                # If we are in EP mode, we need to move the expert map to GPU.
+                self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
+
         if self.expert_map_gpu is not None:
             topk_output = topk_output._replace(
                 topk_ids=self.expert_map_gpu[topk_output.topk_ids]
             )
 
         # Matrix multiply.
-        final_hidden_states = self.quant_method.apply(
-            layer=self,
-            x=hidden_states,
-            topk_output=topk_output,
-            activation=self.activation,
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
-            routed_scaling_factor=self.routed_scaling_factor,
-            **(
-                dict(
-                    tp_rank=self.moe_tp_rank,
-                    tp_size=self.moe_tp_size,
-                    ep_rank=self.moe_ep_rank,
-                    ep_size=self.moe_ep_size,
-                )
-                if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod"
-                else {}
-            ),
-        )
+        with use_symmetric_memory(get_tp_group()) as sm:
+            final_hidden_states = self.quant_method.apply(
+                layer=self,
+                x=hidden_states,
+                topk_output=topk_output,
+                activation=self.activation,
+                apply_router_weight_on_input=self.apply_router_weight_on_input,
+                routed_scaling_factor=self.routed_scaling_factor,
+                **(
+                    dict(
+                        tp_rank=self.moe_tp_rank,
+                        tp_size=self.moe_tp_size,
+                        ep_rank=self.moe_ep_rank,
+                        ep_size=self.moe_ep_size,
+                    )
+                    if self.quant_method.__class__.__name__
+                    == "ModelOptNvFp4FusedMoEMethod"
+                    else {}
+                ),
+            )
+            sm.tag(final_hidden_states)
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
