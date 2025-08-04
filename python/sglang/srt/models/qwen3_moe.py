@@ -72,7 +72,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
-from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty
+from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, LazyValue
 
 Qwen3MoeConfig = None
 
@@ -837,11 +837,13 @@ class Qwen3MoeForCausalLM(nn.Module):
                         logger.warning(f"Parameter {name} not found in params_dict")
 
         # TODO mimic deepseek
-        self.routed_experts_weights_of_layer = {
-            layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-            for layer_id in range(self.start_layer, self.end_layer)
-            if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
-        }
+        self.routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.start_layer, self.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
+            }
+        )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
