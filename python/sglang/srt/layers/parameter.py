@@ -69,6 +69,13 @@ class BasevLLMParameter(Parameter):
     def __torch_dispatch__(cls, func, types, args, kwargs):
         if kwargs is None:
             kwargs = {}
+
+        # avoid the overhead of tree_map_only for non compile mode
+        if not torch.compiler.is_compiling():
+            # avoid infinite recursion for non compile mode
+            with torch._C._DisableTorchDispatch():
+                return func(*args, **kwargs)
+
         args_data = pytree.tree_map_only(BasevLLMParameter, lambda x: x._data, args)
         return func(*args_data, **kwargs)
 

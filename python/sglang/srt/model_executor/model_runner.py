@@ -1804,30 +1804,29 @@ class ModelRunner:
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
-        # disable torch dispatch for the non-graph mode to avoid potential overhead
-        with torch._C._DisableTorchDispatch():
-            if forward_batch.forward_mode.is_decode():
-                ret = self.forward_decode(
-                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
-                )
-            elif forward_batch.forward_mode.is_extend():
-                ret = self.forward_extend(
-                    forward_batch,
-                    skip_attn_backend_init=skip_attn_backend_init,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                )
-            elif forward_batch.forward_mode.is_split_prefill():
-                ret = self.forward_split_prefill(
-                    forward_batch,
-                    reinit_attn_backend=reinit_attn_backend,
-                    forward_count=split_forward_count,
-                )
-            elif forward_batch.forward_mode.is_idle():
-                ret = self.forward_idle(
-                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
-                )
-            else:
-                raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+
+        if forward_batch.forward_mode.is_decode():
+            ret = self.forward_decode(
+                forward_batch,
+                skip_attn_backend_init=skip_attn_backend_init,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        elif forward_batch.forward_mode.is_extend():
+            ret = self.forward_extend(
+                forward_batch,
+                skip_attn_backend_init=skip_attn_backend_init,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        elif forward_batch.forward_mode.is_split_prefill():
+            ret = self.forward_split_prefill(
+                forward_batch,
+                reinit_attn_backend=reinit_attn_backend,
+                forward_count=split_forward_count,
+            )
+        elif forward_batch.forward_mode.is_idle():
+            ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+        else:
+            raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.post_forward_mlp_sync_batch(ret)
