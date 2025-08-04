@@ -66,12 +66,48 @@ model.quantize(calibration_dataset, batch_size=2) # quantize
 model.save(quant_path) # save model
 ```
 
-#### Using [LLM Compressor](https://github.com/vllm-project/llm-compressor/)
+#### Using [ModelOpt](https://github.com/nvidia/modelopt) (Recommended for NVIDIA GPUs)
+
+ModelOpt is now the recommended tool for FP8 and FP4 quantization on NVIDIA GPUs.
 
 ```bash
 # install
-pip install llmcompressor
+pip install nvidia-modelopt
 ```
+
+Here's an example of how to quantize a model to FP8 using ModelOpt:
+
+```python
+from transformers import AutoTokenizer
+from modelopt.torch.quantization import quantize
+from modelopt.torch.quantization import QuantConfig
+from modelopt.torch.export.unified_export_hf import export_hf_checkpoint
+
+
+# Step 1: Load the model's tokenizer
+MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+
+# Step 2: Configure and apply quantization
+config = QuantConfig(weights_precision=modelopt.torch.quantization.FP8_DEFAULT_CFG)
+model = quantize(MODEL_ID, config)
+
+# Step 3: Save the quantized model
+SAVE_DIR = MODEL_ID.split("/")[1] + "-FP8-ModelOpt"
+model.save_pretrained(SAVE_DIR)
+export_hf_checkpoint(model=model, export_dir=SAVE_DIR,)
+tokenizer.save_pretrained(SAVE_DIR)
+```
+
+You can then use the quantized model with SGLang:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path $PWD/Meta-Llama-3-8B-Instruct-FP8-ModelOpt \
+    --port 30000 --host 0.0.0.0
+```
+
+#### Using [LLM Compressor](https://github.com/vllm-project/llm-compressor/) (Deprecated for NVIDIA GPUs)
 
 Here, we take quantize `meta-llama/Meta-Llama-3-8B-Instruct` to `FP8` as an example to elaborate on how to do offline quantization.
 
@@ -121,6 +157,15 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
+For NVIDIA GPUs, we recommend using `modelopt` quantization method for better performance with FP8 and FP4:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --quantization modelopt \
+    --port 30000 --host 0.0.0.0
+```
+
 Our team is working on supporting more online quantization methods. SGLang will soon support methods including but not limited to `["awq", "gptq", "marlin", "gptq_marlin", "awq_marlin", "bitsandbytes", "gguf"]`.
 
 SGLang also supports quantization methods based on [torchao](https://github.com/pytorch/ao). You can simply specify `--torchao-config` in the command line to support this feature. For example, if you want to enable `int4wo-128` for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can launch the server with the following command:
@@ -147,6 +192,7 @@ python3 -m sglang.launch_server \
 ## Reference
 
 - [GPTQModel](https://github.com/ModelCloud/GPTQModel)
+- [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
 - [LLM Compressor](https://github.com/vllm-project/llm-compressor/)
 - [Torchao: PyTorch Architecture Optimization](https://github.com/pytorch/ao)
 - [vLLM Quantization](https://docs.vllm.ai/en/latest/quantization/)
