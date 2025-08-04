@@ -66,6 +66,7 @@ from sglang.srt.layers.quantization.utils import get_linear_quant_method
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+from sglang.srt.layers.quantization.int4fp8_moe import QuarkInt4Fp8Config
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
@@ -83,6 +84,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "qoq": QoQConfig,
     "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
+    "int4fp8_moe": QuarkInt4Fp8Config,
 }
 
 # VLLM-dependent quantization methods
