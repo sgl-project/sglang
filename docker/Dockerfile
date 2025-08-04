@@ -7,16 +7,26 @@ ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG FLASHMLA_COMMIT=1408756a88e52a25196b759eaf8db89d2b51b5a1
-ARG FAST_HADAMARD_TRANSFORM_COMMIT=7fd811c2b47f63b0b08d2582619f939e14dad77c
-ARG CMAKE_BUILD_PARALLEL_LEVEL=2
+ARG FLASHMLA_CUTLASS_COMMIT=e94e888df3551224738bfa505787b515eae8352f
+ARG BUILD_AND_DOWNLOAD_PARALLEL=2
 ARG SGL_KERNEL_VERSION=0.3.16.post3
+ARG GDRCOPY_VERSION=2.4.4
+ARG PIP_DEFAULT_INDEX
+ARG UBUNTU_MIRROR
+ARG GITHUB_ARTIFACTORY=github.com
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
-    GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
+    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
     NVSHMEM_DIR=/sgl-workspace/nvshmem/install
 # Add GKE default lib and bin locations.
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+
+# Replace Ubuntu sources if it is specified
+RUN if [ -n "$UBUNTU_MIRROR" ]; then \
+    sed -i "s|http://.*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
+    sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
+fi
 
 RUN apt update && apt install wget -y && apt install software-properties-common -y \
  && add-apt-repository ppa:deadsnakes/ppa -y \
@@ -53,10 +63,16 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
  && rm -rf /var/lib/apt/lists/* \
  && apt-get clean
 
+# Replace pip global cache if it is specified
+RUN if [ -n "${PIP_DEFAULT_INDEX}" ]; then \
+    python3 -m pip config set global.index-url ${PIP_DEFAULT_INDEX}; \
+fi
+
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
- && git clone https://github.com/NVIDIA/gdrcopy.git -b v2.4.4 \
- && cd gdrcopy/packages \
+ && wget -q https://${GITHUB_ARTIFACTORY}/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz \
+ && tar -xzf v${GDRCOPY_VERSION}.tar.gz && rm v${GDRCOPY_VERSION}.tar.gz \
+ && cd gdrcopy-${GDRCOPY_VERSION}/packages \
  && CUDA=/usr/local/cuda ./build-deb-packages.sh \
  && dpkg -i gdrdrv-dkms_*.deb libgdrapi_*.deb gdrcopy-tests_*.deb gdrcopy_*.deb \
  && cd / && rm -rf /tmp/gdrcopy
@@ -87,14 +103,14 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
  && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
-     python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
+     python3 -m pip install --no-cache-dir https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
    fi \
 && if [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
      python3 -m pip install --no-cache-dir sgl-kernel==${SGL_KERNEL_VERSION} ; \
    fi \
  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
- && FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
+ && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
 
 # Download NVSHMEM source files
@@ -104,8 +120,10 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
       git clone https://github.com/fzyzcjy/DeepEP.git \
       && cd DeepEP && git checkout 2555874d8713ea758671867a50ebc9883552686d && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
     else \
-      git clone https://github.com/deepseek-ai/DeepEP.git \
-      && cd DeepEP && git checkout ${DEEPEP_COMMIT} && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
+      wget https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip \
+      && unzip ${DEEPEP_COMMIT}.zip && rm ${DEEPEP_COMMIT}.zip \
+      && mv DeepEP-${DEEPEP_COMMIT} DeepEP \
+      && cd DeepEP && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
     fi \
     && tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
     && mv nvshmem_src nvshmem \
@@ -123,7 +141,7 @@ RUN cd /sgl-workspace/nvshmem && \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
     NVSHMEM_USE_GDRCOPY=1 \
     cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} && \
-    cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
+    cmake --build build --target install -j${BUILD_AND_DOWNLOAD_PARALLEL}
 
 # Install DeepEP
 RUN cd /sgl-workspace/DeepEP && \
@@ -142,14 +160,14 @@ RUN cd /sgl-workspace/DeepEP && \
 
 # Install flashmla
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
-      git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
-      cd flash-mla && \
-      git checkout ${FLASHMLA_COMMIT} && \
-      git submodule update --init --recursive && \
+      wget -q https://${GITHUB_ARTIFACTORY}/deepseek-ai/FlashMLA/archive/${FLASHMLA_COMMIT}.zip && \
+      unzip -q ${FLASHMLA_COMMIT}.zip && rm ${FLASHMLA_COMMIT}.zip && mv FlashMLA-${FLASHMLA_COMMIT} flash-mla && cd flash-mla/csrc && \
+      wget -q https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/${FLASHMLA_CUTLASS_COMMIT}.zip && \
+      unzip -q ${FLASHMLA_CUTLASS_COMMIT}.zip && rm ${FLASHMLA_CUTLASS_COMMIT}.zip && mv cutlass-${FLASHMLA_CUTLASS_COMMIT}/* cutlass && cd .. && \
       if [ "$CUDA_VERSION" = "12.6.1" ]; then \
         export FLASH_MLA_DISABLE_SM100=1; \
       fi && \
-      pip install -v . ; \
+      NVCC_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install -v . ; \
     fi
 
 # Python tools
@@ -221,15 +239,15 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
     tabulate
 
 # Install diff-so-fancy
-RUN curl -LSso /usr/local/bin/diff-so-fancy https://github.com/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
+RUN curl -LSso /usr/local/bin/diff-so-fancy https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
     && chmod +x /usr/local/bin/diff-so-fancy
 
 # Install clang-format
-RUN curl -LSso /usr/local/bin/clang-format https://github.com/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
+RUN curl -LSso /usr/local/bin/clang-format https://${GITHUB_ARTIFACTORY}/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
     && chmod +x /usr/local/bin/clang-format
 
 # Install clangd
-RUN curl -L https://github.com/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip \
+RUN curl -L https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip \
     && unzip clangd.zip \
     && cp -r clangd_18.1.3/bin/* /usr/local/bin/ \
     && cp -r clangd_18.1.3/lib/* /usr/local/lib/ \
@@ -239,7 +257,7 @@ RUN curl -L https://github.com/clangd/clangd/releases/download/18.1.3/clangd-lin
 RUN CMAKE_VERSION=3.31.1 \
     && ARCH=$(uname -m) \
     && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
-    && wget "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
+    && wget "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
     && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
     && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
     && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
@@ -253,7 +271,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 # Build and install sgl-router
 RUN python3 -m pip install --no-cache-dir setuptools-rust \
     && cd /sgl-workspace/sglang/sgl-router \
-    && cargo build --release \
+    && cargo build --release -j ${BUILD_AND_DOWNLOAD_PARALLEL} \
     && python3 -m pip install --no-cache-dir . \
     && rm -rf /root/.cache
 
@@ -412,7 +430,9 @@ setopt INC_APPEND_HISTORY
 EOF
 
 RUN set -euxo ; \
-    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | \
+    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
+    bash -s -- --tag 1.42.4 --to /usr/local/bin
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
