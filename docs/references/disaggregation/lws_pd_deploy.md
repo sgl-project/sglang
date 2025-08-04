@@ -64,9 +64,8 @@ spec:
           - --dp-size
           - "16"
           - --disable-radix-cache
-          - --enable-deepep-moe
-          - --deepep-mode
-          - normal
+          - --moe-a2a-backend
+          - deepep
           - --disaggregation-mode
           - prefill
           - --mem-fraction-static
@@ -212,9 +211,8 @@ spec:
           - --dp-size
           - "16"
           - --disable-radix-cache
-          - --enable-deepep-moe
-          - --deepep-mode
-          - normal
+          - --moe-a2a-backend
+          - deepep
           - --disaggregation-mode
           - prefill
           - --mem-fraction-static
@@ -373,9 +371,8 @@ spec:
           - --enable-dp-lm-head
           - --dp-size
           - "16"
-          - --enable-deepep-moe
-          - --deepep-mode
-          - low_latency
+          - --moe-a2a-backend
+          - deepep
           - --disaggregation-mode
           - decode
           - --mem-fraction-static
@@ -508,9 +505,8 @@ spec:
             #- --enable-two-batch-overlap
           - --dp-size
           - "16"
-          - --enable-deepep-moe
-          - --deepep-mode
-          - low_latency
+          - --moe-a2a-backend
+          - deepep
           - --disaggregation-mode
           - decode
           - --mem-fraction-static

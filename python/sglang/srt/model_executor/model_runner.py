@@ -60,6 +60,7 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.layers.quantization import (
     deep_gemm_wrapper,
     monkey_patch_isinstance_for_vllm_base_layer,
@@ -216,6 +217,10 @@ class ModelRunner:
                 # TODO it is indeed not a "server args"
                 "use_mla_backend": self.use_mla_backend,
                 "speculative_algorithm": self.spec_algorithm,
+            }
+            | {
+                "moe_a2a_backend": MoeA2ABackend(server_args.moe_a2a_backend),
+                "deepep_mode": DeepEPMode(server_args.deepep_mode),
             }
         )
 
@@ -436,6 +441,7 @@ class ModelRunner:
                     "triton",
                     "flashmla",
                     "cutlass_mla",
+                    "trtllm_mla",
                     "ascend",
                 ]:
                     logger.info(
@@ -1437,6 +1443,12 @@ class ModelRunner:
             )
 
             return CutlassMLABackend(self)
+        elif self.server_args.attention_backend == "trtllm_mla":
+            if not self.use_mla_backend:
+                raise ValueError("trtllm_mla backend can only be used with MLA models.")
+            from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+
+            return TRTLLMMLABackend(self)
         elif self.server_args.attention_backend == "intel_amx":
             from sglang.srt.layers.attention.intel_amx_backend import (
                 IntelAMXAttnBackend,
