@@ -434,6 +434,7 @@ class Req:
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
+        priority: int = 0,
     ):
         # Input and output info
         self.rid = rid
@@ -484,6 +485,7 @@ class Req:
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
+        self.priority = priority
 
         # For incremental decoding
         # ----- | --------- read_ids -------|

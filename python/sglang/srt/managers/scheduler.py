@@ -20,6 +20,7 @@ import signal
 import sys
 import threading
 import time
+from bisect import insort
 from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
@@ -438,6 +439,7 @@ class Scheduler(
             self.tree_cache,
             self.enable_hierarchical_cache,
         )
+        self.use_priority_scheduling = self.schedule_policy == "priority"
         assert (
             server_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"
@@ -1001,19 +1003,25 @@ class Scheduler(
             ):
                 self.return_health_check_ct += 1
                 continue
-
-            # If it is a work request, accept or reject the request based on the request queue size.
-            if is_work_request(recv_req):
-                if len(self.waiting_queue) + 1 > self.max_queued_requests:
-                    abort_req = AbortReq(
-                        recv_req.rid,
-                        finished_reason={
-                            "type": "abort",
-                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                            "message": "The request queue is full.",
-                        },
-                    )
-                    self.send_to_tokenizer.send_pyobj(abort_req)
+            # If it is a work request and the request queue is full, we need to either reject or evict a request.
+            if is_work_request(recv_req) and len(self.waiting_queue) + 1 > self.max_queued_requests:
+                # Reject the incoming request by default.
+                abort_req = AbortReq(
+                    recv_req.rid,
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                        "message": "The request queue is full." ,
+                    },
+                )
+                # When using priority scheduling, consider eviciting existing request with the lowest priority.
+                if self.use_priority_scheduling and recv_req.priority >  self.waiting_queue[-1].priority:
+                    lowest_priority_req = self.waiting_queue.pop()
+                    abort_req.rid = lowest_priority_req.rid
+                    abort_req.finished_reason["message"] = "The request is evicted based on priority."
+                self.send_to_tokenizer.send_pyobj(abort_req)
+                # Skip dispatcher when the incoming request is rejected.
+                if abort_req.rid == recv_req.rid:
                     continue
             output = self._request_dispatcher(recv_req)
             if output is not None:
@@ -1062,6 +1070,7 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 data_parallel_rank=recv_req.data_parallel_rank,
                 vocab_size=self.model_config.vocab_size,
+                priority=recv_req.priority,
             )
             req.tokenizer = self.tokenizer
 
@@ -1193,7 +1202,10 @@ class Scheduler(
             self.disagg_decode_prealloc_queue.add(req)
         else:
             self._prefetch_kvcache(req)
-            self.waiting_queue.append(req)
+            if self.use_priority_scheduling:
+                self._add_requests_to_queue_in_order([req])
+            else:
+                self.waiting_queue.append(req)
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
@@ -1216,7 +1228,14 @@ class Scheduler(
             # If this is a decode server, we put the request to the decode pending prealloc queue
             self.disagg_decode_prealloc_queue.extend(reqs, is_retracted)
         else:
-            self.waiting_queue.extend(reqs)
+            if self.use_priority_scheduling:
+                self._add_requests_to_queue_in_order(reqs)
+            else:
+                self.waiting_queue.extend(reqs)
+
+    def _add_requests_to_queue_in_order(self, reqs: List[Req]):
+        for req in reqs:
+            insort(self.waiting_queue,req, key=(lambda x: (-x.priority, x.queue_time_start)))
 
     def handle_embedding_request(
         self,
@@ -1228,6 +1247,7 @@ class Scheduler(
             recv_req.input_ids,
             recv_req.sampling_params,
             token_type_ids=recv_req.token_type_ids,
+            priority=recv_req.priority,
         )
         req.tokenizer = self.tokenizer
 

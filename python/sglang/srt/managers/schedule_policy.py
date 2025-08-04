@@ -72,6 +72,7 @@ class CacheAgnosticPolicy(Enum):
     FCFS = "fcfs"  # first come first serve
     LOF = "lof"  # longest output first
     RANDOM = "random"
+    PRIORITY = "priority" # higher priority first
 
 
 class SchedulePolicy:
@@ -99,7 +100,9 @@ class SchedulePolicy:
         if self.policy == CacheAgnosticPolicy.FCFS:
             # A shortcut for FCFS
             return False
-
+        if self.policy == CacheAgnosticPolicy.PRIORITY:
+            # We use sorted array for priority scheduling instead
+            return False
         policy = self._determine_active_policy(waiting_queue)
 
         prefix_computed = False
@@ -123,6 +126,8 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_longest_output(waiting_queue)
             elif policy == CacheAgnosticPolicy.RANDOM:
                 SchedulePolicy._sort_randomly(waiting_queue)
+            if policy == CacheAgnosticPolicy.FCFS:
+                pass
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
