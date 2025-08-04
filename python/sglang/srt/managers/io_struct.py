@@ -101,8 +101,10 @@ class GenerateReqInput:
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
-    # The path to the LoRA
+    # The path to the LoRA adaptors
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # The uid of LoRA adaptors, should be initialized by tokenizer manager
+    lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
@@ -500,7 +502,7 @@ class TokenizedGenerateReqInput:
     stream: bool
 
     # LoRA related
-    lora_path: Optional[str] = None  # None means just use the base model
+    lora_id: Optional[str] = None  # None means just use the base model
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
@@ -522,6 +524,9 @@ class TokenizedGenerateReqInput:
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+
+    # For dp balance
+    dp_balance_id: int = -1
 
 
 @dataclass
@@ -648,6 +653,8 @@ class TokenizedEmbeddingReqInput:
     token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
+    # For dp balance
+    dp_balance_id: int = -1
 
 
 @dataclass
@@ -1097,7 +1104,7 @@ class UnloadLoRAAdapterReqInput:
 class LoRAUpdateResult:
     success: bool
     error_message: Optional[str] = None
-    loaded_adapters: Dict[str, LoRARef] = field(default_factory=dict)
+    loaded_adapters: Optional[Dict[str, LoRARef]] = None
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
