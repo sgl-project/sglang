@@ -836,6 +836,9 @@ class Qwen3MoeForCausalLM(nn.Module):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
+        # Synchronize to ensure all weights are loaded since we loaded them in non-blocking mode
+        torch.cuda.synchronize()
+
         # TODO mimic deepseek
         self.routed_experts_weights_of_layer = {
             layer_id: self.model.layers[layer_id].mlp.get_moe_weights()

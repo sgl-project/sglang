@@ -283,7 +283,7 @@ class FusedMoE(torch.nn.Module):
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
-        expert_data.copy_(loaded_weight)
+        expert_data.copy_(loaded_weight, non_blocking=True)
 
     def _load_w2(
         self,
@@ -347,7 +347,7 @@ class FusedMoE(torch.nn.Module):
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
-        expert_data.copy_(loaded_weight)
+        expert_data.copy_(loaded_weight, non_blocking=True)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
