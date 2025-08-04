@@ -259,7 +259,7 @@ class Engine(EngineBase):
                     f"data_parallel_rank must be in range [0, {self.server_args.dp_size-1}]"
                 )
 
-        logger.info(f"data_parallel_rank: {data_parallel_rank}")
+        logger.debug(f"data_parallel_rank: {data_parallel_rank}")
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
