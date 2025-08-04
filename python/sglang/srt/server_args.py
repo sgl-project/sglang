@@ -149,6 +149,7 @@ class ServerArgs:
     max_lora_rank: Optional[int] = None
     lora_target_modules: Optional[Union[set[str], List[str]]] = None
     lora_paths: Optional[Union[dict[str, str], dict[str, LoRARef], List[str]]] = None
+    max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
 
@@ -172,12 +173,11 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    enable_ep_moe: bool = False
-    enable_deepep_moe: bool = False
+    moe_a2a_backend: Optional[Literal["deepep"]] = None
     enable_flashinfer_cutlass_moe: bool = False
     enable_flashinfer_trtllm_moe: bool = False
     enable_flashinfer_allreduce_fusion: bool = False
-    deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
+    deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
@@ -219,6 +219,7 @@ class ServerArgs:
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
+    enable_symm_mem: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
@@ -272,7 +273,27 @@ class ServerArgs:
     enable_pdmux: bool = False
     sm_group_num: int = 3
 
+    # Deprecated arguments
+    enable_ep_moe: bool = False
+    enable_deepep_moe: bool = False
+
     def __post_init__(self):
+
+        # Check deprecated arguments
+        def print_deprecated_warning(message: str):
+            logger.warning(f"\033[33m{message}\033[0m")
+
+        if self.enable_ep_moe:
+            self.ep_size = self.tp_size
+            print_deprecated_warning(
+                "NOTE: --enable-ep-moe is deprecated. Please set `--ep-size` to the same value as `--tp-size` instead."
+            )
+        if self.enable_deepep_moe:
+            self.moe_a2a_backend = "deepep"
+            print_deprecated_warning(
+                "NOTE: --enable-deepep-moe is deprecated. Please set `--moe-a2a-backend` to 'deepep' instead."
+            )
+
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -455,14 +476,13 @@ class ServerArgs:
                 self.quantization == "modelopt_fp4"
             ), "modelopt_fp4 quantization is required for Flashinfer MOE"
             os.environ["TRTLLM_ENABLE_PDL"] = "1"
-            if self.enable_ep_moe:
-                self.ep_size = self.tp_size
-                logger.warning(
-                    f"Flashinfer cutlass MoE and EP MoE are enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-                )
+            assert self.ep_size in [
+                1,
+                self.tp_size,
+            ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         # DeepEP MoE
-        if self.enable_deepep_moe:
+        if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
@@ -486,7 +506,7 @@ class ServerArgs:
             )
 
         if self.enable_eplb:
-            assert self.enable_ep_moe or self.enable_deepep_moe
+            assert self.ep_size > 1 or self.moe_a2a_backend is not None
 
         if self.enable_expert_distribution_metrics and (
             self.expert_distribution_recorder_mode is None
@@ -848,7 +868,7 @@ class ServerArgs:
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
-            choices=["lpm", "random", "fcfs", "dfs-weight"],
+            choices=["lpm", "random", "fcfs", "dfs-weight", "lof"],
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
@@ -1151,6 +1171,7 @@ class ServerArgs:
             choices=[
                 "round_robin",
                 "shortest_queue",
+                "minimum_tokens",
             ],
         )
 
@@ -1217,6 +1238,12 @@ class ServerArgs:
             type=int,
             default=8,
             help="Maximum number of adapters for a running batch, include base-only request.",
+        )
+        parser.add_argument(
+            "--max-loaded-loras",
+            type=int,
+            default=ServerArgs.max_loaded_loras,
+            help="If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`.",
         )
         parser.add_argument(
             "--lora-backend",
@@ -1354,29 +1381,26 @@ class ServerArgs:
             help="The expert parallelism size.",
         )
         parser.add_argument(
-            "--enable-ep-moe",
-            action="store_true",
-            help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
+            "--moe-a2a-backend",
+            type=str,
+            choices=["deepep"],
+            default=ServerArgs.moe_a2a_backend,
+            help="Choose the backend for MoE A2A.",
         )
         parser.add_argument(
             "--enable-flashinfer-cutlass-moe",
             action="store_true",
-            help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP with --enable-ep-moe",
+            help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
         )
         parser.add_argument(
             "--enable-flashinfer-trtllm-moe",
             action="store_true",
-            help="Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP with --enable-ep-moe",
+            help="Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
-        )
-        parser.add_argument(
-            "--enable-deepep-moe",
-            action="store_true",
-            help="Enabling DeepEP MoE implementation for EP MoE.",
         )
         parser.add_argument(
             "--deepep-mode",
@@ -1583,6 +1607,11 @@ class ServerArgs:
             "--enable-nccl-nvls",
             action="store_true",
             help="Enable NCCL NVLS for prefill heavy requests when available.",
+        )
+        parser.add_argument(
+            "--enable-symm-mem",
+            action="store_true",
+            help="Enable NCCL symmetric memory for fast collectives.",
         )
         parser.add_argument(
             "--enable-tokenizer-batch-encode",
@@ -1839,6 +1868,18 @@ class ServerArgs:
             help="Disable mmap while loading weight using safetensors.",
         )
 
+        # Deprecated arguments
+        parser.add_argument(
+            "--enable-ep-moe",
+            action="store_true",
+            help="(Deprecated) Enabling expert parallelism for moe. The ep size is equal to the tp size.",
+        )
+        parser.add_argument(
+            "--enable-deepep-moe",
+            action="store_true",
+            help="(Deprecated) Enabling DeepEP MoE implementation for EP MoE.",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
@@ -1894,6 +1935,12 @@ class ServerArgs:
         model_arch = self.get_hf_config().architectures[0]
         if "Llama4" in model_arch:
             assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
+
+        if "Gemma2ForCausalLM" in model_arch:
+            # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
+            # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
+            logger.warning("Disable hybrid SWA memory for Gemma2ForCausalLM.")
+            self.disable_hybrid_swa_memory = True
 
         # Check LoRA
         self.check_lora_server_args()
@@ -1968,6 +2015,19 @@ class ServerArgs:
             assert self.lora_paths or (
                 self.max_lora_rank and self.lora_target_modules
             ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+
+            # Validate max_loaded_loras
+            if self.max_loaded_loras is not None:
+                assert self.max_loaded_loras >= self.max_loras_per_batch, (
+                    "max_loaded_loras should be greater than or equal to max_loras_per_batch. "
+                    f"max_loaded_loras={self.max_loaded_loras}, max_loras_per_batch={self.max_loras_per_batch}"
+                )
+                assert (
+                    not self.lora_paths or len(self.lora_paths) <= self.max_loaded_loras
+                ), (
+                    "The number of LoRA paths should not exceed max_loaded_loras. "
+                    f"max_loaded_loras={self.max_loaded_loras}, lora_paths={len(self.lora_paths)}"
+                )
 
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
         larger_tp = max(decode_tp, prefill_tp)

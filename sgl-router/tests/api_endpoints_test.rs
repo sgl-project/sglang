@@ -83,12 +83,12 @@ impl TestContext {
             .build()
             .unwrap();
 
-        // Clone config for the closure
-        let config_clone = config.clone();
+        // Create app context
+        let app_context = common::create_test_context(config.clone());
 
         // Create router using sync factory in a blocking context
         let router =
-            tokio::task::spawn_blocking(move || RouterFactory::create_router(&config_clone))
+            tokio::task::spawn_blocking(move || RouterFactory::create_router(&app_context))
                 .await
                 .unwrap()
                 .unwrap();
@@ -1433,9 +1433,12 @@ mod pd_mode_tests {
             cors_allowed_origins: vec![],
         };
 
+        // Create app context
+        let app_context = common::create_test_context(config);
+
         // Create router - this might fail due to health check issues
         let router_result =
-            tokio::task::spawn_blocking(move || RouterFactory::create_router(&config))
+            tokio::task::spawn_blocking(move || RouterFactory::create_router(&app_context))
                 .await
                 .unwrap();
 
