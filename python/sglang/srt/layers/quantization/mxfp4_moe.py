@@ -321,5 +321,5 @@ def fused_experts_mxfp4_oai(
         gammas=rdata.gate_scal if rdata else None)
     gemm2_output = maybe_remove_padding(gemm2_output,
                                         hidden_size,
-                                        swizzle_scale)
+                                        swizzle_scale).contiguous()
     return gemm2_output

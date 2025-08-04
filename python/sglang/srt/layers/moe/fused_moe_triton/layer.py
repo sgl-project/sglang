@@ -585,7 +585,7 @@ class FusedMoE(torch.nn.Module):
                 self.quant_method.swiglu_alpha = swiglu_alpha
                 self.quant_method.swiglu_beta = swiglu_beta
                 self.quant_method.bias = bias
-                self.quant_method.activation_dtype = self.activation_dtype
+                self.quant_method.set_activation_dtype(self.activation_dtype)
                 self.quant_method.shuffle_weight = shuffle_weight
         assert self.quant_method is not None
 

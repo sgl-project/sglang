@@ -105,6 +105,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase, CustomOp):
         self.shuffle_weight = shuffle_weight
         self.swizzle_value, self.swizzle_scale = get_swizzle_type(activation_dtype)
 
+    def set_activation_dtype(self, activation_dtype: torch.dtype):
+        self.activation_dtype = activation_dtype
+        self.swizzle_value, self.swizzle_scale = get_swizzle_type(activation_dtype)
+
     def create_weights(
         self,
         layer: torch.nn.Module,
