@@ -34,7 +34,7 @@ def get_moe_padding_size(weight_block_size):
     if weight_block_size is not None:
         # See NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
         assert (
-            len(weight_block_size) == 2 or len(weight_block_size) == 1
+            len(weight_block_size) in [1, 2]
         ), "Only len(weight_block_size) in [1, 2] is supported"
         if len(weight_block_size) == 2:
             assert (
