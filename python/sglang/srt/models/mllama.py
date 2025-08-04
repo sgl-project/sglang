@@ -880,9 +880,7 @@ class MllamaForConditionalGeneration(nn.Module):
                 self.image_size,
                 dtype=torch.float32,
             )
-            batched_ar_ids = torch.ones(
-                bs, max_num_images, dtype=torch.int64, device="cuda"
-            )
+            batched_ar_ids = torch.ones(bs, max_num_images, dtype=torch.int64)
             batched_ar_mask = torch.zeros(
                 bs, max_num_images, max_num_tiles, dtype=torch.int64
             )
@@ -901,11 +899,13 @@ class MllamaForConditionalGeneration(nn.Module):
                     img = pixel_values[0, j]
                     num_tiles = img.shape[0]
                     batched_images[i, j, :num_tiles] = img
-                    batched_ar_ids[i, j] = mm_input.mm_items[0].aspect_ratio_id[0, j]
+                    batched_ar_ids[i, j] = mm_input.mm_items[0].model_specific_data[
+                        "aspect_ratio_ids"
+                    ][0, j]
 
                     batched_ar_mask[i, j, :num_tiles] = mm_input.mm_items[
                         0
-                    ].aspect_ratio_mask[0, j]
+                    ].model_specific_data["aspect_ratio_mask"][0, j]
                 i += 1
 
         return batched_images, batched_ar_ids, batched_ar_mask, encoder_lens_need

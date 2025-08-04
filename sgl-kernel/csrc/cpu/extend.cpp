@@ -232,6 +232,7 @@ void extend_attention_kernel_impl(
     const index_t* __restrict__ req_to_token,
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
+    const int64_t* __restrict__ encoder_lens,
     const index_t* __restrict__ extend_seq_lens,
     const index_t* __restrict__ extend_start_loc,
     const void* __restrict__ buffer,
@@ -257,7 +258,8 @@ void extend_attention_kernel_impl(
     int max_total_num_tokens,
     int max_len_extend,
     int buffer_size_per_thread,
-    bool is_prefix_skipped) {
+    bool is_prefix_skipped,
+    bool has_encoder_lens) {
   using Vec = at::vec::Vectorized<float>;
 
   // strides
@@ -310,6 +312,7 @@ void extend_attention_kernel_impl(
       int seq_extend_start_loc = extend_start_loc[bs];
 
       int req_pool_id = req_pool_indices[bs];
+      int kv_offset = has_encoder_lens ? encoder_lens[bs] : 0;
       TORCH_CHECK(seq_len_prefix >= 0, "prefix len < 0!");
       TORCH_CHECK(seq_len <= max_context_len, "seq_len out of scope!");
       TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
@@ -346,7 +349,7 @@ void extend_attention_kernel_impl(
         pack_vnni<scalar_t, index_t>(
             /*    dst */ Btmp,
             /*    src */ k_buffer + head_kv_id * k_strideH,
-            /*    ind */ req_to_token + req_pool_id * max_context_len + n,
+            /*    ind */ req_to_token + req_pool_id * max_context_len + n + kv_offset,
             /*     N  */ n_size,
             /*     K  */ head_size,
             /* ld_src */ k_strideN,
@@ -415,7 +418,7 @@ void extend_attention_kernel_impl(
         pack_vnni2<scalar_t, index_t>(
             /*    dst */ Btmp,
             /*    src */ v_buffer + head_kv_id * v_strideH,
-            /*    ind */ req_to_token + req_pool_id * max_context_len + n,
+            /*    ind */ req_to_token + req_pool_id * max_context_len + n + kv_offset,
             /*     K  */ n_size,
             /*     N  */ head_size_v,
             /* ld_src */ v_strideN,
@@ -575,6 +578,7 @@ void extend_attention_kernel_impl(
 // seq_lens: [num_seqs] int64
 // extend_seq_lens: [num_seqs]
 // extend_start_loc: [num_seqs]
+// encoder_lens: [num_seqs] int64
 //
 void extend_attention_cpu(
     at::Tensor& q_extend,
@@ -590,7 +594,8 @@ void extend_attention_cpu(
     at::Tensor& extend_start_loc,
     int64_t max_len_extend,
     double sm_scale,
-    double logit_cap) {
+    double logit_cap,
+    std::optional<at::Tensor> encoder_lens) {
   RECORD_FUNCTION(
       "sgl-kernel::extend_attention_cpu",
       std::vector<c10::IValue>(
@@ -680,6 +685,13 @@ void extend_attention_cpu(
   int num_threads = at::get_num_threads();
   auto buffer = at::empty({num_threads, size_per_thread}, q_extend.options().dtype(at::kChar));
 
+  bool has_encoder_lens = encoder_lens.has_value();
+  // Since encoder_lens is not used when it is None, encoder_lens_t can be initialized as any tensor of int64_t dtype.
+  at::Tensor encoder_lens_t = seq_lens;
+  if (has_encoder_lens) {
+    encoder_lens_t = encoder_lens.value();
+    CHECK_EQ(encoder_lens_t.size(0), num_seqs);
+  }
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {
       extend_attention_kernel_impl<scalar_t, index_t, BLOCK_M, BLOCK_N>(
@@ -692,6 +704,7 @@ void extend_attention_cpu(
           req_to_token.data_ptr<index_t>(),
           req_pool_indices.data_ptr<int64_t>(),
           seq_lens.data_ptr<int64_t>(),
+          encoder_lens_t.data_ptr<int64_t>(),
           extend_seq_lens.data_ptr<index_t>(),
           extend_start_loc.data_ptr<index_t>(),
           buffer.data_ptr(),
@@ -717,7 +730,8 @@ void extend_attention_cpu(
           max_total_num_tokens,
           max_len_extend,
           size_per_thread,
-          is_prefix_skipped);
+          is_prefix_skipped,
+          has_encoder_lens);
     });
   });
 }

@@ -869,6 +869,7 @@ void decode_attention_kernel_impl(
     const index_t* __restrict__ req_to_token,
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
+    const int64_t* __restrict__ encoder_lens,
     int64_t batches,
     int64_t num_heads,
     int64_t head_size,
@@ -884,7 +885,8 @@ void decode_attention_kernel_impl(
     float logit_cap,
     int64_t max_num_reqs,
     int64_t max_context_len,
-    int64_t max_total_num_tokens) {
+    int64_t max_total_num_tokens,
+    bool has_encoder_lens) {
   using Vec = at::vec::Vectorized<float>;
 
   // strides
@@ -910,6 +912,7 @@ void decode_attention_kernel_impl(
       // get key/value
       int64_t seq_len_kv = seq_lens[bs];
       int64_t req_pool_id = req_pool_indices[bs];
+      int64_t kv_offset = has_encoder_lens ? encoder_lens[bs] : 0;
       TORCH_CHECK(seq_len_kv <= max_context_len, "seq_len_kv out of scope!");
       TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
 
@@ -933,7 +936,7 @@ void decode_attention_kernel_impl(
             /* A   */ q_ptr,
             /* B   */ k_buffer + head_id * k_strideH,
             /* C   */ s_i,
-            /* ind */ req_to_token + req_pool_id * max_context_len + n,
+            /* ind */ req_to_token + req_pool_id * max_context_len + n + kv_offset,
             /* scl */ scaling,
             /* M   */ 1,
             /* N   */ n_size,
@@ -973,7 +976,7 @@ void decode_attention_kernel_impl(
             /* A   */ s_delta,
             /* B   */ v_buffer + head_id * v_strideH,
             /* C   */ v_prime,
-            /* ind */ req_to_token + req_pool_id * max_context_len + n,
+            /* ind */ req_to_token + req_pool_id * max_context_len + n + kv_offset,
             /* scl */ &m_delta,
             /* M   */ 1,
             /* N   */ head_size_v,
@@ -1203,6 +1206,7 @@ void decode_attention_grouped_kernel_impl(
     const index_t* __restrict__ req_to_token,
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
+    const int64_t* __restrict__ encoder_lens,
     int64_t batches,
     int64_t num_heads,
     int64_t num_heads_kv,
@@ -1219,7 +1223,8 @@ void decode_attention_grouped_kernel_impl(
     float logit_cap,
     int64_t max_num_reqs,
     int64_t max_context_len,
-    int64_t max_total_num_tokens) {
+    int64_t max_total_num_tokens,
+    bool has_encoder_lens) {
   using Vec = at::vec::Vectorized<float>;
 
   // block length for heads
@@ -1262,6 +1267,7 @@ void decode_attention_grouped_kernel_impl(
 
       int64_t seq_len_kv = seq_lens[bs];
       int64_t req_pool_id = req_pool_indices[bs];
+      int64_t kv_offset = has_encoder_lens ? encoder_lens[bs] : 0;
       TORCH_CHECK(seq_len_kv <= max_context_len, "seq_len_kv out of scope!");
       TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
 
@@ -1287,7 +1293,7 @@ void decode_attention_grouped_kernel_impl(
             /* A   */ q_ptr,
             /* B   */ k_buffer + head_kv_id * k_strideH,
             /* C   */ s_i,
-            /* ind */ req_to_token + req_pool_id * max_context_len + n,
+            /* ind */ req_to_token + req_pool_id * max_context_len + n + kv_offset,
             /* scl */ scaling,
             /* M   */ h_size,
             /* N   */ n_size,
@@ -1331,7 +1337,7 @@ void decode_attention_grouped_kernel_impl(
             /* A   */ s_delta,
             /* B   */ v_buffer + head_kv_id * v_strideH,
             /* C   */ v_prime,
-            /* ind */ req_to_token + req_pool_id * max_context_len + n,
+            /* ind */ req_to_token + req_pool_id * max_context_len + n + kv_offset,
             /* scl */ m_delta,
             /* M   */ h_size,
             /* N   */ head_size_v,
@@ -1371,6 +1377,7 @@ void decode_attention_grouped_kernel_impl(
 // req_to_token:     [max_num_reqs, max_context_len] int32 or int64
 // req_pool_indices: [num_seqs] int64
 // seq_lens:         [num_seqs] int64
+// encoder_lens:     [num_seqs] int64 or None
 //
 void decode_attention_cpu(
     at::Tensor& query,
@@ -1385,7 +1392,8 @@ void decode_attention_cpu(
     at::Tensor& req_pool_indices,
     at::Tensor& seq_lens,
     double sm_scale,
-    double logit_cap) {
+    double logit_cap,
+    std::optional<at::Tensor> encoder_lens) {
   RECORD_FUNCTION(
       "sgl-kernel::decode_attention_cpu",
       std::vector<c10::IValue>(
@@ -1461,7 +1469,13 @@ void decode_attention_cpu(
   int num_threads = at::get_num_threads();
   int64_t size_per_thread = is_mla ? BLOCK_N * head_size + BLOCK_N * head_size_v : 0;
   auto buffer = at::empty({num_threads, size_per_thread}, k_buffer.options());
-
+  bool has_encoder_lens = encoder_lens.has_value();
+  // Since encoder_lens is not used when it is None, encoder_lens_t can be initialized as any tensor of int64_t dtype.
+  at::Tensor encoder_lens_t = seq_lens;
+  if (has_encoder_lens) {
+    encoder_lens_t = encoder_lens.value();
+    CHECK_EQ(encoder_lens_t.size(0), num_seqs);
+  }
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "decode_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "decode_attention_indices", [&] {
       // update the kv buffer
@@ -1496,6 +1510,7 @@ void decode_attention_cpu(
             req_to_token.data_ptr<index_t>(),
             req_pool_indices.data_ptr<int64_t>(),
             seq_lens.data_ptr<int64_t>(),
+            encoder_lens_t.data_ptr<int64_t>(),
             num_seqs,
             num_heads,
             head_size,
@@ -1511,7 +1526,8 @@ void decode_attention_cpu(
             logit_cap,
             max_num_reqs,
             max_context_len,
-            max_total_num_tokens);
+            max_total_num_tokens,
+            has_encoder_lens);
       } else if (is_mla) {
         // MLA
         decode_attention_mla_kernel_impl<scalar_t, index_t, BLOCK_N>(
@@ -1552,6 +1568,7 @@ void decode_attention_cpu(
             req_to_token.data_ptr<index_t>(),
             req_pool_indices.data_ptr<int64_t>(),
             seq_lens.data_ptr<int64_t>(),
+            encoder_lens_t.data_ptr<int64_t>(),
             num_seqs,
             num_heads,
             num_heads_kv,
@@ -1568,7 +1585,8 @@ void decode_attention_cpu(
             logit_cap,
             max_num_reqs,
             max_context_len,
-            max_total_num_tokens);
+            max_total_num_tokens,
+            has_encoder_lens);
       }
     });
   });
