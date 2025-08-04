@@ -112,13 +112,19 @@ struct AttentionSink : AttentionVariantBase {
     return (kv_idx + qo_len + window_left >= kv_len + qo_idx);
   })
 
-  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, {
-    float log_sink = math::ptx_log2(params.sink[qo_head_idx]);
-    float m_all = (log_sink > m) ? log_sink : m;
-    float scale = math::ptx_exp2(m - m_all);
-    float d_all = d * scale;
-    float denom = math::ptx_exp2(log_sink - m_all) + d_all;
-    return (output * scale) * math::ptx_rcp(denom);
+  REGISTER_M_D_UPDATE(params, kv_tile_idx, qo_head_idx, m, d, scale, {
+    float log_sink = (kv_tile_idx == 0 && qo_head_idx < params.num_qo_heads) ? params.sink[qo_head_idx] * math::log2e : -math::inf;
+    float m_new = (log_sink > m) ? log_sink : m;
+    scale = math::ptx_exp2(m - m_new);
+    float d_new = math::ptx_exp2(log_sink - m_new) + d * scale;
+    // Update m and d
+    m = m_new;
+    d = d_new;
+  })
+
+  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale, {
+    float d_rcp = (m != -math::inf) ? math::ptx_rcp(d) : 0.f;
+    return output * scale * d_rcp;
   });
 };
 """
@@ -311,7 +317,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # Decode wrappers with attention sink support
             if self.enable_attention_sink:
                 # Create JIT args for decode with attention sink
-                decode_jit_args = [
+                self.decode_jit_args = [
                     f"batch_decode_attention_sink_{filename_safe_dtype_map[model_runner.dtype]}",  # uri
                     model_runner.dtype,  # dtype_q
                     model_runner.kv_cache_dtype,  # dtype_kv
@@ -331,7 +337,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         self.workspace_buffer,
                         "NHD",
                         use_tensor_cores=self.decode_use_tensor_cores,
-                        jit_args=decode_jit_args,
+                        jit_args=self.decode_jit_args,
                     )
                 )
             else:
@@ -472,6 +478,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         "NHD",
                         use_cuda_graph=True,
                         use_tensor_cores=self.decode_use_tensor_cores,
+                        jit_args=self.decode_jit_args,
                         paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
                         paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
                         paged_kv_last_page_len_buffer=self.kv_last_page_len[
@@ -502,6 +509,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         self.workspace_buffer,
                         "NHD",
                         use_cuda_graph=True,
+                        jit_args=self.attention_sink_jit_args,
                         qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
                         paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
                         paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
