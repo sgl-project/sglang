@@ -19,9 +19,11 @@ class TestDecodeAttention(CustomTestCase):
         req_to_token: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        encoder_lens=None,
         scaling=None,
         enable_gqa=False,
         causal=False,
+        is_cross_attn=False,
     ):
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
@@ -31,14 +33,21 @@ class TestDecodeAttention(CustomTestCase):
             seq_len_q = 1
             seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + seq_len_q
-            end_kv = start_kv + seq_len_kv
+            if encoder_lens is not None:
+                start_kv = 0 if is_cross_attn else encoder_lens[seq_idx]
+                end_kv = (
+                    encoder_lens[seq_idx] if is_cross_attn else start_kv + seq_len_kv
+                )
+            else:
+                start_kv = 0
+                end_kv = start_kv + seq_len_kv
 
             per_req_query = query[:, start_q:end_q, :]
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
             req_pool_idx = req_pool_indices[seq_idx]
-            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+            per_req_tokens = req_to_token[req_pool_idx, start_kv:end_kv]
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
@@ -63,7 +72,8 @@ class TestDecodeAttention(CustomTestCase):
         dtype = torch.bfloat16
         # This represents the number of tokens already in the sequence
         seq_len = 1024
-        total_tokens = B * seq_len
+        encoder_len = 10
+        total_tokens = B * (seq_len + encoder_len)
         sm_scale = 1.0 / (D**0.5)
         logit_cap = 0.0
         num_kv_splits = 8
@@ -90,11 +100,12 @@ class TestDecodeAttention(CustomTestCase):
 
         req_to_token = (
             torch.arange(total_tokens, device=device)
-            .reshape(B, seq_len)
+            .reshape(B, seq_len + encoder_len)
             .to(torch.int32)
         )
         b_req_idx = torch.arange(B, device=device).to(torch.int64)
         b_seq_len = torch.full((B,), seq_len, device=device).to(torch.int64)
+        encoder_lens = torch.randint(0, encoder_len, (B,)).to(torch.int64)
 
         attn_logits = torch.empty(
             (B, H_Q, num_kv_splits, D_V + 1),
@@ -122,6 +133,7 @@ class TestDecodeAttention(CustomTestCase):
             b_seq_len,
             sm_scale,
             logit_cap,
+            encoder_lens,
         )
 
         self._run_sdpa_forward_decode(
@@ -134,6 +146,7 @@ class TestDecodeAttention(CustomTestCase):
             b_seq_len,
             scaling=sm_scale,
             enable_gqa=enable_gqa,
+            encoder_lens=encoder_lens,
         )
 
         cos_sim = torch.nn.functional.cosine_similarity(

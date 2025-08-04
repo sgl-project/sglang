@@ -22,9 +22,11 @@ class TestExtendAttention(CustomTestCase):
         seq_lens: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
+        encoder_lens=None,
         scaling=None,
         enable_gqa=False,
         causal=False,
+        is_cross_attn=False,
     ):
 
         assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
@@ -41,7 +43,14 @@ class TestExtendAttention(CustomTestCase):
 
             seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + extend_seq_len_q
-            end_kv = start_kv + seq_len_kv
+            if encoder_lens is not None:
+                start_kv = 0 if is_cross_attn else encoder_lens[seq_idx]
+                end_kv = (
+                    encoder_lens[seq_idx] if is_cross_attn else start_kv + seq_len_kv
+                )
+            else:
+                start_kv = 0
+                end_kv = start_kv + seq_len_kv
 
             per_req_query = query[:, start_q:end_q, :]
             per_req_query_redudant = torch.empty(
@@ -55,7 +64,7 @@ class TestExtendAttention(CustomTestCase):
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
             req_pool_idx = req_pool_indices[seq_idx]
-            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+            per_req_tokens = req_to_token[req_pool_idx, start_kv:end_kv]
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
@@ -79,25 +88,29 @@ class TestExtendAttention(CustomTestCase):
         dtype = torch.bfloat16
 
         b_seq_len_prefix = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
+        encoder_lens = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int64)
         if mla:
             b_seq_len_prefix.zero_()
+            encoder_lens.zero_()
         b_seq_len_extend = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
         b_seq_len = b_seq_len_prefix + b_seq_len_extend
-        max_len_in_batch = torch.max(b_seq_len, 0)[0].item()
+        max_len_in_batch = (
+            torch.max(b_seq_len, 0)[0].item() + torch.max(encoder_lens, 0)[0].item()
+        )
 
         b_req_idx = torch.arange(B, dtype=torch.int32)
         req_to_tokens = torch.empty((B, max_len_in_batch), dtype=torch.int32)
         b_start_loc = torch.zeros((B,), dtype=torch.int32)
-        b_start_loc[1:] = torch.cumsum(b_seq_len[:-1], 0)
+        b_start_loc[1:] = torch.cumsum(b_seq_len[:-1] + encoder_lens[:-1], 0)
         b_start_loc_extend = torch.zeros((B,), dtype=torch.int32)
         b_start_loc_extend[1:] = torch.cumsum(b_seq_len_extend[:-1], 0)
 
         for i in range(B):
-            req_to_tokens[i, : b_seq_len[i]] = torch.arange(
-                b_start_loc[i], b_start_loc[i] + b_seq_len[i]
+            req_to_tokens[i, : b_seq_len[i] + encoder_lens[i]] = torch.arange(
+                b_start_loc[i], b_start_loc[i] + b_seq_len[i] + encoder_lens[i]
             )
 
-        total_token_num = torch.sum(b_seq_len).item()
+        total_token_num = torch.sum(b_seq_len).item() + torch.sum(encoder_lens).item()
         extend_token_num = torch.sum(b_seq_len_extend).item()
 
         H_BUF = 1 if mla else H_KV
@@ -109,8 +122,10 @@ class TestExtendAttention(CustomTestCase):
         q_extend = torch.empty((extend_token_num, H_Q, D), dtype=dtype)
 
         for i in range(B):
-            extend_start_in_buffer = b_start_loc[i] + b_seq_len_prefix[i]
-            extend_end_in_buffer = b_start_loc[i] + b_seq_len[i]
+            extend_start_in_buffer = (
+                b_start_loc[i] + b_seq_len_prefix[i] + encoder_lens[i]
+            )
+            extend_end_in_buffer = b_start_loc[i] + b_seq_len[i] + encoder_lens[i]
             extend_start = b_start_loc_extend[i]
             extend_end = b_start_loc_extend[i] + b_seq_len_extend[i]
             k_extend[extend_start:extend_end] = k_buffer[
@@ -157,6 +172,7 @@ class TestExtendAttention(CustomTestCase):
             scaling=sm_scale,
             enable_gqa=enable_gqa,
             causal=True,
+            encoder_lens=encoder_lens,
         )
 
         o_extend = torch.empty((extend_token_num, H_Q, DV), dtype=dtype)
@@ -175,6 +191,7 @@ class TestExtendAttention(CustomTestCase):
             max_len_extend,
             sm_scale,
             logit_cap,
+            encoder_lens,
         )
 
         torch.testing.assert_close(o_ref, o_extend, atol=1e-2, rtol=1e-2)

@@ -117,6 +117,7 @@ class TestMLA(CustomTestCase):
             b_seq_len,
             sm_scale,
             logit_cap,
+            None,
         )
 
         self._run_sdpa_forward_decode(
