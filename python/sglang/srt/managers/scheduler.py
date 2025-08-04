@@ -2189,7 +2189,7 @@ class Scheduler(
             logger.debug(f"Abort queued request. {req.rid=}")
             # in decode engine, the request has been granted memory, so we need to free it.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                self.tree_cache.cache_finished_request(req)
+                self.tree_cache.cache_finished_req(req)
 
         # Delete the requests in the grammar queue
         for req in self.grammar_queue:
