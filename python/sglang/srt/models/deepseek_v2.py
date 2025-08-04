@@ -307,19 +307,23 @@ class DeepseekV2MoE(nn.Module):
             config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
         )
 
-        self.topk = (
-            TopK(
-                top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
-                renormalize=config.norm_topk_prob,
-                use_grouped_topk=True,
-                num_expert_group=config.n_group,
-                num_fused_shared_experts=self.num_fused_shared_experts,
-                topk_group=config.topk_group,
-                correction_bias=self.gate.e_score_correction_bias,
-                routed_scaling_factor=self.routed_scaling_factor,
-            )
-            if not should_use_flashinfer_trtllm_moe()
-            else None
+        # TRTLLM mode doesn't support fused shared experts, so use base top_k
+        # Normal mode includes fused shared experts in top_k calculation
+        topk_value = (
+            config.num_experts_per_tok 
+            if use_flashinfer_trtllm_moe 
+            else config.num_experts_per_tok + self.num_fused_shared_experts
+        )
+        
+        self.topk = TopK(
+            top_k=topk_value,
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=True,
+            num_expert_group=config.n_group,
+            num_fused_shared_experts=self.num_fused_shared_experts,
+            topk_group=config.topk_group,
+            correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
         )
 
         self.experts = get_moe_impl_class()(
@@ -476,10 +480,14 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             kwargs = {"hidden_states": hidden_states}
-            if self.topk is not None:
-                kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+            
+            # CUTLASS path: unchanged behavior - process router_logits through TopK
+            # TRTLLM path: pass (topk_config, router_logits) tuple for internal processing
+            if use_flashinfer_trtllm_moe:
+                kwargs["topk_output"] = (self.topk, router_logits)
             else:
-                kwargs["router_logits"] = router_logits
+                kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+                
             final_hidden_states = self.experts(**kwargs)
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
@@ -505,10 +513,14 @@ class DeepseekV2MoE(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         kwargs = {"hidden_states": hidden_states}
-        if self.topk is not None:
-            kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+        
+        # CUTLASS path: unchanged behavior - process router_logits through TopK
+        # TRTLLM path: pass (topk_config, router_logits) tuple for internal processing
+        if use_flashinfer_trtllm_moe:
+            kwargs["topk_output"] = (self.topk, router_logits)
         else:
-            kwargs["router_logits"] = router_logits
+            kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+            
         final_hidden_states = self.experts(**kwargs)
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here

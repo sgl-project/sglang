@@ -48,7 +48,6 @@ _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-
 if not (_is_npu or _is_hip):
     from sgl_kernel import silu_and_mul
 
@@ -741,6 +740,19 @@ class FlashInferEPMoE(EPMoE):
 def get_moe_impl_class():
     if global_server_args_dict["moe_a2a_backend"].is_deepep():
         return DeepEPMoE
+    
+    # NEW: Direct FP4 detection (bypasses EP requirements)
+    # Check for FP4 quantization with TRTLLM flag, regardless of EP
+    if global_server_args_dict.get("enable_flashinfer_trtllm_moe", False):
+        try:
+            # Check the quantization argument directly 
+            quantization = global_server_args_dict.get("quantization")
+            if quantization == "modelopt_fp4":
+                from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFP4MoE
+                return FlashInferFP4MoE
+        except:
+            pass
+    
     if global_server_args_dict["enable_flashinfer_cutlass_moe"]:
         return FusedMoE
     if get_moe_expert_parallel_world_size() > 1:

@@ -1931,6 +1931,13 @@ class ServerArgs:
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
 
+        # Check FlashInfer TRTLLM MoE compatibility
+        if self.enable_flashinfer_trtllm_moe:
+            assert self.disable_shared_experts_fusion, (
+                "--enable-flashinfer-trtllm-moe requires --disable-shared-experts-fusion. "
+                "FlashInfer TRTLLM MoE is not compatible with shared experts fusion."
+            )
+
         # Check model architecture
         model_arch = self.get_hf_config().architectures[0]
         if "Llama4" in model_arch:
