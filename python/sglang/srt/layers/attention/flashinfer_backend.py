@@ -769,7 +769,7 @@ class FlashInferIndicesUpdaterDecode:
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
-            self.page_size,
+            self.page_size,  # todo(Yingyi): rebase on page_size > 1
             data_type=self.data_type,
             q_data_type=self.q_data_type,
             non_blocking=True,
@@ -1019,7 +1019,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
-            self.page_size,
+            self.page_size,  # todo(Yingyi): rebase on page_size > 1
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
             custom_mask=custom_mask,
