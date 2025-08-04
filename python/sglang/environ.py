@@ -147,7 +147,7 @@ class Envs:
     SGLANG_TBO_DEBUG = EnvBool(False)
 
     # DeepGemm
-    SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(False)
+    SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
 
     SGLANG_MOE_PADDING = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
