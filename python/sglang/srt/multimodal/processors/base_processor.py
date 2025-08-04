@@ -142,11 +142,14 @@ class MultimodalSpecialTokens:
 class BaseMultimodalProcessor(ABC):
     models = []
 
-    def __init__(self, hf_config, server_args, _processor):
+    def __init__(
+        self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
+    ):
         self.hf_config = hf_config
         self._processor = _processor
         self.arch = hf_config.architectures[0]
         self.server_args = server_args
+        self.transport_mode = transport_mode
 
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
@@ -172,6 +175,8 @@ class BaseMultimodalProcessor(ABC):
             "image_grid_hws": Modality.IMAGE,
             "aspect_ratio_ids": Modality.IMAGE,
             "aspect_ratio_mask": Modality.IMAGE,
+            "num_patches": Modality.IMAGE,
+            "patch_pixel_values": Modality.IMAGE,
             # Audio-related attributes
             "audio_features": Modality.AUDIO,
             "audio_feature_lens": Modality.AUDIO,
@@ -188,7 +193,12 @@ class BaseMultimodalProcessor(ABC):
 
         # name of the feature filed
         # TODO: pass from processors
-        self.FEATURE_NAMES = ["pixel_values", "pixel_values_videos", "audio_features"]
+        self.FEATURE_NAMES = [
+            "pixel_values",
+            "pixel_values_videos",
+            "audio_features",
+            "input_features",
+        ]
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -207,8 +217,10 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["audio"] = audios
 
         processor = self._processor
-        if hasattr(processor, "image_processor") and isinstance(
-            processor.image_processor, BaseImageProcessorFast
+        if (
+            hasattr(processor, "image_processor")
+            and isinstance(processor.image_processor, BaseImageProcessorFast)
+            and not self.server_args.disable_fast_image_processor
         ):
             kwargs["device"] = "cuda"
         result = processor.__call__(
@@ -217,10 +229,13 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        if "pixel_values" in result and isinstance(
-            result["pixel_values"], torch.Tensor
-        ):
-            result["pixel_values"] = result["pixel_values"].to("cpu")
+        # move feature tensors to cpu
+        for feature_name in self.FEATURE_NAMES:
+            if feature_name in result and isinstance(
+                result[feature_name], torch.Tensor
+            ):
+                result[feature_name] = result[feature_name].to("cpu")
+
         return result
 
     @abstractmethod
@@ -500,7 +515,6 @@ class BaseMultimodalProcessor(ABC):
     ) -> List[MultimodalDataItem]:
         """Create mm_items directly from processor output."""
         items: dict[Modality, MultimodalDataItem] = {}
-
         for attr_name, value in data_dict.items():
             if attr_name == "input_ids":
                 continue

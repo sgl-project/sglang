@@ -10,7 +10,6 @@ def moe_align_block_size(
     sorted_token_ids,
     experts_ids,
     num_tokens_post_pad,
-    token_cnts_buffer,
     cumsum_buffer,
     pad_sorted_token_ids=False,
 ):
@@ -21,7 +20,6 @@ def moe_align_block_size(
         sorted_token_ids,
         experts_ids,
         num_tokens_post_pad,
-        token_cnts_buffer,
         cumsum_buffer,
         pad_sorted_token_ids,
     )

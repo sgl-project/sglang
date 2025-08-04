@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -150,8 +151,6 @@ class GenerateReqInput:
             self._normalize_single_inputs()
         else:
             self._normalize_batch_inputs()
-
-        self._validate_session_params()
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
@@ -524,6 +523,9 @@ class TokenizedGenerateReqInput:
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+    # For dp balance
+    dp_balance_id: int = -1
+
 
 @dataclass
 class EmbeddingReqInput:
@@ -649,6 +651,8 @@ class TokenizedEmbeddingReqInput:
     token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
+    # For dp balance
+    dp_balance_id: int = -1
 
 
 @dataclass
@@ -910,6 +914,8 @@ class AbortReq:
     rid: str = ""
     # Whether to abort all requests
     abort_all: bool = False
+    # The finished reason data
+    finished_reason: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1067,19 +1073,46 @@ class LoadLoRAAdapterReqInput:
     lora_name: str
     # The path of loading.
     lora_path: str
+    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+            lora_path=self.lora_path,
+        )
 
 
 @dataclass
 class UnloadLoRAAdapterReqInput:
     # The name of lora module to unload.
     lora_name: str
+    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+        )
 
 
 @dataclass
 class LoRAUpdateResult:
     success: bool
     error_message: Optional[str] = None
-    loaded_adapters: Dict[str, str] = field(default_factory=dict)
+    loaded_adapters: Optional[Dict[str, LoRARef]] = None
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
+
+
+class BlockReqType(Enum):
+    BLOCK = 1
+    UNBLOCK = 2
+
+
+@dataclass
+class BlockReqInput:
+    type: BlockReqType
