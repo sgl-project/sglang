@@ -672,37 +672,6 @@ class Scheduler(
         self.profile_in_progress: bool = False
         self.rpd_profiler = None
 
-    def init_metrics(self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]):
-        self.last_gen_throughput: float = 0.0
-        self.last_input_throughput: float = 0.0
-        self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
-        self.spec_num_total_accepted_tokens = 0
-        self.spec_num_total_forward_ct = 0
-        self.cum_spec_accept_length = 0
-        self.cum_spec_accept_count = 0
-        self.total_retracted_reqs = 0
-        self.stats = SchedulerStats()
-        if self.enable_metrics:
-            engine_type = "unified"
-            labels = {
-                "model_name": self.server_args.served_model_name,
-                "engine_type": engine_type,
-                "tp_rank": tp_rank,
-                "pp_rank": pp_rank,
-            }
-            if dp_rank is not None:
-                labels["dp_rank"] = dp_rank
-            self.metrics_collector = SchedulerMetricsCollector(
-                labels=labels,
-                bucket_kvcache_transfer_latency=self.server_args.bucket_kvcache_transfer_latency,
-            )
-
-    def init_kv_events(self, kv_events_config: Optional[str]):
-        if self.enable_kv_cache_events:
-            self.kv_event_publisher = EventPublisherFactory.create(
-                kv_events_config, self.attn_dp_rank
-            )
-
     def init_disaggregation(self):
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
