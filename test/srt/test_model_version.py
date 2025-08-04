@@ -14,7 +14,7 @@ import unittest
 import requests
 
 from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     CustomTestCase,
     popen_launch_server,
@@ -25,7 +25,7 @@ class TestModelVersion(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         """Start server once for all tests with custom model version."""
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = "http://127.0.0.1:30000"
         cls.process = popen_launch_server(
             cls.model,
@@ -205,6 +205,42 @@ class TestModelVersion(CustomTestCase):
         )
 
         print("✅ All model_version functionality tests passed!")
+
+    def test_update_model_version_with_weight_updates(self):
+        """Test that model_version can be updated along with weight updates using real model data."""
+        print("Testing model_version update with real weight operations...")
+
+        # Get current model info for reference
+        model_info_response = requests.get(f"{self.base_url}/get_model_info")
+        self.assertEqual(model_info_response.status_code, 200)
+        current_model_path = model_info_response.json()["model_path"]
+        print(f"Current model path: {current_model_path}")
+
+        update_data = {
+            "model_path": current_model_path,
+            "load_format": "auto",
+            "abort_all_requests": False,
+            "model_version": "disk_update_v2.0.0",
+        }
+
+        response = requests.post(
+            f"{self.base_url}/update_weights_from_disk", json=update_data
+        )
+        self.assertEqual(
+            response.status_code,
+            200,
+            f"update_weights_from_disk failed with status {response.status_code}",
+        )
+
+        print("   ✓ update_weights_from_disk with model_version succeeded")
+
+        # Verify version was updated
+        version_response = requests.get(f"{self.base_url}/get_model_version")
+        self.assertEqual(version_response.status_code, 200)
+        self.assertEqual(version_response.json()["model_version"], "disk_update_v2.0.0")
+        print("   ✓ Model version was updated successfully")
+
+        print("✅ Weight update with model_version test completed!")
 
 
 if __name__ == "__main__":

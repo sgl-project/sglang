@@ -514,6 +514,12 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
     success, message, num_paused_requests = (
         await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
     )
+
+    # Update model version if provided and weights update was successful
+    if success and obj.model_version is not None:
+        _update_model_version_if_provided(obj.model_version)
+        message += f" Model version updated to {obj.model_version}."
+
     content = {
         "success": success,
         "message": message,
@@ -560,6 +566,12 @@ async def update_weights_from_tensor(
     success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
         obj, request
     )
+
+    # Update model version if provided and weights update was successful
+    if success and obj.model_version is not None:
+        _update_model_version_if_provided(obj.model_version)
+        message += f" Model version updated to {obj.model_version}."
+
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
@@ -576,6 +588,12 @@ async def update_weights_from_distributed(
             obj, request
         )
     )
+
+    # Update model version if provided and weights update was successful
+    if success and obj.model_version is not None:
+        _update_model_version_if_provided(obj.model_version)
+        message += f" Model version updated to {obj.model_version}."
+
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(content, status_code=200)
@@ -937,6 +955,13 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     if isinstance(ret, Response):
         return ret
     return ORJSONResponse({"predictions": ret})
+
+
+def _update_model_version_if_provided(model_version: Optional[str]) -> None:
+    """Update global model version if provided."""
+    if model_version is not None:
+        _global_state.model_version = model_version
+        _global_state.tokenizer_manager.server_args.model_version = model_version
 
 
 def _create_error_response(e):
