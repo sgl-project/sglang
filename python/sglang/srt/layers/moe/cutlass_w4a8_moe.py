@@ -44,7 +44,7 @@ def cutlass_w4a8_moe(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     apply_router_weight_on_input: bool = False,
-    ep_mode: str = "ep",
+    deepep_mode: str = None,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -91,7 +91,7 @@ def cutlass_w4a8_moe(
     assert w1_q.dtype == torch.int8
     assert w2_q.dtype == torch.int8
     assert (
-        a.shape[1] // 2 == w1_q.shape[2] if ep_mode != "deepep_ll" else True
+        a.shape[1] // 2 == w1_q.shape[2] if not deepep_mode else True
     ), "Hidden size mismatch w1"
     assert w1_q.shape[2] * 2 == w2_q.shape[1], "Hidden size mismatch w2"
     assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
@@ -103,17 +103,22 @@ def cutlass_w4a8_moe(
     assert a_strides2.shape[0] == w2_q.shape[0], "A Strides 2 expert number mismatch"
     assert b_strides2.shape[0] == w2_q.shape[0], "B Strides 2 expert number mismatch"
     num_experts = w1_q.size(0)
-    m = a.size(0)
+    m = a.size(0) if not deepep_mode.is_deepep_ll() else a.size(1)
     k = w1_q.size(2) * 2  # w1_q is transposed and packed
     n = w2_q.size(2) * 2  # w2_q is transposed and packed
-    topk = topk_ids_.size(1) if ep_mode == "ep" else 8
+    topk = topk_ids_.size(1) if not deepep_mode else 8
 
     if apply_router_weight_on_input:
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
 
     device = a.device
 
-    if ep_mode == "ep":
+    if not deepep_mode:
+        local_topk_ids = topk_ids_
+        local_topk_ids = (
+            torch.where(local_topk_ids == -1, num_experts, topk_ids_).to(torch.int32)
+        ).contiguous()
+
         _, src2dst, _ = run_cutlass_moe_ep_preproess(
             local_topk_ids,
             num_experts,
@@ -137,10 +142,7 @@ def cutlass_w4a8_moe(
             BLOCK_SIZE=512,
         )
 
-    # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
-    # they are kept to allow for a quick switch of the permutation logic
-    # from the current triton kernel implementation to the cutlass-based one if needed.
-    if ep_mode == "deepep_ll":
+    if deepep_mode.is_deepep_ll():
 
         problem_sizes1, problem_sizes2 = deepep_ll_get_cutlass_w4a8_moe_mm_data(
             local_topk_ids,
@@ -153,11 +155,13 @@ def cutlass_w4a8_moe(
 
         gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=device)
         sgl_per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
-
         c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.half)
         c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.half)
         intermediate = torch.empty((num_experts, m, n), device=device, dtype=torch.half)
 
+    # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
+    # they are kept to allow for a quick switch of the permutation logic
+    # from the current triton kernel implementation to the cutlass-based one if needed.
     else:
         a_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
         c_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
@@ -192,7 +196,6 @@ def cutlass_w4a8_moe(
         128,
         topk,
     )
-
     silu_and_mul(c1, intermediate)
 
     intermediate_q = torch.empty(
@@ -215,7 +218,8 @@ def cutlass_w4a8_moe(
         128,
         topk,
     )
-    if ep_mode == "ep":
+
+    if not deepep_mode:
         output = torch.empty_like(a)
         post_reorder_triton_kernel[(m,)](
             c2,
@@ -230,6 +234,8 @@ def cutlass_w4a8_moe(
             0,
             BLOCK_SIZE=512,
         )
-    else:
+    elif deepep_mode.is_deepep_ll():
         output = c2
-    return output.to(torch.bfloat16)
+    else:
+        raise ValueError(f"Invalid deepep_mode: {deepep_mode}")
+    return output
