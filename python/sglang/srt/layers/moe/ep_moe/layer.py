@@ -38,8 +38,8 @@ from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip,
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
+        AscendDeepEPLLOutput,
         DeepEPLLOutput,
-        AscendDeepEPLLOutput
         DeepEPNormalOutput,
         DispatchOutput,
     )
@@ -733,6 +733,7 @@ class DeepEPMoE(EPMoE):
         )[0]
 
         return hidden_states
+
 
 class FlashInferEPMoE(EPMoE):
     def __init__(self, *args, **kwargs):
