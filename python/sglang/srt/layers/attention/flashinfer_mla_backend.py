@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import triton
-
 """
 Support attention backend for flashinfer MLA.
 The flashinfer_mla_disable_ragged flag controls whether to use ragged prefill wrapper and defaults to be false.
@@ -17,11 +15,9 @@ from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
-import triton
 
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
-    
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
 
@@ -44,9 +40,7 @@ if is_flashinfer_available():
     from flashinfer import (
         BatchMLAPagedAttentionWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
-
     )
-
 
 
 @dataclass
