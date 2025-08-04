@@ -489,9 +489,6 @@ class ModelRunner:
 
         if not self.use_mla_backend:
             server_args.disable_chunked_prefix_cache = True
-        elif self.page_size > 1:
-            logger.info("Disable chunked prefix cache when page size > 1.")
-            server_args.disable_chunked_prefix_cache = True
 
         if not server_args.disable_chunked_prefix_cache:
             logger.info("Chunked prefix cache is turned on.")

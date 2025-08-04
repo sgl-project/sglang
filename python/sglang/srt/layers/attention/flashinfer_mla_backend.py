@@ -202,7 +202,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.enable_chunk_kv = (
             not skip_prefill
-            and global_server_args_dict["attention_backend"] == "flashinfer"
             and global_server_args_dict["disaggregation_mode"] != "decode"
             and not global_server_args_dict["disable_chunked_prefix_cache"]
         )

@@ -987,15 +987,19 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if attention_backend == "ascend":
             return AttnForwardMethod.MLA
-        elif attention_backend == "flashinfer" or attention_backend == "fa3":
+        elif (
+            attention_backend == "flashinfer"
+            or attention_backend == "fa3"
+            or attention_backend == "flashmla"
+        ):
             # Use MHA with chunked KV cache when prefilling on long sequences.
             sum_extend_prefix_lens = sum(forward_batch.extend_prefix_lens_cpu or [])
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
+            disable_ragged = (
+                attention_backend == "flashinfer" or attention_backend == "flashmla"
+            ) and self.flashinfer_mla_disable_ragged
             if (
-                not (
-                    attention_backend == "flashinfer"
-                    and self.flashinfer_mla_disable_ragged
-                )
+                not disable_ragged
                 and forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
@@ -1678,7 +1682,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             # Only initialize the info once
             if forward_batch.num_prefix_chunks is None:
                 forward_batch.prepare_chunked_prefix_cache_info(q.device)
-                if self.current_attention_backend == "flashinfer":
+                if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
                     forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
 
         forward_batch.mha_return_lse = has_extend_prefix
