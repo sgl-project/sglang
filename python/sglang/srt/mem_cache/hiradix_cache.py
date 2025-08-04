@@ -464,7 +464,7 @@ class HiRadixCache(RadixCache):
 
         return can_terminate
 
-    def check_prefetch_progress(self, req_id: str):
+    def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             # there is no ongoing prefetch for this request or it has been revoked
             return True

@@ -1563,7 +1563,9 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                if not self.tree_cache.check_prefetch_progress(req.rid):
+                prefetch_done = self.tree_cache.check_prefetch_done(req.rid)
+                if not prefetch_done:
+                    # skip staging requests that are ongoing prefetch
                     continue
 
             req.init_next_round_input(self.tree_cache)
