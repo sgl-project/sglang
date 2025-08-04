@@ -312,7 +312,7 @@ def _read_prompts_from_file(prompt_file, rank_print):
             f"Custom prompt file {prompt_file} not found. Using default inputs..."
         )
         return []
-    with open(prompt_file, 'r') as pf:
+    with open(prompt_file, "r") as pf:
         return pf.readlines()
 
 
@@ -443,7 +443,9 @@ def latency_test_run_once(
         profiler.stop()
         profile_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_prefill.trace.json.gz"
         _save_profile_trace_results(profiler, profile_filename)
-        rank_print(f"torch profiler chrome trace for prefill saved to {profile_filename}")
+        rank_print(
+            f"torch profiler chrome trace for prefill saved to {profile_filename}"
+        )
 
     # Decode
     decode_latencies = []
@@ -477,7 +479,9 @@ def latency_test_run_once(
             profiler.stop()
             profile_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_decode.trace.json.gz"
             _save_profile_trace_results(profiler, profile_filename)
-            rank_print(f"torch profiler chrome trace for decoding 1 token saved to {profile_filename}")
+            rank_print(
+                f"torch profiler chrome trace for decoding 1 token saved to {profile_filename}"
+            )
 
     # Record decode timing from 2nd output
     if output_len > 1:
