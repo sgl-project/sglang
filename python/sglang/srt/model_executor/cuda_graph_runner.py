@@ -281,9 +281,13 @@ class CudaGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self.hip_config = model_runner.server_args.hip_attention_config
         self.enable_hip_attention = model_runner.server_args.enable_hip_attention
         if self.enable_hip_attention:
-            self.hip_config = model_runner.server_args.hip_attention_config
+            from hip_attn.v1_2.paged_hip import cuda_graph_capture_configs
+            self.capture_configs = cuda_graph_capture_configs(self.hip_config)
+        else:
+            self.capture_configs = [()]
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
@@ -522,8 +526,8 @@ class CudaGraphRunner:
                         capture_range.set_description(
                             f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                         )
-
-                    for capture_config in self.capture_configs():
+                    
+                    for capture_config in self.capture_configs:
                         with patch_model(
                             self.model_runner.model,
                             bs in self.compile_bs,
@@ -553,14 +557,6 @@ class CudaGraphRunner:
                 )
             )
             logger.info(log_message)
-
-    def capture_configs(self):
-        if self.enable_hip_attention:
-            from hip_attn.v1_2.paged_hip import cuda_graph_capture_configs
-
-            return cuda_graph_capture_configs(self.hip_config)
-        else:
-            return [()]
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         with self.device_module.graph(graph, pool=pool, stream=stream):
@@ -879,7 +875,9 @@ class CudaGraphRunner:
             end.record()
             end.synchronize()
             elapsed = start.elapsed_time(end)
-            print(f"[CudaGraphRunner.replay] graph {graph_handle} took {elapsed:.2f} ms")
+            print(
+                f"[CudaGraphRunner.replay] graph {graph_handle} took {elapsed:.2f} ms"
+            )
         output = self.output_buffers[graph_handle]
 
         if isinstance(output, LogitsProcessorOutput):

@@ -129,7 +129,7 @@ class HiPAttentionBackend(AttentionBackend):
 
         self.flashattention_backend.init_forward_metadata(forward_batch=forward_batch)
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self._block_table = torch.zeros(
             max_bs,
             (self.max_context_len + self.page_size - 1) // self.page_size + 4,
@@ -139,6 +139,7 @@ class HiPAttentionBackend(AttentionBackend):
 
         self.flashattention_backend.init_cuda_graph_state(
             max_bs=max_bs,
+            max_num_tokens=max_num_tokens,
         )
 
     def init_forward_metadata_capture_cuda_graph(
@@ -220,8 +221,8 @@ class HiPAttentionBackend(AttentionBackend):
         # assert torch.all(fa3_cu_seqlens_k == cu_seqlens_k)
 
     def get_cuda_graph_seq_len_fill_value(self):
-        assert self.flashattention_backend.get_cuda_graph_seq_len_fill_value() == 0
-        return 0
+        assert self.flashattention_backend.get_cuda_graph_seq_len_fill_value() == 1
+        return 1
 
     def forward_extend(
         self,
