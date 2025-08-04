@@ -18,15 +18,12 @@ import torch
 
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
-
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.flashinfer_backend import (
-    create_flashinfer_kv_indices_triton,
-)
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -72,12 +69,16 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
     ):
         super().__init__()
-
+        self.num_update_calls = 0
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
-
+        self.page_size = model_runner.page_size
+        self.kv_cache_dim = (
+            model_runner.model_config.kv_lora_rank 
+            + model_runner.model_config.qk_rope_head_dim
+        )
         # Allocate buffers
         global global_workspace_buffer
         if global_workspace_buffer is None:
@@ -140,7 +141,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.indices_updater_decode = FlashInferMLAIndicesUpdaterDecode(
             model_runner, self
         )
-
+    
+        
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata = {}
@@ -239,6 +241,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
+      
         if forward_mode.is_decode_or_idle():
             decode_wrapper = BatchMLAPagedAttentionWrapper(
                 self.workspace_buffer,
@@ -400,7 +403,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_rope = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-
         if self.forward_metadata.use_ragged:
             # ragged prefill
             if q_rope is not None:
@@ -421,6 +423,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
                 q.dtype
             )
+            k_buf = k_buf.view(-1, self.page_size, k_buf.shape[-1])
+            
             if q_rope is None:
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 q, q_rope = (
@@ -481,18 +485,18 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             q_nope = reshaped_q[:, :, : layer.v_head_dim]
             q_rope = reshaped_q[:, :, layer.v_head_dim :]
-
-        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
+        
+        k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
             q.dtype
         )
+        k_buf = k_buf.view(-1, self.page_size, k_buf.shape[-1])
 
         o = q_nope.new_empty(q_nope.shape)
-        # Direct call to run without the wrapper
         o = decode_wrapper.run(
             q_nope,
             q_rope,
-            k_buffer[:, :, : layer.v_head_dim],
-            k_buffer[:, :, layer.v_head_dim :],
+            k_buf[:, :, : layer.v_head_dim],
+            k_buf[:, :, layer.v_head_dim :],
             out=o,
         )
 
@@ -511,7 +515,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.scaling = model_runner.model_config.scaling
         self.data_type = model_runner.dtype
         self.attn_backend = attn_backend
-
+        self.page_size = model_runner.page_size
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -557,10 +561,12 @@ class FlashInferMLAIndicesUpdaterDecode:
         kv_lens = paged_kernel_lens.to(torch.int32)
         sm_scale = self.scaling
         if spec_info is None:
-            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
+            num_pages_per_req = (paged_kernel_lens + self.page_size - 1) // self.page_size
+            kv_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=paged_kernel_lens.device)
+            kv_indptr[1:] = torch.cumsum(num_pages_per_req, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = (
-                torch.empty(paged_kernel_lens_sum, dtype=torch.int32, device="cuda")
+                torch.empty(kv_indptr[-1], dtype=torch.int32, device=q_indptr.device)
                 if not init_metadata_replay
                 else fast_decode_kwargs["kv_indices"]
             )
@@ -572,39 +578,41 @@ class FlashInferMLAIndicesUpdaterDecode:
                 None,
                 kv_indices,
                 self.req_to_token.shape[1],
+                self.page_size,
             )
+            
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
         if not init_metadata_replay:
-            wrapper.plan(
-                q_indptr,
-                kv_indptr,
-                kv_indices,
-                kv_lens,
-                self.num_local_heads,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-                1,
-                False,
-                sm_scale,
-                self.data_type,
-                self.data_type,
-            )
+           wrapper.plan(
+               qo_indptr=q_indptr,
+               kv_indptr=kv_indptr,
+               kv_indices=kv_indices,
+               kv_len_arr=kv_lens,
+               num_heads=self.num_local_heads,
+               head_dim_ckv=self.kv_lora_rank,
+               head_dim_kpe=self.qk_rope_head_dim,
+               page_size=self.page_size,
+               causal=False,
+               sm_scale=sm_scale,
+               q_data_type=self.data_type,
+               kv_data_type=self.data_type,
+           )
         else:
             wrapper.plan(
-                fast_decode_kwargs["qo_indptr_cpu"],
-                fast_decode_kwargs["kv_indptr_cpu"],
-                kv_indices,
-                fast_decode_kwargs["kv_len_arr_cpu"],
-                self.num_local_heads,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-                1,
-                False,
-                sm_scale,
-                self.data_type,
-                self.data_type,
+                qo_indptr=fast_decode_kwargs["qo_indptr_cpu"],
+                kv_indptr=fast_decode_kwargs["kv_indptr_cpu"],
+                kv_indices=kv_indices,
+                kv_len_arr=fast_decode_kwargs["kv_len_arr_cpu"],
+                num_heads=self.num_local_heads,
+                head_dim_ckv=self.kv_lora_rank,
+                head_dim_kpe=self.qk_rope_head_dim,
+                page_size=self.page_size,
+                causal=False,
+                sm_scale=sm_scale,
+                q_data_type=self.data_type,
+                kv_data_type=self.data_type,
             )
 
 
@@ -628,7 +636,8 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
-
+        self.page_size = model_runner.page_size
+    
     def update(
         self,
         req_pool_indices: torch.Tnesor,
@@ -645,7 +654,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
         else:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
-
         self.call_begin_forward(
             self.prefill_wrapper_ragged,
             prefill_wrapper_paged,
@@ -679,10 +687,11 @@ class FlashInferMLAIndicesUpdaterPrefill:
 
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
-            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
-            kv_indptr = kv_indptr[: bs + 1]
+            num_pages_per_req = (paged_kernel_lens + self.page_size - 1) // self.page_size
+            kv_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=paged_kernel_lens.device)
+            kv_indptr[1:] = torch.cumsum(num_pages_per_req, dim=0)  
             kv_indices = torch.empty(
-                paged_kernel_lens_sum,
+                kv_indptr[-1],
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
@@ -693,10 +702,13 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 kv_indptr,
                 None,
                 kv_indices,
-                self.req_to_token.shape[1],
+                self.req_to_token.size(1),
+                self.page_size,
             )
+           
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
+          
             custom_mask = None
         else:
             assert isinstance(spec_info, EagleDraftInput) or isinstance(
@@ -725,20 +737,19 @@ class FlashInferMLAIndicesUpdaterPrefill:
             )
         else:
             # mla paged prefill
-            kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
             wrapper_paged.plan(
-                qo_indptr,
-                kv_indptr,
-                kv_indices,
-                kv_len_arr,
-                self.num_local_heads,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-                1,
-                True,
-                sm_scale,
-                self.q_data_type,
-                self.data_type,
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                kv_len_arr=paged_kernel_lens.to(torch.int32),
+                num_heads=self.num_local_heads,
+                head_dim_ckv=self.kv_lora_rank,
+                head_dim_kpe=self.qk_rope_head_dim,
+                page_size=self.page_size,
+                causal=True,
+                sm_scale=sm_scale,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
             )
 
 
