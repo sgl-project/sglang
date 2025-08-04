@@ -481,6 +481,13 @@ class ServerArgs:
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
+        if self.enable_flashinfer_trtllm_moe:
+            if not self.disable_shared_experts_fusion:
+                self.disable_shared_experts_fusion = True
+                logger.warning(
+                    "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+                )
+
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
@@ -1930,13 +1937,6 @@ class ServerArgs:
             1,
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
-
-        # Check FlashInfer TRTLLM MoE compatibility
-        if self.enable_flashinfer_trtllm_moe:
-            assert self.disable_shared_experts_fusion, (
-                "--enable-flashinfer-trtllm-moe requires --disable-shared-experts-fusion. "
-                "FlashInfer TRTLLM MoE is not compatible with shared experts fusion."
-            )
 
         # Check model architecture
         model_arch = self.get_hf_config().architectures[0]

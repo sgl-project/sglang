@@ -1,17 +1,14 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
-import importlib.util
-import logging
-from enum import Enum
-from functools import lru_cache
-from typing import List, Optional, Tuple
-import sys
-import os
 import datetime
 import glob
+import logging
+import os
+import sys
+from enum import Enum
+from typing import List, Optional, Tuple
 
 import torch
-from packaging import version as pkg_version
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
@@ -26,6 +23,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -33,27 +31,32 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
-from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var, is_cpu, is_hip, next_power_of_2
-from flashinfer import (
-    reorder_rows_for_gated_act_gemm,
-    shuffle_matrix_a,
-    shuffle_matrix_sf_a,
-    fp4_quantize,
-    RoutingMethodType,
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_bool_env_var,
+    is_cpu,
+    is_flashinfer_available,
+    is_hip,
+    next_power_of_2,
 )
+
+if is_flashinfer_available():
+    from flashinfer import (
+        RoutingMethodType,
+        fp4_quantize,
+        reorder_rows_for_gated_act_gemm,
+        shuffle_matrix_a,
+        shuffle_matrix_sf_a,
+    )
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
-use_flashinfer_trtllm_moe = (
-    global_server_args_dict["enable_flashinfer_trtllm_moe"]
-    and importlib.util.find_spec("flashinfer.fused_moe") is not None
-)
 
 # Try to import FP4 TRTLLM function if flashinfer is available
 trtllm_fp4_block_scale_moe = None
-if use_flashinfer_trtllm_moe:
+if should_use_flashinfer_trtllm_moe():
     try:
         from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
     except ImportError:
@@ -61,18 +64,6 @@ if use_flashinfer_trtllm_moe:
 
 logger = logging.getLogger(__name__)
 
-
-@lru_cache(maxsize=1)
-def should_use_flashinfer_trtllm_moe():
-    enable_trtllm = global_server_args_dict["enable_flashinfer_trtllm_moe"]
-    enable_cutlass = global_server_args_dict.get("enable_flashinfer_cutlass_moe", False)
-    
-    result = enable_trtllm and (
-        not importlib.util.find_spec("flashinfer")
-        or pkg_version.parse(__import__("flashinfer").__version__)
-        >= pkg_version.parse("0.2.9rc1")
-    )
-    return result
 
 def _is_fp4_quantization_enabled():
     """Check if ModelOpt FP4 quantization is enabled."""
@@ -83,6 +74,7 @@ def _is_fp4_quantization_enabled():
     except:
         return False
 
+
 def _get_tile_tokens_dim(num_tokens, top_k, num_experts):
     # Guess tokens per expert assuming perfect expert distribution first.
     num_tokens_per_expert = (num_tokens * top_k) // num_experts
@@ -91,6 +83,7 @@ def _get_tile_tokens_dim(num_tokens, top_k, num_experts):
     # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
     tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
     return tile_tokens_dim
+
 
 class FusedMoeWeightScaleSupported(Enum):
     TENSOR = "tensor"
@@ -796,6 +789,7 @@ class FlashInferFusedMoE(FusedMoE):
 
 class FlashInferFP4MoE(FusedMoE):
     """FP4 TRTLLM MoE implementation using FlashInfer."""
+
     def __init__(self, *args, **kwargs):
         # Extract DeepSeek-specific parameters
         renormalize = kwargs.pop("renormalize", True)
@@ -804,7 +798,7 @@ class FlashInferFP4MoE(FusedMoE):
         num_expert_group = kwargs.pop("num_expert_group", None)
         topk_group = kwargs.pop("topk_group", None)
         correction_bias = kwargs.pop("correction_bias", None)
-        
+
         # Extract additional TopK parameters that were previously extracted in forward
         routed_scaling_factor = kwargs.pop("routed_scaling_factor", None)
 
@@ -819,17 +813,16 @@ class FlashInferFP4MoE(FusedMoE):
         self.correction_bias = correction_bias
         self.routed_scaling_factor = routed_scaling_factor
 
-
     # ---------------------------------------------------------------------
     # Helper: quantize hidden states to FP4 each forward pass
     # ---------------------------------------------------------------------
     def _quantize_hidden_states_fp4(self, hidden_states: torch.Tensor):
         """
         Quantize hidden states using global scale factor from quantization method.
-        
+
         Global scale factor is set by ModelOptNvFp4FusedMoEMethod during weight loading.
         Only block scales are computed at runtime for efficiency.
-        
+
         Returns (packed_fp4_uint8, scale_float8_e4m3fn_runtime, global_scale_float32)
         """
 
@@ -838,41 +831,51 @@ class FlashInferFP4MoE(FusedMoE):
         hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
             hidden_states,
             self.w13_input_scale_quant,
-            16,  # sf_vec_size  
+            16,  # sf_vec_size
             False,  # use_ue8m0
-            False,   # is_sf_swizzled_layout
+            False,  # is_sf_swizzled_layout
         )
 
-        hs_fp4 = hs_fp4_bytes.reshape(hidden_states.shape[0], hidden_states.shape[1] // 2)
+        hs_fp4 = hs_fp4_bytes.reshape(
+            hidden_states.shape[0], hidden_states.shape[1] // 2
+        )
         hs_sf = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(-1)
-        
+
         return hs_fp4, hs_sf
 
     def forward(self, hidden_states: torch.Tensor, topk_output):
         """Forward pass using FP4 TRTLLM kernel.
-        
+
         Args:
             hidden_states: Input tensor
             topk_output: Should be tuple of (TopK_config, router_logits) for TRTLLM mode
         """
 
         # TRTLLM mode expects (TopK_config, router_logits) tuple
-        if not isinstance(topk_output, tuple):
-            raise ValueError(f"FlashInferFP4MoE expects (TopK_config, router_logits) tuple, got {type(topk_output)}")
-            
+        if not isinstance(topk_output, tuple) or len(topk_output) != 2:
+            raise ValueError(
+                f"FlashInferFP4MoE expects (TopK_config, router_logits) tuple, got {type(topk_output)}"
+            )
+
         _, router_logits = topk_output
-        
+
         hs_fp4, hs_scale_linear = self._quantize_hidden_states_fp4(hidden_states)
 
+        router_logits = router_logits.to(torch.float32)
+
         result = trtllm_fp4_block_scale_moe(
-            routing_logits=router_logits.to(torch.float32),
+            routing_logits=router_logits,
             routing_bias=self.correction_bias.to(hidden_states.dtype),
             hidden_states=hs_fp4,
             hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).flatten(),
             gemm1_weights=self.gemm1_weights_fp4_shuffled.data,
-            gemm1_weights_scale=self.gemm1_scales_fp4_shuffled.data.view(torch.float8_e4m3fn),
+            gemm1_weights_scale=self.gemm1_scales_fp4_shuffled.data.view(
+                torch.float8_e4m3fn
+            ),
             gemm2_weights=self.gemm2_weights_fp4_shuffled.data,
-            gemm2_weights_scale=self.gemm2_scales_fp4_shuffled.data.view(torch.float8_e4m3fn),
+            gemm2_weights_scale=self.gemm2_scales_fp4_shuffled.data.view(
+                torch.float8_e4m3fn
+            ),
             output1_scale_scalar=self.g1_scale_c.data,
             output1_scale_gate_scalar=self.g1_alphas.data,
             output2_scale_scalar=self.g2_alphas.data,
@@ -884,7 +887,9 @@ class FlashInferFP4MoE(FusedMoE):
             local_expert_offset=self.moe_ep_rank * self.num_local_experts,
             local_num_experts=self.num_local_experts,
             routed_scaling_factor=self.routed_scaling_factor,
-            tile_tokens_dim=_get_tile_tokens_dim(hidden_states.shape[0], self.top_k, self.num_local_experts),
+            tile_tokens_dim=_get_tile_tokens_dim(
+                hidden_states.shape[0], self.top_k, self.num_local_experts
+            ),
             routing_method_type=RoutingMethodType.DeepSeekV3,
             do_finalize=True,
         )[0]
@@ -894,8 +899,7 @@ class FlashInferFP4MoE(FusedMoE):
 
 def get_fused_moe_impl_class():
     """Factory function to get the appropriate FusedMoE implementation class."""
-    if (should_use_flashinfer_trtllm_moe()
-        and _is_fp4_quantization_enabled()):
+    if should_use_flashinfer_trtllm_moe() and _is_fp4_quantization_enabled():
         # Use FP4 variant when FP4 quantization is enabled
         return FlashInferFP4MoE
     elif should_use_flashinfer_trtllm_moe():
