@@ -2,6 +2,10 @@
 
 SGLang supports various environment variables that can be used to configure its runtime behavior. This document provides a comprehensive list and aims to stay updated over time.
 
+## `sglang.environ`
+
+<!-- todo -->
+
 *Note: SGLang uses environment variables with prefix `SGLANG_`. Due to historical reasons, some variables with `SGL_` prefix are now deprecated, and they will be removed in the future.*
 
 ## General Configuration
