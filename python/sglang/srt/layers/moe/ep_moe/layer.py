@@ -141,7 +141,8 @@ class DeepEPMoE(FusedMoE):
                 self.w13_weight,
                 (
                     self.w13_weight_scale_inv
-                    if self.use_block_quant or get_bool_env_var("SGLANG_USE_W4A8")
+                    if self.use_block_quant
+                    or get_moe_runner_backend() == "cutlass_w4afp8"
                     else self.w13_weight_scale
                 ),
             )
@@ -149,7 +150,8 @@ class DeepEPMoE(FusedMoE):
                 self.w2_weight,
                 (
                     self.w2_weight_scale_inv
-                    if self.use_block_quant or get_bool_env_var("SGLANG_USE_W4A8")
+                    if self.use_block_quant
+                    or get_moe_runner_backend() == "cutlass_w4afp8"
                     else self.w2_weight_scale
                 ),
             )
@@ -205,12 +207,15 @@ class DeepEPMoE(FusedMoE):
             assert DispatchOutputChecker.format_is_deepep(dispatch_output)
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
             return self.forward_aiter(dispatch_output)
-        if dispatch_output.format.is_deepep_normal():
-            if get_bool_env_var("SGLANG_USE_W4A8"):
+        if _is_npu:
+            assert DispatchOutputChecker.format_is_ascent_ll(dispatch_output)
+            return self.forward_npu(dispatch_output)
+        if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+            if get_moe_runner_backend() == "cutlass_w4afp8":
                 return self.forward_cutlass_w4a8(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_contiguous(dispatch_output)
-        elif dispatch_output.format.is_deepep_ll():
+        elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
@@ -520,7 +525,8 @@ class DeepEPMoE(FusedMoE):
             dispatch_output.topk_idx,
             dispatch_output.topk_weights,
         )
-        if hidden_states.shape[0] > 0:
+        num_tokens = hidden_states.shape[0]
+        if num_tokens > 0:
             output = cutlass_w4a8_moe(
                 self.start_expert_id,
                 self.end_expert_id,
@@ -548,9 +554,9 @@ class DeepEPMoE(FusedMoE):
                 self.w2_input_scale,
                 deepep_mode=self.deepep_mode,
             )
-            return output.to(torch.bfloat16)
+            return output
         else:
-            return hidden_states.to(torch.bfloat16)
+            return hidden_states
 
     def forward_npu(
         self,

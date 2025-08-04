@@ -2320,7 +2320,16 @@ class ServerArgs:
         parser.add_argument(
             "--moe-runner-backend",
             type=str,
-            choices=MOE_RUNNER_BACKEND_CHOICES,
+            choices=[
+                "auto",
+                "triton",
+                "triton_kernel",
+                "flashinfer_trtllm",
+                "flashinfer_cutlass",
+                "flashinfer_mxfp4",
+                "flashinfer_cutedsl",
+                "cutlass_w4afp8",
+            ],
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
         )
