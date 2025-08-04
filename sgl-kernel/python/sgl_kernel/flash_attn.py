@@ -18,10 +18,9 @@ def is_fa3_supported(device=None) -> bool:
     #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
     #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
     #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
-    return (
-        torch.cuda.get_device_capability(device)[0] == 9
-        or torch.cuda.get_device_capability(device)[0] == 8
-    ) and (torch.version.cuda >= "12.3")
+    return (torch.cuda.get_device_capability(device)[0] >= 8) and (
+        torch.version.cuda >= "12.3"
+    )
 
 
 def maybe_contiguous(x):
@@ -51,6 +50,7 @@ def flash_attn_with_kvcache(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
+    attention_chunk=0,  # 0 means no chunking
     softcap=0.0,  # 0.0 means deactivated
     rotary_interleaved=True,
     scheduler_metadata=None,
@@ -172,39 +172,40 @@ def flash_attn_with_kvcache(
     rotary_seqlens = maybe_contiguous(rotary_seqlens)
 
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
-        q,
-        k_cache,
-        v_cache,
-        k,
-        v,
-        qv,
+        q,  # q
+        k_cache,  # k
+        v_cache,  # v
+        k,  # k_new
+        v,  # v_new
+        qv,  # q_v
         None,  # out
-        cu_seqlens_q,
+        cu_seqlens_q,  # cu_seqlens_q
         None,  # cu_seqlens_k
-        cu_seqlens_k_new,
+        cu_seqlens_k_new,  # cu_seqlens_k_new
         None,  # seqused_q
-        cache_seqlens,
-        max_seqlen_q,
+        cache_seqlens,  # seqused_k
+        max_seqlen_q,  # max_seqlen_q
         None,  # max_seqlen_k
-        page_table,
-        cache_batch_idx,
-        cache_leftpad,
-        rotary_cos,
-        rotary_sin,
-        rotary_seqlens,
-        q_descale,
-        k_descale,
-        v_descale,
-        softmax_scale,
-        causal,
-        window_size[0],
-        window_size[1],
-        softcap,
-        rotary_interleaved,
-        scheduler_metadata,
-        num_splits,
-        pack_gqa,
-        sm_margin,
+        page_table,  # page_table
+        cache_batch_idx,  # kv_batch_idx
+        cache_leftpad,  # leftpad_k
+        rotary_cos,  # rotary_cos
+        rotary_sin,  # rotary_sin
+        rotary_seqlens,  # seqlens_rotary
+        q_descale,  # q_descale
+        k_descale,  # k_descale
+        v_descale,  # v_descale
+        softmax_scale,  # softmax_scale
+        causal,  # is_causal
+        window_size[0],  # window_size_left
+        window_size[1],  # window_size_right
+        attention_chunk,  # attention_chunk
+        softcap,  # softcap
+        rotary_interleaved,  # is_rotary_interleaved
+        scheduler_metadata,  # scheduler_metadata
+        num_splits,  # num_splits
+        pack_gqa,  # pack_gqa
+        sm_margin,  # sm_margin
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
@@ -227,6 +228,7 @@ def flash_attn_varlen_func(
     k_descale=None,
     v_descale=None,
     window_size=(-1, -1),
+    attention_chunk=0,
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
@@ -271,6 +273,7 @@ def flash_attn_varlen_func(
         causal,
         window_size[0],
         window_size[1],
+        attention_chunk,
         softcap,
         is_rotary_interleaved=False,
         scheduler_metadata=None,
