@@ -84,7 +84,7 @@ def detect_jinja_template_content_format(chat_template: str) -> str:
     - 'openai': content is a list of structured dicts (like Llama4 templates)
 
     Detection logic:
-    - If template has loops like {%- for content in message['content'] -%} → 'openai'
+    - If template has loops like {%- for content in message['content'] -%} or {%- for item in msg.content -%} → 'openai'
     - Otherwise → 'string'
     """
     jinja_ast = _try_extract_ast(chat_template)
@@ -99,6 +99,10 @@ def detect_jinja_template_content_format(chat_template: str) -> str:
             # Check if iterating over message['content'] or similar
             if _is_var_or_elems_access(loop_iter, "message", "content"):
                 return "openai"  # Found content iteration → openai format
+
+            # Also check for patterns like: {%- for item in msg.content -%}
+            if _is_var_or_elems_access(loop_iter, "msg", "content"):
+                return "openai"  # Found content iteration → openai format (glm4v)
 
         return "string"  # No content loops found → string format
     except Exception as e:

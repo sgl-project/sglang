@@ -1,6 +1,6 @@
 import logging
 from functools import lru_cache, partial
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -19,6 +19,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
 from sglang.srt.models.qwen2_5_vl import (
@@ -488,6 +489,16 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        pixel_values = torch.cat(
+            [item.feature.squeeze(0) for item in items], dim=0
+        ).type(self.visual.dtype)
+        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
+        assert pixel_values.dim() == 2, pixel_values.dim()
+        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        return image_embeds
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
