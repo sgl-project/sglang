@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
@@ -168,6 +169,7 @@ class MooncakeKVManager(BaseKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
+            self.pp_group = get_pp_group()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = get_int_env_var(
@@ -645,7 +647,7 @@ class MooncakeKVManager(BaseKVManager):
                             )
                             break
 
-                        if kv_chunk.is_last:
+                        if kv_chunk.is_last and self.pp_group.is_last_rank:
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
                                 req.mooncake_session_id,
@@ -1116,7 +1118,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size
             )
             self.required_dst_info_num = 1
-            self.required_prefill_response_num = 1
+            self.required_prefill_response_num = 1 * self.kv_mgr.pp_size
             self.target_tp_ranks = [self.target_tp_rank]
         elif self.kv_mgr.attn_tp_size > self.prefill_attn_tp_size:
             if not self.kv_mgr.is_mla_backend:
@@ -1129,7 +1131,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.required_dst_info_num = (
                 self.kv_mgr.attn_tp_size // self.prefill_attn_tp_size
             )
-            self.required_prefill_response_num = 1
+            self.required_prefill_response_num = 1 * self.kv_mgr.pp_size
             self.target_tp_ranks = [self.target_tp_rank]
         else:
             if not self.kv_mgr.is_mla_backend:
@@ -1154,7 +1156,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.required_dst_info_num = 1
             self.required_prefill_response_num = (
                 self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size
-            )
+            ) * self.kv_mgr.pp_size
 
         if self.data_parallel_rank is not None:
             logger.debug(f"Targeting DP rank: {self.data_parallel_rank}")
@@ -1449,7 +1451,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
                 "rank_port": rank_port,
             }
             logger.debug(
-                f"Register prefill bootstrap: DP {dp_group} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
+                f"Register prefill bootstrap: DP{dp_group} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
             )
 
         return web.Response(text="OK", status=200)
