@@ -763,6 +763,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 " dynamic quantization is not supported."
             )
 
+        # TODO(ch-wan): check if this is needed
+        layer.num_experts = num_experts
+        layer.num_local_experts = num_experts
+        layer.intermediate_size_per_partition = intermediate_size_per_partition
+        layer.params_dtype = params_dtype
+        layer.quant_config = self.quant_config
+
         weight_dtype = torch.uint8
         weight_scale_dtype = torch.float8_e4m3fn
         weight_loader = extra_weight_attrs.get("weight_loader")
