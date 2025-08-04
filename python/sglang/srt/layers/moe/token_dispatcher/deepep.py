@@ -23,7 +23,7 @@ from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, load_json_config
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, is_npu, load_json_config
 
 _is_npu = is_npu()
 
