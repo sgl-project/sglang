@@ -229,7 +229,7 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
         else:
             extra_args = dict(swiglu_alpha=1.702,
                               swiglu_beta=1.0,
-                              enable_fp8_activation=global_server_args_dict["enable_act8"],
+                              enable_fp8_activation=global_server_args_dict["enable_fp8_act"],
                               pair_wise_act=True)
 
         self.topk = TopK(

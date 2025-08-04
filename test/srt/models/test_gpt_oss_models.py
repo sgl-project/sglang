@@ -35,8 +35,7 @@ class TestOpenAIMoE(CustomTestCase):
                 "4",
                 "--attention-backend",
                 "torch_native_sink", # "flashinfer / triton / torch_native_sink",
-                # "--enable-w4a8-mxfp4-moe", # MoE W4A8
-                # "--enable-w4-mxfp4-moe", # MoE W4A16
+                "--enable-fp8-act", # MoE fp8 activation
                 "--cuda-graph-bs",
                 "128",
                 # "--disable-cuda-graph",

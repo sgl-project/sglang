@@ -70,7 +70,7 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
-    enable_act8: bool = False
+    enable_fp8_act: bool = False
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -1315,7 +1315,7 @@ class ServerArgs:
             help="Enabling DeepEP MoE implementation for EP MoE.",
         )
         parser.add_argument(
-            "--enable-act8",
+            "--enable-fp8-act",
             action="store_true",
             help="Enable fp8 activation for MoE",
         )
