@@ -314,7 +314,7 @@ class SchedulerMetricsCollector:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
 
-    def observe_kvcache_transfer_latency(self, value: float):
+    def observe_kvcache_transfer_latency(self, value: float) -> None:
         self.histogram_kvcache_transfer_latency.labels(**self.labels).observe(value)
 
     def increment_bootstrap_failed_reqs(self) -> None:

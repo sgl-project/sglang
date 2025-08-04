@@ -33,7 +33,10 @@ from sglang.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
 )
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    KVCacheTransferLatencyMonitor,
+)
 from sglang.srt.metrics.collector import SchedulerMetricsCollector
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -203,8 +206,9 @@ class MooncakeKVManager(BaseKVManager):
                 "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 300
             )
 
-            if self.scheduler_metrics_collector is not None:
-                self.kvcache_transfer_latency_table: Dict[int, Dict[str, float]] = {}
+            self.kvcache_transfer_latency_monitor = KVCacheTransferLatencyMonitor(
+                self.scheduler_metrics_collector
+            )
 
             self.enable_custom_mem_pool = get_bool_env_var(
                 "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
@@ -571,7 +575,9 @@ class MooncakeKVManager(BaseKVManager):
                         )
                         local_tp_size = self.tp_size // self.dp_size
 
-                        self._collect_kv_transfer_timestamp(req, True)
+                        self.kvcache_transfer_latency_monitor.collect_begin_timestamp(
+                            req.room, req.mooncake_session_id
+                        )
 
                         if self.is_mla_backend or (
                             local_tp_size == target_rank_registration_info.dst_tp_size
@@ -595,7 +601,9 @@ class MooncakeKVManager(BaseKVManager):
                                 executor,
                             )
 
-                        self._collect_kv_transfer_timestamp(req, False, ret)
+                        self.kvcache_transfer_latency_monitor.collect_finish_timestamp(
+                            req.room, req.mooncake_session_id, ret
+                        )
 
                         if ret != 0:
                             with self.session_lock:
@@ -621,13 +629,9 @@ class MooncakeKVManager(BaseKVManager):
                             break
 
                         if kv_chunk.is_last:
-                            if self.scheduler_metrics_collector is not None:
-                                self.scheduler_metrics_collector.observe_kvcache_transfer_latency(
-                                    self.kvcache_transfer_latency_table[req.room].pop(
-                                        req.mooncake_session_id
-                                    )
-                                )
-
+                            self.kvcache_transfer_latency_monitor.record(
+                                req.room, req.mooncake_session_id
+                            )
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
                                 req.mooncake_session_id,
@@ -660,9 +664,7 @@ class MooncakeKVManager(BaseKVManager):
                 ):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
-                    if self.scheduler_metrics_collector is not None:
-                        if kv_chunk.room in self.kvcache_transfer_latency_table:
-                            self.kvcache_transfer_latency_table.pop(kv_chunk.room)
+                    self.kvcache_transfer_latency_monitor.pop_room(kv_chunk.room)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -940,43 +942,6 @@ class MooncakeKVManager(BaseKVManager):
         logger.error(
             f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), affected {len(affected_rooms)} requests"
         )
-
-    def _collect_kv_transfer_timestamp(
-        self, req: TransferInfo, before_transfer: bool, ret: int = 0
-    ):
-        if self.scheduler_metrics_collector is None:
-            return
-
-        if before_transfer:
-            if req.room not in self.kvcache_transfer_latency_table:
-                self.kvcache_transfer_latency_table[req.room] = {
-                    req.mooncake_session_id: -time.time()
-                }
-            else:
-                if (
-                    req.mooncake_session_id
-                    not in self.kvcache_transfer_latency_table[req.room]
-                ):
-                    self.kvcache_transfer_latency_table[req.room][
-                        req.mooncake_session_id
-                    ] = -time.time()
-                else:
-                    self.kvcache_transfer_latency_table[req.room][
-                        req.mooncake_session_id
-                    ] -= time.time()
-        else:
-            assert req.room in self.kvcache_transfer_latency_table
-            assert (
-                req.mooncake_session_id in self.kvcache_transfer_latency_table[req.room]
-            )
-            if ret != 0:
-                self.kvcache_transfer_latency_table[req.room][
-                    req.mooncake_session_id
-                ] = 0
-            else:
-                self.kvcache_transfer_latency_table[req.room][
-                    req.mooncake_session_id
-                ] += time.time()
 
 
 class MooncakeKVSender(BaseKVSender):
