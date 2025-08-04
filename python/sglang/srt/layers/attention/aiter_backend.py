@@ -765,7 +765,7 @@ class AiterIndicesUpdaterPrefill:
             # this will cause the output tensor value becomes nan
             # WA is to assure that last index of pool not changed
             kv_indices = torch.empty(
-                paged_kernel_lens_sum + 128,
+                paged_kernel_lens_sum + 256,
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
