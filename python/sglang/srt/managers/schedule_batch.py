@@ -51,7 +51,6 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
-from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
