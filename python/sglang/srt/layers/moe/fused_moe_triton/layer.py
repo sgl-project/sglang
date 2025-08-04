@@ -763,8 +763,13 @@ class FlashInferFusedMoE(FusedMoE):
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
         self.correction_bias = correction_bias
+        self.use_flashinfer_trtllm_moe = should_use_flashinfer_trtllm_moe()
 
     def forward(self, hidden_states: torch.Tensor, topk_output: tuple):
+        assert self.use_flashinfer_trtllm_moe
+        assert (
+            self.activation == "silu"
+        ), "Only silu is supported for flashinfer blockscale fp8 moe"
         assert self.quant_method is not None
         assert (
             self.renormalize
