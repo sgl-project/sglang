@@ -1,4 +1,20 @@
+import importlib.util
 from enum import Enum
+from functools import lru_cache
+
+from packaging import version as pkg_version
+
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+
+@lru_cache(maxsize=1)
+def should_use_flashinfer_trtllm_moe():
+    result = global_server_args_dict["enable_flashinfer_trtllm_moe"] and (
+        not importlib.util.find_spec("flashinfer")
+        or pkg_version.parse(__import__("flashinfer").__version__)
+        >= pkg_version.parse("0.2.9rc1")
+    )
+    return result
 
 
 class MoeA2ABackend(Enum):
