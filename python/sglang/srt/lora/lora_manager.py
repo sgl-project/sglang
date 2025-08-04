@@ -166,12 +166,6 @@ class LoRAManager:
                 "included in `--enable_lora_modules`."
             )
 
-        if isinstance(lora_config.target_modules, str) and not self.target_modules:
-            raise ValueError(
-                f"SGLang currently only supports inferring LoRA target modules when a list of suffixes is provided in `target_modules` field of PEFT config. "
-                "Please explicitly specify `--lora-target-modules` during server startup. You can specify `all` to enable all support modules types. "
-            )
-
     def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateResult:
         """
         Unload LoRA adapters by their names. This will remove the adapters from the memory pool and
@@ -392,6 +386,13 @@ class LoRAManager:
         else:
             self.target_modules = set()
             for config in self.configs.values():
+                if not isinstance(config.target_modules, list):
+                    raise ValueError(
+                        f"SGLang currently only supports inferring LoRA target modules when a list of "
+                        "suffixes is provided in `target_modules` field of PEFT config. Please explicitly "
+                        "specify `--lora-target-modules` during server startup. You can specify `all` to "
+                        "enable all support modules types. "
+                    )
                 self.target_modules.update(config.target_modules)
 
         if max_lora_rank is not None:
