@@ -234,6 +234,11 @@ impl ToPdRequest for ChatCompletionRequest {
             other.insert("logprobs".to_string(), true.into());
         }
 
+        // Merge in any additional fields from the other map (e.g., chat_template_kwargs)
+        for (key, value) in self.other {
+            other.insert(key, value);
+        }
+
         ChatReqInput {
             stream: self.stream,
             bootstrap_host: None,
@@ -855,6 +860,7 @@ mod tests {
             parallel_tool_calls: None,
             functions: None,
             function_call: None,
+            other: serde_json::Map::new(),
         };
 
         let pd_req = req.to_pd_request();
@@ -920,6 +926,7 @@ mod tests {
             parallel_tool_calls: Some(false),
             functions: None,
             function_call: None,
+            other: serde_json::Map::new(),
         };
 
         let pd_req = req.to_pd_request();
@@ -989,6 +996,7 @@ mod tests {
             parallel_tool_calls: None,
             functions: None,
             function_call: None,
+            other: serde_json::Map::new(),
         };
 
         let pd_req = req.to_pd_request();
@@ -1037,6 +1045,7 @@ mod tests {
             parallel_tool_calls: None,
             functions: None,
             function_call: None,
+            other: serde_json::Map::new(),
         };
 
         let pd_req = req.to_pd_request();
@@ -1080,6 +1089,7 @@ mod tests {
             parallel_tool_calls: None,
             functions: None,
             function_call: None,
+            other: serde_json::Map::new(),
         };
 
         let pd_req = req.to_pd_request();
@@ -1278,5 +1288,70 @@ mod tests {
         assert_eq!(pd_req.bootstrap_host, None);
         assert_eq!(pd_req.bootstrap_port, None);
         assert_eq!(pd_req.bootstrap_room, None);
+    }
+
+    #[test]
+    fn test_chat_completion_preserves_chat_template_kwargs() {
+        let messages = vec![ChatMessage::User {
+            role: "user".to_string(),
+            content: UserMessageContent::Text("Test message".to_string()),
+            name: None,
+        }];
+
+        let mut other_fields = serde_json::Map::new();
+        // Add chat_template_kwargs to test the specific use case
+        let mut chat_template_kwargs = serde_json::Map::new();
+        chat_template_kwargs.insert("enable_thinking".to_string(), json!(false));
+        other_fields.insert("chat_template_kwargs".to_string(), json!(chat_template_kwargs));
+        
+        // Also add some other custom parameters to ensure they're preserved
+        other_fields.insert("custom_param".to_string(), json!("custom_value"));
+        other_fields.insert("numeric_param".to_string(), json!(42));
+
+        let req = ChatCompletionRequest {
+            messages,
+            model: "test-model".to_string(),
+            temperature: Some(0.7),
+            top_p: None,
+            n: None,
+            stream: false,
+            stream_options: None,
+            stop: None,
+            max_tokens: Some(100),
+            max_completion_tokens: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logit_bias: None,
+            logprobs: false,
+            top_logprobs: None,
+            user: None,
+            seed: None,
+            response_format: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            functions: None,
+            function_call: None,
+            other: other_fields,
+        };
+
+        let pd_req = req.to_pd_request();
+        let other = pd_req.other.as_object().unwrap();
+
+        // Verify that chat_template_kwargs is preserved
+        assert!(other.contains_key("chat_template_kwargs"));
+        let chat_template_kwargs = other.get("chat_template_kwargs").unwrap().as_object().unwrap();
+        assert_eq!(chat_template_kwargs.get("enable_thinking"), Some(&json!(false)));
+
+        // Verify other custom parameters are preserved
+        assert_eq!(other.get("custom_param"), Some(&json!("custom_value")));
+        assert_eq!(other.get("numeric_param"), Some(&json!(42)));
+
+        // Verify standard fields are still present
+        assert!(other.contains_key("messages"));
+        assert_eq!(other.get("model"), Some(&json!("test-model")));
+        assert_eq!(other.get("stream"), Some(&json!(false)));
+        assert!(other.get("temperature").unwrap().as_f64().unwrap() - 0.7 < 0.0001);
+        assert_eq!(other.get("max_tokens"), Some(&json!(100)));
     }
 }

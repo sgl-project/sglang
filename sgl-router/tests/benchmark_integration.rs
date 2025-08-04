@@ -65,6 +65,7 @@ fn test_benchmark_request_creation() {
         parallel_tool_calls: Some(true),
         function_call: None,
         functions: None,
+        other: serde_json::Map::new(),
     };
 
     let completion_req = CompletionRequest {
@@ -161,6 +162,7 @@ fn test_benchmark_request_adaptation() {
         parallel_tool_calls: Some(true),
         function_call: None,
         functions: None,
+        other: serde_json::Map::new(),
     };
 
     let completion_req = CompletionRequest {

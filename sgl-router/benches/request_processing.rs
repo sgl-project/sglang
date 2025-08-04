@@ -74,6 +74,7 @@ fn create_sample_chat_completion_request() -> ChatCompletionRequest {
         parallel_tool_calls: Some(true),
         function_call: None,
         functions: None,
+        other: serde_json::Map::new(),
     }
 }
 
@@ -148,6 +149,7 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
         parallel_tool_calls: Some(true),
         function_call: None,
         functions: None,
+        other: serde_json::Map::new(),
     }
 }
 

@@ -207,6 +207,10 @@ pub struct ChatCompletionRequest {
     /// Deprecated: use tool_choice instead
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function_call: Option<FunctionCall>,
+
+    /// Additional fields including bootstrap info for PD routing and custom parameters
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
