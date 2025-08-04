@@ -515,7 +515,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        if self.enable_chunk_kv and forward_batch.mha_return_lse:  # MHA Chunk
+        if (
+            forward_batch.attn_attend_prefix_cache is not None
+            and forward_batch.mha_return_lse
+        ):  # MHA Chunk
+            assert self.enable_chunk_kv
             assert q_rope is None
             assert k_rope is None
             o1, s1 = self.mha_chunk_kv_cache.forward(q, k, v, layer, forward_batch)

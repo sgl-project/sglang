@@ -987,11 +987,15 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if attention_backend == "ascend":
             return AttnForwardMethod.MLA
-        elif attention_backend == "flashinfer":
+        elif attention_backend == "flashinfer" or attention_backend == "fa3":
+            # Use MHA with chunked KV cache when prefilling on long sequences.
             sum_extend_prefix_lens = sum(forward_batch.extend_prefix_lens_cpu or [])
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
             if (
-                not self.flashinfer_mla_disable_ragged
+                not (
+                    attention_backend == "flashinfer"
+                    and self.flashinfer_mla_disable_ragged
+                )
                 and forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
@@ -1000,26 +1004,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                         sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
                         and not self.disable_chunked_prefix_cache
                     )
-                    or sum_extend_prefix_lens == 0
-                )
-            ):
-                if sum_extend_prefix_lens == 0:  # return_lse=False
-                    return AttnForwardMethod.MHA
-                else:
-                    return AttnForwardMethod.MHA_CHUNKED_KV
-            else:
-                return _dispatch_mla_subtype()
-        elif attention_backend == "fa3":
-            # Flash Attention: Use MHA with chunked KV cache when prefilling on long sequences.
-            if forward_batch.extend_prefix_lens_cpu is not None:
-                sum_extend_prefix_lens = sum(forward_batch.extend_prefix_lens_cpu)
-            if (
-                forward_batch.forward_mode.is_extend()
-                and not self.disable_chunked_prefix_cache
-                and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend()
-                and (
-                    sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
                     or sum_extend_prefix_lens == 0
                 )
             ):
@@ -1663,8 +1647,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             k[..., self.qk_nope_head_dim :] = k_pe
 
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-            if self.current_attention_backend == "fa3":
-                lse = torch.transpose(lse, 0, 1).contiguous()
             tmp_output = torch.empty_like(accum_output)
             tmp_lse = torch.empty_like(accum_lse)
             merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
@@ -1686,60 +1668,28 @@ class DeepseekV2AttentionMLA(nn.Module):
         # will be helpful for understanding the purpose of this function.
 
         # First do normal mha forward to get output for extended part
-        if self.q_lora_rank is not None:
-            q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
-            )
-            q = self.q_a_layernorm(q)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-        else:
-            q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
-            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-        _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        latent_cache = latent_cache.unsqueeze(1)
-        kv_a = self.kv_a_layernorm(kv_a)
-        kv = self.kv_b_proj(kv_a)[0]
-        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim :]
-        k_pe = latent_cache[:, :, self.kv_lora_rank :]
-
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim :] = q_pe
-        k = torch.empty_like(q)
-        k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim :] = k_pe
-
-        latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-        latent_cache[:, :, self.kv_lora_rank :] = k_pe
-
-        # Save latent cache
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+        return self.forward_normal_prepare(
+            positions, hidden_states, forward_batch, zero_allocator
         )
 
-        return q, k, v, forward_batch
-
     def forward_normal_chunked_kv_core(self, q, k, v, forward_batch):
-        if any(forward_batch.extend_prefix_lens_cpu):
+        has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
+        if has_extend_prefix:
             # Only initialize the info once
             if forward_batch.num_prefix_chunks is None:
                 forward_batch.prepare_chunked_prefix_cache_info(q.device)
-                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+                if self.current_attention_backend == "flashinfer":
+                    forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
 
-        forward_batch.mha_return_lse = True
+        forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
-        attn_output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
 
         # Do mha attention with chunked prefix cache if there are any sequence with prefix
-        if any(forward_batch.extend_prefix_lens_cpu):
+        if has_extend_prefix:
+            attn_output, lse = attn_output
             forward_batch.set_attn_attend_prefix_cache(True)
-            if self.current_attention_backend == "fa3":
-                lse = torch.transpose(lse, 0, 1).contiguous()
             attn_output = self._chunked_prefix_attn_mha(
                 q=q,
                 accum_output=attn_output,

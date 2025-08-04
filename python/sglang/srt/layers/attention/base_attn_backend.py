@@ -115,7 +115,3 @@ class AttentionBackend(ABC):
     def support_triton(self):
         """Check if the current backend supports triton."""
         return True
-
-    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
-        """Init the metadata for a forward pass."""
-        pass
