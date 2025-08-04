@@ -623,7 +623,7 @@ def generate_chat_conv(
                         real_content += content.text
                     elif content.type == "image_url":
                         # NOTE: works for llava and intervl2_5
-                        if conv.name in ["internvl-2-5", "interns1"]:
+                        if conv.name in ["internvl-2-5", "interns1","qwen2-vl"]:
                             real_content = image_token + real_content
                         else:
                             real_content += image_token

@@ -435,7 +435,16 @@ class ForwardBatch:
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
 
         if model_runner.model_is_mrope:
-            ret._compute_mrope_positions(model_runner, batch)
+            if (
+                ret.spec_info is not None
+                and getattr(ret.spec_info, "positions", None) is not None
+            ):
+                # TODO : This is a tmp solution for dev, mrope positions should be computed in _compute_mrope_positions when draft decode.
+                ret.mrope_positions = ret.spec_info.positions.unsqueeze(0).repeat(3,1)
+            else:
+                ret._compute_mrope_positions(model_runner, batch)
+
+            # ret._compute_mrope_positions(model_runner, batch)
 
         # Init lora information
         if model_runner.server_args.enable_lora:

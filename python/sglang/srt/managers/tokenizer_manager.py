@@ -523,6 +523,8 @@ class TokenizerManager:
                 obj.image_data = [obj.image_data]
             if not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
+            import time
+            start_time = time.time()
             mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
                 audio_data=obj.audio_data,
@@ -530,6 +532,7 @@ class TokenizerManager:
                 request_obj=obj,
                 max_req_input_len=self.max_req_input_len,
             )
+            print(f"mm processor time: {time.time() - start_time}")
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
         else:

@@ -80,6 +80,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.out_cache_loc = torch.ones((self.max_num_token,), dtype=torch.int64)
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            self.mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
 
             if self.eagle_worker.speculative_algorithm.is_eagle3():
                 self.hidden_states = torch.zeros(
@@ -188,6 +189,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         accept_length = self.accept_length[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
         positions = self.positions[:num_tokens]
+        mrope_positions = self.mrope_positions[:, :num_tokens]
         hidden_states = self.hidden_states[:num_tokens]
 
         if self.require_mlp_tp_gather:
@@ -244,6 +246,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
             positions=positions,
+            mrope_positions=mrope_positions,
             global_num_tokens_gpu=self.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DPPaddingMode.get_default_mode_in_cuda_graph(),

@@ -21,6 +21,7 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.mm_utils import embed_mm_inputs
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -311,14 +312,19 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
+        import time
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            start_time = time.time()
             logits_output, next_token_ids, bid, seq_lens_cpu = (
                 self.forward_target_extend(batch)
             )
+            print(f"forward target extend time: {time.time() - start_time}")
+            start_time = time.time()
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
+            print(f"forward draft extend time: {time.time() - start_time}")
             return logits_output, next_token_ids, bid, 0, False
         else:
             with self.draft_tp_context(self.draft_model_runner.tp_group):
@@ -814,12 +820,48 @@ class EAGLEWorker(TpModelWorker):
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
+        if forward_batch.contains_mm_inputs():
+            forward_batch.input_embeds = self.get_mm_embeds(forward_batch)
         forward_batch.return_logprob = False
         logits_output, _ = self.draft_model_runner.forward(forward_batch)
         self._detect_nan_if_needed(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
+
+    def get_mm_embeds(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Get the input embeds for the draft model forward.
+
+        Args:
+            forward_batch: The forward batch to run.
+        Returns:
+            The input embeds for the draft model forward.
+        """
+        mm_inputs_list = [
+            mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
+        ]
+        extend_prefix_lens = [
+            prefix_len
+            for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
+            if forward_batch.mm_inputs[i] is not None
+        ]
+        extend_seq_lens = [
+            seq_len
+            for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
+            if forward_batch.mm_inputs[i] is not None
+        ]
+        inputs_embeds = embed_mm_inputs(
+            mm_inputs_list=mm_inputs_list,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
+            input_ids=forward_batch.input_ids,
+            input_embedding=self.target_worker.model_runner.model.model.get_input_embeddings(),
+            multimodal_model=self.target_worker.model_runner.model,
+            data_embedding_func_mapping=None,
+            placeholder_tokens=152063,
+        )
+        forward_batch.mm_inputs = None
+        return inputs_embeds
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         assert isinstance(batch.spec_info, EagleDraftInput)
