@@ -1,6 +1,6 @@
 import os
 import warnings
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import Any
 
 
@@ -192,4 +192,11 @@ if __name__ == "__main__":
     with envs.SGLANG_TEST_RETRACT.override(True):
         assert envs.SGLANG_TEST_RETRACT.value is True
 
+    assert envs.SGLANG_TEST_RETRACT.value is None
+
+    # Use this style of context manager in unit test
+    exit_stack = ExitStack()
+    exit_stack.enter_context(envs.SGLANG_TEST_RETRACT.override(False))
+    assert envs.SGLANG_TEST_RETRACT.value is False
+    exit_stack.close()
     assert envs.SGLANG_TEST_RETRACT.value is None

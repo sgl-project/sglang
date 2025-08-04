@@ -2,11 +2,13 @@ import os
 import subprocess
 import time
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import requests
 
+from sglang.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
@@ -15,7 +17,6 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_pd_server,
-    run_with_timeout,
 )
 
 
@@ -23,8 +24,8 @@ class TestDisaggregationMooncakePrefillLargerTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGLANG_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGLANG_ENABLE_JIT_DEEPGEMM"] = "false"
+        cls._exit_stack = ExitStack()
+        cls._exit_stack.enter_context(envs.SGLANG_ENABLE_JIT_DEEPGEMM.override(False))
 
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
@@ -123,10 +124,7 @@ class TestDisaggregationMooncakePrefillLargerTP(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         # Restore JIT DeepGEMM environment variable
-        if cls.original_jit_deepgemm is not None:
-            os.environ["SGLANG_ENABLE_JIT_DEEPGEMM"] = cls.original_jit_deepgemm
-        else:
-            os.environ.pop("SGLANG_ENABLE_JIT_DEEPGEMM", None)
+        cls._exit_stack.close()
 
         for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
             if process:
