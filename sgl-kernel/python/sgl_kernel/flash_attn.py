@@ -246,10 +246,7 @@ def flash_attn_varlen_func(
     return_softmax_lse=False,
 ):
     # Use FlashAttnFunc for sm90 and above when available and conditions are met
-    if (is_sm90_or_higher() and FlashAttnFunc is not None and 
-        qv is None and q_descale is None and k_descale is None and v_descale is None and
-        cu_seqlens_q is None and cu_seqlens_k is None and seqused_q is None and seqused_k is None):
-        
+    if (is_sm90_or_higher() and FlashAttnFunc is not None):
         # Convert window_size format from (-1, -1) to (None, None) for FlashAttnFunc
         window_size_converted = tuple(None if w == -1 else w for w in window_size)
         
