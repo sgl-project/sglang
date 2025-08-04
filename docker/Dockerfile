@@ -3,14 +3,25 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
 
 ARG BUILD_TYPE=all
 ARG DEEPEP_COMMIT=b6ce310bb0b75079682d09bc2ebc063a074fbd58
+ARG GDRCOPY_VERSION=2.4.4
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
+ARG PIP_DEFAULT_INDEX
+ARG UBUNTU_MIRROR
+ARG GITHUB_ARTIFACTORY=github.com
+ARG SGLANG_TAG
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
-    GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
+    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
     NVSHMEM_DIR=/sgl-workspace/nvshmem/install
 # Add GKE default lib and bin locations.
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+
+# Replace Ubuntu sources if it is specified
+RUN if [ -n "$UBUNTU_MIRROR" ]; then \
+    sed -i "s|http://.*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
+    sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
+fi
 
 RUN apt update && apt install wget -y && apt install software-properties-common -y \
  && add-apt-repository ppa:deadsnakes/ppa -y \
@@ -47,10 +58,16 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
  && rm -rf /var/lib/apt/lists/* \
  && apt-get clean
 
+# Replace pip global cache if it is specified
+RUN if [ -n "${PIP_DEFAULT_INDEX}" ]; then \
+    python3 -m pip config set global.index-url ${PIP_DEFAULT_INDEX}; \
+fi
+
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
- && git clone https://github.com/NVIDIA/gdrcopy.git -b v2.4.4 \
- && cd gdrcopy/packages \
+ && curl -L https://${GITHUB_ARTIFACTORY}/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz -o gdrcopy_v${GDRCOPY_VERSION}.tar.gz \
+ && tar -xzf gdrcopy_v${GDRCOPY_VERSION}.tar.gz \
+ && cd gdrcopy-${GDRCOPY_VERSION}/packages \
  && CUDA=/usr/local/cuda ./build-deb-packages.sh \
  && dpkg -i gdrdrv-dkms_*.deb libgdrapi_*.deb gdrcopy-tests_*.deb gdrcopy_*.deb \
  && cd / && rm -rf /tmp/gdrcopy
@@ -61,7 +78,12 @@ RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libm
 # Clone and install SGLang
 WORKDIR /sgl-workspace
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
- && git clone --depth=1 https://github.com/sgl-project/sglang.git \
+ && if [ -n "${SGLANG_TAG}" ]; then \
+      curl -L https://${GITHUB_ARTIFACTORY}/sgl-project/sglang/archive/refs/tags/${SGLANG_TAG}.zip -o sglang.zip \
+      && unzip sglang.zip && mv sglang-* sglang && rm -f sglang.zip; \
+    else \
+      git clone --depth=1 https://github.com/sgl-project/sglang.git; \
+    fi \
  && cd sglang \
  && case "$CUDA_VERSION" in \
       12.6.1) CUINDEX=126 ;; \
@@ -73,19 +95,19 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
  && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
  && python3 -m flashinfer --download-cubin \
  && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.3/sgl_kernel-0.3.3+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v0.3.3/sgl_kernel-0.3.3+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
     fi \
  && if [ "$CUDA_VERSION" = "12.9.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.3/sgl_kernel-0.3.3-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v0.3.3/sgl_kernel-0.3.3-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
     fi
 
-# Download source files
-RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    git clone https://github.com/deepseek-ai/DeepEP.git && \
-    cd DeepEP && git checkout ${DEEPEP_COMMIT} && cd .. && \
-    tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    mv nvshmem_src nvshmem && \
-    rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
+# Download NVSHMEM and DeepEP source files
+RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
+ && wget https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip \
+ && unzip ${DEEPEP_COMMIT}.zip \
+ && tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
+ && mv nvshmem_src nvshmem \
+ && rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
 
 # Build and install NVSHMEM
 RUN cd /sgl-workspace/nvshmem && \
@@ -101,8 +123,8 @@ RUN cd /sgl-workspace/nvshmem && \
     cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
 
 # Install DeepEP
-RUN cd /sgl-workspace/DeepEP && \
-    NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
+RUN cd /sgl-workspace/DeepEP-${DEEPEP_COMMIT} \
+ && NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
@@ -172,22 +194,22 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
     tabulate
 
 # Install diff-so-fancy
-RUN curl -LSso /usr/local/bin/diff-so-fancy https://github.com/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
+RUN curl -LSso /usr/local/bin/diff-so-fancy https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
     && chmod +x /usr/local/bin/diff-so-fancy
 
 # Install clang-format
-RUN curl -LSso /usr/local/bin/clang-format https://github.com/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
+RUN curl -LSso /usr/local/bin/clang-format https://${GITHUB_ARTIFACTORY}/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
     && chmod +x /usr/local/bin/clang-format
 
 # Install clangd
-RUN curl -L https://github.com/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip \
+RUN curl -L https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip \
     && unzip clangd.zip \
     && cp -r clangd_18.1.3/bin/* /usr/local/bin/ \
     && cp -r clangd_18.1.3/lib/* /usr/local/lib/ \
     && rm -rf clangd_18.1.3 clangd.zip
 
 # Install CMake
-RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1-linux-x86_64.tar.gz \
+RUN wget https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1-linux-x86_64.tar.gz \
     && tar -xzf cmake-3.31.1-linux-x86_64.tar.gz \
     && cp -r cmake-3.31.1-linux-x86_64/bin/* /usr/local/bin/ \
     && cp -r cmake-3.31.1-linux-x86_64/share/* /usr/local/share/ \
@@ -346,7 +368,9 @@ setopt INC_APPEND_HISTORY
 EOF
 
 RUN set -euxo ; \
-    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | \
+    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
+    bash -s -- --tag 1.42.4 --to /usr/local/bin
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
