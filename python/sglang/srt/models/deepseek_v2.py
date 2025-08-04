@@ -2334,9 +2334,9 @@ class DeepseekV2Model(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 forward_batch.on_layer_start(i)
                 layer = self.layers[i]
-                    hidden_states, residual = layer(
-                        positions, hidden_states, forward_batch, residual, zero_allocator
-                    )
+                hidden_states, residual = layer(
+                    positions, hidden_states, forward_batch, residual, zero_allocator
+                )
                 forward_batch.on_layer_end(i)
         forward_batch.on_model_end()
 

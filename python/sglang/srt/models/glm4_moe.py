@@ -182,6 +182,7 @@ class Glm4MoeAttention(nn.Module):
         use_qk_norm: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        config: PretrainedConfig = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -242,13 +243,19 @@ class Glm4MoeAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+        assert partial_rotary_factor == 0.5
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            orig_context_len=getattr(
+                config, "orig_context_len", max_position_embeddings
+            ),
+            rope=self.rotary_emb,
             prefix=add_prefix("attn", prefix),
+            rope_range=(self.head_dim//2, self.head_dim),
         )
 
         if self.use_qk_norm:
@@ -302,7 +309,23 @@ class Glm4MoeAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
             q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        
+        # RoPE is applied inside the attention kernel in HiP Attention
+        if (
+            forward_batch.hip_metadata_cache_pool is not None
+            and forward_batch.hip_metadata_cache_pool.hip_config.using_extend
+        ):
+            def rotate(t: torch.Tensor):
+                t_shape = t.shape
+                t = t.reshape(-1, self.head_dim)
+                HID = t.shape[-1]
+                t = torch.cat([t[..., HID//2:], t[..., :HID//2]], dim=-1)
+                return t.reshape(t_shape)
+            q = rotate(q)
+            k = rotate(k)
+        else:
+            q, k = self.rotary_emb(positions, q, k)
+        
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -651,6 +674,7 @@ class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
             use_qk_norm=config.use_qk_norm,
+            config=config,
         )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
@@ -765,6 +789,7 @@ class Glm4MoeModel(DeepseekV2Model):
 
 
 class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
+    hip_attention_supported = True
 
     def __init__(
         self,

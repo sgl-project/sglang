@@ -239,15 +239,6 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     return capture_bs, compile_bs
 
 
-def get_capture_configs(server_args: ServerArgs):
-    if server_args.enable_hip_attention:
-        from hip_attn.v1_2.paged_hip import cuda_graph_capture_configs
-
-        return cuda_graph_capture_configs(server_args.hip_attention_config)
-    else:
-        return [()]
-
-
 # Reuse this memory pool across all cuda graph runners.
 global_graph_memory_pool = None
 
@@ -283,7 +274,13 @@ class CudaGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self.hip_config = model_runner.server_args.hip_attention_config
         self.enable_hip_attention = model_runner.server_args.enable_hip_attention
+        if self.enable_hip_attention:
+            from hip_attn.v1_2.paged_hip import cuda_graph_capture_configs
+            self.capture_configs = cuda_graph_capture_configs(self.hip_config)
+        else:
+            self.capture_configs = [()]
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
@@ -514,7 +511,7 @@ class CudaGraphRunner:
                             f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                         )
 
-                    for capture_config in self.capture_configs():
+                    for capture_config in self.capture_configs:
                         with patch_model(
                             self.model_runner.model,
                             bs in self.compile_bs,
@@ -544,14 +541,6 @@ class CudaGraphRunner:
                 )
             )
             logger.info(log_message)
-
-    def capture_configs(self):
-        if self.enable_hip_attention:
-            from hip_attn.v1_2.paged_hip import cuda_graph_capture_configs
-
-            return cuda_graph_capture_configs(self.hip_config)
-        else:
-            return [()]
 
     def capture_one_batch_size(self, bs: int, forward: Callable, capture_config: tuple):
         graph = torch.cuda.CUDAGraph()

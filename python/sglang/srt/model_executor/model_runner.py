@@ -1613,11 +1613,11 @@ class ModelRunner:
 
     def _get_attention_backend_from_str(self, backend_str: str):
         if backend_str == "hip_attention":
-            from sglang.srt.layers.attention.hip_radix_attention import (
-                HiPRadixAttentionBackend,
+            from sglang.srt.layers.attention.hip_attention import (
+                HiPAttentionBackend,
             )
 
-            self.attn_backend = HiPRadixAttentionBackend(self)
+            return HiPAttentionBackend(self)
         elif backend_str == "flashinfer":
             if not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (

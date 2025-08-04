@@ -1055,6 +1055,8 @@ def _execute_server_warmup(
             text = f"<|start_header_id|>user<|end_header_id|>\n\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nThe passkey is **"
         elif "Qwen3" in server_args.model_path:
             text = f"<|im_start|>user\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.<|im_end|>\n<|im_start|>assistant\n<think></think>\n\nThe passkey is **"
+        elif "GLM-4.5":
+            text = f"[gMASK]<sop><|user|>Your task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.<|assistant|>\n<think></think>The passkey is **"
         else:
             text = f"### User\n\nYour task is find the passkey value from the text. {filler * repeat} {passkey} {filler * repeat}.\n\n### Response\n\nThe passkey is **"
         return text
