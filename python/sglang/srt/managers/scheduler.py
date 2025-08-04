@@ -1036,21 +1036,29 @@ class Scheduler(
                 self.return_health_check_ct += 1
                 continue
             # If it is a work request and the request queue is full, we need to either reject or evict a request.
-            if is_work_request(recv_req) and len(self.waiting_queue) + 1 > self.max_queued_requests:
+            if (
+                is_work_request(recv_req)
+                and len(self.waiting_queue) + 1 > self.max_queued_requests
+            ):
                 # Reject the incoming request by default.
                 abort_req = AbortReq(
                     recv_req.rid,
                     finished_reason={
                         "type": "abort",
                         "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                        "message": "The request queue is full." ,
+                        "message": "The request queue is full.",
                     },
                 )
                 # When using priority scheduling, consider eviciting existing request with the lowest priority.
-                if self.use_priority_scheduling and recv_req.priority >  self.waiting_queue[-1].priority:
+                if (
+                    self.use_priority_scheduling
+                    and recv_req.priority > self.waiting_queue[-1].priority
+                ):
                     lowest_priority_req = self.waiting_queue.pop()
                     abort_req.rid = lowest_priority_req.rid
-                    abort_req.finished_reason["message"] = "The request is evicted based on priority."
+                    abort_req.finished_reason["message"] = (
+                        "The request is evicted based on priority."
+                    )
                 self.send_to_tokenizer.send_pyobj(abort_req)
                 # Skip dispatcher when the incoming request is rejected.
                 if abort_req.rid == recv_req.rid:
@@ -1273,7 +1281,11 @@ class Scheduler(
 
     def _add_requests_to_queue_in_order(self, reqs: List[Req]):
         for req in reqs:
-            insort(self.waiting_queue,req, key=(lambda x: (-x.priority, x.queue_time_start)))
+            insort(
+                self.waiting_queue,
+                req,
+                key=(lambda x: (-x.priority, x.queue_time_start)),
+            )
 
     def handle_embedding_request(
         self,

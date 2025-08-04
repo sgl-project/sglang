@@ -72,7 +72,7 @@ class CacheAgnosticPolicy(Enum):
     FCFS = "fcfs"  # first come first serve
     LOF = "lof"  # longest output first
     RANDOM = "random"
-    PRIORITY = "priority" # higher priority first
+    PRIORITY = "priority"  # higher priority first
 
 
 class SchedulePolicy:

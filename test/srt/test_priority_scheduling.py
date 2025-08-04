@@ -36,12 +36,12 @@ class TestPriorityScheduling(CustomTestCase):
                 "1",
                 "--max-queued-requests",  # Enforce max queued request number is 3
                 "3",
-                "--schedule-policy", # Use priority scheduling
-                "priority"
+                "--schedule-policy",  # Use priority scheduling
+                "priority",
             ),
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
-    
+
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
@@ -55,13 +55,16 @@ class TestPriorityScheduling(CustomTestCase):
 
         responses = asyncio.run(
             send_concurrent_generate_requests_with_custom_params(
-                self.base_url, 
+                self.base_url,
                 [
-                    {"priority": 0, "sampling_params": {"max_new_tokens": 10000}}, # starts being processed first
-                    {"priority": 1}, # third
-                    {"priority": 1}, # fourth
-                    {"priority": 2}, # second
-                ],                 
+                    {
+                        "priority": 0,
+                        "sampling_params": {"max_new_tokens": 10000},
+                    },  # starts being processed first
+                    {"priority": 1},  # third
+                    {"priority": 1},  # fourth
+                    {"priority": 2},  # second
+                ],
             )
         )
 
@@ -71,9 +74,11 @@ class TestPriorityScheduling(CustomTestCase):
             (200, None),
             (200, None),
         ]
-        
+
         e2e_latencies = []
-        _verify_genereate_responses(responses, expected_status_and_error_messages, e2e_latencies)
+        _verify_genereate_responses(
+            responses, expected_status_and_error_messages, e2e_latencies
+        )
         assert e2e_latencies[0] < e2e_latencies[3] < e2e_latencies[1] < e2e_latencies[2]
 
     def test_priority_scheduling_request_eviction_validation(self):
@@ -81,16 +86,19 @@ class TestPriorityScheduling(CustomTestCase):
 
         responses = asyncio.run(
             send_concurrent_generate_requests_with_custom_params(
-                self.base_url, 
+                self.base_url,
                 [
-                    {"priority": 1, "sampling_params": {"max_new_tokens": 10000}}, # starts being processed first and holds the running queue capacity
-                    {"priority": 2}, # evicted by request 5
-                    {"priority": 3}, # evicted by request 6
-                    {"priority": 4}, # evicted by request 7
-                    {"priority": 5}, # fourth
-                    {"priority": 6}, # third
-                    {"priority": 7}, # second
-                ],                 
+                    {
+                        "priority": 1,
+                        "sampling_params": {"max_new_tokens": 10000},
+                    },  # starts being processed first and holds the running queue capacity
+                    {"priority": 2},  # evicted by request 5
+                    {"priority": 3},  # evicted by request 6
+                    {"priority": 4},  # evicted by request 7
+                    {"priority": 5},  # fourth
+                    {"priority": 6},  # third
+                    {"priority": 7},  # second
+                ],
             )
         )
 
@@ -105,24 +113,29 @@ class TestPriorityScheduling(CustomTestCase):
         ]
 
         e2e_latencies = []
-        _verify_genereate_responses(responses, expected_status_and_error_messages, e2e_latencies)
-        assert e2e_latencies[0] < e2e_latencies[6] < e2e_latencies[5] < e2e_latencies[4]      
+        _verify_genereate_responses(
+            responses, expected_status_and_error_messages, e2e_latencies
+        )
+        assert e2e_latencies[0] < e2e_latencies[6] < e2e_latencies[5] < e2e_latencies[4]
 
     def test_priority_scheduling_request_rejection_validation(self):
         """Verify incoming requests are rejected when existing requests have higher priority"""
 
         responses = asyncio.run(
             send_concurrent_generate_requests_with_custom_params(
-                self.base_url, 
+                self.base_url,
                 [
-                    {"priority": 7, "sampling_params": {"max_new_tokens": 10000}}, # starts being processed first and holds the running queue capacity
-                    {"priority": 6}, # second
-                    {"priority": 5}, # third
-                    {"priority": 4}, # fourth
-                    {"priority": 3}, # rejected
-                    {"priority": 2}, # rejected
-                    {"priority": 1}, # rejected
-                ],                 
+                    {
+                        "priority": 7,
+                        "sampling_params": {"max_new_tokens": 10000},
+                    },  # starts being processed first and holds the running queue capacity
+                    {"priority": 6},  # second
+                    {"priority": 5},  # third
+                    {"priority": 4},  # fourth
+                    {"priority": 3},  # rejected
+                    {"priority": 2},  # rejected
+                    {"priority": 1},  # rejected
+                ],
             )
         )
 
@@ -137,7 +150,9 @@ class TestPriorityScheduling(CustomTestCase):
         ]
 
         e2e_latencies = []
-        _verify_genereate_responses(responses, expected_status_and_error_messages, e2e_latencies)
+        _verify_genereate_responses(
+            responses, expected_status_and_error_messages, e2e_latencies
+        )
         assert e2e_latencies[0] < e2e_latencies[1] < e2e_latencies[2] < e2e_latencies[3]
 
     def test_max_running_requests_and_max_queued_request_validation(self):
@@ -153,12 +168,17 @@ class TestPriorityScheduling(CustomTestCase):
                 if qr_match:
                     assert int(qr_match.group(1)) <= 3
 
-def _verify_genereate_responses(responses: Tuple[int, Any], expected_code_and_error_message: Tuple[int, Any], e2e_latencies: List[Optional[float]]):
+
+def _verify_genereate_responses(
+    responses: Tuple[int, Any],
+    expected_code_and_error_message: Tuple[int, Any],
+    e2e_latencies: List[Optional[float]],
+):
     """Verify generate response results are as expected based on status code and response json object content. In addition, collects e2e latency info."""
     for got, expected in zip(responses, expected_code_and_error_message):
         got_status, got_json = got
         expected_status, expected_err_msg = expected
-        
+
         # Check status code is as expected
         assert got_status == expected_status
 
@@ -166,12 +186,15 @@ def _verify_genereate_responses(responses: Tuple[int, Any], expected_code_and_er
         if got_status != 200:
             assert got_json["object"] == "error"
             assert got_json["message"] == expected_err_msg
-        else: 
+        else:
             assert "object" not in got_json
             assert "message" not in got_json
-        
-        # Collect e2e latencies for scheduling validaiton
-        e2e_latencies.append(got_json["meta_info"]["e2e_latency"] if got_status == 200 else None)
+
+        # Collect e2e latencies for scheduling validation
+        e2e_latencies.append(
+            got_json["meta_info"]["e2e_latency"] if got_status == 200 else None
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

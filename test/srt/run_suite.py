@@ -82,6 +82,7 @@ suites = {
         TestFile("test_no_overlap_scheduler.py", 234),
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
+        TestFile("test_priority_scheduling.py", 60),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
         TestFile("test_regex_constrained.py", 64),
