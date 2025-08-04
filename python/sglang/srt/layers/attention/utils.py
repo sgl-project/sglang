@@ -20,29 +20,29 @@ def create_flashinfer_kv_indices_triton(
 ):
     """
     Create KV indices for FlashInfer attention backend.
-    
+
     This Triton kernel builds a lookup table that maps from logical request/token
     coordinates to physical token locations in the global KV cache pool. It's used
     by FlashInfer attention backends to efficiently access scattered KV cache data.
-    
+
     The kernel processes each request in parallel and converts the req_to_token
     lookup table into a flat list of token indices that can be used by attention kernels.
-    
+
     general idea:
-        blocktables/kv_indices_ptr = [batch_size * max_pages(for graph mode with 
+        blocktables/kv_indices_ptr = [batch_size * max_pages(for graph mode with
                                                             fixed number of pages)]
         max_pages = max_context_len / PAGED_SIZE
         kv_indices_ptr will store the flat list of the pages used by each request
     Args:
-        Inputs Arguments (non mutable): 
+        Inputs Arguments (non mutable):
 
         req_to_token_ptr: Request to token location look up table
                          Shape: [max_batch, max_context_len]
         req_pool_indices_ptr: Request to pool index look up table. Each request uses
                              one pool.
                              Shape: [batch_size]
-        page_kernel_lens_ptr: sequence lengths per request 
-                             Shape: [batch_size] 
+        page_kernel_lens_ptr: sequence lengths per request
+                             Shape: [batch_size]
         kv_indptr: Should be computed based on number of pages used by each request.
                    It is used by flashinfer attention kernels to index into the kv_indices_ptr.
                    per request.
@@ -50,7 +50,7 @@ def create_flashinfer_kv_indices_triton(
                   kv_indptr[i] = start index in kv_indices for request i
         kv_start_idx: Pointer to array containing start offsets for each request in SGL.
                      Can be None. If provided, adds offset to token positions.
-        
+
         req_to_token_ptr_stride: Stride for the second dimension of req_to_token.
                                 Equal to max_context_len.
 
@@ -58,7 +58,7 @@ def create_flashinfer_kv_indices_triton(
 
         Outputs:
         kv_indices_ptr: Pointer to output array where KV indices will be stored.
-                    Shape:[total-num-pages], 
+                    Shape:[total-num-pages],
                     where total_num_pages = sum(seq_lens // PAGED_SIZE)
 
     Example:
@@ -101,20 +101,24 @@ def create_flashinfer_kv_indices_triton(
         kv_start = tl.load(kv_start_idx + pid).to(tl.int32)
         kv_end = kv_start
     kv_end += tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
-    
+
     kv_range = kv_end - kv_start
     num_pages = tl.cdiv(kv_range, PAGE_SIZE)
     num_pages_loop = tl.cdiv(kv_range, BLOCK_SIZE)
-    base_ptr = req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + kv_start 
+    base_ptr = req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + kv_start
     for i in range(num_pages_loop):
         page_offsets_int64 = (
             tl.arange(0, NUM_PAGES_PER_BLOCK).to(tl.int64) + i * NUM_PAGES_PER_BLOCK
-            ) * PAGE_SIZE
+        ) * PAGE_SIZE
         out_page_offsets = tl.arange(0, NUM_PAGES_PER_BLOCK) + i * NUM_PAGES_PER_BLOCK
         mask_page_range = page_offsets_int64 < (kv_range)
-        mask_out = out_page_offsets < num_pages 
+        mask_out = out_page_offsets < num_pages
         data = tl.load(base_ptr + page_offsets_int64, mask=mask_page_range)
-        tl.store(kv_indices_ptr + kv_indices_offset + out_page_offsets, data // PAGE_SIZE, mask=mask_out)
+        tl.store(
+            kv_indices_ptr + kv_indices_offset + out_page_offsets,
+            data // PAGE_SIZE,
+            mask=mask_out,
+        )
 
 
 @triton.jit

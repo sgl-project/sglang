@@ -18,6 +18,7 @@ import torch
 
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
+
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
 
@@ -76,7 +77,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.page_size = model_runner.page_size
         self.kv_cache_dim = (
-            model_runner.model_config.kv_lora_rank 
+            model_runner.model_config.kv_lora_rank
             + model_runner.model_config.qk_rope_head_dim
         )
         # Allocate buffers
@@ -141,8 +142,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.indices_updater_decode = FlashInferMLAIndicesUpdaterDecode(
             model_runner, self
         )
-    
-        
+
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata = {}
@@ -241,7 +241,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
-      
+
         if forward_mode.is_decode_or_idle():
             decode_wrapper = BatchMLAPagedAttentionWrapper(
                 self.workspace_buffer,
@@ -424,7 +424,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 q.dtype
             )
             k_buf = k_buf.view(-1, self.page_size, k_buf.shape[-1])
-            
+
             if q_rope is None:
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 q, q_rope = (
@@ -485,7 +485,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             q_nope = reshaped_q[:, :, : layer.v_head_dim]
             q_rope = reshaped_q[:, :, layer.v_head_dim :]
-        
+
         k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
             q.dtype
         )
@@ -561,8 +561,12 @@ class FlashInferMLAIndicesUpdaterDecode:
         kv_lens = paged_kernel_lens.to(torch.int32)
         sm_scale = self.scaling
         if spec_info is None:
-            num_pages_per_req = (paged_kernel_lens + self.page_size - 1) // self.page_size
-            kv_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=paged_kernel_lens.device)
+            num_pages_per_req = (
+                paged_kernel_lens + self.page_size - 1
+            ) // self.page_size
+            kv_indptr = torch.zeros(
+                (bs + 1,), dtype=torch.int32, device=paged_kernel_lens.device
+            )
             kv_indptr[1:] = torch.cumsum(num_pages_per_req, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = (
@@ -580,25 +584,25 @@ class FlashInferMLAIndicesUpdaterDecode:
                 self.req_to_token.shape[1],
                 self.page_size,
             )
-            
+
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
         if not init_metadata_replay:
-           wrapper.plan(
-               qo_indptr=q_indptr,
-               kv_indptr=kv_indptr,
-               kv_indices=kv_indices,
-               kv_len_arr=kv_lens,
-               num_heads=self.num_local_heads,
-               head_dim_ckv=self.kv_lora_rank,
-               head_dim_kpe=self.qk_rope_head_dim,
-               page_size=self.page_size,
-               causal=False,
-               sm_scale=sm_scale,
-               q_data_type=self.data_type,
-               kv_data_type=self.data_type,
-           )
+            wrapper.plan(
+                qo_indptr=q_indptr,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                kv_len_arr=kv_lens,
+                num_heads=self.num_local_heads,
+                head_dim_ckv=self.kv_lora_rank,
+                head_dim_kpe=self.qk_rope_head_dim,
+                page_size=self.page_size,
+                causal=False,
+                sm_scale=sm_scale,
+                q_data_type=self.data_type,
+                kv_data_type=self.data_type,
+            )
         else:
             wrapper.plan(
                 qo_indptr=fast_decode_kwargs["qo_indptr_cpu"],
@@ -637,7 +641,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
         self.page_size = model_runner.page_size
-    
+
     def update(
         self,
         req_pool_indices: torch.Tnesor,
@@ -687,9 +691,13 @@ class FlashInferMLAIndicesUpdaterPrefill:
 
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
-            num_pages_per_req = (paged_kernel_lens + self.page_size - 1) // self.page_size
-            kv_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=paged_kernel_lens.device)
-            kv_indptr[1:] = torch.cumsum(num_pages_per_req, dim=0)  
+            num_pages_per_req = (
+                paged_kernel_lens + self.page_size - 1
+            ) // self.page_size
+            kv_indptr = torch.zeros(
+                (bs + 1,), dtype=torch.int32, device=paged_kernel_lens.device
+            )
+            kv_indptr[1:] = torch.cumsum(num_pages_per_req, dim=0)
             kv_indices = torch.empty(
                 kv_indptr[-1],
                 dtype=torch.int32,
@@ -705,10 +713,10 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 self.req_to_token.size(1),
                 self.page_size,
             )
-           
+
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
-          
+
             custom_mask = None
         else:
             assert isinstance(spec_info, EagleDraftInput) or isinstance(

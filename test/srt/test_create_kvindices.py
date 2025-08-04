@@ -4,8 +4,10 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    create_flashinfer_kv_indices_triton,
+    create_flashmla_kv_indices_triton,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -18,11 +20,11 @@ class TestCreateKvIndices(CustomTestCase):
 
     def _run_test(self, batch, max_batch, max_context_len, page_size):
         np.random.seed(9)
-        PAGE_SIZE = page_size 
+        PAGE_SIZE = page_size
         req_to_token = torch.arange(
             max_batch * max_context_len, dtype=torch.int32, device="cuda"
         ).reshape((max_batch, max_context_len))
-        
+
         # the block table
         req_pool_indices = torch.tensor(
             torch.from_numpy(
@@ -31,7 +33,7 @@ class TestCreateKvIndices(CustomTestCase):
             dtype=torch.int32,
             device="cuda",
         )
-        seq_lens= torch.tensor(
+        seq_lens = torch.tensor(
             torch.from_numpy(
                 np.random.choice(range(max_context_len), size=batch, replace=False)
             ),
@@ -52,8 +54,10 @@ class TestCreateKvIndices(CustomTestCase):
             curr_req_pool = req_pool_indices_cpu[i]
             curr_num_pages = num_pages_per_req[i]
             curr_token_ids = req_to_token[curr_req_pool]
-            curr_pages  = (curr_token_ids[:num_toks_seq] // PAGE_SIZE).unique()
-            assert len(curr_pages) == curr_num_pages, f"req {i} has #{curr_num_pages} pages, but got {len(curr_pages)} pages"
+            curr_pages = (curr_token_ids[:num_toks_seq] // PAGE_SIZE).unique()
+            assert (
+                len(curr_pages) == curr_num_pages
+            ), f"req {i} has #{curr_num_pages} pages, but got {len(curr_pages)} pages"
             kv_indices_ref[kv_indptr_req : kv_indptr_req + curr_num_pages] = curr_pages
 
         # triton
@@ -69,8 +73,10 @@ class TestCreateKvIndices(CustomTestCase):
             PAGE_SIZE,
         )
         max_pages = max_context_len // PAGE_SIZE
-        kv_indices_flashmla = torch.empty(batch, max_pages, dtype=torch.int32, device="cuda")
-        
+        kv_indices_flashmla = torch.empty(
+            batch, max_pages, dtype=torch.int32, device="cuda"
+        )
+
         create_flashmla_kv_indices_triton[(batch,)](
             req_to_token,
             req_pool_indices,
@@ -78,8 +84,8 @@ class TestCreateKvIndices(CustomTestCase):
             None,
             kv_indices_flashmla,
             req_to_token.size(1),
-            max_pages,   
-            PAGE_SIZE
+            max_pages,
+            PAGE_SIZE,
         )
         # Check
         self.assertTrue(torch.equal(kv_indices_ref, kv_indices_triton))
@@ -89,7 +95,7 @@ class TestCreateKvIndices(CustomTestCase):
         MAX_BATCH = 4096
         MAX_CONTEXT_LEN = 4096
         PAGE_SIZE = [1, 2, 16, 64]
-        # for debug 
+        # for debug
         # BATCH = [4]
         # MAX_BATCH = 4
         # MAX_CONTEXT_LEN = 10
@@ -97,11 +103,13 @@ class TestCreateKvIndices(CustomTestCase):
         for page_size in PAGE_SIZE[:1]:
             print(f"Running test for page size: {page_size} and batch size: {BATCH[0]}")
             self._run_test(BATCH[0], MAX_BATCH, MAX_CONTEXT_LEN, page_size)
-        
+
         # Test for larger batch size
         for batch in BATCH[1:]:
             for page_size in PAGE_SIZE:
-                print(f"Running test for batch size: {batch} and page size: {page_size}")
+                print(
+                    f"Running test for batch size: {batch} and page size: {page_size}"
+                )
                 self._run_test(batch, MAX_BATCH, MAX_CONTEXT_LEN, page_size)
 
 
