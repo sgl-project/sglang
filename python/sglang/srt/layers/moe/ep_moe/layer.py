@@ -39,6 +39,7 @@ from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip,
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         DeepEPLLOutput,
+        AscendDeepEPLLOutput
         DeepEPNormalOutput,
         DispatchOutput,
     )
@@ -103,40 +104,7 @@ class EPMoE(FusedMoE):
 
         self.intermediate_size = intermediate_size
 
-        # TODO(ch-wan): move quant preparation to FusedMoE
-        if quant_config is None:
-            self.quant_method: Optional[QuantizeMethodBase] = (
-                UnquantizedFusedMoEMethod()
-            )
-            self.use_fp8_w8a8 = False
-            self.use_block_quant = False
-            self.block_shape = None
-            self.activation_scheme = None
-            self.w13_input_scale = None
-            self.w2_input_scale = None
-            self.w13_weight_scale = None
-            self.w2_weight_scale = None
-        elif _is_npu and isinstance(quant_config, W8A8Int8Config):
-            self.quant_method: Optional[QuantizeMethodBase] = NPU_W8A8EPMoEMethod(
-                quant_config
-            )
-            self.use_block_quant = False
-            params_dtype = torch.int8
-        elif isinstance(quant_config, W4AFp8Config):
-            self.quant_method: Optional[QuantizeMethodBase] = W4AFp8MoEMethod(
-                quant_config
-            )
-            self.use_fp8_w8a8 = False
-            self.use_block_quant = False
-            self.fp8_dtype = torch.float8_e4m3fn
-            self.w13_input_scale = None
-            self.w2_input_scale = None
-            self.w13_weight_scale = None
-            self.w2_weight_scale = None
-            self.activation_scheme = quant_config.moe_activation_scheme
-        elif isinstance(quant_config, Fp8Config):
-            self.quant_method: Optional[QuantizeMethodBase] = Fp8MoEMethod(quant_config)
-            self.use_fp8_w8a8 = True
+        if isinstance(quant_config, Fp8Config):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.block_shape = (
                 self.quant_method.quant_config.weight_block_size
@@ -391,7 +359,7 @@ class DeepEPMoE(EPMoE):
             )
             # the last one is invalid rank_id
             self.expert_mask[:-1] = 1
-        else:
+        elif not _is_npu:
             self.w13_weight_fp8 = (
                 self.w13_weight,
                 (
@@ -446,6 +414,8 @@ class DeepEPMoE(EPMoE):
         if _use_aiter:
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
             return self.forward_aiter(dispatch_output)
+        if _is_npu:
+            return self.forward_npu(dispatch_output)
         if dispatch_output.format.is_deepep_normal():
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_contiguous(dispatch_output)
@@ -710,6 +680,59 @@ class DeepEPMoE(EPMoE):
 
         return down_output
 
+    def forward_npu(
+        self,
+        dispatch_output: DeepEPLLOutput,
+    ):
+        if TYPE_CHECKING:
+            assert isinstance(dispatch_output, AscendDeepEPLLOutput)
+        hidden_states, topk_idx, topk_weights, _, seg_indptr, _ = dispatch_output
+        assert self.quant_method is not None
+        assert self.activation == "silu"
+
+        # NOTE: Ascend's Dispatch & Combine does not support FP16
+        output_dtype = torch.bfloat16
+
+        pertoken_scale = hidden_states[1]
+        hidden_states = hidden_states[0]
+
+        group_list_type = 1
+        seg_indptr = seg_indptr.to(torch.int64)
+
+        import torch_npu
+
+        # gmm1: gate_up_proj
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[self.w13_weight],
+            scale=[self.w13_weight_scale.to(output_dtype)],
+            per_token_scale=[pertoken_scale],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=seg_indptr,
+            output_dtype=output_dtype,
+        )[0]
+
+        # act_fn: swiglu
+        hidden_states = torch_npu.npu_swiglu(hidden_states)
+
+        hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
+
+        # gmm2: down_proj
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[self.w2_weight],
+            scale=[self.w2_weight_scale.to(output_dtype)],
+            per_token_scale=[swiglu_out_scale],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=seg_indptr,
+            output_dtype=output_dtype,
+        )[0]
+
+        return hidden_states
 
 class FlashInferEPMoE(EPMoE):
     def __init__(self, *args, **kwargs):
@@ -769,186 +792,6 @@ class FlashInferEPMoE(EPMoE):
             routing_method_type=2,  # DeepSeek-styled routing method
             use_shuffled_weight=False,
         )
-
-
-class AscendDeepEPMoE(EPMoE):
-    """
-    Extend DeepEPMoE with Ascend-specific features
-    """
-
-    _has_printed = False
-
-    def __init__(
-        self,
-        num_experts: int,
-        top_k: int,
-        hidden_size: int,
-        intermediate_size: int,
-        layer_id: int,
-        num_fused_shared_experts: int = 0,
-        params_dtype: Optional[torch.dtype] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        tp_size: Optional[int] = None,
-        prefix: str = "",
-        activation: str = "silu",
-        routed_scaling_factor: Optional[float] = None,
-        deepep_mode: DeepEPMode = DeepEPMode.auto,
-    ):
-        super().__init__(
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            layer_id=layer_id,
-            num_fused_shared_experts=num_fused_shared_experts,
-            params_dtype=params_dtype,
-            quant_config=quant_config,
-            tp_size=tp_size,
-            prefix=prefix,
-            activation=activation,
-            routed_scaling_factor=routed_scaling_factor,
-        )
-        self.deepep_mode = deepep_mode
-
-        self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
-            group=get_tp_group().device_group,
-            router_topk=self.top_k,
-            permute_fusion=True,
-            num_experts=self.num_experts,
-            num_local_experts=self.num_local_experts,
-            hidden_size=hidden_size,
-            params_dtype=params_dtype,
-            deepep_mode=deepep_mode,
-            async_finish=True,
-            return_recv_hook=True,
-        )
-
-    def _weight_loader_impl(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-    ) -> None:
-        if shard_id not in ("w1", "w2", "w3"):
-            raise ValueError(
-                f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
-            )
-
-        # Special case for w8a8 scales.
-        if "scale" in weight_name or "offset" in weight_name:
-            self._load_w8a8_scale(
-                param,
-                loaded_weight,
-                weight_name,
-                shard_id,
-                expert_id,
-            )
-            return
-
-        if shard_id == "w2":
-            param.data[expert_id] = loaded_weight
-        elif shard_id == "w1":
-            param.data[expert_id][: self.intermediate_size, :] = loaded_weight
-        elif shard_id == "w3":
-            param.data[expert_id][self.intermediate_size :, :] = loaded_weight
-        else:
-            raise ValueError(f"Expected shard_id w1,w2 or w3 but got {shard_id}")
-
-    def _load_w8a8_scale(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-    ) -> None:
-        expert_data = param.data[expert_id]
-        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
-        shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
-        if shard_id == "w2":
-            expert_data.copy_(loaded_weight)
-        elif shard_id in ("w1", "w3"):
-            # Index the loaded weight for tp sharding.
-            # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
-            shard_size = expert_data.shape[shard_dim] // 2
-
-            if shard_id == "w1":
-                expert_data = expert_data.narrow(shard_dim, 0, shard_size)
-            # w3, up_proj: Load into second logical weight of w13.
-            else:
-                assert shard_id == "w3"
-                expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
-            expert_data.copy_(loaded_weight)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        assert self.quant_method is not None
-        assert self.activation == "silu"
-
-        hidden_states, topk_idx, topk_weights, _, seg_indptr, _ = (
-            self.deepep_dispatcher.dispatch(
-                hidden_states=hidden_states,
-                topk_idx=topk_idx,
-                topk_weights=topk_weights,
-                forward_batch=forward_batch,
-            )
-        )
-        output_dtype = torch.bfloat16
-
-        pertoken_scale = hidden_states[1]
-        hidden_states = hidden_states[0]
-
-        group_list_type = 1
-        seg_indptr = seg_indptr.to(torch.int64)
-
-        import torch_npu
-
-        # gmm1: gate_up_proj
-        hidden_states = torch_npu.npu_grouped_matmul(
-            x=[hidden_states],
-            weight=[self.w13_weight],
-            scale=[self.w13_weight_scale.to(output_dtype)],
-            per_token_scale=[pertoken_scale],
-            split_item=2,
-            group_list_type=group_list_type,
-            group_type=0,
-            group_list=seg_indptr,
-            output_dtype=output_dtype,
-        )[0]
-
-        # act_fn: swiglu
-        hidden_states = torch_npu.npu_swiglu(hidden_states)
-
-        hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
-
-        # gmm2: down_proj
-        hidden_states = torch_npu.npu_grouped_matmul(
-            x=[hidden_states],
-            weight=[self.w2_weight],
-            scale=[self.w2_weight_scale.to(output_dtype)],
-            per_token_scale=[swiglu_out_scale],
-            split_item=2,
-            group_list_type=group_list_type,
-            group_type=0,
-            group_list=seg_indptr,
-            output_dtype=output_dtype,
-        )[0]
-
-        hidden_states = self.deepep_dispatcher.combine(
-            hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            forward_batch=forward_batch,
-        )
-
-        return hidden_states
 
 
 def get_moe_impl_class():
