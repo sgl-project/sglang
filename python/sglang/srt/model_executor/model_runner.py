@@ -393,6 +393,7 @@ class ModelRunner:
 
             if not self.use_mla_backend:
                 # MHA architecture
+                # todo(Yingyi): update auto with trtllm_mha?
                 if (
                     is_hopper_with_cuda_12_3()
                     and is_no_spec_infer_or_topk_one(server_args)
@@ -404,6 +405,8 @@ class ModelRunner:
                     server_args.attention_backend = "aiter"
                 elif _is_npu:
                     server_args.attention_backend = "ascend"
+                elif is_sm100_supported():
+                    server_args.attention_backend = "trtllm_mha"
                 else:
                     server_args.attention_backend = (
                         "flashinfer" if is_flashinfer_available() else "triton"
@@ -1372,7 +1375,8 @@ class ModelRunner:
         return attn_backend
 
     def _get_attention_backend_from_str(self, backend_str: str):
-        if backend_str == "flashinfer":
+        if backend_str == "flashinfer" or backend_str == "trtllm_mha":
+            # import flashinfer MHA implementation with auto or trtllm_mha backend
             if not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (
                     FlashInferAttnBackend,
@@ -1385,7 +1389,9 @@ class ModelRunner:
                         or not self.plan_stream_for_flashinfer
                     ):
                         self.plan_stream_for_flashinfer = torch.cuda.Stream()
-                return FlashInferAttnBackend(self)
+                return FlashInferAttnBackend(
+                    self, is_trtllm_mha=backend_str == "trtllm_mha"
+                )
             else:
                 from sglang.srt.layers.attention.flashinfer_mla_backend import (
                     FlashInferMLAAttnBackend,

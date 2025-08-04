@@ -76,8 +76,10 @@ class FlashInferAttnBackend(AttentionBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
+        is_trtllm_mha: bool = False,
     ):
         super().__init__()
+        self.is_trtllm_mha = is_trtllm_mha
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
@@ -170,7 +172,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        backend="fa2",
+                        backend="trtllm-gen" if self.is_trtllm_mha else "fa2",
                     )
                 )
                 self.prefill_wrappers_verify.append(
@@ -184,6 +186,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     self.workspace_buffer,
                     "NHD",
                     use_tensor_cores=self.decode_use_tensor_cores,
+                    backend="trtllm-gen" if self.is_trtllm_mha else "auto",
                 )
             )
 
@@ -321,6 +324,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         paged_kv_last_page_len_buffer=self.kv_last_page_len[
                             :num_tokens
                         ],
+                        backend="trtllm-gen" if self.is_trtllm_mha else "auto",
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
@@ -352,6 +356,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
                         custom_mask_buf=self.cuda_graph_custom_mask,
                         mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
+                        backend="trtllm-gen" if self.is_trtllm_mha else "auto",
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
@@ -374,12 +379,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        backend="fa2",
                         use_cuda_graph=True,
                         qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
                         paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
                         paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
                         paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                        backend="trtllm-gen" if self.is_trtllm_mha else "fa2",
                     )
                 )
 
@@ -594,6 +599,7 @@ class FlashInferIndicesUpdaterDecode:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.page_size = model_runner.page_size
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -763,7 +769,7 @@ class FlashInferIndicesUpdaterDecode:
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
-            1,
+            self.page_size,
             data_type=self.data_type,
             q_data_type=self.q_data_type,
             non_blocking=True,
@@ -784,6 +790,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.page_size = model_runner.page_size
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -1012,7 +1019,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
-            1,
+            self.page_size,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
             custom_mask=custom_mask,
