@@ -1320,7 +1320,7 @@ class ModelRunner:
                 # Init streams
                 if self.server_args.speculative_algorithm == "EAGLE":
                     self.plan_stream_for_flashinfer = torch.cuda.Stream()
-                return FlashInferAttnBackend(self)
+                return FlashInferAttnBackend(self, enable_attention_sink=True if hasattr(self.model.model.layers[0].self_attn, "sinks") else False)
             else:
                 from sglang.srt.layers.attention.flashinfer_mla_backend import (
                     FlashInferMLAAttnBackend,

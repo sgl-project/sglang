@@ -155,7 +155,7 @@ class FlashInferAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
         # todo: set it as false and pass it as a parameter
-        enable_attention_sink: bool = True,
+        enable_attention_sink: bool = False,
     ):
         super().__init__()
 
