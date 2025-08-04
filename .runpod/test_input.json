@@ -1,0 +1,11 @@
+{
+  "input": {
+    "openai_route": "/v1/chat/completions",
+    "openai_input": {
+      "model": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+      "messages": [
+        { "role": "user", "content": "What is the capital of France?" }
+      ]
+    }
+  }
+}

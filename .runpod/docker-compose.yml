@@ -1,0 +1,34 @@
+services:
+  sglang-worker:
+    image: runpod/worker-sglang:dev
+    pull_policy: never
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    environment:
+      - HOST=0.0.0.0
+      - PORT=30000
+      - MODEL_PATH=HuggingFaceTB/SmolLM2-1.7B-Instruct
+      - TRUST_REMOTE_CODE=true
+      - ATTENTION_BACKEND=flashinfer
+      - SAMPLING_BACKEND=flashinfer
+
+      # make it work locally with <= 8 GB VRAM
+      - MEM_FRACTION_STATIC=0.5
+      - CHUNKED_PREFILL_SIZE=512
+      - MAX_PREFILL_TOKENS=2048
+      - MAX_TOTAL_TOKENS=2048
+      - DISABLE_CUDA_GRAPH=true
+      - CONTEXT_LENGTH=2048
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      - ../var/runpod-volume:/runpod-volume
