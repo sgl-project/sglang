@@ -230,7 +230,7 @@ void tinygemm_kernel(
 
     // apply compensation and scale
     for (int64_t m = 0; m < M; ++m) {
-      scale_C<scalar_t, has_bias, 32>::apply(C + m * ldc, Ctmp + m * BLOCK_N, Bcomp, bias, As[m], Bs);
+      scale_C<scalar_t, has_bias, BLOCK_N>::apply(C + m * ldc, Ctmp + m * BLOCK_N, Bcomp, bias, As[m], Bs);
     }
     return;
   }
