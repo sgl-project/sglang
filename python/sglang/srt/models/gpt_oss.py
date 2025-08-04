@@ -516,7 +516,7 @@ class GptOssMoeAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         # default sink dtype is bfloat16
-        self.sinks = nn.Parameter(torch.empty(self.num_heads, dtype=torch.bfloat16))
+        self.sinks = nn.Parameter(torch.empty(self.num_heads, dtype=torch.float32))
 
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -1072,8 +1072,6 @@ class GptOssForCausalLM(nn.Module):
                             start_idx : start_idx + shard_size
                         ]
                         default_weight_loader(param, loaded_weight)
-                        if global_server_args_dict["attention_backend"] == "flashinfer":
-                            param.data = param.data.exp_().to(torch.float32)
                     continue
 
                 # Handle batch expert weights (simplified approach)
