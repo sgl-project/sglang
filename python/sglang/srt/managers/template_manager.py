@@ -120,7 +120,8 @@ class TemplateManager:
                 hf_template = self._resolve_hf_chat_template(tokenizer_manager)
                 if hf_template:
                     # override the chat template
-                    tokenizer_manager.tokenizer.chat_template = hf_template
+                    if tokenizer_manager.tokenizer:
+                        tokenizer_manager.tokenizer.chat_template = hf_template
                     self._jinja_template_content_format = (
                         detect_jinja_template_content_format(hf_template)
                     )
@@ -134,9 +135,10 @@ class TemplateManager:
             logger.info("No chat template found, defaulting to 'string' content format")
 
         # Detect reasoning pattern from chat template
-        self._force_reasoning = self._detect_reasoning_pattern(
-            tokenizer_manager.tokenizer.chat_template
-        )
+        if tokenizer_manager.tokenizer:
+            self._force_reasoning = self._detect_reasoning_pattern(
+                tokenizer_manager.tokenizer.chat_template
+            )
 
     def _load_explicit_chat_template(
         self, tokenizer_manager, chat_template_arg: str
