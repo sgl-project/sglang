@@ -7,6 +7,7 @@ import subprocess
 import sys
 import unittest
 from types import SimpleNamespace
+from typing import Optional
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -47,7 +48,7 @@ class TestVLMModels(CustomTestCase):
         model_version: str,
         output_path: str,
         *,
-        env: dict | None = None,
+        env: Optional[dict] = None,
     ):
         """
         Evaluate a VLM on the MMMU validation set with lmms‑eval.
