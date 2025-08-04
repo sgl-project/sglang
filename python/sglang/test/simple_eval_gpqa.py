@@ -103,31 +103,14 @@ class GPQAEval(Eval):
                 r"(?i)option is \*\*[^a-zA-Z]*\$?([A-D])\$?",
                 r"(?i)correct option is \*\*[^a-zA-Z]*\$?([A-D])\$?",
                 r"(?i)closest option is \*\*\([^a-zA-Z]*\$?([A-D])\)\$?",
-                # # Simple header
-                # r"Answer[ \t]*:[ \t]*(?:Option)?[ \t]*\(?([A-D])\)?",
-                # # Common short patterns
-                # r"is:[ \t]*([A-D])",
-                # r"be[ \t]*\*\*([A-D])\*\*",
-                # # Wordy preamble
-                # r"(?:correct|closest|best) (?:answer|option|choice) (?:is|is:|is simply)\s*\(?([A-D])\)?",
-                # # Latex
-                # r"\\boxed{([A-D])}",
-                # r"\\text{(?:Option )?([A-D])}",
-                # # Bolded option
-                # r"\*\*Option ([A-D])\*\*",
             ]
             extracted_answer = None
             for pattern in pattern_list:
                 match = re.findall(pattern, response_text, re.IGNORECASE)
                 if match:
-                    extracted_answer = match[-1] # .upper()
+                    extracted_answer = match[-1]
                     break
-            score = (
-                1.0
-                if extracted_answer
-                and extracted_answer.upper() == correct_answer.upper()
-                else 0.0
-            )
+            score = 1.0 if extracted_answer == correct_answer else 0.0
             html = common.jinja_env.from_string(HTML_JINJA).render(
                 prompt_messages=actual_queried_prompt_messages,
                 next_message=dict(content=response_text, role="assistant"),

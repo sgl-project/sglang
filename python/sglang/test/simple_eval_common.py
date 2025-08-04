@@ -188,28 +188,28 @@ class ChatCompletionSampler(SamplerBase):
             # unknown error shall throw exception
 
 
-# QUERY_TEMPLATE_MULTICHOICE = """
-# Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD. Think step by step before answering.
+QUERY_TEMPLATE_MULTICHOICE = """
+Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD. Think step by step before answering.
 
-# {Question}
+{Question}
 
-# A) {A}
-# B) {B}
-# C) {C}
-# D) {D}
-# """.strip()
+A) {A}
+B) {B}
+C) {C}
+D) {D}
+""".strip()
 
-QUERY_TEMPLATE_MULTICHOICE = """{Question}
+# QUERY_TEMPLATE_MULTICHOICE = """{Question}
 
-(A) {A}
-(B) {B}
-(C) {C}
-(D) {D}
+# (A) {A}
+# (B) {B}
+# (C) {C}
+# (D) {D}
 
-Express your final answer as the corresponding option 'A', 'B', 'C', or 'D'.""".strip()
+# Express your final answer as the corresponding option 'A', 'B', 'C', or 'D'.""".strip()
 
-# ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer\s*:\s*([A-D])"
-ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer[ \t]*:[^a-zA-Z]*\$?([A-D])\$?"
+ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer\s*:\s*([A-D])"
+# ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer[ \t]*:[^a-zA-Z]*\$?([A-D])\$?"
 ANSWER_PATTERN = r"(?i)Answer\s*:\s*([^\n]+)"
 
 
