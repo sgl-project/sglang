@@ -750,6 +750,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 " above."
             )
         self.enable_flashinfer_trtllm_moe = _use_flashinfer_trtllm_moe()
+    
+    @property
+    def enable_flashinfer_cutlass_moe(self) -> bool:
+        """Access the global enable_flashinfer_cutlass_moe setting."""
+        return global_server_args_dict.get("enable_flashinfer_cutlass_moe", False)   
+
 
     def create_weights(
         self,
@@ -1072,19 +1078,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_blockscale_swizzled = self.swizzle_blockscale(layer.w13_weight_scale)
             layer.w13_blockscale_swizzled = Parameter(w13_blockscale_swizzled, requires_grad=False)
             layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
-            print("Applied weight processing for w13 (CUTLASS path)")
             
             # Process w2 weights  
             w2_blockscale_swizzled = self.swizzle_blockscale(layer.w2_weight_scale)
             layer.w2_blockscale_swizzled = Parameter(w2_blockscale_swizzled, requires_grad=False)
             layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
             
-            if (self.enable_flashinfer_cutlass_moe and 
-                shuffle_matrix_a is not None and 
-                shuffle_matrix_sf_a is not None):
-                print("Applied weight processing for w2")
-            else:
-                print("Applied weight processing for w2")
+            # Both flashinfer cutlass and regular cutlass use same processing for w2
+            print("Applied weight processing for both w13 and w2")
             
             # Set up CUTLASS MoE parameters
             device = layer.w13_weight.device
@@ -1130,7 +1131,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ), "apply_router_weight_on_input is not supported for Flashinfer"
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
-            topk_weights, topk_ids, _ = topk_output
+            
+            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
             
             output = flashinfer_cutlass_fused_moe(
                 x,
@@ -1159,7 +1161,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 
-        topk_weights, topk_ids, _ = topk_output
+        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         output = cutlass_moe_fp4(
             a=x,
             a1_gscale=layer.w13_input_scale_quant,

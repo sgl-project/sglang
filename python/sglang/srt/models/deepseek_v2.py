@@ -311,7 +311,7 @@ class DeepseekV2MoE(nn.Module):
         # Normal mode includes fused shared experts in top_k calculation
         topk_value = (
             config.num_experts_per_tok 
-            if use_flashinfer_trtllm_moe 
+            if should_use_flashinfer_trtllm_moe 
             else config.num_experts_per_tok + self.num_fused_shared_experts
         )
         
@@ -481,9 +481,9 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states)
             kwargs = {"hidden_states": hidden_states}
             
-            # CUTLASS path: unchanged behavior - process router_logits through TopK
-            # TRTLLM path: pass (topk_config, router_logits) tuple for internal processing
-            if use_flashinfer_trtllm_moe:
+            # FlashInferFP4MoE (TRTLLM path) expects (TopK, router_logits) tuple
+            # Regular FusedMoE (CUTLASS path) expects StandardTopKOutput  
+            if should_use_flashinfer_trtllm_moe():
                 kwargs["topk_output"] = (self.topk, router_logits)
             else:
                 kwargs["topk_output"] = self.topk(hidden_states, router_logits)
@@ -514,9 +514,9 @@ class DeepseekV2MoE(nn.Module):
         router_logits = self.gate(hidden_states)
         kwargs = {"hidden_states": hidden_states}
         
-        # CUTLASS path: unchanged behavior - process router_logits through TopK
-        # TRTLLM path: pass (topk_config, router_logits) tuple for internal processing
-        if use_flashinfer_trtllm_moe:
+        # FlashInferFP4MoE (TRTLLM path) expects (TopK, router_logits) tuple
+        # Regular FusedMoE (CUTLASS path) expects StandardTopKOutput  
+        if should_use_flashinfer_trtllm_moe():
             kwargs["topk_output"] = (self.topk, router_logits)
         else:
             kwargs["topk_output"] = self.topk(hidden_states, router_logits)

@@ -64,11 +64,15 @@ logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=1)
 def should_use_flashinfer_trtllm_moe():
-    return global_server_args_dict["enable_flashinfer_trtllm_moe"] and (
+    enable_trtllm = global_server_args_dict["enable_flashinfer_trtllm_moe"]
+    enable_cutlass = global_server_args_dict.get("enable_flashinfer_cutlass_moe", False)
+    
+    result = enable_trtllm and (
         not importlib.util.find_spec("flashinfer")
         or pkg_version.parse(__import__("flashinfer").__version__)
         >= pkg_version.parse("0.2.9rc1")
     )
+    return result
 
 def _is_fp4_quantization_enabled():
     """Check if ModelOpt FP4 quantization is enabled."""
@@ -198,10 +202,6 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix)
-            if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod":
-                self.quant_method.enable_flashinfer_cutlass_moe = (
-                    self.enable_flashinfer_cutlass_moe
-                )
         assert self.quant_method is not None
 
         self.quant_config = quant_config
