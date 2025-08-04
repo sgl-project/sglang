@@ -556,7 +556,7 @@ class TokenizerManager:
         if self.server_args.enable_lora and obj.lora_path:
             # Start tracking ongoing requests for LoRA adapters and replace the user-friendly LoRA names in
             # `lora_path` with their corresponding unique LoRA IDs, as required for internal processing.
-            obj.lora_path = await self.lora_registry.acquire(obj.lora_path)
+            obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
 
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
@@ -665,7 +665,7 @@ class TokenizerManager:
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
-                lora_path=obj.lora_path,
+                lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
@@ -773,7 +773,7 @@ class TokenizerManager:
 
                 # Mark ongoing LoRA request as finished.
                 if self.server_args.enable_lora and obj.lora_path:
-                    await self.lora_registry.release(obj.lora_path)
+                    await self.lora_registry.release(obj.lora_id)
 
                 # Check if this was an abort/error created by scheduler
                 if isinstance(out["meta_info"].get("finish_reason"), dict):

@@ -1090,7 +1090,7 @@ class Scheduler(
                 top_logprobs_num=recv_req.top_logprobs_num,
                 token_ids_logprob=recv_req.token_ids_logprob,
                 stream=recv_req.stream,
-                lora_path=recv_req.lora_path,
+                lora_id=recv_req.lora_id,
                 input_embeds=recv_req.input_embeds,
                 custom_logit_processor=recv_req.custom_logit_processor,
                 return_hidden_states=recv_req.return_hidden_states,
@@ -1534,7 +1534,7 @@ class Scheduler(
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
-            lora_set = set([req.lora_path for req in self.running_batch.reqs])
+            lora_set = set([req.lora_id for req in self.running_batch.reqs])
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -1542,8 +1542,8 @@ class Scheduler(
                 self.enable_lora
                 and len(
                     lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
+                    | set([req.lora_id for req in adder.can_run_list])
+                    | set([req.lora_id])
                 )
                 > self.max_loras_per_batch
             ):
