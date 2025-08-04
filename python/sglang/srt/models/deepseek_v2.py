@@ -211,9 +211,7 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(
-        self, x, forward_batch=None, should_fuse_allreduce_residual_rmsnorm=False
-    ):
+    def forward(self, x, forward_batch=None, should_allreduce_fusion=False):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
@@ -221,7 +219,7 @@ class DeepseekV2MLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x,
-            should_fuse_allreduce_residual_rmsnorm=should_fuse_allreduce_residual_rmsnorm,
+            should_allreduce_fusion=should_allreduce_fusion,
         )
         return x
 
@@ -452,7 +450,7 @@ class DeepseekV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        should_fuse_allreduce_residual_rmsnorm: bool = False,
+        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         if not self._enable_deepep_moe:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
@@ -462,19 +460,17 @@ class DeepseekV2MoE(nn.Module):
                 and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             ):
                 return self.forward_normal_dual_stream(
-                    hidden_states, should_fuse_allreduce_residual_rmsnorm
+                    hidden_states, should_allreduce_fusion
                 )
             else:
-                return self.forward_normal(
-                    hidden_states, should_fuse_allreduce_residual_rmsnorm
-                )
+                return self.forward_normal(hidden_states, should_allreduce_fusion)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
-        should_fuse_allreduce_residual_rmsnorm: bool = False,
+        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
 
         current_stream = torch.cuda.current_stream()
@@ -498,21 +494,19 @@ class DeepseekV2MoE(nn.Module):
         torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
         final_hidden_states = final_hidden_states_out
         sm.tag(final_hidden_states)
-        if self.tp_size > 1 and not should_fuse_allreduce_residual_rmsnorm:
+        if self.tp_size > 1 and not should_allreduce_fusion:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-        should_fuse_allreduce_residual_rmsnorm: bool = False,
+        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
-            return self.forward_cpu(
-                hidden_states, should_fuse_allreduce_residual_rmsnorm
-            )
+            return self.forward_cpu(hidden_states, should_allreduce_fusion)
 
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
@@ -532,14 +526,14 @@ class DeepseekV2MoE(nn.Module):
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
             final_hidden_states = final_hidden_states_out
             sm.tag(final_hidden_states)
-        if self.tp_size > 1 and not should_fuse_allreduce_residual_rmsnorm:
+        if self.tp_size > 1 and not should_allreduce_fusion:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_cpu(
         self,
         hidden_states: torch.Tensor,
-        should_fuse_allreduce_residual_rmsnorm: bool = False,
+        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
@@ -590,7 +584,7 @@ class DeepseekV2MoE(nn.Module):
             None,  # a2_scale
             True,  # is_vnni
         )
-        if self.tp_size > 1 and not should_fuse_allreduce_residual_rmsnorm:
+        if self.tp_size > 1 and not should_allreduce_fusion:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
@@ -1838,8 +1832,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
         )
 
-        self._should_fuse_allreduce_residual_rmsnorm_static = None
-        self._should_fuse_allreduce_residual_rmsnorm_cache = {}
+        self._fuse_allreduce_lookup_table = self._build_fuse_allreduce_lookup_table()
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
@@ -1851,50 +1844,16 @@ class DeepseekV2DecoderLayer(nn.Module):
     def _should_fuse_mlp_allreduce_with_next_layer(self, forward_batch) -> bool:
         """Check if MLP allreduce can be fused with next layer's add_rmsnorm"""
 
-        if self._should_fuse_allreduce_residual_rmsnorm_static is None:
-            if (
-                self.layer_id == self.config.num_hidden_layers - 1
-                or get_tensor_model_parallel_world_size() <= 1
-            ):
-                self._should_fuse_allreduce_residual_rmsnorm_static = False
-            elif not global_server_args_dict.get(
-                "enable_flashinfer_allreduce_fusion", False
-            ):
-                self._should_fuse_allreduce_residual_rmsnorm_static = False
-            elif not _is_sm100_supported or not _is_flashinfer_available:
-                self._should_fuse_allreduce_residual_rmsnorm_static = False
-            else:
-                self._should_fuse_allreduce_residual_rmsnorm_static = True
-
-        if not self._should_fuse_allreduce_residual_rmsnorm_static:
-            return False
-
         batch_size = (
             forward_batch.input_ids.shape[0]
             if hasattr(forward_batch, "input_ids")
             else 0
         )
-        is_last_layer = self.layer_id == self.config.num_hidden_layers - 1
-        cache_key = (is_last_layer, batch_size)
 
-        if cache_key in self._should_fuse_allreduce_residual_rmsnorm_cache:
-            return self._should_fuse_allreduce_residual_rmsnorm_cache[cache_key]
+        if batch_size > 128:
+            return False
 
-        if hasattr(forward_batch, "input_ids") and (
-            forward_batch.input_ids.shape[0] == 0
-            or forward_batch.input_ids.shape[0] > 128
-        ):
-            result = False
-        else:
-            result = True
-
-        self._should_fuse_allreduce_residual_rmsnorm_cache[cache_key] = result
-
-        if len(self._should_fuse_allreduce_residual_rmsnorm_cache) > 100:
-            oldest_key = next(iter(self._should_fuse_allreduce_residual_rmsnorm_cache))
-            del self._should_fuse_allreduce_residual_rmsnorm_cache[oldest_key]
-
-        return result
+        return self._fuse_allreduce_lookup_table.get(batch_size, False)
 
     def forward(
         self,
@@ -1920,38 +1879,18 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        batch_size = (
-            forward_batch.input_ids.shape[0]
-            if hasattr(forward_batch, "input_ids")
-            else 0
-        )
-        is_last_layer = self.layer_id == self.config.num_hidden_layers - 1
-        cache_key = (is_last_layer, batch_size)
-
-        if cache_key in self._should_fuse_allreduce_residual_rmsnorm_cache:
-            should_fuse_allreduce_residual_rmsnorm = (
-                self._should_fuse_allreduce_residual_rmsnorm_cache[cache_key]
-            )
-        else:
-            should_fuse_allreduce_residual_rmsnorm = (
-                self._should_fuse_mlp_allreduce_with_next_layer(forward_batch)
-                and not (
-                    self.enable_dp_attention and self.speculative_algorithm.is_eagle()
-                )
-                and not self.is_nextn
-            )
-            self._should_fuse_allreduce_residual_rmsnorm_cache[cache_key] = (
-                should_fuse_allreduce_residual_rmsnorm
-            )
-
-        hidden_states = self.mlp(
-            hidden_states, forward_batch, should_fuse_allreduce_residual_rmsnorm
+        should_allreduce_fusion = (
+            self._should_fuse_mlp_allreduce_with_next_layer(forward_batch)
+            and not (self.enable_dp_attention and self.speculative_algorithm.is_eagle())
+            and not self.is_nextn
         )
 
-        if should_fuse_allreduce_residual_rmsnorm:
+        hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
+
+        if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
 
-        if not should_fuse_allreduce_residual_rmsnorm:
+        if not should_allreduce_fusion:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
@@ -2027,6 +1966,26 @@ class DeepseekV2DecoderLayer(nn.Module):
             }
         )
         return output
+
+    def _build_fuse_allreduce_lookup_table(self):
+        static_conditions_met = (
+            self.layer_id != self.config.num_hidden_layers - 1
+            and get_tensor_model_parallel_world_size() > 1
+            and global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False)
+            and _is_sm100_supported
+            and _is_flashinfer_available
+        )
+
+        if not static_conditions_met:
+            return {}
+
+        lookup_table = {}
+        for batch_size in range(129):  # 0 to 128
+            is_last_layer = self.layer_id == self.config.num_hidden_layers - 1
+            should_fuse = batch_size > 0 and batch_size <= 128 and not is_last_layer
+            lookup_table[batch_size] = should_fuse
+
+        return lookup_table
 
 
 class DeepseekV2Model(nn.Module):
