@@ -616,8 +616,7 @@ class Scheduler(
                     ),
                     hicache_mem_layout=server_args.hicache_mem_layout,
                     hicache_storage_backend=server_args.hicache_storage_backend,
-                    historage_prefetch_start_policy=server_args.historage_prefetch_start_policy,
-                    historage_prefetch_stop_policy=server_args.historage_prefetch_stop_policy,
+                    historage_prefetch_policy=server_args.historage_prefetch_policy,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter

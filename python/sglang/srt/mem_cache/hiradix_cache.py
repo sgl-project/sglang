@@ -38,8 +38,7 @@ class HiRadixCache(RadixCache):
         hicache_io_backend: str,
         hicache_mem_layout: str,
         hicache_storage_backend: Optional[str] = None,
-        historage_prefetch_start_policy: Optional[str] = "immediate",
-        historage_prefetch_stop_policy: Optional[str] = "best_effort",
+        historage_prefetch_policy: Optional[str] = "best_effort",
     ):
 
         if hicache_io_backend == "direct":
@@ -88,7 +87,6 @@ class HiRadixCache(RadixCache):
             prefetch_threshold=self.prefetch_threshold,
         )
 
-        self.prefetch_start_policy = historage_prefetch_start_policy
         self.prefetch_throttle_queue = Queue()
         # todo: customizable storage prefetch tokens threshold
         self.prefetch_tokens_threshold = int(
@@ -96,12 +94,10 @@ class HiRadixCache(RadixCache):
         )
         self.prefetch_tokens_occupied = 0
 
-        self.prefetch_stop_policy = historage_prefetch_stop_policy
+        self.prefetch_stop_policy = historage_prefetch_policy
         # todo: customizable storage prefetch timeout
         self.prefetch_timeout = 3  # seconds
-        logger.info(
-            f"{historage_prefetch_start_policy=}, {historage_prefetch_stop_policy=}"
-        )
+        logger.info(f"{historage_prefetch_policy=}")
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
@@ -555,10 +551,7 @@ class HiRadixCache(RadixCache):
         )
 
     def can_start_prefetch(self):
-        if self.prefetch_start_policy == "immediate":
-            return True
-        elif self.prefetch_start_policy == "threshold_based":
-            return self.prefetch_tokens_occupied < self.prefetch_tokens_threshold
+        return self.prefetch_tokens_occupied < self.prefetch_tokens_threshold
 
     def prefetch_from_storage(
         self,

@@ -589,7 +589,7 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if self.is_mooncake_backend():
                     self.mooncake_page_transfer(operation)
-                elif isinstance(self.storage_backend, HiCacheHF3FS):
+                elif self.storage_backend_type == "hf3fs":
                     self.generic_page_transfer(operation, batch_size=128)
                 else:
                     self.generic_page_transfer(operation)
@@ -755,7 +755,7 @@ class HiCacheController:
 
                 if self.is_mooncake_backend():
                     self.mooncake_page_backup(operation)
-                elif isinstance(self.storage_backend, HiCacheHF3FS):
+                elif self.storage_backend_type == "hf3fs":
                     self.generic_page_backup(operation, batch_size=128)
                 else:
                     self.generic_page_backup(operation)
