@@ -85,6 +85,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager
 
+from sglang.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
 logger = logging.getLogger(__name__)
@@ -101,10 +102,15 @@ def is_hip() -> bool:
     return torch.version.hip is not None
 
 
+def is_use_aiter() -> bool:
+    return envs.SGLANG_USE_AITER.value and is_hip()
+
+
 if is_hip():
     FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
 else:
     FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+
 
 FP8_E4M3_MIN = -FP8_E4M3_MAX
 
@@ -226,14 +232,12 @@ def is_flashinfer_available():
     Check whether flashinfer is available.
     As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
     """
-    if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
+    if not envs.SGLANG_IS_FLASHINFER_AVAILABLE.value:
         return False
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
-_ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
-    "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
-)
+_ENABLE_TORCH_INFERENCE_MODE = envs.SGLANG_ENABLE_TORCH_INFERENCE_MODE.value
 
 
 class DynamicGradMode(_DecoratorContextManager):
@@ -979,7 +983,7 @@ def add_api_key_middleware(app, api_key: str):
 
 
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
-    if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+    if envs.SGLANG_USE_MODELSCOPE.value:
         if not os.path.exists(model_path):
             from modelscope import snapshot_download
 
@@ -1512,7 +1516,7 @@ def init_custom_process_group(
 
 def crash_on_warnings():
     # Crash on warning if we are running CI tests
-    return get_bool_env_var("SGLANG_IS_IN_CI")
+    return envs.SGLANG_IS_IN_CI.value
 
 
 def print_warning_once(msg: str) -> None:

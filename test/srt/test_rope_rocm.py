@@ -3,13 +3,12 @@ import unittest
 import torch
 
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import is_use_aiter
 from sglang.test.test_utils import CustomTestCase
 
 torch.manual_seed(0)
 
-_is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = is_use_aiter()
 
 
 _CASES = [

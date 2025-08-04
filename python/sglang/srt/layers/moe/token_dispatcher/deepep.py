@@ -2,16 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    List,
-    NamedTuple,
-    Optional,
-    Protocol,
-    Tuple,
-    Union,
-    runtime_checkable,
-)
+from typing import List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
@@ -23,7 +14,7 @@ from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, load_json_config
+from sglang.srt.utils import get_int_env_var, is_use_aiter, load_json_config
 
 try:
     from deep_ep import Buffer, Config
@@ -41,14 +32,10 @@ from enum import Enum, IntEnum, auto
 import torch
 import torch.distributed as dist
 
-from sglang.srt.layers.moe.ep_moe.kernels import (
-    deepep_permute_triton_kernel,
-    deepep_post_reorder_triton_kernel,
-    deepep_run_moe_deep_preprocess,
-)
+from sglang.srt.layers.moe.ep_moe.kernels import deepep_post_reorder_triton_kernel
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_use_aiter = is_use_aiter()
 
 logger = logging.getLogger(__name__)
 

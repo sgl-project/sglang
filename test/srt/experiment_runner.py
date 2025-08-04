@@ -8,8 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import psutil
 import requests
@@ -317,7 +316,8 @@ def format_results(results: List[TaskResult]) -> str:
     return "\n".join(output)
 
 
-def get_bool_env_var(name: str, default: str = "false") -> bool:
+# don't want to import sglang package here
+def _get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
     return value.lower() in ("true", "1")
 
@@ -354,8 +354,9 @@ def main():
             result = runner.run_task(config)
             results.append(result)
 
-        if get_bool_env_var("SGLANG_IS_IN_CI"):
+        if _get_bool_env_var("SGLANG_IS_IN_CI"):
             write_in_github_step_summary(results)
+
     except Exception as e:
         logger.error(f"Error: {e}")
         raise

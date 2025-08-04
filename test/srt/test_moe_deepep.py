@@ -93,7 +93,7 @@ class TestDPAttn(unittest.TestCase):
                 ),
             ],
             env={
-                "SGL_ENABLE_JIT_DEEPGEMM": "0",
+                "SGLANG_ENABLE_JIT_DEEPGEMM": "0",
                 **os.environ,
             },
         )

@@ -51,6 +51,7 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
+from sglang.environ import envs
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import (
@@ -935,7 +936,7 @@ class TokenizerManager:
         profile_by_stage: bool = False,
     ):
         self.auto_create_handle_loop()
-        env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
+        env_with_stack: bool = envs.SGLANG_PROFILE_WITH_STACK.value
         with_stack = False if with_stack is False or env_with_stack is False else True
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
@@ -1474,7 +1475,7 @@ class TokenizerManager:
                 self.dump_requests_before_crash()
                 break
 
-            elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
+            elif get_bool_env_var("SGLANG_FORCE_SHUTDOWN"):
                 # if force shutdown flag set, exit immediately
                 logger.error(
                     "Signal SIGTERM received while force shutdown flag set. Force exiting... remaining number of requests: %d",

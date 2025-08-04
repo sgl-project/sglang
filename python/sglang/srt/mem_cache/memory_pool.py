@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from sglang.environ import envs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 """
@@ -188,9 +189,7 @@ class MHATokenToKVPool(KVCache):
         self.head_dim = head_dim
 
         # for disagg with nvlink
-        self.enable_custom_mem_pool = get_bool_env_var(
-            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
-        )
+        self.enable_custom_mem_pool = envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.value
         if self.enable_custom_mem_pool:
             # TODO(shangming): abstract custom allocator class for more backends
             from mooncake.allocator import NVLinkAllocator
@@ -734,9 +733,7 @@ class MLATokenToKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
 
         # for disagg with nvlink
-        self.enable_custom_mem_pool = get_bool_env_var(
-            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
-        )
+        self.enable_custom_mem_pool = envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.value
         if self.enable_custom_mem_pool:
             # TODO(shangming): abstract custom allocator class for more backends
             from mooncake.allocator import NVLinkAllocator

@@ -16,7 +16,7 @@ def _compute_enable_deep_gemm():
         logger.warning("Failed to import deep_gemm, disable ENABLE_JIT_DEEPGEMM.")
         return False
 
-    return get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true")
+    return get_bool_env_var("SGLANG_ENABLE_JIT_DEEPGEMM", default="true")
 
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()

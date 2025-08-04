@@ -33,6 +33,7 @@ import torch
 import zmq
 from torch.distributed import barrier
 
+from sglang.environ import envs
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import (
@@ -161,8 +162,8 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
-TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
-GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
+TEST_RETRACT = envs.SGLANG_TEST_RETRACT.value
+GRAMMAR_TIMEOUT = envs.SGLANG_GRAMMAR_TIMEOUT.value
 
 _is_cpu = is_cpu()
 
@@ -2526,7 +2527,7 @@ def run_scheduler_process(
     suppress_other_loggers()
 
     # Set cpu affinity to this gpu process
-    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
+    if envs.SGLANG_SET_CPU_AFFINITY.value:
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
 
     # Create a scheduler and run the event loop
