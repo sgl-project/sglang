@@ -110,13 +110,34 @@ class ModelOptFp8Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> ModelOptFp8Config:
-        quant_method = cls.get_from_keys(config, ["quantization"]).get("quant_algo")
-        kv_cache_quant_method = cls.get_from_keys(config, ["quantization"]).get(
-            "kv_cache_quant_algo"
-        )
-        exclude_modules = cls.get_from_keys(config, ["quantization"]).get(
-            "exclude_modules"
-        )
+        # Handle two different config formats:
+        # 1. hf_quant_config.json format: {"quantization": {"quant_algo": "FP8", ...}}
+        # 2. config.json quantization_config format: {"quant_algo": "FP8", ...}
+
+        # Try nested format first (hf_quant_config.json)
+        try:
+            quantization_section = cls.get_from_keys(config, ["quantization"])
+            quant_method = quantization_section.get("quant_algo")
+            kv_cache_quant_method = quantization_section.get("kv_cache_quant_algo")
+            exclude_modules = quantization_section.get("exclude_modules")
+        except ValueError:
+            # Fall back to flat format (config.json quantization_config)
+            quant_method = config.get("quant_algo")
+            if quant_method is None:
+                raise ValueError(
+                    "Cannot find 'quant_algo' in the model's quantization config. "
+                    "Expected either nested format with 'quantization' key or flat format."
+                )
+
+            # For kv_cache, check if kv_cache_scheme exists and extract algo
+            kv_cache_scheme = config.get("kv_cache_scheme")
+            if kv_cache_scheme and kv_cache_scheme.get("type") == "float":
+                kv_cache_quant_method = "FP8"
+            else:
+                kv_cache_quant_method = None
+
+            # Map 'ignore' field to 'exclude_modules'
+            exclude_modules = config.get("ignore")
 
         if "FP8" not in quant_method:
             raise ValueError(
