@@ -421,5 +421,5 @@ install(DIRECTORY "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute/"
         PATTERN "__pycache__" EXCLUDE)
 
 execute_process(
-        COMMAND bash -c "pip3 install nvidia-cutlass-dsl==0.0.0a0 && pip3 install nvidia-cutlass"
+        COMMAND bash -c "pip3 install nvidia-cutlass-dsl && pip3 install nvidia-cutlass"
 )
