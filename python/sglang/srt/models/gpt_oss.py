@@ -36,10 +36,6 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SwiGLU
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes, ScatterMode
 from sglang.srt.layers.dp_attention import (
-    attn_tp_all_gather,
-    attn_tp_reduce_scatter,
-    dp_gather_partial,
-    dp_scatter,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_local_attention_dp_size,
@@ -53,7 +49,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
+from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -71,7 +67,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher, model_forward_maybe_tbo
-from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+from sglang.srt.layers.moe.utils import DeepEPMode
 
 GptOssMoeConfig = None
 
@@ -222,14 +219,15 @@ class GptOssMoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
-        if global_server_args_dict["enable_deepep_moe"]:
+        moe_backend = global_server_args_dict.get("moe_a2a_backend")
+        if moe_backend and hasattr(moe_backend, 'is_deepep') and moe_backend.is_deepep():
             extra_args = dict(
                 deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]]
             )
         else:
             extra_args = dict(swiglu_alpha=1.702,
                               swiglu_beta=1.0,
-                              enable_fp8_activation=global_server_args_dict["enable_fp8_act"],
+                              enable_fp8_activation=global_server_args_dict.get("enable_fp8_act", False),
                               pair_wise_act=True)
 
         self.topk = TopK(
@@ -262,11 +260,12 @@ class GptOssMoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
 
-        if global_server_args_dict["enable_deepep_moe"]:
+        moe_backend = global_server_args_dict.get("moe_a2a_backend")
+        if moe_backend and hasattr(moe_backend, 'is_deepep') and moe_backend.is_deepep():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_tensor_model_parallel_world_size()
             self.num_experts = (
-                config.num_experts + global_server_args_dict["ep_num_redundant_experts"]
+                config.num_experts + global_server_args_dict.get("ep_num_redundant_experts", 0)
             )
             self.top_k = config.num_experts_per_tok
             self.renormalize = config.norm_topk_prob
@@ -287,7 +286,8 @@ class GptOssMoeSparseMoeBlock(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
     ) -> torch.Tensor:
-        if not global_server_args_dict["enable_deepep_moe"]:
+        moe_backend = global_server_args_dict.get("moe_a2a_backend")
+        if not (moe_backend and hasattr(moe_backend, 'is_deepep') and moe_backend.is_deepep()):
             return self.forward_normal(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
