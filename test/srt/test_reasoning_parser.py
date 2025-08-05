@@ -493,5 +493,117 @@ class TestIntegrationScenarios(CustomTestCase):
         self.assertIn("final answer", all_normal)
 
 
+class TestBufferLossBugFix(CustomTestCase):
+    """Test cases for the buffer loss bug fix in parse_streaming_increment."""
+
+    def test_partial_end_tag_buffer_loss_bug(self):
+        """
+        Test the bug where partial end tag fragments are lost when followed by normal text.
+
+        Bug scenario:
+        1. _in_reasoning is False
+        2. new_text is "</" (part of closing thinking tag)
+        3. Fragment is stored in buffer and empty string is returned
+        4. Next step: new_text is "answer", _in_reasoning still False
+        5. Buffer is cleared and "answer" is returned directly
+        6. The "</" from previous step is lost
+
+        This test verifies the fix where line 108 was changed from:
+        return StreamingParseResult(normal_text=new_text)
+        to:
+        return StreamingParseResult(normal_text=current_text)
+        """
+        detector = BaseReasoningFormatDetector("<think>", "</think>")
+
+        # Step 1: Send partial end tag when not in reasoning mode
+        # This should be buffered since it could be start of "</think>"
+        result1 = detector.parse_streaming_increment("</")
+        self.assertEqual(result1.normal_text, "")
+        self.assertEqual(result1.reasoning_text, "")
+
+        # Step 2: Send normal text that doesn't complete the end tag
+        # Before fix: would return only "answer", losing the "</"
+        # After fix: should return the complete buffered content "</answer"
+        result2 = detector.parse_streaming_increment("answer")
+        self.assertEqual(result2.normal_text, "</answer")
+        self.assertEqual(result2.reasoning_text, "")
+
+    def test_partial_start_tag_buffer_preservation(self):
+        """
+        Test that partial start tag fragments are properly preserved.
+        """
+        detector = BaseReasoningFormatDetector("<think>", "</think>")
+
+        # Send partial start tag
+        result1 = detector.parse_streaming_increment("<th")
+        self.assertEqual(result1.normal_text, "")
+        self.assertEqual(result1.reasoning_text, "")
+
+        # Complete with non-matching text
+        result2 = detector.parse_streaming_increment("is is text")
+        self.assertEqual(result2.normal_text, "<this is text")
+        self.assertEqual(result2.reasoning_text, "")
+
+    def test_partial_end_tag_in_reasoning_mode(self):
+        """
+        Test partial end tag handling when already in reasoning mode.
+        """
+        detector = BaseReasoningFormatDetector("<think>", "</think>")
+
+        # Enter reasoning mode
+        detector.parse_streaming_increment("<think>")
+        detector.parse_streaming_increment("some reasoning")
+
+        # Send partial end tag
+        result1 = detector.parse_streaming_increment("</")
+        self.assertEqual(result1.normal_text, "")
+        self.assertEqual(result1.reasoning_text, "")
+
+        # Complete the end tag with normal text
+        result2 = detector.parse_streaming_increment("think>normal text")
+        self.assertEqual(result2.normal_text, "normal text")
+        # The reasoning text should be empty since buffer was cleared when end tag was processed
+        self.assertEqual(result2.reasoning_text, "")
+
+    def test_multiple_partial_fragments(self):
+        """
+        Test handling of multiple partial fragments that don't match any tokens.
+        """
+        detector = BaseReasoningFormatDetector("<think>", "</think>")
+
+        # Send multiple partial fragments
+        result1 = detector.parse_streaming_increment("<")
+        self.assertEqual(result1.normal_text, "")
+        self.assertEqual(result1.reasoning_text, "")
+
+        result2 = detector.parse_streaming_increment("/")
+        self.assertEqual(result2.normal_text, "")
+        self.assertEqual(result2.reasoning_text, "")
+
+        result3 = detector.parse_streaming_increment("random>")
+        self.assertEqual(result3.normal_text, "</random>")
+        self.assertEqual(result3.reasoning_text, "")
+
+    def test_edge_case_exact_token_match(self):
+        """
+        Test edge case where buffer content exactly matches a token.
+        """
+        detector = BaseReasoningFormatDetector("<think>", "</think>")
+
+        # Build up the exact start token character by character
+        detector.parse_streaming_increment("<")
+        detector.parse_streaming_increment("t")
+        detector.parse_streaming_increment("h")
+        detector.parse_streaming_increment("i")
+        detector.parse_streaming_increment("n")
+        result = detector.parse_streaming_increment("k>")
+
+        # Should enter reasoning mode
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertTrue(detector._in_reasoning)
+        self.assertTrue(detector.stripped_think_start)
+
+
 if __name__ == "__main__":
     unittest.main()
