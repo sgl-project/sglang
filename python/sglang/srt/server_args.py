@@ -457,6 +457,20 @@ class ServerArgs:
                 raise ValueError(
                     "trtllm_mla backend does not support speculative decoding yet."
                 )
+        
+        if self.attention_backend == "dual_chunk_flash_attn":
+            logger.warning(
+                "Mixed chunk is disabled because of using dual chunk flash attention backend"
+            )
+            logger.warning(
+                "Radix cache is disabled because of using dual chunk flash attention backend"
+            )
+            logger.warning(
+                "Cuda graph is disabled because of using dual chunk flash attention backend"
+            )
+            self.enable_mixed_chunk = False
+            self.disable_cuda_graph = True
+            self.disable_radix_cache = True
 
         # Set page size
         if self.page_size is None:
@@ -1307,6 +1321,7 @@ class ServerArgs:
                 "fa3",
                 "flashmla",
                 "cutlass_mla",
+                "dual_chunk_flash_attn",
             ],
             default=ServerArgs.decode_attention_backend,
             help="Choose the kernels for decode attention layers (have priority over --attention-backend).",

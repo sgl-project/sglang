@@ -1467,6 +1467,12 @@ class ModelRunner:
 
             logger.info(f"Intel AMX attention backend is enabled.")
             return IntelAMXAttnBackend(self)
+        elif self.server_args.attention_backend == "dual_chunk_flash_attn":
+            from sglang.srt.layers.attention.dual_chunk_flashattention_backend import (
+                DualChunkFlashAttentionBackend,
+            )
+
+            self.attn_backend = DualChunkFlashAttentionBackend(self)
         else:
             raise ValueError(f"Invalid attention backend: {backend_str}")
 

@@ -845,6 +845,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The sum of all sequence lengths
     seq_lens_sum: int = None
+    orig_seq_lens: torch.Tensor = None  # shape: [b], int64
 
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
@@ -1128,6 +1129,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
+        orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
 
@@ -1142,6 +1144,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.device, non_blocking=True
         )
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+        orig_seq_lens_tensor = torch.tensor(orig_seq_lens, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
         prefix_lens_tensor = torch.tensor(
@@ -1257,6 +1262,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = input_ids_tensor
         self.req_pool_indices = req_pool_indices_tensor
         self.seq_lens = seq_lens_tensor
+        self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
             torch.tensor(input_embeds).to(self.device, non_blocking=True)
@@ -1504,6 +1510,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.orig_seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
@@ -1624,6 +1631,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
+        self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
         self.output_ids = self.output_ids[keep_indices_device]
@@ -1656,6 +1664,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
+        self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
@@ -1730,6 +1739,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             input_ids=self.input_ids,
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
+            orig_seq_lens=self.orig_seq_lens,
             out_cache_loc=self.out_cache_loc,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=self.seq_lens_sum,
@@ -1896,6 +1906,9 @@ class ModelWorkerBatch:
 
     # Sampling info
     sampling_info: SamplingBatchInfo
+
+    # The original sequence lengths
+    orig_seq_lens: Optional[torch.Tensor] = None
 
     # The input Embeds
     input_embeds: Optional[torch.Tensor] = None
