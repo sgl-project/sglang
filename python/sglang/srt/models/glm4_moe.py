@@ -50,11 +50,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import (
-    get_moe_impl_class,
-    should_use_flashinfer_trtllm_moe,
-)
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
@@ -787,7 +785,7 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
         )
 
     def determine_num_fused_shared_experts(
-        self, architecture: str = "DeepseekV3ForCausalLM"
+        self, architecture: str = "Glm4MoeForCausalLM"
     ):
         self.num_fused_shared_experts = 0
         if global_server_args_dict["disable_shared_experts_fusion"]:
@@ -799,7 +797,6 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
             not _is_cuda
             or torch.cuda.get_device_capability("cuda") < (8, 0)
             or self.config.architectures[0] != architecture
-            or self.config.n_routed_experts != 128
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Only GLM-4.5 on NV-platform with capability >= 80 can use shared experts fusion optimization."
