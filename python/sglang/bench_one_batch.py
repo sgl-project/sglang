@@ -226,7 +226,9 @@ def prepare_extend_inputs_for_correctness_test(
     return reqs
 
 
-def prepare_synthetic_inputs_for_latency_test(batch_size, input_len, custom_inputs=None):
+def prepare_synthetic_inputs_for_latency_test(
+    batch_size, input_len, custom_inputs=None
+):
     input_ids = (
         custom_inputs
         if custom_inputs
