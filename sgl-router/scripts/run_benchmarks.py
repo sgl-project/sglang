@@ -7,7 +7,9 @@ Replaces the shell script for better maintainability and integration.
 """
 
 import argparse
+import errno
 import os
+import pty
 import subprocess
 import sys
 import time
@@ -28,12 +30,48 @@ class BenchmarkRunner:
         """Run a command and handle errors."""
         try:
             if capture_output:
-                result = subprocess.run(
-                    cmd, capture_output=True, text=True, cwd=self.project_root
+                # Use a pty to preserve color output and stream it
+                master, slave = pty.openpty()
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=slave,
+                    stderr=slave,
+                    cwd=self.project_root,
+                )
+                os.close(slave)  # Close the slave fd in the parent
+
+                stdout_capture = []
+                try:
+                    while True:
+                        try:
+                            data = os.read(master, 1024)
+                            if not data:
+                                break
+                            sys.stdout.buffer.write(data)
+                            sys.stdout.flush()
+                            stdout_capture.append(data.decode(errors="replace"))
+                        except OSError as e:
+                            # EIO means the pty has been closed on the other end.
+                            if e.errno != errno.EIO:
+                                raise
+                            break  # Loop exit.
+                finally:
+                    os.close(master)
+
+                returncode = process.wait()
+
+                result = subprocess.CompletedProcess(
+                    args=process.args,
+                    returncode=returncode,
+                    stdout="".join(stdout_capture),
+                    stderr=None,  # stderr is redirected to stdout
                 )
             else:
                 result = subprocess.run(cmd, cwd=self.project_root)
             return result
+        except FileNotFoundError:
+            print(f"Error: Command '{cmd[0]}' not found.")
+            sys.exit(1)
         except subprocess.CalledProcessError as e:
             print(f"Error running command: {' '.join(cmd)}")
             print(f"Exit code: {e.returncode}")
