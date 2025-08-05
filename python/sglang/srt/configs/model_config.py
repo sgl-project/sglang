@@ -627,6 +627,7 @@ multimodal_model_archs = [
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",
+    "Glm4v_moeForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",

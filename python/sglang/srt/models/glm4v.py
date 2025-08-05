@@ -109,7 +109,7 @@ class Glm4vVisionPatchEmbed(nn.Module):
     def __init__(
         self,
         patch_size: int = 14,
-        temporal_patch_size: int = 1,
+        temporal_patch_size: int = 2,
         in_channels: int = 3,
         hidden_size: int = 1536,
     ) -> None:
