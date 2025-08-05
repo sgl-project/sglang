@@ -4,14 +4,9 @@ import torch
 import torch.nn as nn
 
 try:
-    from sgl_kernel import flash_ops
-except:
-    raise ImportError("Can not import sgl_kernel. Please check your installation.")
-
-try:
-    from flash_attn.cute.interface import _flash_attn_fwd
+    from flash_attn.cute.interface import flash_attn_varlen_func as flash_attn4
 except ImportError:
-    _flash_attn_fwd = None
+    flash_attn4 = None
 
 
 def is_fa3_supported(device=None) -> bool:
@@ -250,19 +245,18 @@ def flash_attn_varlen_func(
             -0.5
         )
     # Use _flash_attn_fwd for sm90 and above when available and conditions are met
-    if is_sm90_or_higher() and _flash_attn_fwd is not None:
-        out, lse = _flash_attn_fwd(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_q,
-            seqused_k,
+    if is_sm90_or_higher() and flash_attn4 is not None:
+        out, lse = flash_attn4(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_q=None,
+            seqused_k=None,
             softmax_scale=softmax_scale,
+            cu_seqlens_k=cu_seqlens_k,
             causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
+            window_size=window_size,
             softcap=softcap,
         )
 
