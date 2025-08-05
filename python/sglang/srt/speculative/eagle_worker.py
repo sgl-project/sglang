@@ -21,7 +21,6 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.managers.mm_utils import embed_mm_inputs
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
