@@ -427,7 +427,7 @@ set(DEEPGEMM_SOURCES
 Python_add_library(deep_gemm_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
 
 # Link against necessary libraries, including nvrtc for JIT compilation.
-target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc)
+target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 
 # Add include directories needed by DeepGEMM.
 target_include_directories(deep_gemm_cpp PRIVATE
