@@ -16,7 +16,7 @@ REASONING_EFFORT = "low" # "low" / "medium" / "high"
 OPENAI_SYSTEM_MESSAGE = (
     f"You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2025-07-13\n\nReasoning: {REASONING_EFFORT}\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message."
 )
-DEFAULT_MODEL_NAME_FOR_TEST = "path-to/Orangina"
+DEFAULT_MODEL_NAME_FOR_TEST = "path-to-model"
 CHAT_TEMPLATE = DEFAULT_MODEL_NAME_FOR_TEST + "/chat_template.jinja"
 
 
