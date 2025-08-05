@@ -153,11 +153,7 @@ def _get_nvcc_info():
 
         try:
             nvcc = os.path.join(CUDA_HOME, "bin/nvcc")
-            nvcc_output = (
-                subprocess.check_output(f'"{nvcc}" -V', shell=True)
-                .decode("utf-8")
-                .strip()
-            )
+            nvcc_output = subprocess.check_output([nvcc, "-V"]).decode("utf-8").strip()
             return {
                 "NVCC": nvcc_output[
                     nvcc_output.rfind("Cuda compilation tools") : nvcc_output.rfind(
@@ -173,9 +169,7 @@ def _get_nvcc_info():
         try:
             hipcc = os.path.join(ROCM_HOME, "bin/hipcc")
             hipcc_output = (
-                subprocess.check_output(f'"{hipcc}" --version', shell=True)
-                .decode("utf-8")
-                .strip()
+                subprocess.check_output([hipcc, "--version"]).decode("utf-8").strip()
             )
             return {
                 "HIPCC": hipcc_output[
