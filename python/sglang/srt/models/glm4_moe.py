@@ -797,6 +797,7 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
             not _is_cuda
             or torch.cuda.get_device_capability("cuda") < (8, 0)
             or self.config.architectures[0] != architecture
+            or (self.config.n_routed_experts != 128 and self.config.n_routed_experts != 160)
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Only GLM-4.5 on NV-platform with capability >= 80 can use shared experts fusion optimization."
