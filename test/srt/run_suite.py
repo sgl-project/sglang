@@ -86,6 +86,7 @@ suites = {
         TestFile("test_radix_attention.py", 105),
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_retract_decode.py", 54),
+        TestFile("test_request_queue_validation.py", 30),
         TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_engine.py", 261),
@@ -101,6 +102,7 @@ suites = {
         TestFile("test_triton_sliding_window.py", 250),
         TestFile("test_update_weights_from_disk.py", 114),
         TestFile("test_update_weights_from_tensor.py", 48),
+        TestFile("test_utils_update_weights.py", 48),
         TestFile("test_vertex_endpoint.py", 31),
         TestFile("test_vision_chunked_prefill.py", 175),
         TestFile("test_vlm_input_format.py", 300),
@@ -108,6 +110,7 @@ suites = {
         TestFile("test_vision_openai_server_b.py", 620),
         TestFile("test_w8a8_quantization.py", 46),
         TestFile("test_reasoning_parser.py", 5),
+        TestFile("test_hybrid_attn_backend.py", 100),
     ],
     "per-commit-amd": [
         TestFile("models/lora/test_lora_backend.py", 99),
@@ -151,8 +154,14 @@ suites = {
         TestFile("test_rope_rocm.py", 3),
         TestFile("test_awq_dequant.py", 2),
     ],
-    "per-commit-npu": [
-        TestFile("test_ascend_attention_backend.py", 400),
+    "per-commit-1-ascend-npu": [
+        TestFile("test_ascend_tp1_bf16.py", 400),
+    ],
+    "per-commit-2-ascend-npu": [
+        TestFile("test_ascend_tp2_bf16.py", 400),
+    ],
+    "per-commit-4-ascend-npu": [
+        TestFile("test_ascend_mla_w8a8int8.py", 400),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),

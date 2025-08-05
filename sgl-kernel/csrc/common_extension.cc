@@ -78,13 +78,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
 
-  m.def("silu_and_mul(Tensor! out, Tensor input, int cuda_stream) -> ()");
+  m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
 
-  m.def("gelu_tanh_and_mul(Tensor! out, Tensor input, int cuda_stream) -> ()");
+  m.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_tanh_and_mul", torch::kCUDA, &gelu_tanh_and_mul);
 
-  m.def("gelu_and_mul(Tensor! out, Tensor input, int cuda_stream) -> ()");
+  m.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
 
   m.def(
@@ -165,7 +165,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def(
       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
-      "experts_ids, Tensor! num_tokens_post_pad, Tensor! token_cnts_buffer, Tensor! cumsum_buffer, bool "
+      "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
       "pad_sorted_token_ids) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
