@@ -330,6 +330,7 @@ class MooncakeKVManager(BaseKVManager):
             ]
         else:
             num_kv_layers = len(self.kv_args.kv_data_ptrs) // 2
+            dst_num_total_layers = num_kv_layers * self.pp_size
             src_k_ptrs = self.kv_args.kv_data_ptrs[:num_kv_layers]
             src_v_ptrs = self.kv_args.kv_data_ptrs[num_kv_layers:]
             layers_per_pp_stage = len(src_k_ptrs)
@@ -337,10 +338,9 @@ class MooncakeKVManager(BaseKVManager):
             end_layer = start_layer + layers_per_pp_stage
             dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
             dst_v_ptrs = dst_kv_ptrs[
-                num_kv_layers + start_layer : num_kv_layers + end_layer
+                dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
             ]
             kv_item_len = self.kv_args.kv_item_lens[0]
-
             layers_params = [
                 (
                     src_k_ptrs[layer_id],
@@ -436,6 +436,7 @@ class MooncakeKVManager(BaseKVManager):
 
         # pp is not supported on the decode side yet
         num_kv_layers = len(self.kv_args.kv_data_ptrs) // 2
+        dst_num_total_layers = num_kv_layers * self.pp_size
         src_k_ptrs = self.kv_args.kv_data_ptrs[:num_kv_layers]
         src_v_ptrs = self.kv_args.kv_data_ptrs[num_kv_layers:]
         layers_per_pp_stage = len(src_k_ptrs)
@@ -443,7 +444,7 @@ class MooncakeKVManager(BaseKVManager):
         end_layer = start_layer + layers_per_pp_stage
         dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
         dst_v_ptrs = dst_kv_ptrs[
-            num_kv_layers + start_layer : num_kv_layers + end_layer
+            dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
         ]
 
         # Calculate precise byte offset and length for the sub-slice within the token
