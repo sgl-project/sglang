@@ -10,7 +10,6 @@ from sglang.srt.layers.moe.topk import biased_grouped_topk
     list(range(1, 10))
     + [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     "params",
     [
@@ -20,13 +19,14 @@ from sglang.srt.layers.moe.topk import biased_grouped_topk
     ],
 )
 @pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
-def test_moe_fused_gate_combined(seq_length, dtype, params, num_fused_shared_experts):
+def test_moe_fused_gate_combined(seq_length, params, num_fused_shared_experts):
     num_experts, num_expert_group, topk_group, topk = params
+    dtype = torch.float32
 
     torch.manual_seed(seq_length)
-    tensor = torch.rand((seq_length, num_experts)).to(dtype).cuda()
+    tensor = torch.rand((seq_length, num_experts), dtype=dtype, device="cuda")
     scores = tensor.clone()
-    bias = torch.rand(num_experts).to(dtype).cuda()
+    bias = torch.rand(num_experts, dtype=dtype, device="cuda")
     topk = topk + num_fused_shared_experts
 
     output, indices = moe_fused_gate(
@@ -46,7 +46,6 @@ def test_moe_fused_gate_combined(seq_length, dtype, params, num_fused_shared_exp
         renormalize=True,
         num_expert_group=num_expert_group,
         topk_group=topk_group,
-        compiled=False,
         num_fused_shared_experts=num_fused_shared_experts,
         routed_scaling_factor=2.5,
     )

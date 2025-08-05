@@ -5,3 +5,4 @@ Hardware Supports
 
    amd.md
    nvidia_jetson.md
+   cpu.md

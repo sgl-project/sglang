@@ -1,12 +1,10 @@
-import math
-
 import numpy as np
 import pytest
 import torch
 from sgl_kernel import awq_marlin_repack
-from sgl_kernel.scalar_type import scalar_types
 
-from sglang.srt.layers.quantization.quant_utils import (
+from sglang.srt.layers.quantization.scalar_type import scalar_types
+from sglang.srt.layers.quantization.utils import (
     get_pack_factor,
     pack_cols,
     quantize_weights,

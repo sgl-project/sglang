@@ -32,6 +32,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -62,6 +63,7 @@ class OlmoeMoE(nn.Module):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
+        layer_id: int = 0,
         prefix: str = "",
     ):
         super().__init__()
@@ -76,15 +78,19 @@ class OlmoeMoE(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
 
+        self.topk = TopK(
+            top_k=top_k,
+            renormalize=False,
+        )
+
         self.experts = FusedMoE(
             num_experts=num_experts,
-            top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             reduce_results=True,
-            renormalize=False,
             quant_config=quant_config,
             tp_size=tp_size,
+            layer_id=layer_id,
             prefix=add_prefix("experts", prefix),
         )
 
@@ -94,9 +100,8 @@ class OlmoeMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
+        topk_output = self.topk(hidden_states, router_logits)
+        final_hidden_states = self.experts(hidden_states, topk_output)
         return final_hidden_states.view(orig_shape)
 
 
@@ -221,6 +226,7 @@ class OlmoeDecoderLayer(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
+            layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )

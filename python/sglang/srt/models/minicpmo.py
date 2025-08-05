@@ -1134,7 +1134,10 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states, attn_weights, past_key_values = self.self_attn(
+        # TODO (lifuhuang): confirmed with Mick that the logic for past_key_values is copied from minicpmo official code,
+        # currently we are not using past_key_values at all. We need to redesign the caching logic when we support streaming
+        # in the future.
+        hidden_states, attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             layer_head_mask=layer_head_mask,
@@ -1552,9 +1555,7 @@ class MiniCPMO(MiniCPMBaseModel):
         Returns:
             List[List[torch.Tensor]]: audio embeddings
         """
-        wavforms = flatten_nested_list(
-            [item.audio_features for item in items if item.audio_features]
-        )
+        wavforms = flatten_nested_list([item.feature for item in items if item.feature])
         # list, [[x1, x2], [y1], [z1]]
         audio_feature_lens_raw = flatten_nested_list(
             [item.audio_feature_lens for item in items if item.audio_feature_lens]
@@ -1659,9 +1660,7 @@ class MiniCPMO(MiniCPMBaseModel):
             List[List[torch.Tensor]]: audio embeddings
         """
         # (bs, 80, frames) or [], multi audios need filled in advance
-        wavforms = flatten_nested_list(
-            [item.audio_features for item in items if item.audio_features]
-        )
+        wavforms = flatten_nested_list([item.feature for item in items if item.feature])
         # list, [[x1, x2], [y1], [z1]]
         audio_feature_lens_raw = flatten_nested_list(
             [item.audio_feature_lens for item in items if item.audio_feature_lens]
@@ -1778,7 +1777,7 @@ class MiniCPMO(MiniCPMBaseModel):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # list of tensors
-        pixel_values = flatten_nested_list([item.pixel_values for item in items])
+        pixel_values = flatten_nested_list([item.feature for item in items])
         tgt_sizes = torch.stack(
             flatten_nested_list([item.tgt_size for item in items]), dim=0
         )
@@ -1827,8 +1826,7 @@ class MiniCPMO(MiniCPMBaseModel):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.llm,
-            image_data_embedding_func=self.get_image_feature,
-            audio_data_embedding_func=self.get_audio_feature,
+            multimodal_model=self,
             positions=positions,
         )
         return hidden_states

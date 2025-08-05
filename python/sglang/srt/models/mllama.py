@@ -838,9 +838,7 @@ class MllamaForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(config.text_config)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pixel_values = torch.cat(
-            [item.pixel_values for item in mm_inputs.mm_items], dim=0
-        )
+        pixel_values = torch.cat([item.feature for item in mm_inputs.mm_items], dim=0)
         pad_values = [item.pad_value for item in mm_inputs.mm_items]
 
         num_concurrent_media, num_tiles = pixel_values.shape[1:3]
@@ -862,7 +860,7 @@ class MllamaForConditionalGeneration(nn.Module):
 
             if not forward_batch.encoder_cached[i] and mm_input is not None:
                 pixel_values = torch.cat(
-                    [item.pixel_values for item in mm_input.mm_items], dim=0
+                    [item.feature for item in mm_input.mm_items], dim=0
                 )
                 max_num_images = max(max_num_images, pixel_values.shape[1])
 
@@ -897,7 +895,7 @@ class MllamaForConditionalGeneration(nn.Module):
 
                 encoder_lens_need.append(forward_batch.encoder_lens[k])
                 pixel_values = torch.cat(
-                    [item.pixel_values for item in mm_input.mm_items], dim=0
+                    [item.feature for item in mm_input.mm_items], dim=0
                 )
                 for j in range(pixel_values.shape[1]):
                     img = pixel_values[0, j]

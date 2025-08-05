@@ -2,10 +2,11 @@ import functools
 from typing import Optional
 
 import torch
-from sgl_kernel.scalar_type import scalar_types
 
 
 def get_scalar_type(num_bits: int, has_zp: bool):
+    from sglang.srt.layers.quantization.scalar_type import scalar_types
+
     if has_zp:
         assert num_bits == 4
         return scalar_types.uint4

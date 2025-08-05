@@ -46,9 +46,9 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
-    ImageDataItem,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
+    MultimodalDataInputFormat,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -71,7 +71,6 @@ from sglang.srt.utils import (
     is_cuda,
     kill_process_tree,
     launch_dummy_health_check_server,
-    maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
@@ -148,13 +147,9 @@ class Engine(EngineBase):
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
         # See also python/sglang/srt/utils.py:load_image for more details.
-        image_data: Optional[
-            Union[
-                List[List[ImageDataItem]],
-                List[ImageDataItem],
-                ImageDataItem,
-            ]
-        ] = None,
+        image_data: Optional[MultimodalDataInputFormat] = None,
+        audio_data: Optional[MultimodalDataInputFormat] = None,
+        video_data: Optional[MultimodalDataInputFormat] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -187,6 +182,8 @@ class Engine(EngineBase):
             input_ids=input_ids,
             sampling_params=sampling_params,
             image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -231,13 +228,9 @@ class Engine(EngineBase):
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
         # See also python/sglang/srt/utils.py:load_image for more details.
-        image_data: Optional[
-            Union[
-                List[List[ImageDataItem]],
-                List[ImageDataItem],
-                ImageDataItem,
-            ]
-        ] = None,
+        image_data: Optional[MultimodalDataInputFormat] = None,
+        audio_data: Optional[MultimodalDataInputFormat] = None,
+        video_data: Optional[MultimodalDataInputFormat] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -272,6 +265,8 @@ class Engine(EngineBase):
             input_ids=input_ids,
             sampling_params=sampling_params,
             image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -295,19 +290,20 @@ class Engine(EngineBase):
     def encode(
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
-        image_data: Optional[
-            Union[
-                List[List[Union[Image, str]]],
-                List[Union[Image, str]],
-                Union[Image, str],
-            ]
-        ] = None,
+        image_data: Optional[MultimodalDataInputFormat] = None,
+        audio_data: Optional[MultimodalDataInputFormat] = None,
+        video_data: Optional[MultimodalDataInputFormat] = None,
     ) -> Dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
         Please refer to `EmbeddingReqInput` for the documentation.
         """
-        obj = EmbeddingReqInput(text=prompt, image_data=image_data)
+        obj = EmbeddingReqInput(
+            text=prompt,
+            image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
+        )
         loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
         ret = loop.run_until_complete(generator.__anext__())
@@ -316,7 +312,9 @@ class Engine(EngineBase):
     async def async_encode(
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
-        image_data: Optional[Union[List[str], str]] = None,
+        image_data: Optional[MultimodalDataInputFormat] = None,
+        audio_data: Optional[MultimodalDataInputFormat] = None,
+        video_data: Optional[MultimodalDataInputFormat] = None,
     ) -> Dict:
         """
         Asynchronous version of encode method.
@@ -324,7 +322,12 @@ class Engine(EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
         Please refer to `EmbeddingReqInput` for the documentation.
         """
-        obj = EmbeddingReqInput(text=prompt, image_data=image_data)
+        obj = EmbeddingReqInput(
+            text=prompt,
+            image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
+        )
         generator = self.tokenizer_manager.generate_request(obj, None)
         return await generator.__anext__()
 
@@ -620,8 +623,9 @@ class Engine(EngineBase):
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["NCCL_CUMEM_ENABLE"] = "0"
-    os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
+    os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
+    if not server_args.enable_symm_mem:
+        os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
@@ -633,16 +637,11 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set ulimit
     set_ulimit()
 
-    # Fix triton bugs
-    if server_args.tp_size * server_args.dp_size > 1:
-        # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
-        maybe_set_triton_cache_manager()
-
     # Check flashinfer version
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.7.post1",
+            "0.2.9rc2",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -650,29 +649,23 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda:
         assert_pkg_version(
             "sgl-kernel",
-            "0.2.4",
+            "0.2.8",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
-    def sigchld_handler(signum, frame):
-        pid, exitcode = os.waitpid(0, os.WNOHANG)
-        if exitcode != 0:
-            logger.warning(
-                f"Child process unexpectedly failed with {exitcode=}. {pid=}"
+    if True:  # Keep this check for internal code compatibility
+        # Register the signal handler.
+        # The child processes will send SIGQUIT to this process when any error happens
+        # This process then clean up the whole process tree
+        # Note: This sigquit handler is used in the launch phase, and may be replaced by
+        # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
+        def launch_phase_sigquit_handler(signum, frame):
+            logger.error(
+                "Received sigquit from a child process. It usually means the child failed."
             )
+            kill_process_tree(os.getpid())
 
-    signal.signal(signal.SIGCHLD, sigchld_handler)
-
-    # Register the signal handler.
-    # The child processes will send SIGQUIT to this process when any error happens
-    # This process then clean up the whole process tree
-    def sigquit_handler(signum, frame):
-        logger.error(
-            "Received sigquit from a child process. It usually means the child failed."
-        )
-        kill_process_tree(os.getpid())
-
-    signal.signal(signal.SIGQUIT, sigquit_handler)
+        signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
@@ -727,6 +720,7 @@ def _launch_subprocesses(
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
+                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
                 proc = mp.Process(
                     target=run_scheduler_process,
                     args=(
@@ -734,9 +728,11 @@ def _launch_subprocesses(
                         port_args,
                         gpu_id,
                         tp_rank,
+                        moe_ep_rank,
                         pp_rank,
                         None,
                         writer,
+                        None,
                     ),
                 )
 
@@ -767,7 +763,9 @@ def _launch_subprocesses(
             # When using `Engine` as a Python API, we don't want to block here.
             return None, None, None
 
-        launch_dummy_health_check_server(server_args.host, server_args.port)
+        launch_dummy_health_check_server(
+            server_args.host, server_args.port, server_args.enable_metrics
+        )
 
         for proc in scheduler_procs:
             proc.join()

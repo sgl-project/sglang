@@ -1,21 +1,25 @@
 # Adapted from https://github.com/vllm-project/vllm/pull/18595/files#diff-f426a6de78c82ffec568eff6811bfbf0043dab5f87f1a8c0cffdbdcb8a81e035
-from typing import Optional
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from sgl_kernel import gelu_and_mul, silu_and_mul
 from triton_kernels.matmul_ogs import matmul_ogs
-from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
+from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
 
 from sglang.srt.utils import direct_register_custom_op
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import TopKOutput
 
 
 def triton_kernel_moe_forward(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
+    topk_output: TopKOutput,
     inplace: bool = False,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
@@ -30,9 +34,8 @@ def triton_kernel_moe_forward(
     block_shape: Optional[list[int]] = None,
 ) -> torch.Tensor:
 
-    if not renormalize:
-        gating_output = torch.softmax(gating_output, dim=-1)
-    routing_data, gather_idx, scatter_idx = routing(gating_output, topk, renormalize)
+    assert topk_output.format.is_triton_kernel()
+    routing_data, gather_idx, scatter_idx = topk_output
 
     return triton_kernel_fused_experts(
         hidden_states,
@@ -143,34 +146,3 @@ def triton_kernel_fused_experts(
     )
 
     return intermediate_cache3
-
-
-def triton_kernel_moe_forward_fake(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    inplace: bool = False,
-    activation: str = "silu",
-    apply_router_weight_on_input: bool = False,
-    use_fp8_w8a8: bool = False,
-    per_channel_quant: bool = False,
-    global_num_experts: int = -1,
-    expert_map: Optional[torch.Tensor] = None,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
-
-
-direct_register_custom_op(
-    op_name="forward_cuda_triton",
-    op_func=triton_kernel_moe_forward,
-    mutates_args=[],
-    fake_impl=triton_kernel_moe_forward_fake,
-)

@@ -31,10 +31,8 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import triton
 import triton.language as tl
-from sgl_kernel.kvcacheio import transfer_kv_per_layer, transfer_kv_per_layer_mla
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -151,18 +149,6 @@ class KVCache(abc.ABC):
     ) -> None:
         raise NotImplementedError()
 
-    @abc.abstractmethod
-    def load_from_host_per_layer(
-        self, host_pool, host_indices, device_indices, layer_id, io_backend
-    ):
-        raise NotImplementedError()
-
-    @abc.abstractmethod
-    def backup_to_host_all_layer(
-        self, host_pool, host_indices, device_indices, io_backend
-    ):
-        raise NotImplementedError()
-
     def register_layer_transfer_counter(self, layer_transfer_counter):
         self.layer_transfer_counter = layer_transfer_counter
 
@@ -251,12 +237,18 @@ class MHATokenToKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
-        self.token_stride = self.head_num * self.head_dim
-        self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_buffer + self.v_buffer],
+
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
             dtype=torch.uint64,
             device=self.device,
         )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
         self.data_strides = torch.tensor(
             [
                 np.prod(x.shape[1:]) * x.dtype.itemsize
@@ -344,47 +336,6 @@ class MHATokenToKVPool(KVCache):
                 self.k_buffer[layer_id][chunk_indices] = k_chunk
                 self.v_buffer[layer_id][chunk_indices] = v_chunk
         torch.cuda.synchronize()
-
-    def load_from_host_per_layer(
-        self,
-        host_pool,
-        host_indices,
-        device_indices,
-        layer_id,
-        io_backend,
-    ):
-        transfer_kv_per_layer(
-            src_k=host_pool.k_buffer[layer_id],
-            dst_k=self.k_buffer[layer_id],
-            src_v=host_pool.v_buffer[layer_id],
-            dst_v=self.v_buffer[layer_id],
-            src_indices=host_indices,
-            dst_indices=device_indices,
-            io_backend=io_backend,
-            page_size=self.page_size,
-            item_size=self.token_stride,
-        )
-
-    def backup_to_host_all_layer(
-        self, host_pool, host_indices, device_indices, io_backend
-    ):
-        # todo: specialized all layer kernels for the layer-non-contiguous memory pool
-        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
-            if layer_id - self.start_layer >= len(host_pool.k_buffer):
-                raise ValueError(
-                    f"Layer ID {layer_id} exceeds the number of layers in host pool."
-                )
-            transfer_kv_per_layer(
-                src_k=self.k_buffer[layer_id],
-                dst_k=host_pool.k_buffer[layer_id],
-                src_v=self.v_buffer[layer_id],
-                dst_v=host_pool.v_buffer[layer_id],
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                io_backend=io_backend,
-                page_size=self.page_size,
-                item_size=self.token_stride,
-            )
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
@@ -518,8 +469,13 @@ class SWAKVPool(KVCache):
             self.layers_mapping[global_layer_id] = (swa_layer_id, True)
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
 
+        k_size, v_size = self.get_kv_size_bytes()
+        self.mem_usage = (k_size + v_size) / GB
+
     def get_kv_size_bytes(self):
-        raise NotImplementedError
+        k_size, v_size = self.full_kv_pool.get_kv_size_bytes()
+        k_size_swa, v_size_swa = self.swa_kv_pool.get_kv_size_bytes()
+        return k_size + k_size_swa, v_size + v_size_swa
 
     def get_contiguous_buf_infos(self):
         full_kv_data_ptrs, full_kv_data_lens, full_kv_item_lens = (
@@ -602,32 +558,49 @@ class AscendTokenToKVPool(MHATokenToKVPool):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = [
-                torch.zeros(
-                    (
-                        self.size // self.page_size + 1,
-                        self.page_size,
-                        self.head_num,
-                        self.head_dim,
-                    ),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
-            self.v_buffer = [
-                torch.zeros(
-                    (
-                        self.size // self.page_size + 1,
-                        self.page_size,
-                        self.head_num,
-                        self.head_dim,
-                    ),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
+            # Continuous memory improves the efficiency of Ascend`s transmission backend,
+            # while other backends remain unchanged.
+            self.kv_buffer = torch.zeros(
+                (
+                    2,
+                    self.layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            self.k_buffer = self.kv_buffer[0]
+            self.v_buffer = self.kv_buffer[1]
+
+    # for disagg
+    def get_contiguous_buf_infos(self):
+        # layer_num x [seq_len, head_num, head_dim]
+        # layer_num x [page_num, page_size, head_num, head_dim]
+        kv_data_ptrs = [
+            self.get_key_buffer(i).data_ptr()
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ] + [
+            self.get_value_buffer(i).data_ptr()
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        kv_data_lens = [
+            self.get_key_buffer(i).nbytes
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ] + [
+            self.get_value_buffer(i).nbytes
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        kv_item_lens = [
+            self.get_key_buffer(i)[0].nbytes
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ] + [
+            self.get_value_buffer(i)[0].nbytes
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def set_kv_buffer(
         self,
@@ -789,7 +762,11 @@ class MLATokenToKVPool(KVCache):
                     for _ in range(layer_num)
                 ]
 
-        self.token_stride = kv_lora_rank + qk_rope_head_dim
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.kv_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
         self.layer_transfer_counter = None
 
         kv_size = self.get_kv_size_bytes()
@@ -875,38 +852,6 @@ class MLATokenToKVPool(KVCache):
             self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
         )
 
-    def load_from_host_per_layer(
-        self, host_pool, host_indices, device_indices, layer_id, io_backend
-    ):
-        transfer_kv_per_layer_mla(
-            src=host_pool.kv_buffer[layer_id],
-            dst=self.kv_buffer[layer_id],
-            src_indices=host_indices,
-            dst_indices=device_indices,
-            io_backend=io_backend,
-            page_size=self.page_size,
-            item_size=self.token_stride,
-        )
-
-    def backup_to_host_all_layer(
-        self, host_pool, host_indices, device_indices, io_backend
-    ):
-        # todo: specialized all layer kernels for the layer-non-contiguous memory pool
-        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
-            if layer_id - self.start_layer >= len(host_pool.kv_buffer):
-                raise ValueError(
-                    f"Layer ID {layer_id} exceeds the number of layers in host pool."
-                )
-            transfer_kv_per_layer_mla(
-                src=self.kv_buffer[layer_id],
-                dst=host_pool.kv_buffer[layer_id],
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                io_backend=io_backend,
-                page_size=self.page_size,
-                item_size=self.token_stride,
-            )
-
     def get_cpu_copy(self, indices):
         torch.cuda.synchronize()
         kv_cache_cpu = []
@@ -967,18 +912,16 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.kv_buffer = [
-                torch.zeros(
-                    (
-                        self.size // self.page_size + 1,
-                        self.page_size,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                    ),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(layer_num)
-            ]
+            self.kv_buffer = torch.zeros(
+                (
+                    layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
 
         self.layer_transfer_counter = None
 
@@ -987,6 +930,14 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
             f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size / GB:.2f} GB"
         )
         self.mem_usage = kv_size / GB
+
+    # for disagg
+    def get_contiguous_buf_infos(self):
+        # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
+        kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        kv_item_lens = [self.kv_buffer[i][0].nbytes for i in range(self.layer_num)]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def set_kv_buffer(
         self,
@@ -1090,20 +1041,6 @@ class DoubleSparseTokenToKVPool(KVCache):
         self.k_buffer[layer_id - self.start_layer][loc] = cache_k
         self.v_buffer[layer_id - self.start_layer][loc] = cache_v
         self.label_buffer[layer_id - self.start_layer][loc] = cache_label
-
-    def load_from_host_per_layer(
-        self, host_pool, host_indices, device_indices, layer_id, io_backend
-    ):
-        raise NotImplementedError(
-            "HiCache not supported for DoubleSparseTokenToKVPool."
-        )
-
-    def backup_to_host_all_layer(
-        self, host_pool, host_indices, device_indices, io_backend
-    ):
-        raise NotImplementedError(
-            "HiCache not supported for DoubleSparseTokenToKVPool."
-        )
 
 
 @triton.jit

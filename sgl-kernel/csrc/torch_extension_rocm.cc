@@ -20,6 +20,20 @@ limitations under the License.
 
 TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
+   * From csrc/activation
+   */
+  m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
+  m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
+
+  m.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
+  m.impl("gelu_tanh_and_mul", torch::kCUDA, &gelu_tanh_and_mul);
+
+  m.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
+  m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
+
+  m.def("gelu_quick(Tensor! out, Tensor input) -> ()");
+  m.impl("gelu_quick", torch::kCUDA, &gelu_quick);
+  /*
    * From csrc/allreduce
    */
   m.def(
@@ -54,12 +68,31 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("get_meta_buffer_ipc_handle", &get_meta_buffer_ipc_handle);
   m.impl("get_meta_buffer_ipc_handle", torch::kCPU, &get_meta_buffer_ipc_handle);
 
+  // quick allreduce
+#ifdef USE_ROCM
+  m.def(
+      "qr_all_reduce(int fa, Tensor inp, Tensor out, int quant_level, bool "
+      "cast_bf2half) -> ()");
+  m.impl("qr_all_reduce", torch::kCUDA, &qr_all_reduce);
+
+  m.def("init_custom_qr", &init_custom_qr);
+  m.def("qr_destroy", &qr_destroy);
+
+  m.def("qr_get_handle", &qr_get_handle);
+
+  m.def("qr_open_handles(int _fa, Tensor[](b!) handles) -> ()");
+  m.impl("qr_open_handles", torch::kCPU, &qr_open_handles);
+
+  // Max input size in bytes
+  m.def("qr_max_size", &qr_max_size);
+#endif
+
   /*
    * From csrc/moe
    */
   m.def(
       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
-      "experts_ids, Tensor! num_tokens_post_pad, Tensor! token_cnts_buffer, Tensor! cumsum_buffer, bool "
+      "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
       "pad_sorted_token_ids) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 

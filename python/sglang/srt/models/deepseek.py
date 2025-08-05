@@ -37,6 +37,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import fused_moe
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -109,7 +110,10 @@ class DeepseekMoE(nn.Module):
                 f"Tensor parallel size {self.tp_size} is greater than "
                 f"the number of experts {self.n_routed_experts}."
             )
-
+        self.topk = TopK(
+            top_k=self.top_k,
+            renormalize=config.norm_topk_prob,
+        )
         self.experts = nn.ModuleList(
             [
                 DeepseekMLP(
@@ -170,13 +174,12 @@ class DeepseekMoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = fused_moe.fused_moe(
             hidden_states,
-            self.w1,
-            self.w2,
-            router_logits,
-            self.top_k,
-            renormalize=self.config.norm_topk_prob,
+            w1=self.w1,
+            w2=self.w2,
+            topk_output=topk_output,
             inplace=True,
         )
 
