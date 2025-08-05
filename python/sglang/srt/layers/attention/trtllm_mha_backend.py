@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 import triton
 
-from sglang.srt.layers.attention.flashinfer_backend import FlashinferAttnBackend
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.utils import (
     TRITON_PAD_NUM_PAGE_PER_BLOCK,
     create_flashinfer_kv_indices_triton,
@@ -50,7 +50,7 @@ class TRTLLMMHADecodeMetadata:
     block_kv_indices: Optional[torch.Tensor] = None
 
 
-class TRTLLMHAAttnBackend(FlashinferAttnBackend):
+class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
 
     def __init__(

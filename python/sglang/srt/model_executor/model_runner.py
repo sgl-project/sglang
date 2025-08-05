@@ -1454,9 +1454,11 @@ class ModelRunner:
                 raise ValueError(
                     "trtllm_mha backend can only be used with non-MLA models."
                 )
-            from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMMHABackend
+            from sglang.srt.layers.attention.trtllm_mha_backend import (
+                TRTLLMHAAttnBackend,
+            )
 
-            return TRTLLMMHABackend(self)
+            return TRTLLMHAAttnBackend(self)
 
         elif self.server_args.attention_backend == "intel_amx":
             from sglang.srt.layers.attention.intel_amx_backend import (
