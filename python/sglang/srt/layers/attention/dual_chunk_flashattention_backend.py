@@ -9,12 +9,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from sgl_kernel.attention import (
+from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from sgl_kernel.sparse_flash_attn import (
     convert_vertical_slash_indexes,
     convert_vertical_slash_indexes_mergehead,
+    sparse_attn_func,
 )
-from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from sgl_kernel.sparse_flash_attn import sparse_attn_func
 
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -104,6 +104,8 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         model_runner: "ModelRunner",
     ) -> None:
         self.forwrad_metadata: FlashAttentionMetadata = None
+        self.device = model_runner.device
+        self.max_context_len = model_runner.model_config.context_len
         self.num_heads = model_runner.model_config.get_num_attention_heads(
             model_runner.server_args.tp_size
         )
@@ -154,16 +156,14 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             )
 
     @functools.lru_cache()
-    def get_sparse_attention_config(self, layer_name) -> List[Dict[str, Any]]:
-        layer_name_parts = layer_name.split(".")
-        layer_idx = int(layer_name_parts[layer_name_parts.index("layers") + 1])
+    def get_sparse_attention_config(self, layer_idx) -> List[Dict[str, Any]]:
 
-        self.sparse_attention_config = {
+        sparse_attention_config_tmp = {
             int(i): j for i, j in self.sparse_attention_config[layer_idx].items()
         }
         start_head = self.num_heads * get_tensor_model_parallel_rank()
         end_head = start_head + self.num_heads
-        return [self.sparse_attention_config[i] for i in range(start_head, end_head)]
+        return [sparse_attention_config_tmp[i] for i in range(start_head, end_head)]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -231,7 +231,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             chunk_len = self.chunk_size - self.local_size
             chunk_num_curr = (metadata.seq_lens_tensor - 1) // chunk_len
 
-            seq_lens_intra = metadata.seq_lens - chunk_num_curr * chunk_len
+            seq_lens_intra = metadata.seq_lens_tensor - chunk_num_curr * chunk_len
             max_seq_len_intra = seq_lens_intra.max().item()
             metadata.seq_lens_intra = seq_lens_intra
             metadata.max_seq_len_intra = max_seq_len_intra
@@ -338,7 +338,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                 )
                 key[current_start:current_end].mul_(metadata.scaling_factor[i])
                 current_start = current_end
-            assert current_end <= metadata.num_prefill_tokens
+            assert current_end <= self.max_context_len
 
         # Do multi-head attention
         key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
@@ -377,6 +377,10 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             )
         else:
             # prefill/chunked-prefill
+            # get per layer sparse attention config
+            self.layer_sparse_attention_config = self.get_sparse_attention_config(
+                layer.layer_id
+            )
             assert metadata.orig_seq_lens is not None
             o = self._dual_chunk_flash_attn_prefill(
                 q=query,
@@ -390,7 +394,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k=metadata.seq_start_loc,
                 orig_seq_lens=metadata.orig_seq_lens,
                 scaling_factor=metadata.scaling_factor,
-                softmax_scale=self.scale,
+                softmax_scale=layer.scaling,
                 causal=True,
                 window_size=(-1, -1),
                 block_table=metadata.block_tables,
@@ -562,7 +566,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                         vertical_size,
                         slash_size,
                         _,
-                    ) = self.sparse_attention_config[head_id]
+                    ) = self.layer_sparse_attention_config[head_id]
                     assert ty == "vertical_and_slash", "only support slash mode"
 
                     if vertical_size == 30:

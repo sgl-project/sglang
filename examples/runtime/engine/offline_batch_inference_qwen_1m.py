@@ -1,6 +1,6 @@
 """
 Usage:
-python3 offline_batch_inference.py  --model meta-llama/Llama-3.1-8B-Instruct
+python3 offline_batch_inference.py
 """
 
 from urllib.request import urlopen
@@ -18,7 +18,7 @@ def load_prompt() -> str:
 
     with urlopen(
         "https://qianwen-res.oss-cn-beijing.aliyuncs.com"
-        "/Qwen2.5-1M/test-data/600k.txt",
+        "/Qwen2.5-1M/test-data/64k.txt",
         timeout=5,
     ) as response:
         prompt = response.read().decode("utf-8")
@@ -59,6 +59,7 @@ def initialize_engine() -> sgl.Engine:
         disable_radix_cache=True,
         enable_mixed_chunk=False,
         chunked_prefill_size=131072,
+        mem_fraction_static=0.6,
     )
     return llm
 
