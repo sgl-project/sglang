@@ -157,6 +157,7 @@ class Glm4vPatchMerger(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("proj", prefix),
+            gather_output=True
         )
         self.post_projection_norm = nn.LayerNorm(self.hidden_size)
         self.gate_up_proj = MergedColumnParallelLinear(
