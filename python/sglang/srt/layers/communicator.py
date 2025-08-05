@@ -541,6 +541,8 @@ class CommunicateSummableTensorPairFn:
             forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
             hidden_states,
         )
+        if hidden_states.data_ptr() == global_hidden_states.data_ptr():
+            hidden_states = hidden_states.clone()
         dp_scatter(hidden_states, global_hidden_states, forward_batch)
         return hidden_states, residual
 
