@@ -43,6 +43,7 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -367,6 +368,15 @@ class Engine(EngineBase):
     def stop_profile(self):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.tokenizer_manager.stop_profile())
+
+    def abort_request(self, rid: str = "", abort_all: bool = False):
+        """Abort a specific request or all requests.
+
+        Args:
+            rid: The request ID to abort. If empty and abort_all is False, no action is taken.
+            abort_all: If True, abort all running requests regardless of rid.
+        """
+        self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
 
     def start_expert_distribution_record(self):
         loop = asyncio.get_event_loop()
