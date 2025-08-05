@@ -394,9 +394,10 @@ class HiRadixCache(RadixCache):
         for _ in range(queue_size.item()):
             req_id = self.cache_controller.prefetch_revoke_queue.get()
             if req_id in self.ongoing_prefetch:
-                last_host_node, _, _, _ = self.ongoing_prefetch[req_id]
+                last_host_node, token_ids, _, _ = self.ongoing_prefetch[req_id]
                 last_host_node.release_host()
                 del self.ongoing_prefetch[req_id]
+                self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
             else:
                 # the revoked operation already got terminated
                 pass
@@ -507,7 +508,7 @@ class HiRadixCache(RadixCache):
         )
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
-        self.cache_controller.update_token_counter(-len(token_ids))
+        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
         return True
 
@@ -577,6 +578,7 @@ class HiRadixCache(RadixCache):
             host_indices,
             operation,
         )
+        self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
 
     def _insert_helper_host(self, node: TreeNode, key: List, host_value, hash_value):
         node.last_access_time = time.monotonic()

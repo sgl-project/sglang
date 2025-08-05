@@ -284,7 +284,7 @@ class HiCacheController:
             self.prefetch_capacity_limit = int(
                 0.8 * (self.mem_pool_host.size - self.mem_pool_device.size)
             )
-            self.token_counter_lock = threading.Lock()
+            # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
             # create a new communication group for synchronizing storage operations across TP workers
@@ -380,7 +380,6 @@ class HiCacheController:
         self.load_thread.start()
 
         if self.enable_storage:
-            self.update_token_counter(-self.prefetch_tokens_occupied)
             self.prefetch_thread = threading.Thread(
                 target=self.prefetch_thread_func, daemon=True
             )
@@ -603,16 +602,6 @@ class HiCacheController:
             except Empty:
                 continue
 
-    def update_token_counter(self, num_tokens: int):
-        """
-        Update the token counter for prefetching rate limiting.
-        """
-        with self.token_counter_lock:
-            self.prefetch_tokens_occupied += num_tokens
-            assert (
-                self.prefetch_tokens_occupied >= 0
-            ), f"Prefetch tokens occupied cannot be negative: {self.prefetch_tokens_occupied}"
-
     def prefetch_rate_limit_check(self) -> bool:
         """
         Rate limit the prefetching operations to avoid overwhelming the storage backend.
@@ -696,7 +685,6 @@ class HiCacheController:
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
                     self.prefetch_buffer.put(operation)
-                    self.update_token_counter(storage_hit_count)
 
             except Empty:
                 continue
