@@ -1549,6 +1549,7 @@ class TokenizerManager:
             if isinstance(recv_obj, BatchStrOut):
                 state.text += recv_obj.output_strs[i]
                 out_dict = {
+                    "output_ids": recv_obj.output_ids[i],
                     "text": state.text,
                     "meta_info": meta_info,
                 }

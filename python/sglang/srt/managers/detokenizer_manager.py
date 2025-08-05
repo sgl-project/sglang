@@ -179,6 +179,7 @@ class DetokenizerManager:
 
         # Incremental decoding
         output_strs = []
+        output_ids = []
         for i in range(bs):
             try:
                 s = self.decode_status[recv_obj.rids[i]]
@@ -212,11 +213,21 @@ class DetokenizerManager:
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
 
+            # For streaming: send only new token IDs that correspond to incremental output
+            # For final: send all token IDs
+            if recv_obj.finished_reasons[i] is None:
+                # Streaming: send new token IDs since last sent
+                new_token_ids = recv_obj.decode_ids[i]  # New tokens in this batch
+                output_ids.append(new_token_ids)
+            else:
+                # Final: send all token IDs
+                output_ids.append(s.decode_ids.copy())
+
         return BatchStrOut(
             rids=recv_obj.rids,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
-            output_ids=None,
+            output_ids=output_ids,
             prompt_tokens=recv_obj.prompt_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,

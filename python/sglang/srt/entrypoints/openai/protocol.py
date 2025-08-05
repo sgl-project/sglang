@@ -15,8 +15,17 @@
 
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, TypeAlias, Union
 
+from openai.types.responses import (
+    ResponseFunctionToolCall,
+    ResponseFunctionToolCallOutputItem,
+    ResponseInputItemParam,
+    ResponseOutputItem,
+    ResponsePrompt,
+    ResponseStatus,
+    ResponseTextConfig,
+)
 from pydantic import (
     BaseModel,
     Field,
@@ -428,6 +437,7 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
     return_hidden_states: bool = False
+    reasoning_effort: Optional[Literal["low", "medium", "high"]] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -645,3 +655,22 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[Any] = None
+
+
+class ResponseReasoningTextContent(BaseModel):
+    text: str
+    type: Literal["reasoning_text"] = "reasoning_text"
+
+
+class ResponseReasoningItem(BaseModel):
+    id: str
+    content: list[ResponseReasoningTextContent] = Field(default_factory=list)
+    summary: list = Field(default_factory=list)
+    type: Literal["reasoning"] = "reasoning"
+    encrypted_content: Optional[str] = None
+    status: Optional[Literal["in_progress", "completed", "incomplete"]]
+
+
+ResponseInputOutputItem: TypeAlias = Union[
+    ResponseInputItemParam, "ResponseReasoningItem", ResponseFunctionToolCall
+]
