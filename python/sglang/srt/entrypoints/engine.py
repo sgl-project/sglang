@@ -37,7 +37,6 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 import torch
 import uvloop
 
-from sglang.srt.code_completion_parser import load_completion_template_for_openai_api
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -47,22 +46,21 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
-    ImageDataItem,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterReqInput,
+    MultimodalDataInputFormat,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
+    UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.openai_api.adapter import (
-    guess_chat_template_name_from_model_path,
-    load_chat_template_for_openai_api,
-)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
@@ -73,7 +71,6 @@ from sglang.srt.utils import (
     is_cuda,
     kill_process_tree,
     launch_dummy_health_check_server,
-    maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
@@ -119,21 +116,22 @@ class Engine(EngineBase):
         atexit.register(self.shutdown)
 
         # Allocate ports for inter-process communications
-        port_args = PortArgs.init_new(server_args)
+        self.port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
         # Launch subprocesses
-        tokenizer_manager, scheduler_info = _launch_subprocesses(
+        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args,
-            port_args=port_args,
+            port_args=self.port_args,
         )
         self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
+        self.template_manager = template_manager
         self.scheduler_info = scheduler_info
 
         context = zmq.Context(2)
         self.send_to_rpc = get_zmq_socket(
-            context, zmq.DEALER, port_args.rpc_ipc_name, True
+            context, zmq.DEALER, self.port_args.rpc_ipc_name, True
         )
 
     def generate(
@@ -149,13 +147,9 @@ class Engine(EngineBase):
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
         # See also python/sglang/srt/utils.py:load_image for more details.
-        image_data: Optional[
-            Union[
-                List[List[ImageDataItem]],
-                List[ImageDataItem],
-                ImageDataItem,
-            ]
-        ] = None,
+        image_data: Optional[MultimodalDataInputFormat] = None,
+        audio_data: Optional[MultimodalDataInputFormat] = None,
+        video_data: Optional[MultimodalDataInputFormat] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -175,7 +169,7 @@ class Engine(EngineBase):
         """
         if self.server_args.enable_dp_attention:
             if data_parallel_rank is None:
-                logger.info("data_parallel_rank not provided, using default dispatch")
+                logger.debug("data_parallel_rank not provided, using default dispatch")
             elif data_parallel_rank < 0:
                 raise ValueError("data_parallel_rank must be non-negative")
             elif data_parallel_rank >= self.server_args.dp_size:
@@ -188,6 +182,8 @@ class Engine(EngineBase):
             input_ids=input_ids,
             sampling_params=sampling_params,
             image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -232,19 +228,16 @@ class Engine(EngineBase):
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
         # See also python/sglang/srt/utils.py:load_image for more details.
-        image_data: Optional[
-            Union[
-                List[List[ImageDataItem]],
-                List[ImageDataItem],
-                ImageDataItem,
-            ]
-        ] = None,
+        image_data: Optional[MultimodalDataInputFormat] = None,
+        audio_data: Optional[MultimodalDataInputFormat] = None,
+        video_data: Optional[MultimodalDataInputFormat] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        return_hidden_states: bool = False,
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
@@ -258,7 +251,7 @@ class Engine(EngineBase):
 
         if self.server_args.enable_dp_attention:
             if data_parallel_rank is None:
-                logger.info("data_parallel_rank not provided, using default dispatch")
+                logger.debug("data_parallel_rank not provided, using default dispatch")
             elif data_parallel_rank < 0:
                 raise ValueError("data_parallel_rank must be non-negative")
             elif data_parallel_rank >= self.server_args.dp_size:
@@ -272,11 +265,14 @@ class Engine(EngineBase):
             input_ids=input_ids,
             sampling_params=sampling_params,
             image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
+            return_hidden_states=return_hidden_states,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
             bootstrap_host=bootstrap_host,
@@ -294,19 +290,20 @@ class Engine(EngineBase):
     def encode(
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
-        image_data: Optional[
-            Union[
-                List[List[Union[Image, str]]],
-                List[Union[Image, str]],
-                Union[Image, str],
-            ]
-        ] = None,
+        image_data: Optional[MultimodalDataInputFormat] = None,
+        audio_data: Optional[MultimodalDataInputFormat] = None,
+        video_data: Optional[MultimodalDataInputFormat] = None,
     ) -> Dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
         Please refer to `EmbeddingReqInput` for the documentation.
         """
-        obj = EmbeddingReqInput(text=prompt, image_data=image_data)
+        obj = EmbeddingReqInput(
+            text=prompt,
+            image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
+        )
         loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
         ret = loop.run_until_complete(generator.__anext__())
@@ -315,7 +312,9 @@ class Engine(EngineBase):
     async def async_encode(
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
-        image_data: Optional[Union[List[str], str]] = None,
+        image_data: Optional[MultimodalDataInputFormat] = None,
+        audio_data: Optional[MultimodalDataInputFormat] = None,
+        video_data: Optional[MultimodalDataInputFormat] = None,
     ) -> Dict:
         """
         Asynchronous version of encode method.
@@ -323,9 +322,28 @@ class Engine(EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
         Please refer to `EmbeddingReqInput` for the documentation.
         """
-        obj = EmbeddingReqInput(text=prompt, image_data=image_data)
+        obj = EmbeddingReqInput(
+            text=prompt,
+            image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
+        )
         generator = self.tokenizer_manager.generate_request(obj, None)
         return await generator.__anext__()
+
+    def rerank(
+        self,
+        prompt: Union[List[List[str]]],
+    ) -> Dict:
+        """
+        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
+        Please refer to `EmbeddingReqInput` for the documentation.
+        """
+        obj = EmbeddingReqInput(text=prompt, is_cross_encoder_request=True)
+        loop = asyncio.get_event_loop()
+        generator = self.tokenizer_manager.generate_request(obj, None)
+        ret = loop.run_until_complete(generator.__anext__())
+        return ret
 
     def shutdown(self):
         """Shutdown the engine"""
@@ -403,12 +421,21 @@ class Engine(EngineBase):
             self.tokenizer_manager.init_weights_update_group(obj, None)
         )
 
-    def update_weights_from_distributed(self, name: str, dtype, shape):
+    def update_weights_from_distributed(
+        self,
+        names: list[str],
+        dtypes: list[str],
+        shapes: list[list[int]],
+        group_name: str = "weight_update_group",
+        flush_cache: bool = True,
+    ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
-            name=name,
-            dtype=dtype,
-            shape=shape,
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name=group_name,
+            flush_cache=flush_cache,
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
@@ -465,17 +492,38 @@ class Engine(EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
-    def release_memory_occupation(self):
-        """Release GPU occupation temporarily."""
-        obj = ReleaseMemoryOccupationReqInput()
+    def load_lora_adapter(self, lora_name: str, lora_path: str):
+        """Load a new LoRA adapter without re-launching the engine."""
+
+        obj = LoadLoRAAdapterReqInput(
+            lora_name=lora_name,
+            lora_path=lora_path,
+        )
+
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.load_lora_adapter(obj, None)
+        )
+
+    def unload_lora_adapter(self, lora_name: str):
+        """Unload a LoRA adapter without re-launching the engine."""
+
+        obj = UnloadLoRAAdapterReqInput(lora_name=lora_name)
+
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.unload_lora_adapter(obj, None)
+        )
+
+    def release_memory_occupation(self, tags: Optional[List[str]] = None):
+        obj = ReleaseMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.release_memory_occupation(obj, None)
         )
 
-    def resume_memory_occupation(self):
-        """Resume GPU occupation."""
-        obj = ResumeMemoryOccupationReqInput()
+    def resume_memory_occupation(self, tags: Optional[List[str]] = None):
+        obj = ResumeMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.resume_memory_occupation(obj, None)
@@ -575,8 +623,9 @@ class Engine(EngineBase):
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["NCCL_CUMEM_ENABLE"] = "0"
-    os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
+    os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
+    if not server_args.enable_symm_mem:
+        os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
@@ -588,16 +637,11 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set ulimit
     set_ulimit()
 
-    # Fix triton bugs
-    if server_args.tp_size * server_args.dp_size > 1:
-        # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
-        maybe_set_triton_cache_manager()
-
     # Check flashinfer version
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.6.post1",
+            "0.2.9",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -605,29 +649,23 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda:
         assert_pkg_version(
             "sgl-kernel",
-            "0.1.7",
+            "0.2.8",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
-    def sigchld_handler(signum, frame):
-        pid, exitcode = os.waitpid(0, os.WNOHANG)
-        if exitcode != 0:
-            logger.warning(
-                f"Child process unexpectedly failed with {exitcode=}. {pid=}"
+    if True:  # Keep this check for internal code compatibility
+        # Register the signal handler.
+        # The child processes will send SIGQUIT to this process when any error happens
+        # This process then clean up the whole process tree
+        # Note: This sigquit handler is used in the launch phase, and may be replaced by
+        # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
+        def launch_phase_sigquit_handler(signum, frame):
+            logger.error(
+                "Received sigquit from a child process. It usually means the child failed."
             )
+            kill_process_tree(os.getpid())
 
-    signal.signal(signal.SIGCHLD, sigchld_handler)
-
-    # Register the signal handler.
-    # The child processes will send SIGQUIT to this process when any error happens
-    # This process then clean up the whole process tree
-    def sigquit_handler(signum, frame):
-        logger.error(
-            "Received sigquit from a child process. It usually means the child failed."
-        )
-        kill_process_tree(os.getpid())
-
-    signal.signal(signal.SIGQUIT, sigquit_handler)
+        signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
@@ -635,7 +673,7 @@ def _set_envs_and_config(server_args: ServerArgs):
 
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: Optional[PortArgs] = None
-) -> Tuple[TokenizerManager, Dict]:
+) -> Tuple[TokenizerManager, TemplateManager, Dict]:
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """
@@ -656,11 +694,9 @@ def _launch_subprocesses(
 
     scheduler_procs = []
     if server_args.dp_size == 1:
-        # Launch tensor parallel scheduler processes
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
-
         scheduler_pipe_readers = []
 
         nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
@@ -684,6 +720,7 @@ def _launch_subprocesses(
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
+                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
                 proc = mp.Process(
                     target=run_scheduler_process,
                     args=(
@@ -691,11 +728,14 @@ def _launch_subprocesses(
                         port_args,
                         gpu_id,
                         tp_rank,
+                        moe_ep_rank,
                         pp_rank,
                         None,
                         writer,
+                        None,
                     ),
                 )
+
                 with memory_saver_adapter.configure_subprocess():
                     proc.start()
                 scheduler_procs.append(proc)
@@ -721,16 +761,18 @@ def _launch_subprocesses(
 
         if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
             # When using `Engine` as a Python API, we don't want to block here.
-            return None, None
+            return None, None, None
 
-        launch_dummy_health_check_server(server_args.host, server_args.port)
+        launch_dummy_health_check_server(
+            server_args.host, server_args.port, server_args.enable_metrics
+        )
 
         for proc in scheduler_procs:
             proc.join()
             logger.error(
                 f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
             )
-        return None, None
+        return None, None, None
 
     # Launch detokenizer process
     detoken_proc = mp.Process(
@@ -744,15 +786,15 @@ def _launch_subprocesses(
 
     # Launch tokenizer process
     tokenizer_manager = TokenizerManager(server_args, port_args)
-    if server_args.chat_template:
-        load_chat_template_for_openai_api(
-            tokenizer_manager, server_args.chat_template, server_args.model_path
-        )
-    else:
-        guess_chat_template_name_from_model_path(server_args.model_path)
 
-    if server_args.completion_template:
-        load_completion_template_for_openai_api(server_args.completion_template)
+    # Initialize templates
+    template_manager = TemplateManager()
+    template_manager.initialize_templates(
+        tokenizer_manager=tokenizer_manager,
+        model_path=server_args.model_path,
+        chat_template=server_args.chat_template,
+        completion_template=server_args.completion_template,
+    )
 
     # Wait for the model to finish loading
     scheduler_infos = []
@@ -776,4 +818,4 @@ def _launch_subprocesses(
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
-    return tokenizer_manager, scheduler_info
+    return tokenizer_manager, template_manager, scheduler_info

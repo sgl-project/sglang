@@ -227,7 +227,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
-            image_data_embedding_func=self.get_image_feature,
+            multimodal_model=self,
             language_model=self.language_model,
         )
 
@@ -253,16 +253,14 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 weights_loader = getattr(param, "weight_loader", default_weight_loader)
                 weights_loader(param, loaded_weight)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
-        helper = MultiModalityDataPaddingPatternMultimodalTokens(
-            [image_inputs.im_token_id]
-        )
-        return helper.pad_input_tokens(input_ids, image_inputs)
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]):
 
         images_spatial_crop = torch.cat(
-            [item.image_spatial_crop for item in items], dim=0
+            [item.images_spatial_crop for item in items], dim=0
         )
 
         assert images_spatial_crop.dim() == 3
@@ -270,9 +268,9 @@ class DeepseekVL2ForCausalLM(nn.Module):
         # TODO: can it be batched ?
         images_in_this_batch = []
         for item in items:
-            assert item.pixel_values.dim() == 4
+            assert item.feature.dim() == 4
             image_feature = self.vision.forward_features(
-                item.pixel_values.type(next(self.vision.parameters()).dtype).to(
+                item.feature.type(next(self.vision.parameters()).dtype).to(
                     device=next(self.vision.parameters()).device
                 )
             )
@@ -280,8 +278,8 @@ class DeepseekVL2ForCausalLM(nn.Module):
             _, hw, n_dim = images_embeds.shape
             h = w = int(hw**0.5)
             tile_index = 0
-            for jdx in range(item.image_spatial_crop.shape[1]):
-                num_width_tiles, num_height_tiles = item.image_spatial_crop[0, jdx]
+            for jdx in range(item.images_spatial_crop.shape[1]):
+                num_width_tiles, num_height_tiles = item.images_spatial_crop[0, jdx]
                 if num_width_tiles == 0 or num_height_tiles == 0:
                     break
                 num_tiles_in_image = num_width_tiles * num_height_tiles

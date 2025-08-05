@@ -1,11 +1,13 @@
 import logging
+import threading
+import time
 from abc import ABC
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 try:
     import torch_memory_saver
 
-    _primary_memory_saver = torch_memory_saver.TorchMemorySaver()
+    _memory_saver = torch_memory_saver.torch_memory_saver
     import_error = None
 except ImportError as e:
     import_error = e
@@ -38,13 +40,13 @@ class TorchMemorySaverAdapter(ABC):
     def configure_subprocess(self):
         raise NotImplementedError
 
-    def region(self):
+    def region(self, tag: str):
         raise NotImplementedError
 
-    def pause(self):
+    def pause(self, tag: str):
         raise NotImplementedError
 
-    def resume(self):
+    def resume(self, tag: str):
         raise NotImplementedError
 
     @property
@@ -53,21 +55,23 @@ class TorchMemorySaverAdapter(ABC):
 
 
 class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
+    """Adapter for TorchMemorySaver with tag-based control"""
+
     def configure_subprocess(self):
         return torch_memory_saver.configure_subprocess()
 
-    def region(self):
-        return _primary_memory_saver.region()
+    def region(self, tag: str):
+        return _memory_saver.region(tag=tag)
 
-    def pause(self):
-        return _primary_memory_saver.pause()
+    def pause(self, tag: str):
+        return _memory_saver.pause(tag=tag)
 
-    def resume(self):
-        return _primary_memory_saver.resume()
+    def resume(self, tag: str):
+        return _memory_saver.resume(tag=tag)
 
     @property
     def enabled(self):
-        return _primary_memory_saver.enabled
+        return _memory_saver is not None and _memory_saver.enabled
 
 
 class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
@@ -76,13 +80,13 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
         yield
 
     @contextmanager
-    def region(self):
+    def region(self, tag: str):
         yield
 
-    def pause(self):
+    def pause(self, tag: str):
         pass
 
-    def resume(self):
+    def resume(self, tag: str):
         pass
 
     @property

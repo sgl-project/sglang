@@ -27,8 +27,7 @@ from tqdm import tqdm
 class EvalArgs:
     seed: int = 42
     split: str = "validation"
-    # Default setting to make the benchmark available on A100 for most 7B models
-    image_pixels_limit: int = 4300000
+    image_pixels_limit: int = -1
     result_filename: str = ""
     prompt_format_file: str = "prompt_format.yaml"
     dataset_path: str = "MMMU/MMMU"
@@ -36,17 +35,22 @@ class EvalArgs:
     profile: bool = False
     profile_number: int = 5
     concurrency: int = 1
+    lora_path: Optional[str] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument(
-            "--result-filename", type=str, default=EvalArgs.result_filename
+            "--result-filename",
+            type=str,
+            default=EvalArgs.result_filename,
+            help="The filename to save the evaluation results.",
         )
-
         parser.add_argument(
-            "--image-pixels-limit", type=int, default=EvalArgs.image_pixels_limit
+            "--image-pixels-limit",
+            type=int,
+            default=EvalArgs.image_pixels_limit,
+            help="The maximum number of pixels allowed for an image. If an image exceeds this limit, it will be skipped during evaluation.",
         )
-
         parser.add_argument(
             "--dataset-path",
             type=str,
@@ -59,7 +63,12 @@ class EvalArgs:
             type=str,
             help="The path to the prompt format of mmmu. If not, a default format llava_config.yaml will be used",
         )
-        parser.add_argument("--split", type=str, default=EvalArgs.split)
+        parser.add_argument(
+            "--split",
+            type=str,
+            default=EvalArgs.split,
+            help='Split of the dataset to use for evaluation. Default is "validation".',
+        )
         parser.add_argument(
             "--extra-request-body",
             metavar='{"key1": "value1", "key2": "value2"}',
@@ -72,9 +81,23 @@ class EvalArgs:
             "--profile", action="store_true", help="enable mmmu profile"
         )
         parser.add_argument(
-            "--profile-number", type=int, default=EvalArgs.profile_number
+            "--profile-number",
+            type=int,
+            default=EvalArgs.profile_number,
+            help="Number of samples to profile. If not set, will profile all samples.",
         )
-        parser.add_argument("--concurrency", type=int, default=EvalArgs.concurrency)
+        parser.add_argument(
+            "--concurrency",
+            type=int,
+            default=EvalArgs.concurrency,
+            help="Number of concurrent requests to make during evaluation. Default is 1, which means no concurrency.",
+        )
+        parser.add_argument(
+            "--lora-path",
+            type=str,
+            default=EvalArgs.lora_path,
+            help="Specify the LoRA path to use for evaluation. If specified, the value will be specified in the body of every request as `lora-path`.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -166,7 +189,7 @@ def prepare_samples(eval_args: EvalArgs):
         sample = construct_prompt(sample, eval_args.config)
         image = sample["image"]
         width, height = image.size
-        if width * height >= eval_args.image_pixels_limit:
+        if 0 < eval_args.image_pixels_limit <= width * height:
             return None, True
         # Use a unique identifier for the image path to avoid potential collisions if indices reset
         image_path = f"{images_path}/image_{sample['id']}.png"
@@ -192,6 +215,8 @@ def prepare_samples(eval_args: EvalArgs):
                 skip_count += 1
             elif sample:
                 samples.append(sample)
+
+    samples.sort(key=lambda x: x["final_input_prompt"])
 
     print(
         f"Skipping {skip_count} samples with large images, {round((float(skip_count) / len(dataset)) * 100, 2)}% of dataset"

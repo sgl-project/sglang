@@ -27,9 +27,8 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
-    dp_gather_partial,
-    dp_scatter,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_local_attention_dp_size,
@@ -41,6 +40,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -87,6 +87,7 @@ class Llama4MoE(nn.Module):
     def __init__(
         self,
         config: Llama4TextConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -104,14 +105,18 @@ class Llama4MoE(nn.Module):
             prefix=add_prefix("router", prefix),
         )
 
+        self.topk = TopK(
+            top_k=self.top_k,
+            renormalize=False,
+            custom_routing_function=Llama4MoE.custom_routing_function,
+        )
+
         self.experts = FusedMoE(
             num_experts=config.num_local_experts,
-            top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
-            custom_routing_function=Llama4MoE.custom_routing_function,
             intermediate_size=intermediate_size_moe,
+            layer_id=layer_id,
             reduce_results=False,
-            renormalize=False,
             quant_config=quant_config,
             apply_router_weight_on_input=True,
             prefix=add_prefix("experts", prefix),
@@ -148,10 +153,8 @@ class Llama4MoE(nn.Module):
         # router_scores: [num_tokens, num_experts]
         router_logits, _ = self.router(hidden_states)
         shared_out = self.shared_expert(hidden_states)
-        routed_out = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
+        topk_output = self.topk(hidden_states, router_logits)
+        routed_out = self.experts(hidden_states, topk_output)
         return shared_out, routed_out
 
     def _forward_core_shared_routed_overlap(self, hidden_states):
@@ -164,10 +167,8 @@ class Llama4MoE(nn.Module):
         with self.device_module.stream(alt_stream):
             # router_scores: [num_tokens, num_experts]
             router_logits, _ = self.router(hidden_states)
-            routed_out = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-            )
+            topk_output = self.topk(hidden_states, router_logits)
+            routed_out = self.experts(hidden_states, topk_output)
         self.device_module.current_stream().wait_stream(alt_stream)
 
         return shared_out, routed_out
@@ -240,13 +241,22 @@ class Llama4Attention(nn.Module):
             if self.use_qk_norm
             else None
         )
+
+        qkv_quant_config = quant_config
+        o_quant_config = quant_config
+        if quant_config and hasattr(quant_config, "ignore") and quant_config.ignore:
+            if add_prefix("q_proj", prefix) in quant_config.ignore:
+                qkv_quant_config = None
+            if add_prefix("o_proj", prefix) in quant_config.ignore:
+                o_quant_config = None
+
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
             head_size=self.head_dim,
             total_num_heads=self.total_num_heads,
             total_num_kv_heads=self.total_num_kv_heads,
             bias=bias,
-            quant_config=quant_config,
+            quant_config=qkv_quant_config,
             prefix=add_prefix("qkv_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -256,7 +266,7 @@ class Llama4Attention(nn.Module):
             input_size=self.total_num_heads * self.head_dim,
             output_size=hidden_size,
             bias=bias_o_proj,
-            quant_config=quant_config,
+            quant_config=o_quant_config,
             prefix=add_prefix("o_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -367,10 +377,14 @@ class Llama4DecoderLayer(nn.Module):
             bias_o_proj=False,
             prefix=add_prefix("self_attn", prefix),
         )
-        is_moe_layer = (layer_id + 1) % config.interleave_moe_layer_step == 0
+        self.config = config
+        is_moe_layer = self._is_moe_layer(layer_id)
+        is_previous_moe_layer = self._is_moe_layer(layer_id - 1)
+
         if is_moe_layer:
             self.feed_forward = Llama4MoE(
                 config=config,
+                layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("feed_forward", prefix),
             )
@@ -387,6 +401,24 @@ class Llama4DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=is_moe_layer,
+            is_previous_layer_sparse=is_previous_moe_layer,
+        )
+
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+        )
+
+    def _is_moe_layer(self, layer_id: int) -> bool:
+        if self.config.interleave_moe_layer_step == 0:
+            return self.config.num_local_experts > 0
+        return (layer_id + 1) % self.config.interleave_moe_layer_step == 0
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -394,57 +426,26 @@ class Llama4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if hidden_states.shape[0] == 0:
-            residual = hidden_states
-        else:
-            # Self Attention
-            if residual is None:
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+
+        if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
 
-        # Gather
-        if get_tensor_model_parallel_world_size() > 1:
-            # all gather and all reduce
-            if self.local_dp_size != 1:
-                if self.attn_tp_rank == 0:
-                    hidden_states += residual
-                hidden_states, local_hidden_states = (
-                    forward_batch.gathered_buffer,
-                    hidden_states,
-                )
-                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
-                dp_scatter(residual, hidden_states, forward_batch)
-                hidden_states = self.post_attention_layernorm(hidden_states)
-            else:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                hidden_states, residual = self.post_attention_layernorm(
-                    hidden_states, residual
-                )
-        else:
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
 
         # Fully Connected
         hidden_states = self.feed_forward(hidden_states, forward_batch)
-
-        # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
-        # Scatter
-        if self.local_dp_size != 1:
-            # important: forward batch.gathered_buffer is used both after scatter and after gather.
-            # be careful about this!
-            hidden_states, global_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            dp_scatter(hidden_states, global_hidden_states, forward_batch)
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
 
         return hidden_states, residual
 

@@ -33,7 +33,8 @@ class TestTwoBatchOverlap(unittest.TestCase):
                 "--dp",
                 "2",
                 "--enable-dp-attention",
-                "--enable-deepep-moe",
+                "--moe-a2a-backend",
+                "deepep",
                 "--deepep-mode",
                 "normal",
                 "--disable-cuda-graph",  # DeepEP normal does not support CUDA Graph
@@ -56,7 +57,7 @@ class TestTwoBatchOverlap(unittest.TestCase):
             },
         )
         print(f"{response.json()=}")
-        self.assertEquals(response.json()["text"], "5, 1+5=6")
+        self.assertEqual(response.json()["text"], "5, 1+5=6")
 
     def test_mmlu(self):
         args = SimpleNamespace(
@@ -122,7 +123,8 @@ class TestQwen3TwoBatchOverlap(TestTwoBatchOverlap):
                 "--dp",
                 "2",
                 "--enable-dp-attention",
-                "--enable-deepep-moe",
+                "--moe-a2a-backend",
+                "deepep",
                 "--deepep-mode",
                 "normal",
                 "--disable-cuda-graph",  # DeepEP normal does not support CUDA Graph
