@@ -973,7 +973,7 @@ def match_internvl(model_path: str):
     if re.search(r"internvl", model_path, re.IGNORECASE):
         return "internvl-2-5"
 
-
+@register_conv_template_matching_function
 def match_deepseek_janus_pro(model_path: str):
     if re.search(r"janus", model_path, re.IGNORECASE):
         return "janus-pro"

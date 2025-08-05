@@ -160,8 +160,6 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             video_grid_thw=getattr(ret, "video_grid_thw", None),
         )
         mrope_positions = mrope_positions.squeeze(1)
-        print(f"!!!DEBUG: mm_items: {mm_items}")
-        print(f"!!!DEBUG: mrope_positions: {mrope_positions}")
 
         mm_inputs = {
             "input_ids": input_ids.tolist(),

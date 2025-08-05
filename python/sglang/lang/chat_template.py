@@ -516,11 +516,10 @@ register_chat_template(
             "assistant": ("<|assistant|>\n", "\n"),
         },
         style=ChatTemplateStyle.PLAIN,
-        stop_str=["<|user|>", "<|endoftext|>"],
-        image_token="<|begin_of_image|><|image|><|end_of_image|>",
+        stop_str=["<|user|>", "<|endoftext|>", "<|observation|>"],
+        image_token="<|image|>",
     )
 )
-
 
 @register_chat_template_matching_function
 def match_deepseek(model_path: str):
