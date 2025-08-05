@@ -6,19 +6,12 @@ from python.sglang.srt.layers.radix_attention import RadixAttention
 Support attention backend for TRTLLM MLA kernels from flashinfer.
 """
 
-import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional
 
 import torch
-import triton
 
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
-from sglang.srt.layers.attention.utils import (
-    TRITON_PAD_NUM_PAGE_PER_BLOCK,
-    create_flashinfer_kv_indices_triton,
-)
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 
@@ -88,7 +81,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
-        self.cuda_graph_kv_indices = None
+
+        # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
 
     def init_cuda_graph_state(
@@ -98,16 +92,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """Initialize CUDA graph state for TRTLLM MHA."""
-        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+        self.decode_cuda_graph_metadata = {
+            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            "page_table": torch.zeros(
+                max_bs,
+                (self.max_context_len + self.page_size - 1) // self.page_size,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "strided_indices": torch.arange(
+                0, self.max_context_len, self.page_size, device=self.device
+            ),
+        }
 
-        self.cuda_graph_kv_indices = torch.full(
-            (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
-        )
-        self.cuda_graph_workspace = torch.empty(
-            self.workspace_size, dtype=torch.int8, device=self.device
-        )
-
-    # todo: kv_indptr
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -119,33 +116,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         spec_info: Optional[SpecInfo],
     ):
         """Initialize metadata for CUDA graph capture."""
-        # Delegate to parent for non-decode modes or when speculative execution is used.
-        if not (forward_mode.is_decode_or_idle() and spec_info is None):
-            return super().init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                req_pool_indices,
-                seq_lens,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-            )
+        metadata = TRTLLMMHAMetadata()
 
-        # Custom fast-path for decode/idle without speculative execution.
-        max_seqlen_pad = self._calc_padded_blocks(seq_lens.max().item())
-        block_kv_indices = self.cuda_graph_kv_indices[:bs, :max_seqlen_pad]
+        # Get sequence information
+        metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
 
-        create_flashinfer_kv_indices_triton[(bs,)](
-            self.req_to_token,
-            req_pool_indices,
-            seq_lens,
-            None,
-            block_kv_indices,
-            self.req_to_token.shape[1],
-            PAGE_SIZE=self.page_size,
-        )
+        # Precompute maximum sequence length
+        metadata.max_seq_len_k = seq_lens.max().item()
 
-        metadata = TRTLLMMHAMetadata(self.cuda_graph_workspace, block_kv_indices)
+        # Precompute page table
+        metadata.page_table = self.decode_cuda_graph_metadata["page_table"][:bs, :]
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
@@ -161,32 +141,25 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         """Replay CUDA graph with new inputs."""
-        # Delegate to parent for non-decode modes or when speculative execution is used.
-        if not (forward_mode.is_decode_or_idle() and spec_info is None):
-            return super().init_forward_metadata_replay_cuda_graph(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-                seq_lens_cpu,
-            )
+        seq_lens = seq_lens[:bs]
+        seq_lens_cpu = seq_lens_cpu[:bs]
+        req_pool_indices = req_pool_indices[:bs]
+        device = seq_lens.device
+        metadata = None
 
+        # Normal Decode
         metadata = self.decode_cuda_graph_metadata[bs]
+        max_len = seq_lens_cpu.max().item()
+        max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+        metadata.max_seq_len_k = max_len
 
-        # Update block indices for new sequences.
-        # todo: kv_indptr
-        create_flashinfer_kv_indices_triton[(bs,)](
-            self.req_to_token,
-            req_pool_indices,
-            seq_lens,
-            None,
-            metadata.block_kv_indices,
-            self.req_to_token.shape[1],
-            PAGE_SIZE=self.page_size,
-        )
+        metadata.cache_seqlens_int32.copy_(seq_lens)
+        page_indices = self.req_to_token[
+            req_pool_indices[:, None],
+            self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages][None, :],
+        ]
+        metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
+        self.forward_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
@@ -284,6 +257,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             window_left=self.sliding_window_size,
+            # TODO: add attention_sink operation or nvfp4 scale factor if needed
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
