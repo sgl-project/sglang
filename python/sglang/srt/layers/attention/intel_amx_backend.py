@@ -145,88 +145,6 @@ class IntelAMXAttnBackend(AttentionBackend):
             start_q, start_kv = end_q, end_kv
         return output
 
-    def _run_sdpa_forward_decode(
-        self,
-        query: torch.Tensor,
-        output: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        req_to_token: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens=None,
-        scaling=None,
-        enable_gqa=False,
-        causal=False,
-        is_cross_attn=False,
-    ):
-        """Run the decode forward by using torch native sdpa op.
-
-        Args:
-            query: [num_tokens, num_heads, head_size]
-            output: [num_tokens, num_heads, head_size]
-            k_cache: [max_total_num_tokens, num_heads, head_size]
-            v_cache: [max_total_num_tokens, num_heads, head_size]
-            req_to_token: [max_num_reqs, max_context_len],
-            req_pool_indices: [num_seqs],
-            seq_lens: [num_seqs]
-            encoder_lens: [num_seqs] or None
-            scaling: float or None
-            enable_gqa: bool
-            causal: bool
-            is_cross_attn: bool
-
-        Returns:
-            output: [num_tokens, num_heads, head_size]
-        """
-
-        # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
-        query = query.movedim(0, query.dim() - 2)
-
-        start_q, start_kv = 0, 0
-        for seq_idx in range(seq_lens.shape[0]):
-            # TODO: this loop process a sequence per iter, this is inefficient.
-            # Need optimize the performance later.
-
-            seq_len_q = 1
-            seq_len_kv = seq_lens[seq_idx]
-            end_q = start_q + seq_len_q
-            if encoder_lens is not None:
-                start_kv = 0 if is_cross_attn else encoder_lens[seq_idx]
-                end_kv = (
-                    encoder_lens[seq_idx] if is_cross_attn else start_kv + seq_len_kv
-                )
-            else:
-                start_kv = 0
-                end_kv = start_kv + seq_len_kv
-
-            per_req_query = query[:, start_q:end_q, :]
-
-            # get key and value from cache. per_req_tokens contains the kv cache
-            # index for each token in the sequence.
-
-            req_pool_idx = req_pool_indices[seq_idx]
-            per_req_tokens = req_to_token[req_pool_idx, start_kv:end_kv]
-            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
-            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
-
-            per_req_out = (
-                scaled_dot_product_attention(
-                    per_req_query.unsqueeze(0),
-                    per_req_key.unsqueeze(0),
-                    per_req_value.unsqueeze(0),
-                    enable_gqa=enable_gqa,
-                    scale=scaling,
-                    is_causal=causal,
-                )
-                .squeeze(0)
-                .movedim(query.dim() - 2, 0)
-            )
-            output[start_q:end_q, :, :] = per_req_out
-            start_q, start_kv = end_q, end_kv
-
-        return output
-
     def forward_extend(
         self,
         q,
@@ -315,45 +233,23 @@ class IntelAMXAttnBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
-        if k is not None:
-            assert v is not None
-            self.decode_attention_fwd(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                k,
-                v,
-                cache_loc,
-                attn_logits,
-                forward_batch.req_to_token_pool.req_to_token,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                layer.scaling,
-                layer.logit_cap,
-                forward_batch.encoder_lens,
-            )
-        else:
-            use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
-
-            q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-            o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-
-            self._run_sdpa_forward_decode(
-                q_,
-                o_,
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                forward_batch.req_to_token_pool.req_to_token,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=forward_batch.encoder_lens,
-                scaling=layer.scaling,
-                enable_gqa=use_gqa,
-                causal=False,
-                is_cross_attn=layer.is_cross_attention,
-            )
-
+        self.decode_attention_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            k,
+            v,
+            cache_loc,
+            attn_logits,
+            forward_batch.req_to_token_pool.req_to_token,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            layer.scaling,
+            layer.logit_cap,
+            layer.is_cross_attention,
+            forward_batch.encoder_lens,
+        )
         return o
 
     def support_triton(self):

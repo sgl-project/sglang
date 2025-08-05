@@ -886,6 +886,7 @@ void decode_attention_kernel_impl(
     int64_t max_num_reqs,
     int64_t max_context_len,
     int64_t max_total_num_tokens,
+    bool is_cross_attn,
     bool has_encoder_lens) {
   using Vec = at::vec::Vectorized<float>;
 
@@ -910,9 +911,9 @@ void decode_attention_kernel_impl(
       const scalar_t* __restrict__ q_ptr = query + bs * q_strideM + head_id * q_strideH;
 
       // get key/value
-      int64_t seq_len_kv = seq_lens[bs];
+      int64_t seq_len_kv = is_cross_attn ? encoder_lens[bs] : seq_lens[bs];
       int64_t req_pool_id = req_pool_indices[bs];
-      int64_t kv_offset = has_encoder_lens ? encoder_lens[bs] : 0;
+      int64_t kv_offset = (has_encoder_lens && (!is_cross_attn)) ? encoder_lens[bs] : 0;
       TORCH_CHECK(seq_len_kv <= max_context_len, "seq_len_kv out of scope!");
       TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
 
@@ -993,6 +994,8 @@ void decode_attention_kernel_impl(
         at::vec::map<float>([s](Vec out) { return out * Vec(s); }, v_prime, v_prime, head_size_v);
 
         v_prime[head_size_v] = m_prime + std::log(s_prime);
+      } else {
+        v_prime[head_size_v] = -std::numeric_limits<float>::infinity();
       }
 
       // move to the next index
@@ -1184,6 +1187,10 @@ void decode_attention_mla_kernel_impl(
               [s](Vec out) { return out * Vec(s); }, v_prime + h * l_stride1, v_prime + h * l_stride1, head_size_v);
           (v_prime + h * l_stride1)[head_size_v] = m_prime[h] + std::log(s_prime[h]);
         }
+      } else {
+        for (int64_t h = 0; h < h_size; ++h) {
+          (v_prime + h * l_stride1)[head_size_v] = -std::numeric_limits<float>::infinity();
+        }
       }
 
       // move to the next index
@@ -1224,6 +1231,7 @@ void decode_attention_grouped_kernel_impl(
     int64_t max_num_reqs,
     int64_t max_context_len,
     int64_t max_total_num_tokens,
+    bool is_cross_attn,
     bool has_encoder_lens) {
   using Vec = at::vec::Vectorized<float>;
 
@@ -1265,9 +1273,9 @@ void decode_attention_grouped_kernel_impl(
       // get query
       const scalar_t* __restrict__ q_ptr = query + bs * q_strideM + h_start * q_strideH;
 
-      int64_t seq_len_kv = seq_lens[bs];
+      int64_t seq_len_kv = is_cross_attn ? encoder_lens[bs] : seq_lens[bs];
       int64_t req_pool_id = req_pool_indices[bs];
-      int64_t kv_offset = has_encoder_lens ? encoder_lens[bs] : 0;
+      int64_t kv_offset = (has_encoder_lens && (!is_cross_attn)) ? encoder_lens[bs] : 0;
       TORCH_CHECK(seq_len_kv <= max_context_len, "seq_len_kv out of scope!");
       TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
 
@@ -1356,6 +1364,10 @@ void decode_attention_grouped_kernel_impl(
               [s](Vec out) { return out * Vec(s); }, v_prime + h * l_stride1, v_prime + h * l_stride1, head_size_v);
           (v_prime + h * l_stride1)[head_size_v] = m_prime[h] + std::log(s_prime[h]);
         }
+      } else {
+        for (int64_t h = 0; h < h_size; ++h) {
+          (v_prime + h * l_stride1)[head_size_v] = -std::numeric_limits<float>::infinity();
+        }
       }
 
       // move to the next index
@@ -1384,8 +1396,8 @@ void decode_attention_cpu(
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
     at::Tensor& output,
-    at::Tensor& key,
-    at::Tensor& value,
+    const std::optional<at::Tensor>& key,
+    const std::optional<at::Tensor>& value,
     at::Tensor& loc,
     at::Tensor& attn_logits,
     at::Tensor& req_to_token,
@@ -1393,6 +1405,7 @@ void decode_attention_cpu(
     at::Tensor& seq_lens,
     double sm_scale,
     double logit_cap,
+    bool is_cross_attn,
     std::optional<at::Tensor> encoder_lens) {
   RECORD_FUNCTION(
       "sgl-kernel::decode_attention_cpu",
@@ -1402,14 +1415,9 @@ void decode_attention_cpu(
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
-  // for MLA, key and value shares the same storage and value could be non-contiguous
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(value);
   CHECK_DIM(3, query);
   CHECK_DIM(3, k_buffer);
   CHECK_DIM(3, v_buffer);
-  CHECK_DIM(3, key);
-  CHECK_DIM(3, value);
   CHECK_DIM(1, loc);
 
   int64_t num_seqs = seq_lens.size(0);
@@ -1424,7 +1432,6 @@ void decode_attention_cpu(
 
   int64_t num_kv_splits = attn_logits.size(2);
 
-  CHECK_EQ(loc.numel(), num_seqs);
   CHECK_EQ(attn_logits.size(0), num_seqs);
   CHECK_EQ(attn_logits.size(1), num_heads);
   CHECK_EQ(attn_logits.size(3), head_size_v + 1);
@@ -1439,11 +1446,6 @@ void decode_attention_cpu(
   int64_t k_strideH = k_buffer.stride(1);
   int64_t v_strideN = v_buffer.stride(0);
   int64_t v_strideH = v_buffer.stride(1);
-  // strides for new key and value
-  int64_t nk_strideN = key.stride(0);
-  int64_t nk_strideH = key.stride(1);
-  int64_t nv_strideN = value.stride(0);
-  int64_t nv_strideH = value.stride(1);
 
   // check index data types
   const auto index_dtype = req_to_token.scalar_type();
@@ -1478,26 +1480,42 @@ void decode_attention_cpu(
   }
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "decode_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "decode_attention_indices", [&] {
-      // update the kv buffer
-      decode_set_kv_buffer(
-          (scalar_t*)k_buffer_data,
-          (scalar_t*)v_buffer_data,
-          key.data_ptr<scalar_t>(),
-          value.data_ptr<scalar_t>(),
-          loc.data_ptr<int64_t>(),
-          num_seqs,
-          num_heads_kv,
-          head_size,
-          head_size_v,
-          k_strideN,
-          k_strideH,
-          v_strideN,
-          v_strideH,
-          nk_strideN,
-          nk_strideH,
-          nv_strideN,
-          nv_strideH,
-          is_mla);
+      if (key.has_value()) {
+        TORCH_CHECK(value.has_value(), "key and value should have values at the same time")
+        CHECK_EQ(loc.numel(), num_seqs);
+        auto key_tensor = key.value();
+        auto value_tensor = value.value();
+        // for MLA, key and value shares the same storage and value could be non-contiguous
+        CHECK_LAST_DIM_CONTIGUOUS_INPUT(key_tensor);
+        CHECK_LAST_DIM_CONTIGUOUS_INPUT(value_tensor);
+        CHECK_DIM(3, key_tensor);
+        CHECK_DIM(3, value_tensor);
+        // strides for new key and value
+        int64_t nk_strideN = key_tensor.stride(0);
+        int64_t nk_strideH = key_tensor.stride(1);
+        int64_t nv_strideN = value_tensor.stride(0);
+        int64_t nv_strideH = value_tensor.stride(1);
+        // update the kv buffer
+        decode_set_kv_buffer(
+            (scalar_t*)k_buffer_data,
+            (scalar_t*)v_buffer_data,
+            key_tensor.data_ptr<scalar_t>(),
+            value_tensor.data_ptr<scalar_t>(),
+            loc.data_ptr<int64_t>(),
+            num_seqs,
+            num_heads_kv,
+            head_size,
+            head_size_v,
+            k_strideN,
+            k_strideH,
+            v_strideN,
+            v_strideH,
+            nk_strideN,
+            nk_strideH,
+            nv_strideN,
+            nv_strideH,
+            is_mla);
+      }
 
       if (num_heads == num_heads_kv) {
         // MHA
@@ -1527,6 +1545,7 @@ void decode_attention_cpu(
             max_num_reqs,
             max_context_len,
             max_total_num_tokens,
+            is_cross_attn,
             has_encoder_lens);
       } else if (is_mla) {
         // MLA
@@ -1586,6 +1605,7 @@ void decode_attention_cpu(
             max_num_reqs,
             max_context_len,
             max_total_num_tokens,
+            is_cross_attn,
             has_encoder_lens);
       }
     });

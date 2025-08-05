@@ -68,7 +68,9 @@ class TestDecodeAttention(CustomTestCase):
 
         return output
 
-    def _test_grouped_decode_attention_once(self, B, H_Q, H_KV, D, D_V, device):
+    def _test_grouped_decode_attention_once(
+        self, B, H_Q, H_KV, D, D_V, is_cross_attn, device
+    ):
         dtype = torch.bfloat16
         # This represents the number of tokens already in the sequence
         seq_len = 1024
@@ -105,7 +107,7 @@ class TestDecodeAttention(CustomTestCase):
         )
         b_req_idx = torch.arange(B, device=device).to(torch.int64)
         b_seq_len = torch.full((B,), seq_len, device=device).to(torch.int64)
-        encoder_lens = torch.randint(0, encoder_len, (B,)).to(torch.int64)
+        encoder_lens = torch.full((B,), encoder_len, device=device).to(torch.int64)
 
         attn_logits = torch.empty(
             (B, H_Q, num_kv_splits, D_V + 1),
@@ -124,8 +126,8 @@ class TestDecodeAttention(CustomTestCase):
             k_buffer,
             v_buffer,
             o,
-            key,
-            value,
+            key if not is_cross_attn else None,
+            value if not is_cross_attn else None,
             loc,
             attn_logits,
             req_to_token,
@@ -133,6 +135,7 @@ class TestDecodeAttention(CustomTestCase):
             b_seq_len,
             sm_scale,
             logit_cap,
+            is_cross_attn,
             encoder_lens,
         )
 
@@ -147,8 +150,8 @@ class TestDecodeAttention(CustomTestCase):
             scaling=sm_scale,
             enable_gqa=enable_gqa,
             encoder_lens=encoder_lens,
+            is_cross_attn=is_cross_attn,
         )
-
         cos_sim = torch.nn.functional.cosine_similarity(
             o.flatten(), o_grouped.flatten(), dim=0
         )
@@ -172,7 +175,10 @@ class TestDecodeAttention(CustomTestCase):
 
         for B, H_Q, H_KV, D, D_V in configs:
             self._test_grouped_decode_attention_once(
-                B, H_Q, H_KV, D, D_V, device=device
+                B, H_Q, H_KV, D, D_V, False, device=device
+            )
+            self._test_grouped_decode_attention_once(
+                B, H_Q, H_KV, D, D_V, True, device=device
             )
 
     def test_grouped_decode_attention(self):
