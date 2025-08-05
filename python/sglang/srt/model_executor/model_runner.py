@@ -968,8 +968,6 @@ class ModelRunner:
         else:
             num_layers = self.num_effective_layers
         if self.use_mla_backend:
-            # FIXME: pipeline parallelism is not compatible with mla backend
-            assert self.pp_size == 1
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
                 * num_layers
