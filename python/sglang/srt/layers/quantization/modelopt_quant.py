@@ -776,7 +776,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # GEMM 1
         w13_weight = ModelWeightParameter(
             data=torch.empty(
-                layer.local_num_experts,
+                layer.num_local_experts,
                 2 * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,

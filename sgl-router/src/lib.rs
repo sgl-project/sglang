@@ -19,7 +19,7 @@ pub enum PolicyType {
     Random,
     RoundRobin,
     CacheAware,
-    PowerOfTwo, // Moved from PD-specific, now shared
+    PowerOfTwo,
 }
 
 #[pyclass]
@@ -45,7 +45,6 @@ struct Router {
     selector: HashMap<String, String>,
     service_discovery_port: u16,
     service_discovery_namespace: Option<String>,
-    // PD service discovery fields
     prefill_selector: HashMap<String, String>,
     decode_selector: HashMap<String, String>,
     bootstrap_port_annotation: String,
@@ -53,14 +52,11 @@ struct Router {
     prometheus_host: Option<String>,
     request_timeout_secs: u64,
     request_id_headers: Option<Vec<String>>,
-    // PD mode flag
     pd_disaggregation: bool,
-    // PD-specific fields (only used when pd_disaggregation is true)
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
     prefill_policy: Option<PolicyType>,
     decode_policy: Option<PolicyType>,
-    // Additional server config fields
     max_concurrent_requests: usize,
     cors_allowed_origins: Vec<String>,
 }
@@ -150,6 +146,7 @@ impl Router {
             request_id_headers: self.request_id_headers.clone(),
             max_concurrent_requests: self.max_concurrent_requests,
             cors_allowed_origins: self.cors_allowed_origins.clone(),
+            retry: config::RetryConfig::default(),
         })
     }
 }
@@ -289,7 +286,6 @@ impl Router {
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
-                // PD mode configuration
                 pd_mode: self.pd_disaggregation,
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
