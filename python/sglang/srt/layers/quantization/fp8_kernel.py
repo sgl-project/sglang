@@ -1356,3 +1356,49 @@ def per_token_group_quant_fp8_hopper_moe_mn_major(
         expert_tokens_alignment,
     )
     return a_q, sfa
+
+
+@triton.jit
+def _per_group_transpose(
+    data_ptr: torch.Tensor,
+    trans_data_ptr: torch.Tensor,
+    m_indices: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    k: int,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    expert_id = tl.load(m_indices + token_id)
+    expert_offset = tl.load(expert_offsets + expert_id)
+    next_expert_offset = tl.load(expert_offsets + expert_id + 1)
+    data_start_ptr = data_ptr + expert_offset * k
+    trans_data_start_ptr = trans_data_ptr + expert_offset * k
+    num_tokens_of_expert = next_expert_offset - expert_offset
+    x_off = token_id - expert_offset
+
+    for start_offset in tl.range(0, k, BLOCK_SIZE):
+        y_off = start_offset + tl.arange(0, BLOCK_SIZE)
+        mask = y_off < k
+        data = tl.load(data_start_ptr + x_off * k + y_off, mask=mask)
+        tl.store(
+            trans_data_start_ptr + x_off + y_off * num_tokens_of_expert, data, mask=mask
+        )
+
+
+def per_group_transpose(
+    a: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    m_indices: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    assert a.dim() == 2
+    assert a.is_contiguous(), "`a` is not contiguous"
+
+    m, k = a.size()
+    trans_a = torch.empty_like(a)
+    if m_indices is None:
+        m_indices = torch.zeros(m, dtype=torch.int64, device=expert_offsets.device)
+        num_experts = expert_offsets.size(0) - 1
+        for i in range(num_experts):
+            m_indices[expert_offsets[i] : expert_offsets[i + 1]].fill_(i)
+    _per_group_transpose[(m,)](a, trans_a, m_indices, expert_offsets, k, 32)
+    return trans_a
