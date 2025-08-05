@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
@@ -765,8 +764,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
         # TODO(ch-wan): check if this is needed
-        layer.num_experts = num_experts * get_moe_expert_parallel_world_size()
-        layer.num_local_experts = num_experts
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.params_dtype = params_dtype
         layer.quant_config = self.quant_config
