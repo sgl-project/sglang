@@ -802,6 +802,15 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
 
         # Used to track and store by the Mamba cache between steps.
         self.mamba_cache: Optional[MambaCacheManager] = None
+    
+    def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
+        self.init_mamba_cache_once()
+        return self.mamba_cache.copy_inputs_before_cuda_graphs(
+            input_buffers, **kwargs)
+
+    def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
+        self.init_mamba_cache_once()
+        return self.mamba_cache.get_seqlen_agnostic_capture_inputs(batch_size)
 
     def _get_linear_cache_shape(self) -> Tuple[Tuple[int, int], Tuple[int, int]]:
         config = self.config
@@ -851,6 +860,34 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         )
         return conv_state_shape, temporal_state_shape
     
+    def init_mamba_cache_once(self):
+        if self.mamba_cache is not None:
+            return
+        layers_block_type_value = self.config.layers_block_type
+        if self.config.hybrid_linear_attention:
+            num_mamba_layers = sum(type_value == HybridLayerType.linear_attention.value for type_value in layers_block_type_value)
+            conv_state_shape, temporal_state_shape = self._get_linear_cache_shape()
+        else:
+            num_mamba_layers = sum(type_value == HybridLayerType.mamba2.value for type_value in layers_block_type_value)
+            conv_state_shape, temporal_state_shape = self._get_mamba_cache_shape()
+        self.mamba_cache = MambaCacheManager(
+            self.lm_head.weight.dtype, num_mamba_layers,
+            conv_state_shape, temporal_state_shape)
+
+    def prepare_extend_start_loc(self, forward_batch: ForwardBatch):
+        # extend_start_loc shape is batch_size, while hybrid attention need batch_size + 1
+        # ugly code, but works :)
+        input_ids = forward_batch.input_ids
+        if forward_batch.extend_start_loc is not None:
+            extend_start_loc = torch.cat([forward_batch.extend_start_loc,
+                                                            torch.tensor([input_ids.shape[0]], dtype=torch.int32,
+                                                                        device=input_ids.device)],
+                                                            dim=0)
+        else:
+            extend_start_loc = torch.arange(
+                input_ids.shape[0] + 1, dtype=torch.int32, device=input_ids.device)
+        return extend_start_loc
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -859,27 +896,7 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        # extend_start_loc shape is batch_size, while hybrid attention need batch_size + 1
-        if forward_batch.extend_start_loc is not None:
-            forward_batch.extend_start_loc = torch.cat([forward_batch.extend_start_loc,
-                                                            torch.tensor([input_ids.shape[0]], dtype=torch.int32,
-                                                                        device=input_ids.device)],
-                                                            dim=0)
-        else:
-            forward_batch.extend_start_loc = torch.arange(
-                input_ids.shape[0] + 1, dtype=torch.int32, device=input_ids.device)
-
-        if self.mamba_cache is None:
-            layers_block_type_value = self.config.layers_block_type
-            if self.config.hybrid_linear_attention:
-                num_mamba_layers = sum(type_value == HybridLayerType.linear_attention.value for type_value in layers_block_type_value)
-                conv_state_shape, temporal_state_shape = self._get_linear_cache_shape()
-            else:
-                num_mamba_layers = sum(type_value == HybridLayerType.mamba2.value for type_value in layers_block_type_value)
-                conv_state_shape, temporal_state_shape = self._get_mamba_cache_shape()
-            self.mamba_cache = MambaCacheManager(
-                self.lm_head.weight.dtype, num_mamba_layers,
-                conv_state_shape, temporal_state_shape)
+        self.init_mamba_cache_once()
 
         mamba_cache_params = self.mamba_cache.current_run_tensors(**kwargs)
 
