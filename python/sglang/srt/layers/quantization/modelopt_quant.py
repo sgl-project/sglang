@@ -1107,7 +1107,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer.w13_weight_scale,
             )
 
-            print("Applied flashinfer weight processing for both w13 and w2")
+            logger.info_once("Applied flashinfer weight processing for both w13 and w2")
 
         else:
             # CUTLASS processing - handle w13 and w2 separately
@@ -1127,7 +1127,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
             # Both flashinfer cutlass and regular cutlass use same processing for w2
-            print("Applied weight processing for both w13 and w2")
+            logger.info_once("Applied weight processing for both w13 and w2")
 
             # Set up CUTLASS MoE parameters
             device = layer.w13_weight.device
