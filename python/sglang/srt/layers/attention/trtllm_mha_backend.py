@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from python.sglang.srt.layers.radix_attention import RadixAttention
+
 """
 Support attention backend for TRTLLM MLA kernels from flashinfer.
 """
@@ -11,10 +13,10 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 import triton
 
-from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
+from sglang.srt.layers.attention.flashinfer_backend import FlashinferAttnBackend
 from sglang.srt.layers.attention.utils import (
     TRITON_PAD_NUM_PAGE_PER_BLOCK,
-    create_flashmla_kv_indices_triton,
+    create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -41,15 +43,15 @@ TRTLLM_BLOCK_CONSTRAINT = 128
 
 
 @dataclass
-class TRTLLMMLADecodeMetadata:
-    """Metadata for TRTLLM MLA decode operations."""
+class TRTLLMMHADecodeMetadata:
+    """Metadata for TRTLLM MHA decode operations."""
 
     workspace: Optional[torch.Tensor] = None
     block_kv_indices: Optional[torch.Tensor] = None
 
 
-class TRTLLMMLABackend(FlashInferMLAAttnBackend):
-    """TRTLLM MLA attention kernel from flashinfer."""
+class TRTLLMHAAttnBackend(FlashinferAttnBackend):
+    """TRTLLM MHA attention kernel from flashinfer."""
 
     def __init__(
         self,
@@ -67,12 +69,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.num_kv_heads = config.get_num_kv_heads(get_attention_tp_size())
         self.num_local_heads = config.num_attention_heads // get_attention_tp_size()
 
-        # MLA-specific dimensions
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
-        self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        # MHA-specific dimensions
+        self.max_context_len = model_runner.model_config.context_len
+        self.sliding_window_size = model_runner.sliding_window_size
+        self.hidden_size = config.hidden_size
 
         # Runtime parameters
         self.scaling = config.scaling
@@ -90,7 +90,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
         self.cuda_graph_kv_indices = None
-        self.forward_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
+        self.forward_metadata: Union[TRTLLMMHADecodeMetadata, None] = None
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -139,7 +139,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             (batch_size, max_blocks), -1, dtype=torch.int32, device=device
         )
 
-        create_flashmla_kv_indices_triton[(batch_size,)](
+        create_flashinfer_kv_indices_triton[(batch_size,)](
             self.req_to_token,
             req_pool_indices,
             seq_lens,
@@ -159,7 +159,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
-        """Initialize CUDA graph state for TRTLLM MLA."""
+        """Initialize CUDA graph state for TRTLLM MHA."""
         max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
 
         self.cuda_graph_kv_indices = torch.full(
@@ -169,6 +169,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.workspace_size, dtype=torch.int8, device=self.device
         )
 
+    # todo: kv_indptr
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -196,19 +197,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         max_seqlen_pad = self._calc_padded_blocks(seq_lens.max().item())
         block_kv_indices = self.cuda_graph_kv_indices[:bs, :max_seqlen_pad]
 
-        create_flashmla_kv_indices_triton[(bs,)](
+        create_flashinfer_kv_indices_triton[(bs,)](
             self.req_to_token,
             req_pool_indices,
             seq_lens,
             None,
             block_kv_indices,
-            self.req_to_token.stride(0),
-            max_seqlen_pad,
-            NUM_PAGE_PER_BLOCK=TRITON_PAD_NUM_PAGE_PER_BLOCK,
-            PAGED_SIZE=self.page_size,
+            self.req_to_token.shape[1],
+            PAGE_SIZE=self.page_size,
         )
 
-        metadata = TRTLLMMLADecodeMetadata(self.cuda_graph_workspace, block_kv_indices)
+        metadata = TRTLLMMHADecodeMetadata(self.cuda_graph_workspace, block_kv_indices)
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
@@ -240,16 +239,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         metadata = self.decode_cuda_graph_metadata[bs]
 
         # Update block indices for new sequences.
-        create_flashmla_kv_indices_triton[(bs,)](
+        # todo: kv_indptr
+        create_flashinfer_kv_indices_triton[(bs,)](
             self.req_to_token,
-            req_pool_indices[:bs],
-            seq_lens[:bs],
+            req_pool_indices,
+            seq_lens,
             None,
             metadata.block_kv_indices,
-            self.req_to_token.stride(0),
-            metadata.block_kv_indices.shape[1],
-            NUM_PAGE_PER_BLOCK=TRITON_PAD_NUM_PAGE_PER_BLOCK,
-            PAGED_SIZE=self.page_size,
+            self.req_to_token.shape[1],
+            PAGE_SIZE=self.page_size,
         )
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
@@ -274,6 +272,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             max_seq = forward_batch.seq_lens.max().item()
 
         max_seqlen_pad = self._calc_padded_blocks(max_seq)
+        # todo: kv_indptr
         block_kv_indices = self._create_block_kv_indices(
             bs,
             max_seqlen_pad,
@@ -282,10 +281,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             forward_batch.seq_lens.device,
         )
 
-        self.forward_metadata = TRTLLMMLADecodeMetadata(
+        self.forward_metadata = TRTLLMMHADecodeMetadata(
             self.workspace_buffer, block_kv_indices
         )
-        forward_batch.decode_trtllm_mla_metadata = self.forward_metadata
+        forward_batch.decode_trtllm_mha_metadata = self.forward_metadata
 
     def forward_decode(
         self,
@@ -295,49 +294,43 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
-        q_rope: Optional[torch.Tensor] = None,
-        k_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Run forward for decode using TRTLLM MLA kernel."""
+        """Run forward for decode using TRTLLM MHA kernel."""
         # Save KV cache if requested
-        if k is not None and save_kv_cache:
-            cache_loc = forward_batch.out_cache_loc
-            if k_rope is not None:
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, cache_loc, k, k_rope
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
+        if k is not None:
+            assert v is not None
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
-            elif v is not None:
-                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         # Prepare query tensor inline
-        if q_rope is not None:
-            # q contains NOPE part (v_head_dim)
-            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-            q_rope_reshaped = q_rope.view(
-                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
-            )
-            query = torch.cat([q_nope, q_rope_reshaped], dim=-1)
-        else:
-            # q already has both parts
-            query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        assert (
+            q.dim() == 3 and q.shape[1] == 1 and q.shape[2] == layer.head_dim
+        ), "q must be of shape [bs, 1, head_dim]"
 
-        # Ensure query has shape [bs, acc_q_len, num_q_heads, head_dim] when seq_len 1
-        if query.dim() == 3:
-            query = query.unsqueeze(1)
-
-        # Prepare KV cache inline
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        pages = k_cache.view(-1, self.page_size, self.kv_cache_dim)
-        # TRT-LLM expects single KV data with extra dimension
-        kv_cache = pages.unsqueeze(1)
+        # Prepare KV cache inline (num_blocks, 2, num_kv_heads, page_size, head_dim)
+        kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        assert (
+            kv_cache.dim() == 5
+            and kv_cache.shape[1] == 2
+            and kv_cache.shape[2] == self.num_kv_heads
+            and kv_cache.shape[3] == self.page_size
+            and kv_cache.shape[4] == layer.head_dim
+        ), "kv_cache must be of shape [num_blocks, 2, num_kv_heads, page_size, head_dim]"
 
         # Get metadata
         metadata = (
-            getattr(forward_batch, "decode_trtllm_mla_metadata", None)
+            getattr(forward_batch, "decode_trtllm_mha_metadata", None)
             or self.forward_metadata
         )
 
-        # Scale computation for TRTLLM MLA kernel:
+        # Scale computation for TRTLLM MHA kernel:
         # - BMM1 scale = q_scale * k_scale * softmax_scale
         # - For FP16 path we keep q_scale = 1.0, softmax_scale = 1/sqrt(head_dim) which is pre-computed as layer.scaling
         # - k_scale is read from model checkpoint if available
@@ -352,21 +345,28 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         bmm1_scale = q_scale * k_scale * layer.scaling
 
         # Call TRT-LLM kernel
-        raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
-            query=query,
+        # raw_out: like q, [bs, acc_q_len, num_q_heads, head_dim] but with output dtype
+        raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=q,
             kv_cache=kv_cache,
             workspace_buffer=metadata.workspace,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=metadata.block_kv_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             max_seq_len=int(metadata.block_kv_indices.shape[1] * self.page_size),
             bmm1_scale=bmm1_scale,
+            bmm2_scale=1.0,
         )
 
-        # Extract value projection part and reshape
-        raw_out_v = raw_out[..., : layer.v_head_dim].contiguous()
-        output = raw_out_v.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return raw_out
 
-        return output
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+    ):
+        # todo(Yingyi): implement this
+        return None
