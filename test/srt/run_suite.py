@@ -86,6 +86,7 @@ suites = {
         TestFile("test_radix_attention.py", 105),
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_retract_decode.py", 54),
+        TestFile("test_request_queue_validation.py", 30),
         TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_engine.py", 261),
@@ -153,8 +154,14 @@ suites = {
         TestFile("test_rope_rocm.py", 3),
         TestFile("test_awq_dequant.py", 2),
     ],
-    "per-commit-npu": [
-        TestFile("test_ascend_attention_backend.py", 400),
+    "per-commit-1-ascend-npu": [
+        TestFile("test_ascend_tp1_bf16.py", 400),
+    ],
+    "per-commit-2-ascend-npu": [
+        TestFile("test_ascend_tp2_bf16.py", 400),
+    ],
+    "per-commit-4-ascend-npu": [
+        TestFile("test_ascend_mla_w8a8int8.py", 400),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),

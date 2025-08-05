@@ -12,7 +12,6 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
-from sglang.srt.managers.mm_utils import TransportProxyTensor
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import load_audio, load_image, load_video, logger
 
@@ -176,6 +175,8 @@ class BaseMultimodalProcessor(ABC):
             "image_grid_hws": Modality.IMAGE,
             "aspect_ratio_ids": Modality.IMAGE,
             "aspect_ratio_mask": Modality.IMAGE,
+            "num_patches": Modality.IMAGE,
+            "patch_pixel_values": Modality.IMAGE,
             # Audio-related attributes
             "audio_features": Modality.AUDIO,
             "audio_feature_lens": Modality.AUDIO,
@@ -192,7 +193,12 @@ class BaseMultimodalProcessor(ABC):
 
         # name of the feature filed
         # TODO: pass from processors
-        self.FEATURE_NAMES = ["pixel_values", "pixel_values_videos", "audio_features"]
+        self.FEATURE_NAMES = [
+            "pixel_values",
+            "pixel_values_videos",
+            "audio_features",
+            "input_features",
+        ]
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -211,8 +217,10 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["audio"] = audios
 
         processor = self._processor
-        if hasattr(processor, "image_processor") and isinstance(
-            processor.image_processor, BaseImageProcessorFast
+        if (
+            hasattr(processor, "image_processor")
+            and isinstance(processor.image_processor, BaseImageProcessorFast)
+            and not self.server_args.disable_fast_image_processor
         ):
             kwargs["device"] = "cuda"
         result = processor.__call__(
@@ -221,6 +229,13 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
+        # move feature tensors to cpu
+        for feature_name in self.FEATURE_NAMES:
+            if feature_name in result and isinstance(
+                result[feature_name], torch.Tensor
+            ):
+                result[feature_name] = result[feature_name].to("cpu")
+
         return result
 
     @abstractmethod
@@ -622,20 +637,5 @@ class BaseMultimodalProcessor(ABC):
                 input_ids=input_ids,
                 mm_token_id=mm_token_id,
             )
-
-        # post-process
-        for item in all_collected_items:
-            # replace the feature tensor with a proxy
-            if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                item.feature = TransportProxyTensor(
-                    transport_mode=self.transport_mode, data=item.feature
-                )
-            elif (
-                isinstance(item.precomputed_embeddings, torch.Tensor)
-                and item.precomputed_embeddings.is_cuda
-            ):
-                item.precomputed_embeddings = TransportProxyTensor(
-                    transport_mode=self.transport_mode, data=item.precomputed_embeddings
-                )
 
         return all_collected_items, input_ids, ret
