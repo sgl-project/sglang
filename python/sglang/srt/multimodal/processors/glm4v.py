@@ -43,21 +43,11 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         self.MIN_PIXELS = 112 * 112
         self.MAX_PIXELS = 30000 * 28 * 28 * 2
 
-        # Setup regex patterns
-        self.IMAGE_TOKEN_REGEX = re.compile(
-            r"<\|begin_of_image\|>(?:<\|image\|>)+<\|end_of_image\|>"
-        )
-        self.VIDEO_TOKEN_REGEX = re.compile(
-            r"<\|begin_of_video\|>(?:<\|video\|>)+<\|end_of_video\|>"
-        )
-
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.IMAGE_TOKEN,
             image_token_id=self.IM_TOKEN_ID,
-            image_token_regex=self.IMAGE_TOKEN_REGEX,
             video_token=self.VIDEO_TOKEN,
             video_token_id=self.VIDEO_TOKEN_ID,
-            video_token_regex=self.VIDEO_TOKEN_REGEX,
         ).build(_processor)
 
     def preprocess_video(self, vr: VideoReader):
