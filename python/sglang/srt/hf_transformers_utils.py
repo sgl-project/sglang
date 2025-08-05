@@ -177,6 +177,8 @@ def get_generation_config(
     except OSError as e:
         return None
 
+
+# Qwen-1M related
 def get_sparse_attention_config(
     model: str,
     sparse_attention_config_filename: str = "sparse_attention_config.json",

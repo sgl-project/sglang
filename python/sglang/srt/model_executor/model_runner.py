@@ -1472,7 +1472,7 @@ class ModelRunner:
                 DualChunkFlashAttentionBackend,
             )
 
-            self.attn_backend = DualChunkFlashAttentionBackend(self)
+            return DualChunkFlashAttentionBackend(self)
         else:
             raise ValueError(f"Invalid attention backend: {backend_str}")
 

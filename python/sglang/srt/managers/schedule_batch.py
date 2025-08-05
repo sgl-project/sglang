@@ -845,7 +845,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The sum of all sequence lengths
     seq_lens_sum: int = None
-    orig_seq_lens: torch.Tensor = None  # shape: [b], int64
+    # The original sequence lengths, Qwen-1M related
+    orig_seq_lens: torch.Tensor = None  # shape: [b], int32
 
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
@@ -1510,7 +1511,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.orig_seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
@@ -1909,7 +1910,7 @@ class ModelWorkerBatch:
     # Sampling info
     sampling_info: SamplingBatchInfo
 
-    # The original sequence lengths
+    # The original sequence lengths, Qwen-1M related
     orig_seq_lens: Optional[torch.Tensor] = None
 
     # The input Embeds

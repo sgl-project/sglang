@@ -306,7 +306,7 @@ class ModelConfig:
 
     def get_num_attention_heads(self, tensor_parallel_size) -> int:
         total_num_attention_heads = self.num_attention_heads
-        return total_num_attention_heads // tensor_parallel_size
+        return max(1, total_num_attention_heads // tensor_parallel_size)
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
