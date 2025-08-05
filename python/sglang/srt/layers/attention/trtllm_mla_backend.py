@@ -287,6 +287,38 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         forward_batch.decode_trtllm_mla_metadata = self.forward_metadata
 
+    def quantize_and_rope_for_fp8(self, q_nope, q_rope, k_nope, k_rope, forward_batch, cos_sin_cache) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        attn_dtype = torch.float8_e4m3fn
+        q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
+        q_out = q_rope.new_empty(
+            q_len,
+            num_heads,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            dtype=attn_dtype,
+        )
+
+        k_rope_out = k_rope.new_empty(k_rope.shape, dtype=attn_dtype)
+        k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
+
+        flashinfer.rope.mla_rope_quantize(
+            q_rope=q_rope,
+            k_rope=k_rope,
+            q_nope=q_nope,
+            k_nope=k_nope,
+            cos_sin_cache=cos_sin_cache,
+            pos_ids=forward_batch.positions,
+            is_neox=False,
+            quantize_dtype=attn_dtype,
+            q_rope_out=q_out[..., self.kv_lora_rank :],
+            k_rope_out=k_rope_out,
+            q_nope_out=q_out[..., : self.kv_lora_rank],
+            k_nope_out=k_nope_out,
+            quant_scale_q=1.0,
+            quant_scale_kv=1.0,
+        )
+
+        return q_out, k_nope_out, k_rope_out
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -297,27 +329,30 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         save_kv_cache: bool = True,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MLA kernel."""
+        merge_q = (q_rope is None)
+        if self.data_type == torch.float8_e4m3fn:
+            assert all(x is not None for x in [q_rope, k_rope, cos_sin_cache])
+            q, k, k_rope = self.quantize_and_rope_for_fp8(q, q_rope, k.squeeze(1), k_rope.squeeze(1), forward_batch, cos_sin_cache)
+            merge_q = False
+        
         # Save KV cache if requested
-        if k is not None and save_kv_cache:
+        if save_kv_cache:
+            assert k is not None and k_rope is not None
             cache_loc = forward_batch.out_cache_loc
-            if k_rope is not None:
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, cache_loc, k, k_rope
-                )
-            elif v is not None:
-                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                layer, cache_loc, k, k_rope
+            )
 
         # Prepare query tensor inline
-        if q_rope is not None:
-            # q contains NOPE part (v_head_dim)
+        if merge_q:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
 
-            # TODO: get rid of concat to improve perf
             query = torch.cat([q_nope, q_rope_reshaped], dim=-1)
         else:
             # q already has both parts
@@ -333,10 +368,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # TRT-LLM expects single KV data with extra dimension
         kv_cache = pages.unsqueeze(1)
 
-        # Quantize query to fp8 if kv is already set to fp8_e4m3 using --kv-cache-dtype fp8_e4m3
-        if query.dtype != k_cache.dtype:
-            query = query.to(k_cache.dtype)
-
         # Get metadata
         metadata = (
             getattr(forward_batch, "decode_trtllm_mla_metadata", None)
@@ -344,9 +375,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         # Scale computation for TRTLLM MLA kernel BMM1 operation:
-        #
         # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale
-        #
         # Scale components:
         # - q_scale: Query scaling factor (set to 1.0 for both FP16/FP8 paths)
         # - k_scale: Key scaling factor from model checkpoint (defaults to 1.0 if not available)
