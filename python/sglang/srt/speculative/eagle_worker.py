@@ -815,48 +815,12 @@ class EAGLEWorker(TpModelWorker):
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
-        # if forward_batch.contains_mm_inputs():
-        #     forward_batch.input_embeds = self.get_mm_embeds(forward_batch)
         forward_batch.return_logprob = False
         logits_output, _ = self.draft_model_runner.forward(forward_batch)
         self._detect_nan_if_needed(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
-
-    def get_mm_embeds(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """Get the input embeds for the draft model forward.
-
-        Args:
-            forward_batch: The forward batch to run.
-        Returns:
-            The input embeds for the draft model forward.
-        """
-        mm_inputs_list = [
-            mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
-        ]
-        extend_prefix_lens = [
-            prefix_len
-            for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
-            if forward_batch.mm_inputs[i] is not None
-        ]
-        extend_seq_lens = [
-            seq_len
-            for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
-            if forward_batch.mm_inputs[i] is not None
-        ]
-        inputs_embeds = embed_mm_inputs(
-            mm_inputs_list=mm_inputs_list,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_seq_lens=extend_seq_lens,
-            input_ids=forward_batch.input_ids,
-            input_embedding=self.target_worker.model_runner.model.model.get_input_embeddings(),
-            multimodal_model=self.target_worker.model_runner.model,
-            data_embedding_func_mapping=None,
-            placeholder_tokens=152063,
-        )
-        forward_batch.mm_inputs = None
-        return inputs_embeds
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         assert isinstance(batch.spec_info, EagleDraftInput)
