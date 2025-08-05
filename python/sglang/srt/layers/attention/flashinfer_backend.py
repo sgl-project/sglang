@@ -595,7 +595,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
 
 class FlashInferIndicesUpdaterDecode:
-    def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
+    def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
         self.num_qo_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -669,19 +669,26 @@ class FlashInferIndicesUpdaterDecode:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
+        assert self.sliding_window_size is not None
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # Sliding window attention
-                paged_kernel_lens_tmp = torch.minimum(  # TODO: replace this with clamp
-                    seq_lens,
-                    torch.tensor(self.sliding_window_size + 1),
+                paged_kernel_lens_tmp = torch.clamp(
+                    seq_lens, max=self.sliding_window_size + 1
                 )
-                paged_kernel_lens_sum_tmp = paged_kernel_lens_tmp.sum().item()
+                if seq_lens_cpu is not None:
+                    seq_lens_cpu_tmp = torch.clamp(
+                        seq_lens_cpu, max=self.sliding_window_size + 1
+                    )
+                    paged_kernel_lens_sum_tmp = seq_lens_cpu_tmp.sum().item()
+                else:
+                    paged_kernel_lens_sum_tmp = paged_kernel_lens_tmp.sum().item()
                 kv_start_idx_tmp = seq_lens - paged_kernel_lens_tmp
             else:
                 # Full attention
                 paged_kernel_lens_tmp = seq_lens
                 paged_kernel_lens_sum_tmp = seq_lens_sum
+                seq_lens_cpu_tmp = seq_lens_cpu
                 kv_start_idx_tmp = None
 
             use_sliding_window_kv_pool = wrapper_id == 0 and isinstance(
@@ -696,7 +703,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.kv_indptr[wrapper_id],
                 kv_start_idx_tmp,
                 spec_info,
-                seq_lens_cpu=seq_lens_cpu,
+                seq_lens_cpu=seq_lens_cpu_tmp,
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
             )
 
@@ -804,7 +811,7 @@ class FlashInferIndicesUpdaterDecode:
 
 
 class FlashInferIndicesUpdaterPrefill:
-    def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
+    def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
         self.num_qo_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
