@@ -160,8 +160,6 @@ class ChatCompletionSampler(SamplerBase):
                     max_tokens=self.max_tokens,
                 )
                 content = response.choices[0].message.content
-                # print(f"Message list: {message_list}")
-                # print(f"Response: {content}")
                 if content is None:
                     raise ValueError("OpenAI API returned empty response; retrying")
                 return SamplerResponse(
