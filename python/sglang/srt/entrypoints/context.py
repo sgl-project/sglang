@@ -11,25 +11,20 @@ from sglang.srt.entrypoints.harmony_utils import (
     parse_output_into_messages,
     render_for_completion,
 )
+from openai_harmony import Author, Message, Role, StreamState, TextContent
+
 
 if TYPE_CHECKING:
     # Avoid circular import.
     from sglang.srt.entrypoints.tool import Tool
 
 import json
-
 from openai_harmony import Author, Message, Role, StreamState, TextContent
+
 
 
 class ConversationContext(ABC):
 
-    @abstractmethod
-    def append_output(self, output) -> None:
-        pass
-
-    @abstractmethod
-    async def call_tool(self) -> list[Message]:
-        pass
 
     @abstractmethod
     def need_builtin_tool_call(self) -> bool:
@@ -185,7 +180,7 @@ class StreamingHarmonyContext(HarmonyContext):
         return self.parser.messages
 
     def append_output(self, output) -> None:
-        if isinstance(output, RequestOutput):
+        if hasattr(output, "outputs") and output.outputs:
             tok = output.outputs[0].token_ids[0]
             self.parser.process(tok)
             self.last_tok = tok

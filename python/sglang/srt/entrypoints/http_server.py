@@ -64,6 +64,11 @@ from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompl
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
+from sglang.srt.entrypoints.openai.tool_server import (
+    DemoToolServer,
+    MCPToolServer,
+    ToolServer,
+)
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -164,6 +169,14 @@ async def lifespan(fast_api_app: FastAPI):
 
         traceback.print_exc()
         logger.warning(f"Can not initialize OpenAIServingResponses, error: {e}")
+
+    if server_args.tool_server == "demo":
+        tool_server: Optional[ToolServer] = DemoToolServer()
+    elif server_args.tool_server:
+        tool_server = MCPToolServer()
+        await tool_server.add_tool_server(server_args.tool_server)
+    else:
+        tool_server = None
 
     server_args: ServerArgs = fast_api_app.server_args
     if server_args.warmups is not None:
