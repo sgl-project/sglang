@@ -63,7 +63,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     requantize_with_max_scale,
 )
-from sglang.srt.layers.utils import is_sm100_supported
+from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -619,7 +619,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if (
                 get_bool_env_var("SGLANG_CUTLASS_MOE")
                 and self.cutlass_fp8_supported
-                and is_sm100_supported()
+                and (is_sm100_supported() or is_sm90_supported())
             ):
                 self.ab_strides1 = torch.full(
                     (num_experts,),
@@ -1034,12 +1034,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             get_bool_env_var("SGLANG_CUTLASS_MOE")
             and self.cutlass_fp8_supported
             and self.block_quant
-            and is_sm100_supported()
+            and (is_sm100_supported() or is_sm90_supported())
         ):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             topk_weights, topk_ids, _ = topk_output
-            return cutlass_fused_experts_fp8(
+            output = cutlass_fused_experts_fp8(
                 x,
                 layer.w13_weight.transpose(1, 2),
                 layer.w2_weight.transpose(1, 2),
@@ -1062,6 +1062,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.problem_sizes2,
                 use_fp8_blockscale=True,
             )
+            # TODO: Fuse into select_experts
+            if routed_scaling_factor is not None:
+                output *= routed_scaling_factor
+            return output
         # Expert fusion with FP8 quantization
         return fused_experts(
             x,

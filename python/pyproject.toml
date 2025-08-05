@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.10.post1"
+version = "0.4.10.post2"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -60,7 +60,7 @@ srt = [
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.9rc2",
+    "flashinfer_python==0.2.9",
 ]
 
 blackwell = [
@@ -71,7 +71,7 @@ blackwell = [
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.9rc2",
+    "flashinfer_python==0.2.9",
     "tiktoken",
 ]
 
@@ -108,6 +108,7 @@ test = [
     "pandas",
     "peft",
     "sentence_transformers",
+    "pytest",
 ]
 all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[torch_memory_saver]", "sglang[decord]"]
 all_hip = ["sglang[srt_hip]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]

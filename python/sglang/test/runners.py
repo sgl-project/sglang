@@ -514,6 +514,7 @@ class SRTRunner:
         max_lora_rank: Optional[int] = None,
         lora_target_modules: Optional[List[str]] = None,
         enable_lora: Optional[bool] = None,
+        max_loaded_loras: Optional[int] = None,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -556,6 +557,7 @@ class SRTRunner:
             max_lora_rank=max_lora_rank,
             lora_target_modules=lora_target_modules,
             enable_lora=enable_lora,
+            max_loaded_loras=max_loaded_loras,
             **spec_kwargs,
         )
 
