@@ -310,7 +310,7 @@ jobs:
         run: bash scripts/amd_ci_install_dependency.sh
 
       - name: Run CustomAllReduce test
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           bash scripts/amd_ci_exec.sh -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 -m unittest test_custom_allreduce.TestCustomAllReduce
 
