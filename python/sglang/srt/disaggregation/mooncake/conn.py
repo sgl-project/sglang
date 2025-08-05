@@ -565,7 +565,7 @@ class MooncakeKVManager(BaseKVManager):
                 )
                 polls = []
                 dst_ranks_infos = []
-                local_rank = self.kv_args.engine_rank
+                local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -647,14 +647,18 @@ class MooncakeKVManager(BaseKVManager):
                             )
                             break
 
-                        if kv_chunk.is_last and self.pp_group.is_last_rank:
+                        if kv_chunk.is_last:
                             # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_aux_index,
-                                target_rank_registration_info.dst_aux_ptrs,
-                                req.dst_aux_index,
-                            )
+                            if self.pp_group.is_last_rank:
+                                # Only the last rank of pp need to send the aux data
+                                ret = self.send_aux(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_aux_index,
+                                    target_rank_registration_info.dst_aux_ptrs,
+                                    req.dst_aux_index,
+                                )
+                            else:
+                                ret = 0
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
@@ -1118,7 +1122,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size
             )
             self.required_dst_info_num = 1
-            self.required_prefill_response_num = 1 * self.kv_mgr.pp_size
+            self.required_prefill_response_num = 1 * self.prefill_pp_size
             self.target_tp_ranks = [self.target_tp_rank]
         elif self.kv_mgr.attn_tp_size > self.prefill_attn_tp_size:
             if not self.kv_mgr.is_mla_backend:
@@ -1131,7 +1135,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.required_dst_info_num = (
                 self.kv_mgr.attn_tp_size // self.prefill_attn_tp_size
             )
-            self.required_prefill_response_num = 1 * self.kv_mgr.pp_size
+            self.required_prefill_response_num = 1 * self.prefill_pp_size
             self.target_tp_ranks = [self.target_tp_rank]
         else:
             if not self.kv_mgr.is_mla_backend:
@@ -1156,7 +1160,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.required_dst_info_num = 1
             self.required_prefill_response_num = (
                 self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size
-            ) * self.kv_mgr.pp_size
+            ) * self.prefill_pp_size
 
         if self.data_parallel_rank is not None:
             logger.debug(f"Targeting DP rank: {self.data_parallel_rank}")
