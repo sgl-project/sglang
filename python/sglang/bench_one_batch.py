@@ -68,6 +68,8 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
+    DeepEPMode,
+    MoeA2ABackend,
     configure_logger,
     get_bool_env_var,
     kill_process_tree,
@@ -279,6 +281,11 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             speculative_num_draft_tokens=None,
+            enable_two_batch_overlap=model_runner.server_args.enable_two_batch_overlap,
+            enable_deepep_moe=MoeA2ABackend(
+                model_runner.server_args.moe_a2a_backend
+            ).is_deepep(),
+            deepep_mode=DeepEPMode(model_runner.server_args.deepep_mode),
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
             disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
         )
