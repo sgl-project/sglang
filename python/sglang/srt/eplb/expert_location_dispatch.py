@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 import numpy as np
+import nvtx
 import torch
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
@@ -34,7 +35,7 @@ class ExpertLocationDispatchInfo:
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
     # (num_logical_experts, X)
-    partial_logical_to_valid_physical_map: torch.Tensor
+    # partial_logical_to_valid_physical_map: torch.Tensor
     lp_metadata: Optional[dict[str, np.ndarray]]
 
     @classmethod
@@ -66,13 +67,13 @@ class ExpertLocationDispatchInfo:
                 layer_id, :
             ],
             num_physical_experts=expert_location_metadata.num_physical_experts,
-            partial_logical_to_valid_physical_map=expert_location_metadata.logical_to_all_physical_map[
-                layer_id,
-                :,
-                : expert_location_metadata.logical_to_all_physical_map_num_valid[
-                    layer_id, :
-                ].max(),
-            ],
+            # partial_logical_to_valid_physical_map=expert_location_metadata.logical_to_all_physical_map[
+            #     layer_id,
+            #     :,
+            #     : expert_location_metadata.logical_to_all_physical_map_num_valid[
+            #         layer_id, :
+            #     ].max(),
+            # ],
             lp_metadata=(
                 {
                     "B1": lp_metadata.B1[layer_id],
@@ -149,6 +150,7 @@ def _topk_ids_logical_to_physical_dynamic(
     topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
+    topk_ids = torch.ones_like(topk_ids, device=device)
     return topk_ids
 
 
@@ -171,43 +173,46 @@ def _topk_ids_logical_to_physical_probability(
     Returns:
         Physical expert IDs with same shape as topk_ids
     """
+    # nvtx.push_range("topk_ids_logical_to_physical_probability", color="green")
     topk_ids_original_shape = topk_ids.shape
     device = topk_ids.device
     topk_ids = topk_ids.flatten()
 
     # Get the mapping from logical to physical experts
-    log2phy_map = info.partial_logical_to_valid_physical_map
-    num_valid_physical = info.partial_logical_to_all_physical_map_num_valid
+    log2phy_map = info.partial_logical_to_all_physical_map
+    # num_valid_physical = info.partial_logical_to_all_physical_map_num_valid
 
     # Verify probability tensor has correct shape
-    expected_shape = log2phy_map.shape
-    if logical_expert_probabilities.shape != expected_shape:
-        raise ValueError(
-            f"Probability tensor shape {logical_expert_probabilities.shape} "
-            f"does not match expected shape {expected_shape}"
-        )
+    # expected_shape = log2phy_map.shape
+    # if logical_expert_probabilities.shape != expected_shape:
+    #     raise ValueError(
+    #         f"Probability tensor shape {logical_expert_probabilities.shape} "
+    #         f"does not match expected shape {expected_shape}"
+    #     )
     # Create mask for valid physical experts (-1 indicates invalid)
-    valid_mask = log2phy_map != -1
+    # valid_mask = log2phy_map != -1
 
-    # Zero out probabilities for invalid physical experts
-    masked_probabilities = logical_expert_probabilities * valid_mask
+    # # Zero out probabilities for invalid physical experts
+    # masked_probabilities = logical_expert_probabilities * valid_mask
 
-    topk_probs = masked_probabilities[topk_ids]
+    topk_probs = logical_expert_probabilities[topk_ids]
 
-    # Check for zero-sum probabilities and handle them
-    prob_sums = topk_probs.sum(dim=-1)
-    zero_sum_mask = prob_sums <= 0
+    # # # Check for zero-sum probabilities and handle them
+    # prob_sums = topk_probs.sum(dim=-1)
+    # zero_sum_mask = prob_sums <= 0
 
-    if zero_sum_mask.any():
-        # print(f"Warning: Found {zero_sum_mask.sum()} tokens with zero-sum probabilities. Assigning 1 to all values and reapplying mask.")
-        # For tokens with zero-sum probabilities, assign 1 to all values and reapply mask
-        topk_probs[zero_sum_mask] = 1.0
-        # Reapply the mask to zero out invalid experts
-        topk_probs = topk_probs * valid_mask[topk_ids]
+    # if zero_sum_mask.any():
+    #     # print(f"Warning: Found {zero_sum_mask.sum()} tokens with zero-sum probabilities. Assigning 1 to all values and reapplying mask.")
+    #     # For tokens with zero-sum probabilities, assign 1 to all values and reapply mask
+    #     topk_probs[zero_sum_mask] = 1.0
+    #     # Reapply the mask to zero out invalid experts
+    #     topk_probs = topk_probs * valid_mask[topk_ids]
 
-    chosen_dispatch_index = torch.multinomial(topk_probs, 1).flatten()
+    chosen_dispatch_index = torch.multinomial(topk_probs.float(), 1).flatten()
 
     topk_ids = log2phy_map[topk_ids, chosen_dispatch_index]
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
+    # nvtx.pop_range()
+    topk_ids = torch.ones_like(topk_ids, device=device)
     return topk_ids

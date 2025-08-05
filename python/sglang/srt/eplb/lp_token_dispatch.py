@@ -63,7 +63,8 @@ def run_lp_solver(
         log2phy_prob = np.full_like(log2phy, fill_value=0, dtype=float)
         mask = log2phy != -1
         log2phy_prob[mask] = np.take(phy_prob, log2phy[mask])
-        return torch.from_numpy(log2phy_prob)
+        log2phy_prob = (torch.from_numpy(log2phy_prob) * 100).to(torch.int8)
+        return log2phy_prob
     else:
         # Fall back to random dispatch
         # copy log2phy
@@ -71,7 +72,7 @@ def run_lp_solver(
         # replace -1 with 0, all other values to 1
         log2phy_prob[log2phy_prob == -1] = 0
         log2phy_prob[log2phy_prob != -1] = 1
-        return log2phy_prob
+        return log2phy_prob.to(torch.int8)
 
 
 def count_logical_expert_tokens(
@@ -95,13 +96,11 @@ def count_logical_expert_tokens(
     valid_mask = flat_ids >= 0
     valid_ids = flat_ids[valid_mask]
 
-    if valid_ids.numel() > 0:
-        # Use scatter_add to count occurrences
-        logical_counts.scatter_add_(
-            dim=0,
-            index=valid_ids.long(),
-            src=torch.ones_like(valid_ids, dtype=torch.int32),
-        )
+    logical_counts.scatter_add_(
+        dim=0,
+        index=valid_ids.long(),
+        src=torch.ones_like(valid_ids, dtype=torch.int32),
+    )
 
     return logical_counts
 
@@ -119,32 +118,26 @@ def get_global_logical_counts_on_rank0(local_counts: torch.Tensor) -> torch.Tens
         Global logical counts tensor on GPU
     """
     # Get the tensor parallel group from SGLang
-
     group = get_world_group()
 
     if group.world_size == 1:
         # Single rank case, just return local counts
         return local_counts
 
-    # Move local counts to CPU for CPU-based communication
-    local_counts_cpu = local_counts.cpu()
-
     # Use the CPU communication group for all-reduce
     torch.distributed.reduce(
-        local_counts_cpu,
+        local_counts,
         dst=0,
-        group=group.cpu_group,
+        group=group.device_group,
         op=torch.distributed.ReduceOp.SUM,
     )
-    # Move result back to GPU
-    global_counts = local_counts_cpu.to(local_counts.device)
-    return global_counts
+    return local_counts
 
 
 def send_log2phy_prob_broadcast(log2phy_prob: torch.Tensor):
     """Send log2phy_prob to all ranks"""
     group = get_world_group()
-    torch.distributed.broadcast(log2phy_prob, src=0, group=group.cpu_group)
+    torch.distributed.broadcast(log2phy_prob, src=0, group=group.device_group)
     return log2phy_prob
 
 
@@ -174,15 +167,16 @@ def get_log2phy_prob(
         log2phy_prob = run_lp_solver(
             global_counts,
             expert_location_dispatch_info.lp_metadata,
-            expert_location_dispatch_info.partial_logical_to_valid_physical_map.cpu(),
+            expert_location_dispatch_info.partial_logical_to_all_physical_map.cpu(),
         )
     else:
         log2phy_prob = torch.empty_like(
-            expert_location_dispatch_info.partial_logical_to_valid_physical_map,
-            device="cpu",
+            expert_location_dispatch_info.partial_logical_to_all_physical_map,
+            device=device,
+            dtype=torch.int8,
         )
 
     # Step 4: Broadcast to all ranks
+    log2phy_prob = log2phy_prob.to(device=device)
     log2phy_prob = send_log2phy_prob_broadcast(log2phy_prob)
-    log2phy_prob = log2phy_prob.to(device, dtype=torch.float32, non_blocking=True)
     return log2phy_prob

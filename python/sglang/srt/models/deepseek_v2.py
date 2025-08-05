@@ -22,6 +22,7 @@ import os
 from enum import IntEnum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+import nvtx
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -607,8 +608,8 @@ class DeepseekV2MoE(nn.Module):
                 )
                 torch.distributed.broadcast(
                     torch.zeros_like(
-                        expert_location_dispatch_info.partial_logical_to_valid_physical_map
-                    ).to(device=hidden_states.device),
+                        expert_location_dispatch_info.partial_logical_to_all_physical_map
+                    ).to(device=hidden_states.device, dtype=torch.int8),
                     src=0,
                     group=get_world_group().device_group,
                 )
@@ -665,6 +666,7 @@ class DeepseekV2MoE(nn.Module):
         expert_location_dispatch_info = ExpertLocationDispatchInfo.init_new(
             layer_id=self.layer_id,
         )
+        # nvtx.push_range("select_experts", color="red")
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
@@ -690,8 +692,8 @@ class DeepseekV2MoE(nn.Module):
                 )
                 torch.distributed.broadcast(
                     torch.zeros_like(
-                        expert_location_dispatch_info.partial_logical_to_valid_physical_map
-                    ).to(device=hidden_states.device),
+                        expert_location_dispatch_info.partial_logical_to_all_physical_map
+                    ).to(device=hidden_states.device, dtype=torch.int8),
                     src=0,
                     group=get_world_group().device_group,
                 )
@@ -701,6 +703,7 @@ class DeepseekV2MoE(nn.Module):
             state.topk_weights_local = torch.empty(
                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
+        # nvtx.pop_range()
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
