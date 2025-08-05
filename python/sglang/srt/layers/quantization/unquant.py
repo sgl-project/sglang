@@ -230,6 +230,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         kwargs = {}
         if activation_alpha is not None:
             kwargs["activation_alpha"] = activation_alpha
+        if swiglu_limit is not None:
+            kwargs["swiglu_limit"] = swiglu_limit
 
         return self.forward(
             x=x,
@@ -240,7 +242,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             inplace=inplace,
             no_combine=no_combine,
             routed_scaling_factor=routed_scaling_factor,
-            swiglu_limit=swiglu_limit,
             **kwargs,
         )
 
