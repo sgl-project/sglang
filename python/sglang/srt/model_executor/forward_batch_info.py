@@ -189,6 +189,7 @@ class ForwardBatch:
     token_ids_logprobs: Optional[List[List[int]]] = None
 
     # For logits and logprobs post processing
+    next_token_logits_buffer: torch.Tensor = None
     temp_scaled_logprobs: bool = False
     temperature: torch.Tensor = None
     top_p_normalized_logprobs: bool = False
@@ -247,7 +248,7 @@ class ForwardBatch:
     encoder_out_cache_loc: Optional[torch.Tensor] = None
 
     # For LoRA
-    lora_paths: Optional[List[str]] = None
+    lora_ids: Optional[List[str]] = None
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
@@ -326,7 +327,7 @@ class ForwardBatch:
             is_extend_in_batch=batch.is_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
-            lora_paths=batch.lora_paths,
+            lora_ids=batch.lora_ids,
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
@@ -645,11 +646,16 @@ class ForwardBatch:
             device=model_runner.device,
         )
 
-        bs = self.batch_size
         if len(global_num_tokens) > 1:
             num_tokens = global_num_tokens[get_attention_dp_rank()]
         else:
             num_tokens = global_num_tokens[0]
+
+        if self.forward_mode.is_decode():
+            setattr(self, "raw_bs", self.batch_size)
+            self.batch_size = num_tokens
+
+        bs = self.batch_size
 
         # padding
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
@@ -657,6 +663,9 @@ class ForwardBatch:
 
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+        )
+        self.seq_lens_sum = self.seq_lens_sum + seq_len_fill_value * (
+            bs - self.seq_lens.shape[0]
         )
         self.seq_lens = self._pad_tensor_to_size(
             self.seq_lens, bs, value=seq_len_fill_value
@@ -701,7 +710,7 @@ class ForwardBatch:
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
 
-        bs = self.batch_size
+        bs = getattr(self, "raw_bs", self.batch_size)
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
