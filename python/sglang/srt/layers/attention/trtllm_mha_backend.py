@@ -87,7 +87,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # MHA-specific dimensions
         self.max_context_len = model_runner.model_config.context_len
-        self.sliding_window_size = model_runner.sliding_window_size
+        self.sliding_window_size = (
+            model_runner.sliding_window_size
+            if model_runner.sliding_window_size is not None
+            else -1  # -1 indicates full attention
+        )
         self.hidden_size = config.hidden_size
 
         # Runtime parameters
@@ -442,9 +446,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         k_cache = k_cache.view(-1, self.page_size, self.num_kv_heads, layer.head_dim)
         v_cache = v_cache.view(-1, self.page_size, self.num_kv_heads, layer.head_dim)
-        kv_cache = torch.cat([k_cache, v_cache], dim=1)
+        kv_cache = torch.stack([k_cache, v_cache], dim=1)
 
         # TODO: bmm1_scale and bmm2_scale might require modification
+        # TODO: Change once quantization is supported
         q_scale = 1.0
         k_scale = (
             layer.k_scale_float
