@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.layers.utils import is_sm100_supported
 
 try:
@@ -26,6 +27,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.utils import (
     align,
+    ceil_div,
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
@@ -305,6 +307,33 @@ def triton_w8a8_block_fp8_linear(
     if bias is not None:
         output += bias
     return output.to(dtype=input_2d.dtype).view(*output_shape)
+
+
+def dequant_mxfp4(
+    w_block: torch.Tensor,
+    w_scale: torch.Tensor,
+    out_dtype,
+) -> torch.Tensor:
+    """
+    :param w_block: (batch, n, k, 16), uint8, pack two mxfp4 into one byte
+    :param w_scale: (batch, n, k), uint8
+    :return: (batch, n, k * 32), float32
+    """
+
+    assert w_block.dtype == torch.uint8
+    assert w_scale.dtype == torch.uint8
+
+    batch, n, k, pack_dim = w_block.shape
+    batch_, n_, k_ = w_scale.shape
+    assert pack_dim == 16
+    assert batch == batch_
+    assert n == n_
+    assert k == k_
+
+    out_raw = MXFP4QuantizeUtil.dequantize(
+        quantized_data=w_block, scale=w_scale, dtype=out_dtype, block_sizes=[32]
+    )
+    return out_raw.reshape(batch, n, k * 32)
 
 
 def input_to_float8(
