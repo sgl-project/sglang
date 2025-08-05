@@ -9,8 +9,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.models.glm4_moe import Glm4MoeModel, Glm4vForConditionalGeneration
-from sglang.srt.models.glm4v import Glm4vVisionModel
+from sglang.srt.models.glm4_moe import Glm4MoeModel
+from sglang.srt.models.glm4v import Glm4vVisionModel,Glm4vForConditionalGeneration
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)

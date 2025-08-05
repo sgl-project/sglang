@@ -505,6 +505,21 @@ register_chat_template(
     )
 )
 
+# Reference: https://huggingface.co/docs/transformers/main/model_doc/glm4_v#usage-example
+register_chat_template(
+    ChatTemplate(
+        name="glm-4v",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": ("<|system|>\n", "\n"),
+            "user": ("<|user|>\n", "\n"),
+            "assistant": ("<|assistant|>\n", "\n"),
+        },
+        style=ChatTemplateStyle.PLAIN,
+        stop_str=["<|user|>", "<|endoftext|>"],
+        image_token="<|begin_of_image|><|image|><|end_of_image|>",
+    )
+)
 
 @register_chat_template_matching_function
 def match_deepseek(model_path: str):
