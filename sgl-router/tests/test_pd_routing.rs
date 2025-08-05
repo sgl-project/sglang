@@ -2,7 +2,7 @@
 mod test_pd_routing {
     use rand::Rng;
     use serde_json::json;
-    use sglang_router_rs::config::{PolicyConfig, RouterConfig, RoutingMode};
+    use sglang_router_rs::config::{PolicyConfig, RetryConfig, RouterConfig, RoutingMode};
     use sglang_router_rs::core::{WorkerFactory, WorkerType};
     use sglang_router_rs::routers::pd_types::get_hostname;
     use sglang_router_rs::routers::pd_types::PDSelectionPolicy;
@@ -178,6 +178,7 @@ mod test_pd_routing {
                 request_id_headers: None,
                 max_concurrent_requests: 64,
                 cors_allowed_origins: vec![],
+                retry: RetryConfig::default(),
             };
 
             // Router creation will fail due to health checks, but config should be valid
