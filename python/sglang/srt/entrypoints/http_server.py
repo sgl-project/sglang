@@ -118,7 +118,6 @@ class _GlobalState:
     tokenizer_manager: TokenizerManager
     template_manager: TemplateManager
     scheduler_info: Dict
-    model_version: str = "version_0"
 
 
 _global_state: Optional[_GlobalState] = None
@@ -312,7 +311,7 @@ async def get_model_info():
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
-        "model_version": _global_state.model_version,
+        "model_version": _global_state.tokenizer_manager.server_args.model_version,
     }
     return result
 
@@ -320,7 +319,7 @@ async def get_model_info():
 @app.get("/get_model_version")
 async def get_model_version():
     """Get the current model version."""
-    return {"model_version": _global_state.model_version}
+    return {"model_version": _global_state.tokenizer_manager.server_args.model_version}
 
 
 @app.get("/get_server_info")
@@ -610,9 +609,7 @@ async def update_model_version(obj: UpdateModelVersionReqInput, request: Request
     # Use a simple approach without the complex lock mechanism for now
     # since model_version update is a simple operation that doesn't affect model weights
     try:
-        # Update the global state
-        _global_state.model_version = obj.new_version
-        # Also update the server args so it's consistent
+        # Update the model version in server args (the single source of truth)
         _global_state.tokenizer_manager.server_args.model_version = obj.new_version
 
         return ORJSONResponse(
@@ -958,9 +955,8 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
 
 
 def _update_model_version_if_provided(model_version: Optional[str]) -> None:
-    """Update global model version if provided."""
+    """Update model version if provided."""
     if model_version is not None:
-        _global_state.model_version = model_version
         _global_state.tokenizer_manager.server_args.model_version = model_version
 
 
@@ -998,7 +994,6 @@ def launch_server(
             tokenizer_manager=tokenizer_manager,
             template_manager=template_manager,
             scheduler_info=scheduler_info,
-            model_version=server_args.model_version,
         )
     )
 
