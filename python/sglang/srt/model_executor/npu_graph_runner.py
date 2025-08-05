@@ -16,8 +16,8 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
 import threading
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -65,8 +65,7 @@ class NPUGraphRunner(CudaGraphRunner):
             out = run_once_fn()
         return out
 
-    def _update_inputs(self, forward_batch: ForwardBatch):
-        seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (self.bs - self.raw_bs)
+    def _update_inputs(self, seq_lens):
         self.graphs[self.bs].update(
             cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
         )
@@ -85,7 +84,8 @@ class NPUGraphRunner(CudaGraphRunner):
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
-        thread = threading.Thread(target=self._update_inputs, args=(forward_batch, ))
+        seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (self.bs - self.raw_bs)
+        thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
         thread.start()
         self.graphs[self.bs].replay()
         thread.join()
