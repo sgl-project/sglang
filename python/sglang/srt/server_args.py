@@ -637,14 +637,6 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-        parser.add_argument(
-            "--config",
-            type=str,
-            default=None,
-            help=("The path to the configuration file in YAML format. "
-                "Priority: command line arguments > config file > default value."),
-            required=False,
-        )
         # Model and tokenizer
         parser.add_argument(
             "--model-path",
@@ -2117,6 +2109,15 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         The server arguments.
     """
     parser = argparse.ArgumentParser()
+    # Add the `config` argument here to show up in the full help message.
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help=("The path to the configuration file in YAML format. "
+            "Priority: command line arguments > config file > default value."),
+        required=False,
+    )
     ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)
 
@@ -2124,12 +2125,11 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         config_path = pathlib.Path(raw_args.config)
         if not (config_path.exists() and config_path.is_file()):
             raise ValueError(f"Config file {config_path} does not exist or is not a file.")
-        config_args = yaml.safe_load(config_path.read_bytes())
-        # Only update the `raw_args` if the value is not set via the command line.
-        arg_default = {action.dest: action.default for action in parser._actions}
-        for key, value in config_args.items():
-            if getattr(raw_args, key, None) == arg_default.get(key, None):
-                setattr(raw_args, key, value)
+        config_args = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        if not isinstance(config_args, dict):
+            raise ValueError(f"Invalid config file {config_path}, expected a dictionary.")
+        parser.set_defaults(**config_args)
+        raw_args = parser.parse_args(argv)
     delattr(raw_args, "config")
 
     server_args = ServerArgs.from_cli_args(raw_args)
