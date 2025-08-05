@@ -246,6 +246,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if getattr(layer, "k_scale_float", None) is not None
             else 1.0
         )
+        # sink: additional value per head in the denominator of the softmax.
+        attention_sink = layer.attention_sinks if layer.enable_attention_sink else None
         bmm1_scale = q_scale * k_scale * layer.scaling
         bmm2_scale = 1.0
 
@@ -262,6 +264,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             bmm2_scale=bmm2_scale,
             window_left=self.sliding_window_size,
             # TODO: add attention_sink operation or nvfp4 scale factor if needed
+            sink=attention_sink,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -292,6 +295,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # TODO: bmm1_scale and bmm2_scale might require modification
         # TODO: Change once quantization is supported
+        # sink: additional value per head in the denominator of the softmax.
+        attention_sink = layer.attention_sinks if layer.enable_attention_sink else None
         q_scale = 1.0
         k_scale = (
             layer.k_scale_float
@@ -316,6 +321,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
             window_left=self.sliding_window_size,
             # TODO: add attention_sink operation or nvfp4 scale factor if needed
+            sink=attention_sink,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
