@@ -219,7 +219,7 @@ class TransformersForCausalLM(nn.Module):
                 f"{type(self.model)} does not support tensor parallel yet!"
             )
 
-        tp_plan = self.model._tp_plan
+        tp_plan = getattr(self.model.config, "base_model_tp_plan", None) or {}
 
         def _tensor_parallel(module: nn.Module, prefix: str = ""):
             for child_name, child_module in module.named_children():
