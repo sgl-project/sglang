@@ -43,8 +43,8 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj, require_mlp_sync
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.utils import broadcast_pyobj, DynamicGradMode, point_to_point_pyobj, require_mlp_sync
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -399,7 +399,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 self.disagg_prefill_inflight_queue.append(req)
-                if logits_output.hidden_states is not None:
+                if logits_output is not None and logits_output.hidden_states is not None:
                     last_hidden_index = (
                         hidden_state_offset + extend_input_len_per_req[i] - 1
                     )
@@ -780,7 +780,6 @@ class SchedulerDisaggregationPrefillMixin:
                             pp_outputs.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
-
                     if ENABLE_RELEASE:
                         if release_rids is not None:
                             self.send_pyobj_to_next_stage(release_rids)
@@ -819,7 +818,7 @@ class SchedulerDisaggregationPrefillMixin:
             point_to_point_pyobj(
                 data,
                 self.pp_rank * self.tp_size + dp_offset,
-                self.world_group.cpu_group,
+                self.world_group.device_group,
                 self.pp_rank * self.tp_size + dp_offset,
                 ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
             )
@@ -830,7 +829,7 @@ class SchedulerDisaggregationPrefillMixin:
             data = point_to_point_pyobj(
                 [],
                 self.pp_rank * self.tp_size + dp_offset,
-                self.world_group.cpu_group,
+                self.world_group.device_group,
                 ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
                 self.pp_rank * self.tp_size + dp_offset,
             )
