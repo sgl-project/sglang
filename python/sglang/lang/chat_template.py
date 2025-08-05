@@ -578,6 +578,8 @@ def match_chat_ml(model_path: str):
         return "chatml"
     if re.search(r"qwen.*vl", model_path, re.IGNORECASE):
         return "qwen2-vl"
+    if re.search(r"glm[-_]?4(\.\d+)?v", model_path, re.IGNORECASE):
+        return "glm-4v"
     if re.search(r"qwen.*(chat|instruct)", model_path, re.IGNORECASE) and not re.search(
         r"llava", model_path, re.IGNORECASE
     ):
