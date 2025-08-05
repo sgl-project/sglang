@@ -292,13 +292,11 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         topk_weights, topk_ids, _ = topk_output
         local_topk_ids = topk_ids
-        if layer.expert_map_gpu is not None:
-            "Translate info from expert_map to topk_ids"
-            local_topk_ids = torch.where(
-                topk_ids == -1,
-                layer.num_experts,
-                topk_ids,
-            )
+        local_topk_ids = torch.where(
+            topk_ids == -1,
+            layer.num_experts,
+            topk_ids,
+        )
 
         output = cutlass_w4a8_moe(
             layer.start_expert_id,
