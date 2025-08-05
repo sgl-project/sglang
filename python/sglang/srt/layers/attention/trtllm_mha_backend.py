@@ -466,7 +466,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             block_tables=self.forward_metadata.page_table,
             seq_lens=self.forward_metadata.cache_seqlens_int32,
             max_q_len=self.forward_metadata.max_seq_len_q,
-            max_seq_len=self.forward_metadata.max_seq_len_k,
+            max_kv_len=self.forward_metadata.max_seq_len_k,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             batch_size=forward_batch.batch_size,
