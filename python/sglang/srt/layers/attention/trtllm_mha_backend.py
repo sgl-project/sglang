@@ -368,5 +368,5 @@ class TRTLLMHAAttnBackend(FlashinferAttnBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        # todo(Yingyi): implement this
-        return None
+        # todo(Yingyi): implement this trtllm_batch_context_with_kv_cache
+        return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)

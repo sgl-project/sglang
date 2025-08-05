@@ -1450,8 +1450,10 @@ class ModelRunner:
 
             return TRTLLMMLABackend(self)
         elif self.server_args.attention_backend == "trtllm_mha":
-            if not self.use_mla_backend:
-                raise ValueError("trtllm_mha backend can only be used with MLA models.")
+            if self.use_mla_backend:
+                raise ValueError(
+                    "trtllm_mha backend can only be used with non-MLA models."
+                )
             from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMMHABackend
 
             return TRTLLMMHABackend(self)
