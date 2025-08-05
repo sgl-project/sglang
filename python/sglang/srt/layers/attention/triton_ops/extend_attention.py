@@ -351,6 +351,7 @@ def extend_attention_fwd(
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
     """
+    # print(f"context by triton")
     Lq, Lk, Lv = (
         q_extend.shape[-1],
         k_extend.shape[-1],

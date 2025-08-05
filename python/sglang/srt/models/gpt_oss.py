@@ -295,6 +295,7 @@ class GptOssAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+        # print(f"self.sinks from forward_core: {self.sinks}")
         attn_output = self.attn(*inner_state, sk=self.sinks.to(torch.float32))
         output, _ = self.o_proj(attn_output)
         return output

@@ -459,7 +459,13 @@ class ServerArgs:
                 )
         model_arch = self.get_hf_config().architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
-            self.attention_backend = "triton"
+            # self.prefill_attention_backend = "triton"
+            # self.decode_attention_backend = "trtllm_mha"
+            self.prefill_attention_backend = "trtllm_mha"
+            self.decode_attention_backend = "triton"
+            # if self.attention_backend is None:
+            #     self.attention_backend = "triton"
+            # assert self.attention_backend == "trtllm_mha" or self.attention_backend == "triton"
             self.enable_triton_kernel_moe = True
 
         # Set page size
