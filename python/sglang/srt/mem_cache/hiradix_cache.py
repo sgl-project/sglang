@@ -38,7 +38,7 @@ class HiRadixCache(RadixCache):
         hicache_io_backend: str,
         hicache_mem_layout: str,
         hicache_storage_backend: Optional[str] = None,
-        historage_prefetch_policy: Optional[str] = "best_effort",
+        hicache_storage_prefetch_policy: Optional[str] = "best_effort",
     ):
 
         if hicache_io_backend == "direct":
@@ -87,10 +87,12 @@ class HiRadixCache(RadixCache):
             prefetch_threshold=self.prefetch_threshold,
         )
 
-        self.prefetch_stop_policy = historage_prefetch_policy
+        self.prefetch_stop_policy = hicache_storage_prefetch_policy
         # todo: customizable storage prefetch timeout
         self.prefetch_timeout = 3  # seconds
-        logger.info(f"HiCache storage prefetch policy: {historage_prefetch_policy}")
+        logger.info(
+            f"HiCache storage prefetch policy: {hicache_storage_prefetch_policy}"
+        )
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}

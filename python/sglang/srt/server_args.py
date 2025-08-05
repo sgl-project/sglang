@@ -201,7 +201,7 @@ class ServerArgs:
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
-    historage_prefetch_policy: str = "best_effort"
+    hicache_storage_prefetch_policy: str = "best_effort"
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -1536,10 +1536,10 @@ class ServerArgs:
             help="The storage backend for hierarchical KV cache.",
         )
         parser.add_argument(
-            "--historage-prefetch-policy",
+            "--hicache-storage-prefetch-policy",
             type=str,
             choices=["best_effort", "wait_complete", "timeout"],
-            default=ServerArgs.historage_prefetch_policy,
+            default=ServerArgs.hicache_storage_prefetch_policy,
             help="Control when prefetching from the storage backend should stop.",
         )
 
