@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
+from sglang.srt.distributed import parallel_state
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -11,6 +12,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
 from .dots_vlm_vit import DotsVisionTransformer
@@ -24,6 +26,7 @@ class DotsVLMForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.config = config
         self.image_token_id = config.im_span_id
         self.video_token_id = config.video_span_id
 
@@ -33,6 +36,36 @@ class DotsVLMForCausalLM(nn.Module):
 
         # Initialize vision tower (matching transformers naming for weight compatibility)
         self.vision_tower = DotsVisionTransformer(config.vision_config)
+
+    def _pad_vit_attn_dummy_heads(self, name: str, loaded_weight: torch.Tensor):
+        """pad attn qkv weights for dummy heads"""
+        num_dummy_heads = self.config.vision_config.num_dummy_heads
+        if num_dummy_heads == 0:
+            return loaded_weight
+        head_dim = self.config.vision_config.head_dim
+
+        if "attn.qkv_proj" in name:
+            wq, wk, wv = loaded_weight.chunk(3, dim=0)
+            if name.endswith(".weight"):
+                dummy_shape = [num_dummy_heads, head_dim, wq.shape[-1]]
+            elif name.endswith(".bias"):
+                dummy_shape = [num_dummy_heads, head_dim]
+            else:
+                raise RuntimeError(f"Unsupported weight with name={name}")
+            pad_func = lambda x: torch.cat(
+                [x.unflatten(0, (-1, head_dim)), x.new_zeros(dummy_shape)], dim=0
+            ).flatten(0, 1)
+            wq, wk, wv = pad_func(wq), pad_func(wk), pad_func(wv)
+            loaded_weight = torch.cat([wq, wk, wv], dim=0)
+        if "attn.proj.weight" in name:
+            padded_weight = loaded_weight.new_zeros(
+                loaded_weight.shape[0], head_dim * num_dummy_heads
+            )
+            loaded_weight = torch.cat([loaded_weight, padded_weight], dim=-1)
+        if "attn.q_norm.weight" in name or "attn.k_norm.weight" in name:
+            padded_weight = loaded_weight.new_zeros(head_dim * num_dummy_heads)
+            loaded_weight = torch.cat([loaded_weight, padded_weight], dim=0)
+        return loaded_weight
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights for the model, separating vision and language weights"""
@@ -44,8 +77,7 @@ class DotsVLMForCausalLM(nn.Module):
 
         for name, loaded_weight in weights:
             if name.startswith("vision_tower."):
-                # Remove "vision_tower." prefix for vision tower weights
-                vision_name = name[len("vision_tower.") :]
+                vision_name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
                 vision_weights.append((vision_name, loaded_weight))
             else:
                 # All other weights go to language model
@@ -53,7 +85,14 @@ class DotsVLMForCausalLM(nn.Module):
 
         # Load vision tower weights
         vision_state_dict = dict(vision_weights)
-        self.vision_tower.load_state_dict(vision_state_dict, strict=True)
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        for name, loaded_weight in vision_state_dict.items():
+            if name not in params_dict:
+                raise ValueError(f"Weight {name} not found in params_dict")
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
+            weight_loader(param, loaded_weight)
 
         # Load language model weights
         if language_weights:
@@ -73,18 +112,20 @@ class DotsVLMForCausalLM(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         """Extract image features from multimodal data items"""
-        if any(item.precomputed_features is not None for item in items):
+        if any(item.precomputed_embeddings is not None for item in items):
             # If features are precomputed, just concatenate them
-            if not all(item.precomputed_features is not None for item in items):
+            if not all(item.precomputed_embeddings is not None for item in items):
                 raise NotImplementedError(
                     "MM inputs where only some items are precomputed."
                 )
-            return torch.concat([item.precomputed_features for item in items])
+            return torch.concat(
+                [torch.tensor(item.precomputed_embeddings) for item in items]
+            )
 
         # Extract pixel values and grid information (following reference pattern)
-        pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
-            self.vision_tower.dtype
-        )
+        pixel_values = torch.cat(
+            [torch.tensor(item.feature) for item in items], dim=0
+        ).type(self.vision_tower.dtype)
         image_grid_thw = torch.concat(
             [item.image_grid_thw for item in items], dim=0
         ).to(self.vision_tower.device)
@@ -117,7 +158,7 @@ class DotsVLMForCausalLM(nn.Module):
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
-            image_data_embedding_func=self.get_image_feature,
+            multimodal_model=self,
             language_model=self.language_model,
         )
         return hidden_states

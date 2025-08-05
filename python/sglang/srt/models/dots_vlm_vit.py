@@ -1,3 +1,4 @@
+import logging
 from typing import Optional
 
 import torch
@@ -8,9 +9,12 @@ from torch.nn import LayerNorm
 from transformers.modeling_utils import PreTrainedModel
 
 from sglang.srt.configs.dots_vlm import DotsVisionConfig
+from sglang.srt.distributed import parallel_state
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 
 def rotate_half(x):
@@ -70,7 +74,7 @@ class PatchMerger(nn.Module):
         elif self.pre_norm == "rmsnorm":
             self.ln_q = RMSNorm(context_dim, eps=1e-6)
         else:
-            print("no norm in patch merger")
+            logger.warning(f"no norm in patch merger: {self.pre_norm}")
 
         self.mlp = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
@@ -90,45 +94,6 @@ class PatchMerger(nn.Module):
         else:
             x = self.mlp(x.view(-1, self.hidden_size))
         return x
-
-
-# class VisionAttention(nn.Module):
-#     def __init__(self, config, dim: int, num_heads: int = 16, bias=True) -> None:
-#         super().__init__()
-#         self.num_heads = num_heads
-#         self.head_dim = dim // num_heads
-#         self.qkv = nn.Linear(dim, dim * 3, bias=bias)
-#         self.proj = nn.Linear(dim, dim, bias=bias)
-#
-#     def forward(
-#         self,
-#         hidden_states: torch.Tensor,
-#         cu_seqlens: torch.Tensor,
-#         rotary_pos_emb: torch.Tensor = None,
-#     ) -> torch.Tensor:
-#         seq_length = hidden_states.shape[0]
-#
-#         q, k, v = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
-#         q = apply_rotary_pos_emb_vision(q.unsqueeze(0), rotary_pos_emb).squeeze(0)
-#         k = apply_rotary_pos_emb_vision(k.unsqueeze(0), rotary_pos_emb).squeeze(0)
-#
-#         attention_mask = torch.full(
-#             [1, seq_length, seq_length], torch.finfo(q.dtype).min, device=q.device, dtype=q.dtype
-#         )
-#         for i in range(1, len(cu_seqlens)):
-#             attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = 0
-#
-#         q = q.transpose(0, 1)
-#         k = k.transpose(0, 1)
-#         v = v.transpose(0, 1)
-#         attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(self.head_dim)
-#         attn_weights = attn_weights + attention_mask
-#         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-#         attn_output = torch.matmul(attn_weights, v)
-#         attn_output = attn_output.transpose(0, 1)
-#         attn_output = attn_output.reshape(seq_length, -1)
-#         attn_output = self.proj(attn_output)
-#         return attn_output
 
 
 class VisionFlashAttention2(nn.Module):
@@ -300,7 +265,7 @@ class DotsViTPreprocessor(nn.Module):
 class DotsVisionBlock(nn.Module):
     def __init__(
         self,
-        config,
+        config: DotsVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         attn_implementation: str = "flash_attention_2",
@@ -311,7 +276,6 @@ class DotsVisionBlock(nn.Module):
             softmax_in_single_precision = False
         else:
             raise RuntimeError("Unimplemented")
-        print(f"{config=}")
         self.attn = VisionAttention(
             embed_dim=config.embed_dim,
             num_heads=config.num_attention_heads,
@@ -322,6 +286,9 @@ class DotsVisionBlock(nn.Module):
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
+            num_dummy_heads=config.num_dummy_heads,
+            qkv_bias=config.use_bias,
+            proj_bias=config.use_bias,
         )
         self.norm1 = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
         self.mlp = DotsSwiGLUFFN(config)
@@ -337,13 +304,6 @@ class DotsVisionBlock(nn.Module):
         return hidden_states
 
 
-# DOTS_VISION_ATTENTION_CLASSES = {
-#     "eager": VisionAttention,
-#     "flash_attention_2": VisionFlashAttention2,
-#     "sdpa": VisionSdpaAttention,
-# }
-
-
 class DotsVisionTransformer(PreTrainedModel):
     def __init__(
         self,
@@ -352,6 +312,7 @@ class DotsVisionTransformer(PreTrainedModel):
     ) -> None:
         super().__init__(config)
         self.config = config
+        self._update_vision_config()
         self.spatial_merge_size = config.spatial_merge_size
 
         self.patch_embed = DotsViTPreprocessor(config)
@@ -364,8 +325,10 @@ class DotsVisionTransformer(PreTrainedModel):
         _num_hidden_layers = config.num_hidden_layers
         self.blocks = nn.ModuleList(
             [
-                DotsVisionBlock(config, config.attn_implementation, quant_config)
-                for _ in range(_num_hidden_layers)
+                DotsVisionBlock(
+                    config, quant_config, f"blocks.{i}", config.attn_implementation
+                )
+                for i in range(_num_hidden_layers)
             ]
         )
 
@@ -380,11 +343,25 @@ class DotsVisionTransformer(PreTrainedModel):
         )
 
         self.gradient_checkpointing = False
-        self._gradient_checkpointing_func = torch.utils.checkpoint.checkpoint
+
+    def _update_vision_config(self):
+        """update vision config to support tp"""
+        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        num_heads = self.config.num_attention_heads
+        head_dim = self.config.embed_dim // num_heads
+        num_dummy_heads = 0
+
+        if num_heads % world_size != 0:
+            num_dummy_heads = (
+                (num_heads + world_size) // world_size
+            ) * world_size - num_heads
+
+        setattr(self.config, "head_dim", head_dim)
+        setattr(self.config, "num_dummy_heads", num_dummy_heads)
 
     def _init_weights(self, module):
         std = self.config.initializer_range
-        if isinstance(module, (nn.Linear, nn.Conv3d)):
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -435,6 +412,14 @@ class DotsVisionTransformer(PreTrainedModel):
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
+    def calc_cos_sin(self, rotary_pos_emb):
+        cos = rotary_pos_emb.cos()
+        sin = rotary_pos_emb.sin()
+        cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+        sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+        rotary_pos_emb = (cos, sin)
+        return rotary_pos_emb
+
     def forward(
         self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, bf16=True
     ) -> torch.Tensor:
@@ -443,6 +428,7 @@ class DotsVisionTransformer(PreTrainedModel):
         hidden_states = self.patch_embed(hidden_states, grid_thw)
 
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        rotary_pos_emb = self.calc_cos_sin(rotary_pos_emb)
 
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
@@ -453,21 +439,9 @@ class DotsVisionTransformer(PreTrainedModel):
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
         for blk in self.blocks:
-            if self.gradient_checkpointing and self.training:
-                hidden_states = self._gradient_checkpointing_func(
-                    blk.__call__,
-                    hidden_states,
-                    cu_seqlens,
-                    rotary_pos_emb,
-                    use_reentrant=(
-                        self.config.ckpt_use_reentrant
-                        or self.config.ve_ckpt_use_reentrant
-                    ),
-                )
-            else:
-                hidden_states = blk(
-                    hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
-                )
+            hidden_states = blk(
+                hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
+            )
 
         if self.config.post_norm:
             hidden_states = self.post_trunk_norm(hidden_states)
