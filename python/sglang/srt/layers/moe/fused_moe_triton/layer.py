@@ -776,6 +776,8 @@ class FusedMoE(torch.nn.Module):
             kwargs = {}
             if self.activation_alpha is not None:
                 kwargs["activation_alpha"] = self.activation_alpha
+            if self.swiglu_limit is not None:
+                kwargs["swiglu_limit"] = self.swiglu_limit
 
             final_hidden_states = self.quant_method.apply(
                 layer=self,
@@ -784,7 +786,6 @@ class FusedMoE(torch.nn.Module):
                 activation=self.activation,
                 apply_router_weight_on_input=self.apply_router_weight_on_input,
                 routed_scaling_factor=self.routed_scaling_factor,
-                swiglu_limit=self.swiglu_limit,
                 **(
                     dict(
                         tp_rank=self.moe_tp_rank,
