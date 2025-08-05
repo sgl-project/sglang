@@ -1101,7 +1101,9 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 data_parallel_rank=recv_req.data_parallel_rank,
                 vocab_size=self.model_config.vocab_size,
-                metrics_collector=self.metrics_collector,
+                metrics_collector=(
+                    self.metrics_collector if self.enable_metrics else None
+                ),
             )
             req.tokenizer = self.tokenizer
 
