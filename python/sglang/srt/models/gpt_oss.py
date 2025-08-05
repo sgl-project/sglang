@@ -241,7 +241,7 @@ class GptOssAttention(nn.Module):
         )
 
         self.sinks = nn.Parameter(
-            torch.empty(self.num_heads, dtype=params_dtype), requires_grad=False
+            torch.empty(self.num_heads, dtype=torch.float32), requires_grad=False
         )
 
         self.o_proj = RowParallelLinear(
@@ -804,7 +804,9 @@ class GptOssForCausalLM(nn.Module):
                         if "sinks" in name:
                             start = tp_rank * param.numel()
                             param.data.copy_(
-                                loaded_weight[start : start + param.numel()]
+                                loaded_weight[start : start + param.numel()].to(
+                                    torch.float32
+                                )
                             )
                         else:
                             weight_loader = getattr(
