@@ -297,10 +297,11 @@ class Scheduler(
             )
 
         if self.enable_pdmux:
-            # for pd_multiplexing, Init stream_groups
-            initialize_stream_groups(gpu_id)
+            # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
+            initialize_stream_groups(gpu_id, server_args.sm_group_num - 2)
             self.stream_groups = get_stream_groups()
             self.sm_counts = get_sm_counts()
+            self.real_sm_group_num = len(self.stream_groups)
 
         # Init tokenizer
         self.init_tokenizer()
@@ -1714,7 +1715,12 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none():
+            if self.enable_pdmux and batch.forward_mode.is_split_prefill():
+                logits_output, next_token_ids, can_run_cuda_graph, model_worker_batch = (
+                    self.tp_worker.forward_batch_split_prefill(batch)
+                )
+                bid = model_worker_batch.bid            
+            elif self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
 
                 # update the consumer index of hicache to the running batch

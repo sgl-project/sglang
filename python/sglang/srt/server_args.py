@@ -271,7 +271,7 @@ class ServerArgs:
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
-    sm_group_num: int = 3
+    sm_group_num: int = 8
 
     # Deprecated arguments
     enable_ep_moe: bool = False

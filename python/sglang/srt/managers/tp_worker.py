@@ -261,10 +261,13 @@ class TpModelWorker:
             return pp_proxy_tensors.tensors, None, can_run_cuda_graph
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
-        model_worker_batch = batch.get_model_worker_batch()
         if batch.split_index == 0:
+            model_worker_batch = batch.get_model_worker_batch()
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
             batch.split_forward_batch = forward_batch
+            batch.seq_lens_cpu_cache = model_worker_batch.seq_lens_cpu
+        else:
+            model_worker_batch = batch.get_model_worker_batch(batch.seq_lens_cpu_cache)
 
         logits_output, can_run_cuda_graph = self.model_runner.forward(
             batch.split_forward_batch, split_forward_count=batch.split_forward_count
@@ -273,7 +276,7 @@ class TpModelWorker:
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
         else:
             next_token_ids = None
-        return logits_output, next_token_ids, can_run_cuda_graph
+        return logits_output, next_token_ids, can_run_cuda_graph, model_worker_batch
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)

@@ -887,6 +887,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     split_prefill_finished: bool = False
     split_forward_count: int = 1
     split_forward_batch: ForwardBatch = None
+    seq_lens_cpu_cache: torch.Tensor = None
 
     # Stream
     has_stream: bool = False
