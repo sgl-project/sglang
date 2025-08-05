@@ -68,7 +68,7 @@ blackwell = [
     "sgl-kernel",
     "torch==2.8.0",
     "torchaudio==2.8.0",
-    "torchvision==0.22.1",
+    "torchvision",
     "cuda-python",
     "einops",
     "flashinfer_python==0.2.10",
