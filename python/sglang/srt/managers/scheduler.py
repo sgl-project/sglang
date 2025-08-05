@@ -472,6 +472,7 @@ class Scheduler(
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
+        self.offload_tags = set()
         self.init_profier()
 
         self.input_blocker = (
@@ -1029,7 +1030,9 @@ class Scheduler(
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
-                self.chunked_req is not None or not self.running_batch.is_empty()
+                self.chunked_req is not None
+                or not self.running_batch.is_empty()
+                or len(self.offload_tags) > 0
             ):
                 self.return_health_check_ct += 1
                 continue

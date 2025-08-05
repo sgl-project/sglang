@@ -231,18 +231,6 @@ async def validate_json_request(raw_request: Request):
 
 
 @app.get("/health")
-async def health() -> Response:
-    """Check the health of the http server."""
-    if _global_state.tokenizer_manager.gracefully_exit:
-        logger.info("Health check request received during shutdown. Returning 503.")
-        return Response(status_code=503)
-
-    if not _global_state.tokenizer_manager.server_status.is_healthy():
-        return Response(status_code=503)
-
-    return Response(status_code=200)
-
-
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """
