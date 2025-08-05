@@ -23,13 +23,9 @@ from flash_attn.utils.testing import (
 
 
 def is_bw_supported(device=None) -> bool:
-    #  There some fa3 FYI
-    #  FA3 can fail without a enough shared memory for a some shapes, such as higher
-    #  hidden_dim or some special cases.
-    #  Right now, fa3 is supported for sm80/sm87 and sm86/sm89. The main different
-    #  Between sm80/sm87 and sm86/sm89 is the shared memory size. you can follow the link below for more information
-    #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
-    #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
+    #  There some fa4 FYI
+
+    #  And for sgl-kernel right now, we can build fa3 on sm90/sm100
     #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
     return (torch.cuda.get_device_capability(device)[0] == 10) and (
         torch.version.cuda >= "12.9"
