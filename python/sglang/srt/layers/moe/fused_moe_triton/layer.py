@@ -200,8 +200,7 @@ class FusedMoE(torch.nn.Module):
         self.quant_config = quant_config
         self.quant_method.create_weights(
             layer=self,
-            num_experts=self.num_experts,
-            num_local_experts=self.num_local_experts,
+            num_experts=self.num_local_experts,
             hidden_size=hidden_size,
             # FIXME: figure out which intermediate_size to use
             intermediate_size=self.intermediate_size_per_partition,
