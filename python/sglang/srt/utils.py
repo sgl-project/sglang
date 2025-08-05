@@ -44,7 +44,7 @@ import traceback
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
-from enum import Enum
+from dataclasses import dataclass
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -85,6 +85,7 @@ from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager
+from typing_extensions import Literal
 
 from sglang.srt.metrics.func_timer import enable_func_timer
 
@@ -92,6 +93,7 @@ logger = logging.getLogger(__name__)
 
 show_time_cost = False
 time_infos = {}
+
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
@@ -736,9 +738,18 @@ def load_audio(
     return audio
 
 
+@dataclass
+class ImageData:
+    url: str
+    detail: Optional[Literal["auto", "low", "high"]] = "auto"
+
+
 def load_image(
-    image_file: Union[Image.Image, str, bytes],
+    image_file: Union[Image.Image, str, ImageData, bytes],
 ) -> tuple[Image.Image, tuple[int, int]]:
+    if isinstance(image_file, ImageData):
+        image_file = image_file.url
+
     image = image_size = None
     if isinstance(image_file, Image.Image):
         image = image_file
@@ -762,7 +773,7 @@ def load_image(
     elif isinstance(image_file, str):
         image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     else:
-        raise ValueError(f"Invalid image: {image}")
+        raise ValueError(f"Invalid image: {image_file}")
 
     return image, image_size
 
@@ -2205,27 +2216,6 @@ def flatten_nested_list(nested_list):
         return [nested_list]
 
 
-class DeepEPMode(Enum):
-    normal = "normal"
-    low_latency = "low_latency"
-    auto = "auto"
-
-    def enable_normal(self):
-        return self in [DeepEPMode.normal, DeepEPMode.auto]
-
-    def enable_low_latency(self):
-        return self in [DeepEPMode.low_latency, DeepEPMode.auto]
-
-    def resolve(self, is_extend_in_batch: bool):
-        if self != DeepEPMode.auto:
-            return self
-
-        if is_extend_in_batch:
-            return DeepEPMode.normal
-        else:
-            return DeepEPMode.low_latency
-
-
 def is_non_idle_and_non_empty(forward_mode, hidden_states):
     return (
         (forward_mode is not None)
@@ -2414,7 +2404,7 @@ def require_mlp_tp_gather(server_args):
             return True
         elif not server_args.enable_dp_lm_head:
             return True
-        elif not server_args.enable_deepep_moe:
+        elif server_args.moe_a2a_backend is None:
             return True
         else:
             return (
@@ -2430,7 +2420,7 @@ def require_attn_tp_gather(server_args):
     Check if the input of attention is scattered.
     """
     assert server_args.moe_dense_tp_size in [1, None]
-    if server_args.enable_deepep_moe or server_args.moe_dense_tp_size == 1:
+    if server_args.moe_a2a_backend is not None or server_args.moe_dense_tp_size == 1:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
@@ -2851,6 +2841,17 @@ def parse_module_path(module_path, function_name, create_dummy):
         return final_module, getattr(final_module, function_name)
 
     return final_module, None
+
+
+def mxfp_supported():
+    """
+    Returns whether the current platform supports MX types.
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx95"])
+    else:
+        return False
 
 
 # LoRA-related constants and utilities

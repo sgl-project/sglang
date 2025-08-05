@@ -8,7 +8,7 @@ use axum::{
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
 use reqwest::Client;
 use serde_json::json;
-use sglang_router_rs::config::{PolicyConfig, RouterConfig, RoutingMode};
+use sglang_router_rs::config::{PolicyConfig, RetryConfig, RouterConfig, RoutingMode};
 use sglang_router_rs::routers::{RouterFactory, RouterTrait};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -44,6 +44,7 @@ impl TestContext {
             request_id_headers: None,
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -83,12 +84,12 @@ impl TestContext {
             .build()
             .unwrap();
 
-        // Clone config for the closure
-        let config_clone = config.clone();
+        // Create app context
+        let app_context = common::create_test_context(config.clone());
 
         // Create router using sync factory in a blocking context
         let router =
-            tokio::task::spawn_blocking(move || RouterFactory::create_router(&config_clone))
+            tokio::task::spawn_blocking(move || RouterFactory::create_router(&app_context))
                 .await
                 .unwrap()
                 .unwrap();
@@ -1085,6 +1086,7 @@ mod error_tests {
             request_id_headers: None,
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
         };
 
         let ctx = TestContext::new_with_config(
@@ -1431,11 +1433,15 @@ mod pd_mode_tests {
             request_id_headers: None,
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
         };
+
+        // Create app context
+        let app_context = common::create_test_context(config);
 
         // Create router - this might fail due to health check issues
         let router_result =
-            tokio::task::spawn_blocking(move || RouterFactory::create_router(&config))
+            tokio::task::spawn_blocking(move || RouterFactory::create_router(&app_context))
                 .await
                 .unwrap();
 
@@ -1581,6 +1587,7 @@ mod request_id_tests {
             request_id_headers: Some(vec!["custom-id".to_string(), "trace-id".to_string()]),
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
         };
 
         let ctx = TestContext::new_with_config(
