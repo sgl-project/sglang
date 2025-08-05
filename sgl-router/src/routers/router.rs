@@ -1,17 +1,25 @@
+use crate::config::types::RetryConfig;
 use crate::core::{HealthChecker, Worker, WorkerFactory};
 use crate::metrics::RouterMetrics;
-use crate::middleware::get_request_id;
+use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::policies::LoadBalancingPolicy;
-use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
-use actix_web::{HttpRequest, HttpResponse};
-use futures_util::{StreamExt, TryStreamExt};
+use crate::routers::{RouterTrait, WorkerManagement};
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
+use futures_util::StreamExt;
+use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
-
-pub fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
+pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
     req.headers()
         .iter()
         .filter_map(|(name, value)| {
@@ -28,24 +36,28 @@ pub fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
 pub struct Router {
     workers: Arc<RwLock<Vec<Box<dyn Worker>>>>,
     policy: Arc<dyn LoadBalancingPolicy>,
+    client: Client,
     timeout_secs: u64,
     interval_secs: u64,
     dp_aware: bool,
     api_key: Option<String>,
+    retry_config: RetryConfig,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     _health_checker: Option<HealthChecker>,
 }
 
 impl Router {
-    /// Create a new router with injected policy
+    /// Create a new router with injected policy and client
     pub fn new(
         worker_urls: Vec<String>,
         policy: Arc<dyn LoadBalancingPolicy>,
+        client: Client,
         timeout_secs: u64,
         interval_secs: u64,
         dp_aware: bool,
         api_key: Option<String>,
+        retry_config: RetryConfig,
     ) -> Result<Self, String> {
         // Update active workers gauge
         RouterMetrics::set_active_workers(worker_urls.len());
@@ -88,9 +100,17 @@ impl Router {
             let monitor_urls = worker_urls.clone();
             let monitor_interval = interval_secs;
             let policy_clone = Arc::clone(&policy);
+            let client_clone = client.clone();
 
             Some(Arc::new(tokio::spawn(async move {
-                Self::monitor_worker_loads(monitor_urls, tx, monitor_interval, policy_clone).await;
+                Self::monitor_worker_loads(
+                    monitor_urls,
+                    tx,
+                    monitor_interval,
+                    policy_clone,
+                    client_clone,
+                )
+                .await;
             })))
         } else {
             None
@@ -99,10 +119,12 @@ impl Router {
         Ok(Router {
             workers,
             policy,
+            client,
             timeout_secs,
             interval_secs,
             dp_aware,
             api_key,
+            retry_config,
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
             _health_checker: Some(health_checker),
@@ -124,6 +146,12 @@ impl Router {
         timeout_secs: u64,
         interval_secs: u64,
     ) -> Result<(), String> {
+        if worker_urls.is_empty() {
+            return Err(
+                "Timeout waiting for workers to become healthy: no workers provided".to_string(),
+            );
+        }
+
         let start_time = std::time::Instant::now();
         let sync_client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
@@ -239,154 +267,102 @@ impl Router {
         }
     }
 
-    pub async fn send_request(
-        &self,
-        client: &reqwest::Client,
-        worker_url: &str,
-        route: &str,
-        req: &HttpRequest,
-    ) -> HttpResponse {
-        let request_id = get_request_id(req);
-        let start = Instant::now();
-
-        let worker_url = if self.dp_aware {
+    pub async fn send_health_check(&self, worker_url: &str) -> Response {
+        let health_url = if self.dp_aware {
             // Need to extract the URL from "http://host:port@dp_rank"
-            let (worker_url_prefix, _dp_rank) = match Self::extract_dp_rank(worker_url) {
-                Ok(tup) => tup,
+            match Self::extract_dp_rank(worker_url) {
+                Ok((worker_url_prefix, _dp_rank)) => worker_url_prefix,
                 Err(e) => {
-                    error!("Failed to extract dp_rank: {}", e);
-                    return HttpResponse::InternalServerError().finish();
+                    error!("Failed to extract dp_rank for health check: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to extract dp_rank: {}", e),
+                    )
+                        .into_response();
                 }
-            };
-            worker_url_prefix
+            }
         } else {
             worker_url
         };
 
-        let mut request_builder = client.get(format!("{}{}", worker_url, route));
-
-        // Copy all headers from original request except for /health because it does not need authorization
-        if route != "/health" {
-            for (name, value) in copy_request_headers(req) {
-                // Skip Content-Type and Content-Length as .json() sets them
-                if name.to_lowercase() != "content-type" && name.to_lowercase() != "content-length"
-                {
-                    request_builder = request_builder.header(name, value);
-                }
-            }
-        }
+        let request_builder = self.client.get(format!("{}/health", health_url));
 
         let response = match request_builder.send().await {
             Ok(res) => {
-                let status = actix_web::http::StatusCode::from_u16(res.status().as_u16())
-                    .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+                let status = StatusCode::from_u16(res.status().as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
                 match res.bytes().await {
-                    Ok(body) => HttpResponse::build(status).body(body.to_vec()),
+                    Ok(body) => (status, body).into_response(),
                     Err(e) => {
                         error!(
-                            request_id = %request_id,
-                            worker_url = %worker_url,
-                            route = %route,
+                            worker_url = %health_url,
                             error = %e,
-                            "Failed to read response body"
+                            "Failed to read health response body"
                         );
-                        HttpResponse::InternalServerError()
-                            .body(format!("Failed to read response body: {}", e))
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to read response body: {}", e),
+                        )
+                            .into_response()
                     }
                 }
             }
             Err(e) => {
                 error!(
-                    request_id = %request_id,
-                    worker_url = %worker_url,
-                    route = %route,
+                    worker_url = %health_url,
                     error = %e,
-                    "Failed to send request to worker"
+                    "Failed to send health request to worker"
                 );
-                HttpResponse::InternalServerError().body(format!(
-                    "Failed to send request to worker {}: {}",
-                    worker_url, e
-                ))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to send request to worker {}: {}", health_url, e),
+                )
+                    .into_response()
             }
         };
 
-        // Record request metrics
-        if route != "/health" {
-            let duration = start.elapsed();
-            RouterMetrics::record_request(route);
-            RouterMetrics::record_request_duration(route, duration);
-
-            if !response.status().is_success() {
-                RouterMetrics::record_request_error(route, "request_failed");
-            }
-        }
+        // Don't record metrics for health checks
         response
     }
 
-    pub async fn route_to_first(
-        &self,
-        client: &reqwest::Client,
-        route: &str,
-        req: &HttpRequest,
-    ) -> HttpResponse {
-        let request_id = get_request_id(req);
-        const MAX_REQUEST_RETRIES: u32 = 3;
-        const MAX_TOTAL_RETRIES: u32 = 6;
-        let mut total_retries = 0;
+    // Helper method to proxy GET requests to the first available worker
+    async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
+        let headers = copy_request_headers(&req);
 
-        while total_retries < MAX_TOTAL_RETRIES {
-            match self.select_first_worker() {
-                Ok(worker_url) => {
-                    let mut request_retries = 0;
-
-                    // Try the same worker multiple times
-                    while request_retries < MAX_REQUEST_RETRIES {
-                        if total_retries >= 1 {
-                            info!("Retrying request after {} failed attempts", total_retries);
-                        }
-
-                        let response = self.send_request(client, &worker_url, route, req).await;
-
-                        if response.status().is_success() {
-                            return response;
-                        } else {
-                            // if the worker is healthy, it means the request is bad, so return the error response
-                            let health_response =
-                                self.send_request(client, &worker_url, "/health", req).await;
-                            if health_response.status().is_success() {
-                                return response;
-                            }
-                        }
-
-                        warn!(
-                            request_id = %request_id,
-                            route = %route,
-                            worker_url = %worker_url,
-                            attempt = request_retries + 1,
-                            max_attempts = MAX_REQUEST_RETRIES,
-                            "Request failed"
-                        );
-
-                        request_retries += 1;
-                        total_retries += 1;
-
-                        if request_retries == MAX_REQUEST_RETRIES {
-                            warn!(
-                                request_id = %request_id,
-                                worker_url = %worker_url,
-                                "Removing failed worker"
-                            );
-                            self.remove_failed_worker(&worker_url);
-                            break;
-                        }
+        match self.select_first_worker() {
+            Ok(worker_url) => {
+                let mut request_builder = self.client.get(format!("{}/{}", worker_url, endpoint));
+                for (name, value) in headers {
+                    if name.to_lowercase() != "content-type"
+                        && name.to_lowercase() != "content-length"
+                    {
+                        request_builder = request_builder.header(name, value);
                     }
                 }
-                Err(e) => return HttpResponse::InternalServerError().body(e),
-            }
-        }
 
-        HttpResponse::InternalServerError().body("All retry attempts failed")
+                match request_builder.send().await {
+                    Ok(res) => {
+                        let status = StatusCode::from_u16(res.status().as_u16())
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        match res.bytes().await {
+                            Ok(body) => (status, body).into_response(),
+                            Err(e) => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to read response: {}", e),
+                            )
+                                .into_response(),
+                        }
+                    }
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Request failed: {}", e),
+                    )
+                        .into_response(),
+                }
+            }
+            Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+        }
     }
 
     // New method to route typed requests directly
@@ -394,19 +370,19 @@ impl Router {
         T: crate::openai_api_types::GenerationRequest + serde::Serialize + Clone,
     >(
         &self,
-        client: &reqwest::Client,
-        req: &HttpRequest,
+        headers: Option<&HeaderMap>,
         typed_req: &T,
         route: &str,
-    ) -> HttpResponse {
-        let request_id = get_request_id(req);
+    ) -> Response {
         // Handle retries like the original implementation
         let start = Instant::now();
-        const MAX_REQUEST_RETRIES: u32 = 3;
-        const MAX_TOTAL_RETRIES: u32 = 6;
+        // Use retry config for per-worker retries
+        let max_request_retries = self.retry_config.max_retries;
+        // Total retries across all workers (2x to allow trying multiple workers)
+        let max_total_retries = self.retry_config.max_retries * 2;
         let mut total_retries = 0;
 
-        while total_retries < MAX_TOTAL_RETRIES {
+        while total_retries < max_total_retries {
             // Extract routing text directly from typed request
             let text = typed_req.extract_text_for_routing();
             let is_stream = typed_req.is_stream();
@@ -416,7 +392,7 @@ impl Router {
             let mut request_retries = 0;
 
             // Try the same worker multiple times
-            while request_retries < MAX_REQUEST_RETRIES {
+            while request_retries < max_request_retries {
                 if total_retries >= 1 {
                     info!("Retrying request after {} failed attempts", total_retries);
                     RouterMetrics::record_retry(route);
@@ -439,8 +415,7 @@ impl Router {
                 // Send typed request directly
                 let response = self
                     .send_typed_request(
-                        client,
-                        req,
+                        headers,
                         typed_req,
                         route,
                         &worker_url,
@@ -455,8 +430,7 @@ impl Router {
                     return response;
                 } else {
                     // if the worker is healthy, it means the request is bad, so return the error response
-                    let health_response =
-                        self.send_request(client, &worker_url, "/health", req).await;
+                    let health_response = self.send_health_check(&worker_url).await;
                     if health_response.status().is_success() {
                         RouterMetrics::record_request_error(route, "request_failed");
                         return response;
@@ -464,27 +438,33 @@ impl Router {
                 }
 
                 warn!(
-                    request_id = %request_id,
                     "Generate request failed route={} worker_url={} attempt={} max_attempts={}",
-                    route, worker_url, request_retries + 1, MAX_REQUEST_RETRIES
+                    route,
+                    worker_url,
+                    request_retries + 1,
+                    max_request_retries
                 );
 
                 request_retries += 1;
                 total_retries += 1;
 
-                if request_retries == MAX_REQUEST_RETRIES {
+                if request_retries == max_request_retries {
                     warn!(
-                        request_id = %request_id,
-                        "Removing failed worker after typed request failures worker_url={}", worker_url
+                        "Removing failed worker after typed request failures worker_url={}",
+                        worker_url
                     );
-                    self.remove_failed_worker(&worker_url);
+                    self.remove_worker(&worker_url);
                     break;
                 }
             }
         }
 
         RouterMetrics::record_request_error(route, "request_failed");
-        HttpResponse::InternalServerError().body("All retry attempts failed")
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "All retry attempts failed",
+        )
+            .into_response()
     }
 
     // Helper method to select worker from text using the policy
@@ -520,15 +500,13 @@ impl Router {
     // Send typed request directly without conversion
     async fn send_typed_request<T: serde::Serialize>(
         &self,
-        client: &reqwest::Client,
-        req: &HttpRequest,
+        headers: Option<&HeaderMap>,
         typed_req: &T,
         route: &str,
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
-    ) -> HttpResponse {
-        let request_id = get_request_id(req);
+    ) -> Response {
         let start = Instant::now();
 
         let mut request_builder = if self.dp_aware {
@@ -536,7 +514,11 @@ impl Router {
                 Ok(tup) => tup,
                 Err(e) => {
                     error!("Failed to extract dp_rank: {}", e);
-                    return HttpResponse::InternalServerError().finish();
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to extract dp_rank: {}", e),
+                    )
+                        .into_response();
                 }
             };
 
@@ -544,8 +526,11 @@ impl Router {
             let mut json_val = match serde_json::to_value(typed_req) {
                 Ok(j) => j,
                 Err(e) => {
-                    return HttpResponse::BadRequest()
-                        .body(format!("Convert into serde_json::Value failed: {}", e));
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("Convert into serde_json::Value failed: {}", e),
+                    )
+                        .into_response();
                 }
             };
 
@@ -560,24 +545,31 @@ impl Router {
                     serde_json::to_string(&json_val).unwrap_or(String::from("ERR"))
                 );
             } else {
-                return HttpResponse::BadRequest()
-                    .body("Failed to insert the data_parallel_rank field into the request body");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Failed to insert the data_parallel_rank field into the request body",
+                )
+                    .into_response();
             }
 
-            client
+            self.client
                 .post(format!("{}{}", worker_url_prefix, route))
                 .json(&json_val)
         } else {
-            client
+            self.client
                 .post(format!("{}{}", worker_url, route))
                 .json(typed_req) // Use json() directly with typed request
         };
 
-        // Copy all headers from original request
-        for (name, value) in copy_request_headers(req) {
-            // Skip Content-Type and Content-Length as .json() sets them
-            if name.to_lowercase() != "content-type" && name.to_lowercase() != "content-length" {
-                request_builder = request_builder.header(&name, &value);
+        // Copy all headers from original request if provided
+        if let Some(headers) = headers {
+            for (name, value) in headers {
+                // Skip Content-Type and Content-Length as .json() sets them
+                if name.to_string().to_lowercase() != "content-type"
+                    && name.to_string().to_lowercase() != "content-length"
+                {
+                    request_builder = request_builder.header(name, value);
+                }
             }
         }
 
@@ -585,7 +577,6 @@ impl Router {
             Ok(res) => res,
             Err(e) => {
                 error!(
-                    request_id = %request_id,
                     "Failed to send typed request worker_url={} route={} error={}",
                     worker_url, route, e
                 );
@@ -600,20 +591,24 @@ impl Router {
                     }
                 }
 
-                return HttpResponse::InternalServerError().body(format!("Request failed: {}", e));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Request failed: {}", e),
+                )
+                    .into_response();
             }
         };
 
-        let status = actix_web::http::StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let status = StatusCode::from_u16(res.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         if !is_stream {
             // For non-streaming requests, get response first
             let response = match res.bytes().await {
-                Ok(body) => HttpResponse::build(status).body(body.to_vec()),
+                Ok(body) => (status, body).into_response(),
                 Err(e) => {
                     let error_msg = format!("Failed to get response body: {}", e);
-                    HttpResponse::InternalServerError().body(error_msg)
+                    (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
             };
 
@@ -638,42 +633,86 @@ impl Router {
             let workers = Arc::clone(&self.workers);
             let worker_url = worker_url.to_string();
 
-            HttpResponse::build(status)
-                .insert_header((CONTENT_TYPE, HeaderValue::from_static("text/event-stream")))
-                .streaming(
-                    res.bytes_stream()
-                        .map_err(|_| {
-                            actix_web::error::ErrorInternalServerError("Failed to read stream")
-                        })
-                        .inspect(move |bytes| {
-                            if let Ok(bytes) = bytes {
-                                if bytes
-                                    .as_ref()
-                                    .windows(12)
-                                    .any(|window| window == b"data: [DONE]")
-                                {
-                                    if let Ok(workers_guard) = workers.read() {
-                                        if let Some(worker) =
-                                            workers_guard.iter().find(|w| w.url() == &worker_url)
-                                        {
-                                            worker.decrement_load();
-                                            RouterMetrics::set_running_requests(
-                                                &worker_url,
-                                                worker.load(),
-                                            );
-                                        }
+            let stream = res.bytes_stream();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+            // Spawn task to forward stream and detect completion
+            tokio::spawn(async move {
+                let mut stream = stream;
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            // Check for stream end marker
+                            if bytes
+                                .as_ref()
+                                .windows(12)
+                                .any(|window| window == b"data: [DONE]")
+                            {
+                                if let Ok(workers_guard) = workers.read() {
+                                    if let Some(worker) =
+                                        workers_guard.iter().find(|w| w.url() == &worker_url)
+                                    {
+                                        worker.decrement_load();
+                                        RouterMetrics::set_running_requests(
+                                            &worker_url,
+                                            worker.load(),
+                                        );
                                     }
                                 }
                             }
-                        }),
-                )
+                            if tx.send(Ok(bytes)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let stream = UnboundedReceiverStream::new(rx);
+            let body = Body::from_stream(stream);
+
+            let mut response = Response::new(body);
+            *response.status_mut() = status;
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            response
         } else {
             // For requests without load tracking, just stream
-            HttpResponse::build(status)
-                .insert_header((CONTENT_TYPE, HeaderValue::from_static("text/event-stream")))
-                .streaming(res.bytes_stream().map_err(|_| {
-                    actix_web::error::ErrorInternalServerError("Failed to read stream")
-                }))
+            let stream = res.bytes_stream();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+            // Spawn task to forward stream
+            tokio::spawn(async move {
+                let mut stream = stream;
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            if tx.send(Ok(bytes)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let stream = UnboundedReceiverStream::new(rx);
+            let body = Body::from_stream(stream);
+
+            let mut response = Response::new(body);
+            *response.status_mut() = status;
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            response
         }
     }
 
@@ -775,7 +814,6 @@ impl Router {
         }
     }
 
-    /// Remove all the worker(s) that match the URL prefix
     pub fn remove_worker(&self, worker_url: &str) {
         if self.dp_aware {
             // remove dp-aware workers in a prefix-matching fashion
@@ -844,29 +882,7 @@ impl Router {
         }
     }
 
-    /// Remove a specific failed worker; for internal usage
-    fn remove_failed_worker(&self, worker_url: &str) {
-        let mut workers_guard = self.workers.write().unwrap();
-        if let Some(index) = workers_guard.iter().position(|w| w.url() == worker_url) {
-            workers_guard.remove(index);
-            info!("Removed failed worker: {}", worker_url);
-            RouterMetrics::set_active_workers(workers_guard.len());
-        } else {
-            warn!("Worker {} not found, skipping removal", worker_url);
-            return;
-        }
-
-        // If cache aware policy, remove the worker from the tree
-        if let Some(cache_aware) = self
-            .policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            cache_aware.remove_worker(worker_url);
-        }
-    }
-
-    async fn get_worker_load(&self, client: &reqwest::Client, worker_url: &str) -> Option<isize> {
+    async fn get_worker_load(&self, worker_url: &str) -> Option<isize> {
         let worker_url = if self.dp_aware {
             // Need to extract the URL from "http://host:port@dp_rank"
             let (worker_url_prefix, _dp_rank) = match Self::extract_dp_rank(worker_url) {
@@ -881,7 +897,12 @@ impl Router {
             worker_url
         };
 
-        match client.get(&format!("{}/get_load", worker_url)).send().await {
+        match self
+            .client
+            .get(&format!("{}/get_load", worker_url))
+            .send()
+            .await
+        {
             Ok(res) if res.status().is_success() => match res.bytes().await {
                 Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
                     Ok(data) => data
@@ -919,18 +940,8 @@ impl Router {
         tx: tokio::sync::watch::Sender<HashMap<String, isize>>,
         interval_secs: u64,
         policy: Arc<dyn LoadBalancingPolicy>,
+        client: Client,
     ) {
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Failed to create HTTP client for load monitoring: {}", e);
-                return;
-            }
-        };
-
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
 
         loop {
@@ -1004,9 +1015,7 @@ impl Router {
     }
 }
 
-use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;
-use reqwest::Client;
 
 #[async_trait]
 impl WorkerManagement for Router {
@@ -1023,100 +1032,74 @@ impl WorkerManagement for Router {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl RouterTrait for Router {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
-    async fn health(&self, _client: &Client, _req: &HttpRequest) -> HttpResponse {
-        // Check local health state of all workers (consistent with PD router)
-        // Note: This uses cached health status from background health checks, not live checks
-        let mut all_healthy = true;
-        let mut unhealthy_servers = Vec::new();
+    async fn health(&self, _req: Request<Body>) -> Response {
+        let workers = self.workers.read().unwrap();
+        let unhealthy_servers: Vec<_> = workers
+            .iter()
+            .filter(|w| !w.is_healthy())
+            .map(|w| w.url().to_string())
+            .collect();
 
-        for worker in self.workers.read().unwrap().iter() {
-            if !worker.is_healthy() {
-                all_healthy = false;
-                unhealthy_servers.push(worker.url().to_string());
-            }
-        }
-
-        if all_healthy {
-            HttpResponse::Ok().body("All servers healthy")
+        if unhealthy_servers.is_empty() {
+            (StatusCode::OK, "All servers healthy").into_response()
         } else {
-            HttpResponse::ServiceUnavailable()
-                .body(format!("Unhealthy servers: {:?}", unhealthy_servers))
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Unhealthy servers: {:?}", unhealthy_servers),
+            )
+                .into_response()
         }
     }
 
-    async fn health_generate(&self, client: &Client, req: &HttpRequest) -> HttpResponse {
-        // Test model generation capability by sending to first available worker
-        // Note: This endpoint actually causes the model to generate a token, so we only test one worker
-        self.route_to_first(client, "/health_generate", req).await
+    async fn health_generate(&self, req: Request<Body>) -> Response {
+        self.proxy_get_request(req, "health_generate").await
     }
 
-    async fn get_server_info(&self, client: &Client, req: &HttpRequest) -> HttpResponse {
-        self.route_to_first(client, "/get_server_info", req).await
+    async fn get_server_info(&self, req: Request<Body>) -> Response {
+        self.proxy_get_request(req, "get_server_info").await
     }
 
-    async fn get_models(&self, client: &Client, req: &HttpRequest) -> HttpResponse {
-        self.route_to_first(client, "/v1/models", req).await
+    async fn get_models(&self, req: Request<Body>) -> Response {
+        self.proxy_get_request(req, "v1/models").await
     }
 
-    async fn get_model_info(&self, client: &Client, req: &HttpRequest) -> HttpResponse {
-        self.route_to_first(client, "/get_model_info", req).await
+    async fn get_model_info(&self, req: Request<Body>) -> Response {
+        self.proxy_get_request(req, "get_model_info").await
     }
 
     async fn route_generate(
         &self,
-        client: &Client,
-        req: &HttpRequest,
-        body: serde_json::Value,
-    ) -> HttpResponse {
-        // Convert JSON to typed request
-        match serde_json::from_value::<crate::openai_api_types::GenerateRequest>(body) {
-            Ok(typed_req) => {
-                self.route_typed_request(client, req, &typed_req, "/generate")
-                    .await
-            }
-            Err(e) => HttpResponse::BadRequest().body(format!("Invalid request: {}", e)),
-        }
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/generate").await
     }
 
     async fn route_chat(
         &self,
-        client: &Client,
-        req: &HttpRequest,
-        body: serde_json::Value,
-    ) -> HttpResponse {
-        // Convert JSON to typed request
-        match serde_json::from_value::<crate::openai_api_types::ChatCompletionRequest>(body) {
-            Ok(typed_req) => {
-                self.route_typed_request(client, req, &typed_req, "/v1/chat/completions")
-                    .await
-            }
-            Err(e) => HttpResponse::BadRequest().body(format!("Invalid request: {}", e)),
-        }
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/chat/completions")
+            .await
     }
 
     async fn route_completion(
         &self,
-        client: &Client,
-        req: &HttpRequest,
-        body: serde_json::Value,
-    ) -> HttpResponse {
-        // Convert JSON to typed request
-        match serde_json::from_value::<crate::openai_api_types::CompletionRequest>(body) {
-            Ok(typed_req) => {
-                self.route_typed_request(client, req, &typed_req, "/v1/completions")
-                    .await
-            }
-            Err(e) => HttpResponse::BadRequest().body(format!("Invalid request: {}", e)),
-        }
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/completions")
+            .await
     }
 
-    async fn flush_cache(&self, client: &Client) -> HttpResponse {
+    async fn flush_cache(&self) -> Response {
         // Get all worker URLs
         let worker_urls = self.get_worker_urls();
 
@@ -1129,14 +1112,18 @@ impl RouterTrait for Router {
                     Ok(tup) => tup,
                     Err(e) => {
                         error!("Failed to extract dp_rank: {}", e);
-                        return HttpResponse::InternalServerError().finish();
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to extract dp_rank: {}", e),
+                        )
+                            .into_response();
                     }
                 };
                 worker_url_prefix
             } else {
                 worker_url
             };
-            let request_builder = client.post(format!("{}/flush_cache", worker_url));
+            let request_builder = self.client.post(format!("{}/flush_cache", worker_url));
             tasks.push(request_builder.send());
         }
 
@@ -1151,35 +1138,40 @@ impl RouterTrait for Router {
         });
 
         if all_success {
-            HttpResponse::Ok().body("Cache flushed on all servers")
+            (StatusCode::OK, "Cache flushed on all servers").into_response()
         } else {
-            HttpResponse::InternalServerError().body("Cache flush failed on one or more servers")
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Cache flush failed on one or more servers",
+            )
+                .into_response()
         }
     }
 
-    async fn get_worker_loads(&self, client: &Client) -> HttpResponse {
+    async fn get_worker_loads(&self) -> Response {
         let urls = self.get_worker_urls();
         let mut loads = Vec::new();
 
         // Get loads from all workers
         for url in &urls {
-            let load = self.get_worker_load(client, url).await.unwrap_or(-1);
+            let load = self.get_worker_load(url).await.unwrap_or(-1);
             loads.push(serde_json::json!({
                 "worker": url,
                 "load": load
             }));
         }
 
-        HttpResponse::Ok().json(serde_json::json!({
+        Json(serde_json::json!({
             "workers": loads
         }))
+        .into_response()
     }
 
     fn router_type(&self) -> &'static str {
         "regular"
     }
 
-    fn readiness(&self) -> HttpResponse {
+    fn readiness(&self) -> Response {
         // Regular router is ready if it has at least one healthy worker
         let healthy_count = self
             .workers
@@ -1190,17 +1182,22 @@ impl RouterTrait for Router {
             .count();
 
         if healthy_count > 0 {
-            HttpResponse::Ok().json(serde_json::json!({
+            Json(serde_json::json!({
                 "status": "ready",
                 "healthy_workers": healthy_count,
                 "total_workers": self.workers.read().unwrap().len()
             }))
+            .into_response()
         } else {
-            HttpResponse::ServiceUnavailable().json(serde_json::json!({
-                "status": "not_ready",
-                "reason": "no healthy workers available",
-                "total_workers": self.workers.read().unwrap().len()
-            }))
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "not_ready",
+                    "reason": "no healthy workers available",
+                    "total_workers": self.workers.read().unwrap().len()
+                })),
+            )
+                .into_response()
         }
     }
 }
@@ -1224,6 +1221,8 @@ mod tests {
             interval_secs: 1,
             dp_aware: false,
             api_key: None,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             _health_checker: None,
@@ -1251,8 +1250,10 @@ mod tests {
 
     #[test]
     fn test_wait_for_healthy_workers_empty_list() {
+        // Empty list will timeout as there are no workers to check
         let result = Router::wait_for_healthy_workers(&[], 1, 1);
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Timeout"));
     }
 
     #[test]

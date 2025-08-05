@@ -103,6 +103,8 @@ class PrefillBootstrapQueue:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
+        kv_args.pp_rank = self.pp_rank
+        kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.decode_tp_size = self.decode_tp_size // self.decode_dp_size
         kv_args.prefill_pp_size = self.pp_size
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
@@ -460,6 +462,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         # We need to remove the sync in the following function for overlap schedule.
         self.set_next_batch_sampling_info_done(batch)
+        self.maybe_send_health_check_signal()
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
