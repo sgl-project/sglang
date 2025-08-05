@@ -5,20 +5,39 @@ import json
 from collections.abc import Iterable
 from typing import Literal, Optional, Union
 
-from openai.types.responses import (ResponseOutputItem, ResponseOutputMessage,
-                                    ResponseOutputText)
-from openai.types.responses.response_function_tool_call import (
-    ResponseFunctionToolCall)
+from openai.types.responses import (
+    ResponseOutputItem,
+    ResponseOutputMessage,
+    ResponseOutputText,
+)
+from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_function_web_search import (
-    ActionFind, ActionOpenPage, ActionSearch, ResponseFunctionWebSearch)
+    ActionFind,
+    ActionOpenPage,
+    ActionSearch,
+    ResponseFunctionWebSearch,
+)
 from openai.types.responses.tool import Tool
-from openai_harmony import (Author, Conversation, DeveloperContent,
-                            HarmonyEncodingName, Message, ReasoningEffort,
-                            Role, StreamableParser, SystemContent, TextContent,
-                            ToolDescription, load_harmony_encoding)
+from openai_harmony import (
+    Author,
+    Conversation,
+    DeveloperContent,
+    HarmonyEncodingName,
+    Message,
+    ReasoningEffort,
+    Role,
+    StreamableParser,
+    SystemContent,
+    TextContent,
+    ToolDescription,
+    load_harmony_encoding,
+)
 
-
-from sglang.srt.entrypoints.openai.protocol import ResponseInputOutputItem, ResponseReasoningItem, ResponseReasoningTextContent
+from sglang.srt.entrypoints.openai.protocol import (
+    ResponseInputOutputItem,
+    ResponseReasoningItem,
+    ResponseReasoningTextContent,
+)
 from sglang.srt.utils import random_uuid
 
 REASONING_EFFORT = {
@@ -33,8 +52,7 @@ _harmony_encoding = None
 def get_encoding():
     global _harmony_encoding
     if _harmony_encoding is None:
-        _harmony_encoding = load_harmony_encoding(
-            HarmonyEncodingName.HARMONY_GPT_OSS)
+        _harmony_encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
     return _harmony_encoding
 
 
@@ -50,7 +68,8 @@ def get_system_message(
         sys_msg_content = sys_msg_content.with_model_identity(model_identity)
     if reasoning_effort is not None:
         sys_msg_content = sys_msg_content.with_reasoning_effort(
-            REASONING_EFFORT[reasoning_effort])
+            REASONING_EFFORT[reasoning_effort]
+        )
     if start_date is None:
         start_date = datetime.datetime.now().strftime("%Y-%m-%d")
     sys_msg_content = sys_msg_content.with_conversation_start_date(start_date)
@@ -62,8 +81,9 @@ def get_system_message(
     return sys_msg
 
 
-def get_developer_message(instructions: Optional[str] = None,
-                          tools: Optional[list[Tool]] = None) -> Message:
+def get_developer_message(
+    instructions: Optional[str] = None, tools: Optional[list[Tool]] = None
+) -> Message:
     dev_msg_content = DeveloperContent.new()
     if instructions is not None:
         dev_msg_content = dev_msg_content.with_instructions(instructions)
@@ -83,10 +103,12 @@ def get_developer_message(instructions: Optional[str] = None,
                     name=tool.name,
                     description=tool.description,
                     parameters=tool.parameters,
-                ) for tool in function_tools
+                )
+                for tool in function_tools
             ]
             dev_msg_content = dev_msg_content.with_function_tools(
-                function_tool_descriptions)
+                function_tool_descriptions
+            )
     dev_msg = Message.from_role_and_content(Role.DEVELOPER, dev_msg_content)
     return dev_msg
 
@@ -97,7 +119,7 @@ def get_user_message(content: str) -> Message:
 
 def parse_response_input(
     response_msg: ResponseInputOutputItem,
-    prev_responses: list[Union[ResponseOutputItem, ResponseReasoningItem]]
+    prev_responses: list[Union[ResponseOutputItem, ResponseReasoningItem]],
 ) -> Message:
     if not isinstance(response_msg, dict):
         response_msg = response_msg.model_dump()
@@ -115,30 +137,30 @@ def parse_response_input(
         if isinstance(content, str):
             msg = Message.from_role_and_content(role, text_prefix + content)
         else:
-            contents = [
-                TextContent(text=text_prefix + c["text"]) for c in content
-            ]
+            contents = [TextContent(text=text_prefix + c["text"]) for c in content]
             msg = Message.from_role_and_contents(role, contents)
     elif response_msg["type"] == "function_call_output":
         call_id = response_msg["call_id"]
         call_response: Optional[ResponseFunctionToolCall] = None
         for prev_response in reversed(prev_responses):
-            if isinstance(prev_response, ResponseFunctionToolCall
-                          ) and prev_response.call_id == call_id:
+            if (
+                isinstance(prev_response, ResponseFunctionToolCall)
+                and prev_response.call_id == call_id
+            ):
                 call_response = prev_response
                 break
         if call_response is None:
             raise ValueError(f"No call message found for {call_id}")
         msg = Message.from_author_and_content(
             Author.new(Role.TOOL, f"functions.{call_response.name}"),
-            response_msg["output"])
+            response_msg["output"],
+        )
     elif response_msg["type"] == "reasoning":
         content = response_msg["content"]
         assert len(content) == 1
         msg = Message.from_role_and_content(Role.ASSISTANT, content[0]["text"])
     elif response_msg["type"] == "function_call":
-        msg = Message.from_role_and_content(Role.ASSISTANT,
-                                            response_msg["arguments"])
+        msg = Message.from_role_and_content(Role.ASSISTANT, response_msg["arguments"])
         msg = msg.with_channel("commentary")
         msg = msg.with_recipient(f"functions.{response_msg['name']}")
         msg = msg.with_content_type("json")
@@ -178,7 +200,8 @@ def parse_chat_input(chat_msg) -> Message:
 def render_for_completion(messages: list[Message]) -> list[int]:
     conversation = Conversation.from_messages(messages)
     token_ids = get_encoding().render_conversation_for_completion(
-        conversation, Role.ASSISTANT)
+        conversation, Role.ASSISTANT
+    )
     return token_ids
 
 
@@ -207,14 +230,18 @@ def parse_output_message(message: Message):
         # TODO: translate to url properly!
         if recipient == "browser.search":
             action = ActionSearch(
-                query=f"cursor:{browser_call.get('query', '')}", type="search")
+                query=f"cursor:{browser_call.get('query', '')}", type="search"
+            )
         elif recipient == "browser.open":
             action = ActionOpenPage(
-                url=f"cursor:{browser_call.get('url', '')}", type="open_page")
+                url=f"cursor:{browser_call.get('url', '')}", type="open_page"
+            )
         elif recipient == "browser.find":
-            action = ActionFind(pattern=browser_call["pattern"],
-                                url=f"cursor:{browser_call.get('url', '')}",
-                                type="find")
+            action = ActionFind(
+                pattern=browser_call["pattern"],
+                url=f"cursor:{browser_call.get('url', '')}",
+                type="find",
+            )
         else:
             raise ValueError(f"Unknown browser action: {recipient}")
         web_search_item = ResponseFunctionWebSearch(
@@ -244,8 +271,9 @@ def parse_output_message(message: Message):
                     id=f"ft_{random_id}",
                 )
                 output_items.append(response_item)
-        elif message.recipient.startswith(
-                "python") or message.recipient.startswith("browser"):
+        elif message.recipient.startswith("python") or message.recipient.startswith(
+            "browser"
+        ):
             for content in message.content:
                 reasoning_item = ResponseReasoningItem(
                     text=content.text,
@@ -283,15 +311,12 @@ def parse_remaining_state(parser: StreamableParser):
     if parser.current_role != Role.ASSISTANT:
         return []
     current_recipient = parser.current_recipient
-    if (current_recipient is not None
-            and current_recipient.startswith("browser.")):
+    if current_recipient is not None and current_recipient.startswith("browser."):
         return []
 
     if parser.current_channel == "analysis":
         reasoning_item = ResponseReasoningItem(
-            content=[
-                ResponseReasoningTextContent(text=parser.current_content)
-            ],
+            content=[ResponseReasoningTextContent(text=parser.current_content)],
             status=None,
         )
         return [reasoning_item]

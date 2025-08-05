@@ -6,14 +6,20 @@ from typing import TYPE_CHECKING, Optional, Union
 from mcp import ClientSession
 
 from sglang.srt.entrypoints.harmony_utils import (
-    get_encoding, get_streamable_parser_for_assistant, render_for_completion, parse_output_into_messages)
+    get_encoding,
+    get_streamable_parser_for_assistant,
+    parse_output_into_messages,
+    render_for_completion,
+)
 
 if TYPE_CHECKING:
     # Avoid circular import.
     from sglang.srt.entrypoints.tool import Tool
 
-from openai_harmony import Author, Message, Role, StreamState, TextContent
 import json
+
+from openai_harmony import Author, Message, Role, StreamState, TextContent
+
 
 class ConversationContext(ABC):
 
@@ -104,8 +110,9 @@ class HarmonyContext(ConversationContext):
     def need_builtin_tool_call(self) -> bool:
         last_msg = self.messages[-1]
         recipient = last_msg.recipient
-        return recipient is not None and (recipient.startswith("browser.")
-                                          or recipient.startswith("python"))
+        return recipient is not None and (
+            recipient.startswith("browser.") or recipient.startswith("python")
+        )
 
     async def call_tool(self) -> list[Message]:
         if not self.messages:
@@ -115,17 +122,20 @@ class HarmonyContext(ConversationContext):
         if recipient is not None:
             if recipient.startswith("browser."):
                 return await self.call_search_tool(
-                    self.tool_sessions["browser"], last_msg)
+                    self.tool_sessions["browser"], last_msg
+                )
             elif recipient.startswith("python"):
                 return await self.call_python_tool(
-                    self.tool_sessions["python"], last_msg)
+                    self.tool_sessions["python"], last_msg
+                )
         raise ValueError("No tool call found")
 
     def render_for_completion(self) -> list[int]:
         return render_for_completion(self.messages)
 
-    async def call_search_tool(self, tool_session: Union[ClientSession, Tool],
-                               last_msg: Message) -> list[Message]:
+    async def call_search_tool(
+        self, tool_session: Union[ClientSession, Tool], last_msg: Message
+    ) -> list[Message]:
         if isinstance(tool_session, Tool):
             return await tool_session.get_result(self)
         tool_name = last_msg.recipient.split(".")[1]
@@ -134,12 +144,11 @@ class HarmonyContext(ConversationContext):
         result_str = result.content[0].text
         content = TextContent(text=result_str)
         author = Author(role=Role.TOOL, name=last_msg.recipient)
-        return [
-            Message(author=author, content=[content], recipient=Role.ASSISTANT)
-        ]
+        return [Message(author=author, content=[content], recipient=Role.ASSISTANT)]
 
-    async def call_python_tool(self, tool_session: Union[ClientSession, Tool],
-                               last_msg: Message) -> list[Message]:
+    async def call_python_tool(
+        self, tool_session: Union[ClientSession, Tool], last_msg: Message
+    ) -> list[Message]:
         if isinstance(tool_session, Tool):
             return await tool_session.get_result(self)
         param = {
@@ -152,10 +161,12 @@ class HarmonyContext(ConversationContext):
         author = Author(role=Role.TOOL, name="python")
 
         return [
-            Message(author=author,
-                    content=[content],
-                    channel=last_msg.channel,
-                    recipient=Role.ASSISTANT)
+            Message(
+                author=author,
+                content=[content],
+                channel=last_msg.channel,
+                recipient=Role.ASSISTANT,
+            )
         ]
 
 
@@ -195,8 +206,7 @@ class StreamingHarmonyContext(HarmonyContext):
         return self.parser.state == StreamState.EXPECT_START
 
     def is_assistant_action_turn(self) -> bool:
-        return self.last_tok in self.encoding.stop_tokens_for_assistant_actions(
-        )
+        return self.last_tok in self.encoding.stop_tokens_for_assistant_actions()
 
     def render_for_completion(self) -> list[int]:
         # now this list of tokens as next turn's starting tokens

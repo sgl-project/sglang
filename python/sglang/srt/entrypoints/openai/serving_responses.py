@@ -29,13 +29,13 @@ try:
 except ImportError:
     print("OpenAI Harmony not installed, skipping")
 
+from openai.types.responses import ResponseOutputMessage, ResponseOutputText
+
 from sglang.srt.entrypoints.context import (
     ConversationContext,
     HarmonyContext,
     SimpleContext,
 )
-from openai.types.responses import ResponseOutputMessage, ResponseOutputText
-
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
@@ -572,7 +572,18 @@ class OpenAIServingResponses(OpenAIServingChat):
         **kwargs,
     ):
         try:
-            response = await self.responses_full_generator(request, sampling_params, result_generator, context, model_name, tokenizer, request_metadata, created_time, *args, **kwargs)
+            response = await self.responses_full_generator(
+                request,
+                sampling_params,
+                result_generator,
+                context,
+                model_name,
+                tokenizer,
+                request_metadata,
+                created_time,
+                *args,
+                **kwargs,
+            )
         except Exception as e:
             logger.exception("Background request failed for %s", request.request_id)
             response = self.create_error_response(str(e))

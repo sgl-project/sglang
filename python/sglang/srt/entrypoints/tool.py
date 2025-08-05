@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 class Tool(ABC):
 
     @abstractmethod
@@ -32,8 +33,7 @@ class HarmonyBrowserTool(Tool):
             from gpt_oss.tools.simple_browser.backend import ExaBackend
         except ImportError:
             self.enabled = False
-            logger.warning_once(
-                "gpt_oss is not installed, browsing is disabled")
+            logger.warning_once("gpt_oss is not installed, browsing is disabled")
             return
 
         browser_backend = ExaBackend(source="web", api_key=exa_api_key)
@@ -42,6 +42,7 @@ class HarmonyBrowserTool(Tool):
 
     async def get_result(self, context: "ConversationContext") -> Any:
         from sglang.srt.entrypoints.context import HarmonyContext
+
         assert isinstance(context, HarmonyContext)
         last_msg = context.messages[-1]
         tool_output_msgs = []
@@ -64,7 +65,8 @@ class HarmonyPythonTool(Tool):
         except ImportError:
             self.enabled = False
             logger.warning_once(
-                "gpt_oss is not installed, code interpreter is disabled")
+                "gpt_oss is not installed, code interpreter is disabled"
+            )
             return
 
         self.python_tool = PythonTool()
@@ -72,6 +74,7 @@ class HarmonyPythonTool(Tool):
 
     async def get_result(self, context: "ConversationContext") -> Any:
         from sglang.srt.entrypoints.context import HarmonyContext
+
         assert isinstance(context, HarmonyContext)
         last_msg = context.messages[-1]
         tool_output_msgs = []
