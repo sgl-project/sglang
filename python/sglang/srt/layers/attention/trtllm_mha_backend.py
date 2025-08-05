@@ -256,17 +256,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_cache = (
-            k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.head_dim)
-            .transpose(1, 2)
-            .unsqueeze(1)
-        )
-        v_cache = (
-            v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.head_dim)
-            .transpose(1, 2)
-            .unsqueeze(1)
-        )
-        kv_cache = torch.cat([k_cache, v_cache], dim=1)
+        k_cache = k_cache.view(
+            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+        ).transpose(1, 2)
+        v_cache = v_cache.view(
+            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+        ).transpose(1, 2)
+
+        kv_cache = torch.stack([k_cache, v_cache], dim=1)
 
         # TODO: bmm1_scale and bmm2_scale might require modification
         q_scale = 1.0
@@ -310,8 +307,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_cache = k_cache.view(-1, self.page_size, self.num_kv_heads, layer.head_dim)
-        v_cache = v_cache.view(-1, self.page_size, self.num_kv_heads, layer.head_dim)
+        k_cache = k_cache.view(
+            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+        ).transpose(1, 2)
+        v_cache = v_cache.view(
+            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+        ).transpose(1, 2)
         kv_cache = torch.stack([k_cache, v_cache], dim=1)
 
         # TODO: bmm1_scale and bmm2_scale might require modification
