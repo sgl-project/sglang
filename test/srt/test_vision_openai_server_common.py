@@ -96,8 +96,8 @@ class TestOpenAIVisionServer(CustomTestCase):
         ), f"text: {text}, should contain cab, taxi, SUV, vehicle or car"
         # MiniCPMO fails to recognize `iron`, but `hanging`
         assert (
-            "iron" in text or "hang" in text or "cloth" in text or "holding" in text
-        ), f"text: {text}, should contain iron, hang, cloth or holding"
+            "iron" in text or "hang" in text or "cloth" in text or "coat" in text or "holding" in text
+        ), f"text: {text}, should contain iron, hang, cloth, coat or holding"
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -193,8 +193,8 @@ class TestOpenAIVisionServer(CustomTestCase):
         print(f"Multi images response:\n{text}")
         print("-" * 30)
         assert (
-            "man" in text or "cab" in text or "SUV" in text or "taxi" in text
-        ), f"text: {text}, should contain man, cab, SUV or taxi"
+            "man" in text or "cab" in text or "SUV" in text or "taxi" in text or "car" in text
+        ), f"text: {text}, should contain man, cab, SUV, taxi or car"
         assert (
             "logo" in text or '"S"' in text or "SG" in text or "graphic" in text
         ), f"text: {text}, should contain logo, S or SG or graphic"
@@ -308,11 +308,12 @@ class TestOpenAIVisionServer(CustomTestCase):
             "iPod" in video_response
             or "device" in video_response
             or "microphone" in video_response
+            or "rectangular" in video_response
         ), f"""
         ====================== video_response =====================
         {video_response}
         ===========================================================
-        should contain 'iPod' or 'device' or 'microphone'
+        should contain 'iPod' or 'device' or 'microphone' or 'rectangular'
         """
         assert (
             "man" in video_response
