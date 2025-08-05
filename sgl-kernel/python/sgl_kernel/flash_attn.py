@@ -9,9 +9,9 @@ except:
     raise ImportError("Can not import sgl_kernel. Please check your installation.")
 
 try:
-    from flash_attn.cute.interface import flash_attn_func
+    from flash_attn.cute.interface import _flash_attn_fwd
 except ImportError:
-    flash_attn_func = None
+    _flash_attn_fwd = None
 
 
 def is_fa3_supported(device=None) -> bool:
@@ -245,17 +245,24 @@ def flash_attn_varlen_func(
     sm_margin=0,
     return_softmax_lse=False,
 ):
-    # Use flash_attn_func for sm90 and above when available and conditions are met
-    if is_sm90_or_higher() and flash_attn_func is not None:
-        # Convert window_size format from (-1, -1) to (None, None) for flash_attn_func
-        window_size_converted = tuple(None if w == -1 else w for w in window_size)
-        out, lse = flash_attn_func(
+    if softmax_scale is None:
+        softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
+            -0.5
+        )
+    # Use _flash_attn_fwd for sm90 and above when available and conditions are met
+    if is_sm90_or_higher() and _flash_attn_fwd is not None:
+        out, lse = _flash_attn_fwd(
             q,
             k,
             v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
             softmax_scale=softmax_scale,
             causal=causal,
-            window_size=window_size_converted,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
             softcap=softcap,
         )
 
@@ -264,11 +271,6 @@ def flash_attn_varlen_func(
     if not is_fa3_supported():
         raise NotImplementedError(
             "flash_attn at sgl-kernel is only supported on sm90 and above"
-        )
-
-    if softmax_scale is None:
-        softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
-            -0.5
         )
 
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
