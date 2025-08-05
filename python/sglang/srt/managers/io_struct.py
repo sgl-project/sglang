@@ -126,6 +126,9 @@ class GenerateReqInput:
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+    # For background responses (OpenAI responses API)
+    background: bool = False
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -559,6 +562,9 @@ class EmbeddingReqInput:
     modalities: Optional[List[str]] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
+
+    # For background responses (OpenAI responses API)
+    background: bool = False
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided

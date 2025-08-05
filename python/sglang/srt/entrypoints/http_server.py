@@ -146,6 +146,25 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager
     )
 
+    try:
+        from sglang.srt.entrypoints.openai.serving_responses import (
+            OpenAIServingResponses,
+        )
+
+        fast_api_app.state.openai_serving_responses = OpenAIServingResponses(
+            _global_state.tokenizer_manager,
+            _global_state.template_manager,
+            enable_prompt_tokens_details=True,
+            enable_force_include_usage=True,
+            use_harmony=False,  # Enable harmony for OpenAI compatibility
+        )
+    except Exception as e:
+        # print stack trace
+        import traceback
+
+        traceback.print_exc()
+        logger.warning(f"Can not initialize OpenAIServingResponses, error: {e}")
+
     server_args: ServerArgs = fast_api_app.server_args
     if server_args.warmups is not None:
         await execute_warmups(
@@ -840,6 +859,33 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
     """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
     return await raw_request.app.state.openai_serving_score.handle_request(
         request, raw_request
+    )
+
+
+@app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
+async def v1_responses_request(request: dict, raw_request: Request):
+    """Endpoint for the responses API with reasoning support."""
+    from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
+
+    request_obj = ResponsesRequest(**request)
+    return await raw_request.app.state.openai_serving_responses.create_responses(
+        request_obj, raw_request
+    )
+
+
+@app.get("/v1/responses/{response_id}")
+async def v1_retrieve_responses(response_id: str, raw_request: Request):
+    """Retrieve a response by ID."""
+    return await raw_request.app.state.openai_serving_responses.retrieve_responses(
+        response_id
+    )
+
+
+@app.post("/v1/responses/{response_id}/cancel")
+async def v1_cancel_responses(response_id: str, raw_request: Request):
+    """Cancel a background response."""
+    return await raw_request.app.state.openai_serving_responses.cancel_responses(
+        response_id
     )
 
 

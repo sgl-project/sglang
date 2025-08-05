@@ -41,6 +41,7 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
@@ -231,6 +232,10 @@ def is_flashinfer_available():
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
+
+
+def random_uuid() -> str:
+    return str(uuid.uuid4().hex)
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(

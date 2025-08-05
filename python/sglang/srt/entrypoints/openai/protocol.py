@@ -14,9 +14,24 @@
 """Pydantic models for OpenAI API protocol"""
 
 import time
+import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, TypeAlias, Union
 
+from openai.types.responses import (
+    ResponseFunctionToolCall,
+    ResponseFunctionToolCallOutputItem,
+    ResponseInputItemParam,
+    ResponseOutputItem,
+    ResponsePrompt,
+    ResponseStatus,
+    ResponseTextConfig,
+)
+from openai.types.responses.response import ToolChoice
+from openai.types.responses.response_function_web_search import (
+    ResponseFunctionWebSearch,
+)
+from openai.types.responses.tool import Tool
 from pydantic import (
     BaseModel,
     Field,
@@ -428,6 +443,13 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
     return_hidden_states: bool = False
+    reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
+        default="medium",
+        description="Constrains effort on reasoning for reasoning models. "
+        "'low' is the least effort, 'high' is the most effort. Reducing reasoning effort can "
+        "result in faster responses and fewer tokens used on reasoning in a response. "
+        "Currently only supported for OpenAI models.",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -617,6 +639,200 @@ OpenAIServingRequest = Union[
     ScoringRequest,
     V1RerankReqInput,
 ]
+
+
+# Response API protocol definitions
+class ResponseReasoningParam(BaseModel):
+    """Reasoning parameters for responses."""
+
+    effort: Optional[Literal["low", "medium", "high"]] = Field(
+        default="medium",
+        description="Constrains effort on reasoning for reasoning models.",
+    )
+
+
+class ResponseTool(BaseModel):
+    """Tool definition for responses."""
+
+    type: Literal["web_search_preview", "code_interpreter"] = Field(
+        description="Type of tool to enable"
+    )
+
+
+ResponseInputOutputItem: TypeAlias = Union[
+    ResponseInputItemParam,
+    "ResponseReasoningItem",
+    ResponseFunctionToolCall,
+]
+
+
+class ResponsesRequest(BaseModel):
+    """Request body for v1/responses endpoint."""
+
+    # Core OpenAI API fields (ordered by official documentation)
+    background: Optional[bool] = False
+    include: Optional[
+        List[
+            Literal[
+                "code_interpreter_call.outputs",
+                "computer_call_output.output.image_url",
+                "file_search_call.results",
+                "message.input_image.image_url",
+                "message.output_text.logprobs",
+                "reasoning.encrypted_content",
+            ]
+        ]
+    ] = None
+    input: Union[str, List[ResponseInputOutputItem]]
+    instructions: Optional[str] = None
+    max_output_tokens: Optional[int] = None
+    max_tool_calls: Optional[int] = None
+    metadata: Optional[Dict[str, Any]] = None
+    model: Optional[str] = None  # Made optional to match vLLM
+    parallel_tool_calls: Optional[bool] = True
+    previous_response_id: Optional[str] = None
+    reasoning: Optional[ResponseReasoningParam] = None
+    service_tier: Literal["auto", "default", "flex", "scale", "priority"] = "auto"
+    store: Optional[bool] = True
+    stream: Optional[bool] = False
+    temperature: Optional[float] = None
+    tool_choice: Literal["auto", "required", "none"] = "auto"
+    tools: List[ResponseTool] = Field(default_factory=list)
+    top_logprobs: Optional[int] = 0
+    top_p: Optional[float] = None
+    truncation: Optional[Literal["auto", "disabled"]] = "disabled"
+    user: Optional[str] = None
+
+    # Extra SGLang parameters
+    request_id: str = Field(
+        default_factory=lambda: f"resp_{uuid.uuid4().hex}",
+        description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
+    )
+    priority: int = Field(default=0, description="Request priority")
+
+    # SGLang-specific sampling parameters
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    stop: Optional[Union[str, List[str]]] = None
+    top_k: int = -1
+    min_p: float = 0.0
+    repetition_penalty: float = 1.0
+
+    # Default sampling parameters
+    _DEFAULT_SAMPLING_PARAMS = {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "top_k": -1,
+        "min_p": 0.0,
+        "repetition_penalty": 1.0,
+    }
+
+    def to_sampling_params(
+        self, default_max_tokens: int, default_params: Optional[Dict] = None
+    ) -> Dict[str, Any]:
+        """Convert to sampling parameters for generation."""
+        if default_params is None:
+            default_params = {}
+
+        # Use max_output_tokens if available, otherwise use max_tokens for backwards compatibility
+        if self.max_output_tokens is not None:
+            max_tokens = min(self.max_output_tokens, default_max_tokens)
+        else:
+            max_tokens = default_max_tokens
+
+        # Avoid exceed the context length by minus 1 token
+        max_tokens -= 1
+
+        # Get parameters with defaults
+        temperature = self.temperature
+        if temperature is None:
+            temperature = default_params.get(
+                "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"]
+            )
+
+        top_p = self.top_p
+        if top_p is None:
+            top_p = default_params.get("top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"])
+
+        params = {
+            "max_new_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": self.presence_penalty,
+            "stop": self.stop,
+            "top_k": self.top_k,
+            "min_p": self.min_p,
+            "repetition_penalty": self.repetition_penalty,
+        }
+
+        # Apply any additional default parameters
+        for key, value in default_params.items():
+            if key not in params or params[key] is None:
+                params[key] = value
+
+        return params
+
+
+class ResponseReasoningTextContent(BaseModel):
+    text: str
+    type: Literal["reasoning_text"] = "reasoning_text"
+
+
+class ResponseReasoningItem(BaseModel):
+    id: str = Field(default_factory=lambda: f"rs_{uuid.uuid4().hex}")
+    content: list[ResponseReasoningTextContent] = Field(default_factory=list)
+    summary: list = Field(default_factory=list)
+    type: Literal["reasoning"] = "reasoning"
+    encrypted_content: Optional[str] = None
+    status: Optional[Literal["in_progress", "completed", "incomplete"]]
+
+
+class PromptTokenUsageInfo(BaseModel):
+    """Prompt token usage details."""
+
+    cached_tokens: int = 0
+
+
+class ResponsesResponse(BaseModel):
+    """Response body for v1/responses endpoint."""
+
+    id: str = Field(default_factory=lambda: f"resp_{time.time()}")
+    object: Literal["realtime.response"] = "realtime.response"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+
+    output: List[ResponseOutputItem] = Field(default_factory=list)
+    status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
+    usage: Optional[UsageInfo] = None
+
+    @classmethod
+    def from_request(
+        cls,
+        request: ResponsesRequest,
+        sampling_params: Any,
+        model_name: str,
+        created_time: int,
+        output: List[ResponseOutputItem],
+        status: str,
+        usage: Optional[UsageInfo],
+    ) -> "ResponsesResponse":
+        """Create a response from a request."""
+        return cls(
+            id=request.request_id,
+            created=created_time,
+            model=model_name,
+            output=output,
+            status=status,
+            usage=usage,
+        )
+
+
+class RequestResponseMetadata(BaseModel):
+    """Metadata for request/response tracking."""
+
+    request_id: str
+    final_usage_info: Optional[UsageInfo] = None
 
 
 @dataclass
