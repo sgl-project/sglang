@@ -369,7 +369,6 @@ class HiCacheController:
             self.prefetch_revoke_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
 
-        self.update_token_counter(-self.prefetch_tokens_occupied)
         self.write_thread = threading.Thread(
             target=self.write_thread_func_direct, daemon=True
         )
@@ -381,6 +380,7 @@ class HiCacheController:
         self.load_thread.start()
 
         if self.enable_storage:
+            self.update_token_counter(-self.prefetch_tokens_occupied)
             self.prefetch_thread = threading.Thread(
                 target=self.prefetch_thread_func, daemon=True
             )
