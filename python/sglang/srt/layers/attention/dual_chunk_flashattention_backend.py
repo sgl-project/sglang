@@ -157,13 +157,12 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
 
     @functools.lru_cache()
     def get_sparse_attention_config(self, layer_idx) -> List[Dict[str, Any]]:
-
-        sparse_attention_config_tmp = {
+        layer_sparse_attention_config = {
             int(i): j for i, j in self.sparse_attention_config[layer_idx].items()
         }
         start_head = self.num_heads * get_tensor_model_parallel_rank()
         end_head = start_head + self.num_heads
-        return [sparse_attention_config_tmp[i] for i in range(start_head, end_head)]
+        return [layer_sparse_attention_config[i] for i in range(start_head, end_head)]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -183,6 +182,14 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         metadata.block_tables = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, : metadata.max_seq_len
         ]
+        # Convert the block table to a strided format.
+        if self.page_size > 1:
+            strided_indices = torch.arange(
+                0, metadata.block_tables.shape[1], self.page_size, device=self.device
+            )
+            metadata.block_tables = (
+                metadata.block_tables[:, strided_indices] // self.page_size
+            )
 
         metadata.query_start_loc = torch.zeros(
             batch_size + 1, dtype=torch.int32, device=metadata.seq_lens_tensor.device
@@ -222,16 +229,18 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                 metadata.scaling_factor = (
                     0.1
                     * torch.log(
-                        metadata.seq_lens_tensor / self.original_max_position_embeddings
+                        metadata.orig_seq_lens_tensor / self.original_max_position_embeddings
                     )
                     + 1.0
                 ).clip(min=1)
 
         if forward_mode.is_decode():
-            chunk_len = self.chunk_size - self.local_size
-            chunk_num_curr = (metadata.seq_lens_tensor - 1) // chunk_len
+            cache_seq_lens = metadata.orig_seq_lens_tensor
 
-            seq_lens_intra = metadata.seq_lens_tensor - chunk_num_curr * chunk_len
+            chunk_len = self.chunk_size - self.local_size
+            chunk_num_curr = (cache_seq_lens - 1) // chunk_len
+
+            seq_lens_intra = cache_seq_lens - chunk_num_curr * chunk_len
             max_seq_len_intra = seq_lens_intra.max().item()
             metadata.seq_lens_intra = seq_lens_intra
             metadata.max_seq_len_intra = max_seq_len_intra
@@ -246,7 +255,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                 st = chunk_num_curr[i] * chunk_len // self.page_size
                 ed = min(
                     st + (max_seq_len_intra - 1) // self.page_size + 1,
-                    (metadata.seq_lens[i] - 1) // self.page_size + 1,
+                    (cache_seq_lens[i] - 1) // self.page_size + 1,
                 )
                 block_tables_intra[i, : ed - st] = metadata.block_tables[i, st:ed]
             metadata.block_tables_intra = block_tables_intra
@@ -270,7 +279,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     )
                     end = min(
                         start + (metadata.max_seq_len_succ - 1) // self.page_size + 1,
-                        (metadata.seq_lens[i] - 1) // self.page_size + 1,
+                        (cache_seq_lens[i] - 1) // self.page_size + 1,
                     )
                     block_tables_succ[i, : end - start] = metadata.block_tables[
                         i, start:end
@@ -279,15 +288,6 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
 
             metadata.seq_lens_inter = (chunk_num_curr - 1).clip(min=0) * chunk_len
             metadata.max_seq_len_inter = metadata.seq_lens_inter.max().item()
-
-        # Convert the block table to a strided format.
-        if self.page_size > 1:
-            self.strided_indices = torch.arange(
-                0, metadata.block_tables.shape[1], self.page_size, device=self.device
-            )
-            metadata.block_tables = (
-                metadata.block_tables[:, self.strided_indices] // self.page_size
-            )
 
         self.forward_metadata = metadata
 
