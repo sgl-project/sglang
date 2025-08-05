@@ -1705,6 +1705,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             or attention_backend_str == "flashmla"
             or attention_backend_str == "cutlass_mla"
             or attention_backend_str == "ascend"
+            or attention_backend_str == "trtllm_mha"
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
             seq_lens_cpu = (
