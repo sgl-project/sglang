@@ -453,6 +453,10 @@ class AnthropicServingMessages(OpenAIServingBase):
     ) -> AsyncGenerator[str, None]:
         """Generate streaming response in Anthropic format"""
 
+        # State tracking for streaming
+        is_firsts = {}
+        stream_buffers = {}
+
         # Send message_start event
         start_message = AnthropicMessagesResponse(
             id=request_id,
@@ -480,10 +484,13 @@ class AnthropicServingMessages(OpenAIServingBase):
             async for content in self.tokenizer_manager.generate_request(
                 internal_request, raw_request
             ):
+                index = content.get("index", 0)
                 if "text" in content:
-                    index = content.get("index", 0)
+                    # Process content delta
+                    stream_buffer = stream_buffers.get(index, "")
+                    text_delta = content["text"][len(stream_buffer) :]
+                    stream_buffers[index] = stream_buffer + text_delta
 
-                    text_delta = content["text"][index:]
                     accumulated_text += text_delta
 
                     # Send content_block_delta event
