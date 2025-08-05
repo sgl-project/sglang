@@ -186,13 +186,13 @@ def parse_response_output(output: ResponseOutputItem) -> Message:
 
 
 def parse_chat_input(chat_msg) -> Message:
-    role = chat_msg["role"]
-    content = chat_msg["content"]
+    role = chat_msg.role
+    content = chat_msg.content
     if isinstance(content, str):
         contents = [TextContent(text=content)]
     else:
         # TODO: Support refusal.
-        contents = [TextContent(text=c["text"]) for c in content]
+        contents = [TextContent(text=c.text) for c in content]
     msg = Message.from_role_and_contents(role, contents)
     return msg
 

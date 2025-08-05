@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copied from vLLM
+import json
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional, Union
 
 from mcp import ClientSession
+from openai_harmony import Author, Message, Role, StreamState, TextContent
 
 from sglang.srt.entrypoints.harmony_utils import (
     get_encoding,
@@ -11,20 +13,10 @@ from sglang.srt.entrypoints.harmony_utils import (
     parse_output_into_messages,
     render_for_completion,
 )
-from openai_harmony import Author, Message, Role, StreamState, TextContent
-
-
-if TYPE_CHECKING:
-    # Avoid circular import.
-    from sglang.srt.entrypoints.tool import Tool
-
-import json
-from openai_harmony import Author, Message, Role, StreamState, TextContent
-
+from sglang.srt.entrypoints.tool import Tool
 
 
 class ConversationContext(ABC):
-
 
     @abstractmethod
     def need_builtin_tool_call(self) -> bool:

@@ -50,6 +50,7 @@ runtime_common = [
     "uvicorn",
     "uvloop",
     "xgrammar==0.1.22",
+    "openai-harmony==0.0.2a1",
 ]
 
 srt = [

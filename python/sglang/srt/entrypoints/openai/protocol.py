@@ -99,6 +99,7 @@ class UsageInfo(BaseModel):
     completion_tokens: Optional[int] = 0
     # only used to return cached tokens when --enable-cache-report is set
     prompt_tokens_details: Optional[Dict[str, int]] = None
+    reasoning_tokens: Optional[int] = 0
 
 
 class StreamOptions(BaseModel):
@@ -786,6 +787,43 @@ class ResponseReasoningItem(BaseModel):
     type: Literal["reasoning"] = "reasoning"
     encrypted_content: Optional[str] = None
     status: Optional[Literal["in_progress", "completed", "incomplete"]]
+
+
+class ResponseReasoningTextDeltaEvent(BaseModel):
+    type: Literal["response.reasoning_text.delta"] = "response.reasoning_text.delta"
+    item_id: str = "item_1234"
+    output_index: int
+    content_index: int
+    delta: str
+    sequence_number: int = -1
+
+
+class ResponseReasoningTextDoneEvent(BaseModel):
+    type: Literal["response.reasoning_text.done"] = "response.reasoning_text.done"
+    item_id: str = "item_1234"
+    output_index: int
+    content_index: int
+    text: str
+    sequence_number: int = -1
+
+
+class ResponseContentPartDoneEvent(BaseModel):
+    type: Literal["response.content_part.done"] = "response.content_part.done"
+    item_id: str = "item_1234"
+    output_index: int
+    content_index: int
+    part: Union[ResponseOutputItem, ResponseReasoningItem]
+    sequence_number: int = -1
+
+
+class ResponseOutputItemDoneEvent(BaseModel):
+    type: Literal["response.output_item.done"] = "response.output_item.done"
+    item_id: str = "item_1234"
+    output_index: int
+    item: Union[
+        ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCallOutputItem
+    ]
+    sequence_number: int = -1
 
 
 class PromptTokenUsageInfo(BaseModel):

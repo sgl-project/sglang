@@ -151,6 +151,16 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager
     )
 
+    server_args: ServerArgs = fast_api_app.server_args
+
+    if server_args.tool_server == "demo":
+        tool_server: Optional[ToolServer] = DemoToolServer()
+    elif server_args.tool_server:
+        tool_server = MCPToolServer()
+        await tool_server.add_tool_server(server_args.tool_server)
+    else:
+        tool_server = None
+
     try:
         from sglang.srt.entrypoints.openai.serving_responses import (
             OpenAIServingResponses,
@@ -161,7 +171,7 @@ async def lifespan(fast_api_app: FastAPI):
             _global_state.template_manager,
             enable_prompt_tokens_details=True,
             enable_force_include_usage=True,
-            use_harmony=False,  # Enable harmony for OpenAI compatibility
+            tool_server=tool_server,
         )
     except Exception as e:
         # print stack trace
@@ -170,15 +180,6 @@ async def lifespan(fast_api_app: FastAPI):
         traceback.print_exc()
         logger.warning(f"Can not initialize OpenAIServingResponses, error: {e}")
 
-    if server_args.tool_server == "demo":
-        tool_server: Optional[ToolServer] = DemoToolServer()
-    elif server_args.tool_server:
-        tool_server = MCPToolServer()
-        await tool_server.add_tool_server(server_args.tool_server)
-    else:
-        tool_server = None
-
-    server_args: ServerArgs = fast_api_app.server_args
     if server_args.warmups is not None:
         await execute_warmups(
             server_args.disaggregation_mode,

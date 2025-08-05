@@ -8,6 +8,7 @@ from typing import Any
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.types import ListToolsResult
+from openai_harmony import ToolDescription, ToolNamespaceConfig
 
 from sglang.srt.entrypoints.tool import HarmonyBrowserTool, HarmonyPythonTool, Tool
 
