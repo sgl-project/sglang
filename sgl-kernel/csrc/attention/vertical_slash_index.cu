@@ -6,6 +6,8 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
 #include <torch/all.h>
+#include <c10/cuda/CUDAStream.h>
+
 
 // Save the start index of each block in the given range into block_offset.
 // Returns the updated block count.
