@@ -495,6 +495,7 @@ def _fwd_kernel_stage2(
     O,
     kv_indptr,
     num_kv_splits,
+    sk_ptr,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -504,6 +505,7 @@ def _fwd_kernel_stage2(
     MIN_BLOCK_KV: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
+    HAS_SK: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -545,6 +547,10 @@ def _fwd_kernel_stage2(
             e_sum = e_sum * old_scale + exp_logic
             e_max = n_e_max
 
+    if HAS_SK:
+        cur_sk = tl.load(sk_ptr + cur_head)
+        e_sum += tl.exp(cur_sk - e_max)
+
     tl.store(
         O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
         acc / e_sum,
@@ -561,12 +567,14 @@ def _decode_softmax_reducev_fwd(
     kv_indptr,
     num_kv_splits,
     max_kv_splits,
+    sk=None,
 ):
     batch, head_num = q.shape[0], q.shape[1]
     Lv = v_buffer.shape[-1]
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     MAX_KV_SPLITS = max_kv_splits
+    HAS_SK = sk is not None
 
     extra_kargs = {}
     if _is_hip:
@@ -581,6 +589,7 @@ def _decode_softmax_reducev_fwd(
         o,
         kv_indptr,
         num_kv_splits,
+        sk,
         logits.stride(0),
         logits.stride(1),
         logits.stride(2),
@@ -590,6 +599,7 @@ def _decode_softmax_reducev_fwd(
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,
+        HAS_SK=HAS_SK,
         num_warps=4,
         num_stages=2,
         **extra_kargs,
@@ -609,6 +619,7 @@ def decode_attention_fwd_normal(
     max_kv_splits,
     sm_scale,
     logit_cap=0.0,
+    sk=None,
 ):
     _decode_att_m_fwd(
         q,
@@ -632,6 +643,7 @@ def decode_attention_fwd_normal(
         kv_indptr,
         num_kv_splits,
         max_kv_splits,
+        sk,
     )
 
 
@@ -648,6 +660,7 @@ def decode_attention_fwd_grouped(
     max_kv_splits,
     sm_scale,
     logit_cap=0.0,
+    sk=None,
 ):
     _decode_grouped_att_m_fwd(
         q,
@@ -671,6 +684,7 @@ def decode_attention_fwd_grouped(
         kv_indptr,
         num_kv_splits,
         max_kv_splits,
+        sk,
     )
 
 
@@ -687,6 +701,7 @@ def decode_attention_fwd(
     max_kv_splits,
     sm_scale,
     logit_cap=0.0,
+    sk=None,
 ):
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
@@ -709,6 +724,7 @@ def decode_attention_fwd(
             max_kv_splits,
             sm_scale,
             logit_cap=logit_cap,
+            sk=sk,
         )
     else:
         # GQA/MQA/MLA
@@ -725,4 +741,5 @@ def decode_attention_fwd(
             max_kv_splits,
             sm_scale,
             logit_cap=logit_cap,
+            sk=sk,
         )
