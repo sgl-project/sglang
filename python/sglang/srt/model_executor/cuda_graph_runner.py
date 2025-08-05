@@ -589,6 +589,7 @@ class CudaGraphRunner:
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             next_token_logits_buffer=next_token_logits_buffer,
+            orig_seq_lens=seq_lens,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,

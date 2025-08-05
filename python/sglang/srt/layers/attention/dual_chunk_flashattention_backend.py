@@ -103,7 +103,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         self,
         model_runner: "ModelRunner",
     ) -> None:
-        self.forwrad_metadata: FlashAttentionMetadata = None
+        self.forward_metadata: FlashAttentionMetadata = None
         self.device = model_runner.device
         self.max_context_len = model_runner.model_config.context_len
         self.num_heads = model_runner.model_config.get_num_attention_heads(
@@ -114,6 +114,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         )
         self.head_size = model_runner.model_config.head_dim
 
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
@@ -229,7 +230,8 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                 metadata.scaling_factor = (
                     0.1
                     * torch.log(
-                        metadata.orig_seq_lens_tensor / self.original_max_position_embeddings
+                        metadata.orig_seq_lens_tensor
+                        / self.original_max_position_embeddings
                     )
                     + 1.0
                 ).clip(min=1)
@@ -479,6 +481,194 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             decode_meta=metadata,
         ).squeeze(1)
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def init_cuda_graph_state(self, max_bs: int):
+        """Initialize CUDA graph state for the attention backend.
+
+        Args:
+            max_bs (int): Maximum batch size to support in CUDA graphs
+
+        This creates fixed-size tensors that will be reused during CUDA graph replay
+        to avoid memory allocations.
+        """
+        self.decode_metadata = {
+            "seq_lens_tensor": torch.zeros(
+                max_bs, dtype=torch.int32, device=self.device
+            ),
+            "orig_seq_lens_tensor": torch.zeros(
+                max_bs, dtype=torch.int32, device=self.device
+            ),
+            "scaling_factor": torch.zeros(
+                max_bs, dtype=torch.float32, device=self.device
+            ),
+            "block_tables": torch.zeros(
+                max_bs,
+                (self.max_context_len - 1) // self.page_size + 1,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "block_tables_intra": torch.zeros(
+                max_bs,
+                (self.max_context_len - 1) // self.page_size + 1,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "seq_lens_intra": torch.zeros(
+                max_bs, dtype=torch.int32, device=self.device
+            ),
+            "block_tables_succ": torch.zeros(
+                max_bs,
+                (self.max_context_len - 1) // self.page_size + 1,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "seq_lens_succ": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            "seq_lens_inter": torch.zeros(
+                max_bs, dtype=torch.int32, device=self.device
+            ),
+        }
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[None],
+    ):
+        metadata = DualChunkFlashAttentionMetadata()
+
+        if forward_mode.is_decode_or_idle():
+            if self.original_max_position_embeddings > 0:
+                metadata.scaling_factor = self.decode_metadata["scaling_factor"][:bs]
+
+            metadata.seq_lens_tensor = self.decode_metadata["seq_lens_tensor"][:bs]
+            metadata.orig_seq_lens_tensor = self.decode_metadata[
+                "orig_seq_lens_tensor"
+            ][:bs]
+            metadata.max_seq_len = self.max_context_len
+            metadata.block_tables = self.decode_metadata["block_tables"][
+                req_pool_indices, :
+            ]
+
+            # intra
+            metadata.max_seq_len_intra = self.max_context_len
+            metadata.seq_lens_intra = self.decode_metadata["seq_lens_intra"][:bs]
+
+            metadata.block_tables_intra = self.decode_metadata["block_tables_intra"][
+                :bs, :
+            ]
+
+            # succ
+            metadata.seq_lens_succ = self.decode_metadata["seq_lens_succ"][:bs]
+            metadata.max_seq_len_succ = self.max_context_len
+
+            metadata.block_tables_succ = self.decode_metadata["block_tables_succ"][
+                :bs, :
+            ]
+
+            metadata.seq_lens_inter = self.decode_metadata["seq_lens_inter"][:bs]
+            metadata.max_seq_len_inter = self.max_context_len
+
+            self.decode_metadata[bs] = metadata
+
+        self.forward_metadata = metadata
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[None],
+        seq_lens_cpu: Optional[torch.Tensor],
+        out_cache_loc: torch.Tensor = None,
+    ):
+        """Initialize forward metadata for replaying CUDA graph."""
+        assert forward_mode.is_decode()
+        seq_lens = seq_lens[:bs]
+        req_pool_indices = req_pool_indices[:bs]
+        metadata = self.decode_metadata[bs]
+
+        metadata.seq_lens_tensor.copy_(seq_lens.to(torch.int32))
+        metadata.seq_lens = seq_lens.tolist()
+        metadata.max_seq_len = seq_lens.max().item()
+
+        metadata.orig_seq_lens_tensor.copy_(seq_lens)
+        metadata.orig_seq_lens = seq_lens.tolist()
+
+        block_tables = self.req_to_token[req_pool_indices, : metadata.max_seq_len]
+        # Convert the block table to a strided format.
+        if self.page_size > 1:
+            strided_indices = torch.arange(
+                0, block_tables.shape[1], self.page_size, device=self.device
+            )
+            block_tables = block_tables[:, strided_indices] // self.page_size
+        metadata.block_tables.fill_(0)
+        metadata.block_tables[: block_tables.shape[0], : block_tables.shape[1]].copy_(
+            block_tables
+        )
+
+        if self.original_max_position_embeddings > 0:
+            scaling_factor = (
+                0.1
+                * torch.log(
+                    metadata.orig_seq_lens_tensor
+                    / self.original_max_position_embeddings
+                )
+                + 1.0
+            ).clip(min=1)
+            metadata.scaling_factor.copy_(scaling_factor)
+
+        cache_seq_lens = metadata.orig_seq_lens_tensor
+
+        chunk_len = self.chunk_size - self.local_size
+        chunk_num_curr = (cache_seq_lens - 1) // chunk_len
+
+        seq_lens_intra = cache_seq_lens - chunk_num_curr * chunk_len
+        max_seq_len_intra = seq_lens_intra.max().item()
+        metadata.seq_lens_intra.copy_(seq_lens_intra)
+        metadata.max_seq_len_intra = max_seq_len_intra
+
+        metadata.block_tables_intra.fill_(0)
+        for i in range(bs):
+            st = chunk_num_curr[i] * chunk_len // self.page_size
+            ed = min(
+                st + (max_seq_len_intra - 1) // self.page_size + 1,
+                (cache_seq_lens[i] - 1) // self.page_size + 1,
+            )
+            metadata.block_tables_intra[i, : ed - st] = metadata.block_tables[i, st:ed]
+
+        seq_lens_succ = (chunk_num_curr - (chunk_num_curr - 1).clip(min=0)) * chunk_len
+        metadata.seq_lens_succ.copy_(seq_lens_succ)
+        metadata.max_seq_len_succ = metadata.seq_lens_succ.max().item()
+        if metadata.max_seq_len_succ:
+            metadata.block_tables_succ.fill_(0)
+            for i in range(bs):
+                start = (
+                    (chunk_num_curr[i] - 1).clip(min=0) * chunk_len // self.page_size
+                )
+                end = min(
+                    start + (metadata.max_seq_len_succ - 1) // self.page_size + 1,
+                    (cache_seq_lens[i] - 1) // self.page_size + 1,
+                )
+                metadata.block_tables_succ[i, : end - start] = metadata.block_tables[
+                    i, start:end
+                ]
+
+        seq_lens_inter = (chunk_num_curr - 1).clip(min=0) * chunk_len
+        metadata.seq_lens_inter.copy_(seq_lens_inter)
+        metadata.max_seq_len_inter = metadata.seq_lens_inter.max().item()
+
+        self.forward_metadata = metadata
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        """Get the fill value for sequence length in CUDA graph."""
+        return 1
 
     def _dual_chunk_flash_attn_prefill(
         self,

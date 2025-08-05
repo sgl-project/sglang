@@ -54,13 +54,12 @@ def initialize_engine() -> sgl.Engine:
         page_size=256,
         attention_backend="dual_chunk_flash_attn",
         tp_size=4,
-        disable_cuda_graph=True,
         disable_radix_cache=True,
         enable_mixed_chunk=False,
         enable_torch_compile=False,
         chunked_prefill_size=131072,
         mem_fraction_static=0.6,
-        log_level='DEBUG',
+        log_level="DEBUG",
     )
     return llm
 
