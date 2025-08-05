@@ -1399,7 +1399,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                 s_lse = s_lse.view(q_len, q_heads, 1).transpose(0, 2).float()
             return res, s_lse
 
-        output, softmax_lse = flash_attn_varlen_func(
+        output, softmax_lse, *rest = flash_attn_varlen_func(
             q=query_states,
             k=key_states,
             v=value_states,
