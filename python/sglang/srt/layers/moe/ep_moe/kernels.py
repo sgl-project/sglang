@@ -602,7 +602,6 @@ def post_reorder_triton_kernel_for_cutlass_moe(
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
     topk_weights_ptr = topk_weights_ptr + src_idx * topk
 
-    computed = False
     store_ptr = output_ptr + src_idx * hidden_size
 
     vec = tl.arange(0, BLOCK_SIZE)
@@ -615,7 +614,6 @@ def post_reorder_triton_kernel_for_cutlass_moe(
         for idx in range(topk):
             expert_id = tl.load(topk_ids_ptr + idx)
             if expert_id != num_experts:
-                computed = True
                 dst_idx_int32 = tl.load(src2dst_ptr + idx)
                 dst_idx = dst_idx_int32.to(tl.int64)
                 dst_idx = dst_idx - dst_start
@@ -624,14 +622,6 @@ def post_reorder_triton_kernel_for_cutlass_moe(
                 in_data = tl.load(load_ptr + offset, mask=mask)
                 sum_vec += in_data * weigh_scale
         tl.store(store_ptr + offset, sum_vec, mask=mask)
-
-    if computed == False:
-        for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
-            offset = start_offset + vec
-            mask = offset < hidden_size
-            tl.store(
-                store_ptr + offset, tl.zeros([BLOCK_SIZE], dtype=InDtype), mask=mask
-            )
 
 
 @triton.jit
