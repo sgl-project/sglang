@@ -117,6 +117,7 @@ class Glm4vVisionPatchEmbed(nn.Module):
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
         self.hidden_size = hidden_size
+        self.in_channels = in_channels
 
         kernel_size = (temporal_patch_size, patch_size, patch_size)
         self.proj = nn.Conv3d(
@@ -128,9 +129,8 @@ class Glm4vVisionPatchEmbed(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        L, C = x.shape
-        x = x.view(L, -1, self.temporal_patch_size, self.patch_size, self.patch_size)
-        x = self.proj(x).view(L, self.hidden_size)
+        x = x.view(-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size)
+        x = self.proj(x).view(-1, self.hidden_size)
         return x
 
 
@@ -495,10 +495,13 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
             [item.feature.squeeze(0) for item in items], dim=0
         ).type(self.visual.dtype)
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
+        # For multi-image, pixel_values is [num_of_images, L, C] shape
+        # assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        return image_embeds
+        split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+        image_embeds = torch.split(image_embeds, split_sizes)
+        return torch.cat(image_embeds)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

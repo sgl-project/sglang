@@ -58,7 +58,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             video_token=self.VIDEO_TOKEN,
             video_token_id=self.VIDEO_TOKEN_ID,
             video_token_regex=self.VIDEO_TOKEN_REGEX,
-        )
+        ).build(_processor)
 
     def preprocess_video(self, vr: VideoReader):
         """
