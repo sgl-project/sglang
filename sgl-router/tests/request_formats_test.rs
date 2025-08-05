@@ -3,7 +3,7 @@ mod common;
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
 use reqwest::Client;
 use serde_json::json;
-use sglang_router_rs::config::{PolicyConfig, RouterConfig, RoutingMode};
+use sglang_router_rs::config::{PolicyConfig, RetryConfig, RouterConfig, RoutingMode};
 use sglang_router_rs::routers::{RouterFactory, RouterTrait};
 use std::sync::Arc;
 
@@ -35,6 +35,7 @@ impl TestContext {
             request_id_headers: None,
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
         };
 
         let mut workers = Vec::new();
@@ -53,10 +54,12 @@ impl TestContext {
 
         config.mode = RoutingMode::Regular { worker_urls };
 
-        let router = tokio::task::spawn_blocking(move || RouterFactory::create_router(&config))
-            .await
-            .unwrap()
-            .unwrap();
+        let app_context = common::create_test_context(config);
+        let router =
+            tokio::task::spawn_blocking(move || RouterFactory::create_router(&app_context))
+                .await
+                .unwrap()
+                .unwrap();
         let router = Arc::from(router);
 
         if !workers.is_empty() {

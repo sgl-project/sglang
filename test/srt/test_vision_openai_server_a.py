@@ -31,6 +31,8 @@ class TestQwen2VLServer(TestOpenAIVisionServer):
             other_args=[
                 "--mem-fraction-static",
                 "0.35",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -53,6 +55,8 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
             other_args=[
                 "--mem-fraction-static",
                 "0.35",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -76,6 +80,8 @@ class TestVLMContextLengthIssue(CustomTestCase):
                 "--context-length",
                 "300",
                 "--mem-fraction-static=0.75",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -149,6 +155,8 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--mem-fraction-static",
                 "0.35",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -164,7 +172,11 @@ class TestInternVL2_5Server(TestOpenAIVisionServer):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--trust-remote-code"],
+            other_args=[
+                "--trust-remote-code",
+                "--cuda-graph-max-bs",
+                "4",
+            ],
         )
         cls.base_url += "/v1"
 
@@ -183,6 +195,8 @@ class TestMinicpmoServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--mem-fraction-static",
                 "0.65",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -207,10 +221,13 @@ class TestMimoVLServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--mem-fraction-static",
                 "0.6",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
 
 
 if __name__ == "__main__":
+    del TestOpenAIVisionServer
     unittest.main()
