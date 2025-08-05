@@ -227,6 +227,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         activation_alpha: Optional[float] = None,
         swiglu_limit: Optional[float] = None,
     ) -> torch.Tensor:
+        kwargs = {}
+        if activation_alpha is not None:
+            kwargs["activation_alpha"] = activation_alpha
 
         return self.forward(
             x=x,
@@ -237,8 +240,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             inplace=inplace,
             no_combine=no_combine,
             routed_scaling_factor=routed_scaling_factor,
-            activation_alpha=activation_alpha,
             swiglu_limit=swiglu_limit,
+            **kwargs,
         )
 
     def forward_cuda(

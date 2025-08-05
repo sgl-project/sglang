@@ -773,6 +773,10 @@ class FusedMoE(torch.nn.Module):
 
         # Matrix multiply.
         with use_symmetric_memory(get_tp_group()) as sm:
+            kwargs = {}
+            if self.activation_alpha is not None:
+                kwargs["activation_alpha"] = self.activation_alpha
+
             final_hidden_states = self.quant_method.apply(
                 layer=self,
                 x=hidden_states,
@@ -780,7 +784,6 @@ class FusedMoE(torch.nn.Module):
                 activation=self.activation,
                 apply_router_weight_on_input=self.apply_router_weight_on_input,
                 routed_scaling_factor=self.routed_scaling_factor,
-                activation_alpha=self.activation_alpha,
                 swiglu_limit=self.swiglu_limit,
                 **(
                     dict(
@@ -793,6 +796,7 @@ class FusedMoE(torch.nn.Module):
                     == "ModelOptNvFp4FusedMoEMethod"
                     else {}
                 ),
+                **kwargs,
             )
             sm.tag(final_hidden_states)
 
