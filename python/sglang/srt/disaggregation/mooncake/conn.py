@@ -37,14 +37,13 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVCacheTransferLatencyMonitor,
 )
-from sglang.srt.metrics.collector import SchedulerMetricsCollector
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
 )
+from sglang.srt.metrics.collector import SchedulerMetricsCollector
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     format_tcp_address,
