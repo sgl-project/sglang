@@ -44,6 +44,7 @@ import traceback
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -84,6 +85,7 @@ from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager
+from typing_extensions import Literal
 
 from sglang.srt.metrics.func_timer import enable_func_timer
 
@@ -736,9 +738,18 @@ def load_audio(
     return audio
 
 
+@dataclass
+class ImageData:
+    url: str
+    detail: Optional[Literal["auto", "low", "high"]] = "auto"
+
+
 def load_image(
-    image_file: Union[Image.Image, str, bytes],
+    image_file: Union[Image.Image, str, ImageData, bytes],
 ) -> tuple[Image.Image, tuple[int, int]]:
+    if isinstance(image_file, ImageData):
+        image_file = image_file.url
+
     image = image_size = None
     if isinstance(image_file, Image.Image):
         image = image_file
@@ -762,7 +773,7 @@ def load_image(
     elif isinstance(image_file, str):
         image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     else:
-        raise ValueError(f"Invalid image: {image}")
+        raise ValueError(f"Invalid image: {image_file}")
 
     return image, image_size
 
