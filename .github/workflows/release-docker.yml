@@ -89,7 +89,7 @@ jobs:
           fi
 
   publish-arm64:
-    if: github.repository == 'sgl-project/sglang' && matrix.build_type == 'blackwell' && matrix.cuda_version == '12.8.1'
+    if: github.repository == 'sgl-project/sglang'
     environment: 'prod'
     strategy:
       matrix:
