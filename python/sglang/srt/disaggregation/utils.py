@@ -374,7 +374,7 @@ class KVCacheTransferLatencyMonitor:
             return
 
         if room not in self.kvcache_transfer_latency_table:
-            self.kvcache_transfer_latency_table[dst_id.room] = {dst_id: -time.time()}
+            self.kvcache_transfer_latency_table[room] = {dst_id: -time.time()}
         else:
             if dst_id not in self.kvcache_transfer_latency_table[room]:
                 self.kvcache_transfer_latency_table[room][dst_id] = 0
