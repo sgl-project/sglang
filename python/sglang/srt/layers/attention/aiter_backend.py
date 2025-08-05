@@ -720,11 +720,6 @@ class AiterIndicesUpdaterPrefill:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.update = self.update_single_wrapper
 
-        # get the last index of the pool
-        self.pool_size = (
-            model_runner.token_to_kv_pool.size + model_runner.token_to_kv_pool.page_size
-        ) - 1
-
         self.kv_indices = None
         self.max_q_len = 0
         self.max_kv_len = 0
@@ -769,9 +764,8 @@ class AiterIndicesUpdaterPrefill:
             # but the 0 location will be made nan (noqa) in cuda graph capture mode
             # this will cause the output tensor value becomes nan
             # WA is to assure that last index of pool not changed
-            kv_indices = torch.full(
-                (paged_kernel_lens_sum + 128,),
-                self.pool_size,
+            kv_indices = torch.empty(
+                paged_kernel_lens_sum + 256,
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
@@ -784,6 +778,9 @@ class AiterIndicesUpdaterPrefill:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+
+            token_num = kv_indptr[-1]
+            kv_indices[token_num:] = kv_indices[0]
 
             self.max_kv_len = torch.max(paged_kernel_lens).item()
 
