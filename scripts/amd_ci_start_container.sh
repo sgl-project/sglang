@@ -101,7 +101,7 @@ if [[ "${RUNNER_NAME}" =~ ^linux-mi350-gpu-[0-9]+$ ]] || [[ "${RUNNER_NAME}" =~ 
   FALLBACK_IMAGE="rocm/sgl-dev:${MI35X_BASE_TAG}-20250715"
   FALLBACK_MSG="No mi35x image found in last 30 days, using fallback image"
 # Check for mi300/mi325 runners
-elif [[ "${RUNNER_NAME}" =~ ^linux-mi300-gpu-[0-9]+.*$ ]] || [[ "${RUNNER_NAME}" =~ ^linux-mi325-gpu-[0-9]+.*$ ]]; then
+elif [[ "${RUNNER_NAME}" =~ ^linux-mi(300|325)-gpu-[0-9]+.*$ ]]; then
   echo "Runner is ${RUNNER_NAME}, will find mi30x image."
 else
   echo "Runner type not recognized: '${RUNNER_NAME}'"
