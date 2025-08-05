@@ -256,29 +256,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        # Create a strided view of k and v caches to avoid permute and stack
-        num_blocks = k_cache.shape[0] // (
-            self.page_size * layer.tp_k_head_num * layer.head_dim
-        )
-        shape = (
-            num_blocks,
-            2,
-            layer.tp_k_head_num,
-            self.page_size,
-            layer.head_dim,
-        )
-        v_offset = v_cache.data_ptr() - k_cache.data_ptr()
-        strides = (
-            self.page_size * layer.tp_k_head_num * layer.head_dim,
-            v_offset,
-            layer.head_dim,
-            layer.tp_k_head_num * layer.head_dim,
-            1,
-        )
-
-        kv_cache = k_cache.as_strided(
-            shape, [s * k_cache.element_size() for s in strides]
-        )
+        # shape conversion:
+        # [bs, page_size, num_kv_heads, head_dim] -> [bs, num_kv_heads, page_size, head_dim]
+        k_cache = k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.head_dim)
+        v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.head_dim)
+        kv_cache = torch.stack([k_cache, v_cache], dim=1).transpose(2, 3)
 
         # TODO: bmm1_scale and bmm2_scale might require modification
         q_scale = 1.0
@@ -322,29 +304,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        # Create a strided view of k and v caches to avoid permute and stack
-        # [bs, page_size, num_kv_heads, head_dim] * 2 -> [bs, 2, num_kv_heads, page_size, head_dim]
-        num_blocks = k_cache.shape[0]
-        shape = (
-            num_blocks,
-            2,
-            layer.tp_k_head_num,
-            self.page_size,
-            layer.head_dim,
-        )
-        v_offset = v_cache.data_ptr() - k_cache.data_ptr()
-        assert v_offset > 0, "v_cache should be after k_cache"
-        strides = (
-            self.page_size * layer.tp_k_head_num * layer.head_dim,
-            v_offset,
-            layer.head_dim,
-            layer.tp_k_head_num * layer.head_dim,
-            1,
-        )
-
-        kv_cache = k_cache.as_strided(
-            shape, [s * k_cache.element_size() for s in strides]
-        )
+        k_cache = k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.head_dim)
+        v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.head_dim)
+        kv_cache = torch.stack([k_cache, v_cache], dim=1).transpose(2, 3)
 
         # TODO: bmm1_scale and bmm2_scale might require modification
         # TODO: Change once quantization is supported
