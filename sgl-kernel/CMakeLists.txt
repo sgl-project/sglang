@@ -445,3 +445,9 @@ install(
     DIRECTORY ${repo-deepgemm_SOURCE_DIR}/deep_gemm/
     DESTINATION deep_gemm
 )
+
+install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
+        DESTINATION "deep_gemm/include/cute")
+
+install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
+        DESTINATION "deep_gemm/include/cutlass")
