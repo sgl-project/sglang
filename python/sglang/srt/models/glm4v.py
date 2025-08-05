@@ -129,7 +129,13 @@ class Glm4vVisionPatchEmbed(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.view(-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size)
+        x = x.view(
+            -1,
+            self.in_channels,
+            self.temporal_patch_size,
+            self.patch_size,
+            self.patch_size,
+        )
         x = self.proj(x).view(-1, self.hidden_size)
         return x
 
@@ -499,7 +505,9 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         # assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+        split_sizes = (
+            image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
+        ).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
         return torch.cat(image_embeds)
 

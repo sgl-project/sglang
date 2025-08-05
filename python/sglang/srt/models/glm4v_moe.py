@@ -1,21 +1,11 @@
 import logging
 from functools import lru_cache
 from typing import Iterable, Optional, Tuple
+
 import torch
 import torch.nn as nn
 from transformers.models.glm4v_moe.configuration_glm4v_moe import Glm4v_moeConfig
 
-from sglang.srt.hf_transformers_utils import get_processor
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.pooler import Pooler, PoolingType
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.models.glm4_moe import Glm4MoeModel
-from sglang.srt.models.glm4v import Glm4vVisionModel,Glm4vForConditionalGeneration
-from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_rank,
@@ -23,21 +13,29 @@ from sglang.srt.distributed import (
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     get_local_attention_dp_size,
 )
-from sglang.srt.utils import (
-    is_cuda,
-    log_info_on_rank0,
-)
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.pooler import Pooler, PoolingType
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.glm4_moe import Glm4MoeModel
+from sglang.srt.models.glm4v import Glm4vForConditionalGeneration, Glm4vVisionModel
+from sglang.srt.utils import add_prefix, is_cuda, log_info_on_rank0
 
 _is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
 
 cached_get_processor = lru_cache(get_processor)
+
 
 class Glm4v_moeForConditionalGeneration(Glm4vForConditionalGeneration):
     def __init__(
@@ -398,5 +396,6 @@ class Glm4v_moeForConditionalGeneration(Glm4vForConditionalGeneration):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
+
 
 EntryClass = [Glm4v_moeForConditionalGeneration]

@@ -35,7 +35,7 @@ class EvalArgs:
     profile: bool = False
     profile_number: int = 5
     concurrency: int = 1
-    response_answer_regex: str = '(.*)'
+    response_answer_regex: str = "(.*)"
     lora_path: Optional[str] = None
 
     @staticmethod

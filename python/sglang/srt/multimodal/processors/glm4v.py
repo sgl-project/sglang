@@ -1,5 +1,6 @@
 import re
 from typing import List, Union
+
 from decord import VideoReader
 from transformers.video_utils import VideoMetadata
 
