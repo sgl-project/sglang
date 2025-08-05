@@ -40,8 +40,8 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
 
         # Vision config
         self.IMAGE_FACTOR = 28
-        self.MIN_PIXELS = 4 * 28 * 28
-        self.MAX_PIXELS = 16384 * 28 * 28
+        self.MIN_PIXELS = 112 * 112
+        self.MAX_PIXELS = 30000 * 28 * 28 * 2
 
         # Setup regex patterns
         self.IMAGE_TOKEN_REGEX = re.compile(
