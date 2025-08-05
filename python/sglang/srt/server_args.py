@@ -481,6 +481,13 @@ class ServerArgs:
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
+        if self.enable_flashinfer_trtllm_moe:
+            if not self.disable_shared_experts_fusion:
+                self.disable_shared_experts_fusion = True
+                logger.warning(
+                    "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+                )
+
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
@@ -806,6 +813,7 @@ class ServerArgs:
                 "moe_wna16",
                 "qoq",
                 "w4afp8",
+                "mxfp4",
             ],
             help="The quantization method.",
         )
@@ -868,7 +876,7 @@ class ServerArgs:
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
-            choices=["lpm", "random", "fcfs", "dfs-weight"],
+            choices=["lpm", "random", "fcfs", "dfs-weight", "lof"],
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
@@ -1936,10 +1944,16 @@ class ServerArgs:
         if "Llama4" in model_arch:
             assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
 
-        if "Gemma2ForCausalLM" in model_arch:
+        if model_arch in [
+            "Gemma2ForCausalLM",
+            "Gemma3nForCausalLM",
+            "Gemma3nForConditionalGeneration",
+        ]:
             # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
             # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
-            logger.warning("Disable hybrid SWA memory for Gemma2ForCausalLM.")
+            logger.warning(
+                f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
+            )
             self.disable_hybrid_swa_memory = True
 
         # Check LoRA
