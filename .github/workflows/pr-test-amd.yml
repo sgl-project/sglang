@@ -29,7 +29,7 @@ jobs:
       github.event.pull_request.draft == false
     strategy:
       matrix:
-        runner: [linux-mi300-gpu-1, linux-mi325-gpu-1]
+        runner: [linux-mi300-gpu-1, linux-mi325-gpu-1-test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -55,7 +55,7 @@ jobs:
         github.event.pull_request.draft == false
     strategy:
       matrix:
-        runner: [linux-mi300-gpu-2, linux-mi325-gpu-2]
+        runner: [linux-mi300-gpu-2, linux-mi325-gpu-2-test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
