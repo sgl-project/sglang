@@ -220,6 +220,7 @@ class GroupCoordinator:
         use_npu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
+        pynccl_use_current_stream: bool = False,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -254,6 +255,7 @@ class GroupCoordinator:
             self.device = torch.device("cpu")
 
         self.use_pynccl = use_pynccl
+        self.pynccl_use_current_stream = pynccl_use_current_stream
         self.use_pymscclpp = use_pymscclpp
         self.use_custom_allreduce = use_custom_allreduce
         self.use_hpu_communicator = use_hpu_communicator
@@ -280,6 +282,7 @@ class GroupCoordinator:
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
+                use_current_stream=pynccl_use_current_stream,
             )
 
         from sglang.srt.distributed.device_communicators.pymscclpp import (
@@ -1116,6 +1119,7 @@ def init_model_parallel_group(
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
     use_mscclpp_allreduce: Optional[bool] = None,
+    pynccl_use_current_stream: bool = True,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1133,6 +1137,7 @@ def init_model_parallel_group(
         use_npu_communicator=True,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
+        pynccl_use_current_stream=pynccl_use_current_stream,
     )
 
 
@@ -1341,6 +1346,7 @@ def initialize_model_parallel(
             "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
         ),
         group_name="tp",
+        pynccl_use_current_stream=duplicate_tp_group,
     )
 
     if duplicate_tp_group:
@@ -1356,9 +1362,13 @@ def initialize_model_parallel(
                 "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
             ),
             group_name="pdmux_prefill_tp",
+            pynccl_use_current_stream=True,
         )
-        _TP.pynccl_comm.disabled = False
-        _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
+        if _TP.pynccl_comm:
+            _TP.pynccl_comm.disabled = False
+            _TP.ca_comm.disabled = True
+            _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
+            _PDMUX_PREFILL_TP_GROUP.ca_comm.disabled = True
 
     moe_ep_size = expert_model_parallel_size
 
@@ -1524,6 +1534,11 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
+
+    global _PDMUX_PREFILL_TP_GROUP
+    if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
+        _PDMUX_PREFILL_TP_GROUP.destroy()
+    _PDMUX_PREFILL_TP_GROUP = None
 
 
 def destroy_distributed_environment():
