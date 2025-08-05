@@ -31,6 +31,9 @@ _is_npu = is_npu()
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+
 if _is_npu:
     torch.cuda.CUDAGraph = torch.npu.NPUGraph
     torch.cuda.synchronize = torch.npu.synchronize
