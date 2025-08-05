@@ -477,6 +477,97 @@ class GenerateReqInput:
 
 
 @dataclass
+class ScoreReqInput:
+    """
+    A request input for scoring/ranking tasks.
+    
+    This class is designed for prefill-only operations that compute logprobs for specific tokens
+    without generating new tokens. It's similar to EmbeddingReqInput but focused on scoring.
+    """
+    
+    # Core input - at least one must be provided
+    text: Optional[Union[List[str], str]] = None
+    input_ids: Optional[Union[List[List[int]], List[int]]] = None
+    
+    # Request management
+    rid: Optional[Union[List[str], str]] = None
+    
+    # Token IDs to score (required for scoring operations)
+    # This is always a List[int] that applies to all prompts in a batch
+    token_ids_logprob: Optional[List[int]] = None
+    
+    # Whether to log metrics for this request
+    log_metrics: bool = True
+    
+    def normalize_batch_and_arguments(self):
+        """Normalize the batch size and arguments for scoring requests."""
+        # At least one of text, input_ids, or input_embeds should be provided
+        if (
+            self.text is None and self.input_ids is None
+        ):
+            raise ValueError(
+                "At least one of text, input_ids should be provided"
+            )
+
+        # text and input_ids cannot be provided at the same time
+        if self.text is not None and self.input_ids is not None:
+            raise ValueError("text and input_ids cannot be provided at the same time")
+
+        # Determine batch size
+        self._determine_batch_size()
+        
+        # Fill in default arguments
+        if self.is_single:
+            self._normalize_single_inputs()
+        else:
+            self._normalize_batch_inputs()
+
+    def _determine_batch_size(self):
+        """Determine if this is a single example or a batch and the batch size."""
+        self.batch_size = 0
+        self.is_single = True
+
+        if self.text is not None:
+            if isinstance(self.text, str):
+                self.batch_size = 1
+                self.is_single = True
+            else:
+                self.batch_size = len(self.text)
+                self.is_single = False
+        elif self.input_ids is not None:
+            if len(self.input_ids) == 0:
+                raise ValueError("input_ids cannot be empty.")
+            if isinstance(self.input_ids[0], int):
+                self.batch_size = 1
+                self.is_single = True
+            else:
+                self.batch_size = len(self.input_ids)
+                self.is_single = False
+
+    def _normalize_single_inputs(self):
+        """Normalize inputs for a single scoring example."""
+        if self.rid is None:
+            self.rid = uuid.uuid4().hex
+
+    def _normalize_batch_inputs(self):
+        """Normalize inputs for a batch of scoring examples."""
+        if self.rid is None:
+            self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
+        else:
+            assert isinstance(self.rid, list), "The rid should be a list."
+
+    def __getitem__(self, i):
+        """Get a single scoring request from a batch."""
+        return ScoreReqInput(
+            text=self.text[i] if self.text is not None else None,
+            input_ids=self.input_ids[i] if self.input_ids is not None else None,
+            token_ids_logprob=self.token_ids_logprob,  # Same token_ids_logprob for all batch items
+            rid=self.rid[i],
+            log_metrics=self.log_metrics,
+        )
+
+
+@dataclass
 class TokenizedGenerateReqInput:
     # The request id
     rid: str
@@ -522,6 +613,26 @@ class TokenizedGenerateReqInput:
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+
+
+@dataclass
+class TokenizedScoreReqInput:
+    """
+    A specialized tokenized request input for scoring/ranking tasks.
+    
+    This class is designed specifically for scoring operations and contains only
+    the fields necessary for scoring tasks.
+    """
+    # The request id
+    rid: str
+    # The input text
+    input_text: str
+    # The input token ids
+    input_ids: List[int]
+    # Token IDs to score (required for scoring operations)
+    token_ids_logprob: List[int]
+    # Whether to log metrics
+    log_metrics: bool
 
 
 @dataclass

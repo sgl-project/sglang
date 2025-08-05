@@ -98,6 +98,7 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    ScoreReqInput,
     SessionParams,
     SetInternalStateReq,
     SetInternalStateReqOutput,
@@ -105,6 +106,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TokenizedScoreReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -140,7 +142,7 @@ class ReqState:
     out_list: List[Dict[Any, Any]]
     finished: bool
     event: asyncio.Event
-    obj: Union[GenerateReqInput, EmbeddingReqInput]
+    obj: Union[GenerateReqInput, EmbeddingReqInput, ScoreReqInput]
 
     # For metrics
     created_time: float
@@ -451,7 +453,7 @@ class TokenizerManager:
 
     async def generate_request(
         self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        obj: Union[GenerateReqInput, EmbeddingReqInput, ScoreReqInput],
         request: Optional[fastapi.Request] = None,
     ):
         created_time = time.time()
@@ -481,7 +483,7 @@ class TokenizerManager:
 
     async def _tokenize_one_request(
         self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        obj: Union[GenerateReqInput, EmbeddingReqInput, ScoreReqInput],
     ):
         """Tokenize one request."""
         # Tokenize
@@ -491,7 +493,7 @@ class TokenizerManager:
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
-        if obj.input_embeds is not None:
+        if hasattr(obj, 'input_embeds') and obj.input_embeds is not None:
             if not self.server_args.disable_radix_cache:
                 raise ValueError(
                     "input_embeds is provided while disable_radix_cache is False. "
@@ -546,7 +548,7 @@ class TokenizerManager:
         )
 
     def _validate_one_request(
-        self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput, ScoreReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
 
@@ -557,6 +559,13 @@ class TokenizerManager:
                 f"The input ({input_token_num} tokens) is longer than the "
                 f"model's context length ({self.context_len} tokens)."
             )
+
+        if isinstance(obj, ScoreReqInput):
+            if obj.token_ids_logprob is None:
+                raise ValueError(
+                    "token_ids_logprob is required for scoring requests."
+                )
+            return
 
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
@@ -608,27 +617,39 @@ class TokenizerManager:
 
     def _create_tokenized_object(
         self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        obj: Union[GenerateReqInput, EmbeddingReqInput, ScoreReqInput],
         input_text: str,
         input_ids: List[int],
         input_embeds: Optional[Union[List[float], None]] = None,
         mm_inputs: Optional[Dict] = None,
         token_type_ids: Optional[List[int]] = None,
-    ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
+    ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, TokenizedScoreReqInput]:
         """Create a tokenized request object from common parameters."""
-        # Parse sampling parameters
-        # Note: if there are preferred sampling params, we use them if they are not
-        # explicitly passed in sampling_params
-        if self.preferred_sampling_params:
-            sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
+        # Parse sampling parameters - skip for ScoreReqInput
+        if isinstance(obj, ScoreReqInput):
+            # ScoreReqInput doesn't use sampling parameters
+            sampling_params = SamplingParams(max_new_tokens=0)
         else:
-            sampling_kwargs = obj.sampling_params
-        sampling_params = SamplingParams(**sampling_kwargs)
-        sampling_params.normalize(self.tokenizer)
-        sampling_params.verify(self.model_config.vocab_size)
+            # Note: if there are preferred sampling params, we use them if they are not
+            # explicitly passed in sampling_params
+            if self.preferred_sampling_params:
+                sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
+            else:
+                sampling_kwargs = obj.sampling_params
+            sampling_params = SamplingParams(**sampling_kwargs)
+            sampling_params.normalize(self.tokenizer)
+            sampling_params.verify(self.model_config.vocab_size)
 
         # Build return object
-        if isinstance(obj, GenerateReqInput):
+        if isinstance(obj, ScoreReqInput):
+            tokenized_obj = TokenizedScoreReqInput(
+                rid=obj.rid,
+                input_text=input_text,
+                input_ids=input_ids,
+                token_ids_logprob=obj.token_ids_logprob or [],
+                log_metrics=obj.log_metrics,
+            )
+        elif isinstance(obj, GenerateReqInput):
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
@@ -667,8 +688,8 @@ class TokenizerManager:
         return tokenized_obj
 
     async def _batch_tokenize_and_process(
-        self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
-    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
+        self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput, ScoreReqInput]
+    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, TokenizedScoreReqInput]]:
         """Handle batch tokenization for text inputs only."""
         logger.debug(f"Starting batch tokenization for {batch_size} text requests")
 
@@ -683,7 +704,7 @@ class TokenizerManager:
         # Process all requests
         tokenized_objs = []
         for i, req in enumerate(requests):
-            self._validate_token_len(obj[i], input_ids_list[i])
+            self._validate_one_request(obj[i], input_ids_list[i])
             tokenized_objs.append(
                 self._create_tokenized_object(
                     req, req.text, input_ids_list[i], None, None
@@ -693,11 +714,12 @@ class TokenizerManager:
         return tokenized_objs
 
     def _validate_batch_tokenization_constraints(
-        self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
+        self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput, ScoreReqInput]
     ) -> None:
         """Validate constraints for batch tokenization processing."""
         for i in range(batch_size):
-            if self.is_generation and obj[i].contains_mm_input():
+            # Skip multimodal validation for ScoreReqInput since they don't support multimodal
+            if self.is_generation and not isinstance(obj[i], ScoreReqInput) and obj[i].contains_mm_input():
                 raise ValueError(
                     "For multimodal input processing do not set `enable_tokenizer_batch_encode`."
                 )
@@ -705,15 +727,15 @@ class TokenizerManager:
                 raise ValueError(
                     "Batch tokenization is not needed for pre-tokenized input_ids. Do not set `enable_tokenizer_batch_encode`."
                 )
-            if obj[i].input_embeds is not None:
+            if hasattr(obj[i], 'input_embeds') and obj[i].input_embeds is not None:
                 raise ValueError(
                     "Batch tokenization is not needed for input_embeds. Do not set `enable_tokenizer_batch_encode`."
                 )
 
     def _send_one_request(
         self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+        obj: Union[GenerateReqInput, EmbeddingReqInput, ScoreReqInput],
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, TokenizedScoreReqInput],
         created_time: Optional[float] = None,
     ):
         self.send_to_scheduler.send_pyobj(tokenized_obj)
@@ -723,7 +745,7 @@ class TokenizerManager:
 
     async def _wait_one_response(
         self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        obj: Union[GenerateReqInput, EmbeddingReqInput, ScoreReqInput],
         state: ReqState,
         request: Optional[fastapi.Request] = None,
     ):
@@ -797,7 +819,7 @@ class TokenizerManager:
 
     async def _handle_batch_request(
         self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        obj: Union[GenerateReqInput, EmbeddingReqInput, ScoreReqInput],
         request: Optional[fastapi.Request] = None,
         created_time: Optional[float] = None,
     ):
@@ -1289,7 +1311,7 @@ class TokenizerManager:
         logging.info(f"Config logging: {obj=}")
         self.log_request_metadata = self.get_log_request_metadata()
 
-    def create_abort_task(self, obj: GenerateReqInput):
+    def create_abort_task(self, obj: Union[GenerateReqInput, ScoreReqInput]):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
@@ -1483,13 +1505,20 @@ class TokenizerManager:
                 "prompt_tokens": recv_obj.prompt_tokens[i],
             }
 
-            if getattr(state.obj, "return_logprob", False):
+            # Call convert_logprob_style for regular requests with return_logprob=True
+            # and for scoring requests (which have token_ids_logprob)
+            if (getattr(state.obj, "return_logprob", False) or 
+                hasattr(state.obj, "token_ids_logprob")):
+                
+                # Use token_ids_logprob for both regular and scoring requests
+                token_ids_logprob = state.obj.token_ids_logprob
+                    
                 self.convert_logprob_style(
                     meta_info,
                     state,
-                    state.obj.top_logprobs_num,
-                    state.obj.token_ids_logprob,
-                    state.obj.return_text_in_logprobs
+                    getattr(state.obj, "top_logprobs_num", 0),
+                    token_ids_logprob,
+                    getattr(state.obj, "return_text_in_logprobs", False)
                     and not self.server_args.skip_tokenizer_init,
                     recv_obj,
                     i,
@@ -1616,6 +1645,7 @@ class TokenizerManager:
             )
 
         if token_ids_logprob is not None:
+
             if len(recv_obj.input_token_ids_logprobs_val) > 0:
                 state.input_token_ids_logprobs_val.extend(
                     recv_obj.input_token_ids_logprobs_val[recv_obj_index]
@@ -1818,6 +1848,8 @@ class TokenizerManager:
         """
         See Engine.score() for more details.
         """
+
+        
         if label_token_ids is None:
             raise ValueError("label_token_ids must be provided")
 
@@ -1840,13 +1872,12 @@ class TokenizerManager:
                 prompts = [f"{item}{query}" for item in items_list]
             else:
                 prompts = [f"{query}{item}" for item in items_list]
-            batch_request = GenerateReqInput(
+
+            batch_request = ScoreReqInput(
                 text=prompts,
-                return_logprob=True,
                 token_ids_logprob=label_token_ids,
-                stream=False,
-                sampling_params={"max_new_tokens": 1},
             )
+
         elif (
             isinstance(query, list)
             and isinstance(items, list)
@@ -1858,13 +1889,12 @@ class TokenizerManager:
                 input_ids_list = [item + query for item in items]
             else:
                 input_ids_list = [query + item for item in items]
-            batch_request = GenerateReqInput(
+
+            batch_request = ScoreReqInput(
                 input_ids=input_ids_list,
-                return_logprob=True,
                 token_ids_logprob=label_token_ids,
-                stream=False,
-                sampling_params={"max_new_tokens": 1},
             )
+
         else:
             raise ValueError(
                 "Invalid combination of query/items types for score_request."
@@ -1876,11 +1906,17 @@ class TokenizerManager:
         for result in results:
             # Get logprobs for each token
             logprobs = {}
-            for logprob, token_id, _ in result["meta_info"].get(
-                "output_token_ids_logprobs", []
-            )[0]:
-                if token_id in label_token_ids:
-                    logprobs[token_id] = logprob
+            
+            # For scoring requests, we read from output_token_ids_logprobs since we want
+            # the logprobs for specific tokens at the next position (not input tokens)
+            output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
+            
+
+            
+            if output_logprobs and output_logprobs[0] is not None:
+                for logprob, token_id, _ in output_logprobs[0]:
+                    if token_id in label_token_ids:
+                        logprobs[token_id] = logprob
 
             # Get scores in order of label_token_ids
             score_list = [

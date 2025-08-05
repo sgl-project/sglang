@@ -14,7 +14,7 @@ import logging
 import uuid
 from typing import Dict, Optional
 
-from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+from sglang.srt.managers.io_struct import TokenizedGenerateReqInput, TokenizedScoreReqInput
 from sglang.srt.managers.schedule_batch import Req
 
 
@@ -144,6 +144,7 @@ class Session:
             return_logprob=req.return_logprob,
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
+            is_scoring_request=isinstance(req, TokenizedScoreReqInput),
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs

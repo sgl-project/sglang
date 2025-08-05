@@ -91,6 +91,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TokenizedScoreReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -181,6 +182,12 @@ class GenerationBatchResult:
 @dataclass
 class EmbeddingBatchResult:
     embeddings: torch.Tensor
+    bid: int
+
+
+@dataclass
+class ScoreBatchResult:
+    logits_output: Optional[LogitsProcessorOutput]
     bid: int
 
 
@@ -491,6 +498,7 @@ class Scheduler(
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
+                (TokenizedScoreReqInput, self.handle_score_request),  # Use dedicated scoring handler
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
                 (AbortReq, self.abort_request),
@@ -1182,6 +1190,57 @@ class Scheduler(
         else:
             self._add_request_to_queue(req)
 
+    def handle_score_request(
+        self,
+        recv_req: TokenizedScoreReqInput,
+    ):
+        """
+        Handle scoring requests separately from generation requests.
+        
+        Scoring requests are prefill-only operations that compute logprobs for specific tokens
+        without generating new tokens. This method creates a specialized request object
+        optimized for scoring tasks.
+        """
+        # Create a specialized Req object for scoring
+        # For scoring requests, we need to create a minimal SamplingParams object
+        # since scoring doesn't use sampling but the Req constructor requires it
+        from sglang.srt.sampling.sampling_params import SamplingParams
+        dummy_sampling_params = SamplingParams(max_new_tokens=0)
+        
+        req = Req(
+            rid=recv_req.rid,
+            origin_input_text=recv_req.input_text,
+            origin_input_ids=recv_req.input_ids,
+            sampling_params=dummy_sampling_params,
+            return_logprob=True,  # Scoring requests always return logprobs
+            top_logprobs_num=0,  # Scoring requests don't need top logprobs
+            token_ids_logprob=recv_req.token_ids_logprob,
+            stream=False,         # Scoring requests don't stream
+            return_hidden_states=False,  # No hidden states for scoring
+            eos_token_ids=self.model_config.hf_eos_token_id,
+            vocab_size=self.model_config.vocab_size,
+            is_scoring_request=True,
+        )
+        
+        # Always set logprob_start_len to last token for scoring requests
+        req.logprob_start_len = len(recv_req.input_ids) - 1
+        req.tokenizer = self.tokenizer
+
+        # Validate prompt length
+        error_msg = validate_input_length(
+            req,
+            self.max_req_input_len,
+            self.server_args.allow_auto_truncate,
+        )
+        if error_msg:
+            req.set_finish_with_abort(error_msg)
+            self._add_request_to_queue(req)
+            return
+
+        # For scoring, we don't need grammar processing or other generation-specific features
+        # Just add the request to the queue for processing
+        self._add_request_to_queue(req)
+                
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1590,6 +1649,10 @@ class Scheduler(
             self.running_batch.filter_batch()
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
+                # Only prepare for decode if this is not a scoring batch
+                # Scoring batches are prefill-only and should not allocate decode tokens
+                if not self.running_batch.is_scoring_batch:
+                    self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = ScheduleBatch(
@@ -1636,13 +1699,15 @@ class Scheduler(
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
 
-        # Update batch tensors
-        batch.prepare_for_decode()
+        # Only prepare for decode if this is not a scoring batch
+        # Scoring batches are prefill-only and should not allocate decode tokens
+        if not batch.is_scoring_batch:
+            batch.prepare_for_decode()
         return batch
 
     def run_batch(
         self, batch: ScheduleBatch
-    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult, ScoreBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
 
@@ -1653,7 +1718,10 @@ class Scheduler(
             time.sleep(self.forward_sleep_time)
 
         # Run forward
-        if self.is_generation:
+        if batch.is_scoring_batch:
+            ret = self._run_scoring_batch(batch)
+            
+        elif self.is_generation:
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
 
@@ -1721,13 +1789,45 @@ class Scheduler(
             )
         return ret
 
+    def _run_scoring_batch(self, batch: ScheduleBatch) -> ScoreBatchResult:
+        """Handle scoring requests (prefill-only) - separate from generation path."""
+        model_worker_batch = batch.get_model_worker_batch()
+        
+        # update the consumer index of hicache to the running batch
+        self.tp_worker.set_hicache_consumer(
+            model_worker_batch.hicache_consumer_index
+        )
+        
+        if self.pp_group.is_last_rank:
+            logits_output, _, can_run_cuda_graph = (
+                self.tp_worker.forward_batch_generation(model_worker_batch)
+            )
+        else:
+            _, _, can_run_cuda_graph = (
+                self.tp_worker.forward_batch_generation(model_worker_batch)
+            )
+        bid = model_worker_batch.bid
+        
+        # Mark scoring requests as finished after forward pass, but only if not chunked
+        for req in batch.reqs:
+            if req.is_chunked <= 0:
+                req.check_finished()
+        
+        return ScoreBatchResult(
+            logits_output=logits_output if self.pp_group.is_last_rank else None,
+            bid=bid,
+        )
+
     def process_batch_result(
         self,
         batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        result: Union[GenerationBatchResult, EmbeddingBatchResult, ScoreBatchResult],
         launch_done: Optional[threading.Event] = None,
     ):
-        if batch.forward_mode.is_decode():
+        if isinstance(result, ScoreBatchResult):
+            # Handle scoring results (prefill-only)
+            self.process_batch_result_score(batch, result, launch_done)
+        elif batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result, launch_done)
@@ -2350,7 +2450,7 @@ def is_health_check_generate_req(recv_req):
 
 
 def is_work_request(recv_req):
-    return isinstance(recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
+    return isinstance(recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, TokenizedScoreReqInput))
 
 
 def run_scheduler_process(

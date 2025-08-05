@@ -8,12 +8,17 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut
-from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    BaseFinishReason,
+    Req,
+    ScheduleBatch,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
         EmbeddingBatchResult,
         GenerationBatchResult,
+        ScoreBatchResult,
         ScheduleBatch,
         Scheduler,
     )
@@ -294,6 +299,120 @@ class SchedulerOutputProcessorMixin:
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
             self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
+
+    def process_batch_result_score(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: ScoreBatchResult,
+        launch_done: Optional[threading.Event] = None,
+    ):
+        """
+        Process scoring batch results.
+        
+        Scoring requests are prefill-only operations that compute logprobs for specific tokens
+        without generating new tokens. They are marked as finished in run_batch.
+        """
+        logits_output = result.logits_output
+        
+        if self.enable_overlap:
+            # Resolve the last batch result for overlap scheduling
+            logits_output, _, _ = self.tp_worker.resolve_last_batch_result(launch_done)
+        else:
+            # Move logprobs to CPU if needed
+            if batch.return_logprob and logits_output is not None:
+                if logits_output.input_token_logprobs is not None:
+                    logits_output.input_token_logprobs = tuple(
+                        logits_output.input_token_logprobs.tolist()
+                    )
+        
+        # Free tokens from the memory pool (same as decode processing)
+        self.token_to_kv_pool_allocator.free_group_begin()
+        
+        # Process logprobs for scoring requests
+        if batch.return_logprob and logits_output is not None:
+            for i, req in enumerate(batch.reqs):
+                if req.is_scoring_request:
+                    # For scoring requests, we use next_token logprobs since we want 
+                    # to know the probability of specific tokens at the next position
+                    if (logits_output.next_token_token_ids_logprobs_val is not None and
+                        logits_output.next_token_token_ids_logprobs_idx is not None):
+                        
+                        # Initialize all the logprob fields for scoring request
+                        if req.input_token_logprobs_val is None:
+                            req.input_token_logprobs_val = []
+                        if req.input_token_logprobs_idx is None:
+                            req.input_token_logprobs_idx = []
+                        if req.input_top_logprobs_val is None:
+                            req.input_top_logprobs_val = []
+                        if req.input_top_logprobs_idx is None:
+                            req.input_top_logprobs_idx = []
+                        if req.output_token_logprobs_val is None:
+                            req.output_token_logprobs_val = []
+                        if req.output_token_logprobs_idx is None:
+                            req.output_token_logprobs_idx = []
+                        if req.output_top_logprobs_val is None:
+                            req.output_top_logprobs_val = []
+                        if req.output_top_logprobs_idx is None:
+                            req.output_top_logprobs_idx = []
+                        if req.input_token_ids_logprobs_val is None:
+                            req.input_token_ids_logprobs_val = []
+                        if req.input_token_ids_logprobs_idx is None:
+                            req.input_token_ids_logprobs_idx = []
+                        if req.output_token_ids_logprobs_val is None:
+                            req.output_token_ids_logprobs_val = []
+                        if req.output_token_ids_logprobs_idx is None:
+                            req.output_token_ids_logprobs_idx = []
+                            
+                        # Store the next token logprobs as output logprobs for scoring
+                        req.output_token_ids_logprobs_val.append(
+                            logits_output.next_token_token_ids_logprobs_val[i]
+                        )
+                        req.output_token_ids_logprobs_idx.append(
+                            logits_output.next_token_token_ids_logprobs_idx[i]
+                        )
+        
+        # Handle cache cleanup for scoring requests (similar to prefill logic)
+        skip_stream_req = None
+        for i, req in enumerate(batch.reqs):
+            if req.is_scoring_request:
+                if req.is_retracted:
+                    continue
+                    
+                # Handle chunked scoring requests
+                if req.is_chunked <= 0:
+                    # For scoring requests, check_finished() was already called in _run_scoring_batch()
+                    # So we just need to cache the requests based on their current state
+                    if req.finished():
+                        # Handle the "one extra delayed token" pattern for overlap scheduling
+                        # Similar to decode processor, but only for non-ChunkCache types
+                        from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
+                        is_chunk_cache = isinstance(self.tree_cache, (ChunkCache, SWAChunkCache))
+                        
+                        if self.enable_overlap and not is_chunk_cache:
+                            if self.page_size == 1:
+                                self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
+                            else:
+                                # Only free when the extra token is in a new page
+                                if (
+                                    len(req.origin_input_ids) + len(req.output_ids) - 1
+                                ) % self.page_size == 0:
+                                    self.token_to_kv_pool_allocator.free(
+                                        batch.out_cache_loc[i : i + 1]
+                                    )
+                        
+                        self.tree_cache.cache_finished_req(req)
+                    else:
+                        self.tree_cache.cache_unfinished_req(req)
+                else:
+                    # Scoring request is still being chunked, don't stream yet
+                    req.is_chunked -= 1
+                    skip_stream_req = req
+        
+        # Stream the results back to the tokenizer manager
+        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+        
+        # Complete memory cleanup (same as decode processing)
+        self.token_to_kv_pool_allocator.free_group_end()
 
     def add_input_logprob_return_values(
         self: Scheduler,
