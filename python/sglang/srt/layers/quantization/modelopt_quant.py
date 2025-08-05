@@ -752,6 +752,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         num_experts: int,
+        num_local_experts: int,
         hidden_size: int,
         intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
@@ -765,7 +766,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # TODO(ch-wan): check if this is needed
         layer.num_experts = num_experts
-        layer.num_local_experts = num_experts
+        layer.num_local_experts = num_local_experts
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.params_dtype = params_dtype
         layer.quant_config = self.quant_config
