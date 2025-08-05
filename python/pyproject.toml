@@ -60,7 +60,7 @@ srt = [
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.9rc2",
+    "flashinfer_python==0.2.9",
 ]
 
 blackwell = [
@@ -71,7 +71,7 @@ blackwell = [
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.9rc2",
+    "flashinfer_python==0.2.9",
     "tiktoken",
 ]
 
