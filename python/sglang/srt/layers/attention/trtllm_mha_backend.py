@@ -272,84 +272,83 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
-        metadata = TRTLLMMHAMetadata()
-        seqlens_in_batch = forward_batch.seq_lens
-        batch_size = forward_batch.batch_size
-        device = seqlens_in_batch.device
+        # Delegate to parent for non-decode modes or when speculative execution is used.
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.spec_info is None
+        ):
 
-        if forward_batch.forward_mode.is_decode_or_idle():
-            # Normal Decode
-            metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
-            metadata.cu_seqlens_q = torch.arange(
-                0, batch_size + 1, dtype=torch.int32, device=device
-            )
-            metadata.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
-            )
-            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
-            ]
-        else:
-            metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
-            metadata.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
-            )
-            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
-            ]
+            bs = forward_batch.batch_size
 
-            if any(forward_batch.extend_prefix_lens_cpu):
-                extend_seq_lens = forward_batch.extend_seq_lens
-                metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
-                metadata.cu_seqlens_q = torch.nn.functional.pad(
-                    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
-                )
+            # Get maximum sequence length.
+            if getattr(forward_batch, "seq_lens_cpu", None) is not None:
+                max_seq = forward_batch.seq_lens_cpu.max().item()
             else:
-                metadata.max_seq_len_q = metadata.max_seq_len_k
-                metadata.cu_seqlens_q = metadata.cu_seqlens_k
+                max_seq = forward_batch.seq_lens.max().item()
 
-        # Convert the page table to a strided format which is needed by FA3 API
-        if self.page_size > 1:
-            self.strided_indices = torch.arange(
-                0, metadata.page_table.shape[1], self.page_size, device=self.device
+            max_seqlen_pad = self._calc_padded_blocks(max_seq)
+            # todo: kv_indptr
+            block_kv_indices = self._create_block_kv_indices(
+                bs,
+                max_seqlen_pad,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens.device,
             )
-            metadata.page_table = (
-                metadata.page_table[:, self.strided_indices] // self.page_size
+
+            self.forward_metadata = TRTLLMMHADecodeMetadata(
+                self.workspace_buffer, block_kv_indices
             )
+            forward_batch.decode_trtllm_mha_metadata = self.forward_metadata
+        else:
+            metadata = TRTLLMMHAMetadata()
+            seqlens_in_batch = forward_batch.seq_lens
+            batch_size = forward_batch.batch_size
+            device = seqlens_in_batch.device
 
-        self.forward_metadata = metadata
+            if forward_batch.forward_mode.is_decode_or_idle():
+                # Normal Decode
+                metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.cu_seqlens_q = torch.arange(
+                    0, batch_size + 1, dtype=torch.int32, device=device
+                )
+                metadata.cu_seqlens_k = torch.nn.functional.pad(
+                    torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+                )
+                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                ]
+            else:
+                metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.cu_seqlens_k = torch.nn.functional.pad(
+                    torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+                )
+                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                ]
 
-        # # Delegate to parent for non-decode modes or when speculative execution is used.
-        # if not (
-        #     forward_batch.forward_mode.is_decode_or_idle()
-        #     and forward_batch.spec_info is None
-        # ):
-        #     return super().init_forward_metadata(forward_batch)
+                if any(forward_batch.extend_prefix_lens_cpu):
+                    extend_seq_lens = forward_batch.extend_seq_lens
+                    metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+                    metadata.cu_seqlens_q = torch.nn.functional.pad(
+                        torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                    )
+                else:
+                    metadata.max_seq_len_q = metadata.max_seq_len_k
+                    metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
-        # bs = forward_batch.batch_size
+            # Convert the page table to a strided format which is needed by FA3 API
+            if self.page_size > 1:
+                self.strided_indices = torch.arange(
+                    0, metadata.page_table.shape[1], self.page_size, device=self.device
+                )
+                metadata.page_table = (
+                    metadata.page_table[:, self.strided_indices] // self.page_size
+                )
 
-        # # Get maximum sequence length.
-        # if getattr(forward_batch, "seq_lens_cpu", None) is not None:
-        #     max_seq = forward_batch.seq_lens_cpu.max().item()
-        # else:
-        #     max_seq = forward_batch.seq_lens.max().item()
-
-        # max_seqlen_pad = self._calc_padded_blocks(max_seq)
-        # # todo: kv_indptr
-        # block_kv_indices = self._create_block_kv_indices(
-        #     bs,
-        #     max_seqlen_pad,
-        #     forward_batch.req_pool_indices,
-        #     forward_batch.seq_lens,
-        #     forward_batch.seq_lens.device,
-        # )
-
-        # self.forward_metadata = TRTLLMMHADecodeMetadata(
-        #     self.workspace_buffer, block_kv_indices
-        # )
-        # forward_batch.decode_trtllm_mha_metadata = self.forward_metadata
+            self.forward_metadata = metadata
 
     def forward_decode(
         self,
