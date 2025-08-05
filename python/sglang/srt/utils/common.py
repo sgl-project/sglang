@@ -1454,12 +1454,33 @@ def get_zmq_socket_on_host(
     Returns:
         Tuple of (port, socket) where port is the randomly assigned TCP port.
     """
-    socket = context.socket(socket_type)
-    # Bind to random TCP port
-    config_socket(socket, socket_type)
-    bind_host = f"tcp://{host}" if host else "tcp://*"
-    port = socket.bind_to_random_port(bind_host)
-    return port, socket
+    if host is None or len(host) == 0:
+        host = "*"
+
+    # is_valid_ipv6_address function doesn't cover "[ipv6]" case
+    # so simply check whether ":" is in host for IPV6
+    host_is_ipv6 = ":" in host
+
+    retry_count = 5
+    delay = 0.1
+    for retry in range(1, retry_count + 1):
+        new_socket = context.socket(socket_type)
+        try:
+            config_socket(new_socket, socket_type)
+            if host_is_ipv6:
+                new_socket.setsockopt(zmq.IPV6, 1)
+            port = new_socket.bind_to_random_port(format_tcp_address_without_port(host))
+            return port, new_socket
+        except zmq.ZMQError as e:
+            last_error = e
+            if e.errno != zmq.EADDRINUSE:
+                raise
+            new_socket.close(linger=0)
+            if retry == retry_count:
+                break
+
+            time.sleep(delay)
+    raise RuntimeError("Failed to bind socket after retries") from last_error
 
 
 def config_socket(socket, socket_type: zmq.SocketType):
@@ -2605,6 +2626,10 @@ def maybe_wrap_ipv6_address(address: str) -> str:
 
 def format_tcp_address(ip: str, port: int) -> str:
     return f"tcp://{maybe_wrap_ipv6_address(ip)}:{port}"
+
+
+def format_tcp_address_without_port(ip: str) -> str:
+    return f"tcp://{maybe_wrap_ipv6_address(ip)}"
 
 
 def configure_ipv6(dist_init_addr):
