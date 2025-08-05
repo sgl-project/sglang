@@ -30,8 +30,10 @@ import re
 from enum import IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
+from typing_extensions import Literal
+
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.utils import read_system_prompt_from_file
+from sglang.srt.utils import ImageData, read_system_prompt_from_file
 
 
 class SeparatorStyle(IntEnum):
@@ -91,7 +93,7 @@ class Conversation:
     video_token: str = "<video>"
     audio_token: str = "<audio>"
 
-    image_data: Optional[List[str]] = None
+    image_data: Optional[List[ImageData]] = None
     video_data: Optional[List[str]] = None
     modalities: Optional[List[str]] = None
     stop_token_ids: Optional[int] = None
@@ -381,9 +383,9 @@ class Conversation:
         """Append a new message."""
         self.messages.append([role, message])
 
-    def append_image(self, image: str):
+    def append_image(self, image: str, detail: Literal["auto", "low", "high"]):
         """Append a new image."""
-        self.image_data.append(image)
+        self.image_data.append(ImageData(url=image, detail=detail))
 
     def append_video(self, video: str):
         """Append a new video."""
@@ -627,7 +629,9 @@ def generate_chat_conv(
                             real_content = image_token + real_content
                         else:
                             real_content += image_token
-                        conv.append_image(content.image_url.url)
+                        conv.append_image(
+                            content.image_url.url, content.image_url.detail
+                        )
                     elif content.type == "video_url":
                         real_content += video_token
                         conv.append_video(content.video_url.url)
@@ -956,20 +960,6 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
-        name="mimo-vl",
-        system_message="You are MiMo, an AI assistant developed by Xiaomi.",
-        system_template="<|im_start|>system\n{system_message}",
-        roles=("<|im_start|>user", "<|im_start|>assistant"),
-        sep="<|im_end|>\n",
-        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
-        stop_str=["<|im_end|>"],
-        image_token="<|vision_start|><|image_pad|><|vision_end|>",
-    )
-)
-
-
-register_conv_template(
-    Conversation(
         name="qwen2-audio",
         system_template="<|im_start|>system\n{system_message}",
         system_message="You are a helpful assistant.",
@@ -981,34 +971,11 @@ register_conv_template(
     )
 )
 
-register_conv_template(
-    Conversation(
-        name="llama_4_vision",
-        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
-        system_template="<|header_start|>system<|header_end|>\n\n{system_message}<|eot|>",
-        roles=("user", "assistant"),
-        sep_style=SeparatorStyle.LLAMA4,
-        sep="",
-        stop_str="<|eot|>",
-        image_token="<|image|>",
-    )
-)
-
 
 @register_conv_template_matching_function
 def match_internvl(model_path: str):
     if re.search(r"internvl", model_path, re.IGNORECASE):
         return "internvl-2-5"
-    if re.search(r"intern.*s1", model_path, re.IGNORECASE):
-        return "interns1"
-
-
-@register_conv_template_matching_function
-def match_llama_vision(model_path: str):
-    if re.search(r"llama.*3\.2.*vision", model_path, re.IGNORECASE):
-        return "llama_3_vision"
-    if re.search(r"llama.*4.*", model_path, re.IGNORECASE):
-        return "llama_4_vision"
 
 
 @register_conv_template_matching_function
@@ -1024,22 +991,6 @@ def match_vicuna(model_path: str):
 
 
 @register_conv_template_matching_function
-def match_llama2_chat(model_path: str):
-    if re.search(
-        r"llama-2.*chat|codellama.*instruct",
-        model_path,
-        re.IGNORECASE,
-    ):
-        return "llama-2"
-
-
-@register_conv_template_matching_function
-def match_mistral(model_path: str):
-    if re.search(r"pixtral|(mistral|mixtral).*instruct", model_path, re.IGNORECASE):
-        return "mistral"
-
-
-@register_conv_template_matching_function
 def match_deepseek_vl(model_path: str):
     if re.search(r"deepseek.*vl2", model_path, re.IGNORECASE):
         return "deepseek-vl2"
@@ -1047,24 +998,12 @@ def match_deepseek_vl(model_path: str):
 
 @register_conv_template_matching_function
 def match_qwen_chat_ml(model_path: str):
-    if re.search(r"gme.*qwen.*vl", model_path, re.IGNORECASE):
-        return "gme-qwen2-vl"
-    if re.search(r"qwen.*vl", model_path, re.IGNORECASE):
-        return "qwen2-vl"
-    if re.search(r"qwen.*audio", model_path, re.IGNORECASE):
-        return "qwen2-audio"
     if re.search(
         r"llava-v1\.6-34b|llava-v1\.6-yi-34b|llava-next-video-34b|llava-onevision-qwen2",
         model_path,
         re.IGNORECASE,
     ):
         return "chatml-llava"
-
-
-@register_conv_template_matching_function
-def match_gemma3_instruct(model_path: str):
-    if re.search(r"gemma-3.*it", model_path, re.IGNORECASE):
-        return "gemma-it"
 
 
 @register_conv_template_matching_function
@@ -1076,30 +1015,6 @@ def match_openbmb_minicpm(model_path: str):
 
 
 @register_conv_template_matching_function
-def match_moonshot_kimivl(model_path: str):
-    if re.search(r"kimi.*vl", model_path, re.IGNORECASE):
-        return "kimi-vl"
-
-
-@register_conv_template_matching_function
-def match_devstral(model_path: str):
-    if re.search(r"devstral", model_path, re.IGNORECASE):
-        return "devstral"
-
-
-@register_conv_template_matching_function
 def match_phi_4_mm(model_path: str):
     if "phi-4-multimodal" in model_path.lower():
         return "phi-4-mm"
-
-
-@register_conv_template_matching_function
-def match_vila(model_path: str):
-    if re.search(r"vila", model_path, re.IGNORECASE):
-        return "chatml"
-
-
-@register_conv_template_matching_function
-def match_mimo_vl(model_path: str):
-    if re.search(r"mimo.*vl", model_path, re.IGNORECASE):
-        return "mimo-vl"

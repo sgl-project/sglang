@@ -12,7 +12,6 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
-from sglang.srt.managers.mm_utils import TransportProxyTensor
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import load_audio, load_image, load_video, logger
 
@@ -176,6 +175,8 @@ class BaseMultimodalProcessor(ABC):
             "image_grid_hws": Modality.IMAGE,
             "aspect_ratio_ids": Modality.IMAGE,
             "aspect_ratio_mask": Modality.IMAGE,
+            "num_patches": Modality.IMAGE,
+            "patch_pixel_values": Modality.IMAGE,
             # Audio-related attributes
             "audio_features": Modality.AUDIO,
             "audio_feature_lens": Modality.AUDIO,
@@ -216,8 +217,10 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["audio"] = audios
 
         processor = self._processor
-        if hasattr(processor, "image_processor") and isinstance(
-            processor.image_processor, BaseImageProcessorFast
+        if (
+            hasattr(processor, "image_processor")
+            and isinstance(processor.image_processor, BaseImageProcessorFast)
+            and not self.server_args.disable_fast_image_processor
         ):
             kwargs["device"] = "cuda"
         result = processor.__call__(
