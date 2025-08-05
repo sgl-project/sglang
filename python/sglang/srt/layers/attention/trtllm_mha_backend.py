@@ -50,6 +50,22 @@ class TRTLLMMHADecodeMetadata:
     block_kv_indices: Optional[torch.Tensor] = None
 
 
+@dataclass
+class TRTLLMMHAMetadata:
+    # Sequence lengths for the forward batch
+    cache_seqlens_int32: torch.Tensor = None
+    # Maximum sequence length for query
+    max_seq_len_q: int = 1
+    # Maximum sequence length for key
+    max_seq_len_k: int = 0
+    # Cumulative sequence lengths for `query
+    cu_seqlens_q: torch.Tensor = None
+    # Cumulative sequence lengths for key
+    cu_seqlens_k: torch.Tensor = None
+    # Page table, the index of KV Cache Tables/Blocks
+    page_table: torch.Tensor = None
+
+
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
 
@@ -90,7 +106,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
         self.cuda_graph_kv_indices = None
-        self.forward_metadata: Union[TRTLLMMHADecodeMetadata, None] = None
+        self.forward_metadata: Union[TRTLLMMHADecodeMetadata, TRTLLMMHAMetadata] = None
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -256,35 +272,84 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
-        # Delegate to parent for non-decode modes or when speculative execution is used.
-        if not (
-            forward_batch.forward_mode.is_decode_or_idle()
-            and forward_batch.spec_info is None
-        ):
-            return super().init_forward_metadata(forward_batch)
+        metadata = TRTLLMMHAMetadata()
+        seqlens_in_batch = forward_batch.seq_lens
+        batch_size = forward_batch.batch_size
+        device = seqlens_in_batch.device
 
-        bs = forward_batch.batch_size
-
-        # Get maximum sequence length.
-        if getattr(forward_batch, "seq_lens_cpu", None) is not None:
-            max_seq = forward_batch.seq_lens_cpu.max().item()
+        if forward_batch.forward_mode.is_decode_or_idle():
+            # Normal Decode
+            metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+            metadata.cu_seqlens_q = torch.arange(
+                0, batch_size + 1, dtype=torch.int32, device=device
+            )
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+            )
+            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, : metadata.max_seq_len_k
+            ]
         else:
-            max_seq = forward_batch.seq_lens.max().item()
+            metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+            )
+            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, : metadata.max_seq_len_k
+            ]
 
-        max_seqlen_pad = self._calc_padded_blocks(max_seq)
-        # todo: kv_indptr
-        block_kv_indices = self._create_block_kv_indices(
-            bs,
-            max_seqlen_pad,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            forward_batch.seq_lens.device,
-        )
+            if any(forward_batch.extend_prefix_lens_cpu):
+                extend_seq_lens = forward_batch.extend_seq_lens
+                metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+                metadata.cu_seqlens_q = torch.nn.functional.pad(
+                    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            else:
+                metadata.max_seq_len_q = metadata.max_seq_len_k
+                metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
-        self.forward_metadata = TRTLLMMHADecodeMetadata(
-            self.workspace_buffer, block_kv_indices
-        )
-        forward_batch.decode_trtllm_mha_metadata = self.forward_metadata
+        # Convert the page table to a strided format which is needed by FA3 API
+        if self.page_size > 1:
+            self.strided_indices = torch.arange(
+                0, metadata.page_table.shape[1], self.page_size, device=self.device
+            )
+            metadata.page_table = (
+                metadata.page_table[:, self.strided_indices] // self.page_size
+            )
+
+        self.forward_metadata = metadata
+
+        # # Delegate to parent for non-decode modes or when speculative execution is used.
+        # if not (
+        #     forward_batch.forward_mode.is_decode_or_idle()
+        #     and forward_batch.spec_info is None
+        # ):
+        #     return super().init_forward_metadata(forward_batch)
+
+        # bs = forward_batch.batch_size
+
+        # # Get maximum sequence length.
+        # if getattr(forward_batch, "seq_lens_cpu", None) is not None:
+        #     max_seq = forward_batch.seq_lens_cpu.max().item()
+        # else:
+        #     max_seq = forward_batch.seq_lens.max().item()
+
+        # max_seqlen_pad = self._calc_padded_blocks(max_seq)
+        # # todo: kv_indptr
+        # block_kv_indices = self._create_block_kv_indices(
+        #     bs,
+        #     max_seqlen_pad,
+        #     forward_batch.req_pool_indices,
+        #     forward_batch.seq_lens,
+        #     forward_batch.seq_lens.device,
+        # )
+
+        # self.forward_metadata = TRTLLMMHADecodeMetadata(
+        #     self.workspace_buffer, block_kv_indices
+        # )
+        # forward_batch.decode_trtllm_mha_metadata = self.forward_metadata
 
     def forward_decode(
         self,
@@ -368,5 +433,43 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        # todo(Baizhou): implement this trtllm_batch_context_with_kv_cache
-        return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
+        cache_loc = forward_batch.out_cache_loc
+        if save_kv_cache and k is not None:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+            )
+
+        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache = k_cache.view(-1, self.page_size, self.num_kv_heads, layer.head_dim)
+        v_cache = v_cache.view(-1, self.page_size, self.num_kv_heads, layer.head_dim)
+        kv_cache = torch.cat([k_cache, v_cache], dim=1)
+
+        # TODO: bmm1_scale and bmm2_scale might require modification
+        q_scale = 1.0
+        k_scale = (
+            layer.k_scale_float
+            if getattr(layer, "k_scale_float", None) is not None
+            else 1.0
+        )
+        bmm1_scale = q_scale * k_scale * layer.scaling
+        bmm2_scale = 1.0
+
+        o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            query=q,
+            kv_cache=kv_cache,
+            workspace_buffer=self.workspace_buffer,
+            block_tables=self.forward_metadata.page_table,
+            seq_lens=self.forward_metadata.cache_seqlens_int32,
+            max_q_len=self.forward_metadata.max_seq_len_q,
+            max_seq_len=self.forward_metadata.max_seq_len_k,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            batch_size=forward_batch.batch_size,
+            cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
+            cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
+            window_left=self.sliding_window_size,
+            # TODO: add attention_sink operation or nvfp4 scale factor if needed
+        )
+
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
