@@ -1,3 +1,4 @@
+from sglang.srt.configs.arctic import ArcticConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
@@ -12,6 +13,7 @@ from sglang.srt.configs.step3_vl import (
 )
 
 __all__ = [
+    "ArcticConfig",
     "ExaoneConfig",
     "ChatGLMConfig",
     "DbrxConfig",
