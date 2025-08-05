@@ -42,8 +42,7 @@ def process_requests(llm: sgl.Engine, prompts: list[str]) -> None:
         prompt_token_ids = output["meta_info"]["prompt_tokens"]
         generated_text = output["text"]
         print(
-            f"Prompt length: {len(prompt_token_ids)}, "
-            f"Generated text: {generated_text!r}"
+            f"Prompt length: {prompt_token_ids}, " f"Generated text: {generated_text!r}"
         )
 
 

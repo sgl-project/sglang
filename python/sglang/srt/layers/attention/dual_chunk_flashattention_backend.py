@@ -238,15 +238,15 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
 
             block_tables_intra = torch.zeros(
                 batch_size,
-                (max_seq_len_intra - 1) // self.block_size + 1,
+                (max_seq_len_intra - 1) // self.page_size + 1,
                 dtype=metadata.block_tables.dtype,
                 device=metadata.block_tables.device,
             )
             for i in range(batch_size):
-                st = chunk_num_curr[i] * chunk_len // self.block_size
+                st = chunk_num_curr[i] * chunk_len // self.page_size
                 ed = min(
-                    st + (max_seq_len_intra - 1) // self.block_size + 1,
-                    (metadata.seq_lens[i] - 1) // self.block_size + 1,
+                    st + (max_seq_len_intra - 1) // self.page_size + 1,
+                    (metadata.seq_lens[i] - 1) // self.page_size + 1,
                 )
                 block_tables_intra[i, : ed - st] = metadata.block_tables[i, st:ed]
             metadata.block_tables_intra = block_tables_intra
@@ -258,7 +258,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             if metadata.max_seq_len_succ:
                 block_tables_succ = torch.zeros(
                     batch_size,
-                    (metadata.max_seq_len_succ - 1) // self.block_size + 1,
+                    (metadata.max_seq_len_succ - 1) // self.page_size + 1,
                     dtype=metadata.block_tables.dtype,
                     device=metadata.block_tables.device,
                 )
@@ -266,11 +266,11 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     start = (
                         (chunk_num_curr[i] - 1).clip(min=0)
                         * chunk_len
-                        // self.block_size
+                        // self.page_size
                     )
                     end = min(
-                        start + (metadata.max_seq_len_succ - 1) // self.block_size + 1,
-                        (metadata.seq_lens[i] - 1) // self.block_size + 1,
+                        start + (metadata.max_seq_len_succ - 1) // self.page_size + 1,
+                        (metadata.seq_lens[i] - 1) // self.page_size + 1,
                     )
                     block_tables_succ[i, : end - start] = metadata.block_tables[
                         i, start:end
@@ -1232,7 +1232,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             ),
             max_seqlen_k=max_seqlen_k,
             causal=causal,
-            block_table=block_table.unsqueeze(0),
+            page_table=block_table.unsqueeze(0),
             return_softmax_lse=True,
         )
         softmax_lse = softmax_lse.view(q_len, q_heads, 1).transpose(0, 2).float()
@@ -1384,11 +1384,11 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         softmax_scale: float,
         causal: bool,
     ):
-        out, softmax_lse = flash_attn_with_kvcache(
+        out, softmax_lse, *rest_expand = flash_attn_with_kvcache(
             q=query,
             k_cache=key_cache,
             v_cache=value_cache,
-            block_table=block_table,
+            page_table=block_table,
             cache_seqlens=cache_seqlens,
             softmax_scale=softmax_scale,
             causal=causal,
