@@ -51,6 +51,7 @@ def _fwd_kernel(
     kv_indices,
     mask_ptr,
     mask_indptr,
+    sk_ptr,
     sm_scale,
     kv_group_num,
     stride_qbs,
@@ -78,6 +79,7 @@ def _fwd_kernel(
     IS_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
+    HAS_SK: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -178,13 +180,17 @@ def _fwd_kernel(
             final_mask &= custom_mask
         if SLIDING_WINDOW_SIZE > 0:
             # Add mask where q_id <= kv_id + sliding_window_size
-            window_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) <= (
-                start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE
-            )
+            # q_id = prefix_len + cur_m, kv_id = cur_n
+            window_mask = (
+                cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m[:, None]
+            ) <= (start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE)
             final_mask &= window_mask
         qk = tl.where(final_mask, qk, float("-inf"))
 
-        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+        row_max = tl.max(qk, 1)
+        row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
+        n_e_max = tl.maximum(row_max_fixed, e_max)
+
         re_scale = tl.exp(e_max - n_e_max)
         p = tl.exp(qk - n_e_max[:, None])
         deno = deno * re_scale + tl.sum(p, 1)
@@ -242,6 +248,7 @@ def _fwd_kernel(
         if logit_cap > 0:
             qk = logit_cap * tanh(qk / logit_cap)
 
+        final_mask = mask_m[:, None] & mask_n[None, :]
         if USE_CUSTOM_MASK:
             custom_mask = tl.load(
                 mask_ptr
@@ -254,18 +261,30 @@ def _fwd_kernel(
                 other=0,
             )
             custom_mask &= mask_m[:, None] & mask_n[None, :]
-            qk = tl.where(custom_mask, qk, float("-inf"))
+            final_mask &= custom_mask
         elif IS_CAUSAL:
             mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
                 start_n + offs_n[None, :]
             )
             mask_causual &= mask_m[:, None] & mask_n[None, :]
-            qk = tl.where(mask_causual, qk, float("-inf"))
+            final_mask &= mask_causual
         else:
             mask_non_causal = mask_m[:, None] & mask_n[None, :]
-            qk = tl.where(mask_non_causal, qk, float("-inf"))
+            final_mask &= mask_non_causal
 
-        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+        if SLIDING_WINDOW_SIZE > 0:
+            # Add mask where q_id <= kv_id + sliding_window_size
+            window_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) <= (
+                start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE
+            )
+            final_mask &= window_mask
+
+        qk = tl.where(final_mask, qk, float("-inf"))
+
+        row_max = tl.max(qk, 1)
+        row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
+        n_e_max = tl.maximum(row_max_fixed, e_max)
+
         re_scale = tl.exp(e_max - n_e_max)
         p = tl.exp(qk - n_e_max[:, None])
         deno = deno * re_scale + tl.sum(p, 1)
@@ -282,6 +301,10 @@ def _fwd_kernel(
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 
         e_max = n_e_max
+
+    if HAS_SK:
+        cur_sk = tl.load(sk_ptr + cur_head)
+        deno += tl.exp(cur_sk - e_max)
 
     offs_o = (
         (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
@@ -321,6 +344,7 @@ def extend_attention_fwd(
     logit_cap=0.0,
     skip_prefix_custom_mask=True,
     sliding_window_size=-1,
+    sk=None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -386,6 +410,8 @@ def extend_attention_fwd(
     # Skip custom mask for prefix part
     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
 
+    HAS_SK = sk is not None
+
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_stages = 1
 
@@ -405,6 +431,7 @@ def extend_attention_fwd(
         kv_indices,
         custom_mask,
         mask_indptr,
+        sk,
         sm_scale,
         kv_group_num,
         q_extend.stride(0),
@@ -431,6 +458,7 @@ def extend_attention_fwd(
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
+        HAS_SK=HAS_SK,
         STORE_TRANSPOSE=_is_hip,
         num_warps=num_warps,
         num_stages=num_stages,

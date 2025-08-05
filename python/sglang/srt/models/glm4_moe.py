@@ -785,7 +785,7 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
         )
 
     def determine_num_fused_shared_experts(
-        self, architecture: str = "DeepseekV3ForCausalLM"
+        self, architecture: str = "Glm4MoeForCausalLM"
     ):
         self.num_fused_shared_experts = 0
         if global_server_args_dict["disable_shared_experts_fusion"]:
@@ -797,7 +797,6 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
             not _is_cuda
             or torch.cuda.get_device_capability("cuda") < (8, 0)
             or self.config.architectures[0] != architecture
-            or self.config.n_routed_experts != 128
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Only GLM-4.5 on NV-platform with capability >= 80 can use shared experts fusion optimization."

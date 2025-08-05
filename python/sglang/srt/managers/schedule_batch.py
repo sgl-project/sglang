@@ -917,8 +917,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            assert isinstance(tree_cache, SWARadixCache) or isinstance(
-                tree_cache, SWAChunkCache
+            assert (
+                tree_cache is None
+                or isinstance(tree_cache, SWARadixCache)
+                or isinstance(tree_cache, SWAChunkCache)
             ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid = True
 
@@ -1705,6 +1707,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             or attention_backend_str == "flashmla"
             or attention_backend_str == "cutlass_mla"
             or attention_backend_str == "ascend"
+            or attention_backend_str == "trtllm_mha"
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
             seq_lens_cpu = (
