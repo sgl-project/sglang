@@ -161,13 +161,12 @@ def flashinfer_gemm_w8a8_block_fp8_linear(
     q_input, x_scale = sglang_per_token_group_quant_fp8(
         input_2d, block_size[1], column_major_scales=True
     )
-
+    # TRTLLM requires column-major scaling factors
     output = gemm_fp8_nt_groupwise(
         q_input,
         weight,
         x_scale,
         weight_scale,
-        scale_major_mode="MN",
         out_dtype=input_2d.dtype,
         backend="trtllm",
     )
