@@ -413,3 +413,13 @@ install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
 
 install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
         DESTINATION "deep_gemm/include/cutlass")
+
+#CuTe dsl(depend on cutlass)
+install(DIRECTORY "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute/"
+        DESTINATION "cute"
+        PATTERN "pyproject.toml" EXCLUDE
+        PATTERN "__pycache__" EXCLUDE)
+
+execute_process(
+        COMMAND bash -c "pip3 install nvidia-cutlass-dsl==0.0.0a0 && pip3 install nvidia-cutlass"
+)
