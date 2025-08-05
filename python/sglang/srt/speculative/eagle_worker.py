@@ -312,19 +312,14 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
-        import time
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            start_time = time.time()
             logits_output, next_token_ids, bid, seq_lens_cpu = (
                 self.forward_target_extend(batch)
             )
-            print(f"forward target extend time: {time.time() - start_time}")
-            start_time = time.time()
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
-            print(f"forward draft extend time: {time.time() - start_time}")
             return logits_output, next_token_ids, bid, 0, False
         else:
             with self.draft_tp_context(self.draft_model_runner.tp_group):
@@ -820,8 +815,8 @@ class EAGLEWorker(TpModelWorker):
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
-        if forward_batch.contains_mm_inputs():
-            forward_batch.input_embeds = self.get_mm_embeds(forward_batch)
+        # if forward_batch.contains_mm_inputs():
+        #     forward_batch.input_embeds = self.get_mm_embeds(forward_batch)
         forward_batch.return_logprob = False
         logits_output, _ = self.draft_model_runner.forward(forward_batch)
         self._detect_nan_if_needed(logits_output)
