@@ -457,7 +457,7 @@ class ServerArgs:
                 raise ValueError(
                     "trtllm_mla backend does not support speculative decoding yet."
                 )
-        
+
         if self.attention_backend == "dual_chunk_flash_attn":
             logger.warning(
                 "Mixed chunk is disabled because of using dual chunk flash attention backend"

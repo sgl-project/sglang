@@ -380,9 +380,10 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         else:
             # prefill/chunked-prefill
             # get per layer sparse attention config
-            self.layer_sparse_attention_config = self.get_sparse_attention_config(
-                layer.layer_id
-            )
+            if self.sparse_attention_enabled:
+                self.layer_sparse_attention_config = self.get_sparse_attention_config(
+                    layer.layer_id
+                )
             assert metadata.orig_seq_lens is not None
             o = self._dual_chunk_flash_attn_prefill(
                 q=query,
