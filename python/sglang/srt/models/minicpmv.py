@@ -582,7 +582,7 @@ class MiniCPMBaseModel(nn.Module):
 
     def init_llm(
         self,
-        config: Qwen2Config,
+        config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> nn.Module:
@@ -932,7 +932,10 @@ class MiniCPMV4_0(MiniCPMBaseModel):
         return pattern.pad_input_tokens(input_ids, image_inputs)
 
 
-_SUPPORT_VERSION = {(2, 6): MiniCPMV2_6, (4, 0): MiniCPMV4_0}
+_SUPPORT_VERSION = {
+    (2, 6): MiniCPMV2_6,
+    (4, 0): MiniCPMV4_0,
+}
 
 
 class MiniCPMV:
