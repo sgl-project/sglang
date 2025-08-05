@@ -50,6 +50,7 @@ runtime_common = [
     "uvicorn",
     "uvloop",
     "xgrammar==0.1.22",
+    "pyyaml>=6.0.2",
 ]
 
 srt = [

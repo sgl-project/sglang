@@ -21,7 +21,10 @@ import os
 import random
 import sys
 import tempfile
+import pathlib
 from typing import List, Literal, Optional, Union
+
+import yaml
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.layers.utils import is_sm100_supported
@@ -634,6 +637,14 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+        parser.add_argument(
+            "--config",
+            type=str,
+            default=None,
+            help=("The path to the configuration file in YAML format. "
+                "Priority: command line arguments > config file > default value."),
+            required=False,
+        )
         # Model and tokenizer
         parser.add_argument(
             "--model-path",
@@ -2099,7 +2110,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     Prepare the server arguments from the command line arguments.
 
     Args:
-        args: The command line arguments. Typically, it should be `sys.argv[1:]`
+        argv: The command line arguments. Typically, it should be `sys.argv[1:]`
             to ensure compatibility with `parse_args` when no arguments are passed.
 
     Returns:
@@ -2108,6 +2119,19 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)
+
+    if raw_args.config:
+        config_path = pathlib.Path(raw_args.config)
+        if not (config_path.exists() and config_path.is_file()):
+            raise ValueError(f"Config file {config_path} does not exist or is not a file.")
+        config_args = yaml.safe_load(config_path.read_bytes())
+        # Only update the `raw_args` if the value is not set via the command line.
+        arg_default = {action.dest: action.default for action in parser._actions}
+        for key, value in config_args.items():
+            if getattr(raw_args, key, None) == arg_default.get(key, None):
+                setattr(raw_args, key, value)
+    delattr(raw_args, "config")
+
     server_args = ServerArgs.from_cli_args(raw_args)
     return server_args
 
