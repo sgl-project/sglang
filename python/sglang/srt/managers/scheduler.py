@@ -1100,6 +1100,7 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 data_parallel_rank=recv_req.data_parallel_rank,
                 vocab_size=self.model_config.vocab_size,
+                is_scoring_request=recv_req.is_scoring_request,
             )
             req.tokenizer = self.tokenizer
 
@@ -1466,8 +1467,13 @@ class Scheduler(
             # Run prefill first if possible
             ret = new_batch
         else:
+            # For scoring-only (prefill-only) requests, decoding is not needed.
+            # Reset the current decode batch to an empty placeholder.
+            if self.running_batch.is_scoring_batch:
+                self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+                ret = None
             # Run decode
-            if not self.running_batch.is_empty():
+            elif not self.running_batch.is_empty():
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:

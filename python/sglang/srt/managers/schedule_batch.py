@@ -435,6 +435,7 @@ class Req:
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
+        is_scoring_request: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -602,6 +603,9 @@ class Req:
 
         # For data parallel rank routing
         self.data_parallel_rank: Optional[int] = data_parallel_rank
+
+        # Whether this is a scoring request (prefill-only) for the decoder model
+        self.is_scoring_request: bool = is_scoring_request
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
@@ -897,6 +901,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Whether this batch contains scoring requests (prefill-only)
+    is_scoring_batch: bool = False
+
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = 0
 
@@ -937,6 +944,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=spec_algorithm,
             enable_custom_logit_processor=enable_custom_logit_processor,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
+            is_scoring_batch=any(req.is_scoring_request for req in reqs),
             chunked_req=chunked_req,
         )
 

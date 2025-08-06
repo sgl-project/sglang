@@ -576,6 +576,11 @@ class TokenizerManager:
                 f"model's context length ({self.context_len} tokens)."
             )
 
+        if isinstance(obj, GenerateReqInput) and obj.is_scoring_request:
+            if obj.token_ids_logprob is None:
+                raise ValueError("token_ids_logprob is required for scoring requests.")
+            return
+
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
                 "This model does not appear to be an embedding model by default. "
@@ -671,6 +676,7 @@ class TokenizerManager:
                 custom_logit_processor=obj.custom_logit_processor,
                 return_hidden_states=obj.return_hidden_states,
                 data_parallel_rank=obj.data_parallel_rank,
+                is_scoring_request=obj.is_scoring_request,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -701,7 +707,7 @@ class TokenizerManager:
         # Process all requests
         tokenized_objs = []
         for i, req in enumerate(requests):
-            self._validate_token_len(obj[i], input_ids_list[i])
+            self._validate_one_request(obj[i], input_ids_list[i])
             tokenized_objs.append(
                 self._create_tokenized_object(
                     req, req.text, input_ids_list[i], None, None
@@ -1178,7 +1184,7 @@ class TokenizerManager:
 
                 return result
         except ValueError as e:
-            return UnloadLoRAAdapterReqOutput(success=False, rror_message=str(e))
+            return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
 
     async def get_weights_by_name(
         self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
@@ -1882,13 +1888,16 @@ class TokenizerManager:
                 prompts = [f"{item}{query}" for item in items_list]
             else:
                 prompts = [f"{query}{item}" for item in items_list]
+
             batch_request = GenerateReqInput(
                 text=prompts,
-                return_logprob=True,
                 token_ids_logprob=label_token_ids,
+                is_scoring_request=True,
+                return_logprob=True,
                 stream=False,
-                sampling_params={"max_new_tokens": 1},
+                sampling_params={"max_new_tokens": 0},
             )
+
         elif (
             isinstance(query, list)
             and isinstance(items, list)
@@ -1900,12 +1909,13 @@ class TokenizerManager:
                 input_ids_list = [item + query for item in items]
             else:
                 input_ids_list = [query + item for item in items]
+
             batch_request = GenerateReqInput(
                 input_ids=input_ids_list,
-                return_logprob=True,
                 token_ids_logprob=label_token_ids,
+                is_scoring_request=True,
+                return_logprob=True,
                 stream=False,
-                sampling_params={"max_new_tokens": 1},
             )
         else:
             raise ValueError(
@@ -1918,9 +1928,20 @@ class TokenizerManager:
         for result in results:
             # Get logprobs for each token
             logprobs = {}
-            for logprob, token_id, _ in result["meta_info"].get(
-                "output_token_ids_logprobs", []
-            )[0]:
+
+            # For scoring requests, we read from output_token_ids_logprobs since we want
+            # the logprobs for specific tokens mentioned in the label_token_ids at
+            # the next position after the last token in the prompt
+            output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
+
+            # Throw an error here if output_logprobs is None
+            if output_logprobs is None:
+                raise RuntimeError(
+                    f"output_logprobs is None for request {result['meta_info'].get('id', '<unknown>')}. "
+                    "This usually indicates a problem with the scoring request or the backend output."
+                )
+
+            for logprob, token_id, _ in output_logprobs[0]:
                 if token_id in label_token_ids:
                     logprobs[token_id] = logprob
 
