@@ -242,23 +242,12 @@ class W8A8Int8Config(QuantizationConfig):
 
         if _is_npu:
             if isinstance(layer, LinearBase):
-                packed_modules_mapping_subset = {}
+                key = "model"
                 if "vision_model" in prefix:
-                    packed_modules_mapping_subset = self.packed_modules_mapping.get(
-                        "vision_model", {}
-                    )
+                    key = "vision_model"
                 elif "visual" in prefix:
-                    packed_modules_mapping_subset = self.packed_modules_mapping.get(
-                        "visual", {}
-                    )
-                elif "language_model" in prefix:
-                    packed_modules_mapping_subset = self.packed_modules_mapping.get(
-                        "model", {}
-                    )
-                else:
-                    packed_modules_mapping_subset = self.packed_modules_mapping.get(
-                        "model", {}
-                    )
+                    key = "visual"
+                packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
                 prefix_in_quant_config = prefix
                 proj_name = prefix.split(".")[-1]
                 if proj_name in packed_modules_mapping_subset:
