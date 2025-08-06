@@ -362,7 +362,7 @@ impl PDRouter {
         .await
     }
 
-    // Core dual dispatch implementation
+    // Core dual dispatch implementation (restored from .bak with HTTP handshake fix)
     async fn execute_dual_dispatch_inner(
         &self,
         headers: Option<&HeaderMap>,
@@ -377,22 +377,34 @@ impl PDRouter {
         // Update load tracking for both workers
         let _guard = WorkerLoadGuard::new_multi(vec![prefill, decode]);
 
-        // Build requests with headers
-        let prefill_request =
-            self.build_request_with_headers(prefill.url(), route, &json_request, headers);
+        // Build requests using .json() method (restored from .bak)
+        let mut prefill_request = self
+            .client
+            .post(api_path(prefill.url(), route))
+            .json(&json_request);
 
-        let decode_request =
-            self.build_request_with_headers(decode.url(), route, &json_request, headers);
+        let mut decode_request = self
+            .client
+            .post(api_path(decode.url(), route))
+            .json(&json_request);
+
+        // Copy headers from original request (restored from .bak)
+        if let Some(headers) = headers {
+            for (name, value) in headers.iter() {
+                let name_str = name.as_str();
+                if name_str != "content-type" && name_str != "content-length" {
+                    // Skip headers with non-ASCII values
+                    if value.to_str().is_ok() {
+                        prefill_request = prefill_request.header(name, value);
+                        decode_request = decode_request.header(name, value);
+                    }
+                }
+            }
+        }
 
         // Send both requests concurrently
-        debug!(
-            "Sending concurrent requests to prefill={} decode={}",
-            prefill.url(),
-            decode.url()
-        );
         let (prefill_result, decode_result) =
             tokio::join!(prefill_request.send(), decode_request.send());
-        debug!("Received responses from both servers");
 
         // Update metrics
         let duration = start_time.elapsed();
@@ -401,13 +413,11 @@ impl PDRouter {
         RouterMetrics::record_pd_prefill_request(prefill.url());
         RouterMetrics::record_pd_decode_request(decode.url());
 
-        // Process decode response FIRST (critical path)
-        debug!("Processing decode response");
+        // Process decode response (restored from .bak)
         match decode_result {
             Ok(res) => {
                 let status = StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                debug!("Decode response status: {}", status);
 
                 if !status.is_success() {
                     RouterMetrics::record_pd_decode_error(decode.url());
@@ -428,109 +438,142 @@ impl PDRouter {
                     }
                 }
 
-                // Handle prefill response asynchronously (non-blocking)
-                let prefill_body = if return_logprob {
-                    // For logprobs, we need the body content synchronously
-                    match prefill_result {
-                        Ok(prefill_res) => {
-                            let prefill_status = prefill_res.status();
-                            if prefill_status.is_success() {
-                                match prefill_res.bytes().await {
-                                    Ok(body) => Some(body),
+                // Log prefill errors for debugging (restored from .bak)
+                if let Err(e) = &prefill_result {
+                    error!(
+                        "Prefill server failed (non-critical) prefill_url={} error={}",
+                        prefill.url(),
+                        e
+                    );
+                    RouterMetrics::record_pd_prefill_error(prefill.url());
+                }
+
+                if is_stream {
+                    // Streaming response (restored from .bak)
+                    if return_logprob {
+                        // Get prefill logprobs for merging
+                        let prefill_logprobs =
+                            match prefill_result {
+                                Ok(prefill_res) => match prefill_res.bytes().await {
+                                    Ok(body) => serde_json::from_slice::<Value>(&body)
+                                        .ok()
+                                        .and_then(|json| {
+                                            json.pointer("/meta_info/input_token_logprobs").cloned()
+                                        }),
+                                    Err(_) => None,
+                                },
+                                Err(_) => None,
+                            };
+
+                        // Stream with logprob merging
+                        let stream = res.bytes_stream();
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+                        tokio::spawn(async move {
+                            let mut stream = stream;
+                            while let Some(chunk_result) = stream.next().await {
+                                match chunk_result {
+                                    Ok(chunk) => {
+                                        // Try to merge logprobs
+                                        if let Ok(merged) = Self::merge_streaming_logprobs(
+                                            prefill_logprobs.clone(),
+                                            &chunk,
+                                        ) {
+                                            if tx.send(Ok(merged)).is_err() {
+                                                break;
+                                            }
+                                        } else {
+                                            if tx.send(Ok(chunk)).is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
                                     Err(e) => {
-                                        warn!(
-                                            "Failed to read prefill response body for logprobs: {}",
-                                            e
-                                        );
-                                        None
+                                        let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                        break;
                                     }
                                 }
+                            }
+                        });
+
+                        let stream = UnboundedReceiverStream::new(rx);
+                        let body = Body::from_stream(stream);
+
+                        let mut response = Response::new(body);
+                        *response.status_mut() = status;
+                        response
+                            .headers_mut()
+                            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                        response
+                    } else {
+                        // No logprob merging needed (restored from .bak)
+
+                        // Fix HTTP handshake issue by consuming prefill response when not needed
+                        tokio::spawn(async move {
+                            if let Ok(prefill_res) = prefill_result {
+                                let _ = prefill_res.bytes().await; // Consume to complete handshake
+                            }
+                        });
+
+                        let stream = res.bytes_stream();
+                        let decode_url = decode.url().to_string();
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+                        tokio::spawn(async move {
+                            let mut stream = stream;
+                            while let Some(chunk) = stream.next().await {
+                                match chunk {
+                                    Ok(bytes) => {
+                                        if tx.send(Ok(bytes)).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "Stream error from decode server {}: {}",
+                                            decode_url, e
+                                        );
+                                        RouterMetrics::record_pd_stream_error(&decode_url);
+                                        let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+
+                        let stream = UnboundedReceiverStream::new(rx);
+                        let body = Body::from_stream(stream);
+
+                        let mut response = Response::new(body);
+                        *response.status_mut() = status;
+                        response
+                            .headers_mut()
+                            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                        response
+                    }
+                } else {
+                    // Non-streaming response (restored from .bak)
+                    match res.bytes().await {
+                        Ok(decode_body) => {
+                            if return_logprob {
+                                self.merge_logprobs(prefill_result, decode_body, status)
+                                    .await
                             } else {
-                                // Consume error response asynchronously
-                                let prefill_url = prefill.url().to_string();
+                                // Fix HTTP handshake issue by consuming prefill response when not needed
                                 tokio::spawn(async move {
-                                    let _ = prefill_res.bytes().await;
-                                    RouterMetrics::record_pd_prefill_error(&prefill_url);
-                                    error!(
-                                        "Prefill server error (non-critical): status={}",
-                                        prefill_status
-                                    );
+                                    if let Ok(prefill_res) = prefill_result {
+                                        let _ = prefill_res.bytes().await; // Consume to complete handshake
+                                    }
                                 });
-                                None
+                                (status, decode_body).into_response()
                             }
                         }
                         Err(e) => {
-                            RouterMetrics::record_pd_prefill_error(prefill.url());
-                            error!("Prefill server failed (non-critical): error={}", e);
-                            None
+                            error!("Failed to read decode response: {}", e);
+                            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response")
+                                .into_response()
                         }
                     }
-                } else {
-                    // For non-logprob requests, consume prefill response asynchronously
-                    let prefill_url = prefill.url().to_string();
-                    tokio::spawn(async move {
-                        match prefill_result {
-                            Ok(prefill_res) => {
-                                let prefill_status = prefill_res.status();
-                                if prefill_status.is_success() {
-                                    // Consume response to complete handshake protocol
-                                    match prefill_res.bytes().await {
-                                        Ok(_) => {
-                                            debug!("Prefill response consumed successfully (async)")
-                                        }
-                                        Err(e) => {
-                                            warn!("Error consuming prefill response (async): {}", e)
-                                        }
-                                    }
-                                } else {
-                                    // Consume error response
-                                    let _ = prefill_res.bytes().await;
-                                    RouterMetrics::record_pd_prefill_error(&prefill_url);
-                                    error!(
-                                        "Prefill server error (non-critical): status={}",
-                                        prefill_status
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                RouterMetrics::record_pd_prefill_error(&prefill_url);
-                                error!("Prefill server failed (non-critical): error={}", e);
-                            }
-                        }
-                    });
-                    None
-                };
-
-                if is_stream {
-                    // Streaming response
-                    let prefill_logprobs = if return_logprob && prefill_body.is_some() {
-                        prefill_body
-                            .as_ref()
-                            .and_then(|body| serde_json::from_slice::<Value>(body).ok())
-                            .and_then(|json| {
-                                json.pointer("/meta_info/input_token_logprobs").cloned()
-                            })
-                    } else {
-                        None
-                    };
-
-                    let decode_url = if !return_logprob {
-                        Some(decode.url().to_string())
-                    } else {
-                        None
-                    };
-
-                    Self::create_streaming_response(
-                        res.bytes_stream(),
-                        status,
-                        prefill_logprobs,
-                        return_logprob,
-                        decode_url,
-                    )
-                } else {
-                    // Non-streaming response - use helper
-                    self.process_non_streaming_response(res, status, return_logprob, prefill_body)
-                        .await
                 }
             }
             Err(e) => {
@@ -756,6 +799,62 @@ impl PDRouter {
         }
 
         request
+    }
+
+    // Merge logprobs from prefill and decode responses (from .bak version)
+    async fn merge_logprobs(
+        &self,
+        prefill_result: Result<reqwest::Response, reqwest::Error>,
+        decode_body: bytes::Bytes,
+        status: StatusCode,
+    ) -> Response {
+        match prefill_result {
+            Ok(prefill_res) => {
+                match prefill_res.bytes().await {
+                    Ok(prefill_body) => {
+                        match (
+                            serde_json::from_slice::<Value>(&prefill_body),
+                            serde_json::from_slice::<Value>(&decode_body),
+                        ) {
+                            (Ok(prefill_json), Ok(mut decode_json)) => {
+                                // Merge input_token_logprobs
+                                if let (Some(prefill_meta), Some(decode_meta)) = (
+                                    prefill_json.get("meta_info"),
+                                    decode_json.get_mut("meta_info"),
+                                ) {
+                                    if let (Some(prefill_logprobs), Some(decode_logprobs)) = (
+                                        prefill_meta.get("input_token_logprobs"),
+                                        decode_meta.get_mut("input_token_logprobs"),
+                                    ) {
+                                        if let (Some(p_arr), Some(d_arr)) = (
+                                            prefill_logprobs.as_array(),
+                                            decode_logprobs.as_array(),
+                                        ) {
+                                            let mut merged = p_arr.clone();
+                                            merged.extend(d_arr.clone());
+                                            decode_meta["input_token_logprobs"] =
+                                                Value::Array(merged);
+                                        }
+                                    }
+                                }
+                                let mut response = Json(decode_json).into_response();
+                                *response.status_mut() = status;
+                                response
+                            }
+                            _ => {
+                                warn!("Failed to parse responses for logprob merging");
+                                (status, decode_body).into_response()
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to read prefill response: {}", e);
+                        (status, decode_body).into_response()
+                    }
+                }
+            }
+            Err(_) => (status, decode_body).into_response(),
+        }
     }
 
     // Helper to merge logprobs from prefill and decode responses
