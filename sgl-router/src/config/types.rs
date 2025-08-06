@@ -39,6 +39,8 @@ pub struct RouterConfig {
     pub max_concurrent_requests: usize,
     /// CORS allowed origins
     pub cors_allowed_origins: Vec<String>,
+    /// Retry configuration
+    pub retry: RetryConfig,
 }
 
 /// Routing mode configuration
@@ -182,6 +184,30 @@ impl Default for DiscoveryConfig {
     }
 }
 
+/// Retry configuration for request handling
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts
+    pub max_retries: u32,
+    /// Initial backoff delay in milliseconds
+    pub initial_backoff_ms: u64,
+    /// Maximum backoff delay in milliseconds
+    pub max_backoff_ms: u64,
+    /// Backoff multiplier for exponential backoff
+    pub backoff_multiplier: f32,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            initial_backoff_ms: 100,
+            max_backoff_ms: 10000,
+            backoff_multiplier: 2.0,
+        }
+    }
+}
+
 /// Metrics configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsConfig {
@@ -210,7 +236,7 @@ impl Default for RouterConfig {
             host: "127.0.0.1".to_string(),
             port: 3001,
             max_payload_size: 268_435_456, // 256MB
-            request_timeout_secs: 600,
+            request_timeout_secs: 3600,    // 1 hour to match Python mini LB
             worker_startup_timeout_secs: 300,
             worker_startup_check_interval_secs: 10,
             dp_aware: false,
@@ -222,6 +248,7 @@ impl Default for RouterConfig {
             request_id_headers: None,
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
         }
     }
 }
@@ -277,7 +304,7 @@ mod tests {
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 3001);
         assert_eq!(config.max_payload_size, 268_435_456);
-        assert_eq!(config.request_timeout_secs, 600);
+        assert_eq!(config.request_timeout_secs, 3600);
         assert_eq!(config.worker_startup_timeout_secs, 300);
         assert_eq!(config.worker_startup_check_interval_secs, 10);
         assert!(config.discovery.is_none());
@@ -332,6 +359,7 @@ mod tests {
             request_id_headers: None,
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -759,6 +787,7 @@ mod tests {
             request_id_headers: None,
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
         };
 
         assert!(config.mode.is_pd_mode());
@@ -810,6 +839,7 @@ mod tests {
             request_id_headers: None,
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -857,6 +887,7 @@ mod tests {
             request_id_headers: None,
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
         };
 
         assert!(config.has_service_discovery());
