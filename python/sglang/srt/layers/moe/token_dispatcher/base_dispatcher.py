@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class DispatchChecker:
+class DispatchOutputChecker:
     @staticmethod
     def format_is_standard(
         dispatch_output: DispatchOutput,
