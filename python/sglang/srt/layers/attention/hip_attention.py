@@ -235,7 +235,7 @@ class HiPAttentionBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
-        sk: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
         cache_loc = (
             forward_batch.out_cache_loc
@@ -393,7 +393,7 @@ class HiPAttentionBackend(AttentionBackend):
                     is_decode=False,
                     offloading_metadata=offloading_metadata,
                     sliding_window_size=sw_size,
-                    sliding_window_sink=sk,
+                    sliding_window_sink=sinks,
                     using_chunked_sliding_window=using_chunked_sw,
                     self_extend_scale=self.hip_config.self_extend_scale,
                 )
@@ -453,7 +453,7 @@ class HiPAttentionBackend(AttentionBackend):
                         is_decode=False,
                         offloading_metadata=offloading_metadata,
                         sliding_window_size=sw_size,
-                        sliding_window_sink=sk,
+                        sliding_window_sink=sinks,
                         using_chunked_sliding_window=using_chunked_sw,
                         self_extend_scale=self.hip_config.self_extend_scale,
                     )
@@ -598,7 +598,7 @@ class HiPAttentionBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
-        sk: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
         cache_loc = (
             forward_batch.out_cache_loc
@@ -785,7 +785,7 @@ class HiPAttentionBackend(AttentionBackend):
                     is_decode=True,
                     offloading_metadata=offloading_metadata,
                     sliding_window_size=sw_size,
-                    sliding_window_sink=sk,
+                    sliding_window_sink=sinks,
                     using_chunked_sliding_window=using_chunked_sw,
                     k_descale=k_descale,
                     v_descale=v_descale,
@@ -878,7 +878,7 @@ class HiPAttentionBackend(AttentionBackend):
                     is_decode=True,
                     offloading_metadata=offloading_metadata,
                     sliding_window_size=sw_size,
-                    sliding_window_sink=sk,
+                    sliding_window_sink=sinks,
                     using_chunked_sliding_window=using_chunked_sw,
                     cache_seqlens=self.cache_seqlens,
                     cu_seqlens_q=self.cu_seqlens_q,
