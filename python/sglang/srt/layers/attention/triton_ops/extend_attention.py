@@ -263,7 +263,7 @@ def _fwd_kernel(
             final_mask &= window_mask
 
         SKIP_TILE = False
-        if (USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK) or SLIDING_WINDOW_SIZE > 0:
+        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
