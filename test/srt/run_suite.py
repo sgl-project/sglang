@@ -146,8 +146,14 @@ suites = {
         TestFile("test_rope_rocm.py", 3),
         TestFile("test_awq_dequant.py", 2),
     ],
-    "per-commit-npu": [
-        TestFile("test_ascend_attention_backend.py", 400),
+    "per-commit-1-ascend-npu": [
+        TestFile("test_ascend_tp1_bf16.py", 400),
+    ],
+    "per-commit-2-ascend-npu": [
+        TestFile("test_ascend_tp2_bf16.py", 400),
+    ],
+    "per-commit-4-ascend-npu": [
+        TestFile("test_ascend_mla_w8a8int8.py", 400),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
@@ -173,6 +179,22 @@ suites = {
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
+    ],
+    "per-commit-8-gpu": [
+        # Disabled because it hangs on the CI.
+        # TestFile("test_moe_ep.py", 181),
+        TestFile("test_disaggregation.py", 499),
+        TestFile("test_disaggregation_different_tp.py", 155),
+        TestFile("test_full_deepseek_v3.py", 333),
+    ],
+    "per-commit-8-gpu-deepep": [
+        TestFile("test_deepep_large.py", 338),
+    ],
+    "per-commit-8-gpu-amd": [
+        TestFile("test_full_deepseek_v3.py", 250),
+    ],
+    "per-commit-8-gpu-b200": [
+        # add more here
     ],
     "per-commit-cpu": [
         TestFile("cpu/test_activation.py"),
