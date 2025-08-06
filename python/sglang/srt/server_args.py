@@ -1454,12 +1454,12 @@ class ServerArgs:
         parser.add_argument(
             "--enable-flashinfer-cutlass-moe",
             action="store_true",
-            help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
+            help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Used for high-throughput scenarios. Supports MoE-EP",
         )
         parser.add_argument(
             "--enable-flashinfer-trtllm-moe",
             action="store_true",
-            help="Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP",
+            help="Enable FlashInfer TRTLLM MoE backend on Blackwell. Used for low-latency scenarios. Supports BlockScale FP8 MoE-EP",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
@@ -1469,7 +1469,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-flashinfer-fp4-allgather",
             action="store_true",
-            help="Quantize before all-gather when using DP with flashinfer MOE EP, for high-throughput serving.",
+            help="Quantize before all-gather to reduce communication cost in high-throughput serving. Automatically enabled when --enable-cutlass-flashinfer-moe and --enable-dp-attention and dp_size == ep_size.",
         )
         parser.add_argument(
             "--deepep-mode",
