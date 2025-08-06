@@ -402,15 +402,13 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            if context.attn_tp_rank == 0:
-                hidden_states += residual
-
             # Perform layernorm on smaller data before comm. Only valid when attn_tp_size is 1 (tp_size == dp_size)
             use_layer_norm_before_gather = context.attn_tp_size == 1
             if use_layer_norm_before_gather:
-                residual.copy_(hidden_states)
                 if hidden_states.shape[0] != 0:
-                    hidden_states = layernorm(hidden_states)
+                    hidden_states, residual = layernorm(hidden_states, residual)
+            elif context.attn_tp_rank == 0:
+                hidden_states += residual
 
             hidden_states, local_hidden_states = (
                 forward_batch.gathered_buffer,
@@ -541,6 +539,11 @@ class CommunicateSummableTensorPairFn:
             forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
             hidden_states,
         )
+        if hidden_states.data_ptr() == global_hidden_states.data_ptr():
+            # If layernorm before all-gather is used, hidden_states and
+            # global_hidden_states could both be stored in gathered_buffer,
+            # which is not allowed by dp_scatter.
+            hidden_states = torch.empty_like(hidden_states)
         dp_scatter(hidden_states, global_hidden_states, forward_batch)
         return hidden_states, residual
 
