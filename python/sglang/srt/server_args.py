@@ -230,6 +230,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
+    tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     torchao_config: str = ""
@@ -479,6 +480,7 @@ class ServerArgs:
         if model_arch in ["GptOssForCausalLM"]:
             self.attention_backend = "triton"
             self.moe_grouped_gemm_backend = "triton_kernel"
+            self.disable_hybrid_swa_memory = True
 
         # Set page size
         if self.page_size is None:
@@ -1717,6 +1719,12 @@ class ServerArgs:
             "--enable-two-batch-overlap",
             action="store_true",
             help="Enabling two micro batches to overlap.",
+        )
+        parser.add_argument(
+            "--tbo-token-distribution-threshold",
+            type=float,
+            default=ServerArgs.tbo_token_distribution_threshold,
+            help="The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap.",
         )
         parser.add_argument(
             "--enable-torch-compile",
