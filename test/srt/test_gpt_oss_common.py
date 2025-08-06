@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing import Literal, List
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
@@ -11,12 +12,31 @@ from sglang.test.test_utils import (
 from sglang.test.test_utils import CustomTestCase
 
 
-class BaseTestGptOssCommon(CustomTestCase):
+class BaseTestGptOss(CustomTestCase):
     def run_test(
+        self,
+        model_variant: Literal["20b", "120b"],
+        quantization: Literal["mxfp4", "bf16"],
+        expected_score: float,
+        other_args: List[str],
+    ):
+        model = {
+            ("20b", "bf16"): "lmsys/gpt-oss-20b-bf16",
+            ("120b", "bf16"): "lmsys/gpt-oss-120b-bf16",
+            ("20b", "mxfp4"): "openai/gpt-oss-20b",
+            ("120b", "mxfp4"): "openai/gpt-oss-120b",
+        }[(model_variant, quantization)]
+        self._run_test_raw(
+            model=model,
+            expected_score=expected_score,
+            other_args=other_args,
+        )
+
+    def _run_test_raw(
         self,
         model: str,
         expected_score: float,
-        other_args=[],
+        other_args: List[str],
     ):
         base_url = DEFAULT_URL_FOR_TEST
 
