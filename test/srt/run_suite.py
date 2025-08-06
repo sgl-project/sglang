@@ -42,6 +42,7 @@ suites = {
         TestFile("openai_server/features/test_json_constrained.py", 98),
         TestFile("openai_server/features/test_json_mode.py", 90),
         TestFile("openai_server/features/test_openai_server_ebnf.py", 95),
+        TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
         TestFile("openai_server/features/test_reasoning_content.py", 89),
         TestFile("openai_server/function_call/test_openai_function_calling.py", 60),
         TestFile("openai_server/function_call/test_tool_choice.py", 226),
@@ -85,6 +86,7 @@ suites = {
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_engine.py", 261),
         TestFile("test_srt_endpoint.py", 130),
+        TestFile("test_start_profile.py", 60),
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 172),
         TestFile("test_torch_native_attention_backend.py", 123),
@@ -162,6 +164,7 @@ suites = {
         TestFile("test_mla_tp.py", 170),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_update_weights_from_distributed.py", 103),
+        TestFile("test_release_memory_occupation.py", 127),
     ],
     "per-commit-2-gpu-amd": [
         TestFile("models/lora/test_lora_tp.py", 116),
@@ -179,6 +182,9 @@ suites = {
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
+    ],
+    "per-commit-8-gpu-deepep": [
+        TestFile("test_deepep_large.py", 338),
     ],
     "per-commit-8-gpu-b200": [
         # add more here
@@ -204,22 +210,15 @@ suites = {
     ],
     "nightly-amd": [
         TestFile("test_nightly_gsm8k_eval_amd.py"),
+        TestFile("test_mla_deepseek_v3.py", 221),
     ],
     "nightly-2-gpu": [
         TestFile("test_nightly_gsm8k_eval.py"),
-    ],
-    "nightly-4-gpu": [
-        TestFile("test_local_attn.py", 250),
     ],
     "weekly": [
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
         TestFile("models/lora/test_lora_update.py", 800),
-        TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
-        TestFile("test_start_profile.py", 60),
-    ],
-    "weekly-2-gpu": [
-        TestFile("test_release_memory_occupation.py", 127),
     ],
     "weekly-4-gpu": [
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
@@ -228,7 +227,6 @@ suites = {
         TestFile("test_disaggregation.py", 499),
         TestFile("test_disaggregation_different_tp.py", 155),
         TestFile("test_full_deepseek_v3.py", 333),
-        TestFile("test_deepep_large.py", 338),
     ],
     "weekly-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),

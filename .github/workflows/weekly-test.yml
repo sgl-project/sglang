@@ -27,23 +27,6 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite weekly --timeout-per-file 3600
 
-  weekly-test-2-gpu:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch'
-    runs-on: 2-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 120
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite weekly-2-gpu --timeout-per-file 3600
-
   weekly-test-4-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch'
     runs-on: 4-gpu-runner
