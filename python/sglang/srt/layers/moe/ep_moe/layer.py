@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -405,13 +405,16 @@ class DeepEPMoE(EPMoE):
         )
 
     def moe_impl(self, dispatch_output: DispatchOutput):
+        from sglang.srt.layers.moe.token_dispatcher import DispatchChecker
+
         if _use_aiter:
+            assert DispatchChecker.format_is_deepep(dispatch_output)
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
             return self.forward_aiter(dispatch_output)
-        if dispatch_output.format.is_deepep_normal():
+        if DispatchChecker.format_is_deepep_normal(dispatch_output):
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_contiguous(dispatch_output)
-        elif dispatch_output.format.is_deepep_ll():
+        elif DispatchChecker.format_is_deepep_ll(dispatch_output):
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
@@ -435,7 +438,7 @@ class DeepEPMoE(EPMoE):
 
     def forward_aiter(
         self,
-        dispatch_output: DeepEPNormalOutput,
+        dispatch_output: Union[DeepEPNormalOutput, DeepEPLLOutput],
     ):
         hidden_states, topk_idx, topk_weights = (
             dispatch_output.hidden_states,

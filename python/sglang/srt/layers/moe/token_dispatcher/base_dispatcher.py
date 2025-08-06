@@ -1,36 +1,54 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, TypeGuard, Union, runtime_checkable
 
 import torch
 
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher import (
+        DeepEPLLOutput,
+        DeepEPNormalOutput,
+        StandardDispatchOutput,
+    )
 
-class MoEA2ABackend(Enum):
-    none = "none"
-    deepep = "deepep"
 
-    def is_none(self):
-        return self == MoEA2ABackend.none
+@dataclass
+class DispatchChecker:
+    @staticmethod
+    def format_is_standard(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[StandardDispatchOutput]:
+        return dispatch_output.format == DispatchOutputFormat.standard
 
-    def is_deepep(self):
-        return self == MoEA2ABackend.deepep
+    @staticmethod
+    def format_is_deepep_normal(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[DeepEPNormalOutput]:
+        return dispatch_output.format == DispatchOutputFormat.deepep_normal
+
+    @staticmethod
+    def format_is_deepep_ll(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[DeepEPLLOutput]:
+        return dispatch_output.format == DispatchOutputFormat.deepep_ll
+
+    @staticmethod
+    def format_is_deepep(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[Union[DeepEPNormalOutput, DeepEPLLOutput]]:
+        return dispatch_output.format in [
+            DispatchOutputFormat.deepep_normal,
+            DispatchOutputFormat.deepep_ll,
+        ]
 
 
 class DispatchOutputFormat(Enum):
     standard = auto()
     deepep_normal = auto()
     deepep_ll = auto()
-
-    def is_standard(self) -> bool:
-        return self == DispatchOutputFormat.standard
-
-    def is_deepep_normal(self) -> bool:
-        return self == DispatchOutputFormat.deepep_normal
-
-    def is_deepep_ll(self) -> bool:
-        return self == DispatchOutputFormat.deepep_ll
 
 
 @runtime_checkable
