@@ -28,11 +28,16 @@ void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
 _allocator = None
 _mem_pool = None
 _registered_base_addrs = set()
+_registered_tensor_addrs = set()
 _graph_pool_id = None
 
 
 def is_symmetric_memory_enabled():
     return global_server_args_dict["enable_symm_mem"]
+
+
+def is_symmetric_memory_tensor(tensor: torch.Tensor):
+    return tensor.untyped_storage().data_ptr() in _registered_tensor_addrs
 
 
 def set_graph_pool_id(graph_pool_id):
@@ -64,7 +69,12 @@ def get_nccl_mem_pool():
 
 
 class use_symmetric_memory:
-    def __init__(self, group_coordinator: GroupCoordinator):
+    def __init__(
+        self,
+        group_coordinator: GroupCoordinator,
+        disabled: bool = False,
+        disable_war: bool = False,
+    ):
         if not is_symmetric_memory_enabled():
             self.group_coordinator = None
             self._mem_pool_ctx = None
@@ -77,9 +87,11 @@ class use_symmetric_memory:
             self.is_graph_capture = torch.cuda.is_current_stream_capturing()
             self.device = torch.cuda.current_device()
             self.pre_2_8_0 = version.parse(torch.__version__) < version.parse("2.8.0")
+        self.disabled = disabled
+        self.disable_war = disable_war
 
     def __enter__(self):
-        if not is_symmetric_memory_enabled():
+        if not is_symmetric_memory_enabled() or self.disabled:
             return self
         assert (
             self.group_coordinator.pynccl_comm is not None
@@ -102,18 +114,19 @@ class use_symmetric_memory:
         return self
 
     def tag(self, tensor: torch.Tensor):
-        if not is_symmetric_memory_enabled():
+        if not is_symmetric_memory_enabled() or self.disabled:
             return
-        tensor.symmetric_memory = True
+        global _registered_tensor_addrs
+        _registered_tensor_addrs.add(tensor.untyped_storage().data_ptr())
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not is_symmetric_memory_enabled():
+        if not is_symmetric_memory_enabled() or self.disabled:
             return
         global _registered_base_addrs
         self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)
         for segment in get_nccl_mem_pool().snapshot():
             if segment["address"] not in _registered_base_addrs:
-                if segment["stream"] == 0 and self.pre_2_8_0:
+                if segment["stream"] == 0 and self.pre_2_8_0 and not self.disable_war:
                     # PyTorch version < 2.8.0 has a multi-thread MemPool bug
                     # See https://github.com/pytorch/pytorch/issues/152861
                     # Fixed at https://github.com/pytorch/pytorch/commit/f01e628e3b31852983ab30b25bf251f557ba9c0b

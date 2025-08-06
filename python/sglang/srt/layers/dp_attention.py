@@ -298,7 +298,10 @@ def _dp_gather_via_all_gather(
     scattered_local_tokens = local_tokens.tensor_split(get_attention_tp_size())[
         get_attention_tp_rank()
     ]
-    get_attention_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
+    if get_attention_tp_size() > 1:
+        get_attention_tp_group().reduce_scatter_tensor(
+            scattered_local_tokens, local_tokens
+        )
     get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
 
 
@@ -364,7 +367,12 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
             get_tensor_model_parallel_world_size()
         )[get_tensor_model_parallel_rank()]
         get_tp_group().reduce_scatter_tensor(scattered_local_tokens, input)
-        get_attention_tp_group().all_gather_into_tensor(output, scattered_local_tokens)
+        if get_attention_tp_size() > 1:
+            get_attention_tp_group().all_gather_into_tensor(
+                output, scattered_local_tokens
+            )
+        else:
+            output[:] = scattered_local_tokens
 
 
 def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
