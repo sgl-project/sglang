@@ -15,7 +15,7 @@ import requests
 import torch
 import torch.distributed as dist
 
-from sglang.srt.utils import get_ip
+from sglang.srt.utils import get_ip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -94,8 +94,12 @@ class MetadataBuffers:
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
         self.custom_mem_pool = custom_mem_pool
-        device = "cuda" if self.custom_mem_pool else "cpu"
-
+        device = "cpu"
+        if is_npu():
+            # For ascend backend, output tokens are placed in the NPU and will be transferred by D2D channel.
+            device = "npu"
+        elif self.custom_mem_pool:
+            device = "cuda"
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -200,6 +204,7 @@ class MetadataBuffers:
 class TransferBackend(Enum):
     MOONCAKE = "mooncake"
     NIXL = "nixl"
+    ASCEND = "ascend"
     FAKE = "fake"
 
 
@@ -229,6 +234,23 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
             KVClassType.SENDER: MooncakeKVSender,
             KVClassType.RECEIVER: (MooncakeKVReceiver),
             KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
+        }
+        return class_mapping.get(class_type)
+    elif transfer_backend == TransferBackend.ASCEND:
+        from sglang.srt.disaggregation.ascend import (
+            AscendKVBootstrapServer,
+            AscendKVManager,
+            AscendKVReceiver,
+            AscendKVSender,
+        )
+        from sglang.srt.disaggregation.base import KVArgs
+
+        class_mapping = {
+            KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: AscendKVManager,
+            KVClassType.SENDER: AscendKVSender,
+            KVClassType.RECEIVER: (AscendKVReceiver),
+            KVClassType.BOOTSTRAP_SERVER: AscendKVBootstrapServer,
         }
         return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.NIXL:

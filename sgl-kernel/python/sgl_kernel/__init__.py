@@ -31,6 +31,10 @@ from sgl_kernel.elementwise import (
     silu_and_mul,
 )
 from sgl_kernel.fused_moe import fused_marlin_moe
+
+if torch.version.hip is not None:
+    from sgl_kernel.elementwise import gelu_quick
+
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
@@ -81,6 +85,7 @@ from sgl_kernel.sampling import (
     top_p_renorm_prob,
     top_p_sampling_from_probs,
 )
+from sgl_kernel.spatial import create_greenctx_stream_by_value, get_sm_available
 from sgl_kernel.speculative import (
     build_tree_kernel_efficient,
     segment_packbits,

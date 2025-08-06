@@ -3,7 +3,6 @@ Unit tests for Jinja chat template utils.
 """
 
 import unittest
-from unittest.mock import patch
 
 from sglang.srt.jinja_template_utils import (
     detect_jinja_template_content_format,
@@ -76,16 +75,17 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         }
 
         image_data = []
+        video_data = []
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
-            msg_dict, "openai", image_data, audio_data, modalities
+            msg_dict, "openai", image_data, video_data, audio_data, modalities
         )
 
         # Check that image_data was extracted
         self.assertEqual(len(image_data), 1)
-        self.assertEqual(image_data[0], "http://example.com/image.jpg")
+        self.assertEqual(image_data[0].url, "http://example.com/image.jpg")
 
         # Check that content was normalized
         expected_content = [
@@ -111,11 +111,12 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         }
 
         image_data = []
+        video_data = []
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
-            msg_dict, "string", image_data, audio_data, modalities
+            msg_dict, "string", image_data, video_data, audio_data, modalities
         )
 
         # For string format, should flatten to text only
@@ -139,11 +140,12 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         }
 
         image_data = []
+        video_data = []
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
-            msg_dict, "openai", image_data, audio_data, modalities
+            msg_dict, "openai", image_data, video_data, audio_data, modalities
         )
 
         # Check that audio_data was extracted
@@ -162,11 +164,12 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         msg_dict = {"role": "user", "content": "Hello world"}
 
         image_data = []
+        video_data = []
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
-            msg_dict, "openai", image_data, audio_data, modalities
+            msg_dict, "openai", image_data, video_data, audio_data, modalities
         )
 
         # Should pass through unchanged
@@ -188,11 +191,12 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         }
 
         image_data = []
+        video_data = []
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
-            msg_dict, "openai", image_data, audio_data, modalities
+            msg_dict, "openai", image_data, video_data, audio_data, modalities
         )
 
         # Check that modalities was extracted
@@ -209,11 +213,12 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         }
 
         image_data = []
+        video_data = []
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
-            msg_dict, "string", image_data, audio_data, modalities
+            msg_dict, "string", image_data, video_data, audio_data, modalities
         )
 
         # None values should be filtered out

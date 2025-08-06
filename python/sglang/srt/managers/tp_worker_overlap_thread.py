@@ -58,13 +58,14 @@ class TpModelWorkerClient:
         server_args: ServerArgs,
         gpu_id: int,
         tp_rank: int,
+        moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
     ):
         # Load the model
         self.worker = TpModelWorker(
-            server_args, gpu_id, tp_rank, pp_rank, dp_rank, nccl_port
+            server_args, gpu_id, tp_rank, moe_ep_rank, pp_rank, dp_rank, nccl_port
         )
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
@@ -101,6 +102,17 @@ class TpModelWorkerClient:
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
+
+    def get_tokens_per_layer_info(self):
+        return self.worker.get_tokens_per_layer_info()
+
+    @property
+    def sliding_window_size(self) -> Optional[int]:
+        return self.worker.sliding_window_size
+
+    @property
+    def is_hybrid(self) -> bool:
+        return self.worker.is_hybrid
 
     def get_pad_input_ids_func(self):
         return self.worker.get_pad_input_ids_func()
