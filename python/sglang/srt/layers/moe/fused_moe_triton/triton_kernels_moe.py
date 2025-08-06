@@ -69,7 +69,10 @@ def triton_kernel_moe_forward(
     block_shape: Optional[list[int]] = None,
 ) -> torch.Tensor:
 
-    assert topk_output.format.is_triton_kernel()
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+    assert TopKOutputChecker.format_is_triton_kernel(topk_output)
+
     routing_data, gather_idx, scatter_idx = topk_output
 
     return triton_kernel_fused_experts(
