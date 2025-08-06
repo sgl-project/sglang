@@ -29,6 +29,7 @@ runtime_common = [
     "modelscope",
     "msgspec",
     "ninja",
+    "openai-harmony==0.0.3",
     "orjson",
     "outlines==0.1.11",
     "packaging",
@@ -96,7 +97,7 @@ srt_cpu = ["sglang[runtime_common]", "einops"]
 # https://vllm-ascend.readthedocs.io/en/latest/installation.html
 srt_npu = ["sglang[runtime_common]"]
 
-openai = ["openai>=1.0", "tiktoken"]
+openai = ["openai>=1.99.1", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
 torch_memory_saver = ["torch_memory_saver>=0.0.8"]
