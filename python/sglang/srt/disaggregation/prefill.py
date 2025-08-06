@@ -635,7 +635,7 @@ class SchedulerDisaggregationPrefillMixin:
         Stage i                        | Stage i+1
         send ith req                   | recv ith req
         send ith bootstrap req         | recv ith bootstrap req
-        send ith transfered req        | recv ith transfered req
+        send ith transferred req       | recv ith transferred req
         send ith proxy                 | recv ith proxy
         send prev (i+1)th carry        | recv prev (i+1)th carry
         send prev (i+1)th release req  | recv prev (i+1)th release req
@@ -648,7 +648,7 @@ class SchedulerDisaggregationPrefillMixin:
             b. The first stage polls the status and propagates the bootstrapped requests down to all other stages.
             c. If the first stage polls successfully, by nature, other ranks are also successful because they performed a handshake together.
 
-        2. Transfered Requests + Release Requests:
+        2. Transferred Requests + Release Requests:
             a. The first stage polls the transfer finished requests, performs an intersection with the next stage's finished requests, and propagates down to the last stage.
             b. The last stage receives the requests that have finished transfer on all stages (consensus), then sends them to the first stage to release the memory.
             c. The first stage receives the release requests, releases the memory, and then propagates the release requests down to the last stage.
@@ -696,7 +696,7 @@ class SchedulerDisaggregationPrefillMixin:
                     ]
                     self.waiting_queue.extend(bootstrapped_reqs)
                 else:
-                    # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the concensus
+                    # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
                     bootstrapped_rids = self.recv_pyobj_from_prev_stage()
                     bootstrapped_reqs = (
                         self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
@@ -713,7 +713,7 @@ class SchedulerDisaggregationPrefillMixin:
                     prev_transferred_rids = self.recv_pyobj_from_prev_stage()
                     # 2. get the current stage's transferred reqs info
                     curr_transferred_rids = self.get_transferred_rids()
-                    # 3. new concensus rids = intersection(previous concensus rids, transfer finished rids)
+                    # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
                     transferred_rids = list(
                         set(prev_transferred_rids) & set(curr_transferred_rids)
                     )
@@ -749,7 +749,7 @@ class SchedulerDisaggregationPrefillMixin:
 
                 if ENABLE_RELEASE:
                     if self.pp_group.is_last_rank:
-                        # At the last stage, all stages has reached the concensus to release memory for transferred_rids
+                        # At the last stage, all stages has reached the consensus to release memory for transferred_rids
                         release_rids = transferred_rids
                         # send to the first rank
                         self.send_pyobj_to_next_stage(release_rids)
@@ -783,7 +783,7 @@ class SchedulerDisaggregationPrefillMixin:
 
                 if ENABLE_RELEASE:
                     if tmbs[next_mb_id] is not None:
-                        # recv concensus rids from the previous rank
+                        # recv consensus rids from the previous rank
                         next_release_rids = self.recv_pyobj_from_prev_stage()
                         self.process_disagg_prefill_inflight_queue(next_release_rids)
 
