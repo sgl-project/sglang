@@ -512,6 +512,21 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         image_embeds = torch.split(image_embeds, split_sizes)
         return torch.cat(image_embeds)
 
+    def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        pixel_values = torch.cat(
+            [item.feature.squeeze(0) for item in items], dim=0
+        ).type(self.visual.dtype)
+        video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
+        # For multi-image, pixel_values is [num_of_images, L, C] shape
+        # assert pixel_values.dim() == 2, pixel_values.dim()
+        assert video_grid_thw.dim() == 2, video_grid_thw.dim()
+        video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
+        split_sizes = (
+            video_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
+        ).tolist()
+        video_embeds = torch.split(video_embeds, split_sizes)
+        return torch.cat(video_embeds)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

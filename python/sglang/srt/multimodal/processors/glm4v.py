@@ -50,7 +50,8 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             video_token_id=self.VIDEO_TOKEN_ID,
         ).build(_processor)
 
-    def preprocess_video(self, vr: VideoReader):
+    # adapted from https://github.com/huggingface/transformers/blob/369c99d0cea403b77bd0aef818527106453fd9fc/src/transformers/video_utils.py#L312
+    async def preprocess_video(self, vr: VideoReader):
         """
         Preprocess video using VideoReader from Decord backend.
 
@@ -93,71 +94,28 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        # videos_processed = []
-        # video_outputs = {}
-        # if base_output.videos:
-        #     # devide the base output into image_base_output and video_base_output
-        #     video_base_output = BaseMultiModalProcessorOutput(
-        #         input_text="<|begin_of_video|><|video|><|end_of_video|>",
-        #         videos=base_output.videos,
-        #     )
-        #     base_output.videos = []
+        video_metadata = None
 
-        #     # Process videos standalone first
-        #     video_grid_thw_lst = []
-
-        #     for video_vr in video_base_output.videos:
-        #         # Process individual video
-        #         frames, metadata = self.preprocess_video(video_vr)
-
-        #         video_base_output.videos = [[frames]]
-
-        #         video_mm_items, video_input_ids, video_ret = self.process_and_combine_mm_data(
-        #             video_base_output, self.mm_tokens, video_metadata=[[metadata]]
-        #         )
-
-        #         # # Replace image token IDs with video token IDs in the processed video
-        #         # video_input_ids[video_input_ids == self.mm_tokens.image_token_id] = self.mm_tokens.video_token_id
-        #         # # Get video placeholder text
-        #         # video_placeholder = self._processor.tokenizer.batch_decode(video_input_ids.unsqueeze(0))[0]
-
-        #         # # Replace first remaining video token with the processed placeholder
-        #         # input_text = input_text.replace(
-        #         #     "<|begin_of_video|><|video|><|end_of_video|>",
-        #         #     video_placeholder,
-        #         #     1  # Replace first occurrence (next unprocessed video)
-        #         # )
-
-        #         # Collect video grid info
-        #         if hasattr(video_ret, "video_grid_thw") and video_ret.video_grid_thw is not None:
-        #             grid_t = len(video_ret.video_grid_thw)
-        #             _, grid_h, grid_w = video_ret.video_grid_thw[0]
-        #             grid_thw = torch.tensor([[grid_t, grid_h, grid_w]])
-        #             video_grid_thw_lst.append(grid_thw)
-
-        #         videos_processed.append(video_mm_items)
-
-        #     # Combine video outputs
-        #     if video_grid_thw_lst:
-        #         video_outputs["video_grid_thw"] = torch.cat(video_grid_thw_lst)
-
-        #     base_output.input_text = input_text
+        if base_output.videos:
+            videos_processed = [ 
+                await self.preprocess_video(video) for video in base_output.videos
+            ]
+            base_output.videos, video_metadata = map(list, zip(*videos_processed))
+            # transformer requires the video inputs to be under this format
+            base_output.videos = [base_output.videos]
+            video_metadata = [video_metadata]
 
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
+            base_output, self.mm_tokens, video_metadata=video_metadata
         )
-
-        # # Combine video items with image items
-        # if videos_processed:
-        #     for video_items in videos_processed:
-        #         mm_items.extend(video_items)
 
         input_ids = input_ids.flatten()
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
-            input_ids=input_ids,
+            input_ids=input_ids.unsqueeze(0),
             hf_config=self.hf_config,
             image_grid_thw=getattr(ret, "image_grid_thw", None),
             video_grid_thw=getattr(ret, "video_grid_thw", None),
+            attention_mask=getattr(ret, "attention_mask", None),
         )
         mrope_positions = mrope_positions.squeeze(1)
 
