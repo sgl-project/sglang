@@ -55,6 +55,17 @@ pip install -e "python[all_hip]"
 Note: Please refer to [the CPU environment setup command list](../references/cpu.md#install-from-source)
 to set up the SGLang environment for running the models with CPU servers.
 
+Note: For Ascend NPUs, do the following instead, and more info can be found [here](../references/ascend_npu.md#installing-sglang-from-source)
+
+```bash
+# Use the last release branch
+git clone -b v0.4.10.post2 https://github.com/sgl-project/sglang.git
+cd sglang
+
+pip install --upgrade pip
+pip install -e "python[srt_npu]"
+```
+
 ## Method 3: Using docker
 
 The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
