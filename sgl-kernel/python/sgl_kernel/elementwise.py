@@ -81,6 +81,121 @@ def fused_add_rmsnorm(
         input, residual, weight, eps, enable_pdl
     )
 
+def fused_rmsnorm_quant(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    weight: torch.Tensor,
+    group_size: int,
+    quant_eps: float,
+    fp8_min: float,
+    fp8_max: float,
+    scale_ue8m0: bool,
+    rms_eps: float = 1e-6,
+    enable_pdl: Optional[bool] = None,
+) -> None:
+    r"""Fused RMS normalization and quantization.
+
+    Step 1:
+    ``normalized[i] = (input[i] / RMS(input)) * weight[i]``
+
+    Step 2:
+    ``output_q[i] = quantize(normalized[i])``
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape (batch_size, hidden_size).
+    output_q: torch.Tensor
+        Quantized output tensor.
+    output_s: torch.Tensor
+        Scale tensor for quantization.
+    weight: torch.Tensor
+        Weight tensor, shape (hidden_size,).
+    group_size: int
+        Group size for quantization.
+    quant_eps: float
+        Epsilon for quantization.
+    fp8_min: float
+        Minimum value for FP8 quantization.
+    fp8_max: float
+        Maximum value for FP8 quantization.
+    scale_ue8m0: bool
+        Whether to use UE8M0 scale format.
+    rms_eps: float
+        Epsilon for RMS normalization numerical stability.
+    enable_pdl: Optional[bool]
+        Whether to enable `programmatic dependent launch
+        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        If None, will be automatically enabled on Hopper architecture.
+    """
+    if enable_pdl is None:
+        enable_pdl = is_hopper_arch()
+    torch.ops.sgl_kernel.fused_rmsnorm_quant.default(
+            input, output_q, output_s, weight, group_size, rms_eps, quant_eps, fp8_min, fp8_max, scale_ue8m0, enable_pdl
+    )
+
+
+def fused_add_rmsnorm_quant(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    weight: torch.Tensor,
+    group_size: int,
+    quant_eps: float,
+    fp8_min: float,
+    fp8_max: float,
+    scale_ue8m0: bool,
+    rms_eps: float = 1e-6,
+    enable_pdl: Optional[bool] = None,
+) -> None:
+    r"""Fused add, RMS normalization and quantization.
+
+    Step 1:
+    ``residual[i] += input[i]``
+
+    Step 2:
+    ``normalized[i] = (residual[i] / RMS(residual)) * weight[i]``
+
+    Step 3:
+    ``output_q[i] = quantize(normalized[i])``
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape (batch_size, hidden_size).
+    residual: torch.Tensor
+        Residual tensor, shape (batch_size, hidden_size).
+    output_q: torch.Tensor
+        Quantized output tensor.
+    output_s: torch.Tensor
+        Scale tensor for quantization.
+    weight: torch.Tensor
+        Weight tensor, shape (hidden_size,).
+    group_size: int
+        Group size for quantization.
+    quant_eps: float
+        Epsilon for quantization.
+    fp8_min: float
+        Minimum value for FP8 quantization.
+    fp8_max: float
+        Maximum value for FP8 quantization.
+    scale_ue8m0: bool
+        Whether to use UE8M0 scale format.
+    rms_eps: float
+        Epsilon for RMS normalization numerical stability.
+    enable_pdl: Optional[bool]
+        Whether to enable `programmatic dependent launch
+        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        If None, will be automatically enabled on Hopper architecture.
+    """
+    if enable_pdl is None:
+        enable_pdl = is_hopper_arch()
+    torch.ops.sgl_kernel.fused_add_rmsnorm_quant.default(
+            input, residual, output_q, output_s, weight, group_size, rms_eps, quant_eps, fp8_min, fp8_max, scale_ue8m0, enable_pdl
+    )
+
 
 def gemma_rmsnorm(
     input: torch.Tensor,

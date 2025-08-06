@@ -228,6 +228,8 @@ set(SOURCES
     "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
+    "csrc/elementwise/fused_rms_norm_quant.cu"
+    "csrc/elementwise/fused_add_rms_norm_quant.cu"
     "csrc/elementwise/rope.cu"
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"

@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
+from sglang.srt.layers.quantization.fp8_kernel import fp8_max, fp8_min, fp8_dtype, create_per_token_group_quant_fp8_output_scale
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -39,6 +40,8 @@ _is_cpu = is_cpu()
 if _is_cuda:
     from sgl_kernel import (
         fused_add_rmsnorm,
+        fused_rmsnorm_quant,
+        fused_add_rmsnorm_quant,
         gemma_fused_add_rmsnorm,
         gemma_rmsnorm,
         rmsnorm,
@@ -62,14 +65,35 @@ class RMSNorm(CustomOp):
         hidden_size: int,
         eps: float = 1e-6,
         var_hidden_size: Optional[int] = None,
+        output_quant: bool = False,
+        group_size: Optional[int] = None,
+        column_major_scales: bool = False,
+        scale_tma_aligned: bool = False,
+        scale_ue8m0: bool = False,
+        quant_eps: float = 1e-10
     ) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.weight = nn.Parameter(torch.randn(hidden_size))
+        # self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
         self.hidden_size = hidden_size
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
+
+        self.output_quant = output_quant if _is_cuda else False
+        if self.output_quant:
+            assert self.variance_size_override is not None, "variance size override not implemented for outputting quants"
+            assert group_size is not None, "To output quants in RMS norm we need group size set"
+            assert hidden_size % group_size == 0, f"Hidden size must be a multiple of group size got {hidden_size=} {group_size=}"
+            self.group_size = group_size
+        self.column_major_scales = column_major_scales
+        self.scale_tma_aligned = scale_tma_aligned
+        self.scale_ue8m0 = scale_ue8m0
+        if self.scale_ue8m0:
+            assert self.column_major_scales and self.scale_tma_aligned
+        self.quant_eps = quant_eps
+
         if _use_aiter:
             self._forward_method = self.forward_aiter
 
@@ -80,11 +104,27 @@ class RMSNorm(CustomOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
-        if residual is not None:
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
-            return x, residual
-        out = rmsnorm(x, self.weight.data, self.variance_epsilon)
-        return out
+        if self.output_quant:
+            q = torch.empty_like(x, dtype=fp8_dtype)
+            s = create_per_token_group_quant_fp8_output_scale(x.shape,
+                                                              x.device,
+                                                     self.group_size,
+                                                     self.column_major_scales,
+                                                     self.scale_tma_aligned,
+                                                     self.scale_ue8m0)
+            if residual is not None:
+                fused_add_rmsnorm_quant(x, residual, q, s, self.weight, self.group_size, self.quant_eps,
+                                fp8_min, fp8_max, slf.scale_ue8m0, rms_eps=self.variance_epsilon)
+                return (q, s), residual
+            fused_rmsnorm_quant(x, q, s, self.weight, self.group_size, self.quant_eps,
+                                fp8_min, fp8_max, self.scale_ue8m0, rms_eps=self.variance_epsilon)
+            return (q, s)
+        else:
+            if residual is not None:
+                fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+                return x, residual
+            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            return out
 
     def forward_npu(
         self,
