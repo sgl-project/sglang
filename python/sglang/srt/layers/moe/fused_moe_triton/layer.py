@@ -389,7 +389,7 @@ class FusedMoE(torch.nn.Module):
         # Narrow parameter and load.
         if is_bias:
             # this expert_data is a bias, not weight,
-            # for w2_bias in TP, it does not need to be sharded
+            # for w2_weight_bias in TP, it does not need to be sharded
             shard_size = expert_data.shape[-1]
         else:
             # this parameter is a weight matrix
@@ -410,10 +410,6 @@ class FusedMoE(torch.nn.Module):
             if not is_bias and not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
-                if shard_size * tp_rank + shard_size > loaded_weight.shape[shard_dim]:
-                    raise ValueError(
-                        f"Shard size {shard_size} at rank {tp_rank} exceeds loaded_weight dimension {loaded_weight.shape[shard_dim]}"
-                    )
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )
@@ -461,8 +457,24 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.Tensor,
         weight_name: str,
         shard_id: str,
-        expert_id: int,
+        expert_id: Optional[int],
     ) -> None:
+
+        # if expert_id is None, then
+        # all the experts are loaded at the same time
+        if (
+            not expert_id
+            and self.quant_config is not None
+            and self.quant_config.get_name() == "mxfp4"
+        ):
+            if "bias" in weight_name:
+                dim1 = loaded_weight.shape[1]
+                param.data[:, :dim1].copy_(loaded_weight)
+            else:
+                dim1 = loaded_weight.shape[1]
+                dim2 = loaded_weight.shape[2]
+                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+            return
 
         global_expert_location_metadata = get_global_expert_location_metadata()
         if global_expert_location_metadata is None:
@@ -502,6 +514,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
         if expert_id == -1:
             return
@@ -705,6 +718,18 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         tp_rank = self.moe_tp_rank
 
+        if self.quant_config is not None and self.quant_config.get_name() == "mxfp4":
+            if "bias" in weight_name:
+                dim1 = loaded_weight.shape[1]
+                param.data[:, :dim1].copy_(loaded_weight)
+            elif "scale" in weight_name:
+                param.data.copy_(loaded_weight)
+            else:
+                dim1 = loaded_weight.shape[1]
+                dim2 = loaded_weight.shape[2]
+                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+            return
+
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO: check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
@@ -852,6 +877,33 @@ class FusedMoE(torch.nn.Module):
             ),
             ("experts.w2_weight", f"experts.{ckpt_down_proj_name}", "w2"),
             ("experts.w2_weight_bias", f"experts.{ckpt_down_proj_bias_name}", "w2"),
+        ]
+
+    @classmethod
+    def make_expert_params_mapping_fused_mxfp4(
+        cls,
+        ckpt_gate_up_proj_name: str,
+        ckpt_down_proj_name: str,
+        ckpt_gate_up_proj_bias_name: str,
+        ckpt_down_proj_bias_name: str,
+        ckpt_gate_up_proj_scale_name: str,
+        ckpt_down_proj_scale_name: str,
+    ):
+        return [
+            ("experts.w13_weight", f"experts.{ckpt_gate_up_proj_name}", "w13"),
+            (
+                "experts.w13_weight_bias",
+                f"experts.{ckpt_gate_up_proj_bias_name}",
+                "w13",
+            ),
+            ("experts.w2_weight", f"experts.{ckpt_down_proj_name}", "w2"),
+            ("experts.w2_weight_bias", f"experts.{ckpt_down_proj_bias_name}", "w2"),
+            (
+                "experts.w13_weight_scale",
+                f"experts.{ckpt_gate_up_proj_scale_name}",
+                "w13",
+            ),
+            ("experts.w2_weight_scale", f"experts.{ckpt_down_proj_scale_name}", "w2"),
         ]
 
     @classmethod
