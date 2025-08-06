@@ -235,7 +235,7 @@ class HiPAttentionBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
-        sk: int = None,
+        sk: Optional[torch.Tensor] = None,
     ):
         cache_loc = (
             forward_batch.out_cache_loc
@@ -598,7 +598,7 @@ class HiPAttentionBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
-        sk: Optional[int] = None,
+        sk: Optional[torch.Tensor] = None,
     ):
         cache_loc = (
             forward_batch.out_cache_loc
