@@ -181,7 +181,7 @@ class ForwardBatch:
     seq_lens_sum: int
 
     # The original sequence length without being chunked. Qwen-1M related.
-    orig_seq_lens: torch.Tensor
+    orig_seq_lens: Optional[torch.Tensor] = None
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
