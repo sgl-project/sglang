@@ -48,7 +48,7 @@ conda activate sglang_npu
 
 #### MemFabric Adaptor
 
-_TODO: MemFabric is still a working project yet open sourced til August/September. We will release it as prebuilt wheel packge for now._
+_TODO: MemFabric is still a working project yet open sourced til August/September, 2025. We will release it as prebuilt wheel packge for now._
 
 _Notice: Prebuilt wheel packge is based on `aarch64`, please leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) to let us know the requests for `amd64` build._
 
@@ -57,24 +57,25 @@ MemFabric Adaptor is a drop-in replacement of Mooncake Transfer Engine that enab
 ```shell
 MF_WHL_NAME="mf_adapter-1.0.0-cp311-cp311-linux_aarch64.whl"
 MEMFABRIC_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/${MF_WHL_NAME}"
-wget "${MEMFABRIC_URL}" && pip install "./${MF_WHL_NAME}"
+wget -O "${MF_WHL_NAME}" "${MEMFABRIC_URL}" && pip install "./${MF_WHL_NAME}"
 ```
 
 #### Pytorch and Pytorch Framework Adaptor on Ascend
 
-Only `torch==2.6.0` is supported currently due to NPUgraph and Triton-on-Ascend's limitation, however a more generalized version will be release til end of September.
+Only `torch==2.6.0` is supported currently due to NPUgraph and Triton-on-Ascend's limitation, however a more generalized version will be release by the end of September, 2025.
 
 ```shell
 PYTORCH_VERSION=2.6.0
 TORCHVISION_VERSION=0.21.0
-PTA_VERSION=2.6.0
 pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
+
+PTA_VERSION=2.6.0
 pip install torch_npu==$PTA_VERSION
 ```
 
 #### vLLM
 
-vLLM is still a major prerequisite on Ascend NPU, removing the dependency is on the way. Because of `torch==2.6.0` limitation, only vLLM v0.8.5 is supported.
+vLLM is still a major prerequisite on Ascend NPU. Because of `torch==2.6.0` limitation, only vLLM v0.8.5 is supported.
 
 ```shell
 VLLM_TAG=v0.8.5
@@ -84,15 +85,11 @@ git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG
 
 #### Triton on Ascend
 
-```shell
-TRITON_ASCEND_VERSION=3.2.0rc2
-pip install attrs==24.2.0 numpy==1.26.4 scipy==1.13.1 decorator==5.1.1 psutil==6.0.0 pytest==8.3.2 pytest-xdist==3.6.1 pyyaml pybind11
-pip install triton-ascend==$TRITON_ASCEND_VERSION
-```
+Please follow Triton-on-Ascend's [installation guide](https://gitee.com/ascend/triton-ascend) to install the latest `triton-ascend` package.
 
 #### DeepEP-compatible Library
 
-We are also providing a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the installation guide [here](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
+We are also providing a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
 
 #### Installing SGLang from source
 
@@ -108,6 +105,8 @@ pip install -e python[srt_npu]
 ### Method 2: Using docker
 
 __Notice:__ `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
+
+__Notice:__ The following docker command is based on Atlas A3 machines. If you are using A2, make sure only `davinci[0-7]` are mapped into container.
 
 ```shell
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
@@ -158,9 +157,9 @@ drun v0.4.10.post2-cann8.2.rc1.alpha003-a3 \
 
 Decode:
 ```
-export HCCL_BUFFSIZE=200
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
+export HCCL_BUFFSIZE=200
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=24
 
 drun v0.4.10.post2-cann8.2.rc1.alpha003-a3 \

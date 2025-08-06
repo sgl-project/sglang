@@ -37,6 +37,17 @@ pip install -e "python[all]"
 - If you want to develop SGLang, it is recommended to use docker. Please refer to [setup docker container](../developer_guide/development_guide_using_docker.md#setup-docker-container). The docker image is `lmsysorg/sglang:dev`.
 - SGLang currently uses torch 2.8 and flashinfer for torch 2.8. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html). Please note that the FlashInfer pypi package is called `flashinfer-python` instead of `flashinfer`.
 
+Note: For Ascend NPUs, do the following instead, and more info can be found [here](../references/ascend_npu.md#installing-sglang-from-source)
+
+```bash
+# Use the last release branch
+git clone -b v0.4.10.post2 https://github.com/sgl-project/sglang.git
+cd sglang
+
+pip install --upgrade pip
+pip install -e "python[srt_npu]"
+```
+
 ## Method 3: Using docker
 
 The docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
