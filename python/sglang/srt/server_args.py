@@ -229,6 +229,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
+    tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     torchao_config: str = ""
@@ -441,6 +442,28 @@ class ServerArgs:
                     "trtllm_mla backend does not support speculative decoding yet."
                 )
 
+        if self.attention_backend == "trtllm_mha":
+            if not is_sm100_supported():
+                raise ValueError(
+                    "TRTLLM MHA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
+                )
+
+            if self.page_size not in [16, 32, 64]:
+                logger.warning(
+                    f"TensorRT-LLM MHA only supports page_size of 16, 32 or 64, changing page_size from {self.page_size} to 64."
+                )
+                self.page_size = 64
+
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "trtllm_mla backend does not support speculative decoding yet."
+                )
+        model_arch = self.get_hf_config().architectures[0]
+        if model_arch in ["GptOssForCausalLM"]:
+            self.attention_backend = "triton"
+            self.enable_triton_kernel_moe = True
+            self.disable_hybrid_swa_memory = True
+
         # Set page size
         if self.page_size is None:
             self.page_size = 1
@@ -480,6 +503,13 @@ class ServerArgs:
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+
+        if self.enable_flashinfer_trtllm_moe:
+            if not self.disable_shared_experts_fusion:
+                self.disable_shared_experts_fusion = True
+                logger.warning(
+                    "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+                )
 
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":
@@ -806,6 +836,7 @@ class ServerArgs:
                 "moe_wna16",
                 "qoq",
                 "w4afp8",
+                "mxfp4",
             ],
             help="The quantization method.",
         )
@@ -1267,6 +1298,7 @@ class ServerArgs:
                 "ascend",
                 "triton",
                 "trtllm_mla",
+                "trtllm_mha",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
@@ -1659,6 +1691,12 @@ class ServerArgs:
             help="Enabling two micro batches to overlap.",
         )
         parser.add_argument(
+            "--tbo-token-distribution-threshold",
+            type=float,
+            default=ServerArgs.tbo_token_distribution_threshold,
+            help="The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap.",
+        )
+        parser.add_argument(
             "--enable-torch-compile",
             action="store_true",
             help="Optimize the model with torch.compile. Experimental feature.",
@@ -1936,10 +1974,16 @@ class ServerArgs:
         if "Llama4" in model_arch:
             assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
 
-        if "Gemma2ForCausalLM" in model_arch:
+        if model_arch in [
+            "Gemma2ForCausalLM",
+            "Gemma3nForCausalLM",
+            "Gemma3nForConditionalGeneration",
+        ]:
             # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
             # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
-            logger.warning("Disable hybrid SWA memory for Gemma2ForCausalLM.")
+            logger.warning(
+                f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
+            )
             self.disable_hybrid_swa_memory = True
 
         # Check LoRA
