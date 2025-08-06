@@ -68,6 +68,7 @@ def run_eval(args):
         max_tokens=2048,
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
     )
 
     # Run eval
@@ -121,6 +122,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--reasoning-effort", type=str)
     args = parser.parse_args()
 
     run_eval(args)
