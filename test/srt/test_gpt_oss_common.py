@@ -43,6 +43,8 @@ class BaseTestGptOss(CustomTestCase):
         )
 
         try:
+            # run multiple tests in parallel since we are mostly bound by the longest generate sequence
+            # instead of the number of questions
             with ThreadPoolExecutor(max_workers=4) as executor:
                 list(
                     executor.map(
