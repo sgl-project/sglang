@@ -17,7 +17,7 @@ from enum import Enum, auto
 from functools import partial
 from typing import Dict, Optional
 
-import torch.distributed
+import torch
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,

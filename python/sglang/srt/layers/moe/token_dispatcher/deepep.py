@@ -54,7 +54,7 @@ class DeepEPNormalOutput(NamedTuple):
 
     @property
     def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.deepep_normal
+        return DispatchOutputFormat.DEEPEP_NORMAL
 
 
 class DeepEPLLOutput(NamedTuple):
@@ -68,7 +68,7 @@ class DeepEPLLOutput(NamedTuple):
 
     @property
     def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.deepep_ll
+        return DispatchOutputFormat.DEEPEP_LL
 
 
 assert isinstance(DeepEPNormalOutput, DispatchOutput)

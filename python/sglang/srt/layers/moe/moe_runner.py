@@ -1,4 +1,5 @@
 import importlib.util
+import logging
 from functools import lru_cache
 from typing import Optional
 
@@ -6,9 +7,12 @@ from packaging import version as pkg_version
 
 from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend, MoeGroupedGemmBackend
 
-MOE_A2A_BACKEND: MoeA2ABackend = MoeA2ABackend(None)
-MOE_GROUPED_GEMM_BACKEND: MoeGroupedGemmBackend = MoeGroupedGemmBackend("triton")
-DEEPEP_MODE: DeepEPMode = DeepEPMode("auto")
+logger = logging.getLogger(__name__)
+
+
+MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
+MOE_GROUPED_GEMM_BACKEND: Optional[MoeGroupedGemmBackend] = None
+DEEPEP_MODE: Optional[DeepEPMode] = None
 
 
 def initialize_moe_runner(
@@ -26,14 +30,28 @@ def initialize_moe_runner(
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
+    global MOE_A2A_BACKEND
+    if MOE_A2A_BACKEND is None:
+        logger.warning("MOE_A2A_BACKEND is not initialized, using default backend")
+        MOE_A2A_BACKEND = MoeA2ABackend(None)
     return MOE_A2A_BACKEND
 
 
 def get_moe_grouped_gemm_backend() -> MoeGroupedGemmBackend:
+    global MOE_GROUPED_GEMM_BACKEND
+    if MOE_GROUPED_GEMM_BACKEND is None:
+        logger.warning(
+            "MOE_GROUPED_GEMM_BACKEND is not initialized, using default backend"
+        )
+        MOE_GROUPED_GEMM_BACKEND = MoeGroupedGemmBackend("triton")
     return MOE_GROUPED_GEMM_BACKEND
 
 
 def get_deepep_mode() -> DeepEPMode:
+    global DEEPEP_MODE
+    if DEEPEP_MODE is None:
+        logger.warning("DEEPEP_MODE is not initialized, using default mode")
+        DEEPEP_MODE = DeepEPMode("auto")
     return DEEPEP_MODE
 
 

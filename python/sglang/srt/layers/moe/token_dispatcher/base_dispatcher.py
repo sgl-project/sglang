@@ -21,34 +21,34 @@ class DispatchOutputChecker:
     def format_is_standard(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[StandardDispatchOutput]:
-        return dispatch_output.format == DispatchOutputFormat.standard
+        return dispatch_output.format == DispatchOutputFormat.STANDARD
 
     @staticmethod
     def format_is_deepep_normal(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[DeepEPNormalOutput]:
-        return dispatch_output.format == DispatchOutputFormat.deepep_normal
+        return dispatch_output.format == DispatchOutputFormat.DEEPEP_NORMAL
 
     @staticmethod
     def format_is_deepep_ll(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[DeepEPLLOutput]:
-        return dispatch_output.format == DispatchOutputFormat.deepep_ll
+        return dispatch_output.format == DispatchOutputFormat.DEEPEP_LL
 
     @staticmethod
     def format_is_deepep(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[Union[DeepEPNormalOutput, DeepEPLLOutput]]:
         return dispatch_output.format in [
-            DispatchOutputFormat.deepep_normal,
-            DispatchOutputFormat.deepep_ll,
+            DispatchOutputFormat.DEEPEP_NORMAL,
+            DispatchOutputFormat.DEEPEP_LL,
         ]
 
 
 class DispatchOutputFormat(Enum):
-    standard = auto()
-    deepep_normal = auto()
-    deepep_ll = auto()
+    STANDARD = auto()
+    DEEPEP_NORMAL = auto()
+    DEEPEP_LL = auto()
 
 
 @runtime_checkable
