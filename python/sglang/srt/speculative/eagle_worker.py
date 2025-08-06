@@ -179,7 +179,12 @@ class EAGLEWorker(TpModelWorker):
         self.has_prefill_wrapper_verify = False
         self.draft_extend_attn_backend = None
 
-        if self.server_args.attention_backend == "flashinfer":
+        draft_attention_backend = self.server_args.draft_attention_backend
+        if draft_attention_backend is None:
+            # If it is set to none, it is by default the same as target model attention backend
+            draft_attention_backend = self.server_args.attention_backend
+
+        if draft_attention_backend == "flashinfer":
             if not global_server_args_dict["use_mla_backend"]:
                 from sglang.srt.layers.attention.flashinfer_backend import (
                     FlashInferAttnBackend,
@@ -211,7 +216,7 @@ class EAGLEWorker(TpModelWorker):
                     skip_prefill=False,
                 )
             self.has_prefill_wrapper_verify = True
-        elif self.server_args.attention_backend == "triton":
+        elif draft_attention_backend == "triton":
             from sglang.srt.layers.attention.triton_backend import (
                 TritonAttnBackend,
                 TritonMultiStepDraftBackend,
@@ -226,7 +231,7 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner,
                 skip_prefill=False,
             )
-        elif self.server_args.attention_backend == "fa3":
+        elif draft_attention_backend == "fa3":
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
                 FlashAttentionMultiStepBackend,
@@ -241,7 +246,7 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner,
                 skip_prefill=False,
             )
-        elif self.server_args.attention_backend == "flashmla":
+        elif draft_attention_backend == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import (
                 FlashMLAMultiStepDraftBackend,
             )
@@ -253,7 +258,7 @@ class EAGLEWorker(TpModelWorker):
             )
         else:
             raise ValueError(
-                f"EAGLE is not supported in attention backend {self.server_args.attention_backend}"
+                f"EAGLE is not supported in attention backend {self.server_args.draft_attention_backend}"
             )
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
