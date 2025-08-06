@@ -882,7 +882,7 @@ class MiniCPMV4_0(MiniCPMBaseModel):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # list of tensors
-        pixel_values = flatten_nested_list([item.pixel_values for item in items])
+        pixel_values = flatten_nested_list([item.feature for item in items])
         tgt_sizes = torch.stack(
             flatten_nested_list([item.tgt_size for item in items]), dim=0
         )
@@ -970,7 +970,7 @@ class MiniCPMV:
         # Dispatch class based on version
         instance_class = _SUPPORT_VERSION.get(version)
         if instance_class is None:
-            raise ValueError("Currently, MiniCPMV only supports versions 2.6")
+            raise ValueError("Currently, MiniCPMV only supports versions 2.6 and 4.0")
 
         try:
             minicpmv = instance_class(
