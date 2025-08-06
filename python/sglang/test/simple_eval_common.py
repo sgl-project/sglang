@@ -105,6 +105,7 @@ class ChatCompletionSampler(SamplerBase):
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
         self.image_format = "url"
+        print(f"ChatCompletionSampler initialized with {self.system_message=} {self.temperature=} {self.max_tokens=} {self.reasoning_effort=}")
 
     def _handle_image(
         self,
