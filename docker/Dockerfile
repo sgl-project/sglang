@@ -14,7 +14,7 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin" \
 
 RUN apt update && apt install wget -y && apt install software-properties-common -y \
  && add-apt-repository ppa:deadsnakes/ppa -y \
- && apt install python3.12-full python3.12-dev -y \
+  && apt install python3.12-full python3.12-dev python3.10-venv -y \
  && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
  && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
  && update-alternatives --set python3 /usr/bin/python3.12 \
@@ -78,13 +78,16 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
       python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.2/sgl_kernel-0.3.2-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
     fi
 
-# Build and install NVSHMEM + DeepEP
+# Build and install DeepEP
 RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
  && git clone https://github.com/deepseek-ai/DeepEP.git \
  && cd DeepEP && git checkout ${DEEPEP_COMMIT} && cd .. \
- && tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && mv nvshmem_src nvshmem \
- && cd nvshmem \
+ && tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && mv nvshmem_src nvshmem
+
+# Build and install NVSHMEM
+RUN cd nvshmem \
  && rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
+ && echo "cmake configuring..." \
  && NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
@@ -93,10 +96,10 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
     NVSHMEM_PMIX_SUPPORT=0 \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
     NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=90 \
- && cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL} \
- && cd /sgl-workspace/DeepEP \
- && NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=90 && echo "cmake config done" \
+  && cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL} && echo "cmake build done"
+
+RUN cd /sgl-workspace/DeepEP && NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
