@@ -35,9 +35,6 @@ from sglang.srt.distributed import (
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -261,7 +258,8 @@ class DeepseekV2MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+            x,
+            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
         )
         return x
 
@@ -538,12 +536,8 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
-        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
-            final_hidden_states_out = torch.empty_like(final_hidden_states)
+        final_hidden_states += shared_output
 
-        torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-        final_hidden_states = final_hidden_states_out
-        sm.tag(final_hidden_states)
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -581,11 +575,7 @@ class DeepseekV2MoE(nn.Module):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
-            with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
-                final_hidden_states_out = torch.empty_like(final_hidden_states)
-            torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-            final_hidden_states = final_hidden_states_out
-            sm.tag(final_hidden_states)
+            final_hidden_states += shared_output
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -654,7 +644,9 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_deepep(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         shared_output = None
         if hidden_states.shape[0] > 0:
