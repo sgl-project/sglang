@@ -1,9 +1,9 @@
 import argparse
 import json
-import time
 import os
-import re
 import random
+import re
+import time
 
 import numpy as np
 from datasets import load_dataset
@@ -16,32 +16,33 @@ from sglang.test.test_utils import (
 
 choices = ["A", "B", "C", "D"]
 
+
 def get_one_example(line, include_answer):
-    res = line['question']
+    res = line["question"]
     res += f"\nA. {line['A']}"
     res += f"\nB. {line['B']}"
     res += f"\nC. {line['C']}"
     res += f"\nD. {line['D']}"
-    
+
     if include_answer:
         res += f"\nAnswer: {line['answer']} \n\n"
     return res
 
 
 def get_few_shot_examples(lines):
-    res = ''
+    res = ""
     for line in lines:
         res += get_one_example(line, True) + "\n\n"
     return res
 
 
 def get_answer_value(response):
-    pattern = r'(Answer:|answer:|答案是|答案是:|正确答案是:|答案:|Assistant:)\s*([A-D])(?![\w])'
+    pattern = r"(Answer:|answer:|答案是|答案是:|正确答案是:|答案:|Assistant:)\s*([A-D])(?![\w])"
     match = re.search(pattern, response)
-    
+
     if match:
         return match.group(2)
-    
+
     return random.choice(choices)
 
 
@@ -55,15 +56,15 @@ def main(args):
         subject_path = os.path.join(data_path, subject)
         if os.path.isdir(subject_path) and subject != ".git":
             dataset = load_dataset(data_path, name=subject)
-            dev_lines_temp = dataset['dev']
-            val_lines_temp = dataset['val']
+            dev_lines_temp = dataset["dev"]
+            val_lines_temp = dataset["val"]
             few_shot_examples = get_few_shot_examples(dev_lines_temp, subject)
             examples += f"{few_shot_examples}"
             for val_line in val_lines_temp:
                 arguments.append(
                     {
                         "examples": few_shot_examples,
-                        "question": get_one_example(val_line, False)
+                        "question": get_one_example(val_line, False),
                     }
                 )
                 labels.append(val_line["answer"])
@@ -77,7 +78,6 @@ def main(args):
     @sgl.function
     def few_shot_ceval(s, examples, question):
         s += examples + question + sgl.gen("Answer")
-
 
     #####################################
     ########## SGL Program End ##########

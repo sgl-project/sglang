@@ -57,9 +57,7 @@ def main(args):
     @sgl.function
     def few_shot_boolq(s, question):
         s += few_shots + question
-        s += sgl.gen(
-            "answer", max_tokens=5, stop=["\n"]
-        )
+        s += sgl.gen("answer", max_tokens=5, stop=["\n"])
 
     #####################################
     ########## SGL Program End ##########
@@ -113,8 +111,14 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-shots", type=int, default=5)
-    parser.add_argument("--train-data-path", type=str, default="./boolq/data/train-00000-of-00001.json")
-    parser.add_argument("--test-data-path", type=str, default="./boolq/data/validation-00000-of-00001.json")
+    parser.add_argument(
+        "--train-data-path", type=str, default="./boolq/data/train-00000-of-00001.json"
+    )
+    parser.add_argument(
+        "--test-data-path",
+        type=str,
+        default="./boolq/data/validation-00000-of-00001.json",
+    )
     parser.add_argument("--num-questions", type=int, default=200)
     args = add_common_sglang_args_and_parse(parser)
     main(args)
