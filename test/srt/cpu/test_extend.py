@@ -84,7 +84,9 @@ class TestExtendAttention(CustomTestCase):
             start_q, start_kv = end_q, end_kv
         return output
 
-    def _test_extend_attention_once(self, B, N_CTX, H_Q, H_KV, D, DV, mla=False):
+    def _test_extend_attention_once(
+        self, B, N_CTX, H_Q, H_KV, D, DV, mla=False, is_cross_attn=False
+    ):
         dtype = torch.bfloat16
 
         b_seq_len_prefix = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
@@ -171,7 +173,8 @@ class TestExtendAttention(CustomTestCase):
             b_seq_len_extend,
             scaling=sm_scale,
             enable_gqa=enable_gqa,
-            causal=True,
+            causal=not is_cross_attn,
+            is_cross_attn=is_cross_attn,
             encoder_lens=encoder_lens,
         )
 
@@ -191,6 +194,7 @@ class TestExtendAttention(CustomTestCase):
             max_len_extend,
             sm_scale,
             logit_cap,
+            is_cross_attn,
             encoder_lens,
         )
 
@@ -198,9 +202,18 @@ class TestExtendAttention(CustomTestCase):
 
     def test_extend_attention(self):
         for is_mla in [True, False]:
-            self._test_extend_attention_once(1, 123, 1, 1, 128, 96, is_mla)
-            self._test_extend_attention_once(1, 123, 16, 1, 128, 96, is_mla)
-            self._test_extend_attention_once(4, 1230, 16, 4, 128, 96, is_mla)
+            for is_cross_attn in [True, False]:
+                if is_mla and is_cross_attn:
+                    continue
+                self._test_extend_attention_once(
+                    1, 123, 1, 1, 128, 96, is_mla, is_cross_attn
+                )
+                self._test_extend_attention_once(
+                    1, 123, 16, 1, 128, 96, is_mla, is_cross_attn
+                )
+                self._test_extend_attention_once(
+                    4, 1230, 16, 4, 128, 96, is_mla, is_cross_attn
+                )
 
 
 if __name__ == "__main__":

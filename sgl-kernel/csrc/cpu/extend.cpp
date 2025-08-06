@@ -259,6 +259,7 @@ void extend_attention_kernel_impl(
     int max_len_extend,
     int buffer_size_per_thread,
     bool is_prefix_skipped,
+    bool is_cross_attn,
     bool has_encoder_lens) {
   using Vec = at::vec::Vectorized<float>;
 
@@ -312,7 +313,7 @@ void extend_attention_kernel_impl(
       int seq_extend_start_loc = extend_start_loc[bs];
 
       int req_pool_id = req_pool_indices[bs];
-      int kv_offset = has_encoder_lens ? encoder_lens[bs] : 0;
+      int kv_offset = (has_encoder_lens && (!is_cross_attn)) ? encoder_lens[bs] : 0;
       TORCH_CHECK(seq_len_prefix >= 0, "prefix len < 0!");
       TORCH_CHECK(seq_len <= max_context_len, "seq_len out of scope!");
       TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
@@ -337,10 +338,10 @@ void extend_attention_kernel_impl(
       fill_stub(v_prime, 0.f, m_size * head_size_v);
       fill_stub(s_prime, 0.f, m_size);
       fill_stub(m_prime, -std::numeric_limits<scalar_t>::infinity(), m_size);
-
-      // stage 1: compute scores with prefix
-      for (int n = 0; n < seq_len_prefix; n += BLOCK_N) {
-        int n_size = std::min(BLOCK_N, seq_len_prefix - n);
+      int kv_start = 0;
+      int kv_end = is_cross_attn ? encoder_lens[bs] : seq_len_prefix;
+      for (int n = kv_start; n < kv_end; n += BLOCK_N) {
+        int n_size = std::min(BLOCK_N, kv_end - n);
 
         // `n_size` is K in 2nd gemm, pad to TILE_K;
         const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
@@ -436,119 +437,122 @@ void extend_attention_kernel_impl(
             /* A     */ s_delta2,
             /* B     */ Btmp,
             /* C     */ v_prime);
-      }  // loop with seq_len_prefix
+      }
+      if (!is_cross_attn) {
+        // stage 2: compute the triangle part
+        int num_keys = std::min(seq_len_extend, m + BLOCK_M);
+        for (int n = 0; n < num_keys; n += BLOCK_N) {
+          int n_size = std::min(BLOCK_N, num_keys - n);
 
-      // stage 2: compute the triangle part
-      int num_keys = std::min(seq_len_extend, m + BLOCK_M);
-      for (int n = 0; n < num_keys; n += BLOCK_N) {
-        int n_size = std::min(BLOCK_N, num_keys - n);
+          // `n_size` is K in 2nd gemm, pad to TILE_K;
+          const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
 
-        // `n_size` is K in 2nd gemm, pad to TILE_K;
-        const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
+          // get key and pack
+          pack_vnni<scalar_t, index_t>(
+              /*    dst */ Btmp,
+              /*    src */ k_extend + (seq_extend_start_loc + n) * ke_strideN + head_kv_id * ke_strideH,
+              /*    ind */ nullptr,
+              /*     N  */ n_size,
+              /*     K  */ head_size,
+              /* ld_src */ ke_strideN,
+              /* ld_dst */ BLOCK_N);
 
-        // get key and pack
-        pack_vnni<scalar_t, index_t>(
-            /*    dst */ Btmp,
-            /*    src */ k_extend + (seq_extend_start_loc + n) * ke_strideN + head_kv_id * ke_strideH,
-            /*    ind */ nullptr,
-            /*     N  */ n_size,
-            /*     K  */ head_size,
-            /* ld_src */ ke_strideN,
-            /* ld_dst */ BLOCK_N);
+          // calculate s_i <- Q @ K
+          at::native::cpublas::brgemm(
+              /* M     */ m_size,
+              /* N     */ n_size,
+              /* K     */ head_size,
+              /* lda   */ q_strideM,
+              /* ldb   */ BLOCK_N,
+              /* ldc   */ BLOCK_N,
+              /* add_C */ false,
+              /* A     */ q_ptr,
+              /* B     */ Btmp,
+              /* C     */ s_i);
 
-        // calculate s_i <- Q @ K
-        at::native::cpublas::brgemm(
-            /* M     */ m_size,
-            /* N     */ n_size,
-            /* K     */ head_size,
-            /* lda   */ q_strideM,
-            /* ldb   */ BLOCK_N,
-            /* ldc   */ BLOCK_N,
-            /* add_C */ false,
-            /* A     */ q_ptr,
-            /* B     */ Btmp,
-            /* C     */ s_i);
-
-        // apply causal mask
-        if (num_keys - n <= BLOCK_N) {
-          for (int row = 0; row < m_size; ++row) {
-            int last_col = m + row - n;
-            // fill [last_col + 1, n_size) to -inf
-            float* row_ptr = s_i + row * BLOCK_N;
-            fill_stub(row_ptr + last_col + 1, -std::numeric_limits<float>::infinity(), n_size - last_col - 1);
+          // apply causal mask
+          if (num_keys - n <= BLOCK_N) {
+            for (int row = 0; row < m_size; ++row) {
+              int last_col = m + row - n;
+              // fill [last_col + 1, n_size) to -inf
+              float* row_ptr = s_i + row * BLOCK_N;
+              fill_stub(row_ptr + last_col + 1, -std::numeric_limits<float>::infinity(), n_size - last_col - 1);
+            }
           }
-        }
 
-        const Vec scale_vec = Vec(scaling);
-        for (int row = 0; row < m_size; ++row) {
-          // s_i <- s_i * scale
-          at::vec::map<float>(
-              [scale_vec](Vec x) { return x * scale_vec; }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
-
-          // TODO: `tanh` from torch uses sleef u10, going to be slow
-          if (has_logit_cap) {
+          const Vec scale_vec = Vec(scaling);
+          for (int row = 0; row < m_size; ++row) {
+            // s_i <- s_i * scale
             at::vec::map<float>(
-                [logit_cap, rlogit_cap](Vec x) { return Vec(logit_cap) * (x * Vec(rlogit_cap)).tanh(); },
-                s_i + row * BLOCK_N,
+                [scale_vec](Vec x) { return x * scale_vec; }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
+
+            // TODO: `tanh` from torch uses sleef u10, going to be slow
+            if (has_logit_cap) {
+              at::vec::map<float>(
+                  [logit_cap, rlogit_cap](Vec x) { return Vec(logit_cap) * (x * Vec(rlogit_cap)).tanh(); },
+                  s_i + row * BLOCK_N,
+                  s_i + row * BLOCK_N,
+                  n_size);
+            }
+
+            // m_i: max value per row
+            float m_i = at::vec::reduce_all<float>(
+                [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + row * BLOCK_N, n_size);
+            m_i = std::max(m_i, m_prime[row]);
+
+            // m_delta <- exp(m' - m_i)
+            float m_delta = std::exp(m_prime[row] - m_i);
+
+            // s_delta <- exp(s_i - m_i)
+            at::vec::map<float>(
+                [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); },
+                s_delta + row * BLOCK_N,
                 s_i + row * BLOCK_N,
                 n_size);
+
+            // s' <- s' * m_delta + sum(s_delta)
+            s_prime[row] *= m_delta;
+            s_prime[row] +=
+                at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
+
+            m_prime[row] = m_i;
+
+            // v' <- v' * m_delta
+            at::vec::map<float>(
+                [m_delta](Vec x) { return x * Vec(m_delta); },
+                v_prime + row * head_size_v,
+                v_prime + row * head_size_v,
+                head_size_v);
+
+            // pad s_delta with 0 first and then convert to scalar_t
+            fill_stub(s_delta + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
+            copy_stub<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
           }
 
-          // m_i: max value per row
-          float m_i = at::vec::reduce_all<float>(
-              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + row * BLOCK_N, n_size);
-          m_i = std::max(m_i, m_prime[row]);
+          // get value and pack
+          pack_vnni2<scalar_t, index_t>(
+              /*    dst */ Btmp,
+              /*    src */ v_extend + (seq_extend_start_loc + n) * ve_strideN + head_kv_id * ve_strideH,
+              /*    ind */ nullptr,
+              /*     K  */ n_size,
+              /*     N  */ head_size_v,
+              /* ld_src */ ve_strideN,
+              /* ld_dst */ head_size_v);
 
-          // m_delta <- exp(m' - m_i)
-          float m_delta = std::exp(m_prime[row] - m_i);
-
-          // s_delta <- exp(s_i - m_i)
-          at::vec::map<float>(
-              [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
-
-          // s' <- s' * m_delta + sum(s_delta)
-          s_prime[row] *= m_delta;
-          s_prime[row] +=
-              at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
-
-          m_prime[row] = m_i;
-
-          // v' <- v' * m_delta
-          at::vec::map<float>(
-              [m_delta](Vec x) { return x * Vec(m_delta); },
-              v_prime + row * head_size_v,
-              v_prime + row * head_size_v,
-              head_size_v);
-
-          // pad s_delta with 0 first and then convert to scalar_t
-          fill_stub(s_delta + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
-          copy_stub<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
-        }
-
-        // get value and pack
-        pack_vnni2<scalar_t, index_t>(
-            /*    dst */ Btmp,
-            /*    src */ v_extend + (seq_extend_start_loc + n) * ve_strideN + head_kv_id * ve_strideH,
-            /*    ind */ nullptr,
-            /*     K  */ n_size,
-            /*     N  */ head_size_v,
-            /* ld_src */ ve_strideN,
-            /* ld_dst */ head_size_v);
-
-        // calculate V' <- s_delta @ V + V'
-        at::native::cpublas::brgemm(
-            /* M     */ m_size,
-            /* N     */ head_size_v,
-            /* K     */ padded_n_size,  // n_size
-            /* lda   */ BLOCK_N,
-            /* ldb   */ head_size_v,
-            /* ldc   */ head_size_v,
-            /* add_C */ true,
-            /* A     */ s_delta2,
-            /* B     */ Btmp,
-            /* C     */ v_prime);
-      }  // loop with seq_len_extend
-
+          // calculate V' <- s_delta @ V + V'
+          at::native::cpublas::brgemm(
+              /* M     */ m_size,
+              /* N     */ head_size_v,
+              /* K     */ padded_n_size,  // n_size
+              /* lda   */ BLOCK_N,
+              /* ldb   */ head_size_v,
+              /* ldc   */ head_size_v,
+              /* add_C */ true,
+              /* A     */ s_delta2,
+              /* B     */ Btmp,
+              /* C     */ v_prime);
+        }  // loop with seq_len_extend
+      }
       scalar_t* __restrict__ out_ptr = o_extend + (seq_extend_start_loc + m) * o_strideM + head_id * o_strideH;
       for (int row = 0; row < m_size; ++row) {
         float s = 1 / s_prime[row];
@@ -582,8 +586,8 @@ void extend_attention_kernel_impl(
 //
 void extend_attention_cpu(
     at::Tensor& q_extend,
-    at::Tensor& k_extend,
-    at::Tensor& v_extend,
+    const std::optional<at::Tensor>& k_extend_opt,
+    const std::optional<at::Tensor>& v_extend_opt,
     at::Tensor& o_extend,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
@@ -595,13 +599,14 @@ void extend_attention_cpu(
     int64_t max_len_extend,
     double sm_scale,
     double logit_cap,
+    bool is_cross_attn,
     std::optional<at::Tensor> encoder_lens) {
   RECORD_FUNCTION(
       "sgl-kernel::extend_attention_cpu",
       std::vector<c10::IValue>(
           {q_extend,
-           k_extend,
-           v_extend,
+           k_extend_opt,
+           v_extend_opt,
            o_extend,
            k_buffer,
            v_buffer,
@@ -610,7 +615,15 @@ void extend_attention_cpu(
            seq_lens,
            extend_seq_lens,
            extend_start_loc}));
-
+  if (!is_cross_attn) {
+    TORCH_CHECK(
+        k_extend_opt.has_value() && v_extend_opt.has_value(),
+        "k_extend and v_extend are required for non-cross attention");
+  }
+  // Since k_extend and v_extend are not used for cross attention, they can be initialized as k_buffer and v_buffer
+  // here.
+  auto k_extend = k_extend_opt.has_value() ? k_extend_opt.value() : k_buffer;
+  auto v_extend = v_extend_opt.has_value() ? v_extend_opt.value() : v_buffer;
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_extend);
   CHECK_INPUT(o_extend);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_extend);
@@ -731,6 +744,7 @@ void extend_attention_cpu(
           max_len_extend,
           size_per_thread,
           is_prefix_skipped,
+          is_cross_attn,
           has_encoder_lens);
     });
   });
