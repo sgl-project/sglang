@@ -105,11 +105,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                 get_stop_tokens_for_assistant_actions()
             )
 
-            # self.browser_tool = HarmonyBrowserTool()
-            # self.supports_browsing = self.browser_tool.enabled
-            # self.python_tool = HarmonyPythonTool()
-            # self.supports_code_interpreter = self.python_tool.enabled
-
         # Response storage for background and retrieval operations
         # Note: In production, this should use a proper storage backend (Redis, database)
         # with TTL/expiration to prevent memory leaks

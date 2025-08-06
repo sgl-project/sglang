@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     # Avoid circular import.
-    from sglang.srt.entrypoints.context import ConversationContext, HarmonyContext
+    from sglang.srt.entrypoints.context import ConversationContext
 
 logger = logging.getLogger(__name__)
 

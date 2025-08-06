@@ -17,7 +17,6 @@ from openai_harmony import Author, Message, Role, StreamState, TextContent
 from sglang.srt.entrypoints.harmony_utils import (
     get_encoding,
     get_streamable_parser_for_assistant,
-    parse_output_into_messages,
     render_for_completion,
 )
 from sglang.srt.entrypoints.tool import Tool
