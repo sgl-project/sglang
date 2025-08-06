@@ -1566,18 +1566,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             locs = self.seq_lens.clone()
 
-        is_dual_chunk_flash_atten = (
+        is_dual_chunk_flash_attn = (
             global_server_args_dict["attention_backend"] == "dual_chunk_flash_attn"
         )
         if self.enable_overlap:
             # Do not use in-place operations in the overlap mode
             self.seq_lens = self.seq_lens + 1
-            if is_dual_chunk_flash_atten:
+            if is_dual_chunk_flash_attn:
                 self.orig_seq_lens = self.orig_seq_lens + 1
         else:
             # A faster in-place version
             self.seq_lens.add_(1)
-            if is_dual_chunk_flash_atten:
+            if is_dual_chunk_flash_attn:
                 self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
 
