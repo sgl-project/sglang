@@ -50,8 +50,10 @@ fi
 # Install hf_xet
 pip install huggingface_hub[hf_xet] --break-system-packages
 
-# Install xformers
-pip install -U xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps --force-reinstall --break-system-packages
+if [ "$MODE_BLACKWELL" != "1" ]; then
+    # Install xformers
+    pip install -U xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps --force-reinstall --break-system-packages
+fi
 
 # To help dumping traces when timeout occurred
 pip install py-spy --break-system-packages
