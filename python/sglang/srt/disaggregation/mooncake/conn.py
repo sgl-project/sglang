@@ -677,13 +677,8 @@ class MooncakeKVManager(BaseKVManager):
                             )
                             break
 
-                        # currently only support prefill_pp_size = decode_pp_size or decode_pp_size = 1
-                        # dst_kv_ptrs > kv_data_ptrs means prefill_pp_size > decode_pp_size and decode_pp_size = 1
-                        # dst_kv_ptrs == kv_data_ptrs means prefill_pp_size == decode_pp_size
-                        # there should be no case where dst_kv_ptrs < kv_data_ptrs
-                        need_send_aux = (len(target_rank_registration_info.dst_kv_ptrs) == len(self.kv_args.kv_data_ptrs)) or self.pp_group.is_last_rank
                         if kv_chunk.is_last:
-                            if need_send_aux:
+                            if self.pp_group.is_last_rank:
                                 # Only the last chunk we need to send the aux data
                                 ret = self.send_aux(
                                     req.mooncake_session_id,
