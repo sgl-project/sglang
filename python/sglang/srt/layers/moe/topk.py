@@ -183,7 +183,6 @@ class TopK(CustomOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-        apply_routed_scaling_factor_on_output: Optional[bool] = False,
     ) -> TopKOutput:
         if self.use_triton_kernels:
             # renormalize=True is equivalent to sm_first=False
@@ -206,7 +205,6 @@ class TopK(CustomOp):
                 correction_bias=self.correction_bias,
                 torch_native=torch_native,
                 routed_scaling_factor=self.routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
             )
@@ -375,7 +373,6 @@ def grouped_topk_gpu(
     topk_group: int = 0,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
-    apply_routed_scaling_factor_on_output: Optional[bool] = False,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
@@ -425,8 +422,6 @@ def grouped_topk_gpu(
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
         )
         topk_weights = topk_weights / topk_weights_sum
-        if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
@@ -471,7 +466,6 @@ def biased_grouped_topk_impl(
     topk_group: int = 0,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
-    apply_routed_scaling_factor_on_output: Optional[bool] = False,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
@@ -525,8 +519,6 @@ def biased_grouped_topk_impl(
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
         )
         topk_weights = topk_weights / topk_weights_sum
-        if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
@@ -566,7 +558,6 @@ def biased_grouped_topk_gpu(
     num_expert_group: int = 0,
     topk_group: int = 0,
     num_fused_shared_experts: int = 0,
-    apply_routed_scaling_factor_on_output: bool = False,
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
@@ -600,7 +591,6 @@ def biased_grouped_topk_gpu(
             )
         return topk_weights, topk_ids
     elif _use_aiter:
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
         token = gating_output.shape[0]
         device = gating_output.device
         assert (
@@ -630,7 +620,6 @@ def biased_grouped_topk_gpu(
             topk_group,
             num_fused_shared_experts=num_fused_shared_experts,
             routed_scaling_factor=routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
@@ -690,7 +679,6 @@ def select_experts(
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
     routed_scaling_factor: Optional[float] = None,
-    apply_routed_scaling_factor_on_output: Optional[bool] = False,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> TopKOutput:
@@ -716,7 +704,6 @@ def select_experts(
                 topk_group=topk_group,
                 num_fused_shared_experts=num_fused_shared_experts,
                 routed_scaling_factor=routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
             )
@@ -730,7 +717,6 @@ def select_experts(
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
                 num_fused_shared_experts=num_fused_shared_experts,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 routed_scaling_factor=routed_scaling_factor,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
@@ -740,7 +726,6 @@ def select_experts(
             num_token_non_padded is None
         ), "num_token_non_padded is not yet supported in fused_topk_native"
         assert expert_location_dispatch_info is None
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -748,7 +733,6 @@ def select_experts(
             renormalize=renormalize,
         )
     elif custom_routing_function is None:
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
         # Qwen3MOE uses fused_topk
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
@@ -763,7 +747,6 @@ def select_experts(
             num_token_non_padded is None
         ), "num_token_non_padded is not yet supported in custom_routing_function"
         assert expert_location_dispatch_info is None
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
