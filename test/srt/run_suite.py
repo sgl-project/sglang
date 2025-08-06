@@ -205,8 +205,6 @@ suites = {
     ],
     "per-commit-8-gpu-b200": [
         # add more here
-        # TODO random test to check CI
-        TestFile("test_abort.py", 51),
     ],
     "per-commit-cpu": [
         TestFile("cpu/test_activation.py"),
