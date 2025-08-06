@@ -20,8 +20,11 @@ class BaseTestGptOss(CustomTestCase):
         model_variant: Literal["20b", "120b"],
         quantization: Literal["mxfp4", "bf16"],
         expected_score_of_reasoning_effort: Dict[str, float],
-        other_args: List[str] = [],
+        other_args: List[str],
     ):
+        if other_args is None:
+            other_args = []
+
         model = {
             ("20b", "bf16"): "lmsys/gpt-oss-20b-bf16",
             ("120b", "bf16"): "lmsys/gpt-oss-120b-bf16",
@@ -42,7 +45,7 @@ class BaseTestGptOss(CustomTestCase):
         self,
         model: str,
         expected_score_of_reasoning_effort: Dict[str, float],
-        other_args: List[str] = [],
+        other_args: List[str],
     ):
         process = popen_launch_server(
             model,
