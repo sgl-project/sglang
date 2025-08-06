@@ -461,6 +461,7 @@ class ServerArgs:
         if model_arch in ["GptOssForCausalLM"]:
             self.attention_backend = "triton"
             self.enable_triton_kernel_moe = True
+            self.disable_hybrid_swa_memory = True
 
         # Set page size
         if self.page_size is None:
