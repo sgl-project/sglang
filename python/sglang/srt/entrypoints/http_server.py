@@ -1299,12 +1299,13 @@ def _execute_server_warmup(
                 ],
                 "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
             }
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=1800,  # because of deep gemm precache is very long if not precache.
-            )
+            for _ in range(2):
+                res = requests.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=headers,
+                    timeout=1800,  # because of deep gemm precache is very long if not precache.
+                )
             if res.status_code == 200:
                 logger.info(
                     f"End of prefill disaggregation mode warmup with status {res.status_code}, resp: {res.json()}"

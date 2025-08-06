@@ -222,7 +222,7 @@ class HiPAttentionBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         assert self.flashattention_backend.get_cuda_graph_seq_len_fill_value() == 1
-        return 1
+        return max(1, self.max_context_len - 1)
 
     def forward_extend(
         self,
