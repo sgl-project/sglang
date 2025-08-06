@@ -541,7 +541,7 @@ class CommunicateSummableTensorPairFn:
             forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
             hidden_states,
         )
-        if hidden_states.data_ptr() == global_hidden_states.data_ptr():
+        if hidden_states.untyped_storage() is global_hidden_states.untyped_storage():
             # dp_scatter is an in-place operation and requires input and output tensors to not be aliased.
             # so we create a separate buffer if they share the same storage.
             hidden_states = torch.empty_like(hidden_states)
