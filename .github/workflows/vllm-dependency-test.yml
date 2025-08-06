@@ -29,9 +29,10 @@ jobs:
 
       - name: Install dependencies
         run: |
+          bash scripts/ci_install_dependency.sh
           pip install "vllm==0.10.0"
           pip install "bitsandbytes>=0.44.0"
-          bash scripts/ci_install_dependency.sh
+          pip3 install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126
 
       - name: Run VLLM dependency tests
         timeout-minutes: 60
