@@ -48,11 +48,11 @@ SCORE_MODEL_PATH = "Qwen/Qwen3-0.6B"
 SCORE_LABEL_TOKEN_IDS = [9454, 2753]  # Yes/No token IDs
 
 # Array of RPS values to test
-RPS_VALUES = [1]
+RPS_VALUES = [70]
 # Array of duration values to test
-DURATION_SECS_VALUES = [1]  # Duration values in seconds
+DURATION_SECS_VALUES = [60]  # Duration values in seconds
 # Array of item count values to test
-ITEM_COUNT_VALUES = [1]  # Number of items per request
+ITEM_COUNT_VALUES = [10]  # Number of items per request
 # Number of unique requests to generate (will be reused)
 NUM_UNIQUE_REQUESTS = 100
 DISTRIBUTION = "POISSON"  # Options: "CONSTANT", "POISSON"

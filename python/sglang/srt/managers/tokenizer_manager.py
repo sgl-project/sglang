@@ -1871,6 +1871,13 @@ class TokenizerManager:
                         f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})"
                     )
 
+        batch_request = GenerateReqInput(
+            token_ids_logprob=label_token_ids,
+            return_logprob=True,
+            stream=False,
+            sampling_params={"max_new_tokens": 0},
+        )
+
         # Handle string or tokenized query/items
         if isinstance(query, str) and (
             isinstance(items, str)
@@ -1883,13 +1890,7 @@ class TokenizerManager:
             else:
                 prompts = [f"{query}{item}" for item in items_list]
 
-            batch_request = GenerateReqInput(
-                text=prompts,
-                token_ids_logprob=label_token_ids,
-                return_logprob=True,
-                stream=False,
-                sampling_params={"max_new_tokens": 0},
-            )
+            batch_request.text = prompts
 
         elif (
             isinstance(query, list)
@@ -1903,13 +1904,7 @@ class TokenizerManager:
             else:
                 input_ids_list = [query + item for item in items]
 
-            batch_request = GenerateReqInput(
-                input_ids=input_ids_list,
-                token_ids_logprob=label_token_ids,
-                return_logprob=True,
-                stream=False,
-                sampling_params={"max_new_tokens": 0},
-            )
+            batch_request.input_ids = input_ids_list
         else:
             raise ValueError(
                 "Invalid combination of query/items types for score_request."
