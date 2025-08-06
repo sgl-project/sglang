@@ -233,7 +233,7 @@ suites = {
     "weekly-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
     ],
-    "weekly-vllm_dependency_test": [
+    "weekly-vllm-dependency-test": [
         TestFile("test_awq.py", 163),
         TestFile("test_bnb.py", 5),
         TestFile("test_gguf.py", 96),
