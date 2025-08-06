@@ -572,6 +572,8 @@ def biased_grouped_topk_gpu(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
+    # TODO(trevor-m): Remove once sgl-kernel is updated
+    assert not apply_routed_scaling_factor_on_output
     assert (
         routed_scaling_factor is not None
     ), "routed_scaling_factor is required for biased_grouped_topk"
@@ -590,7 +592,8 @@ def biased_grouped_topk_gpu(
             topk,
             num_fused_shared_experts,
             routed_scaling_factor,
-            apply_routed_scaling_factor_on_output,
+            # TODO(trevor-m): Uncomment once sgl-kernel is updated
+            # apply_routed_scaling_factor_on_output,
         )
         # TODO merge into kernel
         if (expert_location_dispatch_info is not None) or (
