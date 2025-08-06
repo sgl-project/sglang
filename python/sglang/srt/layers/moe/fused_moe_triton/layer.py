@@ -18,6 +18,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_deepep_mode,
@@ -1048,10 +1049,10 @@ class FlashInferFP4MoE(FusedMoE):
 
         router_logits = router_logits.to(torch.float32)
 
-        with use_symmetric_memory(get_tp_group()) as sm:
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
             symm_output = torch.empty_like(hidden_states)
-            sm.tag(symm_output)
-
         result = trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=topk_config.correction_bias.to(hidden_states.dtype),
