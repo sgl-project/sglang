@@ -464,11 +464,17 @@ class DeepseekV2MoE(nn.Module):
                 and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             ):
                 return self.forward_normal_dual_stream(
-                    hidden_states, forward_batch, can_fuse_mlp_allreduce, use_reduce_scatter,
+                    hidden_states,
+                    forward_batch,
+                    can_fuse_mlp_allreduce,
+                    use_reduce_scatter,
                 )
             else:
                 return self.forward_normal(
-                    hidden_states, forward_batch, can_fuse_mlp_allreduce, use_reduce_scatter
+                    hidden_states,
+                    forward_batch,
+                    can_fuse_mlp_allreduce,
+                    use_reduce_scatter,
                 )
         else:
             return self.forward_deepep(hidden_states, forward_batch)

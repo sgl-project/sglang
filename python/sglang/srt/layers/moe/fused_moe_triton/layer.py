@@ -794,7 +794,12 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported weight_name {weight_name} for FusedMoE weight_loader_fused. Nothing is loaded."
             )
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: StandardTopKOutput, forward_batch: Optional[ForwardBatch] = None):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: StandardTopKOutput,
+        forward_batch: Optional[ForwardBatch] = None,
+    ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         if self.hidden_size != origin_hidden_states_dim:
             hidden_states = torch.nn.functional.pad(
