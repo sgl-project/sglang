@@ -1,20 +1,4 @@
-import importlib.util
 from enum import Enum
-from functools import lru_cache
-
-from packaging import version as pkg_version
-
-from sglang.srt.layers.moe.moe_runner import get_moe_grouped_gemm_backend
-
-
-@lru_cache(maxsize=1)
-def should_use_flashinfer_trtllm_moe():
-    result = get_moe_grouped_gemm_backend().is_flashinfer_trtllm() and (
-        not importlib.util.find_spec("flashinfer")
-        or pkg_version.parse(__import__("flashinfer").__version__)
-        >= pkg_version.parse("0.2.9rc1")
-    )
-    return result
 
 
 class MoeA2ABackend(Enum):

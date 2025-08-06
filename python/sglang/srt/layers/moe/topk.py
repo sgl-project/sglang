@@ -37,8 +37,10 @@ from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
-from sglang.srt.layers.moe.moe_runner import get_moe_grouped_gemm_backend
-from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
+from sglang.srt.layers.moe.moe_runner import (
+    get_moe_grouped_gemm_backend,
+    should_use_flashinfer_trtllm_moe,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,

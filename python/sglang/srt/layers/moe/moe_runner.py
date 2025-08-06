@@ -1,4 +1,8 @@
+import importlib.util
+from functools import lru_cache
 from typing import Optional
+
+from packaging import version as pkg_version
 
 from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend, MoeGroupedGemmBackend
 
@@ -36,3 +40,13 @@ def get_moe_grouped_gemm_backend() -> MoeGroupedGemmBackend:
 def get_deepep_mode() -> DeepEPMode:
     assert DEEPEP_MODE is not None, "DEEPEP_MODE is not initialized"
     return DEEPEP_MODE
+
+
+@lru_cache(maxsize=1)
+def should_use_flashinfer_trtllm_moe():
+    result = get_moe_grouped_gemm_backend().is_flashinfer_trtllm() and (
+        not importlib.util.find_spec("flashinfer")
+        or pkg_version.parse(__import__("flashinfer").__version__)
+        >= pkg_version.parse("0.2.9rc1")
+    )
+    return result

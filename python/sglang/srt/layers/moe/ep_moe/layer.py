@@ -19,9 +19,9 @@ from sglang.srt.layers.moe.moe_runner import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_grouped_gemm_backend,
+    should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config

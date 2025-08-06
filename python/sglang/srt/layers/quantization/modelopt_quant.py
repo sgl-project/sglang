@@ -9,8 +9,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
-from sglang.srt.layers.moe.moe_runner import get_moe_grouped_gemm_backend
-from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
+from sglang.srt.layers.moe.moe_runner import should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -746,6 +745,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
+        from sglang.srt.layers.moe.moe_runner import get_moe_grouped_gemm_backend
+
         """Access the global enable_flashinfer_cutlass_moe setting."""
         return get_moe_grouped_gemm_backend().is_flashinfer_cutlass()
 

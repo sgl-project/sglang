@@ -22,9 +22,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.layers.moe.moe_runner import get_moe_grouped_gemm_backend
+from sglang.srt.layers.moe.moe_runner import (
+    get_moe_grouped_gemm_backend,
+    should_use_flashinfer_trtllm_moe,
+)
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
-from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
