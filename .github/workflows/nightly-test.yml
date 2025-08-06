@@ -12,7 +12,7 @@ concurrency:
 jobs:
   nightly-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: 2-gpu-runner
+    runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -26,6 +26,23 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite nightly --timeout-per-file 3600
+  
+  nightly-test-2-gpu:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 120
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-2-gpu --timeout-per-file 3600
 
   nightly-test-4-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'

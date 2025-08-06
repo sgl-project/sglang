@@ -212,12 +212,14 @@ suites = {
         TestFile("test_intel_amx_attention_backend.py"),
     ],
     "nightly": [
-        TestFile("test_nightly_gsm8k_eval.py"),
         TestFile("test_mla_deepseek_v3.py", 700),
         TestFile("test_mla_int8_deepseek_v3.py", 429),
     ],
     "nightly-amd": [
         TestFile("test_nightly_gsm8k_eval_amd.py"),
+    ],
+    "nightly-2-gpu": [
+        TestFile("test_nightly_gsm8k_eval.py"),
     ],
     "nightly-4-gpu": [
         TestFile("test_local_attn.py", 250),
