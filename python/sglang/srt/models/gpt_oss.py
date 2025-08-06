@@ -214,6 +214,7 @@ class GptOssAttention(nn.Module):
         sliding_window_size: int = -1,  # if -1, normal attention, else, window attention.
         layer_type: str = "",
         params_dtype: torch.dtype = torch.bfloat16,
+        config: GptOssConfig = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -288,6 +289,10 @@ class GptOssAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            orig_context_len=getattr(
+                config, "orig_context_len", max_position_embeddings
+            ),
+            rope=self.rotary_emb,
             prefix=add_prefix("attn", prefix),
             sliding_window_size=(sliding_window_size if use_sliding_window else -1),
         )
@@ -303,7 +308,14 @@ class GptOssAttention(nn.Module):
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        
+        # RoPE is applied inside the attention kernel in HiP Attention
+        if not (
+            forward_batch.hip_metadata_cache_pool is not None
+            and forward_batch.hip_metadata_cache_pool.hip_config.using_extend
+        ):
+            q, k = self.rotary_emb(positions, q, k)
+        
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -370,6 +382,7 @@ class GptOssDecoderLayer(nn.Module):
             sliding_window_size=self.sliding_window_size,
             layer_type=config.layer_types[layer_id],
             params_dtype=config.torch_dtype,
+            config=config,
         )
 
         self.layer_id = layer_id

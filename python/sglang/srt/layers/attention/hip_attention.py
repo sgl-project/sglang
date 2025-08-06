@@ -235,6 +235,7 @@ class HiPAttentionBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        sk: int = None,
     ):
         cache_loc = (
             forward_batch.out_cache_loc
@@ -392,6 +393,7 @@ class HiPAttentionBackend(AttentionBackend):
                     is_decode=False,
                     offloading_metadata=offloading_metadata,
                     sliding_window_size=sw_size,
+                    sliding_window_sink=sk,
                     using_chunked_sliding_window=using_chunked_sw,
                     self_extend_scale=self.hip_config.self_extend_scale,
                 )
@@ -451,6 +453,7 @@ class HiPAttentionBackend(AttentionBackend):
                         is_decode=False,
                         offloading_metadata=offloading_metadata,
                         sliding_window_size=sw_size,
+                        sliding_window_sink=sk,
                         using_chunked_sliding_window=using_chunked_sw,
                         self_extend_scale=self.hip_config.self_extend_scale,
                     )
@@ -506,11 +509,14 @@ class HiPAttentionBackend(AttentionBackend):
                     k_cache = kv_cache
                     v_cache = c_kv_cache
 
-                    if forward_batch.forward_mode.is_draft_extend():
-                        sw_size = 512
-                        sw_sink = 128
+                    if sk is not None:
+                        if forward_batch.forward_mode.is_draft_extend():
+                            sw_size = 512
+                            sw_sink = 128
+                        else:
+                            sw_sink = -1
                     else:
-                        sw_sink = -1
+                        sw_sink = sk
 
                     # print(q_merged.shape, k_cache.shape, v_cache.shape, sw_sink, sw_size)
 
@@ -592,6 +598,7 @@ class HiPAttentionBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        sk: Optional[int] = None,
     ):
         cache_loc = (
             forward_batch.out_cache_loc
@@ -778,6 +785,7 @@ class HiPAttentionBackend(AttentionBackend):
                     is_decode=True,
                     offloading_metadata=offloading_metadata,
                     sliding_window_size=sw_size,
+                    sliding_window_sink=sk,
                     using_chunked_sliding_window=using_chunked_sw,
                     k_descale=k_descale,
                     v_descale=v_descale,
@@ -870,6 +878,7 @@ class HiPAttentionBackend(AttentionBackend):
                     is_decode=True,
                     offloading_metadata=offloading_metadata,
                     sliding_window_size=sw_size,
+                    sliding_window_sink=sk,
                     using_chunked_sliding_window=using_chunked_sw,
                     cache_seqlens=self.cache_seqlens,
                     cu_seqlens_q=self.cu_seqlens_q,
