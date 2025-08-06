@@ -132,6 +132,7 @@ class TopK(CustomOp):
         scoring_func: str = "softmax",
         correction_bias: Optional[torch.Tensor] = None,
         routed_scaling_factor: Optional[float] = None,
+        apply_routed_scaling_factor_on_output: Optional[bool] = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -147,6 +148,7 @@ class TopK(CustomOp):
         self.custom_routing_function = custom_routing_function
         self.correction_bias = correction_bias
         self.routed_scaling_factor = routed_scaling_factor
+        self.apply_routed_scaling_factor_on_output = apply_routed_scaling_factor_on_output
 
         self.use_triton_kernels = global_server_args_dict["enable_triton_kernel_moe"]
 
@@ -183,7 +185,6 @@ class TopK(CustomOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-        apply_routed_scaling_factor_on_output: Optional[bool] = False,
     ) -> TopKOutput:
         if self.use_triton_kernels:
             # renormalize=True is equivalent to sm_first=False
@@ -208,7 +209,7 @@ class TopK(CustomOp):
                 routed_scaling_factor=self.routed_scaling_factor,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                apply_routed_scaling_factor_on_output=self.apply_routed_scaling_factor_on_output,
             )
 
     def forward_cpu(
