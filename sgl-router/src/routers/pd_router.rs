@@ -507,14 +507,6 @@ impl PDRouter {
                         response
                     } else {
                         // No logprob merging needed (restored from .bak)
-
-                        // Fix HTTP handshake issue by consuming prefill response when not needed
-                        tokio::spawn(async move {
-                            if let Ok(prefill_res) = prefill_result {
-                                let _ = prefill_res.bytes().await; // Consume to complete handshake
-                            }
-                        });
-
                         let stream = res.bytes_stream();
                         let decode_url = decode.url().to_string();
                         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -559,12 +551,6 @@ impl PDRouter {
                                 self.merge_logprobs(prefill_result, decode_body, status)
                                     .await
                             } else {
-                                // Fix HTTP handshake issue by consuming prefill response when not needed
-                                tokio::spawn(async move {
-                                    if let Ok(prefill_res) = prefill_result {
-                                        let _ = prefill_res.bytes().await; // Consume to complete handshake
-                                    }
-                                });
                                 (status, decode_body).into_response()
                             }
                         }
