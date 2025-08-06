@@ -1269,7 +1269,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 context_len = getattr(
                     self.tokenizer_manager.model_config, "context_len", 4096
                 )
-                remaining_tokens = context_len - len(prompt_token_ids)
+                remaining_tokens = context_len - len(prompt_token_ids) - 1
 
                 if isinstance(sampling_params, dict):
                     sampling_params["max_new_tokens"] = max(remaining_tokens, 1)
