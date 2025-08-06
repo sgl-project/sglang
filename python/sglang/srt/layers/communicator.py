@@ -33,6 +33,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
 )
+from sglang.srt.layers.moe.utils import should_use_flashinfer_cutlass_moe_fp4_allgather
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -112,7 +113,7 @@ class LayerScatterModes:
                 if (
                     # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                     not global_server_args_dict["moe_a2a_backend"].is_standard()
-                    or global_server_args_dict["enable_flashinfer_fp4_allgather"]
+                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 )
                 else ScatterMode.FULL
             )

@@ -177,7 +177,6 @@ class ServerArgs:
     enable_flashinfer_cutlass_moe: bool = False
     enable_flashinfer_trtllm_moe: bool = False
     enable_flashinfer_allreduce_fusion: bool = False
-    enable_flashinfer_fp4_allgather: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -221,6 +220,7 @@ class ServerArgs:
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
+    disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
@@ -531,11 +531,6 @@ class ServerArgs:
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
-            if self.enable_dp_attention and self.ep_size == self.dp_size:
-                self.enable_flashinfer_fp4_allgather = True
-                logger.warning(
-                    "Automatically enabling --enable-flashinfer-fp4-allgather which will accelerate high-throughput scenarios."
-                )
 
         if self.enable_flashinfer_trtllm_moe:
             if not self.disable_shared_experts_fusion:
@@ -1459,17 +1454,12 @@ class ServerArgs:
         parser.add_argument(
             "--enable-flashinfer-trtllm-moe",
             action="store_true",
-            help="Enable FlashInfer TRTLLM MoE backend on Blackwell. Used for low-latency scenarios. Supports BlockScale FP8 MoE-EP",
+            help="Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
-        )
-        parser.add_argument(
-            "--enable-flashinfer-fp4-allgather",
-            action="store_true",
-            help="Quantize before all-gather to reduce communication cost in high-throughput serving. Automatically enabled when --enable-cutlass-flashinfer-moe and --enable-dp-attention and dp_size == ep_size.",
         )
         parser.add_argument(
             "--deepep-mode",
@@ -1681,6 +1671,11 @@ class ServerArgs:
             "--enable-symm-mem",
             action="store_true",
             help="Enable NCCL symmetric memory for fast collectives.",
+        )
+        parser.add_argument(
+            "--disable-flashinfer-cutlass-moe-fp4-allgather",
+            action="store_true",
+            help="Disables quantize before all-gather for flashinfer cutlass moe.",
         )
         parser.add_argument(
             "--enable-tokenizer-batch-encode",

@@ -10,7 +10,10 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
-from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
+from sglang.srt.layers.moe.utils import (
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_use_flashinfer_trtllm_moe,
+)
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -1176,7 +1179,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             output_dtype = x.dtype
             x_sf = None
-            if global_server_args_dict["enable_flashinfer_fp4_allgather"]:
+            if should_use_flashinfer_cutlass_moe_fp4_allgather():
                 from flashinfer import fp4_quantize, nvfp4_block_scale_interleave
 
                 # Quantize before comm, swizzle after.
@@ -1230,7 +1233,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             if routed_scaling_factor is not None:
                 output *= routed_scaling_factor
 
-            if global_server_args_dict["enable_flashinfer_fp4_allgather"]:
+            if should_use_flashinfer_cutlass_moe_fp4_allgather():
                 output, global_hidden_states = (
                     forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
                     output,

@@ -4,6 +4,8 @@ from functools import lru_cache
 
 from packaging import version as pkg_version
 
+from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
+from sglang.srt.layers.dp_attention import get_attention_dp_size
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 
@@ -15,6 +17,18 @@ def should_use_flashinfer_trtllm_moe():
         >= pkg_version.parse("0.2.9rc1")
     )
     return result
+
+
+def should_use_flashinfer_cutlass_moe_fp4_allgather():
+    """
+    Perform FP4 quantize before all-gather for flashinfer cutlass moe to reduce communication cost for high-throughput serving.
+    """
+    return (
+        not global_server_args_dict["disable_flashinfer_cutlass_moe_fp4_allgather"]
+        and global_server_args_dict["enable_flashinfer_cutlass_moe"]
+        and global_server_args_dict["enable_dp_attention"]
+        and get_moe_expert_parallel_world_size() == get_attention_dp_size()
+    )
 
 
 class MoeA2ABackend(Enum):

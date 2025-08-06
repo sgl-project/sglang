@@ -62,7 +62,10 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
-from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
+from sglang.srt.layers.moe.utils import (
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_use_flashinfer_trtllm_moe,
+)
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -377,7 +380,7 @@ class DeepseekV2MoE(nn.Module):
                 **(
                     dict(tp_rank=0, tp_size=1)
                     if global_server_args_dict["moe_a2a_backend"].is_deepep()
-                    or global_server_args_dict["enable_flashinfer_fp4_allgather"]
+                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
             )
@@ -493,7 +496,7 @@ class DeepseekV2MoE(nn.Module):
                 kwargs["topk_output"] = (self.topk, router_logits)
             else:
                 kwargs["topk_output"] = self.topk(hidden_states, router_logits)
-            if global_server_args_dict["enable_flashinfer_fp4_allgather"]:
+            if should_use_flashinfer_cutlass_moe_fp4_allgather():
                 kwargs["forward_batch"] = forward_batch
 
             final_hidden_states = self.experts(**kwargs)
@@ -509,7 +512,7 @@ class DeepseekV2MoE(nn.Module):
             self.tp_size > 1
             and not can_fuse_mlp_allreduce
             and not use_reduce_scatter
-            and not global_server_args_dict["enable_flashinfer_fp4_allgather"]
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -547,7 +550,7 @@ class DeepseekV2MoE(nn.Module):
             )
             kwargs["topk_output"] = StandardTopKOutput(topk_weights, topk_ids, None)
 
-        if global_server_args_dict["enable_flashinfer_fp4_allgather"]:
+        if should_use_flashinfer_cutlass_moe_fp4_allgather():
             kwargs["forward_batch"] = forward_batch
         final_hidden_states = self.experts(**kwargs)
         if not _is_cuda and not _use_aiter:
@@ -563,7 +566,7 @@ class DeepseekV2MoE(nn.Module):
             self.tp_size > 1
             and not can_fuse_mlp_allreduce
             and not use_reduce_scatter
-            and not global_server_args_dict["enable_flashinfer_fp4_allgather"]
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
