@@ -17,6 +17,18 @@ class TestGptOss4Gpu(BaseTestGptOss):
             other_args=["--tp", "4"],
         )
 
+    def test_mxfp4_120b(self):
+        self.run_test(
+            model_variant="120b",
+            quantization="mxfp4",
+            # TODO
+            expected_score_of_reasoning_effort={
+                "low": 0.50,
+                "medium": 0.50,
+                "high": 0.50,
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
