@@ -8,12 +8,116 @@ use sglang_router_rs::openai_api_types::{
 };
 use sglang_router_rs::routers::request_adapter::{RouteableRequest, ToPdRequest};
 
+/// Create a default GenerateRequest for benchmarks with minimal fields set
+fn default_generate_request() -> GenerateRequest {
+    GenerateRequest {
+        text: None,
+        prompt: None,
+        input_ids: None,
+        stream: false,
+        parameters: None,
+        sampling_params: None,
+        return_logprob: false,
+        // SGLang Extensions
+        lora_path: None,
+        session_params: None,
+        return_hidden_states: false,
+        rid: None,
+    }
+}
+
+/// Create a default ChatCompletionRequest for benchmarks with minimal fields set
+fn default_chat_completion_request() -> ChatCompletionRequest {
+    ChatCompletionRequest {
+        model: String::new(),
+        messages: vec![],
+        max_tokens: None,
+        max_completion_tokens: None,
+        temperature: None,
+        top_p: None,
+        n: None,
+        stream: false,
+        stream_options: None,
+        stop: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        logit_bias: None,
+        logprobs: false,
+        top_logprobs: None,
+        user: None,
+        response_format: None,
+        seed: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        function_call: None,
+        functions: None,
+        // SGLang Extensions
+        top_k: None,
+        min_p: None,
+        min_tokens: None,
+        repetition_penalty: None,
+        regex: None,
+        ebnf: None,
+        stop_token_ids: None,
+        no_stop_trim: false,
+        ignore_eos: false,
+        continue_final_message: false,
+        skip_special_tokens: true,
+        // SGLang Extensions
+        lora_path: None,
+        session_params: None,
+        separate_reasoning: true,
+        stream_reasoning: true,
+        return_hidden_states: false,
+    }
+}
+
+/// Create a default CompletionRequest for benchmarks with minimal fields set
+fn default_completion_request() -> CompletionRequest {
+    CompletionRequest {
+        model: String::new(),
+        prompt: StringOrArray::String(String::new()),
+        suffix: None,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        n: None,
+        stream: false,
+        stream_options: None,
+        logprobs: None,
+        echo: false,
+        stop: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        best_of: None,
+        logit_bias: None,
+        user: None,
+        seed: None,
+        // SGLang Extensions
+        top_k: None,
+        min_p: None,
+        min_tokens: None,
+        repetition_penalty: None,
+        regex: None,
+        ebnf: None,
+        json_schema: None,
+        stop_token_ids: None,
+        no_stop_trim: false,
+        ignore_eos: false,
+        skip_special_tokens: true,
+        // SGLang Extensions
+        lora_path: None,
+        session_params: None,
+        return_hidden_states: false,
+        other: serde_json::Map::new(),
+    }
+}
+
 // Sample request data for benchmarks
 fn create_sample_generate_request() -> GenerateRequest {
     GenerateRequest {
         text: Some("Write a story about artificial intelligence".to_string()),
-        input_ids: None,
-        prompt: None,
         parameters: Some(GenerateParameters {
             max_new_tokens: Some(100),
             temperature: Some(0.8),
@@ -31,8 +135,7 @@ fn create_sample_generate_request() -> GenerateRequest {
             repetition_penalty: Some(1.0),
             ..Default::default()
         }),
-        stream: false,
-        return_logprob: false,
+        ..default_generate_request()
     }
 }
 
@@ -58,22 +161,10 @@ fn create_sample_chat_completion_request() -> ChatCompletionRequest {
         temperature: Some(0.7),
         top_p: Some(1.0),
         n: Some(1),
-        stream: false,
-        stream_options: None,
-        stop: None,
         presence_penalty: Some(0.0),
         frequency_penalty: Some(0.0),
-        logit_bias: None,
-        logprobs: false,
-        top_logprobs: None,
-        user: None,
-        response_format: None,
-        seed: None,
-        tools: None,
-        tool_choice: None,
         parallel_tool_calls: Some(true),
-        function_call: None,
-        functions: None,
+        ..default_chat_completion_request()
     }
 }
 
@@ -81,23 +172,14 @@ fn create_sample_completion_request() -> CompletionRequest {
     CompletionRequest {
         model: "text-davinci-003".to_string(),
         prompt: StringOrArray::String("Complete this sentence: The future of AI is".to_string()),
-        suffix: None,
         max_tokens: Some(50),
         temperature: Some(0.8),
         top_p: Some(1.0),
         n: Some(1),
-        stream: false,
-        stream_options: None,
-        logprobs: None,
-        echo: false,
-        stop: None,
         presence_penalty: Some(0.0),
         frequency_penalty: Some(0.0),
         best_of: Some(1),
-        logit_bias: None,
-        user: None,
-        seed: None,
-        other: serde_json::Map::new(),
+        ..default_completion_request()
     }
 }
 
@@ -121,6 +203,7 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
             name: None,
             tool_calls: None,
             function_call: None,
+            reasoning_content: None,
         });
     }
 
@@ -132,22 +215,13 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
         temperature: Some(0.7),
         top_p: Some(0.95),
         n: Some(1),
-        stream: false,
-        stream_options: None,
-        stop: None,
         presence_penalty: Some(0.1),
         frequency_penalty: Some(0.1),
-        logit_bias: None,
-        logprobs: false,
         top_logprobs: Some(5),
         user: Some("benchmark_user".to_string()),
-        response_format: None,
         seed: Some(42),
-        tools: None,
-        tool_choice: None,
         parallel_tool_calls: Some(true),
-        function_call: None,
-        functions: None,
+        ..default_chat_completion_request()
     }
 }
 
@@ -331,32 +405,17 @@ fn bench_throughput_by_size(c: &mut Criterion) {
     // Create requests of different sizes
     let small_generate = GenerateRequest {
         text: Some("Hi".to_string()),
-        input_ids: None,
-        prompt: None,
-        parameters: None,
-        sampling_params: None,
-        stream: false,
-        return_logprob: false,
+        ..default_generate_request()
     };
 
     let medium_generate = GenerateRequest {
         text: Some("Write a medium length story about AI".repeat(10)),
-        input_ids: None,
-        prompt: None,
-        parameters: None,
-        sampling_params: None,
-        stream: false,
-        return_logprob: false,
+        ..default_generate_request()
     };
 
     let large_generate = GenerateRequest {
         text: Some("Write a very long and detailed story about artificial intelligence and its impact on society".repeat(100)),
-        input_ids: None,
-        prompt: None,
-        parameters: None,
-        sampling_params: None,
-        stream: false,
-        return_logprob: false,
+        ..default_generate_request()
     };
 
     for (name, req) in [

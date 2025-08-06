@@ -6,6 +6,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// Helper function for serde default value
+fn default_true() -> bool {
+    true
+}
+
+// ============= SGLang-Specific Types =============
+
+/// LoRA adapter path - can be single path or batch of paths
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum LoRAPath {
+    Single(Option<String>),
+    Batch(Vec<Option<String>>),
+}
+
 /// Common trait for all generation requests
 pub trait GenerationRequest: Send + Sync {
     /// Check if the request is for streaming
@@ -92,6 +107,64 @@ pub struct CompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
 
+    // ============= SGLang Extensions =============
+    /// Top-k sampling parameter (-1 to disable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
+
+    /// Min-p nucleus sampling parameter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+
+    /// Minimum number of tokens to generate
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_tokens: Option<u32>,
+
+    /// Repetition penalty for reducing repetitive text
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
+
+    /// Regex constraint for output generation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+
+    /// EBNF grammar constraint for structured output
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ebnf: Option<String>,
+
+    /// JSON schema constraint for structured output
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json_schema: Option<String>,
+
+    /// Specific token IDs to use as stop conditions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_token_ids: Option<Vec<i32>>,
+
+    /// Skip trimming stop tokens from output
+    #[serde(default)]
+    pub no_stop_trim: bool,
+
+    /// Ignore end-of-sequence tokens during generation
+    #[serde(default)]
+    pub ignore_eos: bool,
+
+    /// Skip special tokens during detokenization
+    #[serde(default = "default_true")]
+    pub skip_special_tokens: bool,
+
+    // ============= SGLang Extensions =============
+    /// Path to LoRA adapter(s) for model customization
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lora_path: Option<LoRAPath>,
+
+    /// Session parameters for continual prompting
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_params: Option<HashMap<String, serde_json::Value>>,
+
+    /// Return model hidden states
+    #[serde(default)]
+    pub return_hidden_states: bool,
+
     /// Additional fields including bootstrap info for PD routing
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
@@ -166,7 +239,7 @@ pub struct ChatCompletionRequest {
 
     /// Modify the likelihood of specified tokens appearing in the completion
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub logit_bias: Option<HashMap<String, i32>>,
+    pub logit_bias: Option<HashMap<String, f32>>,
 
     /// A unique identifier representing your end-user
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,6 +280,72 @@ pub struct ChatCompletionRequest {
     /// Deprecated: use tool_choice instead
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function_call: Option<FunctionCall>,
+
+    // ============= SGLang Extensions =============
+    /// Top-k sampling parameter (-1 to disable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
+
+    /// Min-p nucleus sampling parameter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+
+    /// Minimum number of tokens to generate
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_tokens: Option<u32>,
+
+    /// Repetition penalty for reducing repetitive text
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
+
+    /// Regex constraint for output generation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+
+    /// EBNF grammar constraint for structured output
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ebnf: Option<String>,
+
+    /// Specific token IDs to use as stop conditions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_token_ids: Option<Vec<i32>>,
+
+    /// Skip trimming stop tokens from output
+    #[serde(default)]
+    pub no_stop_trim: bool,
+
+    /// Ignore end-of-sequence tokens during generation
+    #[serde(default)]
+    pub ignore_eos: bool,
+
+    /// Continue generating from final assistant message
+    #[serde(default)]
+    pub continue_final_message: bool,
+
+    /// Skip special tokens during detokenization
+    #[serde(default = "default_true")]
+    pub skip_special_tokens: bool,
+
+    // ============= SGLang Extensions =============
+    /// Path to LoRA adapter(s) for model customization
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lora_path: Option<LoRAPath>,
+
+    /// Session parameters for continual prompting
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_params: Option<HashMap<String, serde_json::Value>>,
+
+    /// Separate reasoning content from final answer (O1-style models)
+    #[serde(default = "default_true")]
+    pub separate_reasoning: bool,
+
+    /// Stream reasoning tokens during generation
+    #[serde(default = "default_true")]
+    pub stream_reasoning: bool,
+
+    /// Return model hidden states
+    #[serde(default)]
+    pub return_hidden_states: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -234,6 +373,9 @@ pub enum ChatMessage {
         tool_calls: Option<Vec<ToolCall>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         function_call: Option<FunctionCallResponse>,
+        /// Reasoning content for O1-style models (SGLang extension)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
     },
     Tool {
         role: String, // "tool"
@@ -378,7 +520,20 @@ impl GenerationRequest for ChatCompletionRequest {
                         Some(texts.join(" "))
                     }
                 },
-                ChatMessage::Assistant { content, .. } => content.clone(),
+                ChatMessage::Assistant {
+                    content,
+                    reasoning_content,
+                    ..
+                } => {
+                    // Combine content and reasoning content for routing decisions
+                    let main_content = content.clone().unwrap_or_default();
+                    let reasoning = reasoning_content.clone().unwrap_or_default();
+                    if main_content.is_empty() && reasoning.is_empty() {
+                        None
+                    } else {
+                        Some(format!("{} {}", main_content, reasoning).trim().to_string())
+                    }
+                }
                 ChatMessage::Tool { content, .. } => Some(content.clone()),
                 ChatMessage::Function { content, .. } => Some(content.clone()),
             })
@@ -418,6 +573,23 @@ pub struct GenerateRequest {
     /// Whether to return logprobs
     #[serde(default)]
     pub return_logprob: bool,
+
+    // ============= SGLang Extensions =============
+    /// Path to LoRA adapter(s) for model customization
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lora_path: Option<LoRAPath>,
+
+    /// Session parameters for continual prompting
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_params: Option<HashMap<String, serde_json::Value>>,
+
+    /// Return model hidden states
+    #[serde(default)]
+    pub return_hidden_states: bool,
+
+    /// Request ID for tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rid: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -485,6 +657,18 @@ pub struct SamplingParams {
     pub skip_special_tokens: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub json_schema: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ebnf: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_token_ids: Option<Vec<i32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_stop_trim: Option<bool>,
 }
 
 impl GenerationRequest for GenerateRequest {
@@ -561,6 +745,12 @@ pub struct CompletionChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<LogProbs>,
     pub finish_reason: Option<String>, // "stop", "length", "content_filter", etc.
+    /// Information about which stop condition was matched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<serde_json::Value>, // Can be string or integer
+    /// Hidden states from the model (SGLang extension)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden_states: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -591,6 +781,12 @@ pub struct ChatChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>, // "stop", "length", "tool_calls", "content_filter", "function_call"
+    /// Information about which stop condition was matched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<serde_json::Value>, // Can be string or integer
+    /// Hidden states from the model (SGLang extension)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden_states: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -681,6 +877,9 @@ pub struct ChatMessageDelta {
     pub tool_calls: Option<Vec<ToolCallDelta>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function_call: Option<FunctionCallDelta>,
+    /// Reasoning content delta for O1-style models (SGLang extension)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

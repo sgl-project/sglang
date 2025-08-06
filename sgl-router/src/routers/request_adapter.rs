@@ -176,6 +176,33 @@ impl ToPdRequest for CompletionRequest {
             self.stream => "stream"
         );
 
+        // Add SGLang extension fields
+        insert_if_some!(other,
+            // SGLang Extensions - Priority 1
+            self.top_k => "top_k",
+            self.min_p => "min_p",
+            self.min_tokens => "min_tokens",
+            self.repetition_penalty => "repetition_penalty",
+            self.regex => "regex",
+            self.ebnf => "ebnf",
+            self.stop_token_ids => "stop_token_ids",
+            // SGLang Extensions - Priority 2
+            self.lora_path => "lora_path",
+            self.session_params => "session_params"
+        );
+
+        // SGLang boolean extensions (CompletionRequest has these as bool, not Option<bool>)
+        other.insert("no_stop_trim".to_string(), self.no_stop_trim.into());
+        other.insert("ignore_eos".to_string(), self.ignore_eos.into());
+        other.insert(
+            "skip_special_tokens".to_string(),
+            self.skip_special_tokens.into(),
+        );
+        other.insert(
+            "return_hidden_states".to_string(),
+            self.return_hidden_states.into(),
+        );
+
         GenerateReqInput {
             text,
             input_ids: None,
@@ -226,13 +253,45 @@ impl ToPdRequest for ChatCompletionRequest {
             self.tool_choice => "tool_choice",
             self.parallel_tool_calls => "parallel_tool_calls",
             self.functions => "functions",
-            self.function_call => "function_call"
+            self.function_call => "function_call",
+            // SGLang Extensions - Priority 1
+            self.top_k => "top_k",
+            self.min_p => "min_p",
+            self.min_tokens => "min_tokens",
+            self.repetition_penalty => "repetition_penalty",
+            self.regex => "regex",
+            self.ebnf => "ebnf",
+            self.stop_token_ids => "stop_token_ids",
+            // SGLang Extensions - Priority 2
+            self.lora_path => "lora_path",
+            self.session_params => "session_params"
         );
 
-        // Handle boolean logprobs flag
+        // Handle boolean flags
         if self.logprobs {
             other.insert("logprobs".to_string(), true.into());
         }
+
+        // SGLang boolean extensions (ChatCompletionRequest has these as bool, not Option<bool>)
+        other.insert("no_stop_trim".to_string(), self.no_stop_trim.into());
+        other.insert("ignore_eos".to_string(), self.ignore_eos.into());
+        other.insert(
+            "continue_final_message".to_string(),
+            self.continue_final_message.into(),
+        );
+        other.insert(
+            "skip_special_tokens".to_string(),
+            self.skip_special_tokens.into(),
+        );
+        other.insert(
+            "separate_reasoning".to_string(),
+            self.separate_reasoning.into(),
+        );
+        other.insert("stream_reasoning".to_string(), self.stream_reasoning.into());
+        other.insert(
+            "return_hidden_states".to_string(),
+            self.return_hidden_states.into(),
+        );
 
         ChatReqInput {
             stream: self.stream,
@@ -271,18 +330,136 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
 
-    // ============= GenerateRequest to_pd_request Tests =============
+    // ============= Test Helper Functions =============
+    //
+    // These helper functions create default request instances with all required SGLang extension fields
+    // properly initialized. Use the struct spread operator `..default_*_request()` to override only
+    // the fields you need for specific tests, avoiding repetitive boilerplate code.
+    //
+    // Example usage:
+    //   let req = GenerateRequest {
+    //       text: Some("Custom text".to_string()),
+    //       stream: true,
+    //       ..default_generate_request()
+    //   };
 
-    #[test]
-    fn test_generate_to_pd_request_with_text_only() {
-        let req = GenerateRequest {
-            text: Some("Hello world".to_string()),
+    /// Create a default GenerateRequest with minimal fields set
+    fn default_generate_request() -> GenerateRequest {
+        GenerateRequest {
+            text: None,
             prompt: None,
             input_ids: None,
             stream: false,
             parameters: None,
             sampling_params: None,
             return_logprob: false,
+            // SGLang Extensions
+            lora_path: None,
+            session_params: None,
+            return_hidden_states: false,
+            rid: None,
+        }
+    }
+
+    /// Create a default CompletionRequest with minimal fields set
+    fn default_completion_request() -> CompletionRequest {
+        CompletionRequest {
+            model: "test-model".to_string(),
+            prompt: StringOrArray::String("test prompt".to_string()),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: false,
+            stream_options: None,
+            logprobs: None,
+            echo: false,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            best_of: None,
+            logit_bias: None,
+            user: None,
+            seed: None,
+            suffix: None,
+            // SGLang Extensions
+            top_k: None,
+            min_p: None,
+            min_tokens: None,
+            repetition_penalty: None,
+            regex: None,
+            ebnf: None,
+            json_schema: None,
+            stop_token_ids: None,
+            no_stop_trim: false,
+            ignore_eos: false,
+            skip_special_tokens: true,
+            // SGLang Extensions
+            lora_path: None,
+            session_params: None,
+            return_hidden_states: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    /// Create a default ChatCompletionRequest with minimal fields set
+    fn default_chat_completion_request() -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                role: "user".to_string(),
+                content: UserMessageContent::Text("test message".to_string()),
+                name: None,
+            }],
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: false,
+            stream_options: None,
+            stop: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logit_bias: None,
+            logprobs: false,
+            top_logprobs: None,
+            user: None,
+            seed: None,
+            response_format: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            functions: None,
+            function_call: None,
+            // SGLang Extensions
+            top_k: None,
+            min_p: None,
+            min_tokens: None,
+            repetition_penalty: None,
+            regex: None,
+            ebnf: None,
+            stop_token_ids: None,
+            no_stop_trim: false,
+            ignore_eos: false,
+            continue_final_message: false,
+            skip_special_tokens: true,
+            // SGLang Extensions
+            lora_path: None,
+            session_params: None,
+            separate_reasoning: true,
+            stream_reasoning: true,
+            return_hidden_states: false,
+        }
+    }
+
+    // ============= GenerateRequest to_pd_request Tests =============
+
+    #[test]
+    fn test_generate_to_pd_request_with_text_only() {
+        let req = GenerateRequest {
+            text: Some("Hello world".to_string()),
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -308,13 +485,10 @@ mod tests {
     #[test]
     fn test_generate_to_pd_request_with_prompt_string() {
         let req = GenerateRequest {
-            text: None,
             prompt: Some(StringOrArray::String("Test prompt".to_string())),
-            input_ids: None,
             stream: true,
-            parameters: None,
-            sampling_params: None,
             return_logprob: true,
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -342,6 +516,7 @@ mod tests {
             parameters: None,
             sampling_params: None,
             return_logprob: false,
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -360,13 +535,8 @@ mod tests {
     #[test]
     fn test_generate_to_pd_request_with_single_input_ids() {
         let req = GenerateRequest {
-            text: None,
-            prompt: None,
             input_ids: Some(InputIds::Single(vec![100, 200, 300, 400])),
-            stream: false,
-            parameters: None,
-            sampling_params: None,
-            return_logprob: false,
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -381,17 +551,12 @@ mod tests {
     #[test]
     fn test_generate_to_pd_request_with_batch_input_ids() {
         let req = GenerateRequest {
-            text: None,
-            prompt: None,
             input_ids: Some(InputIds::Batch(vec![
                 vec![1, 2, 3],
                 vec![4, 5, 6, 7],
                 vec![8, 9],
             ])),
-            stream: false,
-            parameters: None,
-            sampling_params: None,
-            return_logprob: false,
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -413,10 +578,7 @@ mod tests {
             text: Some("SGLang text".to_string()),
             prompt: Some(StringOrArray::String("OpenAI prompt".to_string())),
             input_ids: Some(InputIds::Single(vec![1, 2, 3])),
-            stream: false,
-            parameters: None,
-            sampling_params: None,
-            return_logprob: false,
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -429,13 +591,9 @@ mod tests {
     #[test]
     fn test_generate_to_pd_request_priority_prompt_over_input_ids() {
         let req = GenerateRequest {
-            text: None,
             prompt: Some(StringOrArray::String("OpenAI prompt".to_string())),
             input_ids: Some(InputIds::Single(vec![1, 2, 3])),
-            stream: false,
-            parameters: None,
-            sampling_params: None,
-            return_logprob: false,
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -459,12 +617,8 @@ mod tests {
 
         let req = GenerateRequest {
             text: Some("test".to_string()),
-            prompt: None,
-            input_ids: None,
-            stream: false,
             parameters: Some(params),
-            sampling_params: None,
-            return_logprob: false,
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -497,12 +651,8 @@ mod tests {
 
         let req = GenerateRequest {
             text: Some("test".to_string()),
-            prompt: None,
-            input_ids: None,
-            stream: false,
-            parameters: None,
             sampling_params: Some(sampling),
-            return_logprob: false,
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -546,6 +696,7 @@ mod tests {
             parameters: Some(params),
             sampling_params: Some(sampling),
             return_logprob: false,
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -568,6 +719,7 @@ mod tests {
             parameters: Some(params),
             sampling_params: None,
             return_logprob: false,
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -603,6 +755,7 @@ mod tests {
             parameters: Some(params),
             sampling_params: Some(sampling),
             return_logprob: true,
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -632,23 +785,7 @@ mod tests {
         let req = CompletionRequest {
             model: "gpt-3.5-turbo".to_string(),
             prompt: StringOrArray::String("Complete this sentence".to_string()),
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            n: None,
-            stream: false,
-            stream_options: None,
-            logprobs: None,
-            echo: false,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            best_of: None,
-            logit_bias: None,
-            user: None,
-            seed: None,
-            suffix: None,
-            other: serde_json::Map::new(),
+            ..default_completion_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -672,23 +809,7 @@ mod tests {
                 "First prompt".to_string(),
                 "Second prompt".to_string(),
             ]),
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            n: None,
-            stream: false,
-            stream_options: None,
-            logprobs: None,
-            echo: false,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            best_of: None,
-            logit_bias: None,
-            user: None,
-            seed: None,
-            suffix: None,
-            other: serde_json::Map::new(),
+            ..default_completion_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -727,7 +848,7 @@ mod tests {
             user: Some("user123".to_string()),
             seed: Some(42),
             suffix: Some("...".to_string()),
-            other: serde_json::Map::new(),
+            ..default_completion_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -771,7 +892,7 @@ mod tests {
             user: None,
             seed: None,
             suffix: None,
-            other: serde_json::Map::new(),
+            ..default_completion_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -803,7 +924,7 @@ mod tests {
             user: None,
             seed: None,
             suffix: None,
-            other: serde_json::Map::new(),
+            ..default_completion_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -834,27 +955,7 @@ mod tests {
         let req = ChatCompletionRequest {
             messages,
             model: "gpt-4".to_string(),
-            temperature: None,
-            top_p: None,
-            n: None,
-            stream: false,
-            stream_options: None,
-            stop: None,
-            max_tokens: None,
-            max_completion_tokens: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            logit_bias: None,
-            logprobs: false,
-            top_logprobs: None,
-            user: None,
-            seed: None,
-            response_format: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            functions: None,
-            function_call: None,
+            ..default_chat_completion_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -883,7 +984,7 @@ mod tests {
         }];
 
         let mut logit_bias = HashMap::new();
-        logit_bias.insert("50256".to_string(), -100);
+        logit_bias.insert("50256".to_string(), -100.0f32);
 
         let tool = Tool {
             tool_type: "function".to_string(),
@@ -920,6 +1021,7 @@ mod tests {
             parallel_tool_calls: Some(false),
             functions: None,
             function_call: None,
+            ..default_chat_completion_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -968,27 +1070,7 @@ mod tests {
         let req = ChatCompletionRequest {
             messages,
             model: "gpt-4-vision".to_string(),
-            temperature: None,
-            top_p: None,
-            n: None,
-            stream: false,
-            stream_options: None,
-            stop: None,
-            max_tokens: None,
-            max_completion_tokens: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            logit_bias: None,
-            logprobs: false,
-            top_logprobs: None,
-            user: None,
-            seed: None,
-            response_format: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            functions: None,
-            function_call: None,
+            ..default_chat_completion_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -1037,6 +1119,7 @@ mod tests {
             parallel_tool_calls: None,
             functions: None,
             function_call: None,
+            ..default_chat_completion_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -1054,32 +1137,13 @@ mod tests {
             name: None,
             tool_calls: None,
             function_call: None,
+            reasoning_content: None,
         }];
 
         let req = ChatCompletionRequest {
             messages,
             model: "gpt-3.5-turbo".to_string(),
-            temperature: None,
-            top_p: None,
-            n: None,
-            stream: false,
-            stream_options: None,
-            stop: None,
-            max_tokens: None,
-            max_completion_tokens: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            logit_bias: None,
-            logprobs: false,
-            top_logprobs: None,
-            user: None,
-            seed: None,
-            response_format: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            functions: None,
-            function_call: None,
+            ..default_chat_completion_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -1101,12 +1165,7 @@ mod tests {
     fn test_routeable_request_to_json() {
         let req = GenerateRequest {
             text: Some("test".to_string()),
-            prompt: None,
-            input_ids: None,
-            stream: false,
-            parameters: None,
-            sampling_params: None,
-            return_logprob: false,
+            ..default_generate_request()
         };
 
         let json = req.to_json().unwrap();
@@ -1166,6 +1225,7 @@ mod tests {
             parameters: Some(params),
             sampling_params: None,
             return_logprob: false,
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -1187,6 +1247,7 @@ mod tests {
             parameters: None,
             sampling_params: None,
             return_logprob: false,
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -1206,12 +1267,7 @@ mod tests {
 
         let req = GenerateRequest {
             text: Some(unicode_text.clone()),
-            prompt: None,
-            input_ids: None,
-            stream: false,
-            parameters: None,
-            sampling_params: None,
-            return_logprob: false,
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -1250,6 +1306,7 @@ mod tests {
             parameters: Some(params),
             sampling_params: None,
             return_logprob: false,
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -1265,12 +1322,7 @@ mod tests {
     fn test_bootstrap_fields_none() {
         let req = GenerateRequest {
             text: Some("test".to_string()),
-            prompt: None,
-            input_ids: None,
-            stream: false,
-            parameters: None,
-            sampling_params: None,
-            return_logprob: false,
+            ..default_generate_request()
         };
 
         let pd_req = req.to_pd_request();
@@ -1278,5 +1330,183 @@ mod tests {
         assert_eq!(pd_req.bootstrap_host, None);
         assert_eq!(pd_req.bootstrap_port, None);
         assert_eq!(pd_req.bootstrap_room, None);
+    }
+
+    // ============= SGLang Extension Field Pass-Through Tests =============
+
+    #[test]
+    fn test_chat_completion_sglang_extensions_passed_through() {
+        let messages = vec![ChatMessage::User {
+            role: "user".to_string(),
+            content: UserMessageContent::Text("Test".to_string()),
+            name: None,
+        }];
+
+        let mut session_params = std::collections::HashMap::new();
+        session_params.insert(
+            "key".to_string(),
+            serde_json::Value::String("value".to_string()),
+        );
+
+        let req = ChatCompletionRequest {
+            messages,
+            model: "test-model".to_string(),
+            // SGLang Extensions - Priority 1
+            top_k: Some(40),
+            min_p: Some(0.05),
+            min_tokens: Some(10),
+            repetition_penalty: Some(1.1),
+            regex: Some("test_regex".to_string()),
+            ebnf: Some("test_ebnf".to_string()),
+            stop_token_ids: Some(vec![1, 2, 3]),
+            // SGLang Extensions - Priority 2
+            lora_path: Some(LoRAPath::Single(Some("test_lora.bin".to_string()))),
+            session_params: Some(session_params.clone()),
+            // Boolean extensions (ChatCompletionRequest has these as bool, not Option<bool>)
+            no_stop_trim: true,
+            ignore_eos: false,
+            continue_final_message: true,
+            skip_special_tokens: false,
+            separate_reasoning: true,
+            stream_reasoning: false,
+            return_hidden_states: true,
+            ..default_chat_completion_request()
+        };
+
+        let pd_req = req.to_pd_request();
+        let other = pd_req.other.as_object().unwrap();
+
+        // Verify SGLang extensions are passed through
+        assert_eq!(other.get("top_k"), Some(&json!(40)));
+        assert!((other.get("min_p").unwrap().as_f64().unwrap() - 0.05).abs() < 0.0001);
+        assert_eq!(other.get("min_tokens"), Some(&json!(10)));
+        assert!((other.get("repetition_penalty").unwrap().as_f64().unwrap() - 1.1).abs() < 0.0001);
+        assert_eq!(other.get("regex"), Some(&json!("test_regex")));
+        assert_eq!(other.get("ebnf"), Some(&json!("test_ebnf")));
+        assert_eq!(other.get("stop_token_ids"), Some(&json!(vec![1, 2, 3])));
+        assert_eq!(other.get("lora_path"), Some(&json!("test_lora.bin")));
+        assert_eq!(
+            other.get("session_params"),
+            Some(&serde_json::to_value(&session_params).unwrap())
+        );
+
+        // Verify boolean extensions
+        assert_eq!(other.get("no_stop_trim"), Some(&json!(true)));
+        assert_eq!(other.get("ignore_eos"), Some(&json!(false)));
+        assert_eq!(other.get("continue_final_message"), Some(&json!(true)));
+        assert_eq!(other.get("skip_special_tokens"), Some(&json!(false)));
+        assert_eq!(other.get("separate_reasoning"), Some(&json!(true)));
+        assert_eq!(other.get("stream_reasoning"), Some(&json!(false)));
+        assert_eq!(other.get("return_hidden_states"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn test_completion_request_sglang_extensions_passed_through() {
+        let mut session_params = std::collections::HashMap::new();
+        session_params.insert(
+            "key".to_string(),
+            serde_json::Value::String("value".to_string()),
+        );
+
+        let req = CompletionRequest {
+            prompt: StringOrArray::String("Test prompt".to_string()),
+            model: "test-model".to_string(),
+            // SGLang Extensions - Priority 1
+            top_k: Some(40),
+            min_p: Some(0.05),
+            min_tokens: Some(10),
+            repetition_penalty: Some(1.1),
+            regex: Some("test_regex".to_string()),
+            ebnf: Some("test_ebnf".to_string()),
+            stop_token_ids: Some(vec![1, 2, 3]),
+            // SGLang Extensions - Priority 2
+            lora_path: Some(LoRAPath::Single(Some("test_lora.bin".to_string()))),
+            session_params: Some(session_params.clone()),
+            // Boolean extensions (CompletionRequest only has these 4 boolean fields)
+            no_stop_trim: true,
+            ignore_eos: false,
+            skip_special_tokens: false,
+            return_hidden_states: true,
+            ..default_completion_request()
+        };
+
+        let pd_req = req.to_pd_request();
+        let other = pd_req.other.as_object().unwrap();
+
+        // Verify SGLang extensions are passed through
+        assert_eq!(other.get("top_k"), Some(&json!(40)));
+        assert!((other.get("min_p").unwrap().as_f64().unwrap() - 0.05).abs() < 0.0001);
+        assert_eq!(other.get("min_tokens"), Some(&json!(10)));
+        assert!((other.get("repetition_penalty").unwrap().as_f64().unwrap() - 1.1).abs() < 0.0001);
+        assert_eq!(other.get("regex"), Some(&json!("test_regex")));
+        assert_eq!(other.get("ebnf"), Some(&json!("test_ebnf")));
+        assert_eq!(other.get("stop_token_ids"), Some(&json!(vec![1, 2, 3])));
+        assert_eq!(other.get("lora_path"), Some(&json!("test_lora.bin")));
+        assert_eq!(
+            other.get("session_params"),
+            Some(&serde_json::to_value(&session_params).unwrap())
+        );
+
+        // Verify boolean extensions (only the ones CompletionRequest has)
+        assert_eq!(other.get("no_stop_trim"), Some(&json!(true)));
+        assert_eq!(other.get("ignore_eos"), Some(&json!(false)));
+        assert_eq!(other.get("skip_special_tokens"), Some(&json!(false)));
+        assert_eq!(other.get("return_hidden_states"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn test_sglang_extensions_none_values_not_passed_through() {
+        let messages = vec![ChatMessage::User {
+            role: "user".to_string(),
+            content: UserMessageContent::Text("Test".to_string()),
+            name: None,
+        }];
+
+        let req = ChatCompletionRequest {
+            messages,
+            model: "test-model".to_string(),
+            // All SGLang extensions as None/default - Optional fields won't appear, bools will use defaults
+            top_k: None,
+            min_p: None,
+            min_tokens: None,
+            repetition_penalty: None,
+            regex: None,
+            ebnf: None,
+            stop_token_ids: None,
+            lora_path: None,
+            session_params: None,
+            // Boolean fields use defaults (false for most, true for some with default_true)
+            no_stop_trim: false,
+            ignore_eos: false,
+            continue_final_message: false,
+            skip_special_tokens: true, // This has default_true
+            separate_reasoning: true,  // This has default_true
+            stream_reasoning: true,    // This has default_true
+            return_hidden_states: false,
+            ..default_chat_completion_request()
+        };
+
+        let pd_req = req.to_pd_request();
+        let other = pd_req.other.as_object().unwrap();
+
+        // Verify None values are not included
+        assert!(!other.contains_key("top_k"));
+        assert!(!other.contains_key("min_p"));
+        assert!(!other.contains_key("min_tokens"));
+        assert!(!other.contains_key("repetition_penalty"));
+        assert!(!other.contains_key("regex"));
+        assert!(!other.contains_key("ebnf"));
+        assert!(!other.contains_key("stop_token_ids"));
+        assert!(!other.contains_key("lora_path"));
+        assert!(!other.contains_key("session_params"));
+
+        // Boolean fields are always present with their values (can't be None)
+        assert_eq!(other.get("no_stop_trim"), Some(&json!(false)));
+        assert_eq!(other.get("ignore_eos"), Some(&json!(false)));
+        assert_eq!(other.get("continue_final_message"), Some(&json!(false)));
+        assert_eq!(other.get("skip_special_tokens"), Some(&json!(true))); // default_true
+        assert_eq!(other.get("separate_reasoning"), Some(&json!(true))); // default_true
+        assert_eq!(other.get("stream_reasoning"), Some(&json!(true))); // default_true
+        assert_eq!(other.get("return_hidden_states"), Some(&json!(false)));
     }
 }
