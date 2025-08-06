@@ -571,8 +571,7 @@ class SchedulerOutputProcessorMixin:
 
                 req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)
-                if self.skip_tokenizer_init:
-                    output_ids.append(req.output_ids[send_token_offset:])
+                output_ids.append(req.output_ids[send_token_offset:])
                 req.send_token_offset = len(req.output_ids)
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(
