@@ -64,7 +64,7 @@ suites = {
         TestFile("test_fp8_kernel.py", 8),
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
-        TestFile("test_gpt_oss_1gpu.py", 300),
+        TestFile("test_gpt_oss_1gpu.py", 900),
         TestFile("test_hicache.py", 116),
         TestFile("test_hicache_mla.py", 127),
         TestFile("test_hicache_storage.py", 127),
