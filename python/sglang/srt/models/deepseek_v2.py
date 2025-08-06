@@ -160,7 +160,7 @@ class AttnForwardMethod(IntEnum):
     # Use multi-head attention, but with KV cache chunked.
     # This method can avoid OOM when prefix lengths are long.
     MHA_CHUNKED_KV = auto()
-    
+
     # Use MLA but with fused RoPE
     MLA_FUSED_ROPE = auto()
 
@@ -1833,7 +1833,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
-    
+
     def forward_absorb_fused_mla_rope_cpu_core(
         self, q_input, k_input, v_input, forward_batch, zero_allocator
     ):
@@ -2354,7 +2354,6 @@ class DeepseekV2Model(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
-
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = self.norm(hidden_states)
@@ -2366,7 +2365,7 @@ class DeepseekV2Model(nn.Module):
 class DeepseekV2ForCausalLM(nn.Module):
     # for quark model load
     packed_modules_mapping = {}
-    
+
     # for hip attention
     hip_attention_supported = True
 
