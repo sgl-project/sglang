@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from python.sglang.srt.layers.radix_attention import RadixAttention
-
 """
 Support attention backend for TRTLLM MLA kernels from flashinfer.
 """
