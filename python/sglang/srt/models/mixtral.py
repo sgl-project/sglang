@@ -104,7 +104,6 @@ class MixtralMoE(nn.Module):
             intermediate_size=intermediate_size,
             params_dtype=params_dtype,
             quant_config=quant_config,
-            tp_size=tp_size,
             prefix=add_prefix("experts", prefix),
         )
 
