@@ -51,7 +51,7 @@ def _fwd_kernel(
     kv_indices,
     mask_ptr,
     mask_indptr,
-    sk_ptr,
+    sink_ptr,
     sm_scale,
     kv_group_num,
     stride_qbs,
@@ -79,7 +79,7 @@ def _fwd_kernel(
     IS_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
-    HAS_SK: tl.constexpr,
+    HAS_SINK: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -302,9 +302,9 @@ def _fwd_kernel(
 
         e_max = n_e_max
 
-    if HAS_SK:
-        cur_sk = tl.load(sk_ptr + cur_head)
-        deno += tl.exp(cur_sk - e_max)
+    if HAS_SINK:
+        cur_sink = tl.load(sink_ptr + cur_head)
+        deno += tl.exp(cur_sink - e_max)
 
     offs_o = (
         (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
@@ -344,7 +344,7 @@ def extend_attention_fwd(
     logit_cap=0.0,
     skip_prefix_custom_mask=True,
     sliding_window_size=-1,
-    sk=None,
+    sinks=None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -410,7 +410,7 @@ def extend_attention_fwd(
     # Skip custom mask for prefix part
     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
 
-    HAS_SK = sk is not None
+    HAS_SINK = sinks is not None
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_stages = 1
@@ -431,7 +431,7 @@ def extend_attention_fwd(
         kv_indices,
         custom_mask,
         mask_indptr,
-        sk,
+        sinks,
         sm_scale,
         kv_group_num,
         q_extend.stride(0),
@@ -458,7 +458,7 @@ def extend_attention_fwd(
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
-        HAS_SK=HAS_SK,
+        HAS_SINK=HAS_SINK,
         STORE_TRANSPOSE=_is_hip,
         num_warps=num_warps,
         num_stages=num_stages,
