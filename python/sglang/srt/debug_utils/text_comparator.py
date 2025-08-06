@@ -14,8 +14,7 @@ Supported inputs:
 
 
 def main(args):
-    # TODO support old
-    if True:
+    if args.data_type == "simple_evals":
         df_input = _compute_df_input_mode_simple_evals(args)
     else:
         df_input = _transform_df_input(_compute_df_raw(args))
@@ -160,7 +159,7 @@ def _transform_df_input(df: pl.DataFrame):
         print("Transform mode: SGLang bench")
         return df
     else:
-        raise Exception(f"Unknown data: {df.columns}")
+        raise Exception(f"Unknown data: {df.columns}. You may need to set `--data-type` if using e.g. simple_evals.")
 
 
 def _compute_df_meta(df_input: pl.DataFrame):
@@ -214,6 +213,7 @@ def _compute_str_prefix_len(a: str, b: str) -> int:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=_DESCRIPTION)
+    parser.add_argument("--data-type", type=str, default="auto")
     parser.add_argument("--baseline-path", type=str, nargs="+")
     parser.add_argument("--target-path", type=str, nargs="+")
     parser.add_argument(
