@@ -1105,9 +1105,10 @@ def launch_server(
     finally:
         warmup_thread.join()
 
+
 def _execute_server_warmup(
     server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection]
+    pipe_finish_writer: Optional[multiprocessing.connection.Connection],
 ):
     def _generate_passkey_sample(length):
         passkey = "The passkey is **000310**. " * 3

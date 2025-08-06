@@ -284,6 +284,7 @@ class GraphRunner:
         self.enable_hip_attention = model_runner.server_args.enable_hip_attention
         if self.enable_hip_attention:
             from hip_attn.v1_2.paged_hip import cuda_graph_capture_configs
+
             self.capture_configs = cuda_graph_capture_configs(self.hip_config)
         else:
             self.capture_configs = [()]

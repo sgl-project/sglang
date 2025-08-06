@@ -72,8 +72,8 @@ from sglang.srt.utils import flatten_nested_list, support_triton
 if TYPE_CHECKING:
     from hip_attn.v1_2 import HiPAttentionConfig, HiPMaskRefreshState
 
-    from sglang.srt.server_args import ServerArgs
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 

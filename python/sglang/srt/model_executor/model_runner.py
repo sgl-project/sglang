@@ -53,8 +53,8 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.hf_transformers_utils import get_context_length, update_context_length
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -1623,9 +1623,7 @@ class ModelRunner:
 
     def _get_attention_backend_from_str(self, backend_str: str):
         if backend_str == "hip_attention":
-            from sglang.srt.layers.attention.hip_attention import (
-                HiPAttentionBackend,
-            )
+            from sglang.srt.layers.attention.hip_attention import HiPAttentionBackend
 
             return HiPAttentionBackend(self)
         elif backend_str == "flashinfer":

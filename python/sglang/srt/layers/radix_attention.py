@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Optional
 from torch import nn
 
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
+
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch

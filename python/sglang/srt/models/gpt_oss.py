@@ -334,7 +334,7 @@ class GptOssAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        
+
         # RoPE is applied inside the attention kernel in HiP Attention
         if not (
             forward_batch.hip_metadata_cache_pool is not None
