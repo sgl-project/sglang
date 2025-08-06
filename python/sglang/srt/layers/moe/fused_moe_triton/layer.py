@@ -719,7 +719,6 @@ class FusedMoE(torch.nn.Module):
         tp_rank = self.moe_tp_rank
 
         if self.quant_config is not None and self.quant_config.get_name() == "mxfp4":
-            # print(f"weight_name: {weight_name}, shard_id: {shard_id}, loaded_weight.shape: {loaded_weight.shape}, param.data.shape: {param.data.shape}")
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
                 param.data[:, :dim1].copy_(loaded_weight)
