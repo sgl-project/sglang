@@ -244,7 +244,10 @@ class MooncakeStore(HiCacheStorage):
                 return None
             # Since mooncake store is stored in layer by layer,
             # only the first layer is checked here.
-            _keys.append(f"{key}_{local_rank}_k")
+            if self.is_mla_model:
+                _keys.append(f"{key}_0_0_k")
+            else:
+                _keys.append(f"{key}_{local_rank}_0_k")
         result = {k: v for k, v in zip(keys, self.store.batch_is_exist(_keys))}
         return result
 
