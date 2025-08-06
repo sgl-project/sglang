@@ -81,6 +81,7 @@ def fused_add_rmsnorm(
         input, residual, weight, eps, enable_pdl
     )
 
+
 def fused_rmsnorm_quant(
     input: torch.Tensor,
     output_q: torch.Tensor,
@@ -132,7 +133,17 @@ def fused_rmsnorm_quant(
     if enable_pdl is None:
         enable_pdl = is_hopper_arch()
     torch.ops.sgl_kernel.fused_rmsnorm_quant.default(
-            input, output_q, output_s, weight, group_size, rms_eps, quant_eps, fp8_min, fp8_max, scale_ue8m0, enable_pdl
+        input,
+        output_q,
+        output_s,
+        weight,
+        group_size,
+        rms_eps,
+        quant_eps,
+        fp8_min,
+        fp8_max,
+        scale_ue8m0,
+        enable_pdl,
     )
 
 
@@ -193,7 +204,18 @@ def fused_add_rmsnorm_quant(
     if enable_pdl is None:
         enable_pdl = is_hopper_arch()
     torch.ops.sgl_kernel.fused_add_rmsnorm_quant.default(
-            input, residual, output_q, output_s, weight, group_size, rms_eps, quant_eps, fp8_min, fp8_max, scale_ue8m0, enable_pdl
+        input,
+        residual,
+        output_q,
+        output_s,
+        weight,
+        group_size,
+        rms_eps,
+        quant_eps,
+        fp8_min,
+        fp8_max,
+        scale_ue8m0,
+        enable_pdl,
     )
 
 
