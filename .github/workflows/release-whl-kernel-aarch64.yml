@@ -19,7 +19,7 @@ concurrency:
 jobs:
   build-cu128-aarch64:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: sgl-kernel-build-node-arm
+    runs-on: ubuntu-22.04-arm
     strategy:
       matrix:
         python-version: ['3.9']
@@ -48,7 +48,7 @@ jobs:
 
   release:
     needs: build-cu128-aarch64
-    runs-on: sgl-kernel-release-node-arm
+    runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v4
 
