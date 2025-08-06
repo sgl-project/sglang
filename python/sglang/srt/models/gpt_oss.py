@@ -110,7 +110,9 @@ class GptOssSparseMoeBlock(nn.Module):
         experts_type = get_moe_impl_class()
         extra_kwargs = {}
         if experts_type.__name__ == "FusedMoE":
-            quant_config_name = quant_config.get_name() if quant_config is not None else None
+            quant_config_name = (
+                quant_config.get_name() if quant_config is not None else None
+            )
             extra_kwargs = {
                 "enable_flashinfer_cutlass_moe": global_server_args_dict[
                     "enable_flashinfer_cutlass_moe"
@@ -662,24 +664,39 @@ class GptOssForCausalLM(nn.Module):
         is_nextn: bool = False,
         weight_name_mapping: dict = None,
     ):
-        quant_config_name = self.quant_config.get_name() if self.quant_config is not None else None
+        quant_config_name = (
+            self.quant_config.get_name() if self.quant_config is not None else None
+        )
         if quant_config_name != "mxfp4":
-            self._load_normal_weights(weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping)
+            self._load_normal_weights(
+                weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
+            )
         else:
-            self._load_weights_mxfp4(weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping)
+            self._load_weights_mxfp4(
+                weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
+            )
 
     def _load_weights_mxfp4(self, weights, is_nextn, weight_name_mapping):
         mxfp4_weights = []
         normal_weights = []
 
         for name, weight in weights:
-            if ".experts" in name and self.quant_config is not None and self.quant_config.get_name() == "mxfp4":
+            if (
+                ".experts" in name
+                and self.quant_config is not None
+                and self.quant_config.get_name() == "mxfp4"
+            ):
                 mxfp4_weights.append((name, weight))
             else:
                 normal_weights.append((name, weight))
 
         mxfp4_loaded_params = self._load_mxfp4_experts_weights(mxfp4_weights)
-        self._load_normal_weights(normal_weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping, other_loaded_param_names=mxfp4_loaded_params)
+        self._load_normal_weights(
+            normal_weights,
+            is_nextn=is_nextn,
+            weight_name_mapping=weight_name_mapping,
+            other_loaded_param_names=mxfp4_loaded_params,
+        )
 
     def _load_mxfp4_experts_weights(self, weights):
 
@@ -817,8 +834,11 @@ class GptOssForCausalLM(nn.Module):
         return loaded_params
 
     def _load_normal_weights(
-        self, weights, is_nextn: bool, weight_name_mapping: dict,
-        other_loaded_param_names = [],
+        self,
+        weights,
+        is_nextn: bool,
+        weight_name_mapping: dict,
+        other_loaded_param_names=[],
     ):
         tp_rank = get_tensor_model_parallel_rank()
         if is_nextn:
