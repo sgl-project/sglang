@@ -116,16 +116,22 @@ class ModelOptFp8Config(QuantizationConfig):
         # In future modelopt will deprecate hf_quant_config.json, and only keep config.json.
         # For legacy reasons, we keep hf_quant_config.json for now.
 
+        # Initialize variables
+        kv_cache_quant_method = None
+        exclude_modules = None
+
         # Try flat format first (config.json quantization_config - preferred format)
         quant_method = config.get("quant_algo")
         if quant_method is not None:
             # Flat format (config.json quantization_config)
             # For kv_cache, check if kv_cache_scheme exists and extract algo
             kv_cache_scheme = config.get("kv_cache_scheme")
-            if kv_cache_scheme and kv_cache_scheme.get("type") == "float":
+            if (
+                kv_cache_scheme
+                and kv_cache_scheme.get("type") == "float"
+                and kv_cache_scheme.get("num_bits") == 8
+            ):
                 kv_cache_quant_method = "FP8"
-            else:
-                kv_cache_quant_method = None
 
             # Map 'ignore' field to 'exclude_modules'
             exclude_modules = config.get("ignore")
@@ -141,10 +147,14 @@ class ModelOptFp8Config(QuantizationConfig):
                     "Cannot find 'quant_algo' in the model's quantization config. "
                     "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
                 )
-
+        if quant_method is None:
+            raise ValueError(
+                "Cannot find 'quant_algo' in the model's quantization config. "
+            )
         if "FP8" not in quant_method:
             raise ValueError(
-                "ModelOpt only supports static FP8 quantization in SGLang. "
+                "ModelOptFp8Config only supports static FP8 quantization in SGLang. "
+                "For FP4 quantization, use ModelOptFp4Config. "
                 "Check the quantization config for your model's configuration."
             )
 
@@ -521,6 +531,11 @@ class ModelOptFp4Config(QuantizationConfig):
         # In future modelopt will deprecate hf_quant_config.json, and only keep config.json.
         # For legacy reasons, we keep hf_quant_config.json for now.
 
+        # Initialize variables
+        kv_cache_quant_algo = None
+        group_size = None
+        exclude_modules = []
+
         # Try flat format first (config.json quantization_config - preferred format)
         quant_method = config.get("quant_algo")
         if quant_method is not None:
@@ -531,7 +546,11 @@ class ModelOptFp4Config(QuantizationConfig):
             if not kv_cache_quant_algo:
                 # For config.json format, derive from kv_cache_scheme if available
                 kv_cache_scheme = config.get("kv_cache_scheme")
-                if kv_cache_scheme and kv_cache_scheme.get("type") == "float":
+                if (
+                    kv_cache_scheme
+                    and kv_cache_scheme.get("type") == "float"
+                    and kv_cache_scheme.get("num_bits") == 8
+                ):
                     kv_cache_quant_algo = "FP8"
                 else:
                     kv_cache_quant_algo = "auto"
@@ -548,7 +567,7 @@ class ModelOptFp4Config(QuantizationConfig):
                     kv_cache_quant_algo = "auto"
                 group_size = quant_config.get("group_size")
                 exclude_modules = quant_config.get("exclude_modules", [])
-            except ValueError:
+            except (ValueError, KeyError):
                 raise ValueError(
                     "Cannot find 'quant_algo' in the model's quantization config. "
                     "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
@@ -562,7 +581,7 @@ class ModelOptFp4Config(QuantizationConfig):
             )
         is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
 
-        if not (group_size and kv_cache_quant_algo and exclude_modules):
+        if not (group_size and kv_cache_quant_algo) or exclude_modules is None:
             logger.warning(
                 f"group_size: {group_size},"
                 f"kv_cache_quant_algo: {kv_cache_quant_algo},"
