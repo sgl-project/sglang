@@ -584,6 +584,10 @@ class HiCacheController:
                     self.mooncake_page_transfer(operation)
                 else:
                     self.generic_page_transfer(operation)
+
+                if self.tp_world_size > 1:
+                    # to ensure all TP workers release the host memory at the same time
+                    torch.distributed.barrier(group=self.prefetch_tp_group)
                 # operation terminated by controller, release pre-allocated memory
                 self.mem_pool_host.free(
                     operation.host_indices[operation.completed_tokens :]
