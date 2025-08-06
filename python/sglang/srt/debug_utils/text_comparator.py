@@ -85,7 +85,9 @@ def _compute_df_input_one_mode_simple_evals(path, category, trial_index):
     rows = []
 
     for single_eval_result in data["metadata"]["single_eval_results"]:
-        prompt = single_eval_result["example_level_metadata"]["actual_queried_prompt_messages"]
+        prompt = single_eval_result["example_level_metadata"][
+            "actual_queried_prompt_messages"
+        ]
         score = single_eval_result["score"]
         assert score in {0.0, 1.0}, f"{score=}"
 
@@ -106,13 +108,17 @@ def _compute_id_from_object(obj):
     if isinstance(obj, pl.Series):
         obj = obj.to_list()
     json_str = json.dumps(obj, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
+    return hashlib.sha256(json_str.encode("utf-8")).hexdigest()
 
 
 def _compute_df_raw(args):
     return pl.concat(
         [
-            _read_df_raw(path=info["path"], category=info["category"], trial_index=info["trial_index"])
+            _read_df_raw(
+                path=info["path"],
+                category=info["category"],
+                trial_index=info["trial_index"],
+            )
             for info in _get_file_infos(args=args)
         ]
     )
@@ -159,7 +165,9 @@ def _transform_df_input(df: pl.DataFrame):
         print("Transform mode: SGLang bench")
         return df
     else:
-        raise Exception(f"Unknown data: {df.columns}. You may need to set `--data-type` if using e.g. simple_evals.")
+        raise Exception(
+            f"Unknown data: {df.columns}. You may need to set `--data-type` if using e.g. simple_evals."
+        )
 
 
 def _compute_df_meta(df_input: pl.DataFrame):
@@ -178,7 +186,9 @@ def _compute_df_meta(df_input: pl.DataFrame):
 
 
 def _handle_one_prompt(df_one_prompt: pl.DataFrame):
-    assert len(set(_compute_id_from_object(obj) for obj in df_one_prompt["prompt"])) == 1
+    assert (
+        len(set(_compute_id_from_object(obj) for obj in df_one_prompt["prompt"])) == 1
+    )
 
     df_baseline = df_one_prompt.filter(pl.col("category") == "baseline")
     df_target = df_one_prompt.filter(pl.col("category") == "target")
