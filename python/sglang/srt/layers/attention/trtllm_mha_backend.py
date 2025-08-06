@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 """
-Support attention backend for TRTLLM MLA kernels from flashinfer.
+Support attention backend for TRTLLM MHA kernels from flashinfer.
+The kernel supports sm100 only, with sliding window and attention sink features.
 """
 
 from dataclasses import dataclass
@@ -242,7 +243,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sk", None)
-        # print(f"decode attention_sink: {attention_sink}")
         bmm1_scale = q_scale * k_scale * layer.scaling
         bmm2_scale = 1.0
 
@@ -294,7 +294,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # TODO: Change once quantization is supported
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sk", None)
-        # print(f"prefill attention_sink: {attention_sink}")
         q_scale = 1.0
         k_scale = (
             layer.k_scale_float
