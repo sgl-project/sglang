@@ -1,8 +1,7 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
-
-use super::bootstrap_injector::inject_bootstrap_fields;
-use super::pd_types::{api_path, PDRouterError};
+use super::pd_types::{api_path, Bootstrap, GenerateReqInput, PDRouterError};
+use super::request_adapter::ToPdRequest;
 use crate::config::types::RetryConfig;
 use crate::core::{HealthChecker, Worker, WorkerFactory, WorkerLoadGuard};
 use crate::metrics::RouterMetrics;
@@ -1310,23 +1309,20 @@ impl RouterTrait for PDRouter {
         body: &GenerateRequest,
     ) -> Response {
         let start = Instant::now();
+        let mut pd_req = body.clone().to_pd_request();
 
-        // Convert directly to JSON to preserve all fields automatically
-        let mut json = match serde_json::to_value(body) {
-            Ok(json) => json,
-            Err(e) => return Self::handle_serialization_error(e),
-        };
+        // Get stream flag and return_logprob flag before moving the request
+        let is_stream = pd_req.stream;
+        let return_logprob = pd_req
+            .other
+            .get("return_logprob")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-        // Extract flags for routing logic
-        let is_stream = body.stream;
-        let return_logprob = body.return_logprob;
-
-        // Extract text for cache-aware routing
-        let request_text = body.text.as_deref().or_else(|| {
-            body.prompt.as_ref().and_then(|p| match p {
-                crate::openai_api_types::StringOrArray::String(s) => Some(s.as_str()),
-                crate::openai_api_types::StringOrArray::Array(v) => v.first().map(|s| s.as_str()),
-            })
+        // Extract text for cache-aware routing from the typed request
+        let request_text = pd_req.text.as_ref().and_then(|t| match t {
+            super::pd_types::InputText::Single(s) => Some(s.as_str()),
+            super::pd_types::InputText::Batch(v) => v.first().map(|s| s.as_str()),
         });
 
         // Select servers
@@ -1342,15 +1338,20 @@ impl RouterTrait for PDRouter {
             decode.url()
         );
 
-        // Inject bootstrap fields directly into JSON
-        if let Err(e) = inject_bootstrap_fields(&mut json, prefill.as_ref()) {
+        // Add bootstrap info using the trait method
+        if let Err(e) = pd_req.add_bootstrap_info(prefill.as_ref()) {
             return Self::handle_bootstrap_error(e);
         }
+        // Convert to JSON after bootstrap injection
+        let json_with_bootstrap = match serde_json::to_value(&pd_req) {
+            Ok(json) => json,
+            Err(e) => return Self::handle_serialization_error(e),
+        };
 
         // Execute dual dispatch
         self.execute_dual_dispatch(
             headers,
-            json,
+            json_with_bootstrap,
             "/generate",
             prefill.as_ref(),
             decode.as_ref(),
@@ -1368,27 +1369,21 @@ impl RouterTrait for PDRouter {
     ) -> Response {
         let start = Instant::now();
 
-        // Convert directly to JSON to preserve all fields automatically
-        let mut json = match serde_json::to_value(body) {
-            Ok(json) => json,
-            Err(e) => return Self::handle_serialization_error(e),
-        };
+        // Convert OpenAI format to PD format
+        let mut pd_req = body.clone().to_pd_request();
 
-        // Extract flags for routing logic
-        let is_stream = body.stream;
+        // Get stream flag and return_logprob flag before moving the request
+        let is_stream = pd_req.stream;
         let return_logprob = body.logprobs;
 
         // Extract text for cache-aware routing from chat messages
-        let request_text = body.messages.first().and_then(|msg| match msg {
-            crate::openai_api_types::ChatMessage::User { content, .. } => {
-                match content {
-                    crate::openai_api_types::UserMessageContent::Text(text) => Some(text.as_str()),
-                    crate::openai_api_types::UserMessageContent::Parts(_) => None, // Skip complex content
-                }
-            }
-            crate::openai_api_types::ChatMessage::System { content, .. } => Some(content.as_str()),
-            _ => None,
-        });
+        let request_text = pd_req
+            .other
+            .get("messages")
+            .and_then(|messages| messages.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|msg| msg.get("content"))
+            .and_then(|content| content.as_str());
 
         // Select servers
         let (prefill, decode) = match self.select_pd_pair(request_text).await {
@@ -1403,15 +1398,20 @@ impl RouterTrait for PDRouter {
             decode.url()
         );
 
-        // Inject bootstrap fields directly into JSON
-        if let Err(e) = inject_bootstrap_fields(&mut json, prefill.as_ref()) {
+        if let Err(e) = pd_req.add_bootstrap_info(prefill.as_ref()) {
             return Self::handle_bootstrap_error(e);
         }
+
+        // Convert to JSON after bootstrap injection
+        let json_with_bootstrap = match serde_json::to_value(&body) {
+            Ok(json) => json,
+            Err(e) => return Self::handle_serialization_error(e),
+        };
 
         // Execute dual dispatch
         self.execute_dual_dispatch(
             headers,
-            json,
+            json_with_bootstrap,
             "/v1/chat/completions",
             prefill.as_ref(),
             decode.as_ref(),
@@ -1429,20 +1429,13 @@ impl RouterTrait for PDRouter {
     ) -> Response {
         let start = Instant::now();
 
-        // Convert directly to JSON to preserve all fields automatically
-        let mut json = match serde_json::to_value(body) {
-            Ok(json) => json,
-            Err(e) => return Self::handle_serialization_error(e),
-        };
-
-        // Extract flags for routing logic
+        let return_logprob = body.logprobs.map(|x| x > 1).unwrap_or(false);
         let is_stream = body.stream;
-        let return_logprob = body.logprobs.is_some();
 
-        // Extract text for cache-aware routing
+        // Extract text for cache-aware routing from the typed request
         let request_text = match &body.prompt {
             crate::openai_api_types::StringOrArray::String(s) => Some(s.as_str()),
-            crate::openai_api_types::StringOrArray::Array(v) => v.first().map(|s| s.as_str()),
+            crate::openai_api_types::StringOrArray::Array(arr) => arr.first().map(|s| s.as_str()),
         };
 
         // Select servers
@@ -1458,15 +1451,20 @@ impl RouterTrait for PDRouter {
             decode.url()
         );
 
-        // Inject bootstrap fields directly into JSON
-        if let Err(e) = inject_bootstrap_fields(&mut json, prefill.as_ref()) {
+        if let Err(e) = body.clone().add_bootstrap_info(prefill.as_ref()) {
             return Self::handle_bootstrap_error(e);
         }
+
+        // Convert to JSON after bootstrap injection
+        let json_with_bootstrap = match serde_json::to_value(&body) {
+            Ok(json) => json,
+            Err(e) => return Self::handle_serialization_error(e),
+        };
 
         // Execute dual dispatch
         self.execute_dual_dispatch(
             headers,
-            json,
+            json_with_bootstrap,
             "/v1/completions",
             prefill.as_ref(),
             decode.as_ref(),
@@ -1691,6 +1689,7 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
     use crate::policies::{CacheAwarePolicy, RandomPolicy};
+    use crate::routers::pd_types::SingleOrBatch;
 
     fn create_test_pd_router() -> PDRouter {
         let prefill_policy = Arc::new(RandomPolicy::new());
@@ -1937,6 +1936,90 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // ============= Bootstrap Injection Tests =============
+
+    #[test]
+    fn test_bootstrap_injection_with_existing_fields() {
+        let mut req = GenerateReqInput {
+            text: Some(SingleOrBatch::Single("Test".to_string())),
+            input_ids: None,
+            stream: false,
+            bootstrap_host: Some(SingleOrBatch::Single("existing-host".to_string())),
+            bootstrap_port: Some(SingleOrBatch::Single(Some(9999))),
+            bootstrap_room: Some(SingleOrBatch::Single(12345)),
+            other: Value::Object(serde_json::Map::new()),
+        };
+
+        let prefill_worker = create_test_worker(
+            "http://new-host:8000".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: Some(8080),
+            },
+            true,
+        );
+
+        // Bootstrap info is added regardless of existing fields
+        let result = req.add_bootstrap_info(prefill_worker.as_ref());
+        assert!(result.is_ok());
+
+        // Bootstrap info should be updated with new values
+        assert_eq!(
+            req.bootstrap_host,
+            Some(SingleOrBatch::Single("new-host".to_string()))
+        );
+        assert_eq!(req.bootstrap_port, Some(SingleOrBatch::Single(Some(8080))));
+        // Room should be regenerated (different from original)
+        if let Some(SingleOrBatch::Single(room)) = req.bootstrap_room {
+            assert_ne!(room, 12345);
+        } else {
+            panic!("Expected single room ID");
+        }
+    }
+
+    #[test]
+    fn test_bootstrap_room_generation() {
+        let mut req1 = GenerateReqInput {
+            text: Some(SingleOrBatch::Single("Test".to_string())),
+            input_ids: None,
+            stream: false,
+            bootstrap_host: None,
+            bootstrap_port: None,
+            bootstrap_room: None,
+            other: Value::Object(serde_json::Map::new()),
+        };
+
+        let mut req2 = GenerateReqInput {
+            text: Some(SingleOrBatch::Single("Test".to_string())),
+            input_ids: None,
+            stream: false,
+            bootstrap_host: None,
+            bootstrap_port: None,
+            bootstrap_room: None,
+            other: Value::Object(serde_json::Map::new()),
+        };
+
+        let prefill_worker = create_test_worker(
+            "http://host:8000".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: Some(8080),
+            },
+            true,
+        );
+
+        // Add bootstrap info to both requests
+        let _ = req1.add_bootstrap_info(prefill_worker.as_ref());
+        let _ = req2.add_bootstrap_info(prefill_worker.as_ref());
+
+        // Room IDs should be different
+        if let (Some(SingleOrBatch::Single(room1)), Some(SingleOrBatch::Single(room2))) =
+            (req1.bootstrap_room, req2.bootstrap_room)
+        {
+            assert_ne!(room1, room2, "Room IDs should be unique");
+        } else {
+            panic!("Expected single room IDs");
+        }
+    }
+
     // ============= Worker Selection Tests =============
 
     #[tokio::test]
@@ -2113,159 +2196,5 @@ mod tests {
         // Check final state
         let workers = router.prefill_workers.read().unwrap();
         assert_eq!(workers.len(), 5);
-    }
-
-    #[tokio::test]
-    async fn test_simplified_routing_preserves_sglang_fields() {
-        use crate::openai_api_types::GenerateRequest;
-        use crate::routers::bootstrap_injector::inject_bootstrap_fields;
-
-        // Create a test worker
-        let worker = BasicWorker::new(
-            "http://test-server:8000".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: Some(5678),
-            },
-        );
-
-        // Create a GenerateRequest with SGLang extensions
-        let mut session_params = std::collections::HashMap::new();
-        session_params.insert("test_key".to_string(), serde_json::json!("test_value"));
-
-        let request = GenerateRequest {
-            text: Some("Test prompt".to_string()),
-            stream: false,
-            return_logprob: true,
-            // SGLang extensions
-            lora_path: Some(crate::openai_api_types::LoRAPath::Single(Some(
-                "test.bin".to_string(),
-            ))),
-            session_params: Some(session_params.clone()),
-            return_hidden_states: true,
-            rid: Some("test-request-id".to_string()),
-            // Other fields default to None/false
-            prompt: None,
-            input_ids: None,
-            parameters: None,
-            sampling_params: None,
-        };
-
-        // Convert to JSON (simulating the simplified routing path)
-        let mut json = serde_json::to_value(&request).unwrap();
-
-        // Inject bootstrap fields
-        let result = inject_bootstrap_fields(&mut json, &worker);
-        assert!(result.is_ok());
-
-        // Verify all SGLang fields are preserved
-        assert_eq!(json["text"], serde_json::json!("Test prompt"));
-        assert_eq!(json["stream"], serde_json::json!(false));
-        assert_eq!(json["return_logprob"], serde_json::json!(true));
-        assert_eq!(json["lora_path"], serde_json::json!("test.bin")); // LoRAPath::Single serializes as just the inner value
-        assert_eq!(
-            json["session_params"],
-            serde_json::to_value(&session_params).unwrap()
-        );
-        assert_eq!(json["return_hidden_states"], serde_json::json!(true));
-        assert_eq!(json["rid"], serde_json::json!("test-request-id"));
-
-        // Verify bootstrap fields were added
-        assert_eq!(json["bootstrap_host"], serde_json::json!("test-server"));
-        assert_eq!(json["bootstrap_port"], serde_json::json!(5678));
-        assert!(json["bootstrap_room"].is_number());
-    }
-
-    #[tokio::test]
-    async fn test_simplified_routing_chat_completion() {
-        use crate::openai_api_types::{ChatCompletionRequest, ChatMessage, UserMessageContent};
-        use crate::routers::bootstrap_injector::inject_bootstrap_fields;
-
-        // Create a test worker
-        let worker = BasicWorker::new(
-            "http://chat-server:8000".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: Some(9999),
-            },
-        );
-
-        // Create a ChatCompletionRequest with SGLang extensions
-        let request = ChatCompletionRequest {
-            model: "gpt-4".to_string(),
-            messages: vec![ChatMessage::User {
-                role: "user".to_string(),
-                content: UserMessageContent::Text("Hello world!".to_string()),
-                name: None,
-            }],
-            stream: false,
-            n: Some(2), // This should create batch bootstrap
-            // SGLang extensions
-            top_k: Some(50),
-            separate_reasoning: false,
-            stream_reasoning: true,
-            // Set all other fields to defaults
-            temperature: None,
-            top_p: None,
-            stream_options: None,
-            stop: None,
-            max_tokens: None,
-            max_completion_tokens: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            logit_bias: None,
-            user: None,
-            seed: None,
-            logprobs: false,
-            top_logprobs: None,
-            response_format: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            functions: None,
-            function_call: None,
-            min_p: None,
-            min_tokens: None,
-            repetition_penalty: None,
-            regex: None,
-            ebnf: None,
-            stop_token_ids: None,
-            no_stop_trim: false,
-            ignore_eos: false,
-            continue_final_message: false,
-            skip_special_tokens: true,
-            lora_path: None,
-            session_params: None,
-            return_hidden_states: false,
-        };
-
-        // Convert to JSON (simulating the simplified routing path)
-        let mut json = serde_json::to_value(&request).unwrap();
-
-        // Inject bootstrap fields
-        let result = inject_bootstrap_fields(&mut json, &worker);
-        assert!(result.is_ok());
-
-        // Verify original fields preserved
-        assert_eq!(json["model"], serde_json::json!("gpt-4"));
-        assert_eq!(json["stream"], serde_json::json!(false));
-        assert_eq!(json["n"], serde_json::json!(2));
-        assert_eq!(json["top_k"], serde_json::json!(50));
-        assert_eq!(json["separate_reasoning"], serde_json::json!(false));
-        assert_eq!(json["stream_reasoning"], serde_json::json!(true));
-
-        // Verify batch bootstrap fields for n=2
-        let bootstrap_hosts = json["bootstrap_host"].as_array().unwrap();
-        assert_eq!(bootstrap_hosts.len(), 2);
-        assert_eq!(bootstrap_hosts[0], serde_json::json!("chat-server"));
-        assert_eq!(bootstrap_hosts[1], serde_json::json!("chat-server"));
-
-        let bootstrap_ports = json["bootstrap_port"].as_array().unwrap();
-        assert_eq!(bootstrap_ports.len(), 2);
-        assert_eq!(bootstrap_ports[0], serde_json::json!(9999));
-        assert_eq!(bootstrap_ports[1], serde_json::json!(9999));
-
-        let bootstrap_rooms = json["bootstrap_room"].as_array().unwrap();
-        assert_eq!(bootstrap_rooms.len(), 2);
-        // Rooms should be different (randomness)
-        assert_ne!(bootstrap_rooms[0], bootstrap_rooms[1]);
     }
 }

@@ -23,7 +23,7 @@ class BenchmarkRunner:
         self.timestamp = time.strftime("%a %b %d %H:%M:%S UTC %Y", time.gmtime())
 
     def run_command(
-        self, cmd: List[str], capture_output: bool = False
+            self, cmd: List[str], capture_output: bool = False
     ) -> subprocess.CompletedProcess:
         """Run a command and handle errors."""
         try:
@@ -56,10 +56,10 @@ class BenchmarkRunner:
             sys.exit(1)
 
     def run_benchmarks(
-        self,
-        quick_mode: bool = False,
-        save_baseline: Optional[str] = None,
-        compare_baseline: Optional[str] = None,
+            self,
+            quick_mode: bool = False,
+            save_baseline: Optional[str] = None,
+            compare_baseline: Optional[str] = None,
     ) -> str:
         """Run benchmarks with specified options."""
         bench_args = ["cargo", "bench", "--bench", "request_processing"]
@@ -121,6 +121,8 @@ class BenchmarkRunner:
                     results["serialization_time"] = self._extract_time(line)
                 elif "Deserialization (avg):" in line:
                     results["deserialization_time"] = self._extract_time(line)
+                elif "PD Adaptation (avg):" in line:
+                    results["adaptation_time"] = self._extract_time(line)
                 elif "Total Pipeline (avg):" in line:
                     results["total_time"] = self._extract_time(line)
 
@@ -143,6 +145,7 @@ class BenchmarkRunner:
         thresholds = {
             "serialization_time": 2000,  # 2μs max
             "deserialization_time": 2000,  # 2μs max
+            "adaptation_time": 5000,  # 5μs max
             "total_time": 10000,  # 10μs max
         }
 
@@ -175,7 +178,7 @@ class BenchmarkRunner:
         return all_passed
 
     def save_results_to_file(
-        self, results: Dict[str, str], filename: str = "benchmark_results.env"
+            self, results: Dict[str, str], filename: str = "benchmark_results.env"
     ):
         """Save benchmark results to a file for CI consumption."""
         filepath = self.project_root / filename

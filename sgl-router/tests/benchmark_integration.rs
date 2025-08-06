@@ -1,15 +1,12 @@
 // Integration test to ensure benchmarks compile and basic functionality works
 // This prevents benchmarks from breaking in CI
-//
-// UPDATED: Removed deprecated ToPdRequest usage, now uses direct JSON serialization
 
-use serde_json::{from_str, to_string, to_value};
-use sglang_router_rs::core::{BasicWorker, WorkerType};
+use serde_json::{from_str, to_string};
 use sglang_router_rs::openai_api_types::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
     SamplingParams, StringOrArray, UserMessageContent,
 };
-use sglang_router_rs::routers::bootstrap_injector::inject_bootstrap_fields;
+use sglang_router_rs::routers::request_adapter::{RouteableRequest, ToPdRequest};
 
 /// Create a default GenerateRequest for benchmarks with minimal fields set
 fn default_generate_request() -> GenerateRequest {
@@ -117,15 +114,6 @@ fn default_completion_request() -> CompletionRequest {
     }
 }
 
-fn create_test_worker() -> BasicWorker {
-    BasicWorker::new(
-        "http://test-server:8000".to_string(),
-        WorkerType::Prefill {
-            bootstrap_port: Some(5678),
-        },
-    )
-}
-
 #[test]
 fn test_benchmark_request_creation() {
     // Ensure all benchmark request types can be created without panicking
@@ -209,8 +197,8 @@ fn test_benchmark_serialization_roundtrip() {
 }
 
 #[test]
-fn test_benchmark_bootstrap_injection() {
-    // Test that bootstrap injection works for benchmark types (replaces PD request adaptation)
+fn test_benchmark_request_adaptation() {
+    // Test that PD request adaptation works for benchmark types
 
     let generate_req = GenerateRequest {
         text: Some("Test prompt".to_string()),
@@ -248,40 +236,24 @@ fn test_benchmark_bootstrap_injection() {
         ..default_completion_request()
     };
 
-    let worker = create_test_worker();
-
-    // Test bootstrap injection (should not panic)
-    let mut generate_json = to_value(&generate_req).unwrap();
-    let mut chat_json = to_value(&chat_req).unwrap();
-    let mut completion_json = to_value(&completion_req).unwrap();
-
-    assert!(inject_bootstrap_fields(&mut generate_json, &worker).is_ok());
-    assert!(inject_bootstrap_fields(&mut chat_json, &worker).is_ok());
-    assert!(inject_bootstrap_fields(&mut completion_json, &worker).is_ok());
-
-    // Verify bootstrap fields were added
-    assert!(generate_json.get("bootstrap_host").is_some());
-    assert!(generate_json.get("bootstrap_port").is_some());
-    assert!(generate_json.get("bootstrap_room").is_some());
+    // Test PD adaptation (should not panic)
+    let _pd_generate = generate_req.to_pd_request();
+    let _pd_chat = chat_req.to_pd_request();
+    let _pd_completion = completion_req.to_pd_request();
 }
 
 #[test]
-fn test_benchmark_direct_json_routing() {
-    // Test direct JSON routing functionality for benchmark types (replaces regular routing)
+fn test_benchmark_regular_routing() {
+    // Test regular routing functionality for benchmark types
 
     let generate_req = GenerateRequest {
         text: Some("Test prompt".to_string()),
         ..default_generate_request()
     };
 
-    // Test direct JSON conversion (replaces regular routing methods)
-    let json = to_value(&generate_req).unwrap();
-    let json_string = to_string(&json).unwrap();
-    let bytes = json_string.as_bytes();
-
-    // Verify conversions work
-    assert!(!json_string.is_empty());
-    assert!(!bytes.is_empty());
+    // Test regular routing methods (should not panic)
+    let _json = generate_req.to_json();
+    let _bytes = generate_req.to_bytes();
 }
 
 #[test]
@@ -294,36 +266,23 @@ fn test_benchmark_performance_baseline() {
         ..default_generate_request()
     };
 
-    // Test the actual simplified pipeline: to_value + bootstrap injection
+    // Serialization should be fast (< 1ms for simple requests)
     let start = Instant::now();
-    let worker = create_test_worker();
-
-    // This mirrors the actual router pipeline
-    let mut json = to_value(&generate_req).unwrap();
-    let _ = inject_bootstrap_fields(&mut json, &worker);
-
-    let total_duration = start.elapsed();
+    let _json = to_string(&generate_req).unwrap();
+    let serialize_duration = start.elapsed();
     assert!(
-        total_duration.as_millis() < 5,
-        "Simplified pipeline took too long: {:?} (should be faster than old adapter approach)",
-        total_duration
+        serialize_duration.as_millis() < 1,
+        "Serialization took too long: {:?}",
+        serialize_duration
     );
 
-    // Individual components should also be fast
+    // PD adaptation should be very fast (< 1ms)
     let start = Instant::now();
-    let _json = to_value(&generate_req).unwrap();
-    let to_value_duration = start.elapsed();
-
-    let start = Instant::now();
-    let mut json = to_value(&generate_req).unwrap();
-    let _ = inject_bootstrap_fields(&mut json, &worker);
-    let inject_duration = start.elapsed();
-
-    // Bootstrap injection should be faster than the JSON conversion
+    let _pd_req = generate_req.to_pd_request();
+    let adapt_duration = start.elapsed();
     assert!(
-        inject_duration <= to_value_duration * 3,
-        "Bootstrap injection ({:?}) should not be much slower than JSON conversion ({:?})",
-        inject_duration,
-        to_value_duration
+        adapt_duration.as_millis() < 1,
+        "PD adaptation took too long: {:?}",
+        adapt_duration
     );
 }
