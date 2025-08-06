@@ -87,6 +87,7 @@ class Llama4MoE(nn.Module):
     def __init__(
         self,
         config: Llama4TextConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -114,6 +115,7 @@ class Llama4MoE(nn.Module):
             num_experts=config.num_local_experts,
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size_moe,
+            layer_id=layer_id,
             reduce_results=False,
             quant_config=quant_config,
             apply_router_weight_on_input=True,
@@ -239,13 +241,22 @@ class Llama4Attention(nn.Module):
             if self.use_qk_norm
             else None
         )
+
+        qkv_quant_config = quant_config
+        o_quant_config = quant_config
+        if quant_config and hasattr(quant_config, "ignore") and quant_config.ignore:
+            if add_prefix("q_proj", prefix) in quant_config.ignore:
+                qkv_quant_config = None
+            if add_prefix("o_proj", prefix) in quant_config.ignore:
+                o_quant_config = None
+
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
             head_size=self.head_dim,
             total_num_heads=self.total_num_heads,
             total_num_kv_heads=self.total_num_kv_heads,
             bias=bias,
-            quant_config=quant_config,
+            quant_config=qkv_quant_config,
             prefix=add_prefix("qkv_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -255,7 +266,7 @@ class Llama4Attention(nn.Module):
             input_size=self.total_num_heads * self.head_dim,
             output_size=hidden_size,
             bias=bias_o_proj,
-            quant_config=quant_config,
+            quant_config=o_quant_config,
             prefix=add_prefix("o_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -373,6 +384,7 @@ class Llama4DecoderLayer(nn.Module):
         if is_moe_layer:
             self.feed_forward = Llama4MoE(
                 config=config,
+                layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("feed_forward", prefix),
             )
@@ -403,6 +415,8 @@ class Llama4DecoderLayer(nn.Module):
         )
 
     def _is_moe_layer(self, layer_id: int) -> bool:
+        if self.config.interleave_moe_layer_step == 0:
+            return self.config.num_local_experts > 0
         return (layer_id + 1) % self.config.interleave_moe_layer_step == 0
 
     def forward(

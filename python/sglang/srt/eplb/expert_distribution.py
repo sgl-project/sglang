@@ -47,6 +47,11 @@ class ExpertDistributionRecorder(ABC):
         rank: int,
     ):
         if server_args.expert_distribution_recorder_mode is not None:
+            assert (
+                expert_location_metadata is not None
+            ), "ExpertLocationMetadata is required for expert distribution recording. One possible"
+            "reason is that you are using a model that does not support expert distribution"
+            "recording. Try setting `get_model_config_for_expert_location` in your model."
             return _ExpertDistributionRecorderReal(
                 server_args, expert_location_metadata, rank
             )
@@ -283,12 +288,14 @@ class _SinglePassGatherer(ABC):
             )
 
         if server_args.expert_distribution_recorder_mode == "stat_approx":
-            if server_args.enable_deepep_moe and (server_args.deepep_mode == "normal"):
+            if server_args.moe_a2a_backend is not None and (
+                server_args.deepep_mode == "normal"
+            ):
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
-        if server_args.enable_deepep_moe:
+        if server_args.moe_a2a_backend is not None:
             if server_args.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif server_args.deepep_mode == "low_latency":

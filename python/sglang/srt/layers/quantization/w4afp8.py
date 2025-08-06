@@ -276,12 +276,13 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer: EPMoE,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        **kwargs,
     ) -> torch.Tensor:
 
         # TODO(ch-wan): move it out of this class
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 
-        topk_ids, topk_weights, _ = topk_output
+        topk_weights, topk_ids, _ = topk_output
         local_topk_ids = topk_ids
         if layer.expert_map is not None:
             "Translate info from expert_map to topk_ids"

@@ -11,6 +11,6 @@ pub mod worker;
 // Re-export commonly used types at the module level
 pub use error::{WorkerError, WorkerResult};
 pub use worker::{
-    start_health_checker, BasicWorker, HealthChecker, Worker, WorkerCollection, WorkerFactory,
-    WorkerLoadGuard, WorkerType,
+    start_health_checker, BasicWorker, DPAwareWorker, HealthChecker, Worker, WorkerCollection,
+    WorkerFactory, WorkerLoadGuard, WorkerType,
 };
