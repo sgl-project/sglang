@@ -12,7 +12,9 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
 
 # Update pip
-pip install --upgrade pip --break-system-packages
+if [ "$MODE_BLACKWELL" != "1" ]; then
+    pip install --upgrade pip --break-system-packages
+fi
 
 # Clean up existing installations
 pip uninstall -y flashinfer flashinfer_python sgl-kernel sglang vllm || true
