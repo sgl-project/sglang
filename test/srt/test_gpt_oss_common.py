@@ -81,6 +81,7 @@ class BaseTestGptOss(CustomTestCase):
             num_examples=198,
             # use enough threads to allow parallelism
             num_threads=198,
+            # TODO 4k is still not enough, we need e.g. 64k token, but that is super slow
             # otherwise a lot of questions are not answered
             max_tokens=4096,
             # simple-evals by default use 0.5 and is better than 0.0 temperature
