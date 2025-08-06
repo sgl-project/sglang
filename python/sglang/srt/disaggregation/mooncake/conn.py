@@ -34,7 +34,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed import get_pp_group, get_pp_indices
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
