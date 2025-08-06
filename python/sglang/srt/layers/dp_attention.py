@@ -17,6 +17,9 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -73,6 +76,7 @@ class _DpGatheredBufferWrapper:
     _global_dp_buffer_len: int
     _local_dp_buffer_len: int
     _global_num_tokens: Optional[List[int]]
+    _is_max_padding: bool
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -85,27 +89,37 @@ class _DpGatheredBufferWrapper:
         cls,
         global_dp_buffer_len: int,
         local_dp_buffer_len: int,
+        is_max_padding: bool,
         global_num_tokens: Optional[List[int]] = None,
     ):
         cls._global_dp_buffer_len = global_dp_buffer_len
         cls._local_dp_buffer_len = local_dp_buffer_len
+        cls._is_max_padding = is_max_padding
         cls._global_num_tokens = global_num_tokens
 
     @classmethod
     def get_global_dp_buffer(cls) -> torch.Tensor:
-        return torch.empty(
-            (cls._global_dp_buffer_len, cls._hidden_size),
-            dtype=cls._dtype,
-            device=cls._device,
-        )
+        with use_symmetric_memory(get_tp_group()) as sm:
+            buffer = torch.empty(
+                (cls._global_dp_buffer_len, cls._hidden_size),
+                dtype=cls._dtype,
+                device=cls._device,
+            )
+            sm.tag(buffer)
+        return buffer
 
     @classmethod
     def get_local_dp_buffer(cls) -> torch.Tensor:
-        return torch.empty(
-            (cls._local_dp_buffer_len, cls._hidden_size),
-            dtype=cls._dtype,
-            device=cls._device,
-        )
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not cls._is_max_padding
+        ) as sm:
+            buffer = torch.empty(
+                (cls._local_dp_buffer_len, cls._hidden_size),
+                dtype=cls._dtype,
+                device=cls._device,
+            )
+            sm.tag(buffer)
+        return buffer
 
     @classmethod
     def get_global_dp_buffer_len(cls) -> int:
@@ -120,13 +134,18 @@ class _DpGatheredBufferWrapper:
         return cls._global_num_tokens
 
 
+    def is_max_padding(cls) -> bool:
+        return cls._is_max_padding
+
+
 def set_dp_buffer_len(
     global_dp_buffer_len: int,
     local_dp_buffer_len: int,
+    is_max_padding: bool,
     global_num_tokens: Optional[List[int]] = None,
 ):
     _DpGatheredBufferWrapper.set_dp_buffer_len(
-        global_dp_buffer_len, local_dp_buffer_len, global_num_tokens
+        global_dp_buffer_len, local_dp_buffer_len, is_max_padding, global_num_tokens
     )
 
 
@@ -148,6 +167,10 @@ def get_local_dp_buffer_len() -> int:
 
 def get_dp_global_num_tokens() -> List[int]:
     return _DpGatheredBufferWrapper.get_dp_global_num_tokens()
+
+
+def is_max_padding() -> bool:
+    return _DpGatheredBufferWrapper.is_max_padding()
 
 
 def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):
@@ -408,7 +431,10 @@ def _dp_gather_via_all_gather(
     scattered_local_tokens = local_tokens.tensor_split(get_attention_tp_size())[
         get_attention_tp_rank()
     ]
-    get_attention_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
+    if get_attention_tp_size() > 1:
+        get_attention_tp_group().reduce_scatter_tensor(
+            scattered_local_tokens, local_tokens
+        )
     get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
 
 
@@ -467,7 +493,7 @@ def dp_scatter(
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
-    if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+    if get_attention_tp_size() == 1:
         get_tp_group().reduce_scatter_tensor(output, input)
     else:
         scattered_local_tokens = input.tensor_split(

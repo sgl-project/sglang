@@ -11,11 +11,7 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_rank,
     get_moe_tensor_parallel_world_size,
-    get_tp_group,
     tensor_model_parallel_all_reduce,
-)
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe import (
@@ -812,15 +808,12 @@ class FusedMoE(torch.nn.Module):
                 raise NotImplementedError()
 
         # Matrix multiply.
-        with use_symmetric_memory(get_tp_group()) as sm:
-
-            final_hidden_states = self.quant_method.apply(
-                layer=self,
-                x=hidden_states,
-                topk_output=topk_output,
-                moe_runner_config=self.moe_runner_config,
-            )
-            sm.tag(final_hidden_states)
+        final_hidden_states = self.quant_method.apply(
+            layer=self,
+            x=hidden_states,
+            topk_output=topk_output,
+            moe_runner_config=self.moe_runner_config,
+        )
 
         final_hidden_states = final_hidden_states[
             ..., :origin_hidden_states_dim
