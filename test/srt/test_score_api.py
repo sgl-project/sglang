@@ -252,13 +252,7 @@ class TestScoreAPI(CustomTestCase):
             request = captured_requests[0]
 
             # Key assertions for decode phase avoidance:
-            # 1. Request is marked as scoring request
-            self.assertTrue(
-                request.is_scoring_request,
-                "Request should be marked as scoring request",
-            )
-
-            # 2. max_new_tokens should be 0 (prevents token generation)
+            # 1. max_new_tokens should be 0 (prevents token generation)
             # Handle both single and batch request cases
             if isinstance(request.sampling_params, dict):
                 max_new_tokens = request.sampling_params.get("max_new_tokens", 0)
@@ -272,7 +266,7 @@ class TestScoreAPI(CustomTestCase):
                 max_new_tokens, 0, "max_new_tokens should be 0 to avoid decode phase"
             )
 
-            # 3. Should have token_ids_logprob for scoring
+            # 2. Should have token_ids_logprob for scoring
             # Handle both single and batch request cases
             if (
                 isinstance(request.token_ids_logprob, list)
@@ -295,7 +289,7 @@ class TestScoreAPI(CustomTestCase):
                     "Should have label_token_ids for scoring",
                 )
 
-            # 4. Should request logprobs but not stream
+            # 3. Should request logprobs but not stream
             self.assertTrue(
                 request.return_logprob, "Should request logprobs for scoring"
             )

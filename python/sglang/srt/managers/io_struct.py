@@ -118,9 +118,6 @@ class GenerateReqInput:
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
 
-    # Whether this is a scoring request (skips decode phase for optimization)
-    is_scoring_request: bool = False
-
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
@@ -479,7 +476,6 @@ class GenerateReqInput:
             data_parallel_rank=(
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
-            is_scoring_request=self.is_scoring_request,
         )
 
 
@@ -521,9 +517,6 @@ class TokenizedGenerateReqInput:
 
     # Whether to return hidden states
     return_hidden_states: bool = False
-
-    # Whether this is a scoring request (skips decode phase for optimization)
-    is_scoring_request: bool = False
 
     # For disaggregated inference
     bootstrap_host: Optional[str] = None

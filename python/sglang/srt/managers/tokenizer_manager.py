@@ -576,11 +576,6 @@ class TokenizerManager:
                 f"model's context length ({self.context_len} tokens)."
             )
 
-        if isinstance(obj, GenerateReqInput) and obj.is_scoring_request:
-            if obj.token_ids_logprob is None:
-                raise ValueError("token_ids_logprob is required for scoring requests.")
-            return
-
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
                 "This model does not appear to be an embedding model by default. "
@@ -676,7 +671,6 @@ class TokenizerManager:
                 custom_logit_processor=obj.custom_logit_processor,
                 return_hidden_states=obj.return_hidden_states,
                 data_parallel_rank=obj.data_parallel_rank,
-                is_scoring_request=obj.is_scoring_request,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -1892,7 +1886,6 @@ class TokenizerManager:
             batch_request = GenerateReqInput(
                 text=prompts,
                 token_ids_logprob=label_token_ids,
-                is_scoring_request=True,
                 return_logprob=True,
                 stream=False,
                 sampling_params={"max_new_tokens": 0},
@@ -1913,9 +1906,9 @@ class TokenizerManager:
             batch_request = GenerateReqInput(
                 input_ids=input_ids_list,
                 token_ids_logprob=label_token_ids,
-                is_scoring_request=True,
                 return_logprob=True,
                 stream=False,
+                sampling_params={"max_new_tokens": 0},
             )
         else:
             raise ValueError(
