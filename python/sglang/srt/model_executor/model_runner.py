@@ -307,7 +307,8 @@ class ModelRunner:
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
         assert (not model_has_mtp_layers) or (
-            self.num_effective_layers == model_num_layers
+            self.spec_algorithm.is_none() ) or (
+            (not self.spec_algorithm.is_none()) and (self.num_effective_layers == model_num_layers)
         ), "PP is not compatible with MTP models."
 
         # Apply torchao quantization
@@ -968,8 +969,6 @@ class ModelRunner:
         else:
             num_layers = self.num_effective_layers
         if self.use_mla_backend:
-            # FIXME: pipeline parallelism is not compatible with mla backend
-            assert self.pp_size == 1
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
                 * num_layers
