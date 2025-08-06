@@ -47,6 +47,12 @@ from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
+from sglang.srt.utils import mxfp_supported
+
+is_mxfp_supported = mxfp_supported()
+if is_mxfp_supported:
+    from sglang.srt.layers.quantization.fp4 import MxFp4Config
+
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.gptq import (
     GPTQConfig,
@@ -84,7 +90,13 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
 }
-
+if is_mxfp_supported:
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "quark": MxFp4Config,
+            "mxfp4": MxFp4Config,
+        }
+    )
 # VLLM-dependent quantization methods
 VLLM_QUANTIZATION_METHODS = {
     "aqlm": AQLMConfig,

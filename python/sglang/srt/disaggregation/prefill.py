@@ -103,6 +103,8 @@ class PrefillBootstrapQueue:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
+        kv_args.pp_rank = self.pp_rank
+        kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.decode_tp_size = self.decode_tp_size // self.decode_dp_size
         kv_args.prefill_pp_size = self.pp_size
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
@@ -287,9 +289,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.process_disagg_prefill_inflight_queue()
 
             if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -337,9 +337,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.process_disagg_prefill_inflight_queue()
 
             if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -425,7 +423,19 @@ class SchedulerDisaggregationPrefillMixin:
                 self.send_kv_chunk(req, last_chunk=True)
 
                 if req.grammar is not None:
-                    req.grammar.accept_token(next_token_id)
+                    # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                    try:
+                        req.grammar.accept_token(next_token_id)
+                    except ValueError as e:
+                        # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                        # This can happen if the grammar is not set correctly or the token is invalid.
+                        error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                        self.tree_cache.cache_finished_req(req)
+                        prepare_abort(
+                            req,
+                            error_message,
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
                     req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
@@ -452,6 +462,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         # We need to remove the sync in the following function for overlap schedule.
         self.set_next_batch_sampling_info_done(batch)
+        self.maybe_send_health_check_signal()
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
