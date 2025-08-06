@@ -81,6 +81,8 @@ class BaseTestGptOss(CustomTestCase):
             num_examples=198,
             # use enough threads to allow parallelism
             num_threads=198,
+            # otherwise a lot of questions are not answered
+            max_tokens=4096,
             # simple-evals by default use 0.5 and is better than 0.0 temperature
             # but here for reproducibility, we use 0.1
             temperature=0.1,
