@@ -69,12 +69,12 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.use_harmony:
             self.harmony_tool_parser = HarmonyToolCallParser()
 
-        # NOTE(woosuk): While OpenAI's chat completion API supports browsing
+        # NOTE While OpenAI's chat completion API supports browsing
         # for some models, currently vLLM doesn't support it. Please use the
         # Responses API instead.
         self.supports_browsing = False
         self.browser_tool = None
-        # NOTE(woosuk): Chat completion API does not support code interpreter.
+        # NOTE: Chat completion API does not support code interpreter.
         # Please use the Responses API instead.
         self.supports_code_interpreter = False
         self.python_tool = None
@@ -145,7 +145,6 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             processed_messages, prompt_ids = self._make_request_with_harmony(request)
 
-            # TODO: check if the transformation works
             adapted_request = GenerateReqInput(
                 input_ids=prompt_ids,
                 sampling_params=self._build_sampling_params(
@@ -153,6 +152,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.stop,
                     tool_call_constraint=None,
                 ),
+                stream=request.stream,
+                return_logprob=request.logprobs,
+                logprob_start_len=-1,
+                top_logprobs_num=request.top_logprobs or 0,
+                return_text_in_logprobs=True,
+                lora_path=request.lora_path,
+                bootstrap_host=request.bootstrap_host,
+                bootstrap_port=request.bootstrap_port,
+                bootstrap_room=request.bootstrap_room,
+                return_hidden_states=request.return_hidden_states,
+                rid=request.rid,
             )
 
         return adapted_request, request
@@ -503,19 +513,51 @@ class OpenAIServingChat(OpenAIServingBase):
 
                     if index not in harmony_token_buffers:
                         harmony_token_buffers[index] = []
+                        # HACK: hack new_token_ids to start from 200006
+                        start_token_index = content["output_ids"].index(200006)
+                        content["output_ids"] = content["output_ids"][
+                            start_token_index:
+                        ]
 
-                    # FIXME: why does content["output_ids"] generate the whole text
-                    new_token_ids = content["output_ids"][
-                        len(harmony_token_buffers[index]) :
-                    ]
+                    new_token_ids = content["output_ids"]
                     for token_id in new_token_ids:
                         harmony_parser.process(token_id)
                     harmony_token_buffers[index].extend(new_token_ids)
 
                     is_final = harmony_parser.current_channel == "final"
-                    if not is_final:
-                        continue
+                    is_analysis = harmony_parser.current_channel == "analysis"
                     delta = harmony_parser.last_content_delta or ""
+
+                    if is_analysis:
+                        choice_data = ChatCompletionResponseStreamChoice(
+                            index=index,
+                            delta=DeltaMessage(reasoning_content=delta),
+                            finish_reason=None,
+                        )
+                        chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            choices=[choice_data],
+                            model=request.model,
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        continue
+
+                    choice_data = ChatCompletionResponseStreamChoice(
+                        index=index,
+                        delta=DeltaMessage(content=delta if delta else None),
+                        finish_reason=None,
+                        matched_stop=None,
+                        logprobs=choice_logprobs,
+                    )
+                    chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[choice_data],
+                        model=request.model,
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    continue
                 else:
                     stream_buffer = stream_buffers.get(index, "")
                     delta = content["text"][len(stream_buffer) :]
@@ -544,22 +586,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
-                if self.use_harmony and not is_final:
-                    choice_data = ChatCompletionResponseStreamChoice(
-                        index=index,
-                        delta=DeltaMessage(reasoning_content=delta),
-                        finish_reason=None,
-                    )
-                    chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        created=int(time.time()),
-                        choices=[choice_data],
-                        model=request.model,
-                    )
-                    yield f"data: {chunk.model_dump_json()}\n\n"
-
                 # Handle tool calls
-                # TODO: support tool call parsing
+                # TODO: support tool call parsing for harmony
                 if (
                     request.tool_choice != "none"
                     and request.tools
@@ -590,7 +618,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     if delta:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
-                            delta=DeltaMessage(content=delta if delta else None),
+                            delta=DeltaMessage(content=delta),
                             finish_reason=None,
                             matched_stop=None,
                             logprobs=choice_logprobs,
