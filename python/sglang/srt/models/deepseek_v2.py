@@ -340,17 +340,6 @@ class DeepseekV2MoE(nn.Module):
                 if global_server_args_dict["enable_flashinfer_cutlass_moe"]
                 else {}
             ),
-            **(
-                dict(
-                    renormalize=config.norm_topk_prob,
-                    use_grouped_topk=True,
-                    num_expert_group=config.n_group,
-                    topk_group=config.topk_group,
-                    correction_bias=self.gate.e_score_correction_bias,
-                )
-                if should_use_flashinfer_trtllm_moe()
-                else {}
-            ),
         )
 
         self.shared_experts_is_int8 = False
@@ -469,13 +458,7 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             kwargs = {"hidden_states": hidden_states}
-
-            # FlashInferFP4MoE (TRTLLM path) expects (TopK, router_logits) tuple
-            # Regular FusedMoE (CUTLASS path) expects StandardTopKOutput
-            if should_use_flashinfer_trtllm_moe():
-                kwargs["topk_output"] = (self.topk, router_logits)
-            else:
-                kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+            kwargs["topk_output"] = self.topk(hidden_states, router_logits)
 
             final_hidden_states = self.experts(**kwargs)
             if not _is_cuda:
@@ -502,13 +485,7 @@ class DeepseekV2MoE(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         kwargs = {"hidden_states": hidden_states}
-
-        # FlashInferFP4MoE (TRTLLM path) expects (TopK, router_logits) tuple
-        # Regular FusedMoE (CUTLASS path) expects StandardTopKOutput
-        if should_use_flashinfer_trtllm_moe():
-            kwargs["topk_output"] = (self.topk, router_logits)
-        else:
-            kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+        kwargs["topk_output"] = self.topk(hidden_states, router_logits)
 
         final_hidden_states = self.experts(**kwargs)
         if not _is_cuda and not _use_aiter:

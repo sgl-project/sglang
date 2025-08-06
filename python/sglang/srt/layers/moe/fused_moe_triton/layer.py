@@ -22,7 +22,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -874,24 +874,10 @@ class FusedMoE(torch.nn.Module):
 
 class FlashInferFusedMoE(FusedMoE):
     def __init__(self, *args, **kwargs):
-        renormalize = kwargs.pop("renormalize", True)
-        num_fused_shared_experts = kwargs.pop("num_fused_shared_experts", 0)
-        use_grouped_topk = kwargs.pop("use_grouped_topk", False)
-        num_expert_group = kwargs.pop("num_expert_group", None)
-        topk_group = kwargs.pop("topk_group", None)
-        correction_bias = kwargs.pop("correction_bias", None)
         super().__init__(*args, **kwargs)
-        self.renormalize = renormalize
-        self.num_fused_shared_experts = num_fused_shared_experts
-        self.use_grouped_topk = use_grouped_topk
-        if self.use_grouped_topk:
-            assert num_expert_group is not None and topk_group is not None
-        self.num_expert_group = num_expert_group
-        self.topk_group = topk_group
-        self.correction_bias = correction_bias
         self.use_flashinfer_trtllm_moe = should_use_flashinfer_trtllm_moe()
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: tuple):
+    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         assert self.use_flashinfer_trtllm_moe
         assert (
             self.activation == "silu"
@@ -904,18 +890,13 @@ class FlashInferFusedMoE(FusedMoE):
             self.num_fused_shared_experts == 0
         ), "Fused shared experts are not supported for flashinfer blockscale fp8 moe"
 
-        # TRTLLM mode expects (TopK_config, router_logits) tuple
-        if not isinstance(topk_output, tuple) or len(topk_output) != 2:
-            raise ValueError(
-                f"FlashInferFusedMoE expects (TopK_config, router_logits) tuple, got {type(topk_output)}"
-            )
-        _, router_logits = topk_output
+        assert TopKOutputChecker.format_is_bypassed(topk_output)
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply_with_router_logits(
             layer=self,
             x=hidden_states,
-            router_logits=router_logits,
+            topk_output=topk_output,
             activation=self.activation,
             routed_scaling_factor=self.routed_scaling_factor,
         )
@@ -930,27 +911,7 @@ class FlashInferFP4MoE(FusedMoE):
     """FP4 TRTLLM MoE implementation using FlashInfer."""
 
     def __init__(self, *args, **kwargs):
-        # Extract DeepSeek-specific parameters
-        renormalize = kwargs.pop("renormalize", True)
-        num_fused_shared_experts = kwargs.pop("num_fused_shared_experts", 0)
-        use_grouped_topk = kwargs.pop("use_grouped_topk", False)
-        num_expert_group = kwargs.pop("num_expert_group", None)
-        topk_group = kwargs.pop("topk_group", None)
-        correction_bias = kwargs.pop("correction_bias", None)
-
-        # Extract additional TopK parameters that were previously extracted in forward
-        routed_scaling_factor = kwargs.pop("routed_scaling_factor", None)
-
         super().__init__(*args, **kwargs)
-
-        # Store DeepSeek parameters
-        self.renormalize = renormalize
-        self.num_fused_shared_experts = num_fused_shared_experts
-        self.use_grouped_topk = use_grouped_topk
-        self.num_expert_group = num_expert_group
-        self.topk_group = topk_group
-        self.correction_bias = correction_bias
-        self.routed_scaling_factor = routed_scaling_factor
 
     # ---------------------------------------------------------------------
     # Helper: quantize hidden states to FP4 each forward pass
@@ -982,21 +943,17 @@ class FlashInferFP4MoE(FusedMoE):
 
         return hs_fp4, hs_sf
 
-    def forward(self, hidden_states: torch.Tensor, topk_output):
+    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         """Forward pass using FP4 TRTLLM kernel.
 
         Args:
             hidden_states: Input tensor
-            topk_output: Should be tuple of (TopK_config, router_logits) for TRTLLM mode
+            topk_output: TopKOutput object with Bypassed format
         """
+        assert TopKOutputChecker.format_is_bypassed(topk_output)
 
-        # TRTLLM mode expects (TopK_config, router_logits) tuple
-        if not isinstance(topk_output, tuple) or len(topk_output) != 2:
-            raise ValueError(
-                f"FlashInferFP4MoE expects (TopK_config, router_logits) tuple, got {type(topk_output)}"
-            )
-
-        _, router_logits = topk_output
+        router_logits = topk_output.router_logits
+        topk_config = topk_output.topk_config
 
         hs_fp4, hs_scale_linear = self._quantize_hidden_states_fp4(hidden_states)
 
@@ -1004,7 +961,7 @@ class FlashInferFP4MoE(FusedMoE):
 
         result = trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
-            routing_bias=self.correction_bias.to(hidden_states.dtype),
+            routing_bias=topk_config.correction_bias.to(hidden_states.dtype),
             hidden_states=hs_fp4,
             hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).flatten(),
             gemm1_weights=self.gemm1_weights_fp4_shuffled.data,
@@ -1019,15 +976,15 @@ class FlashInferFP4MoE(FusedMoE):
             output1_scale_gate_scalar=self.g1_alphas.data,
             output2_scale_scalar=self.g2_alphas.data,
             num_experts=self.num_experts,
-            top_k=self.top_k,
-            n_group=self.num_expert_group,
-            topk_group=self.topk_group,
+            top_k=topk_config.top_k,
+            n_group=topk_config.num_expert_group,
+            topk_group=topk_config.topk_group,
             intermediate_size=self.intermediate_size_per_partition,
             local_expert_offset=self.moe_ep_rank * self.num_local_experts,
             local_num_experts=self.num_local_experts,
             routed_scaling_factor=self.routed_scaling_factor,
             tile_tokens_dim=_get_tile_tokens_dim(
-                hidden_states.shape[0], self.top_k, self.num_local_experts
+                hidden_states.shape[0], topk_config.top_k, self.num_local_experts
             ),
             routing_method_type=RoutingMethodType.DeepSeekV3,
             do_finalize=True,

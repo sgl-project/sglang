@@ -37,6 +37,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
+from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -237,6 +238,14 @@ class TopK(CustomOp):
                 router_logits, self.top_k, sm_first=not self.renormalize
             )
             return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
+        elif should_use_flashinfer_trtllm_moe():
+            return BypassedTopKOutput(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk_config=self.topk_config,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+            )
         else:
             self.topk_config.torch_native = False
             return select_experts(

@@ -1095,18 +1095,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
+        topk_output: TopKOutput,
         *,
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
+
+        from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        assert TopKOutputChecker.format_is_bypassed(topk_output)
+        router_logits = topk_output.router_logits
+        topk_config = topk_output.topk_config
         assert (
             activation == "silu"
         ), "Only silu is supported for flashinfer blockscale fp8 moe"
         a_q, a_sf = per_token_group_quant_fp8(x, self.quant_config.weight_block_size[1])
         # NOTE: scales of hidden states have to be transposed!
         a_sf_t = a_sf.t().contiguous()
-        from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
 
         return trtllm_fp8_block_scale_moe(
             routing_logits=router_logits.to(torch.float32),
@@ -1118,9 +1125,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             gemm2_weights=layer.w2_weight,
             gemm2_weights_scale=layer.w2_weight_scale_inv,
             num_experts=layer.num_experts,
-            top_k=layer.top_k,
-            n_group=layer.num_expert_group,
-            topk_group=layer.topk_group,
+            top_k=topk_config.top_k,
+            n_group=topk_config.num_expert_group,
+            topk_group=topk_config.topk_group,
             intermediate_size=layer.w2_weight.shape[2],
             local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             local_num_experts=layer.num_local_experts,

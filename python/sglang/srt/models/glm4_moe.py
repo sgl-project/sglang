@@ -413,19 +413,15 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
             config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
         )
 
-        self.topk = (
-            TopK(
-                top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
-                renormalize=config.norm_topk_prob,
-                use_grouped_topk=True,
-                num_expert_group=config.n_group,
-                num_fused_shared_experts=self.num_fused_shared_experts,
-                topk_group=config.topk_group,
-                correction_bias=self.gate.e_score_correction_bias,
-                routed_scaling_factor=self.routed_scaling_factor,
-            )
-            if not should_use_flashinfer_trtllm_moe()
-            else None
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=True,
+            num_expert_group=config.n_group,
+            num_fused_shared_experts=self.num_fused_shared_experts,
+            topk_group=config.topk_group,
+            correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
         )
 
         self.experts = get_moe_impl_class()(
@@ -451,18 +447,6 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                     enable_flashinfer_cutlass_moe=True,
                 )
                 if global_server_args_dict["enable_flashinfer_cutlass_moe"]
-                else {}
-            ),
-            **(
-                dict(
-                    renormalize=config.norm_topk_prob,
-                    use_grouped_topk=True,
-                    num_expert_group=config.n_group,
-                    num_fused_shared_experts=self.num_fused_shared_experts,
-                    topk_group=config.topk_group,
-                    correction_bias=self.gate.e_score_correction_bias,
-                )
-                if should_use_flashinfer_trtllm_moe()
                 else {}
             ),
         )
@@ -538,10 +522,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             kwargs = {"hidden_states": hidden_states}
-            if self.topk is not None:
-                kwargs["topk_output"] = self.topk(hidden_states, router_logits)
-            else:
-                kwargs["router_logits"] = router_logits
+            kwargs["topk_output"] = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(**kwargs)
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
@@ -573,10 +554,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         kwargs = {"hidden_states": hidden_states}
-        if self.topk is not None:
-            kwargs["topk_output"] = self.topk(hidden_states, router_logits)
-        else:
-            kwargs["router_logits"] = router_logits
+        kwargs["topk_output"] = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(**kwargs)
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
