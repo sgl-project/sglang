@@ -45,7 +45,7 @@ async def update_weights(
         (
             name,
             MultiprocessingSerializer.serialize(
-                _preprocess_tensor_for_update_weights(tensor)
+                _preprocess_tensor_for_update_weights(tensor.detach())
             ),
         )
         for name, tensor in params_batch
