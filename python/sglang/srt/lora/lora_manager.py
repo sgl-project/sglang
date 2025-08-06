@@ -191,11 +191,7 @@ class LoRAManager:
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # Load active loras into lora memory pool
-        # TODO (lifuhuang): The naming of `forward_batch.lora_paths` is confusing. It actually contains a set of unique
-        # LoRA IDs, not LoRA paths. While unfortunately we cannot change the name in API for backward compatibility, we
-        # should consider (1) renaming the incorrect usage within the system, and (2) deprecating the parameter name in
-        # the current API schema and introducing a better request schema in the future (e.g., use `model_name`).
-        cur_uids = set(forward_batch.lora_paths)
+        cur_uids = set(forward_batch.lora_ids)
         assert len(cur_uids) <= self.max_loras_per_batch
         self.memory_pool.prepare_lora_batch(cur_uids, self.loras, self.lora_modules)
 
@@ -211,10 +207,10 @@ class LoRAManager:
             Transfer adapter metadata (weight indices, LoRA rank, scalings) from host
             to device (CUDA) asynchronously.
             """
-            weight_indices = [0] * len(forward_batch.lora_paths)
+            weight_indices = [0] * len(forward_batch.lora_ids)
             lora_ranks = [0] * self.max_loras_per_batch
             scalings = [0] * self.max_loras_per_batch
-            for i, uid in enumerate(forward_batch.lora_paths):
+            for i, uid in enumerate(forward_batch.lora_ids):
                 weight_indices[i] = self.memory_pool.get_buffer_id(uid)
                 if uid is not None:
                     lora = self.loras[uid]
@@ -390,6 +386,13 @@ class LoRAManager:
         else:
             self.target_modules = set()
             for config in self.configs.values():
+                if not isinstance(config.target_modules, list):
+                    raise ValueError(
+                        f"SGLang currently only supports inferring LoRA target modules when a list of "
+                        "suffixes is provided in `target_modules` field of PEFT config. Please explicitly "
+                        "specify `--lora-target-modules` during server startup. You can specify `all` to "
+                        "enable all support modules types. "
+                    )
                 self.target_modules.update(config.target_modules)
 
         if max_lora_rank is not None:
