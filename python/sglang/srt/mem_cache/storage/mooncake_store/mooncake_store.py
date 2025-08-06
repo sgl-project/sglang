@@ -138,12 +138,10 @@ class MooncakeStore(HiCacheStorage):
 
     def warmup(self):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
-        # 10 MB
-        warmup_value = bytes(10 * 1024 * 1024)
-        self.store.put(warmup_key, warmup_value)
+        warmup_value = bytes(4 *1024) # 4 KB
+        assert self.store.put(warmup_key, warmup_value) == 0
         assert self.store.is_exist(warmup_key) == 1
-        self.store.get(warmup_key)
-        self.store.remove(warmup_key)
+        assert self.store.get(warmup_key) == warmup_value
 
     def register_buffer(self, buffer: torch.Tensor) -> None:
         try:
