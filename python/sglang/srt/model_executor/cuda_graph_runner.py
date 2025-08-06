@@ -383,7 +383,7 @@ class CudaGraphRunner:
             self.next_token_logits_buffer = torch.zeros(
                 (self.max_num_token, self.model_runner.model_config.vocab_size),
                 dtype=torch.float,
-                device="cuda",
+                device=model_runner.device,
             )
 
         # Capture
