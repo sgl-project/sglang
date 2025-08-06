@@ -45,7 +45,6 @@ import triton
 import triton.language as tl
 
 from sglang.global_config import global_config
-from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -68,6 +67,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list, support_triton
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -84,11 +84,12 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "disable_radix_cache",
     "enable_dp_attention",
     "enable_two_batch_overlap",
+    "tbo_token_distribution_threshold",
     "enable_dp_lm_head",
-    "enable_deepep_moe",
+    "moe_a2a_backend",
     "deepep_mode",
-    "enable_ep_moe",
-    "enable_flashinfer_moe",
+    "enable_flashinfer_cutlass_moe",
+    "enable_flashinfer_trtllm_moe",
     "enable_flashinfer_allreduce_fusion",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
@@ -106,6 +107,9 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "num_reserved_decode_tokens",
     "weight_loader_disable_mmap",
     "enable_triton_kernel_moe",
+    "enable_multimodal",
+    "enable_symm_mem",
+    "quantization",
 ]
 
 # Put some global args for easy access
@@ -201,45 +205,42 @@ class MultimodalDataItem:
     For example, if there are 3 images and 1 audio inputs, there will be 2 MultimodalDataItem.
     One for images and one for audio.
 
-    We put the common fields first and the model-specific fields last.
+    We put the common fields first and the model-specific fields in model_specific_data.
     """
 
     modality: Modality
     hash: int = None
     pad_value: int = None
-    image_sizes: Tuple[int, int] = None
     offsets: Optional[list] = None
 
-    # the real data, pixel_values or audio_features
-    # data: Union[List[torch.Tensor], List[np.ndarray]]
-    pixel_values: Union[torch.Tensor, np.ndarray, "PIL.Image"] = None
-    audio_features: Union[torch.Tensor, np.ndarray] = None
-    audio_feature_lens: Optional[List[torch.Tensor]] = None
-    audio_offsets: Optional[List[Tuple[int, int]]] = None
-    precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
+    # the raw features returned by processor, e.g. pixel_values or audio_features
+    feature: Union[torch.Tensor, np.ndarray] = None
+    # the precomputed embeddings, passed as final encoder embeddings
+    # One and only one of the feature and precomputed_embeddings will be empty
+    precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
 
-    # For qwen-vl
-    image_grid_thw: Union[torch.Tensor, np.ndarray] = None
-    second_per_grid_ts: Optional[List[torch.Tensor]] = None
+    # Model-specific data stored in a dictionary
+    model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
 
-    # For deepseek-vl
-    image_emb_mask: Optional[torch.Tensor] = None
-    image_spatial_crop: Optional[torch.Tensor] = None
+    def __getattr__(self, name: str):
+        if (
+            "model_specific_data" in self.__dict__
+            and name in self.__dict__["model_specific_data"]
+        ):
+            return self.__dict__["model_specific_data"][name]
+        else:
+            raise AttributeError(
+                f"'{self.__class__.__name__}' object has no attribute '{name}'"
+            )
 
-    # For minicpmv
-    # [num_images, (n, w, h)]
-    tgt_size: Tuple[int, int] = None
+    def __setitem__(self, key: str, value: Any):
+        if key in self.__dict__:
+            self.__dict__[key] = value
+        else:
+            self.model_specific_data[key] = value
 
-    # For mllama
-    aspect_ratio_id: Optional[List[torch.Tensor]] = None
-    aspect_ratio_mask: Optional[List[torch.Tensor]] = None
-
-    # For kimi-vl
-    image_grid_hws: Optional[List[torch.Tensor]] = None
-
-    # For gemma3n
-    input_features: Optional[torch.Tensor] = None
-    input_features_mask: Optional[torch.Tensor] = None
+    def set(self, key: str, value: Any):
+        self.__setitem__(key, value)
 
     @staticmethod
     def is_empty_list(l):
@@ -254,18 +255,11 @@ class MultimodalDataItem:
         from sglang.srt.managers.mm_utils import hash_feature
 
         if self.hash is None:
-            if self.precomputed_features is not None:
-                self.hash = hash_feature(self.precomputed_features)
-            elif self.is_audio():
-                if self.audio_features is not None:
-                    self.hash = hash_feature(self.audio_features)
-                elif self.input_features is not None:
-                    self.hash = hash_feature(self.input_features)
-            elif self.is_video():
-                self.hash = hash_feature(self.pixel_values_videos)
+            if self.feature is not None:
+                hashed_feature = self.feature
             else:
-                self.hash = hash_feature(self.pixel_values)
-
+                hashed_feature = self.precomputed_embeddings
+            self.hash = hash_feature(hashed_feature)
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
 
@@ -273,25 +267,13 @@ class MultimodalDataItem:
         return self.modality == modality
 
     def is_audio(self):
-        return (self.modality == Modality.AUDIO) and (
-            self.precomputed_features is not None
-            or not MultimodalDataItem.is_empty_list(self.audio_features)
-            or not MultimodalDataItem.is_empty_list(self.input_features)
-        )
+        return self.modality == Modality.AUDIO
 
     def is_image(self):
-        return (
-            self.is_modality(Modality.IMAGE) or self.is_modality(Modality.MULTI_IMAGES)
-        ) and (
-            self.precomputed_features is not None
-            or not MultimodalDataItem.is_empty_list(self.pixel_values)
-        )
+        return self.modality in [Modality.IMAGE, Modality.MULTI_IMAGES]
 
     def is_video(self):
-        return (self.modality == Modality.VIDEO) and (
-            self.precomputed_features is not None
-            or not MultimodalDataItem.is_empty_list(self.pixel_values_videos)
-        )
+        return self.modality == Modality.VIDEO
 
     def is_valid(self) -> bool:
         return self.is_image() or self.is_video() or self.is_audio()
@@ -311,9 +293,8 @@ class MultimodalDataItem:
         return ret
 
     def merge(self, other):
-        self.pixel_values += other.pixel_values
-        self.image_sizes += other.image_sizes
-        self.image_offsets += other.image_offsets
+        self.feature += other.feature
+        self.offsets += other.offsets
         self.hash = hash((self.hash, other.hash))
         self.set_pad_value()
 
@@ -354,7 +335,6 @@ class MultimodalInputs:
 
         assert isinstance(ret.mm_items, list)
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
-
         for item in ret.mm_items:
             item.set_pad_value()
 
@@ -444,7 +424,7 @@ class Req:
         token_ids_logprob: List[int] = None,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
-        lora_path: Optional[str] = None,
+        lora_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         token_type_ids: List[int] = None,
         session_id: Optional[str] = None,
@@ -455,6 +435,7 @@ class Req:
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
+        vocab_size: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -487,7 +468,7 @@ class Req:
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
-        self.lora_path = lora_path
+        self.lora_id = lora_id
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -504,6 +485,7 @@ class Req:
         self.to_abort_message: str = None
         self.stream = stream
         self.eos_token_ids = eos_token_ids
+        self.vocab_size = vocab_size
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -737,6 +719,14 @@ class Req:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
                 return
 
+        if last_token_id > self.vocab_size or last_token_id < 0:
+            if self.sampling_params.stop_token_ids:
+                self.output_ids[-1] = next(iter(self.sampling_params.stop_token_ids))
+            if self.eos_token_ids:
+                self.output_ids[-1] = next(iter(self.eos_token_ids))
+            self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
+            return
+
         # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
             tail_str = self.tokenizer.decode(
@@ -928,8 +918,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            assert isinstance(tree_cache, SWARadixCache) or isinstance(
-                tree_cache, SWAChunkCache
+            assert (
+                tree_cache is None
+                or isinstance(tree_cache, SWARadixCache)
+                or isinstance(tree_cache, SWAChunkCache)
             ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid = True
 
@@ -1278,11 +1270,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if mm_input is None:
                 continue
             for mm_item in mm_input.mm_items:
-                pixel_values = getattr(mm_item, "pixel_values", None)
+                pixel_values = getattr(mm_item, "feature", None)
                 if isinstance(pixel_values, torch.Tensor):
-                    mm_item.pixel_values = pixel_values.to(
-                        self.device, non_blocking=True
-                    )
+                    mm_item.feature = pixel_values.to(self.device, non_blocking=True)
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
@@ -1327,6 +1317,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
+
+    def prepare_for_split_prefill(self):
+        self.prepare_for_extend()
+        # For split prefill, we need to set the forward mode to SPLIT_PREFILL
+        self.forward_mode = ForwardMode.SPLIT_PREFILL
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
@@ -1699,16 +1694,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
+        if self.forward_mode.is_decode_or_idle():
+            attention_backend_str = global_server_args_dict["decode_attention_backend"]
+        else:
+            attention_backend_str = global_server_args_dict["prefill_attention_backend"]
         # Create seq_lens_cpu when needed
         if (
-            global_server_args_dict["attention_backend"] == "fa3"
+            attention_backend_str == "fa3"
             or (
                 global_server_args_dict["use_mla_backend"]
-                and global_server_args_dict["attention_backend"] == "flashinfer"
+                and attention_backend_str == "flashinfer"
             )
-            or global_server_args_dict["attention_backend"] == "flashmla"
-            or global_server_args_dict["attention_backend"] == "cutlass_mla"
-            or global_server_args_dict["attention_backend"] == "ascend"
+            or attention_backend_str == "flashmla"
+            or attention_backend_str == "cutlass_mla"
+            or attention_backend_str == "ascend"
+            or attention_backend_str == "trtllm_mha"
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
             seq_lens_cpu = (
@@ -1754,7 +1754,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             encoder_lens=self.encoder_lens,
             encoder_lens_cpu=self.encoder_lens_cpu,
             encoder_out_cache_loc=self.encoder_out_cache_loc,
-            lora_paths=[req.lora_path for req in self.reqs],
+            lora_ids=[req.lora_id for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
             token_type_ids=self.token_type_ids,
@@ -1895,13 +1895,13 @@ class ModelWorkerBatch:
     encoder_out_cache_loc: Optional[torch.Tensor]
 
     # For LoRA
-    lora_paths: Optional[List[str]]
+    lora_ids: Optional[List[str]]
 
     # Sampling info
     sampling_info: SamplingBatchInfo
 
     # The input Embeds
-    input_embeds: Optional[torch.tensor] = None
+    input_embeds: Optional[torch.Tensor] = None
 
     # For corss-encoder model
     token_type_ids: Optional[torch.Tensor] = None
@@ -1911,7 +1911,6 @@ class ModelWorkerBatch:
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
-    spec_num_draft_tokens: Optional[int] = None
     hicache_consumer_index: int = 0
 
     # Overlap event

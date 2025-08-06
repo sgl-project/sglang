@@ -17,13 +17,13 @@ rm -rf /usr/local/lib/python3.10/dist-packages/flashinfer*
 rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
 
 # Install the main package
-pip install -e "python[dev]"
+pip install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/test/cu126
 
 # Show current packages
 pip list
 
 # Install additional dependencies
-pip install mooncake-transfer-engine==0.3.4.post2 nvidia-cuda-nvrtc-cu12
+pip install mooncake-transfer-engine==0.3.5 nvidia-cuda-nvrtc-cu12
 
 # For lmms_evals evaluating MMMU
 git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git

@@ -1,23 +1,26 @@
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/linear.py"""
 
+from __future__ import annotations
+
 import itertools
 import logging
-from abc import abstractmethod
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    parallel_state,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -27,17 +30,14 @@ from sglang.srt.layers.parameter import (
     RowvLLMParameter,
     _ColumnvLLMParameter,
 )
-from sglang.srt.layers.quantization.base_config import (
-    QuantizationConfig,
-    QuantizeMethodBase,
-)
-from sglang.srt.utils import (
-    cpu_has_amx_support,
-    is_cpu,
-    is_npu,
-    set_weight_attrs,
-    use_intel_amx_backend,
-)
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.utils import is_cpu, is_npu, set_weight_attrs
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import (
+        QuantizationConfig,
+        QuantizeMethodBase,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +57,9 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "ModelOptFp8LinearMethod",
     "ModelOptFp4LinearMethod",
     "IPEXAWQLinearMethod",
+    "PetitNvFp4LinearMethod",
 ]
 
-_is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 
@@ -108,91 +108,6 @@ def adjust_scalar_to_fused_array(param, loaded_weight, shard_id):
         loaded_weight = loaded_weight[0]
 
     return param[shard_id], loaded_weight
-
-
-class LinearMethodBase(QuantizeMethodBase):
-    """Base class for different (maybe quantized) linear methods."""
-
-    @abstractmethod
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        """Create weights for a linear layer.
-           The weights will be set as attributes of the layer.
-
-        Args:
-            layer: The layer that is using the LinearMethodBase factory.
-            input_size_per_partition: Size of the weight input dim on rank X.
-            output_partition_sizes: Sizes of the output dim of each logical
-                weight on rank X. E.g., output_partition_sizes for QKVLinear
-                is a list contains the width of Wq, Wk, Wv on rank X.
-            input_size: Size of the input dim of the weight across all ranks.
-            output_size: Size of the output dim of the weight across all ranks.
-            params_dtype: Datatype of the parameters.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Apply the weights in layer to the input tensor.
-        Expects create_weights to have been called before on the layer."""
-        raise NotImplementedError
-
-
-class UnquantizedLinearMethod(LinearMethodBase):
-    """Linear method without quantization."""
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        weight = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
-        layer.register_parameter("weight", weight)
-        set_weight_attrs(weight, extra_weight_attrs)
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_cpu and _is_cpu_amx_available:
-            _amx_process_weight_after_loading(layer, ["weight"])
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-
-        if use_intel_amx_backend(layer):
-            return torch.ops.sgl_kernel.weight_packed_linear(
-                x, layer.weight, bias, True  # is_vnni
-            )
-
-        return F.linear(x, layer.weight, bias)
 
 
 class LinearBase(torch.nn.Module):
@@ -310,7 +225,7 @@ class ReplicatedLinear(LinearBase):
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
         output = self.quant_method.apply(self, x, bias)
@@ -1276,11 +1191,6 @@ class RowParallelLinear(LinearBase):
                 else self.weight_loader
             ),
         )
-        if not reduce_results and (bias and not skip_bias_add):
-            raise ValueError(
-                "When not reduce the results, adding bias to the "
-                "results can lead to incorrect results"
-            )
 
         if bias:
             self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype))
@@ -1381,7 +1291,9 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+            sm.tag(output_parallel)
         if self.reduce_results and self.tp_size > 1 and not can_fuse_mlp_allreduce:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
