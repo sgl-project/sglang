@@ -1,6 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
@@ -20,7 +20,7 @@ class BaseTestGptOss(CustomTestCase):
         model_variant: Literal["20b", "120b"],
         quantization: Literal["mxfp4", "bf16"],
         expected_score_of_reasoning_effort: Dict[str, float],
-        other_args: List[str],
+        other_args: Optional[List[str]] = None,
     ):
         if other_args is None:
             other_args = []
