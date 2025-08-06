@@ -531,6 +531,11 @@ class ServerArgs:
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+            if self.enable_dp_attention and self.ep_size == self.dp_size:
+                self.enable_flashinfer_fp4_allgather = True
+                logger.warning(
+                    "Automatically enabling --enable-flashinfer-fp4-allgather which will accelerate high-throughput scenarios."
+                )
 
         if self.enable_flashinfer_trtllm_moe:
             if not self.disable_shared_experts_fusion:
@@ -673,13 +678,6 @@ class ServerArgs:
 
             self.disable_cuda_graph = True
             logger.warning("Cuda graph is disabled for prefill server")
-
-        if self.enable_flashinfer_fp4_allgather:
-            assert (
-                self.enable_flashinfer_cutlass_moe
-                and self.ep_size == self.dp_size
-                and self.enable_dp_attention
-            ), "FP4 all-gather requires --enable-cutlass-flashinfer-moe, --enable-dp-attention, and dp_size == ep_size"
 
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
