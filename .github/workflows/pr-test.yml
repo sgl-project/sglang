@@ -401,3 +401,25 @@ jobs:
           done
           echo "All jobs completed successfully"
           exit 0
+
+  unit-test-backend-8-gpu-b200:
+    needs: [check-changes, unit-test-frontend, unit-test-backend-2-gpu]
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+      github.event.pull_request.draft == false &&
+      needs.check-changes.outputs.src == 'true'
+    runs-on: b200-runner
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          MODE_BLACKWELL=1 bash scripts/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-8-gpu-b200 --auto-partition-id 0 --auto-partition-size 1
