@@ -26,7 +26,7 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite nightly --timeout-per-file 3600
-  
+
   nightly-test-2-gpu:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 2-gpu-runner

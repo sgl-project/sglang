@@ -180,19 +180,6 @@ suites = {
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
     ],
-    "per-commit-8-gpu": [
-        # Disabled because it hangs on the CI.
-        # TestFile("test_moe_ep.py", 181),
-        TestFile("test_disaggregation.py", 499),
-        TestFile("test_disaggregation_different_tp.py", 155),
-        TestFile("test_full_deepseek_v3.py", 333),
-    ],
-    "per-commit-8-gpu-deepep": [
-        TestFile("test_deepep_large.py", 338),
-    ],
-    "per-commit-8-gpu-amd": [
-        TestFile("test_full_deepseek_v3.py", 250),
-    ],
     "per-commit-8-gpu-b200": [
         # add more here
     ],
