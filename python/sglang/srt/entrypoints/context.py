@@ -75,7 +75,6 @@ class HarmonyContext(ConversationContext):
 
     def append_output(self, output) -> None:
         # Support both streaming and non-streaming output
-        print(f"!!!!!! DEBUG: output: {output}")
         if isinstance(output, dict) and "output_ids" in output:
             # RequestOutput from SGLang with outputs
             output_token_ids = output["output_ids"]
@@ -87,7 +86,6 @@ class HarmonyContext(ConversationContext):
             for token_id in output_token_ids:
                 self.parser.process(token_id)
             output_msgs = self.parser.messages
-            print(f"!!!!!! DEBUG: output_msgs: {output_msgs}")
 
             meta_info = output["meta_info"]
 
@@ -101,9 +99,6 @@ class HarmonyContext(ConversationContext):
 
         else:
             output_msgs = output
-            print(
-                f"!!!!!! DEBUG: Unsupported output type: Or Maybe a Tool Call? {type(output)} {output}"
-            )
 
         self._messages.extend(output_msgs)
 
@@ -190,14 +185,9 @@ class StreamingHarmonyContext(HarmonyContext):
 
     def append_output(self, output) -> None:
         # Support both streaming and non-streaming output
-        print(f"!!!!!! DEBUG: output: {output}")
         if isinstance(output, dict) and "output_ids" in output:
             # RequestOutput from SGLang with outputs
             output_token_ids = output["output_ids"]
-
-            # TODO: Remove this hack for GPT-OSS models
-            # output_token_ids = output_token_ids[3:]
-            print(f"!!!!!! DEBUG: output_token_ids: {output_token_ids}")
 
             for token_id in output_token_ids:
                 self.parser.process(token_id)

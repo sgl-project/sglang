@@ -487,7 +487,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if stored_response is None or stored_response.status != "cancelled":
                     self.response_store[response.id] = response
 
-        print(f"!!!!!! DEBUG: response: {response}")
         return response
 
     def _make_response_output_items(
@@ -1189,7 +1188,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Convert final_response to the format expected by ResponseCompletedEvent
         response_dict = final_response.model_dump()
 
-        print(f"!!!!!! DEBUG: response_dict: {response_dict}")
         # Convert UsageInfo to ResponseUsage format
         if response_dict.get("usage"):
             usage_info = response_dict["usage"]
