@@ -213,8 +213,8 @@ suites = {
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
-        TestFile("test_mla_deepseek_v3.py"),
-        TestFile("test_mla_int8_deepseek_v3.py"),
+        TestFile("test_mla_deepseek_v3.py", 700),
+        TestFile("test_mla_int8_deepseek_v3.py", 429),
     ],
     "nightly-amd": [
         TestFile("test_nightly_gsm8k_eval_amd.py"),
@@ -225,7 +225,7 @@ suites = {
     "weekly": [
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
-        TestFile("models/lora/test_lora_update.py", 60),
+        TestFile("models/lora/test_lora_update.py", 800),
         TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
         TestFile("test_start_profile.py", 60),
     ],
