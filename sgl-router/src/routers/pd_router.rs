@@ -481,6 +481,30 @@ impl PDRouter {
                         response
                     } else {
                         // No logprob merging needed (restored from .bak)
+
+                        // True streaming discard for HTTP handshake completion
+                        // Use a separate thread to avoid blocking the main runtime
+                        if let Ok(prefill_res) = prefill_result {
+                            let prefill_stream = prefill_res.bytes_stream();
+
+                            // Spawn a separate OS thread to handle prefill consumption
+                            std::thread::spawn(move || {
+                                // Create a separate single-threaded runtime for this task
+                                let rt = tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                    .unwrap();
+
+                                // Block on consuming the stream in this isolated runtime
+                                rt.block_on(async move {
+                                    let mut stream = prefill_stream;
+                                    while let Some(_chunk) = stream.next().await {
+                                        // Discard chunks - just consuming to complete handshake
+                                    }
+                                });
+                            });
+                        }
+
                         let stream = res.bytes_stream();
                         let decode_url = decode.url().to_string();
                         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -525,6 +549,27 @@ impl PDRouter {
                                 self.merge_logprobs(prefill_result, decode_body, status)
                                     .await
                             } else {
+                                // True streaming discard for HTTP handshake completion (non-streaming case)
+                                if let Ok(prefill_res) = prefill_result {
+                                    let prefill_stream = prefill_res.bytes_stream();
+
+                                    // Spawn a separate OS thread to handle prefill consumption
+                                    std::thread::spawn(move || {
+                                        // Create a separate single-threaded runtime for this task
+                                        let rt = tokio::runtime::Builder::new_current_thread()
+                                            .enable_all()
+                                            .build()
+                                            .unwrap();
+
+                                        // Block on consuming the stream in this isolated runtime
+                                        rt.block_on(async move {
+                                            let mut stream = prefill_stream;
+                                            while let Some(_chunk) = stream.next().await {
+                                                // Discard chunks - just consuming to complete handshake
+                                            }
+                                        });
+                                    });
+                                }
                                 (status, decode_body).into_response()
                             }
                         }
