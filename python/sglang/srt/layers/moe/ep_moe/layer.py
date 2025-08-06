@@ -6,6 +6,12 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
+from sglang.srt.layers.moe import (
+    get_deepep_mode,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+    should_use_flashinfer_trtllm_moe,
+)
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
@@ -15,12 +21,6 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
-from sglang.srt.layers.moe.moe_runner import (
-    get_deepep_mode,
-    get_moe_a2a_backend,
-    get_moe_grouped_gemm_backend,
-    should_use_flashinfer_trtllm_moe,
-)
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -678,7 +678,7 @@ def get_moe_impl_class():
 
     # NEW: Direct FP4 detection (bypasses EP requirements)
     # Check for FP4 quantization with TRTLLM flag, regardless of EP
-    if get_moe_grouped_gemm_backend().is_flashinfer_trtllm():
+    if get_moe_runner_backend().is_flashinfer_trtllm():
         try:
             # Check the quantization argument directly
             quantization = global_server_args_dict.get("quantization")
@@ -693,7 +693,7 @@ def get_moe_impl_class():
 
     if should_use_flashinfer_trtllm_moe():
         return FlashInferFusedMoE
-    if get_moe_grouped_gemm_backend().is_flashinfer_cutlass():
+    if get_moe_runner_backend().is_flashinfer_cutlass():
         return FusedMoE
     if get_moe_expert_parallel_world_size() > 1:
         return EPMoE

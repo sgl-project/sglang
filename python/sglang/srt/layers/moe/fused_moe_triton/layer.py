@@ -22,8 +22,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.layers.moe.moe_runner import (
-    get_moe_grouped_gemm_backend,
+from sglang.srt.layers.moe import (
+    get_moe_runner_backend,
     should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
@@ -157,9 +157,7 @@ class FusedMoE(torch.nn.Module):
         self.activation_alpha = activation_alpha
         self.swiglu_limit = swiglu_limit
 
-        enable_flashinfer_cutlass_moe = (
-            get_moe_grouped_gemm_backend().is_flashinfer_cutlass()
-        )
+        enable_flashinfer_cutlass_moe = get_moe_runner_backend().is_flashinfer_cutlass()
 
         if enable_flashinfer_cutlass_moe and quant_config is None:
             logger.warning("Disable flashinfer MoE when quantization config is None.")
@@ -198,7 +196,7 @@ class FusedMoE(torch.nn.Module):
         self.inplace = inplace
         self.no_combine = no_combine
 
-        self.use_triton_kernels = get_moe_grouped_gemm_backend().is_triton_kernel()
+        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
                 self.use_triton_kernels, with_bias=with_bias

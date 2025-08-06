@@ -64,12 +64,11 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.moe_runner import (
+from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
-    initialize_moe_runner,
+    initialize_moe_config,
 )
-from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -298,8 +297,8 @@ class Scheduler(
         # Init tokenizer
         self.init_tokenizer()
 
-        # Init moe runner
-        self.init_moe_runner()
+        # Init moe config
+        self.init_moe_config()
 
         # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
@@ -758,11 +757,11 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
-    def init_moe_runner(self):
+    def init_moe_config(self):
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
-            initialize_moe_runner(
+            initialize_moe_config(
                 moe_a2a_backend=self.server_args.moe_a2a_backend,
-                moe_grouped_gemm_backend=self.server_args.moe_grouped_gemm_backend,
+                moe_runner_backend=self.server_args.moe_runner_backend,
                 deepep_mode=self.server_args.deepep_mode,
             )
 
