@@ -2,6 +2,11 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
+CU_VERSION="cu126"
+if [ "$MODE_BLACKWELL" = "1" ]; then
+    CU_VERSION="cu129"
+fi
+
 # Kill existing processes
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
@@ -17,7 +22,7 @@ rm -rf /usr/local/lib/python3.10/dist-packages/flashinfer*
 rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
 
 # Install the main package
-pip install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/test/cu126
+pip install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/test/${CU_VERSION}
 
 # Show current packages
 pip list
@@ -36,7 +41,7 @@ pip install -e lmms-eval/
 pip install huggingface_hub[hf_xet]
 
 # Install xformers
-pip install -U xformers --index-url https://download.pytorch.org/whl/cu126 --no-deps --force-reinstall
+pip install -U xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps --force-reinstall
 
 # To help dumping traces when timeout occurred
 pip install py-spy

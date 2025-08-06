@@ -401,6 +401,7 @@ jobs:
 #          done
 #          echo "All jobs completed successfully"
 #          exit 0
+
   unit-test-backend-8-gpu-b200:
 #    needs: [check-changes, unit-test-frontend, unit-test-backend-2-gpu]
     needs: [check-changes]
@@ -414,6 +415,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Hello
+      - name: Install dependencies
         run: |
-          nvidia-smi
+          MODE_BLACKWELL=1 bash scripts/ci_install_dependency_blackwell.sh
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-8-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
