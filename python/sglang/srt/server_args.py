@@ -229,6 +229,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
+    tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     torchao_config: str = ""
@@ -462,7 +463,16 @@ class ServerArgs:
             self.attention_backend = "triton"
             self.enable_triton_kernel_moe = True
             self.disable_hybrid_swa_memory = True
-
+            quantization_config = getattr(
+                self.get_hf_config(), "quantization_config", None
+            )
+            if (
+                quantization_config is not None
+                and quantization_config.get("quant_method") == "mxfp4"
+            ):
+                # use bf16 for mxfp4 triton kernels
+                self.dtype = "bfloat16"
+            
         if self.attention_backend == "dual_chunk_flash_attn":
             logger.warning(
                 "Mixed chunk is disabled because of using dual chunk flash attention backend"
@@ -1703,6 +1713,12 @@ class ServerArgs:
             "--enable-two-batch-overlap",
             action="store_true",
             help="Enabling two micro batches to overlap.",
+        )
+        parser.add_argument(
+            "--tbo-token-distribution-threshold",
+            type=float,
+            default=ServerArgs.tbo_token_distribution_threshold,
+            help="The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap.",
         )
         parser.add_argument(
             "--enable-torch-compile",
