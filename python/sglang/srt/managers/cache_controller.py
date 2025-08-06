@@ -561,10 +561,6 @@ class HiCacheController:
                     )
                     completed_tokens += self.page_size
             else:
-                # operation terminated by controller, release pre-allocated memory
-                self.mem_pool_host.free(
-                    operation.host_indices[operation.completed_tokens :]
-                )
                 break
 
     def mooncake_page_transfer(self, operation):
@@ -588,6 +584,10 @@ class HiCacheController:
                     self.mooncake_page_transfer(operation)
                 else:
                     self.generic_page_transfer(operation)
+                # operation terminated by controller, release pre-allocated memory
+                self.mem_pool_host.free(
+                    operation.host_indices[operation.completed_tokens :]
+                )
             except Empty:
                 continue
 
