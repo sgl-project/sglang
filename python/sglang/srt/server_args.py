@@ -457,6 +457,11 @@ class ServerArgs:
                 raise ValueError(
                     "trtllm_mla backend does not support speculative decoding yet."
                 )
+        model_arch = self.get_hf_config().architectures[0]
+        if model_arch in ["GptOssForCausalLM"]:
+            self.attention_backend = "triton"
+            self.enable_triton_kernel_moe = True
+            self.disable_hybrid_swa_memory = True
 
         # Set page size
         if self.page_size is None:
