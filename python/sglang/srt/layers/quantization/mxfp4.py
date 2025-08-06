@@ -229,10 +229,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8
 
-        intermediate_size *= 2
         mxfp4_block = 32
 
-        self.intermediate_size = intermediate_size
+        self.intermediate_size = intermediate_size * 2
         self.hidden_size = hidden_size
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
