@@ -234,17 +234,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         ).permute(0, 2, 1, 3)
         kv_cache = (k_cache, v_cache)
 
-        # TODO: bmm1_scale and bmm2_scale might require modification
+        # TODO: add support for quantization
         q_scale = 1.0
         k_scale = (
             layer.k_scale_float
             if getattr(layer, "k_scale_float", None) is not None
             else 1.0
         )
-        # sink: additional value per head in the denominator of the softmax.
-        attention_sink = kwargs.get("sk", None)
         bmm1_scale = q_scale * k_scale * layer.scaling
         bmm2_scale = 1.0
+        # sink: additional value per head in the denominator of the softmax.
+        attention_sink = kwargs.get("sinks", None)
 
         # Call TRT-LLM kernel
         # raw_out: like q, [bs, acc_q_len, num_q_heads, head_dim] but with output dtype
@@ -290,10 +290,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         ).permute(0, 2, 1, 3)
         kv_cache = (k_cache, v_cache)
 
-        # TODO: bmm1_scale and bmm2_scale might require modification
-        # TODO: Change once quantization is supported
         # sink: additional value per head in the denominator of the softmax.
-        attention_sink = kwargs.get("sk", None)
+        attention_sink = kwargs.get("sinks", None)
+        # TODO: add support for quantization
         q_scale = 1.0
         k_scale = (
             layer.k_scale_float
