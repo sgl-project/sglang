@@ -165,8 +165,8 @@ class FlashInferMhaChunkKVRunner:
             ragger_wrapper = self.chunk_ragger_wrappers[chunk_idx]
             o1, s1 = ragger_wrapper.forward_return_lse(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
                 causal=False,
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
@@ -174,8 +174,8 @@ class FlashInferMhaChunkKVRunner:
         else:
             o1, s1 = self.ragger_wrapper.forward_return_lse(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
                 causal=True,
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
@@ -553,8 +553,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 k = torch.cat([k, k_rope], dim=-1)
             o = self.prefill_wrapper_ragged.forward(
                 qall,
-                k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
+                k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
                 causal=True,
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,

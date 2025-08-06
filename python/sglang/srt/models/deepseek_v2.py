@@ -1678,12 +1678,11 @@ class DeepseekV2AttentionMLA(nn.Module):
 
     def forward_normal_chunked_kv_core(self, q, k, v, forward_batch):
         has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
-        if has_extend_prefix:
-            # Only initialize the info once
-            if forward_batch.num_prefix_chunks is None:
-                forward_batch.prepare_chunked_prefix_cache_info(q.device)
-                if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
-                    forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+        # Only initialize the info once
+        if has_extend_prefix and forward_batch.num_prefix_chunks is None:
+            forward_batch.prepare_chunked_prefix_cache_info(q.device)
+            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
+                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
 
         forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
