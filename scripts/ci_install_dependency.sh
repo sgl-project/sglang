@@ -13,9 +13,8 @@ fi
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
 
-if ! command -v git >/dev/null 2>&1; then
-    apt update
-    apt install -y git
+if [ "$MODE_BLACKWELL" = "1" ]; then
+    apt-get install -y git libnuma-dev
 fi
 
 # Update pip
