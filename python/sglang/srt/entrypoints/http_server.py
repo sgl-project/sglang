@@ -155,13 +155,16 @@ async def lifespan(fast_api_app: FastAPI):
 
     server_args: ServerArgs = fast_api_app.server_args
 
+    tool_server = None
     if server_args.tool_server == "demo":
-        tool_server: Optional[ToolServer] = DemoToolServer()
+        from sglang.srt.entrypoints.openai.tool_server import DemoToolServer
+
+        tool_server = DemoToolServer()
     elif server_args.tool_server:
+        from sglang.srt.entrypoints.openai.tool_server import MCPToolServer
+
         tool_server = MCPToolServer()
         await tool_server.add_tool_server(server_args.tool_server)
-    else:
-        tool_server = None
 
     try:
         from sglang.srt.entrypoints.openai.serving_responses import (

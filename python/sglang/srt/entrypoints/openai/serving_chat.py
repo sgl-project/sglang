@@ -9,7 +9,6 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from openai_harmony import Message as OpenAIMessage
 
-from python.sglang.srt.function_call.harmony_tool_parser import HarmonyToolCallParser
 from sglang.srt.conversation import generate_chat_conv
 from sglang.srt.entrypoints.harmony_utils import (
     get_developer_message,
@@ -67,6 +66,10 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         if self.use_harmony:
+            from sglang.srt.function_call.harmony_tool_parser import (
+                HarmonyToolCallParser,
+            )
+
             self.harmony_tool_parser = HarmonyToolCallParser()
 
         # NOTE While OpenAI's chat completion API supports browsing

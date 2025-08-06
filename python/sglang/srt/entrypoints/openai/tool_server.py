@@ -10,8 +10,6 @@ from mcp.client.sse import sse_client
 from mcp.types import ListToolsResult
 from openai_harmony import ToolDescription, ToolNamespaceConfig
 
-from sglang.srt.entrypoints.tool import HarmonyBrowserTool, HarmonyPythonTool, Tool
-
 logger = logging.getLogger(__name__)
 
 
@@ -141,6 +139,12 @@ class MCPToolServer(ToolServer):
 class DemoToolServer(ToolServer):
 
     def __init__(self):
+        from sglang.srt.entrypoints.tool import (
+            HarmonyBrowserTool,
+            HarmonyPythonTool,
+            Tool,
+        )
+
         self.tools: dict[str, Tool] = {}
         browser_tool = HarmonyBrowserTool()
         if browser_tool.enabled:

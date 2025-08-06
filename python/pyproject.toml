@@ -22,7 +22,6 @@ runtime_common = [
     "compressed-tensors",
     "datasets",
     "fastapi",
-    "gpt-oss==0.0.1",
     "hf_transfer",
     "huggingface_hub",
     "interegular",
