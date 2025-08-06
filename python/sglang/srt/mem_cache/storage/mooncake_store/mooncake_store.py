@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache, MLATokenToKVPoolHost
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 128 * 1024 * 1024  # 128 MB
@@ -19,7 +20,6 @@ logger = logging.getLogger(__name__)
 
 
 def get_hash_str_mooncake(current_page_ids: List, prefix_block_key: str):
-    local_rank = get_tensor_model_parallel_rank()
     prefix_str = ""
     if prefix_block_key:
         if len(prefix_block_key):
@@ -27,7 +27,7 @@ def get_hash_str_mooncake(current_page_ids: List, prefix_block_key: str):
     current_token_ids_bytes = np.array(current_page_ids).tobytes()
     current_hash_object = hashlib.sha256(current_token_ids_bytes)
     current_hash_hex = current_hash_object.hexdigest()
-    return f"{prefix_str}_{int(current_hash_hex[:16], 16)}_{local_rank}"
+    return f"{prefix_str}_{int(current_hash_hex[:16], 16)}"
 
 
 @dataclass
@@ -128,6 +128,7 @@ class MooncakeStore(HiCacheStorage):
             logger.info("Connect to Mooncake store successfully.")
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
+            self.is_mla_model = False
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -145,8 +146,15 @@ class MooncakeStore(HiCacheStorage):
         self.store.get(warmup_key)
         self.store.remove(warmup_key)
 
-    def register_buffer(self, buffer: torch.Tensor) -> None:
+    @property
+    def write_skip(self):
+        return self.is_mla_model and get_tensor_model_parallel_rank() != 0
+
+    def register_buffer(self, mem_pool_host: HostKVCache) -> None:
         try:
+            if isinstance(mem_pool_host, MLATokenToKVPoolHost):
+                self.is_mla_model = True
+            buffer = mem_pool_host.kv_buffer
             buffer_ptr = buffer.data_ptr()
             buffer_size = buffer.numel() * buffer.element_size()
             ret_code = self.store.register_buffer(buffer_ptr, buffer_size)
@@ -163,6 +171,9 @@ class MooncakeStore(HiCacheStorage):
         target_location: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
     ) -> bool:
+        if self.write_skip:
+            return
+
         assert len(key) == len(target_location) == len(target_sizes)
         if len(key) == 0:
             return
@@ -180,6 +191,9 @@ class MooncakeStore(HiCacheStorage):
         target_location: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
     ) -> bool:
+        if self.write_skip:
+            return
+
         assert len(keys) == len(target_location) == len(target_sizes)
         if len(keys) == 0:
             return

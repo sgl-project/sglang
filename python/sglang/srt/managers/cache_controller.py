@@ -255,7 +255,7 @@ class HiCacheController:
 
                 self.storage_backend = MooncakeStore()
                 self.get_hash_str = get_hash_str_mooncake
-                self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
+                self.storage_backend.register_buffer(self.mem_pool_host)
             elif storage_backend == "hf3fs":
                 from sglang.srt.distributed import get_tensor_model_parallel_rank
                 from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import (
