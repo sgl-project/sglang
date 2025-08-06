@@ -2,6 +2,8 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
+MODE_BLACKWELL=${MODE_BLACKWELL:-0}
+
 CU_VERSION="cu126"
 if [ "$MODE_BLACKWELL" = "1" ]; then
     CU_VERSION="cu129"
