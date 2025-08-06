@@ -1379,14 +1379,15 @@ def _per_group_transpose(
     data_start_ptr = data_ptr + curr_expert_offset * k
     trans_data_start_ptr = trans_data_ptr + curr_expert_offset * k
 
-    m_coord = m_id * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    m_mask = m_coord < num_tokens_of_expert
+    k_coord = k_id * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    k_mask = k_coord < k
     for start_m in tl.range(0, num_tokens_of_expert, BLOCK_SIZE_M * tl.num_programs(1)):
-        k_coord = start_m + k_id * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-        k_mask = k_coord < k
+        m_coord = start_m + m_id * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        m_mask = m_coord < num_tokens_of_expert
         off = m_coord[:, None] * k + k_coord[None, :]
         trans_off = m_coord[:, None] + k_coord[None, :] * num_tokens_of_expert
         mask = m_mask[:, None] & k_mask[None, :]
+
         data = tl.load(data_start_ptr + off, mask=mask)
         tl.store(trans_data_start_ptr + trans_off, data, mask=mask)
 
