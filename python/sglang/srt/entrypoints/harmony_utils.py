@@ -254,7 +254,14 @@ def parse_output_message(message: Message):
     elif message.channel == "analysis":
         for content in message.content:
             reasoning_item = ResponseReasoningItem(
-                content=[ResponseReasoningTextContent(text=content.text)],
+                id=f"rs_{random_uuid()}",
+                type="reasoning",
+                summary=[],
+                content=[
+                    ResponseReasoningTextContent(
+                        text=content.text, type="reasoning_text"
+                    )
+                ],
                 status=None,
             )
             output_items.append(reasoning_item)
@@ -276,7 +283,14 @@ def parse_output_message(message: Message):
         ):
             for content in message.content:
                 reasoning_item = ResponseReasoningItem(
-                    text=content.text,
+                    id=f"rs_{random_uuid()}",
+                    type="reasoning",
+                    summary=[],
+                    content=[
+                        ResponseReasoningTextContent(
+                            text=content.text, type="reasoning_text"
+                        )
+                    ],
                     status=None,
                 )
                 output_items.append(reasoning_item)
@@ -316,13 +330,24 @@ def parse_remaining_state(parser: StreamableParser):
 
     if parser.current_channel == "analysis":
         reasoning_item = ResponseReasoningItem(
-            content=[ResponseReasoningTextContent(text=parser.current_content)],
+            id=f"rs_{random_uuid()}",
+            type="reasoning",
+            summary=[],
+            content=[
+                ResponseReasoningTextContent(
+                    text=parser.current_content, type="reasoning_text"
+                )
+            ],
             status=None,
         )
         return [reasoning_item]
     elif parser.current_channel == "final":
         output_text = ResponseOutputText(
-            text=parser.current_content,
+            content=[
+                ResponseReasoningTextContent(
+                    text=parser.current_content, type="reasoning_text"
+                )
+            ],
             annotations=[],  # TODO
             type="output_text",
             logprobs=None,  # TODO

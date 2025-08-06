@@ -682,6 +682,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         **kwargs,
     ):
         try:
+            # Update the status to "in_progress"
+            async with self.response_store_lock:
+                stored_response = self.response_store.get(request.request_id)
+                assert stored_response is not None
+                stored_response.status = "in_progress"
+
             response = await self.responses_full_generator(
                 request,
                 sampling_params,
