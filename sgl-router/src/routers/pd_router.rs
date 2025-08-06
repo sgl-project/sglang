@@ -478,16 +478,7 @@ impl PDRouter {
         RouterMetrics::record_pd_prefill_request(prefill.url());
         RouterMetrics::record_pd_decode_request(decode.url());
 
-        // Process prefill response
-        let (_prefill_status, prefill_body) = match self
-            .process_prefill_response(prefill_result, prefill.url(), return_logprob)
-            .await
-        {
-            Ok(result) => result,
-            Err(error_response) => return error_response,
-        };
-
-        // Process decode response
+        // Process decode response FIRST (critical path)
         debug!("Processing decode response");
         match decode_result {
             Ok(res) => {
@@ -514,9 +505,62 @@ impl PDRouter {
                     }
                 }
 
+                // Process prefill response (non-blocking for decode success)
+                let prefill_body = match prefill_result {
+                    Ok(prefill_res) => {
+                        let prefill_status = StatusCode::from_u16(prefill_res.status().as_u16())
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+                        if prefill_status.is_success() {
+                            // Success case - read body if needed
+                            if return_logprob {
+                                match prefill_res.bytes().await {
+                                    Ok(body) => Some(body),
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to read prefill response body for logprobs: {}",
+                                            e
+                                        );
+                                        None
+                                    }
+                                }
+                            } else {
+                                // Consume response to complete handshake
+                                match prefill_res.bytes().await {
+                                    Ok(_) => debug!("Prefill response consumed successfully"),
+                                    Err(e) => warn!("Error consuming prefill response: {}", e),
+                                }
+                                None
+                            }
+                        } else {
+                            // Prefill error - log but don't block decode
+                            RouterMetrics::record_pd_prefill_error(prefill.url());
+                            let error_body = prefill_res
+                                .text()
+                                .await
+                                .unwrap_or_else(|_| "Unknown prefill error".to_string());
+                            error!(
+                                "Prefill server returned error (non-critical) prefill_url={} status={} body={}",
+                                prefill.url(), prefill_status, error_body
+                            );
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        // Prefill request failed - log but don't block decode
+                        RouterMetrics::record_pd_prefill_error(prefill.url());
+                        error!(
+                            "Prefill server failed (non-critical) prefill_url={} error={}",
+                            prefill.url(),
+                            e
+                        );
+                        None
+                    }
+                };
+
                 if is_stream {
                     // Streaming response
-                    let prefill_logprobs = if return_logprob {
+                    let prefill_logprobs = if return_logprob && prefill_body.is_some() {
                         prefill_body
                             .as_ref()
                             .and_then(|body| serde_json::from_slice::<Value>(body).ok())
@@ -743,83 +787,6 @@ impl PDRouter {
                 (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response").into_response()
             }
         }
-    }
-
-    // Helper to process prefill response and extract body if needed for logprobs
-    async fn process_prefill_response(
-        &self,
-        prefill_result: Result<reqwest::Response, reqwest::Error>,
-        prefill_url: &str,
-        return_logprob: bool,
-    ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
-        // Check prefill result first - it's critical for disaggregated mode
-        let prefill_response = match prefill_result {
-            Ok(response) => response,
-            Err(e) => {
-                RouterMetrics::record_pd_prefill_error(prefill_url);
-                error!(
-                    "Prefill server failed (CRITICAL) prefill_url={} error={}. Decode will timeout without prefill KV cache.",
-                    prefill_url,
-                    e
-                );
-
-                // Return error immediately - don't wait for decode to timeout
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    format!(
-                        "Prefill server error: {}. This will cause decode timeout.",
-                        e
-                    ),
-                )
-                    .into_response());
-            }
-        };
-
-        let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-        // Check if prefill succeeded
-        if !prefill_status.is_success() {
-            RouterMetrics::record_pd_prefill_error(prefill_url);
-
-            // Get error body from prefill
-            let error_msg = prefill_response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown prefill error".to_string());
-
-            error!(
-                "Prefill server returned error status prefill_url={} status={} body={}",
-                prefill_url, prefill_status, error_msg
-            );
-
-            return Err((
-                prefill_status,
-                format!("Prefill server error ({}): {}", prefill_status, error_msg),
-            )
-                .into_response());
-        }
-
-        // Read prefill body if needed for logprob merging
-        let prefill_body = if return_logprob {
-            match prefill_response.bytes().await {
-                Ok(body) => Some(body),
-                Err(e) => {
-                    warn!("Failed to read prefill response body for logprobs: {}", e);
-                    None
-                }
-            }
-        } else {
-            // For non-logprob requests, just consume the response without storing
-            debug!("Consuming prefill response body (non-logprob request)");
-            match prefill_response.bytes().await {
-                Ok(_) => debug!("Prefill response consumed successfully"),
-                Err(e) => warn!("Error consuming prefill response: {}", e),
-            }
-            None
-        };
-
-        Ok((prefill_status, prefill_body))
     }
 
     // Helper to build a request with headers copied from the original request
