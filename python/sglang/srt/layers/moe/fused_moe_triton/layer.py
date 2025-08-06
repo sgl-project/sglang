@@ -794,11 +794,11 @@ class FusedMoE(torch.nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: StandardTopKOutput):
-        og_hidden_states = hidden_states.shape[-1]
-        if self.hidden_size != og_hidden_states:
+        origin_hidden_states_dim = hidden_states.shape[-1]
+        if self.hidden_size != origin_hidden_states_dim:
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
-                (0, self.hidden_size - og_hidden_states),
+                (0, self.hidden_size - origin_hidden_states_dim),
                 mode="constant",
                 value=0.0,
             )
@@ -847,7 +847,7 @@ class FusedMoE(torch.nn.Module):
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        return final_hidden_states[..., :og_hidden_states].contiguous()
+        return final_hidden_states[..., :origin_hidden_states_dim].contiguous()
 
     @classmethod
     def make_expert_params_mapping(
