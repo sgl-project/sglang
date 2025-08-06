@@ -141,6 +141,14 @@ Process:
 
 For unbalanced systems, this strategy tracks pending request counts per worker and routes new requests to the least busy worker. This helps maintain optimal load distribution across workers.
 
+***Data-Parallelism Aware Routing***
+
+An additional DP-aware routing strategy can be enabled on top of the sgl-router’s hybrid cache-aware load-balancing strategy by setting the `--dp-aware` flag when starting the router.
+
+When this flag is enabled, the router attempts to contact the workers to retrieve the `dp_size` of each one and registers the new workers at the DP-rank level.  In this mode, the router applies the cache-aware routing strategy in a more fine-grained manner, with assistance from the DP controller on the SRT side.
+
+By default (when the flag is not set), the SRT’s DP controller distributes incoming requests across DP ranks in a round-robin fashion.
+
 ## Configuration Parameters
 
 1. `cache_threshold`: (float, 0.0 to 1.0, default: 0.5)

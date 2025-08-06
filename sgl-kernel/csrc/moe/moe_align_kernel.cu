@@ -36,11 +36,23 @@ __global__ void count_and_sort_expert_tokens_kernel(
   const size_t stride = blockDim.x * gridDim.x;
 
   for (size_t i = tid; i < numel; i += stride) {
-    int32_t expert_id = topk_ids[i];
+    int32_t expert_id = topk_ids[i] + 1;
     int32_t rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
     sorted_token_ids[rank_post_pad] = i;
   }
 }
+
+#ifdef __CUDA_ARCH__
+__device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffffffffu) {
+  int original = v;
+#pragma unroll
+  for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+    int n = __shfl_up_sync(mask, v, offset);
+    if ((threadIdx.x & (WARP_SIZE - 1)) >= offset) v += n;
+  }
+  return v - original;
+}
+#endif
 
 template <typename scalar_t>
 __global__ void moe_align_block_size_kernel(
@@ -70,7 +82,7 @@ __global__ void moe_align_block_size_kernel(
   __syncthreads();
 
   for (size_t i = tid; i < numel; i += stride) {
-    int expert_id = topk_ids[i];
+    int expert_id = topk_ids[i] + 1;
     atomicAdd(&shared_counts[expert_id], 1);
   }
 
@@ -82,6 +94,8 @@ __global__ void moe_align_block_size_kernel(
     padded_count = (count + block_size - 1) / block_size * block_size;
     scan_buf[tid] = padded_count;
   }
+
+#ifndef __CUDA_ARCH__  // HIP
 
   if (tid >= num_experts && tid < scan_size) {
     scan_buf[tid] = 0;
@@ -132,13 +146,62 @@ __global__ void moe_align_block_size_kernel(
     s_total_tokens_post_pad = prefix[num_experts];
     *total_tokens_post_pad = s_total_tokens_post_pad;
   }
-
   __syncthreads();
+
+#else  // CUDA
+
+  // Intra warp prefix sum
+  int32_t* warp_sums = scan_buf + scan_size;  // [<= 32]
+  const int warp_id = tid / WARP_SIZE;
+  const int lane_id = tid & (WARP_SIZE - 1);
+  const int num_warps_for_scan = (scan_size + WARP_SIZE - 1) / WARP_SIZE;
+  const int warp_sum = warp_exclusive_scan(padded_count) + padded_count;
+  if (lane_id == WARP_SIZE - 1) warp_sums[warp_id] = warp_sum;
+  __syncthreads();
+
+  // warp0 accumulate all the block's prefix sum
+  if (tid < WARP_SIZE) {
+    int val = (tid < num_warps_for_scan) ? warp_sums[tid] : 0;
+    int incl = warp_exclusive_scan(val) + val;
+    warp_sums[tid] = incl;
+  }
+  __syncthreads();
+
+  // Every thread obtains the whole block's sum
+  if (tid == 0) {
+    prefix[num_experts] = warp_sums[num_warps_for_scan - 1];
+    s_total_tokens_post_pad = prefix[num_experts];
+    *total_tokens_post_pad = s_total_tokens_post_pad;
+  }
+  __syncthreads();
+
+  // Fill 0 to scan_buf extended area (tid >= num_expert)
+  if (tid >= num_experts && tid < scan_size) scan_buf[tid] = 0;
+  __syncthreads();
+
+  // Perform 2 level exclusive-prefix-sum to scan_buf
+  int v = (tid < scan_size) ? scan_buf[tid] : 0;
+  int pre = warp_exclusive_scan(v);
+  if (lane_id == WARP_SIZE - 1) warp_sums[warp_id] = pre + v;
+  __syncthreads();
+
+  if (warp_id == 0) {
+    int val = (lane_id < num_warps_for_scan) ? warp_sums[lane_id] : 0;
+    warp_sums[lane_id] = warp_exclusive_scan(val);
+  }
+  __syncthreads();
+
+  int offset = warp_sums[warp_id];
+  if (tid < scan_size) scan_buf[tid] = pre + offset;
+  __syncthreads();
+
+  // Write prefix[0..num_experts - 1] and cumsum
+  if (tid < num_experts) prefix[tid] = scan_buf[tid];
+#endif
 
   if (tid <= num_experts) {
     cumsum[tid] = prefix[tid];
   }
-
   // fill expert_ids
   const int32_t num_blocks = s_total_tokens_post_pad / block_size;
   for (int32_t i = tid; i < num_blocks; i += stride) {
@@ -152,7 +215,7 @@ __global__ void moe_align_block_size_kernel(
         right = mid;
       }
     }
-    expert_ids[i] = left - 1;
+    expert_ids[i] = left - 2;
   }
 
   if (pad_sorted_token_ids) {
@@ -188,7 +251,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   }
 
   for (size_t i = tid; i < numel; i += stride) {
-    ++tokens_cnts[(threadIdx.x + 1) * num_experts + topk_ids[i]];
+    ++tokens_cnts[(threadIdx.x + 1) * num_experts + topk_ids[i] + 1];
   }
 
   __syncthreads();
@@ -214,7 +277,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
 
   if (threadIdx.x < num_experts) {
     for (int i = cumsum[threadIdx.x]; i < cumsum[threadIdx.x + 1]; i += block_size) {
-      expert_ids[i / block_size] = threadIdx.x;
+      expert_ids[i / block_size] = threadIdx.x - 1;
     }
   }
 
@@ -231,7 +294,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   __syncthreads();
 
   for (size_t i = tid; i < numel; i += stride) {
-    int32_t expert_id = topk_ids[i];
+    int32_t expert_id = topk_ids[i] + 1;
     int32_t rank_post_pad = tokens_cnts[threadIdx.x * num_experts + expert_id] + cumsum[expert_id];
     sorted_token_ids[rank_post_pad] = i;
     ++tokens_cnts[threadIdx.x * num_experts + expert_id];
@@ -245,14 +308,10 @@ void moe_align_block_size(
     torch::Tensor sorted_token_ids,
     torch::Tensor experts_ids,
     torch::Tensor num_tokens_post_pad,
-    torch::Tensor token_cnts_buffer,
     torch::Tensor cumsum_buffer,
     bool pad_sorted_token_ids) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  int64_t padded_num_experts = ((num_experts + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
-
-  int experts_per_warp = WARP_SIZE;
   int threads = 1024;
 
   threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
@@ -278,8 +337,7 @@ void moe_align_block_size(
       auto align_kernel = moe_align_block_size_kernel<scalar_t>;
 
       const size_t scan_size = next_pow2(num_experts);
-      const size_t shared_mem_size = (num_experts + (num_experts + 1) + scan_size) * sizeof(int32_t);
-
+      const size_t shared_mem_size = (num_experts + (num_experts + 1) + scan_size + WARP_SIZE) * sizeof(int32_t);
       align_kernel<<<1, threads, shared_mem_size, stream>>>(
           topk_ids.data_ptr<scalar_t>(),
           sorted_token_ids.data_ptr<int32_t>(),

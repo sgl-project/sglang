@@ -6,13 +6,48 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 from sgl_kernel import gelu_and_mul, silu_and_mul
-from triton_kernels.matmul_ogs import matmul_ogs
+from triton_kernels.matmul_ogs import (
+    FlexCtx,
+    FnSpecs,
+    FusedActivation,
+    PrecisionConfig,
+    matmul_ogs,
+)
+from triton_kernels.numerics import InFlexData
 from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
-
-from sglang.srt.utils import direct_register_custom_op
+from triton_kernels.swiglu import swiglu_fn
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
+
+
+def quantize(w, dtype, dev, **opt):
+    if dtype == "bf16":
+        return w.to(torch.bfloat16), InFlexData()
+    elif dtype == "fp8":
+        wq = w.to(torch.float8_e4m3fn).transpose(-1, -2).contiguous().transpose(-1, -2)
+        return (
+            wq,
+            InFlexData(dtype=wq.dtype, scale=w.abs().max().unsqueeze(0)),
+            MicroscalingCtx(),
+        )
+    else:
+        assert dtype == "mx4", f"{dtype=}"
+        swizzle_mx_scale = opt["swizzle_mx_scale"]
+        swizzle_axis = 2 if swizzle_mx_scale else None
+        w = w.to(torch.bfloat16)
+        w, mx_scales, weight_scale_shape = downcast_to_mxfp(
+            w, torch.uint8, axis=1, swizzle_axis=swizzle_axis
+        )
+        return (
+            w,
+            InFlexData(),
+            MicroscalingCtx(
+                weight_scale=mx_scales,
+                swizzle_mx=swizzle_mx_scale,
+                actual_weight_scale_shape=weight_scale_shape,
+            ),
+        )
 
 
 def triton_kernel_moe_forward(
@@ -148,16 +183,17 @@ def triton_kernel_fused_experts(
     return intermediate_cache3
 
 
-def triton_kernel_moe_forward_fake(
+def triton_kernel_moe_with_bias_forward(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
+    w1_pcg,
+    b1: torch.Tensor,
     w2: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
+    w2_pcg,
+    b2: torch.Tensor,
+    topk_output: TopKOutput,
     inplace: bool = False,
     activation: str = "silu",
-    apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
@@ -167,13 +203,131 @@ def triton_kernel_moe_forward_fake(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    activation_alpha: Optional[float] = None,
+    swiglu_limit: Optional[int] = None,
 ) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
+    assert topk_output.format.is_triton_kernel()
+    routing_data, gather_idx, scatter_idx = topk_output
+
+    return triton_kernel_fused_experts_with_bias(
+        hidden_states,
+        w1=w1,
+        w1_pcg=w1_pcg,
+        b1=b1,
+        w2=w2,
+        w2_pcg=w2_pcg,
+        b2=b2,
+        routing_data=routing_data,
+        gather_indx=gather_idx,
+        scatter_indx=scatter_idx,
+        inplace=inplace,
+        activation=activation,
+        use_fp8_w8a8=use_fp8_w8a8,
+        per_channel_quant=per_channel_quant,
+        global_num_experts=global_num_experts,
+        expert_map=expert_map,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        block_shape=block_shape,
+        activation_alpha=activation_alpha,
+        swiglu_limit=swiglu_limit,
+    )
 
 
-direct_register_custom_op(
-    op_name="forward_cuda_triton",
-    op_func=triton_kernel_moe_forward,
-    mutates_args=[],
-    fake_impl=triton_kernel_moe_forward_fake,
-)
+def triton_kernel_fused_experts_with_bias(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w1_pcg,
+    b1: torch.Tensor,
+    w2: torch.Tensor,
+    w2_pcg,
+    b2: torch.Tensor,
+    routing_data: RoutingData,
+    gather_indx: GatherIndx,
+    scatter_indx: ScatterIndx,
+    inplace: bool = False,
+    activation: str = "silu",
+    use_fp8_w8a8: bool = False,
+    per_channel_quant: bool = False,
+    global_num_experts: int = -1,
+    expert_map: Optional[torch.Tensor] = None,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    activation_alpha: Optional[float] = None,
+    swiglu_limit: Optional[int] = None,
+) -> torch.Tensor:
+    # print(f"here in triton moe with bias", b1.shape, b1.dtype, b2.shape, b2.dtype)
+    assert use_fp8_w8a8 == False, "use_fp8_w8a8 is not supported"
+    assert per_channel_quant == False, "per_channel_quant is not supported"
+    assert expert_map == None, "expert_map is not supported"
+    assert w1_scale == None, "w1_scale is not supported"
+    assert w2_scale == None, "w2_scale is not supported"
+    assert a1_scale == None, "a1_scale is not supported"
+    assert a2_scale == None, "a2_scale is not supported"
+    assert block_shape == None, "block_shape is not supported"
+
+    # type check
+    assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
+    for w in (w1, w2):
+        # TODO assert bf16 or mxfp4
+        # assert (w.dtype == torch.bfloat16) or check-is-mxfp4, f"w must be bfloat16 or mxfp4 {w1.dtype=}"
+        pass
+
+    # Shape check
+    assert hidden_states.ndim == 2, "hidden_states must be 2D"
+    assert (
+        hidden_states.shape[-1] == w1.shape[-2]
+    ), f"hidden_states shape[-1] {hidden_states.shape} must be equal to w1 shape[-2] {w1.shape}"
+    assert (
+        w2.shape[-1] == w1.shape[1]
+    ), f"w2 shape[-1] {w2.shape[-1]} must be equal to w1 shape[1] {w1.shape[1]}"
+
+    # feature check
+    assert inplace == False, "Inplace is not supported in new triton MoE kernel"
+
+    E, _, _ = w1.shape
+
+    if global_num_experts == -1:
+        global_num_experts = E
+
+    # TODO maybe completely remove this branch
+    if w1.dtype == torch.bfloat16:
+        device = "cuda"
+        optg = dict()
+        w1, w1_flex = quantize(w1, "bf16", device, **optg)
+        w1_pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w1_flex))
+
+        w2, w2_flex = quantize(w2, "bf16", device, **optg)
+        w2_pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex))
+
+    act = FusedActivation(
+        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")),
+        (activation_alpha, swiglu_limit),
+        2,
+    )
+
+    intermediate_cache = matmul_ogs(
+        hidden_states,
+        w1,
+        b1,
+        routing_data,
+        gather_indx=gather_indx,
+        precision_config=w1_pcg,
+        gammas=None,
+        fused_activation=act,
+    )
+
+    return matmul_ogs(
+        intermediate_cache,
+        w2,
+        b2,
+        routing_data,
+        scatter_indx=scatter_indx,
+        precision_config=w2_pcg,
+        gammas=routing_data.gate_scal,
+    )

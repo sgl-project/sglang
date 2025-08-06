@@ -413,18 +413,37 @@ def fused_moe_kernel(
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
-    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     offs_token = offs_token.to(tl.int64)
     token_mask = offs_token < num_valid_tokens
 
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+
+    if off_experts == -1:
+        # -----------------------------------------------------------
+        # Write back zeros to the output when the expert is not
+        # in the current expert parallel rank.
+        write_zeros_to_output(
+            c_ptr,
+            stride_cm,
+            stride_cn,
+            pid_n,
+            N,
+            offs_token,
+            token_mask,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            compute_type,
+        )
+        return
+
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
     )
 
-    off_experts = tl.load(expert_ids_ptr + pid_m)
     b_ptrs = (
         b_ptr
         + off_experts * stride_be
@@ -497,7 +516,6 @@ def fused_moe_kernel(
 
                 accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             else:
-                # fix out of shared memory issue
                 if use_fp8_w8a8:
                     accumulator = tl.dot(a, b, acc=accumulator)
                 else:
@@ -568,7 +586,7 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
@@ -578,13 +596,9 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
+    # In EP, expert_ids for filtered experts are -1. We have num_experts + 1 ids in total.
     cumsum_buffer = torch.empty(
-        (num_experts + 1,), dtype=torch.int32, device=topk_ids.device
-    )
-    token_cnts_buffer = torch.empty(
-        (num_experts + 1) * num_experts,
-        dtype=torch.int32,
-        device=topk_ids.device,
+        (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
     )
 
     # Threshold based on benchmark results
@@ -594,12 +608,11 @@ def moe_align_block_size(
 
     sgl_moe_align_block_size(
         topk_ids,
-        num_experts,
+        num_experts + 1,
         block_size,
         sorted_ids,
         expert_ids,
         num_tokens_post_pad,
-        token_cnts_buffer,
         cumsum_buffer,
         fuse_sorted_ids_padding,
     )
