@@ -1172,7 +1172,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size
             )
             self.required_dst_info_num = 1
-            self.required_prefill_response_num = 1 * self.prefill_pp_size
+            self.required_prefill_response_num = 1 * (
+                self.prefill_pp_size // self.kv_mgr.pp_size
+            )
             self.target_tp_ranks = [self.target_tp_rank]
         elif self.kv_mgr.attn_tp_size > self.prefill_attn_tp_size:
             if not self.kv_mgr.is_mla_backend:
@@ -1185,7 +1187,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.required_dst_info_num = (
                 self.kv_mgr.attn_tp_size // self.prefill_attn_tp_size
             )
-            self.required_prefill_response_num = 1 * self.prefill_pp_size
+            self.required_prefill_response_num = 1 * (
+                self.prefill_pp_size // self.kv_mgr.pp_size
+            )
             self.target_tp_ranks = [self.target_tp_rank]
         else:
             if not self.kv_mgr.is_mla_backend:
@@ -1210,7 +1214,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.required_dst_info_num = 1
             self.required_prefill_response_num = (
                 self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size
-            ) * self.prefill_pp_size
+            ) * (self.prefill_pp_size // self.kv_mgr.pp_size)
 
         if self.data_parallel_rank is not None:
             logger.debug(f"Targeting DP rank: {self.data_parallel_rank}")
