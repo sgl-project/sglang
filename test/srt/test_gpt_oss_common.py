@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Literal, List, Dict
 
@@ -43,13 +44,18 @@ class BaseTestGptOss(CustomTestCase):
         )
 
         try:
-            TODO_parallel
-            for reasoning_effort in ["low", "medium", "high"]:
-                self._run_one_eval(
-                    model=model,
-                    reasoning_effort=reasoning_effort,
-                    expected_score=expected_score_of_reasoning_effort[reasoning_effort],
-                )
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                list(executor.map(
+                    lambda d: self._run_one_eval(**d),
+                    [
+                        dict(
+                            model=model,
+                            reasoning_effort=reasoning_effort,
+                            expected_score=expected_score_of_reasoning_effort[reasoning_effort],
+                        )
+                        for reasoning_effort in ["low", "medium", "high"]
+                    ]
+                ))
         finally:
             kill_process_tree(process.pid)
 
@@ -67,6 +73,7 @@ class BaseTestGptOss(CustomTestCase):
             reasoning_effort=reasoning_effort,
         )
 
+        print(f"Evaluation start: {model=} {reasoning_effort=} {expected_score=}")
         metrics = run_eval(args)
-        print(f"Evaluation Result: {model=} {reasoning_effort=} {expected_score=} {metrics=}")
+        print(f"Evaluation end: {model=} {reasoning_effort=} {expected_score=} {metrics=}")
         self.assertGreaterEqual(metrics["score"], expected_score)
