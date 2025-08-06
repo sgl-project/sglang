@@ -34,7 +34,9 @@ has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
 
 # Environment variables for FlashInfer MXFP4 MoE backend
 USE_FLASHINFER_MXFP4_MOE = get_bool_env_var("SGLANG_USE_FLASHINFER_MXFP4_MOE", "false")
-USE_FLASHINFER_MXFP4_BF16_MOE = get_bool_env_var("SGLANG_USE_FLASHINFER_MXFP4_BF16_MOE", "false")
+USE_FLASHINFER_MXFP4_BF16_MOE = get_bool_env_var(
+    "SGLANG_USE_FLASHINFER_MXFP4_BF16_MOE", "false"
+)
 
 if is_flashinfer_available():
     # from flashinfer.fused_moe import cutlass_fused_moe
@@ -318,7 +320,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer):
         if USE_FLASHINFER_MXFP4_MOE or USE_FLASHINFER_MXFP4_BF16_MOE:
-            logger.info("Shuffling MoE weights for FlashInfer, it might take a while...")
+            logger.info(
+                "Shuffling MoE weights for FlashInfer, it might take a while..."
+            )
             layer.gemm1_alpha = Parameter(
                 torch.tensor([1.702] * self.num_experts, dtype=torch.float32).cuda(),
                 requires_grad=False,
@@ -354,7 +358,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             assert (
                 layer.w2_weight_scale.dim() == 3
                 and layer.w2_weight_scale.shape[1] == self.hidden_size
-                and layer.w2_weight_scale.shape[2] == self.intermediate_size // sf_block_size
+                and layer.w2_weight_scale.shape[2]
+                == self.intermediate_size // sf_block_size
             )
             assert (
                 layer.w13_weight_bias.dim() == 2
@@ -428,9 +433,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
                 )
                 gemm2_bias_shuffled.append(
-                    shuffle_matrix_a(
-                        w2_bias[i].clone().reshape(-1, 1), epilogue_tile_m
-                    )
+                    shuffle_matrix_a(w2_bias[i].clone().reshape(-1, 1), epilogue_tile_m)
                 )
 
             w13_weight = torch.stack(gemm1_weights_mxfp4_shuffled)
@@ -552,11 +555,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             else:
                 x_quant, x_scale = mxfp8_quantize(x, False)  # to mxfp8
                 x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
-            
+
             # Extract top_k from topk_output
             top_k = topk_output.topk_ids.shape[-1]
             router_logits = topk_output.router_logits
-            
+
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
                 None,  # routing_bias
