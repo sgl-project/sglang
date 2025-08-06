@@ -20,6 +20,7 @@ fi
 pip uninstall -y flashinfer flashinfer_python sgl-kernel sglang vllm --break-system-packages || true
 pip cache purge || true
 rm -rf /root/.cache/flashinfer
+# TODO handle other python versions
 rm -rf /usr/local/lib/python3.10/dist-packages/flashinfer*
 rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
 
