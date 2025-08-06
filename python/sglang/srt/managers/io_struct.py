@@ -99,6 +99,8 @@ class GenerateReqInput:
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
+    # The request priority.
+    priority: int = 0
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -501,6 +503,8 @@ class TokenizedGenerateReqInput:
     token_ids_logprob: List[int]
     # Whether to stream output
     stream: bool
+    # The request priority.
+    priority: int = 0
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
@@ -559,6 +563,8 @@ class EmbeddingReqInput:
     modalities: Optional[List[str]] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
+    # The request priority.
+    priority: int = 0
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -656,6 +662,8 @@ class TokenizedEmbeddingReqInput:
     sampling_params: SamplingParams
     # For dp balance
     dp_balance_id: int = -1
+    # The request priority
+    priority: int = 0
 
 
 @dataclass

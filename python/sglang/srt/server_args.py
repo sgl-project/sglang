@@ -76,7 +76,7 @@ class ServerArgs:
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
-    max_queued_requests: Optional[int] = sys.maxsize
+    max_queued_requests: int = sys.maxsize
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
@@ -909,7 +909,7 @@ class ServerArgs:
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
-            choices=["lpm", "random", "fcfs", "dfs-weight", "lof"],
+            choices=["lpm", "random", "fcfs", "dfs-weight", "lof", "priority"],
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
