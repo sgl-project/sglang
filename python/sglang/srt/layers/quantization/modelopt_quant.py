@@ -8,7 +8,14 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.layers.dp_attention import get_dp_global_num_tokens, get_local_dp_buffer
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.layers.dp_attention import (
+    get_dp_global_num_tokens,
+    get_local_dp_buffer,
+    is_dp_max_padding,
+)
 from sglang.srt.layers.moe import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
     should_use_flashinfer_trtllm_moe,
@@ -1303,7 +1310,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
             output_dtype = x.dtype
+            output_col = x.shape[1]
             x_sf = None
+
             if should_use_flashinfer_cutlass_moe_fp4_allgather():
                 from flashinfer import fp4_quantize, nvfp4_block_scale_interleave
 
@@ -1323,7 +1332,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 x_sf = nvfp4_block_scale_interleave(x_sf)
 
+            with use_symmetric_memory(get_tp_group(), disabled=not is_dp_max_padding()):
+                symm_output = torch.empty(
+                    x.shape[0], output_col, dtype=output_dtype, device=x.device
+                )
+
             output = flashinfer_cutlass_fused_moe(
+                output=symm_output,
                 input=x,
                 token_selected_experts=topk_ids.to(torch.int),
                 token_final_scales=topk_weights,
