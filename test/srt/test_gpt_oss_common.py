@@ -64,6 +64,7 @@ class BaseTestGptOss(CustomTestCase):
             # simple-evals by default use 0.5 and is better than 0.0 temperature
             # but here for reproducibility, we use 0.1
             temperature=0.1,
+            reasoning_effort=reasoning_effort,
         )
 
         metrics = run_eval(args)
