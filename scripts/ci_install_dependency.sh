@@ -20,7 +20,7 @@ fi
 
 # Update pip
 if [ "$MODE_BLACKWELL" != "1" ]; then
-    pip install --upgrade pip --break-system-packages
+    pip install --upgrade pip
 fi
 
 # Clean up existing installations
