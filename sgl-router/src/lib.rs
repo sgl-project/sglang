@@ -19,7 +19,7 @@ pub enum PolicyType {
     Random,
     RoundRobin,
     CacheAware,
-    PowerOfTwo, // Moved from PD-specific, now shared
+    PowerOfTwo,
 }
 
 #[pyclass]
@@ -37,13 +37,14 @@ struct Router {
     eviction_interval_secs: u64,
     max_tree_size: usize,
     max_payload_size: usize,
+    dp_aware: bool,
+    api_key: Option<String>,
     log_dir: Option<String>,
     log_level: Option<String>,
     service_discovery: bool,
     selector: HashMap<String, String>,
     service_discovery_port: u16,
     service_discovery_namespace: Option<String>,
-    // PD service discovery fields
     prefill_selector: HashMap<String, String>,
     decode_selector: HashMap<String, String>,
     bootstrap_port_annotation: String,
@@ -51,13 +52,13 @@ struct Router {
     prometheus_host: Option<String>,
     request_timeout_secs: u64,
     request_id_headers: Option<Vec<String>>,
-    // PD mode flag
     pd_disaggregation: bool,
-    // PD-specific fields (only used when pd_disaggregation is true)
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
     prefill_policy: Option<PolicyType>,
     decode_policy: Option<PolicyType>,
+    max_concurrent_requests: usize,
+    cors_allowed_origins: Vec<String>,
 }
 
 impl Router {
@@ -136,11 +137,16 @@ impl Router {
             request_timeout_secs: self.request_timeout_secs,
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
             worker_startup_check_interval_secs: self.worker_startup_check_interval,
+            dp_aware: self.dp_aware,
+            api_key: self.api_key.clone(),
             discovery,
             metrics,
             log_dir: self.log_dir.clone(),
             log_level: self.log_level.clone(),
             request_id_headers: self.request_id_headers.clone(),
+            max_concurrent_requests: self.max_concurrent_requests,
+            cors_allowed_origins: self.cors_allowed_origins.clone(),
+            retry: config::RetryConfig::default(),
         })
     }
 }
@@ -161,6 +167,8 @@ impl Router {
         eviction_interval_secs = 60,
         max_tree_size = 2usize.pow(24),
         max_payload_size = 256 * 1024 * 1024,  // 256MB default for large batches
+        dp_aware = false,
+        api_key = None,
         log_dir = None,
         log_level = None,
         service_discovery = false,
@@ -178,7 +186,9 @@ impl Router {
         prefill_urls = None,
         decode_urls = None,
         prefill_policy = None,
-        decode_policy = None
+        decode_policy = None,
+        max_concurrent_requests = 64,
+        cors_allowed_origins = vec![]
     ))]
     fn new(
         worker_urls: Vec<String>,
@@ -193,6 +203,8 @@ impl Router {
         eviction_interval_secs: u64,
         max_tree_size: usize,
         max_payload_size: usize,
+        dp_aware: bool,
+        api_key: Option<String>,
         log_dir: Option<String>,
         log_level: Option<String>,
         service_discovery: bool,
@@ -211,6 +223,8 @@ impl Router {
         decode_urls: Option<Vec<String>>,
         prefill_policy: Option<PolicyType>,
         decode_policy: Option<PolicyType>,
+        max_concurrent_requests: usize,
+        cors_allowed_origins: Vec<String>,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -225,6 +239,8 @@ impl Router {
             eviction_interval_secs,
             max_tree_size,
             max_payload_size,
+            dp_aware,
+            api_key,
             log_dir,
             log_level,
             service_discovery,
@@ -243,6 +259,8 @@ impl Router {
             decode_urls,
             prefill_policy,
             decode_policy,
+            max_concurrent_requests,
+            cors_allowed_origins,
         })
     }
 
@@ -268,7 +286,6 @@ impl Router {
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
-                // PD mode configuration
                 pd_mode: self.pd_disaggregation,
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
