@@ -19,7 +19,6 @@ use axum::{
     Json,
 };
 use futures_util::StreamExt;
-use rand::Rng;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -337,7 +336,7 @@ impl PDRouter {
             .into_response()
     }
 
-    // Execute the dual dispatch to prefill and decode servers with retry logic
+    // Execute the dual dispatch to prefill and decode servers (no retry for performance)
     async fn execute_dual_dispatch(
         &self,
         headers: Option<&HeaderMap>,
@@ -349,97 +348,21 @@ impl PDRouter {
         return_logprob: bool,
         start_time: Instant,
     ) -> Response {
-        for attempt in 0..self.retry_config.max_retries {
-            if attempt > 0 {
-                // Calculate backoff with exponential growth and jitter
-                let base_backoff = self.retry_config.initial_backoff_ms as f64
-                    * self
-                        .retry_config
-                        .backoff_multiplier
-                        .powf((attempt - 1) as f32) as f64;
-                let backoff_ms = base_backoff.min(self.retry_config.max_backoff_ms as f64) as u64;
-
-                // Add jitter to prevent thundering herd
-                let jitter = {
-                    let mut rng = rand::thread_rng();
-                    rng.gen_range(0..backoff_ms / 2)
-                };
-                let total_backoff = Duration::from_millis(backoff_ms + jitter);
-
-                info!(
-                    "Retrying request (attempt {}/{}) after {:?} backoff",
-                    attempt + 1,
-                    self.retry_config.max_retries,
-                    total_backoff
-                );
-
-                tokio::time::sleep(total_backoff).await;
-            }
-
-            debug!(
-                "Executing request attempt {}/{}",
-                attempt + 1,
-                self.retry_config.max_retries
-            );
-            let result = self
-                .execute_dual_dispatch_inner(
-                    headers,
-                    json_request.clone(),
-                    route,
-                    prefill,
-                    decode,
-                    is_stream,
-                    return_logprob,
-                    start_time,
-                )
-                .await;
-
-            // Check if we should retry based on the response status
-            let status = result.status();
-            debug!(
-                "Request attempt {} returned status: {}",
-                attempt + 1,
-                status
-            );
-
-            // Don't retry client errors (4xx) or successful responses
-            if status.is_client_error() || status.is_success() {
-                debug!(
-                    "Returning response with status {} (no retry needed)",
-                    status
-                );
-                return result;
-            }
-
-            // Check if this is the last attempt
-            if attempt == self.retry_config.max_retries - 1 {
-                warn!("Final attempt failed with status {}", status);
-                return result;
-            }
-
-            // Log retry decision for retryable errors
-            if status.is_server_error()
-                || status == StatusCode::BAD_GATEWAY
-                || status == StatusCode::GATEWAY_TIMEOUT
-            {
-                warn!(
-                    "Retryable error status: {} on attempt {}/{}. Will retry.",
-                    status,
-                    attempt + 1,
-                    self.retry_config.max_retries
-                );
-            } else {
-                // Don't retry other statuses
-                debug!("Status {} is not retryable, returning response", status);
-                return result;
-            }
-        }
-
-        // This should never be reached due to the loop logic, but just in case
-        unreachable!("Retry loop completed without returning")
+        // Direct execution without retry overhead - PD architecture provides fault tolerance
+        self.execute_dual_dispatch_inner(
+            headers,
+            json_request,
+            route,
+            prefill,
+            decode,
+            is_stream,
+            return_logprob,
+            start_time,
+        )
+        .await
     }
 
-    // Inner implementation of dual dispatch (extracted for retry logic)
+    // Core dual dispatch implementation
     async fn execute_dual_dispatch_inner(
         &self,
         headers: Option<&HeaderMap>,
@@ -505,15 +428,13 @@ impl PDRouter {
                     }
                 }
 
-                // Process prefill response (non-blocking for decode success)
-                let prefill_body = match prefill_result {
-                    Ok(prefill_res) => {
-                        let prefill_status = StatusCode::from_u16(prefill_res.status().as_u16())
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-                        if prefill_status.is_success() {
-                            // Success case - read body if needed
-                            if return_logprob {
+                // Handle prefill response asynchronously (non-blocking)
+                let prefill_body = if return_logprob {
+                    // For logprobs, we need the body content synchronously
+                    match prefill_result {
+                        Ok(prefill_res) => {
+                            let prefill_status = prefill_res.status();
+                            if prefill_status.is_success() {
                                 match prefill_res.bytes().await {
                                     Ok(body) => Some(body),
                                     Err(e) => {
@@ -525,37 +446,59 @@ impl PDRouter {
                                     }
                                 }
                             } else {
-                                // Consume response to complete handshake
-                                match prefill_res.bytes().await {
-                                    Ok(_) => debug!("Prefill response consumed successfully"),
-                                    Err(e) => warn!("Error consuming prefill response: {}", e),
-                                }
+                                // Consume error response asynchronously
+                                let prefill_url = prefill.url().to_string();
+                                tokio::spawn(async move {
+                                    let _ = prefill_res.bytes().await;
+                                    RouterMetrics::record_pd_prefill_error(&prefill_url);
+                                    error!(
+                                        "Prefill server error (non-critical): status={}",
+                                        prefill_status
+                                    );
+                                });
                                 None
                             }
-                        } else {
-                            // Prefill error - log but don't block decode
+                        }
+                        Err(e) => {
                             RouterMetrics::record_pd_prefill_error(prefill.url());
-                            let error_body = prefill_res
-                                .text()
-                                .await
-                                .unwrap_or_else(|_| "Unknown prefill error".to_string());
-                            error!(
-                                "Prefill server returned error (non-critical) prefill_url={} status={} body={}",
-                                prefill.url(), prefill_status, error_body
-                            );
+                            error!("Prefill server failed (non-critical): error={}", e);
                             None
                         }
                     }
-                    Err(e) => {
-                        // Prefill request failed - log but don't block decode
-                        RouterMetrics::record_pd_prefill_error(prefill.url());
-                        error!(
-                            "Prefill server failed (non-critical) prefill_url={} error={}",
-                            prefill.url(),
-                            e
-                        );
-                        None
-                    }
+                } else {
+                    // For non-logprob requests, consume prefill response asynchronously
+                    let prefill_url = prefill.url().to_string();
+                    tokio::spawn(async move {
+                        match prefill_result {
+                            Ok(prefill_res) => {
+                                let prefill_status = prefill_res.status();
+                                if prefill_status.is_success() {
+                                    // Consume response to complete handshake protocol
+                                    match prefill_res.bytes().await {
+                                        Ok(_) => {
+                                            debug!("Prefill response consumed successfully (async)")
+                                        }
+                                        Err(e) => {
+                                            warn!("Error consuming prefill response (async): {}", e)
+                                        }
+                                    }
+                                } else {
+                                    // Consume error response
+                                    let _ = prefill_res.bytes().await;
+                                    RouterMetrics::record_pd_prefill_error(&prefill_url);
+                                    error!(
+                                        "Prefill server error (non-critical): status={}",
+                                        prefill_status
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                RouterMetrics::record_pd_prefill_error(&prefill_url);
+                                error!("Prefill server failed (non-critical): error={}", e);
+                            }
+                        }
+                    });
+                    None
                 };
 
                 if is_stream {
