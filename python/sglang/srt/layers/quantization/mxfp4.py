@@ -291,7 +291,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             torch.zeros(
                 num_experts,
                 hidden_size,
-                intermediate_size_per_partition_after_pad,
+                intermediate_size_per_partition_after_pad // 2,
                 dtype=weight_dtype,
             ),
             requires_grad=False,
@@ -353,7 +353,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.dim() == 3
                 and layer.w2_weight.shape[0] == self.num_experts
                 and layer.w2_weight.shape[1] == self.hidden_size
-                and layer.w2_weight.shape[2] == self.intermediate_size
+                and layer.w2_weight.shape[2] == self.intermediate_size // 2
             )
             assert (
                 layer.w2_weight_scale.dim() == 3
@@ -556,9 +556,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 x_quant, x_scale = mxfp8_quantize(x, False)  # to mxfp8
                 x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
 
-            # Extract top_k from topk_output
-            top_k = topk_output.topk_ids.shape[-1]
-            router_logits = topk_output.router_logits
+            topk_weights, topk_ids, router_logits = topk_output
+            top_k = topk_weights.shape[-1]
 
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
