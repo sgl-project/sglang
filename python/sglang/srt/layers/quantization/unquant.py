@@ -126,17 +126,23 @@ class UnquantizedLinearMethod(LinearMethodBase):
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     """MoE method without quantization."""
 
-    def __init__(self, use_triton_kernels: bool = False):
+    def __init__(self, use_triton_kernels: bool = False, with_bias: bool = False):
         super().__init__()
         self.use_triton_kernels = use_triton_kernels
+        self.with_bias = with_bias
 
         self.triton_kernel_moe_forward = None
+        self.triton_kernel_moe_with_bias_forward = None
         if torch.cuda.is_available() and has_triton_kernels:
             from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
                 triton_kernel_moe_forward as _tk_forward,
             )
+            from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
+                triton_kernel_moe_with_bias_forward as _tk_with_bias_forward,
+            )
 
             self.triton_kernel_moe_forward = _tk_forward
+            self.triton_kernel_moe_with_bias_forward = _tk_with_bias_forward
 
     def create_weights(
         self,
@@ -158,6 +164,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
+        if self.with_bias:
+            w13_weight_bias = torch.nn.Parameter(
+                torch.empty(num_experts, 2 * intermediate_size, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_bias", w13_weight_bias)
+            set_weight_attrs(w13_weight_bias, extra_weight_attrs)
+
         # down_proj (row parallel)
         w2_weight_n, w2_weight_k = (
             hidden_size,
@@ -171,6 +185,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        if self.with_bias:
+            w2_weight_bias = torch.nn.Parameter(
+                torch.empty(num_experts, hidden_size, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_bias", w2_weight_bias)
+            set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _use_aiter:
@@ -202,7 +224,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
+        activation_alpha: Optional[float] = None,
+        swiglu_limit: Optional[float] = None,
     ) -> torch.Tensor:
+        kwargs = {}
+        if activation_alpha is not None:
+            kwargs["activation_alpha"] = activation_alpha
+        if swiglu_limit is not None:
+            kwargs["swiglu_limit"] = swiglu_limit
 
         return self.forward(
             x=x,
@@ -213,6 +242,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             inplace=inplace,
             no_combine=no_combine,
             routed_scaling_factor=routed_scaling_factor,
+            **kwargs,
         )
 
     def forward_cuda(
@@ -226,15 +256,32 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
+        activation_alpha: Optional[float] = None,
+        swiglu_limit: Optional[float] = None,
     ) -> torch.Tensor:
 
         if self.use_triton_kernels:
-            return self.triton_kernel_moe_forward(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_output=topk_output,
-            )
+            if self.with_bias:
+                return self.triton_kernel_moe_with_bias_forward(
+                    hidden_states=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    b1=layer.w13_weight_bias,
+                    b2=layer.w2_weight_bias,
+                    topk_output=topk_output,
+                    activation=activation,
+                    activation_alpha=activation_alpha,
+                    swiglu_limit=swiglu_limit,
+                    w1_pcg=None,
+                    w2_pcg=None,
+                )
+            else:
+                return self.triton_kernel_moe_forward(
+                    hidden_states=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    topk_output=topk_output,
+                )
         else:
             if _use_aiter:
                 assert not no_combine, "unsupported"
