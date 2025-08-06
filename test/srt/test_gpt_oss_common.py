@@ -1,16 +1,15 @@
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from typing import Literal, List, Dict
+from typing import Dict, List, Literal
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
-
-from sglang.test.test_utils import CustomTestCase
 
 _base_url = DEFAULT_URL_FOR_TEST
 
@@ -45,17 +44,21 @@ class BaseTestGptOss(CustomTestCase):
 
         try:
             with ThreadPoolExecutor(max_workers=4) as executor:
-                list(executor.map(
-                    lambda d: self._run_one_eval(**d),
-                    [
-                        dict(
-                            model=model,
-                            reasoning_effort=reasoning_effort,
-                            expected_score=expected_score_of_reasoning_effort[reasoning_effort],
-                        )
-                        for reasoning_effort in ["low", "medium", "high"]
-                    ]
-                ))
+                list(
+                    executor.map(
+                        lambda d: self._run_one_eval(**d),
+                        [
+                            dict(
+                                model=model,
+                                reasoning_effort=reasoning_effort,
+                                expected_score=expected_score_of_reasoning_effort[
+                                    reasoning_effort
+                                ],
+                            )
+                            for reasoning_effort in ["low", "medium", "high"]
+                        ],
+                    )
+                )
         finally:
             kill_process_tree(process.pid)
 
@@ -75,5 +78,7 @@ class BaseTestGptOss(CustomTestCase):
 
         print(f"Evaluation start: {model=} {reasoning_effort=} {expected_score=}")
         metrics = run_eval(args)
-        print(f"Evaluation end: {model=} {reasoning_effort=} {expected_score=} {metrics=}")
+        print(
+            f"Evaluation end: {model=} {reasoning_effort=} {expected_score=} {metrics=}"
+        )
         self.assertGreaterEqual(metrics["score"], expected_score)
