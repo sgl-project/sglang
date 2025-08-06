@@ -175,7 +175,7 @@ class DeepEPBuffer:
         else:
             raise NotImplementedError
 
-        if not is_npu():
+        if not _is_npu:
             total_num_sms = torch.cuda.get_device_properties(
                 device="cuda"
             ).multi_processor_count
