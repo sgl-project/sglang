@@ -38,9 +38,11 @@ pip list
 # Install additional dependencies
 pip install mooncake-transfer-engine==0.3.5 nvidia-cuda-nvrtc-cu12 --break-system-packages
 
-# For lmms_evals evaluating MMMU
-git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-pip install -e lmms-eval/ --break-system-packages
+if [ "$MODE_BLACKWELL" != "1" ]; then
+    # For lmms_evals evaluating MMMU
+    git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+    pip install -e lmms-eval/ --break-system-packages
+fi
 
 # Install FlashMLA for attention backend tests
 # pip install git+https://github.com/deepseek-ai/FlashMLA.git --break-system-packages
