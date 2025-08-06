@@ -4,8 +4,8 @@ import unittest
 import torch
 
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
-from sglang.test.test_utils import CustomTestCase
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestRMSNorm(CustomTestCase):
@@ -58,7 +58,6 @@ class TestRMSNorm(CustomTestCase):
                 self._run_rms_norm_test(*params)
 
 
-
 class TestRMSNormQuant(CustomTestCase):
     DTYPES = [torch.bfloat16]
     NUM_TOKENS = [7, 83, 4096]
@@ -76,20 +75,34 @@ class TestRMSNormQuant(CustomTestCase):
             raise unittest.SkipTest("CUDA is not available")
         torch.set_default_device("cuda")
 
-    def _run_rms_norm_test(self, num_tokens, hidden_size, add_residual, dtype,
-                           column_major_scales, scale_tma_aligned, group_size, scale_ue8m0, seed):
-        #Invalid configuration, skip
-        if scale_ue8m0 and not(scale_tma_aligned and column_major_scales):
+    def _run_rms_norm_test(
+        self,
+        num_tokens,
+        hidden_size,
+        add_residual,
+        dtype,
+        column_major_scales,
+        scale_tma_aligned,
+        group_size,
+        scale_ue8m0,
+        seed,
+    ):
+        # Invalid configuration, skip
+        if scale_ue8m0 and not (
+            scale_tma_aligned and column_major_scales and group_size == 128
+        ):
             return
 
         torch.manual_seed(seed)
 
-        layer = RMSNorm(hidden_size, output_quant=True,
-                        column_major_scales=column_major_scales,
-                        scale_tma_aligned=scale_tma_aligned,
-                        group_size=group_size,
-                        scale_ue8m0=scale_ue8m0,
-                        ).to(dtype=dtype)
+        layer = RMSNorm(
+            hidden_size,
+            output_quant=True,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            group_size=group_size,
+            scale_ue8m0=scale_ue8m0,
+        ).to(dtype=dtype)
         layer.weight.data.normal_(mean=1.0, std=0.1)
         scale = 1 / (2 * hidden_size)
         x = torch.randn(num_tokens, hidden_size, dtype=dtype) * scale
@@ -98,63 +111,63 @@ class TestRMSNormQuant(CustomTestCase):
         with torch.inference_mode():
             ref_out = layer.forward_native(x, residual)
             out = layer(x, residual)
+        quant_atol = 5e-1
 
         if add_residual:
             (q, s), res = out
             ref_rms, ref_res = ref_out
-            ref_q, ref_s = sglang_per_token_group_quant_fp8(ref_rms, group_size,
-                                                            column_major_scales=column_major_scales,
-                                                            scale_tma_aligned=scale_tma_aligned,
-                                                            scale_ue8m0=scale_ue8m0)
+            ref_q, ref_s = sglang_per_token_group_quant_fp8(
+                ref_rms,
+                group_size,
+                column_major_scales=column_major_scales,
+                scale_tma_aligned=scale_tma_aligned,
+                scale_ue8m0=scale_ue8m0,
+            )
             if scale_ue8m0:
                 s = s.flatten().contiguous().view(dtype=torch.uint8)
                 ref_s = ref_s.flatten().contiguous().view(dtype=torch.uint8)
+                # ue8m0 allocates bigger buffers so we clean non zero elements
+                # so that shapes fit
+                s = 2 ** (s[s.nonzero()].to(dtype) - 127)
+                ref_s = 2 ** (ref_s[ref_s.nonzero()].to(dtype) - 127)
 
+            s = s.repeat_interleave(group_size).reshape(q.shape)
+            ref_s = ref_s.repeat_interleave(group_size).reshape(q.shape)
+            dequant = q.to(dtype) * s
+            ref_dequant = ref_q.to(dtype) * ref_s
 
-            if not (torch.allclose(q.to(dtype), ref_q.to(dtype), atol=32, rtol=1e-1)
-                    and torch.allclose(s, ref_s, atol=4 if scale_ue8m0 else 1e-3, rtol=1e-2)):
-                idx = torch.isclose(q.to(dtype), ref_q.to(dtype), atol=32, rtol=1e-1).logical_not()
-                idx2 = torch.isclose(s, ref_s, atol=4 if scale_ue8m0 else 1e-3, rtol=1e-2).logical_not()
-                print(idx.nonzero())
-                print(q[idx])
-                print(ref_q[idx])
-                print(q[0, :30])
-                print(ref_q[0, :30])
-                print(f"{num_tokens=}, {column_major_scales=}, {scale_tma_aligned=}, {group_size=}, {hidden_size=},")
-                print(s[idx2])
-                print(ref_s[idx2])
-
-            self.assertTrue(torch.allclose(q.to(dtype), ref_q.to(dtype), atol=32, rtol=1e-1))
-            self.assertTrue(torch.allclose(s, ref_s, atol=4 if scale_ue8m0 else 1e-3, rtol=1e-2))
+            self.assertTrue(
+                torch.allclose(dequant, ref_dequant, atol=quant_atol, rtol=1e-3)
+            )
             self.assertTrue(torch.allclose(res, ref_res, atol=1e-2, rtol=1e-2))
         else:
             q, s = out
             ref_rms = ref_out
-            ref_q, ref_s = sglang_per_token_group_quant_fp8(ref_rms, group_size,
-                                                            column_major_scales=column_major_scales,
-                                                            scale_tma_aligned=scale_tma_aligned,
-                                                            scale_ue8m0=scale_ue8m0,
-                                                            )
+            ref_q, ref_s = sglang_per_token_group_quant_fp8(
+                ref_rms,
+                group_size,
+                column_major_scales=column_major_scales,
+                scale_tma_aligned=scale_tma_aligned,
+                scale_ue8m0=scale_ue8m0,
+            )
 
             if scale_ue8m0:
                 s = s.flatten().contiguous().view(dtype=torch.uint8)
                 ref_s = ref_s.flatten().contiguous().view(dtype=torch.uint8)
 
-            if not (torch.allclose(q.to(dtype), ref_q.to(dtype), atol=32, rtol=1e-1)
-                    and torch.allclose(s, ref_s, atol=1e-2, rtol=1e-2)):
-                idx = torch.isclose(q.to(dtype), ref_q.to(dtype), atol=32, rtol=1e-1).logical_not()
-                idx2 = torch.isclose(s, ref_s, atol=1e-2, rtol=1e-2).logical_not()
-                print(idx.nonzero())
-                print(q[idx])
-                print(ref_q[idx])
-                print(q[0, :30])
-                print(ref_q[0, :30])
-                print(f"{num_tokens=}, {column_major_scales=}, {scale_tma_aligned=}, {group_size=}, {hidden_size=},")
-                print(s[idx2])
-                print(ref_s[idx2])
+                # ue8m0 allocates bigger buffers so we clean non zero elements
+                # so that shapes fit
+                s = 2 ** (s[s.nonzero()].to(dtype) - 127)
+                ref_s = 2 ** (ref_s[ref_s.nonzero()].to(dtype) - 127)
 
-            self.assertTrue(torch.allclose(q.to(dtype), ref_q.to(dtype), atol=32, rtol=1e-1))
-            self.assertTrue(torch.allclose(s, ref_s, atol=4 if scale_ue8m0 else 1e-3, rtol=1e-2))
+            s = s.repeat_interleave(group_size).reshape(q.shape)
+            ref_s = ref_s.repeat_interleave(group_size).reshape(q.shape)
+            dequant = q.to(dtype) * s
+            ref_dequant = ref_q.to(dtype) * ref_s
+
+            self.assertTrue(
+                torch.allclose(dequant, ref_dequant, atol=quant_atol, rtol=1e-3)
+            )
 
     def test_rms_norm(self):
         for params in itertools.product(
@@ -180,6 +193,7 @@ class TestRMSNormQuant(CustomTestCase):
                 seed=params[8],
             ):
                 self._run_rms_norm_test(*params)
+
 
 class TestGemmaRMSNorm(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16]

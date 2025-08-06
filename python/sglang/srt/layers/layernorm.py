@@ -20,7 +20,12 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.layers.quantization.fp8_kernel import fp8_max, fp8_min, fp8_dtype, create_per_token_group_quant_fp8_output_scale
+from sglang.srt.layers.quantization.fp8_kernel import (
+    create_per_token_group_quant_fp8_output_scale,
+    fp8_dtype,
+    fp8_max,
+    fp8_min,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -40,8 +45,8 @@ _is_cpu = is_cpu()
 if _is_cuda:
     from sgl_kernel import (
         fused_add_rmsnorm,
-        fused_rmsnorm_quant,
         fused_add_rmsnorm_quant,
+        fused_rmsnorm_quant,
         gemma_fused_add_rmsnorm,
         gemma_rmsnorm,
         rmsnorm,
@@ -70,7 +75,7 @@ class RMSNorm(CustomOp):
         column_major_scales: bool = False,
         scale_tma_aligned: bool = False,
         scale_ue8m0: bool = False,
-        quant_eps: float = 1e-10
+        quant_eps: float = 1e-10,
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.randn(hidden_size))
@@ -83,9 +88,15 @@ class RMSNorm(CustomOp):
 
         self.output_quant = output_quant if _is_cuda else False
         if self.output_quant:
-            assert self.variance_size_override is not None, "variance size override not implemented for outputting quants"
-            assert group_size is not None, "To output quants in RMS norm we need group size set"
-            assert hidden_size % group_size == 0, f"Hidden size must be a multiple of group size got {hidden_size=} {group_size=}"
+            assert (
+                self.variance_size_override is None
+            ), "variance size override not implemented for outputting quants"
+            assert (
+                group_size is not None
+            ), "To output quants in RMS norm we need group size set"
+            assert (
+                hidden_size % group_size == 0
+            ), f"Hidden size must be a multiple of group size got {hidden_size=} {group_size=}"
             self.group_size = group_size
         self.column_major_scales = column_major_scales
         self.scale_tma_aligned = scale_tma_aligned
@@ -106,18 +117,41 @@ class RMSNorm(CustomOp):
             return self.forward_native(x, residual)
         if self.output_quant:
             q = torch.empty_like(x, dtype=fp8_dtype)
-            s = create_per_token_group_quant_fp8_output_scale(x.shape,
-                                                              x.device,
-                                                     self.group_size,
-                                                     self.column_major_scales,
-                                                     self.scale_tma_aligned,
-                                                     self.scale_ue8m0)
+            s = create_per_token_group_quant_fp8_output_scale(
+                x.shape,
+                x.device,
+                self.group_size,
+                self.column_major_scales,
+                self.scale_tma_aligned,
+                self.scale_ue8m0,
+            )
             if residual is not None:
-                fused_add_rmsnorm_quant(x, residual, q, s, self.weight, self.group_size, self.quant_eps,
-                                fp8_min, fp8_max, slf.scale_ue8m0, rms_eps=self.variance_epsilon)
+                fused_add_rmsnorm_quant(
+                    x,
+                    residual,
+                    q,
+                    s,
+                    self.weight,
+                    self.group_size,
+                    self.quant_eps,
+                    fp8_min,
+                    fp8_max,
+                    self.scale_ue8m0,
+                    rms_eps=self.variance_epsilon,
+                )
                 return (q, s), residual
-            fused_rmsnorm_quant(x, q, s, self.weight, self.group_size, self.quant_eps,
-                                fp8_min, fp8_max, self.scale_ue8m0, rms_eps=self.variance_epsilon)
+            fused_rmsnorm_quant(
+                x,
+                q,
+                s,
+                self.weight,
+                self.group_size,
+                self.quant_eps,
+                fp8_min,
+                fp8_max,
+                self.scale_ue8m0,
+                rms_eps=self.variance_epsilon,
+            )
             return (q, s)
         else:
             if residual is not None:
