@@ -9,7 +9,15 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 
 import torch
 import triton
-from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+
+from sglang.srt.utils import get_bool_env_var
+if get_bool_env_var("SGLANG_USE_KV_FP8_FLASHMLA"):
+    from sgl_kernel.flashmla_attn import flash_mla_with_kvcache, get_mla_metadata
+else:
+    try:
+        from flashmla import flash_mla_with_kvcache, get_mla_metadata
+    except ImportError:
+        from sgl_kernel.flashmla_attn import flash_mla_with_kvcache, get_mla_metadata
 
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
