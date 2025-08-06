@@ -214,8 +214,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 |-----------|-------------|----------|
 | `--ep-size` | The expert parallelism size. | 1 |
 | `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | None |
-| `--enable-flashinfer-cutlass-moe` | Enabling Flashinfer Cutlass MoE implementation for high throughput. | False |
-| `--enable-flashinfer-trtllm-moe` | Enabling Flashinfer Trtllm MoE implementation for low latency. | False |
+| `--moe-grouped-gemm-backend` | Select the backend for MoE grouped GEMM. | 'triton' |
 | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | auto |
 | `--ep-num-redundant-experts` | Allocate this number of redundant experts in expert parallel. | 0 |
 | `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in expert parallel. | None |
@@ -280,7 +279,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disable-chunked-prefix-cache` | Disable chunked prefix cache. | False |
 | `--disable-fast-image-processor` | Disable fast image processor. | False |
 | `--enable-return-hidden-states` | Enable returning hidden states. | False |
-| `--enable-triton-kernel-moe` | Enable Triton kernel for MoE. | False |
 
 ## Debug tensor dumps
 
