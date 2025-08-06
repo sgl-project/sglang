@@ -47,8 +47,8 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.moe_runner import get_moe_a2a_backend
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -127,11 +127,6 @@ class GptOssSparseMoeBlock(nn.Module):
             swiglu_limit=self.swiglu_limit,
             with_bias=True,
             prefix=add_prefix("experts", prefix),
-            **(
-                dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
-                if global_server_args_dict["moe_a2a_backend"].is_deepep()
-                else {}
-            ),
             **extra_kwargs,
         )
 
@@ -147,7 +142,7 @@ class GptOssSparseMoeBlock(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
     ) -> torch.Tensor:
-        if not global_server_args_dict["moe_a2a_backend"].is_deepep():
+        if not get_moe_a2a_backend().is_deepep():
             return self.forward_normal(hidden_states)
         else:
             raise Exception("forward_deepep branch not implemented yet")

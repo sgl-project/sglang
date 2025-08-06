@@ -32,6 +32,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
 )
+from sglang.srt.layers.moe.moe_runner import get_moe_a2a_backend
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -108,7 +109,7 @@ class LayerScatterModes:
         if context.is_layer_sparse:
             return (
                 ScatterMode.SCATTERED
-                if not global_server_args_dict["moe_a2a_backend"].is_standard()
+                if not get_moe_a2a_backend().is_standard()
                 else ScatterMode.FULL
             )
         else:

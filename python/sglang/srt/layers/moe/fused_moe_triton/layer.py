@@ -133,7 +133,6 @@ class FusedMoE(torch.nn.Module):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
-        enable_flashinfer_cutlass_moe: Optional[bool] = False,
         activation_alpha: Optional[float] = None,
         swiglu_limit: Optional[float] = None,
         use_weight_loader_fused: bool = False,
@@ -155,6 +154,10 @@ class FusedMoE(torch.nn.Module):
         # For activation
         self.activation_alpha = activation_alpha
         self.swiglu_limit = swiglu_limit
+
+        enable_flashinfer_cutlass_moe = global_server_args_dict[
+            "enable_flashinfer_cutlass_moe"
+        ]
 
         if enable_flashinfer_cutlass_moe and quant_config is None:
             logger.warning("Disable flashinfer MoE when quantization config is None.")

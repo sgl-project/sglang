@@ -15,15 +15,12 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
+from sglang.srt.layers.moe.moe_runner import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.utils import DeepEPMode, should_use_flashinfer_trtllm_moe
+from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8 import (
-    Fp8Config,
-    Fp8MoEMethod,
-    get_tile_tokens_dim,
-)
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     sglang_per_token_group_quant_fp8,
@@ -301,7 +298,6 @@ class DeepEPMoE(EPMoE):
         prefix: str = "",
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
-        deepep_mode: DeepEPMode = DeepEPMode.AUTO,
     ):
         super().__init__(
             num_experts=num_experts,
@@ -317,7 +313,7 @@ class DeepEPMoE(EPMoE):
             activation=activation,
             routed_scaling_factor=routed_scaling_factor,
         )
-        self.deepep_mode = deepep_mode
+        self.deepep_mode = get_deepep_mode()
 
         # TODO: move to the beginning of the file
         from sglang.srt.distributed.parallel_state import get_tp_group
@@ -677,7 +673,7 @@ class DeepEPMoE(EPMoE):
 
 
 def get_moe_impl_class():
-    if global_server_args_dict["moe_a2a_backend"].is_deepep():
+    if get_moe_a2a_backend().is_deepep():
         return DeepEPMoE
 
     # NEW: Direct FP4 detection (bypasses EP requirements)

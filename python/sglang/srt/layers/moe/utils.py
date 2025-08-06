@@ -38,6 +38,15 @@ class MoeA2ABackend(Enum):
         return self == MoeA2ABackend.STANDARD
 
 
+class MoeGroupedGemmBackend(Enum):
+    STANDARD = "standard"
+    DEEPEP = "deepgemm"
+    FLASHINFER = "flashinfer_trtllm"
+    FLASHINFER_CUTLASS = "flashinfer_cutlass"
+    TRITON = "triton"
+    TRITON_KERNELS = "triton_kernels"
+
+
 class DeepEPMode(Enum):
     NORMAL = "normal"
     LOW_LATENCY = "low_latency"

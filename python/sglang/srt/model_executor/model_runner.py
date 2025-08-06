@@ -60,6 +60,7 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.moe_runner import initialize_moe_runner
 from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.layers.quantization import (
     deep_gemm_wrapper,
@@ -217,10 +218,6 @@ class ModelRunner:
                 # TODO it is indeed not a "server args"
                 "use_mla_backend": self.use_mla_backend,
                 "speculative_algorithm": self.spec_algorithm,
-            }
-            | {
-                "moe_a2a_backend": MoeA2ABackend(server_args.moe_a2a_backend),
-                "deepep_mode": DeepEPMode(server_args.deepep_mode),
             }
         )
 
@@ -561,6 +558,10 @@ class ModelRunner:
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
+            )
+            initialize_moe_runner(
+                moe_a2a_backend=self.server_args.moe_a2a_backend,
+                # moe_grouped_gemm_backend=self.server_args.moe_grouped_gemm_backend,
             )
             initialize_dp_attention(
                 enable_dp_attention=self.server_args.enable_dp_attention,
