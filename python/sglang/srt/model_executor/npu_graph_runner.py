@@ -41,6 +41,7 @@ if _is_npu:
     torch.cuda.stream = torch.npu.stream
     torch.cuda.Stream = torch.npu.Stream
     torch.cuda.current_stream = torch.npu.current_stream
+    torch.cuda.graph_pool_handle = torch.npu.graph_pool_handle
 
 
 class NPUGraphRunner(CudaGraphRunner):
