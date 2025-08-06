@@ -566,14 +566,20 @@ class GptOssModel(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
+        
+        forward_batch.on_model_start()
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(hidden_states + residual)
+                forward_batch.on_layer_start(i)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual
                 )
+                forward_batch.on_layer_end(i)
+        forward_batch.on_model_end()
+        
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -595,6 +601,7 @@ class GptOssModel(nn.Module):
 
 class GptOssForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+    hip_attention_supported = True
 
     def __init__(
         self,
