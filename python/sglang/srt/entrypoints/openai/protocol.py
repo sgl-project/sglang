@@ -20,18 +20,11 @@ from typing import Any, Dict, List, Optional, TypeAlias, Union
 
 from openai.types.responses import (
     ResponseFunctionToolCall,
-    ResponseFunctionToolCallOutputItem,
     ResponseInputItemParam,
     ResponseOutputItem,
-    ResponsePrompt,
     ResponseReasoningItem,
-    ResponseStatus,
-    ResponseTextConfig,
 )
 from openai.types.responses.response import ToolChoice
-from openai.types.responses.response_function_web_search import (
-    ResponseFunctionWebSearch,
-)
 from openai.types.responses.tool import Tool
 from pydantic import (
     BaseModel,
