@@ -551,20 +551,10 @@ def embed_mm_inputs(
             modality_id = modality.name.lower()
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0 and embedder is not None:
-            # placeholder_tensor = torch.as_tensor(
-            #     [item.pad_value for item in items],
-            #     device=input_ids.device,
-            # )
-            if placeholder_tokens is not None:
-                placeholder_tensor = torch.as_tensor(
-                        [placeholder_tokens for _ in items],
-                        device=input_ids.device,
-                    )
-            else:
-                placeholder_tensor = torch.as_tensor(
-                    [item.pad_value for item in items],
-                    device=input_ids.device,
-                )
+            placeholder_tensor = torch.as_tensor(
+                [item.pad_value for item in items],
+                device=input_ids.device,
+            )
             # calculate per request items length offset
             items_size = torch.zeros(len(mm_inputs_list) + 1, dtype=int)
             items_offsets = []

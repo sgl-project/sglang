@@ -441,7 +441,7 @@ class ForwardBatch:
                 ret.spec_info is not None
                 and getattr(ret.spec_info, "positions", None) is not None
             ):
-                # TODO : This is a tmp solution for dev, mrope positions should be computed in _compute_mrope_positions when draft decode.
+                # TODO : This is a workaround for Qwen2.5-VL when draft model decode
                 ret.mrope_positions = ret.spec_info.positions.unsqueeze(0).repeat(3,1)
             else:
                 ret._compute_mrope_positions(model_runner, batch)
