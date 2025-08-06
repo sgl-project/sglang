@@ -3,11 +3,6 @@ name: Nightly Test
 on:
   schedule:
     - cron: '0 0 * * *'
-  push:
-    branches:
-      - main
-    paths:
-      - "python/sglang/version.py"
   workflow_dispatch:
 
 concurrency:
@@ -31,3 +26,45 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite nightly --timeout-per-file 3600
+
+  nightly-test-4-gpu:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 4-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 120
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-4-gpu --timeout-per-file 3600
+
+  nightly-test-amd:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-2, linux-mi325-gpu-2-nightly]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/amd_ci_install_dependency.sh
+
+      - name: Nightly Test
+        run: |
+          bash scripts/amd_ci_exec.sh -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd --timeout-per-file 7200
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY

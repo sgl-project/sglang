@@ -1,0 +1,130 @@
+name: Weekly Test
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Every Sunday at midnight
+  workflow_dispatch:
+
+concurrency:
+  group: weekly-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  weekly-test:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 120
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite weekly --timeout-per-file 3600
+
+  weekly-test-2-gpu:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 120
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite weekly-2-gpu --timeout-per-file 3600
+
+  weekly-test-4-gpu:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch'
+    runs-on: 4-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 120
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite weekly-4-gpu --timeout-per-file 3600
+
+  weekly-test-8-gpu:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch'
+    runs-on: 8-gpu-runner
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 120
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-8-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+
+  weekly-test-8-gpu-amd:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-8]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start CI container
+        run: bash scripts/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 60
+        run: |
+          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --timeout-per-file 3600
+
+      - name: Run CustomAllReduce test
+        timeout-minutes: 10
+        run: |
+          bash scripts/amd_ci_exec.sh -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 -m unittest test_custom_allreduce.TestCustomAllReduce
+
+  weekly-test-vllm-dependencies:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+          # Install additional dependencies for vLLM tests
+          pip install awq gptqmodel bitsandbytes optimum-quanto
+
+      - name: Run test
+        timeout-minutes: 120
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite weekly-vllm_dependency_test --timeout-per-file 3600
