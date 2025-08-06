@@ -34,7 +34,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import get_pp_group, get_pp_indices
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
@@ -313,12 +313,18 @@ class MooncakeKVManager(BaseKVManager):
         layers_params = None
 
         # pp is not supported on the decode side yet
+        start_layer, end_layer = (
+            get_pp_indices(
+                len(self.kv_args.kv_data_ptrs),
+                self.pp_rank,
+                self.pp_size,
+            )
+            if self.pp_rank is not None and self.pp_size is not None
+            else (0, len(self.kv_args.kv_data_ptrs))
+        )
         if self.is_mla_backend:
             src_kv_ptrs = self.kv_args.kv_data_ptrs
             layers_per_pp_stage = len(src_kv_ptrs)
-            # start_layer = self.pp_rank * layers_per_pp_stage
-            start_layer = self.kv_args.prefill_start_layer
-            end_layer = start_layer + layers_per_pp_stage
             dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
             kv_item_len = self.kv_args.kv_item_lens[0]
             layers_params = [
@@ -335,9 +341,6 @@ class MooncakeKVManager(BaseKVManager):
             src_k_ptrs = self.kv_args.kv_data_ptrs[:num_kv_layers]
             src_v_ptrs = self.kv_args.kv_data_ptrs[num_kv_layers:]
             layers_per_pp_stage = len(src_k_ptrs)
-            # start_layer = self.pp_rank * layers_per_pp_stage
-            start_layer = self.kv_args.prefill_start_layer
-            end_layer = start_layer + layers_per_pp_stage
             dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
             dst_v_ptrs = dst_kv_ptrs[
                 dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
