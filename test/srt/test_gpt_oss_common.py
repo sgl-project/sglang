@@ -34,7 +34,7 @@ class BaseTestGptOss(CustomTestCase):
         self,
         model: str,
         expected_score_of_reasoning_effort: Dict[str, float],
-        other_args: List[str],
+        other_args: List[str] = [],
     ):
         process = popen_launch_server(
             model,

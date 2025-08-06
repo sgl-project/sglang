@@ -14,6 +14,7 @@ class TestGptOss4Gpu(BaseTestGptOss):
                 "medium": 0.50,
                 "high": 0.50,
             },
+            other_args=["--tp", "4"],
         )
 
 
