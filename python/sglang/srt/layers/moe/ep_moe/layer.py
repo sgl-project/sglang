@@ -331,7 +331,7 @@ class DeepEPMoE(EPMoE):
             num_local_experts=self.num_local_experts,
             hidden_size=hidden_size,
             params_dtype=params_dtype,
-            deepep_mode=deepep_mode,
+            deepep_mode=self.deepep_mode,
             async_finish=True,  # TODO
             return_recv_hook=True,
         )

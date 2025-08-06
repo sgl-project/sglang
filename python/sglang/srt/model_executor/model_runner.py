@@ -559,11 +559,6 @@ class ModelRunner:
                 expert_model_parallel_size=self.moe_ep_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
             )
-            initialize_moe_runner(
-                moe_a2a_backend=self.server_args.moe_a2a_backend,
-                moe_grouped_gemm_backend=self.server_args.moe_grouped_gemm_backend,
-                deepep_mode=self.server_args.deepep_mode,
-            )
             initialize_dp_attention(
                 enable_dp_attention=self.server_args.enable_dp_attention,
                 tp_rank=self.tp_rank,

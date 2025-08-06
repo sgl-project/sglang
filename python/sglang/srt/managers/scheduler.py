@@ -64,6 +64,7 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.moe_runner import initialize_moe_runner
 from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -493,6 +494,9 @@ class Scheduler(
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
 
+        # Init moe runner
+        self.init_moe_runner()
+
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -748,6 +752,14 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+
+    def init_moe_runner(self):
+        if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
+            initialize_moe_runner(
+                moe_a2a_backend=self.server_args.moe_a2a_backend,
+                moe_grouped_gemm_backend=self.server_args.moe_grouped_gemm_backend,
+                deepep_mode=self.server_args.deepep_mode,
+            )
 
     @DynamicGradMode()
     def event_loop_normal(self):
