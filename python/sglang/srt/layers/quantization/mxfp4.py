@@ -545,9 +545,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         swiglu_limit: Optional[float] = None,
     ) -> torch.Tensor:
         if USE_FLASHINFER_MXFP4_MOE or USE_FLASHINFER_MXFP4_BF16_MOE:
-            # FlashInfer backend doesn't support EP yet
-            # assert not self.moe.use_ep, (
-            #     "EP is not supported for flashinfer mxfp4 moe backend yet.")
+            # When USE_FLASHINFER_MXFP4_BF16_MOE is enabled, we don't need to quantize the input,
+            # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
+            # which can theoretically improve performance
             if USE_FLASHINFER_MXFP4_BF16_MOE:
                 assert x.dtype == torch.bfloat16
                 x_quant = x
