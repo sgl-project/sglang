@@ -333,6 +333,9 @@ class MiniCPMForCausalLM(nn.Module):
             lm_head = self.lm_head
         return self.logits_processor(input_ids, hidden_states, lm_head, forward_batch)
 
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
