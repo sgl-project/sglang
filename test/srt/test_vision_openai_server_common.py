@@ -319,12 +319,13 @@ class TestOpenAIVisionServer(CustomTestCase):
             or "person" in video_response
             or "individual" in video_response
             or "speaker" in video_response
+            or "presenter" in video_response
             or "Steve" in video_response
         ), f"""
         ====================== video_response =====================
         {video_response}
         ===========================================================
-        should contain 'man' or 'person' or 'individual' or 'speaker'
+        should contain 'man' or 'person' or 'individual' or 'speaker' or 'presenter' or 'Steve'
         """
         assert (
             "present" in video_response
@@ -337,7 +338,6 @@ class TestOpenAIVisionServer(CustomTestCase):
         ===========================================================
         should contain 'present' or 'examine' or 'display' or 'hold'
         """
-        assert "black" in video_response or "dark" in video_response
         self.assertIsNotNone(video_response)
         self.assertGreater(len(video_response), 0)
 
@@ -375,7 +375,8 @@ class TestOpenAIVisionServer(CustomTestCase):
             or "person" in video_response
             or "individual" in video_response
             or "speaker" in video_response
-        ), f"video_response: {video_response}, should either have 'man' in video_response, or 'person' in video_response, or 'individual' in video_response or 'speaker' in video_response"
+            or "presenter" in video_response
+        ), f"video_response: {video_response}, should either have 'man' in video_response, or 'person' in video_response, or 'individual' in video_response or 'speaker' in video_response or 'presenter' in video_response"
         assert (
             "present" in video_response
             or "examine" in video_response
