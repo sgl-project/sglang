@@ -1521,7 +1521,7 @@ class TokenizerManager:
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
-                "model_version": self.server_args.model_version,
+                "weight_version": self.server_args.weight_version,
             }
 
             if getattr(state.obj, "return_logprob", False):

@@ -83,10 +83,10 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
-    UpdateModelVersionReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+    UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
 )
 from sglang.srt.managers.template_manager import TemplateManager
@@ -311,15 +311,17 @@ async def get_model_info():
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
-        "model_version": _global_state.tokenizer_manager.server_args.model_version,
+        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
     }
     return result
 
 
-@app.get("/get_model_version")
-async def get_model_version():
-    """Get the current model version."""
-    return {"model_version": _global_state.tokenizer_manager.server_args.model_version}
+@app.get("/get_weight_version")
+async def get_weight_version():
+    """Get the current weight version."""
+    return {
+        "weight_version": _global_state.tokenizer_manager.server_args.weight_version
+    }
 
 
 @app.get("/get_server_info")
@@ -514,10 +516,10 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
         await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
     )
 
-    # Update model version if provided and weights update was successful
-    if success and obj.model_version is not None:
-        _update_model_version_if_provided(obj.model_version)
-        message += f" Model version updated to {obj.model_version}."
+    # Update weight version if provided and weights update was successful
+    if success and obj.weight_version is not None:
+        _update_weight_version_if_provided(obj.weight_version)
+        message += f" Weight version updated to {obj.weight_version}."
 
     content = {
         "success": success,
@@ -566,10 +568,10 @@ async def update_weights_from_tensor(
         obj, request
     )
 
-    # Update model version if provided and weights update was successful
-    if success and obj.model_version is not None:
-        _update_model_version_if_provided(obj.model_version)
-        message += f" Model version updated to {obj.model_version}."
+    # Update weight version if provided and weights update was successful
+    if success and obj.weight_version is not None:
+        _update_weight_version_if_provided(obj.weight_version)
+        message += f" Weight version updated to {obj.weight_version}."
 
     content = {"success": success, "message": message}
     return ORJSONResponse(
@@ -588,10 +590,10 @@ async def update_weights_from_distributed(
         )
     )
 
-    # Update model version if provided and weights update was successful
-    if success and obj.model_version is not None:
-        _update_model_version_if_provided(obj.model_version)
-        message += f" Model version updated to {obj.model_version}."
+    # Update weight version if provided and weights update was successful
+    if success and obj.weight_version is not None:
+        _update_weight_version_if_provided(obj.weight_version)
+        message += f" Weight version updated to {obj.weight_version}."
 
     content = {"success": success, "message": message}
     if success:
@@ -600,22 +602,22 @@ async def update_weights_from_distributed(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
-@app.post("/update_model_version")
-async def update_model_version(obj: UpdateModelVersionReqInput, request: Request):
-    """Update the model version. This operation requires no active requests."""
+@app.post("/update_weight_version")
+async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Request):
+    """Update the weight version. This operation requires no active requests."""
     if obj.abort_all_requests:
         _global_state.tokenizer_manager.abort_request(abort_all=True)
 
     # Use a simple approach without the complex lock mechanism for now
-    # since model_version update is a simple operation that doesn't affect model weights
+    # since weight_version update is a simple operation that doesn't affect model weights
     try:
-        # Update the model version in server args (the single source of truth)
-        _global_state.tokenizer_manager.server_args.model_version = obj.new_version
+        # Update the weight version in server args (the single source of truth)
+        _global_state.tokenizer_manager.server_args.weight_version = obj.new_version
 
         return ORJSONResponse(
             {
                 "success": True,
-                "message": f"Model version updated to {obj.new_version}",
+                "message": f"Weight version updated to {obj.new_version}",
                 "new_version": obj.new_version,
             },
             status_code=HTTPStatus.OK,
@@ -624,7 +626,7 @@ async def update_model_version(obj: UpdateModelVersionReqInput, request: Request
         return ORJSONResponse(
             {
                 "success": False,
-                "message": f"Failed to update model version: {str(e)}",
+                "message": f"Failed to update weight version: {str(e)}",
             },
             status_code=HTTPStatus.BAD_REQUEST,
         )
@@ -954,10 +956,10 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     return ORJSONResponse({"predictions": ret})
 
 
-def _update_model_version_if_provided(model_version: Optional[str]) -> None:
-    """Update model version if provided."""
-    if model_version is not None:
-        _global_state.tokenizer_manager.server_args.model_version = model_version
+def _update_weight_version_if_provided(weight_version: Optional[str]) -> None:
+    """Update weight version if provided."""
+    if weight_version is not None:
+        _global_state.tokenizer_manager.server_args.weight_version = weight_version
 
 
 def _create_error_response(e):

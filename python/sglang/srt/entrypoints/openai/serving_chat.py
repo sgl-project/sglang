@@ -698,7 +698,7 @@ class OpenAIServingChat(OpenAIServingBase):
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata={"model_version": ret[0]["meta_info"]["model_version"]},
+            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
         )
 
     def _process_logprobs_tokens(
