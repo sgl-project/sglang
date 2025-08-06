@@ -729,6 +729,7 @@ def select_experts(
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     custom_routing_function = topk_config.custom_routing_function
     correction_bias = topk_config.correction_bias
+    torch_native = topk_config.torch_native
     routed_scaling_factor = topk_config.routed_scaling_factor
 
     router_logits, correction_bias = (
