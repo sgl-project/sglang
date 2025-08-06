@@ -307,7 +307,8 @@ class ModelRunner:
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
         assert (not model_has_mtp_layers) or (
-            self.num_effective_layers == model_num_layers
+            self.spec_algorithm.is_none() ) or (
+            (not self.spec_algorithm.is_none()) and (self.num_effective_layers == model_num_layers)
         ), "PP is not compatible with MTP models."
 
         # Apply torchao quantization

@@ -313,15 +313,8 @@ class MooncakeKVManager(BaseKVManager):
         layers_params = None
 
         # pp is not supported on the decode side yet
-        start_layer, end_layer = (
-            get_pp_indices(
-                len(self.kv_args.kv_data_ptrs),
-                self.pp_rank,
-                self.pp_size,
-            )
-            if self.pp_rank is not None and self.pp_size is not None
-            else (0, len(self.kv_args.kv_data_ptrs))
-        )
+        start_layer = self.kv_args.prefill_start_layer
+        end_layer = start_layer + len(self.kv_args.kv_data_ptrs)
         if self.is_mla_backend:
             src_kv_ptrs = self.kv_args.kv_data_ptrs
             layers_per_pp_stage = len(src_kv_ptrs)
@@ -795,8 +788,7 @@ class MooncakeKVManager(BaseKVManager):
                             self.prefill_response_tracker[bootstrap_room]
                         )
                         if (
-                            self.is_mla_backend
-                            or arrived_response_num == expected_response_num
+                            arrived_response_num == expected_response_num
                         ):
                             self.update_status(bootstrap_room, KVPoll.Success)
                 elif status == KVPoll.Failed:

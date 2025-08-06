@@ -112,6 +112,7 @@ class PrefillBootstrapQueue:
         kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.decode_tp_size = self.decode_tp_size // self.decode_dp_size
         kv_args.prefill_pp_size = self.pp_size
+        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
