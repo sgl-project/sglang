@@ -5,14 +5,11 @@ from __future__ import annotations
 
 import importlib
 import logging
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
 
-# from vllm.model_executor.layers.fused_moe import (
-#     FusedMoE, FusedMoEActivationFormat, FusedMoEConfig, FusedMoEMethodBase,
-#     FusedMoEPermuteExpertsUnpermute, FusedMoEPrepareAndFinalize)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -224,7 +221,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        # print(f"hi {self=} create_weights {layer=}")
         self.num_experts = num_experts
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8

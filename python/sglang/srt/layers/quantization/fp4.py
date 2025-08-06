@@ -220,22 +220,10 @@ class MxFp4LinearMethod(LinearMethodBase):
             return out
 
 
-class MxFp4MoEMethod:
-    def __new__(cls, *args, **kwargs):
-        if not hasattr(cls, "_initialized"):
-            original_init = cls.__init__
-            new_cls = type(
-                cls.__name__,
-                (FusedMoEMethodBase,),
-                {
-                    "__init__": original_init,
-                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
-                },
-            )
-            obj = super(new_cls, new_cls).__new__(new_cls)
-            obj.__init__(*args, **kwargs)
-            return obj
-        return super().__new__(cls)
+class MxFp4MoEMethod(FusedMoEMethodBase):
+
+    def __init__(self, quant_config: Mxfp4Config):
+        self.quant_config = quant_config
 
     @staticmethod
     def get_moe_method(
