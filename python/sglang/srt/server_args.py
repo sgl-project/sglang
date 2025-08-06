@@ -463,6 +463,11 @@ class ServerArgs:
             self.enable_triton_kernel_moe = True
             self.disable_hybrid_swa_memory = True
 
+            quantization_config = getattr(self.get_hf_config(), "quantization_config", None)
+            if quantization_config is not None and quantization_config.get("quant_method") == "mxfp4":
+                # use bf16 for mxfp4 triton kernels
+                self.dtype = "bfloat16"
+
         # Set page size
         if self.page_size is None:
             self.page_size = 1
