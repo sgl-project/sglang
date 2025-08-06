@@ -74,7 +74,6 @@ class HarmonyContext(ConversationContext):
         self.num_reasoning_tokens = 0
 
     def append_output(self, output) -> None:
-        print("!!!!DEBUG append_output", output)
         if isinstance(output, dict) and "output_ids" in output:
             output_token_ids = output["output_ids"]
 
@@ -83,13 +82,8 @@ class HarmonyContext(ConversationContext):
             try:
                 start_index = output_token_ids.index(200006)
                 output_token_ids = output_token_ids[start_index:]
-                print(
-                    f"!!!!DEBUG cut output_ids from index {start_index}, new length: {len(output_token_ids)}"
-                )
             except ValueError:
-                print(
-                    "!!!!DEBUG token 200006 not found in output_ids, using all tokens"
-                )
+                pass
 
             for token_id in output_token_ids:
                 self.parser.process(token_id)
@@ -106,7 +100,6 @@ class HarmonyContext(ConversationContext):
                     self.num_output_tokens += meta_info["completion_tokens"]
 
         else:
-            print("!!!!DEBUG output not dict")
             output_msgs = output
 
         self._messages.extend(output_msgs)
@@ -116,7 +109,6 @@ class HarmonyContext(ConversationContext):
         return self._messages
 
     def need_builtin_tool_call(self) -> bool:
-        print("!!!!DEBUG need_builtin_tool_call", self.messages)
         last_msg = self.messages[-1]
         recipient = last_msg.recipient
         return recipient is not None and (
@@ -124,7 +116,6 @@ class HarmonyContext(ConversationContext):
         )
 
     async def call_tool(self) -> list[Message]:
-        print("!!!!DEBUG call_tool", self.messages)
         if not self.messages:
             return []
         last_msg = self.messages[-1]
@@ -205,13 +196,8 @@ class StreamingHarmonyContext(HarmonyContext):
             try:
                 start_index = output_token_ids.index(200006)
                 output_token_ids = output_token_ids[start_index:]
-                print(
-                    f"!!!!DEBUG streaming cut output_ids from index {start_index}, new length: {len(output_token_ids)}"
-                )
             except ValueError:
-                print(
-                    "!!!!DEBUG streaming token 200006 not found in output_ids, using all tokens"
-                )
+                pass
 
             for token_id in output_token_ids:
                 self.parser.process(token_id)

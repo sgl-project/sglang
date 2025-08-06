@@ -79,7 +79,6 @@ class HarmonyPythonTool(Tool):
         last_msg = context.messages[-1]
         tool_output_msgs = []
         async for msg in self.python_tool.process(last_msg):
-            print("!!!!! DEBUG msg", msg)
             tool_output_msgs.append(msg)
         return tool_output_msgs
 
