@@ -459,7 +459,6 @@ class OpenAIServingChat(OpenAIServingBase):
             harmony_parsers = [
                 get_streamable_parser_for_assistant() for _ in range(request.n)
             ]
-            harmony_token_buffers = {}  # Track processed tokens per index
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -511,18 +510,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 if self.use_harmony:
                     harmony_parser = harmony_parsers[index]
 
-                    if index not in harmony_token_buffers:
-                        harmony_token_buffers[index] = []
-                        # HACK: hack new_token_ids to start from 200006
-                        start_token_index = content["output_ids"].index(200006)
-                        content["output_ids"] = content["output_ids"][
-                            start_token_index:
-                        ]
-
                     new_token_ids = content["output_ids"]
                     for token_id in new_token_ids:
                         harmony_parser.process(token_id)
-                    harmony_token_buffers[index].extend(new_token_ids)
 
                     is_final = harmony_parser.current_channel == "final"
                     is_analysis = harmony_parser.current_channel == "analysis"
@@ -585,6 +575,20 @@ class OpenAIServingChat(OpenAIServingBase):
                             model=request.model,
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
+
+                if self.use_harmony and not is_final:
+                    choice_data = ChatCompletionResponseStreamChoice(
+                        index=index,
+                        delta=DeltaMessage(reasoning_content=delta),
+                        finish_reason=None,
+                    )
+                    chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[choice_data],
+                        model=request.model,
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
 
                 # Handle tool calls
                 # TODO: support tool call parsing for harmony

@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copied from vLLM
 import json
-import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from mcp import ClientSession
 from openai_harmony import Author, Message, Role, StreamState, TextContent
@@ -11,11 +10,10 @@ from openai_harmony import Author, Message, Role, StreamState, TextContent
 from sglang.srt.entrypoints.harmony_utils import (
     get_encoding,
     get_streamable_parser_for_assistant,
+    parse_output_into_messages,
     render_for_completion,
 )
 from sglang.srt.entrypoints.tool import Tool
-
-logger = logging.getLogger(__name__)
 
 
 class ConversationContext(ABC):
@@ -76,16 +74,38 @@ class HarmonyContext(ConversationContext):
         self.num_reasoning_tokens = 0
 
     def append_output(self, output) -> None:
-        pass
-        # if isinstance(output, RequestOutput):
-        #     output_token_ids = output.outputs[0].token_ids
-        #     for token_id in output_token_ids:
-        #         self.parser.process(token_id)
-        #     output_msgs = self.parser.messages
-        # else:
-        #     # Tool output.
-        #     output_msgs = output
-        # self._messages.extend(output_msgs)
+        # Support both streaming and non-streaming output
+        print(f"!!!!!! DEBUG: output: {output}")
+        if isinstance(output, dict) and "output_ids" in output:
+            # RequestOutput from SGLang with outputs
+            output_token_ids = output["output_ids"]
+
+            # TODO: Remove this hack for GPT-OSS models
+
+            # output_token_ids = output_token_ids[3:]
+
+            for token_id in output_token_ids:
+                self.parser.process(token_id)
+            output_msgs = self.parser.messages
+            print(f"!!!!!! DEBUG: output_msgs: {output_msgs}")
+
+            meta_info = output["meta_info"]
+
+            if isinstance(meta_info, dict):
+                if "prompt_token_ids" in meta_info:
+                    self.num_prompt_tokens = meta_info["prompt_tokens"]
+                if "cached_tokens" in meta_info:
+                    self.num_cached_tokens = meta_info["cached_tokens"]
+                if "completion_tokens" in meta_info:
+                    self.num_output_tokens += meta_info["completion_tokens"]
+
+        else:
+            output_msgs = output
+            print(
+                f"!!!!!! DEBUG: Unsupported output type: Or Maybe a Tool Call? {type(output)} {output}"
+            )
+
+        self._messages.extend(output_msgs)
 
     @property
     def messages(self) -> list:
@@ -169,24 +189,32 @@ class StreamingHarmonyContext(HarmonyContext):
         return self.parser.messages
 
     def append_output(self, output) -> None:
-        pass
-        # if isinstance(output, Dict[[Any, Any]]):
-        #     tok = output.outputs[0].token_ids[0]
-        #     token = output.
-        #     self.parser.process(tok)
-        #     self.last_tok = tok
-        # else:
-        #     # Handle the case of tool output in direct message format
-        #     assert len(output) == 1, "Tool output should be a single message"
-        #     msg = output[0]
-        #     # Sometimes the recipient is not set for tool messages,
-        #     # so we set it to "assistant"
-        #     if msg.author.role == Role.TOOL and msg.recipient is None:
-        #         msg.recipient = "assistant"
-        #     toks = self.encoding.render(msg)
-        #     for tok in toks:
-        #         self.parser.process(tok)
-        #     self.last_tok = toks[-1]
+        # Support both streaming and non-streaming output
+        print(f"!!!!!! DEBUG: output: {output}")
+        if isinstance(output, dict) and "output_ids" in output:
+            # RequestOutput from SGLang with outputs
+            output_token_ids = output["output_ids"]
+
+            # TODO: Remove this hack for GPT-OSS models
+            # output_token_ids = output_token_ids[3:]
+            print(f"!!!!!! DEBUG: output_token_ids: {output_token_ids}")
+
+            for token_id in output_token_ids:
+                self.parser.process(token_id)
+            output_msgs = self.parser.messages
+
+        else:
+            # Handle the case of tool output in direct message format
+            assert len(output) == 1, "Tool output should be a single message"
+            msg = output[0]
+            # Sometimes the recipient is not set for tool messages,
+            # so we set it to "assistant"
+            if msg.author.role == Role.TOOL and msg.recipient is None:
+                msg.recipient = "assistant"
+            toks = self.encoding.render(msg)
+            for tok in toks:
+                self.parser.process(tok)
+            self.last_tok = toks[-1]
 
     def is_expecting_start(self) -> bool:
         return self.parser.state == StreamState.EXPECT_START

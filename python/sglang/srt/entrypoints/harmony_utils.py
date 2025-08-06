@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import datetime
 import json
-import uuid
 from collections.abc import Iterable
 from typing import Literal, Optional, Union
 
@@ -10,6 +9,7 @@ from openai.types.responses import (
     ResponseOutputItem,
     ResponseOutputMessage,
     ResponseOutputText,
+    ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_function_web_search import (
@@ -17,6 +17,9 @@ from openai.types.responses.response_function_web_search import (
     ActionOpenPage,
     ActionSearch,
     ResponseFunctionWebSearch,
+)
+from openai.types.responses.response_reasoning_item import (
+    Content as ResponseReasoningTextContent,
 )
 from openai.types.responses.tool import Tool
 from openai_harmony import (
@@ -34,11 +37,8 @@ from openai_harmony import (
     load_harmony_encoding,
 )
 
-from sglang.srt.entrypoints.openai.protocol import (
-    ResponseInputOutputItem,
-    ResponseReasoningItem,
-    ResponseReasoningTextContent,
-)
+from sglang.srt.entrypoints.openai.protocol import ResponseInputOutputItem
+from sglang.srt.utils import random_uuid
 
 REASONING_EFFORT = {
     "high": ReasoningEffort.HIGH,
@@ -192,7 +192,7 @@ def parse_chat_input(chat_msg) -> Message:
         contents = [TextContent(text=content)]
     else:
         # TODO: Support refusal.
-        contents = [TextContent(text=c["text"]) for c in content]
+        contents = [TextContent(text=c.text) for c in content]
     msg = Message.from_role_and_contents(role, contents)
     return msg
 
@@ -245,7 +245,7 @@ def parse_output_message(message: Message):
         else:
             raise ValueError(f"Unknown browser action: {recipient}")
         web_search_item = ResponseFunctionWebSearch(
-            id=f"ws_{uuid.uuid4().hex}",
+            id=f"ws_{random_uuid()}",
             action=action,
             status="completed",
             type="web_search_call",
@@ -254,7 +254,14 @@ def parse_output_message(message: Message):
     elif message.channel == "analysis":
         for content in message.content:
             reasoning_item = ResponseReasoningItem(
-                content=[ResponseReasoningTextContent(text=content.text)],
+                id=f"rs_{random_uuid()}",
+                type="reasoning",
+                summary=[],
+                content=[
+                    ResponseReasoningTextContent(
+                        text=content.text, type="reasoning_text"
+                    )
+                ],
                 status=None,
             )
             output_items.append(reasoning_item)
@@ -262,7 +269,7 @@ def parse_output_message(message: Message):
         if message.recipient.startswith("functions."):
             function_name = message.recipient.split(".")[-1]
             for content in message.content:
-                random_id = uuid.uuid4().hex
+                random_id = random_uuid()
                 response_item = ResponseFunctionToolCall(
                     arguments=content.text,
                     call_id=f"call_{random_id}",
@@ -276,7 +283,14 @@ def parse_output_message(message: Message):
         ):
             for content in message.content:
                 reasoning_item = ResponseReasoningItem(
-                    text=content.text,
+                    id=f"rs_{random_uuid()}",
+                    type="reasoning",
+                    summary=[],
+                    content=[
+                        ResponseReasoningTextContent(
+                            text=content.text, type="reasoning_text"
+                        )
+                    ],
                     status=None,
                 )
                 output_items.append(reasoning_item)
@@ -293,7 +307,7 @@ def parse_output_message(message: Message):
             )
             contents.append(output_text)
         text_item = ResponseOutputMessage(
-            id=f"msg_{uuid.uuid4().hex}",
+            id=f"msg_{random_uuid()}",
             content=contents,
             role=message.author.role,
             status="completed",
@@ -316,19 +330,30 @@ def parse_remaining_state(parser: StreamableParser):
 
     if parser.current_channel == "analysis":
         reasoning_item = ResponseReasoningItem(
-            content=[ResponseReasoningTextContent(text=parser.current_content)],
+            id=f"rs_{random_uuid()}",
+            type="reasoning",
+            summary=[],
+            content=[
+                ResponseReasoningTextContent(
+                    text=parser.current_content, type="reasoning_text"
+                )
+            ],
             status=None,
         )
         return [reasoning_item]
     elif parser.current_channel == "final":
         output_text = ResponseOutputText(
-            text=parser.current_content,
+            content=[
+                ResponseReasoningTextContent(
+                    text=parser.current_content, type="reasoning_text"
+                )
+            ],
             annotations=[],  # TODO
             type="output_text",
             logprobs=None,  # TODO
         )
         text_item = ResponseOutputMessage(
-            id=f"msg_{uuid.uuid4().hex}",
+            id=f"msg_{random_uuid()}",
             content=[output_text],
             role="assistant",
             status="completed",

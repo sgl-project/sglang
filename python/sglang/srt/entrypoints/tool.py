@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -7,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     # Avoid circular import.
-    from sglang.srt.entrypoints.context import ConversationContext
+    from sglang.srt.entrypoints.context import ConversationContext, HarmonyContext
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +41,7 @@ class HarmonyBrowserTool(Tool):
         logger.info_once("Browser tool initialized")
 
     async def get_result(self, context: "ConversationContext") -> Any:
-        from vllm.entrypoints.context import HarmonyContext
+        from sglang.srt.entrypoints.context import HarmonyContext
 
         assert isinstance(context, HarmonyContext)
         last_msg = context.messages[-1]
@@ -74,7 +73,7 @@ class HarmonyPythonTool(Tool):
         logger.info_once("Code interpreter tool initialized")
 
     async def get_result(self, context: "ConversationContext") -> Any:
-        from vllm.entrypoints.context import HarmonyContext
+        from sglang.srt.entrypoints.context import HarmonyContext
 
         assert isinstance(context, HarmonyContext)
         last_msg = context.messages[-1]
