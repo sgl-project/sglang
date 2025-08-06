@@ -1,6 +1,6 @@
 """
 Usage:
-python3 -m unittest test_ascend_mla_backend.TestAscendW8A8.test_gsm8k
+python3 -m unittest test_ascend_w8a8_quantization.TestAscendW8A8.test_gsm8k
 """
 
 import os
