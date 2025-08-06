@@ -44,7 +44,12 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
-from sglang.srt.utils import broadcast_pyobj, DynamicGradMode, point_to_point_pyobj, require_mlp_sync
+from sglang.srt.utils import (
+    DynamicGradMode,
+    broadcast_pyobj,
+    point_to_point_pyobj,
+    require_mlp_sync,
+)
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -395,7 +400,10 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 self.disagg_prefill_inflight_queue.append(req)
-                if logits_output is not None and logits_output.hidden_states is not None:
+                if (
+                    logits_output is not None
+                    and logits_output.hidden_states is not None
+                ):
                     last_hidden_index = (
                         hidden_state_offset + extend_input_len_per_req[i] - 1
                     )
