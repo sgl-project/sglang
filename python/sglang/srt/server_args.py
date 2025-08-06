@@ -461,16 +461,21 @@ class ServerArgs:
         model_arch = self.get_hf_config().architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
             self.attention_backend = "triton"
-            
+
             # Check if FlashInfer MXFP4 MoE is enabled
             from sglang.srt.utils import get_bool_env_var
-            USE_FLASHINFER_MXFP4_MOE = get_bool_env_var("SGLANG_USE_FLASHINFER_MXFP4_MOE", "false")
-            USE_FLASHINFER_MXFP4_BF16_MOE = get_bool_env_var("SGLANG_USE_FLASHINFER_MXFP4_BF16_MOE", "false")
-            
+
+            USE_FLASHINFER_MXFP4_MOE = get_bool_env_var(
+                "SGLANG_USE_FLASHINFER_MXFP4_MOE", "false"
+            )
+            USE_FLASHINFER_MXFP4_BF16_MOE = get_bool_env_var(
+                "SGLANG_USE_FLASHINFER_MXFP4_BF16_MOE", "false"
+            )
+
             # Only enable Triton kernel MoE if FlashInfer is not enabled
             if not (USE_FLASHINFER_MXFP4_MOE or USE_FLASHINFER_MXFP4_BF16_MOE):
                 self.enable_triton_kernel_moe = True
-            
+
             self.disable_hybrid_swa_memory = True
 
             quantization_config = getattr(

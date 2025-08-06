@@ -207,8 +207,9 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_config = quant_config
         if self.quant_config.get_name() == "mxfp4" and (
-                get_bool_env_var("SGLANG_USE_FLASHINFER_MXFP4_MOE")
-                or get_bool_env_var("SGLANG_USE_FLASHINFER_MXFP4_BF16_MOE")):
+            get_bool_env_var("SGLANG_USE_FLASHINFER_MXFP4_MOE")
+            or get_bool_env_var("SGLANG_USE_FLASHINFER_MXFP4_BF16_MOE")
+        ):
             hidden_size = round_up(hidden_size, 256)
         self.hidden_size = hidden_size
         self.quant_method.create_weights(
@@ -791,10 +792,12 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, topk_output: StandardTopKOutput):
         og_hidden_states = hidden_states.shape[-1]
         if self.hidden_size != og_hidden_states:
-            hidden_states = torch.nn.functional.pad(hidden_states,
-                                  (0, self.hidden_size - og_hidden_states),
-                                  mode='constant',
-                                  value=0.0)
+            hidden_states = torch.nn.functional.pad(
+                hidden_states,
+                (0, self.hidden_size - og_hidden_states),
+                mode="constant",
+                value=0.0,
+            )
         assert self.quant_method is not None
 
         if self.moe_ep_size > 1 and not self.enable_flashinfer_cutlass_moe:
