@@ -42,6 +42,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     libfabric-dev \
     patchelf \
     nvidia-dkms-550 \
+    python3-dev \
     devscripts debhelper fakeroot dkms check libsubunit0 libsubunit-dev \
  && ln -sf /usr/bin/python3.12 /usr/bin/python \
  && rm -rf /var/lib/apt/lists/* \
