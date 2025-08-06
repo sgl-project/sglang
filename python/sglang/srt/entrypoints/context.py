@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copied from vLLM
 import json
+import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional, Union
+from typing import Union
 
-from mcp import ClientSession
+logger = logging.getLogger(__name__)
+
+try:
+    from mcp import ClientSession
+except ImportError:
+    logger.warning("Ignoring mcp import error")
+
 from openai_harmony import Author, Message, Role, StreamState, TextContent
 
 from sglang.srt.entrypoints.harmony_utils import (
@@ -58,7 +65,7 @@ class HarmonyContext(ConversationContext):
     def __init__(
         self,
         messages: list,
-        tool_sessions: dict[str, Union[ClientSession, Tool]],
+        tool_sessions: dict[str, Union["ClientSession", Tool]],
     ):
         # TODO: Remove the hack of Union[ClientSession, Tool] by using MCP
         # when demo.
@@ -135,7 +142,7 @@ class HarmonyContext(ConversationContext):
         return render_for_completion(self.messages)
 
     async def call_search_tool(
-        self, tool_session: Union[ClientSession, Tool], last_msg: Message
+        self, tool_session: Union["ClientSession", Tool], last_msg: Message
     ) -> list[Message]:
         if isinstance(tool_session, Tool):
             return await tool_session.get_result(self)
@@ -148,7 +155,7 @@ class HarmonyContext(ConversationContext):
         return [Message(author=author, content=[content], recipient=Role.ASSISTANT)]
 
     async def call_python_tool(
-        self, tool_session: Union[ClientSession, Tool], last_msg: Message
+        self, tool_session: Union["ClientSession", Tool], last_msg: Message
     ) -> list[Message]:
         if isinstance(tool_session, Tool):
             return await tool_session.get_result(self)

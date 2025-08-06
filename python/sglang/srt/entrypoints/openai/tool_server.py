@@ -5,12 +5,15 @@ from abc import ABC, abstractmethod
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any
 
-from mcp import ClientSession
-from mcp.client.sse import sse_client
-from mcp.types import ListToolsResult
-from openai_harmony import ToolDescription, ToolNamespaceConfig
-
 logger = logging.getLogger(__name__)
+try:
+    from mcp import ClientSession
+    from mcp.client.sse import sse_client
+    from mcp.types import ListToolsResult
+except ImportError:
+    logger.warning("Ignoring mcp import error")
+
+from openai_harmony import ToolDescription, ToolNamespaceConfig
 
 
 async def list_server_and_tools(server_url: str):
@@ -49,8 +52,8 @@ def trim_schema(schema: dict) -> dict:
 
 
 def post_process_tools_description(
-    list_tools_result: ListToolsResult,
-) -> ListToolsResult:
+    list_tools_result: "ListToolsResult",
+) -> "ListToolsResult":
     # Adapt the MCP tool result for Harmony
     for tool in list_tools_result.tools:
         tool.inputSchema = trim_schema(tool.inputSchema)
