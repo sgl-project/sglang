@@ -52,6 +52,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
+    is_max_padding,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -228,7 +229,9 @@ class DeepseekV2MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+            x,
+            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+            disable_symmetric_memory=not is_max_padding(),
         )
         return x
 
@@ -477,12 +480,13 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
-        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+        with use_symmetric_memory(
+            parallel_state.get_tp_group(), disabled=not is_max_padding()
+        ) as sm:
             final_hidden_states_out = torch.empty_like(final_hidden_states)
-
+            sm.tag(final_hidden_states_out)
         torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
         final_hidden_states = final_hidden_states_out
-        sm.tag(final_hidden_states)
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -517,11 +521,13 @@ class DeepseekV2MoE(nn.Module):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
-            with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+            with use_symmetric_memory(
+                parallel_state.get_tp_group(), disabled=not is_max_padding()
+            ) as sm:
                 final_hidden_states_out = torch.empty_like(final_hidden_states)
+                sm.tag(final_hidden_states_out)
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
             final_hidden_states = final_hidden_states_out
-            sm.tag(final_hidden_states)
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -590,7 +596,9 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_deepep(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         shared_output = None
         if hidden_states.shape[0] > 0:
@@ -1180,7 +1188,9 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward_normal_core(self, q, k, v, forward_batch):
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(
+            attn_output, disable_symmetric_memory=not is_max_padding()
+        )
         return output
 
     def _fuse_rope_for_trtllm_mla(self, forward_batch: ForwardBatch) -> bool:
@@ -1279,7 +1289,13 @@ class DeepseekV2AttentionMLA(nn.Module):
         return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
 
     def forward_absorb_core(
-        self, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
+        self,
+        q_pe,
+        k_pe,
+        q_nope_out,
+        k_nope,
+        forward_batch,
+        zero_allocator,
     ):
         if (
             self.current_attention_backend == "fa3"
@@ -1360,7 +1376,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                     -1, self.num_local_heads, self.v_head_dim
                 ).transpose(0, 1),
             )
-        output, _ = self.o_proj(attn_bmm_output)
+        output, _ = self.o_proj(
+            attn_bmm_output, disable_symmetric_memory=not is_max_padding()
+        )
 
         return output
 
@@ -1598,7 +1616,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(
+            attn_output, disable_symmetric_memory=not is_max_padding()
+        )
 
         return output
 
@@ -1763,7 +1783,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(
+            attn_output, disable_symmetric_memory=not is_max_padding()
+        )
         return output
 
 
@@ -1914,7 +1936,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch
         )
         hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+            hidden_states,
+            forward_batch,
+            should_allreduce_fusion,
+            use_reduce_scatter,
         )
 
         if should_allreduce_fusion:
