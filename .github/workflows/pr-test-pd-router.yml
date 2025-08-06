@@ -26,7 +26,9 @@ permissions:
 
 jobs:
   test-disaggregation:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
     runs-on: [h200]
     timeout-minutes: 45
 
@@ -115,7 +117,7 @@ jobs:
         echo "Installing SGLang with all extras..."
         python3 -m pip --no-cache-dir install -e "python[all]" --break-system-packages
         python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.5
-        python3 -m pip --no-cache-dir install genai-bench==0.0.1
+        python3 -m pip --no-cache-dir install --user --force-reinstall genai-bench==0.0.1
 
     - name: Build and install sgl-router
       run: |

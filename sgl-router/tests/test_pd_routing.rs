@@ -2,7 +2,7 @@
 mod test_pd_routing {
     use rand::Rng;
     use serde_json::json;
-    use sglang_router_rs::config::{PolicyConfig, RouterConfig, RoutingMode};
+    use sglang_router_rs::config::{PolicyConfig, RetryConfig, RouterConfig, RoutingMode};
     use sglang_router_rs::core::{WorkerFactory, WorkerType};
     use sglang_router_rs::routers::pd_types::get_hostname;
     use sglang_router_rs::routers::pd_types::PDSelectionPolicy;
@@ -169,15 +169,23 @@ mod test_pd_routing {
                 request_timeout_secs: 60,
                 worker_startup_timeout_secs: 10,
                 worker_startup_check_interval_secs: 1,
+                dp_aware: false,
+                api_key: None,
                 discovery: None,
                 metrics: None,
                 log_dir: None,
                 log_level: None,
                 request_id_headers: None,
+                max_concurrent_requests: 64,
+                cors_allowed_origins: vec![],
+                retry: RetryConfig::default(),
             };
 
             // Router creation will fail due to health checks, but config should be valid
-            let result = RouterFactory::create_router(&config);
+            let app_context =
+                sglang_router_rs::server::AppContext::new(config, reqwest::Client::new(), 64);
+            let app_context = std::sync::Arc::new(app_context);
+            let result = RouterFactory::create_router(&app_context);
             assert!(result.is_err());
             let error_msg = result.unwrap_err();
             // Error should be about health/timeout, not configuration

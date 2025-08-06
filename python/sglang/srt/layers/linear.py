@@ -13,9 +13,13 @@ from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    parallel_state,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
@@ -1187,11 +1191,6 @@ class RowParallelLinear(LinearBase):
                 else self.weight_loader
             ),
         )
-        if not reduce_results and (bias and not skip_bias_add):
-            raise ValueError(
-                "When not reduce the results, adding bias to the "
-                "results can lead to incorrect results"
-            )
 
         if bias:
             self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype))
@@ -1292,7 +1291,9 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+            sm.tag(output_parallel)
         if self.reduce_results and self.tp_size > 1 and not can_fuse_mlp_allreduce:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
