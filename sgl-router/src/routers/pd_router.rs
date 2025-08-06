@@ -348,32 +348,6 @@ impl PDRouter {
         return_logprob: bool,
         start_time: Instant,
     ) -> Response {
-        // Direct execution without retry overhead - PD architecture provides fault tolerance
-        self.execute_dual_dispatch_inner(
-            headers,
-            json_request,
-            route,
-            prefill,
-            decode,
-            is_stream,
-            return_logprob,
-            start_time,
-        )
-        .await
-    }
-
-    // Core dual dispatch implementation (restored from .bak with HTTP handshake fix)
-    async fn execute_dual_dispatch_inner(
-        &self,
-        headers: Option<&HeaderMap>,
-        json_request: Value,
-        route: &str,
-        prefill: &dyn Worker,
-        decode: &dyn Worker,
-        is_stream: bool,
-        return_logprob: bool,
-        start_time: Instant,
-    ) -> Response {
         // Update load tracking for both workers
         let _guard = WorkerLoadGuard::new_multi(vec![prefill, decode]);
 
