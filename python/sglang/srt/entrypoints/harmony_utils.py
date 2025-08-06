@@ -9,6 +9,7 @@ from openai.types.responses import (
     ResponseOutputItem,
     ResponseOutputMessage,
     ResponseOutputText,
+    ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_function_web_search import (
@@ -16,6 +17,9 @@ from openai.types.responses.response_function_web_search import (
     ActionOpenPage,
     ActionSearch,
     ResponseFunctionWebSearch,
+)
+from openai.types.responses.response_reasoning_item import (
+    Content as ResponseReasoningTextContent,
 )
 from openai.types.responses.tool import Tool
 from openai_harmony import (
@@ -33,11 +37,7 @@ from openai_harmony import (
     load_harmony_encoding,
 )
 
-from sglang.srt.entrypoints.openai.protocol import (
-    ResponseInputOutputItem,
-    ResponseReasoningItem,
-    ResponseReasoningTextContent,
-)
+from sglang.srt.entrypoints.openai.protocol import ResponseInputOutputItem
 from sglang.srt.utils import random_uuid
 
 REASONING_EFFORT = {

@@ -67,26 +67,35 @@ class HarmonyContext(ConversationContext):
 
     def append_output(self, output) -> None:
         # Support both streaming and non-streaming output
-        if hasattr(output, "outputs") and output.outputs:
+        print(f"!!!!!! DEBUG: output: {output}")
+        if isinstance(output, dict) and "output_ids" in output:
             # RequestOutput from SGLang with outputs
-            output_token_ids = output.outputs[0].token_ids
+            output_token_ids = output["output_ids"]
+
+            # TODO: Remove this hack for GPT-OSS models
+
+            # output_token_ids = output_token_ids[3:]
+
             for token_id in output_token_ids:
                 self.parser.process(token_id)
             output_msgs = self.parser.messages
+            print(f"!!!!!! DEBUG: output_msgs: {output_msgs}")
 
-            # Update token counts
-            if hasattr(output, "prompt_token_ids") and output.prompt_token_ids:
-                self.num_prompt_tokens = len(output.prompt_token_ids)
-            if hasattr(output, "num_cached_tokens"):
-                self.num_cached_tokens = output.num_cached_tokens
-            self.num_output_tokens += len(output_token_ids)
+            meta_info = output["meta_info"]
 
-        elif isinstance(output, list):
-            # List of messages
-            output_msgs = output
+            if isinstance(meta_info, dict):
+                if "prompt_token_ids" in meta_info:
+                    self.num_prompt_tokens = meta_info["prompt_tokens"]
+                if "cached_tokens" in meta_info:
+                    self.num_cached_tokens = meta_info["cached_tokens"]
+                if "completion_tokens" in meta_info:
+                    self.num_output_tokens += meta_info["completion_tokens"]
+
         else:
-            # Single message or other format
-            output_msgs = [output] if output else []
+            output_msgs = output
+            print(
+                f"!!!!!! DEBUG: Unsupported output type: Or Maybe a Tool Call? {type(output)} {output}"
+            )
 
         self._messages.extend(output_msgs)
 
@@ -172,10 +181,20 @@ class StreamingHarmonyContext(HarmonyContext):
         return self.parser.messages
 
     def append_output(self, output) -> None:
-        if hasattr(output, "outputs") and output.outputs:
-            tok = output.outputs[0].token_ids[0]
-            self.parser.process(tok)
-            self.last_tok = tok
+        # Support both streaming and non-streaming output
+        print(f"!!!!!! DEBUG: output: {output}")
+        if isinstance(output, dict) and "output_ids" in output:
+            # RequestOutput from SGLang with outputs
+            output_token_ids = output["output_ids"]
+
+            # TODO: Remove this hack for GPT-OSS models
+            # output_token_ids = output_token_ids[3:]
+            print(f"!!!!!! DEBUG: output_token_ids: {output_token_ids}")
+
+            for token_id in output_token_ids:
+                self.parser.process(token_id)
+            output_msgs = self.parser.messages
+
         else:
             # Handle the case of tool output in direct message format
             assert len(output) == 1, "Tool output should be a single message"

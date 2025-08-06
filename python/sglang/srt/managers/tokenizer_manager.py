@@ -1556,8 +1556,17 @@ class TokenizerManager:
 
             if isinstance(recv_obj, BatchStrOut):
                 state.text += recv_obj.output_strs[i]
+                if state.obj.stream:
+                    state.output_ids.extend(recv_obj.output_ids[i])
+                    output_token_ids = state.output_ids[state.last_output_offset :]
+                    state.last_output_offset = len(state.output_ids)
+                else:
+                    state.output_ids.extend(recv_obj.output_ids[i])
+                    output_token_ids = state.output_ids.copy()
+
                 out_dict = {
                     "text": state.text,
+                    "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
             elif isinstance(recv_obj, BatchTokenIDOut):

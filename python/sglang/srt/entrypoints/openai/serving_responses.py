@@ -3,6 +3,7 @@
 """Handler for /v1/responses requests"""
 
 import asyncio
+import copy
 import json
 import logging
 import time
@@ -14,8 +15,15 @@ import jinja2
 import openai.types.responses as openai_responses_types
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
-from openai.types.responses import ResponseOutputMessage, ResponseOutputText
+from openai.types.responses import (
+    ResponseOutputMessage,
+    ResponseOutputText,
+    ResponseReasoningItem,
+)
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from openai.types.responses.response_reasoning_item import (
+    Content as ResponseReasoningTextContent,
+)
 from openai_harmony import Message as OpenAIMessage
 
 from sglang.srt.entrypoints.context import (
@@ -38,15 +46,8 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
-    MessageProcessingResult,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
-    ResponseContentPartDoneEvent,
-    ResponseOutputItemDoneEvent,
-    ResponseReasoningItem,
-    ResponseReasoningTextContent,
-    ResponseReasoningTextDeltaEvent,
-    ResponseReasoningTextDoneEvent,
     ResponsesRequest,
     ResponsesResponse,
     UsageInfo,
@@ -191,8 +192,8 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         # Schedule the request and get the result generator
         generators: list[AsyncGenerator[Any, None]] = []
+        tool_list = []
         if self.use_harmony:
-            tool_list = []
             if self.supports_browsing:
                 tool_list.append("browser")
             if self.supports_code_interpreter:
@@ -485,6 +486,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 # If the response is already cancelled, don't update it
                 if stored_response is None or stored_response.status != "cancelled":
                     self.response_store[response.id] = response
+
+        print(f"!!!!!! DEBUG: response: {response}")
         return response
 
     def _make_response_output_items(
@@ -507,8 +510,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         output_items = []
         if reasoning_content:
             reasoning_item = ResponseReasoningItem(
-                text=reasoning_content,
-                status=None,  # NOTE: Only the last output item has status
+                id=f"rs_{random_uuid()}",
+                type="reasoning",
+                summary=[],
+                content=[
+                    ResponseReasoningTextContent(
+                        type="reasoning_text", text=reasoning_content
+                    ),
+                ],
+                status=None,
             )
             output_items.append(reasoning_item)
         if content:
@@ -793,7 +803,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         current_content_index = 0
         current_output_index = 0
-        current_item_id = ""
+        current_item_id = f"item_{random_uuid()}"
         sent_output_item_added = False
 
         initial_response = ResponsesResponse.from_request(
@@ -833,17 +843,21 @@ class OpenAIServingResponses(OpenAIServingChat):
                         pass
                     elif previous_item.channel == "analysis":
                         reasoning_item = ResponseReasoningItem(
+                            id=f"rs_{random_uuid()}",
                             type="reasoning",
+                            summary=[],
                             content=[
                                 ResponseReasoningTextContent(
-                                    text=previous_item.content[0].text
+                                    text=previous_item.content[0].text,
+                                    type="reasoning_text",
                                 ),
                             ],
                             status="completed",
                         )
                         yield _send_event(
-                            ResponseReasoningTextDoneEvent(
+                            openai_responses_types.ResponseReasoningTextDoneEvent(
                                 type="response.reasoning_text.done",
+                                item_id=current_item_id,
                                 sequence_number=-1,
                                 output_index=current_output_index,
                                 content_index=current_content_index,
@@ -851,16 +865,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
                         )
                         yield _send_event(
-                            ResponseContentPartDoneEvent(
-                                type="response.content_part.done",
-                                sequence_number=-1,
-                                output_index=current_output_index,
-                                content_index=current_content_index,
-                                part=reasoning_item,
-                            )
-                        )
-                        yield _send_event(
-                            ResponseOutputItemDoneEvent(
+                            openai_responses_types.ResponseOutputItemDoneEvent(
                                 type="response.output_item.done",
                                 sequence_number=-1,
                                 output_index=current_output_index,
@@ -868,7 +873,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
                         )
                     elif previous_item.channel == "final":
-                        text_content = ResponseOutputText(
+                        text_content = openai_responses_types.ResponseOutputText(
                             type="output_text",
                             text=previous_item.content[0].text,
                             annotations=[],
@@ -899,7 +904,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 type="response.output_item.done",
                                 sequence_number=-1,
                                 output_index=current_output_index,
-                                item=ResponseOutputMessage(
+                                item=openai_responses_types.ResponseOutputMessage(
                                     id=current_item_id,
                                     type="message",
                                     role="assistant",
@@ -995,8 +1000,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         )
                     # TODO: migrate to OpenAI types once updated.
                     yield _send_event(
-                        ResponseReasoningTextDeltaEvent(
+                        openai_responses_types.ResponseReasoningTextDeltaEvent(
                             type="response.reasoning_text.delta",
+                            item_id=current_item_id,
                             output_index=current_output_index,
                             content_index=current_content_index,
                             delta=ctx.parser.last_content_delta,
@@ -1174,11 +1180,30 @@ class OpenAIServingResponses(OpenAIServingChat):
             request_metadata,
             created_time=created_time,
         )
+        # Convert final_response to the format expected by ResponseCompletedEvent
+        response_dict = final_response.model_dump()
+
+        print(f"!!!!!! DEBUG: response_dict: {response_dict}")
+        # Convert UsageInfo to ResponseUsage format
+        if response_dict.get("usage"):
+            usage_info = response_dict["usage"]
+            response_dict["usage"] = {
+                "input_tokens": usage_info.get("prompt_tokens", 0),
+                "input_tokens_details": {
+                    "cached_tokens": usage_info.get("cached_tokens", 0)
+                },
+                "output_tokens": usage_info.get("completion_tokens", 0),
+                "output_tokens_details": {
+                    "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
+                },
+                "total_tokens": usage_info.get("total_tokens", 0),
+            }
+
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(
                 type="response.completed",
                 sequence_number=-1,
-                response=final_response.model_dump(),
+                response=response_dict,
             )
         )
 

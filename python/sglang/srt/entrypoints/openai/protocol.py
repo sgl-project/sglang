@@ -24,6 +24,7 @@ from openai.types.responses import (
     ResponseInputItemParam,
     ResponseOutputItem,
     ResponsePrompt,
+    ResponseReasoningItem,
     ResponseStatus,
     ResponseTextConfig,
 )
@@ -775,57 +776,6 @@ class ResponsesRequest(BaseModel):
         return params
 
 
-class ResponseReasoningTextContent(BaseModel):
-    text: str
-    type: Literal["reasoning_text"] = "reasoning_text"
-
-
-class ResponseReasoningItem(BaseModel):
-    id: str = Field(default_factory=lambda: f"rs_{uuid.uuid4().hex}")
-    content: list[ResponseReasoningTextContent] = Field(default_factory=list)
-    summary: list = Field(default_factory=list)
-    type: Literal["reasoning"] = "reasoning"
-    encrypted_content: Optional[str] = None
-    status: Optional[Literal["in_progress", "completed", "incomplete"]]
-
-
-class ResponseReasoningTextDeltaEvent(BaseModel):
-    type: Literal["response.reasoning_text.delta"] = "response.reasoning_text.delta"
-    item_id: str = "item_1234"
-    output_index: int
-    content_index: int
-    delta: str
-    sequence_number: int = -1
-
-
-class ResponseReasoningTextDoneEvent(BaseModel):
-    type: Literal["response.reasoning_text.done"] = "response.reasoning_text.done"
-    item_id: str = "item_1234"
-    output_index: int
-    content_index: int
-    text: str
-    sequence_number: int = -1
-
-
-class ResponseContentPartDoneEvent(BaseModel):
-    type: Literal["response.content_part.done"] = "response.content_part.done"
-    item_id: str = "item_1234"
-    output_index: int
-    content_index: int
-    part: Union[ResponseOutputItem, ResponseReasoningItem]
-    sequence_number: int = -1
-
-
-class ResponseOutputItemDoneEvent(BaseModel):
-    type: Literal["response.output_item.done"] = "response.output_item.done"
-    item_id: str = "item_1234"
-    output_index: int
-    item: Union[
-        ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCallOutputItem
-    ]
-    sequence_number: int = -1
-
-
 class PromptTokenUsageInfo(BaseModel):
     """Prompt token usage details."""
 
@@ -836,13 +786,18 @@ class ResponsesResponse(BaseModel):
     """Response body for v1/responses endpoint."""
 
     id: str = Field(default_factory=lambda: f"resp_{time.time()}")
-    object: Literal["realtime.response"] = "realtime.response"
-    created: int = Field(default_factory=lambda: int(time.time()))
+    object: Literal["response"] = "response"
+    created_at: int = Field(default_factory=lambda: int(time.time()))
     model: str
 
-    output: List[ResponseOutputItem] = Field(default_factory=list)
+    output: List[
+        Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
+    ] = Field(default_factory=list)
     status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
     usage: Optional[UsageInfo] = None
+    parallel_tool_calls: bool = True
+    tool_choice: str = "auto"
+    tools: List[ResponseTool] = Field(default_factory=list)
 
     @classmethod
     def from_request(
@@ -851,18 +806,23 @@ class ResponsesResponse(BaseModel):
         sampling_params: Any,
         model_name: str,
         created_time: int,
-        output: List[ResponseOutputItem],
+        output: List[
+            Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
+        ],
         status: str,
         usage: Optional[UsageInfo],
     ) -> "ResponsesResponse":
         """Create a response from a request."""
         return cls(
             id=request.request_id,
-            created=created_time,
+            created_at=created_time,
             model=model_name,
             output=output,
             status=status,
             usage=usage,
+            parallel_tool_calls=request.parallel_tool_calls or True,
+            tool_choice=request.tool_choice,
+            tools=request.tools,
         )
 
 

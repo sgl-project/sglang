@@ -32,6 +32,7 @@ from typing import AsyncIterator, Callable, Dict, Optional
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 from contextlib import asynccontextmanager
+from typing import AsyncGenerator
 
 import numpy as np
 import orjson
@@ -56,6 +57,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
     ModelCard,
     ModelList,
+    ResponsesRequest,
     ScoringRequest,
     V1RerankReqInput,
 )
@@ -879,12 +881,21 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
 async def v1_responses_request(request: dict, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
-    from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
 
     request_obj = ResponsesRequest(**request)
-    return await raw_request.app.state.openai_serving_responses.create_responses(
+    result = await raw_request.app.state.openai_serving_responses.create_responses(
         request_obj, raw_request
     )
+
+    # Handle streaming responses
+    if isinstance(result, AsyncGenerator):
+        return StreamingResponse(
+            result,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    return result
 
 
 @app.get("/v1/responses/{response_id}")
