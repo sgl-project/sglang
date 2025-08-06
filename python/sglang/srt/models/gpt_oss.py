@@ -109,9 +109,6 @@ class GptOssSparseMoeBlock(nn.Module):
         extra_kwargs = {}
         if experts_type.__name__ == "FusedMoE":
             extra_kwargs = {
-                "enable_flashinfer_cutlass_moe": global_server_args_dict[
-                    "enable_flashinfer_cutlass_moe"
-                ],
                 "use_weight_loader_fused": True,  # for moe gate_up_proj and down_proj and their bias loading
             }
         self.experts = experts_type(

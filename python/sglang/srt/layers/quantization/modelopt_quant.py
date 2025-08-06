@@ -9,6 +9,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+from sglang.srt.layers.moe.moe_runner import get_moe_grouped_gemm_backend
 from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -31,7 +32,6 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import is_cuda, next_power_of_2
 
 if TYPE_CHECKING:
@@ -747,7 +747,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
         """Access the global enable_flashinfer_cutlass_moe setting."""
-        return global_server_args_dict.get("enable_flashinfer_cutlass_moe", False)
+        return get_moe_grouped_gemm_backend().is_flashinfer_cutlass()
 
     def create_weights(
         self,

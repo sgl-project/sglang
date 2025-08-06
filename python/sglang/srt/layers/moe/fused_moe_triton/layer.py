@@ -22,7 +22,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.moe_runner import get_moe_grouped_gemm_backend
+from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -155,9 +156,9 @@ class FusedMoE(torch.nn.Module):
         self.activation_alpha = activation_alpha
         self.swiglu_limit = swiglu_limit
 
-        enable_flashinfer_cutlass_moe = global_server_args_dict[
-            "enable_flashinfer_cutlass_moe"
-        ]
+        enable_flashinfer_cutlass_moe = (
+            get_moe_grouped_gemm_backend().is_flashinfer_cutlass()
+        )
 
         if enable_flashinfer_cutlass_moe and quant_config is None:
             logger.warning("Disable flashinfer MoE when quantization config is None.")
@@ -196,10 +197,7 @@ class FusedMoE(torch.nn.Module):
         self.inplace = inplace
         self.no_combine = no_combine
 
-        self.use_triton_kernels = (
-            not _is_cpu and global_server_args_dict["enable_triton_kernel_moe"]
-        )
-
+        self.use_triton_kernels = get_moe_grouped_gemm_backend().is_triton_kernel()
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
                 self.use_triton_kernels, with_bias=with_bias
@@ -761,7 +759,7 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported weight_name {weight_name} for FusedMoE weight_loader_fused. Nothing is loaded."
             )
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: StandardTopKOutput):
+    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         assert self.quant_method is not None
 
         if self.moe_ep_size > 1 and not self.enable_flashinfer_cutlass_moe:
@@ -769,7 +767,9 @@ class FusedMoE(torch.nn.Module):
                 # If we are in EP mode, we need to move the expert map to GPU.
                 self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
 
-        if self.expert_map_gpu is not None:
+        if self.expert_map_gpu is not None and TopKOutputChecker.format_is_standard(
+            topk_output
+        ):
             topk_output = topk_output._replace(
                 topk_ids=self.expert_map_gpu[topk_output.topk_ids]
             )

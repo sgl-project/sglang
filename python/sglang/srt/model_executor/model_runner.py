@@ -561,7 +561,8 @@ class ModelRunner:
             )
             initialize_moe_runner(
                 moe_a2a_backend=self.server_args.moe_a2a_backend,
-                # moe_grouped_gemm_backend=self.server_args.moe_grouped_gemm_backend,
+                moe_grouped_gemm_backend=self.server_args.moe_grouped_gemm_backend,
+                deepep_mode=self.server_args.deepep_mode,
             )
             initialize_dp_attention(
                 enable_dp_attention=self.server_args.enable_dp_attention,

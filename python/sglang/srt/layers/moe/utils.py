@@ -4,12 +4,12 @@ from functools import lru_cache
 
 from packaging import version as pkg_version
 
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.layers.moe.moe_runner import get_moe_grouped_gemm_backend
 
 
 @lru_cache(maxsize=1)
 def should_use_flashinfer_trtllm_moe():
-    result = global_server_args_dict["enable_flashinfer_trtllm_moe"] and (
+    result = get_moe_grouped_gemm_backend().is_flashinfer_trtllm() and (
         not importlib.util.find_spec("flashinfer")
         or pkg_version.parse(__import__("flashinfer").__version__)
         >= pkg_version.parse("0.2.9rc1")
@@ -39,12 +39,22 @@ class MoeA2ABackend(Enum):
 
 
 class MoeGroupedGemmBackend(Enum):
-    STANDARD = "standard"
-    DEEPEP = "deepgemm"
+    TRITON = "triton"
+    TRITON_KERNEL = "triton_kernel"
     FLASHINFER = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
-    TRITON = "triton"
-    TRITON_KERNELS = "triton_kernels"
+
+    def is_triton(self):
+        return self == MoeGroupedGemmBackend.TRITON
+
+    def is_triton_kernel(self):
+        return self == MoeGroupedGemmBackend.TRITON_KERNEL
+
+    def is_flashinfer_trtllm(self):
+        return self == MoeGroupedGemmBackend.FLASHINFER
+
+    def is_flashinfer_cutlass(self):
+        return self == MoeGroupedGemmBackend.FLASHINFER_CUTLASS
 
 
 class DeepEPMode(Enum):

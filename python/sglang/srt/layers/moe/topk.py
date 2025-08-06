@@ -37,8 +37,8 @@ from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
+from sglang.srt.layers.moe.moe_runner import get_moe_grouped_gemm_backend
 from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -205,7 +205,7 @@ class TopK(CustomOp):
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        self.use_triton_kernels = global_server_args_dict["enable_triton_kernel_moe"]
+        self.use_triton_kernels = get_moe_grouped_gemm_backend().is_triton_kernel()
 
     def forward_native(
         self,

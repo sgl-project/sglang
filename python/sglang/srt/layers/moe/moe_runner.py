@@ -1,26 +1,38 @@
 from typing import Optional
 
-from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
+from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend, MoeGroupedGemmBackend
 
-MOE_A2A_BACKEND = None
-# MOE_GROUPED_GEMM_BACKEND = None
-DEEPEP_MODE = None
+MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
+MOE_GROUPED_GEMM_BACKEND: Optional[MoeGroupedGemmBackend] = None
+DEEPEP_MODE: Optional[DeepEPMode] = None
 
 
 def initialize_moe_runner(
-    moe_a2a_backend: str,
-    # moe_grouped_gemm_backend: str,
+    moe_a2a_backend: Optional[str],
+    moe_grouped_gemm_backend: Optional[str],
     deepep_mode: Optional[str],
 ):
     global MOE_A2A_BACKEND
+    global MOE_GROUPED_GEMM_BACKEND
     global DEEPEP_MODE
+
     MOE_A2A_BACKEND = MoeA2ABackend(moe_a2a_backend)
+    MOE_GROUPED_GEMM_BACKEND = MoeGroupedGemmBackend(moe_grouped_gemm_backend)
     DEEPEP_MODE = DeepEPMode(deepep_mode)
 
 
-def get_moe_a2a_backend():
+def get_moe_a2a_backend() -> MoeA2ABackend:
+    assert MOE_A2A_BACKEND is not None, "MOE_A2A_BACKEND is not initialized"
     return MOE_A2A_BACKEND
 
 
-def get_deepep_mode():
+def get_moe_grouped_gemm_backend() -> MoeGroupedGemmBackend:
+    assert (
+        MOE_GROUPED_GEMM_BACKEND is not None
+    ), "MOE_GROUPED_GEMM_BACKEND is not initialized"
+    return MOE_GROUPED_GEMM_BACKEND
+
+
+def get_deepep_mode() -> DeepEPMode:
+    assert DEEPEP_MODE is not None, "DEEPEP_MODE is not initialized"
     return DEEPEP_MODE

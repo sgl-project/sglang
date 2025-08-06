@@ -2,16 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    List,
-    NamedTuple,
-    Optional,
-    Protocol,
-    Tuple,
-    Union,
-    runtime_checkable,
-)
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
@@ -103,8 +94,8 @@ class DeepEPBuffer:
         hidden_size: int,
         param_bytes: int,
         deepep_mode: DeepEPMode,
-        num_max_dispatch_tokens_per_rank: int = None,
-        num_experts: int = None,
+        num_max_dispatch_tokens_per_rank: int = -1,
+        num_experts: int = -1,
     ):
         if cls._buffer is not None:
             return cls._buffer
@@ -131,8 +122,8 @@ class DeepEPBuffer:
                     num_rdma_bytes,
                 )
         if deepep_mode.enable_low_latency():
-            assert num_max_dispatch_tokens_per_rank is not None
-            assert num_experts is not None and num_experts % group.size() == 0
+            assert num_max_dispatch_tokens_per_rank != -1
+            assert num_experts != -1 and num_experts % group.size() == 0
             num_rdma_bytes = max(
                 Buffer.get_low_latency_rdma_size_hint(
                     num_max_dispatch_tokens_per_rank,

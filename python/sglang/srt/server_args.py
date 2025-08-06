@@ -174,8 +174,9 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Optional[Literal["deepep"]] = None
-    enable_flashinfer_cutlass_moe: bool = False
-    enable_flashinfer_trtllm_moe: bool = False
+    moe_grouped_gemm_backend: Optional[
+        Literal["triton", "triton_kernel", "flashinfer_trtllm", "flashinfer_cutlass"]
+    ] = None
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
@@ -246,7 +247,6 @@ class ServerArgs:
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
-    enable_triton_kernel_moe: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -276,6 +276,9 @@ class ServerArgs:
     # Deprecated arguments
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
+    enable_flashinfer_cutlass_moe: bool = False
+    enable_flashinfer_trtllm_moe: bool = False
+    enable_triton_kernel_moe: bool = False
 
     def __post_init__(self):
 
@@ -292,6 +295,21 @@ class ServerArgs:
             self.moe_a2a_backend = "deepep"
             print_deprecated_warning(
                 "NOTE: --enable-deepep-moe is deprecated. Please set `--moe-a2a-backend` to 'deepep' instead."
+            )
+        if self.enable_triton_kernel_moe:
+            self.moe_grouped_gemm_backend = "triton_kernel"
+            print_deprecated_warning(
+                "NOTE: --enable-triton-kernel-moe is deprecated. Please set `--moe-grouped-gemm-backend` to 'triton_kernel' instead."
+            )
+        if self.enable_flashinfer_cutlass_moe:
+            self.moe_grouped_gemm_backend = "flashinfer_cutlass"
+            print_deprecated_warning(
+                "NOTE: --enable-flashinfer-cutlass-moe is deprecated. Please set `--moe-grouped-gemm-backend` to 'flashinfer_cutlass' instead."
+            )
+        if self.enable_flashinfer_trtllm_moe:
+            self.moe_grouped_gemm_backend = "flashinfer_trtllm"
+            print_deprecated_warning(
+                "NOTE: --enable-flashinfer-trtllm-moe is deprecated. Please set `--moe-grouped-gemm-backend` to 'flashinfer_trtllm' instead."
             )
 
         # Set missing default values
@@ -460,7 +478,7 @@ class ServerArgs:
         model_arch = self.get_hf_config().architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
             self.attention_backend = "triton"
-            self.enable_triton_kernel_moe = True
+            self.moe_grouped_gemm_backend = "triton_kernel"
 
         # Set page size
         if self.page_size is None:
@@ -492,7 +510,7 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
         # MoE kernel
-        if self.enable_flashinfer_cutlass_moe:
+        if self.moe_grouped_gemm_backend == "flashinfer_cutlass":
             assert (
                 self.quantization == "modelopt_fp4"
             ), "modelopt_fp4 quantization is required for Flashinfer MOE"
@@ -502,7 +520,7 @@ class ServerArgs:
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
-        if self.enable_flashinfer_trtllm_moe:
+        if self.moe_grouped_gemm_backend == "flashinfer_trtllm":
             if not self.disable_shared_experts_fusion:
                 self.disable_shared_experts_fusion = True
                 logger.warning(
@@ -1416,6 +1434,18 @@ class ServerArgs:
             choices=["deepep"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
+        )
+        parser.add_argument(
+            "--moe-grouped-gemm-backend",
+            type=str,
+            choices=[
+                "triton",
+                "triton_kernel",
+                "flashinfer_trtllm",
+                "flashinfer_cutlass",
+            ],
+            default=ServerArgs.moe_grouped_gemm_backend,
+            help="Choose the backend for MoE grouped GEMM.",
         )
         parser.add_argument(
             "--enable-flashinfer-cutlass-moe",
