@@ -76,7 +76,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
     fi \
  && if [ "$CUDA_VERSION" = "12.9.1" ]; then \
       python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.2/sgl_kernel-0.3.2-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
-    fi \
+    fi
 
 # Build and install NVSHMEM + DeepEP
 RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
