@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import TYPE_CHECKING
 
 import torch
@@ -29,6 +30,9 @@ _is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
 if _is_npu:
     torch.cuda.CUDAGraph = torch.npu.NPUGraph
@@ -64,8 +68,41 @@ class NPUGraphRunner(CudaGraphRunner):
             out = run_once_fn()
         return out
 
-    def _update_inputs(self, forward_batch: ForwardBatch):
-        seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (self.bs - self.raw_bs)
+    def _update_inputs(self, seq_lens):
         self.graphs[self.bs].update(
             cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
         )
+
+    def replay(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        if not skip_attn_backend_init:
+            self.replay_prepare(forward_batch, pp_proxy_tensors)
+        else:
+            # In speculative decoding, these two fields are still needed.
+            self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+            self.positions[: self.raw_num_token].copy_(forward_batch.positions)
+
+        # Replay
+        seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (self.bs - self.raw_bs)
+        thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
+        thread.start()
+        self.graphs[self.bs].replay()
+        thread.join()
+
+        output = self.output_buffers[self.bs]
+        if isinstance(output, LogitsProcessorOutput):
+            return LogitsProcessorOutput(
+                next_token_logits=output.next_token_logits[: self.raw_num_token],
+                hidden_states=(
+                    output.hidden_states[: self.raw_num_token]
+                    if output.hidden_states is not None
+                    else None
+                ),
+            )
+        else:
+            assert isinstance(output, PPProxyTensors)
+            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})

@@ -713,9 +713,6 @@ class CudaGraphRunner:
         self.raw_num_token = raw_num_token
         self.bs = bs
 
-    def _update_inputs(self, forward_batch: ForwardBatch):
-        pass
-
     def replay(
         self,
         forward_batch: ForwardBatch,
@@ -730,7 +727,6 @@ class CudaGraphRunner:
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
-        self._update_inputs(forward_batch)
         self.graphs[self.bs].replay()
 
         output = self.output_buffers[self.bs]
