@@ -463,6 +463,7 @@ class ServerArgs:
             self.attention_backend = "triton"
             self.enable_triton_kernel_moe = True
             self.disable_hybrid_swa_memory = True
+
             quantization_config = getattr(
                 self.get_hf_config(), "quantization_config", None
             )
