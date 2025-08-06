@@ -64,6 +64,7 @@ suites = {
         TestFile("test_fp8_kernel.py", 8),
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
+        TestFile("test_gpt_oss_1gpu.py", 300),
         TestFile("test_hicache.py", 116),
         TestFile("test_hicache_mla.py", 127),
         TestFile("test_hicache_storage.py", 127),
@@ -180,6 +181,7 @@ suites = {
         TestFile("test_update_weights_from_distributed.py", 103),
     ],
     "per-commit-4-gpu": [
+        TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_local_attn.py", 250),
         TestFile("test_pp_single_node.py", 372),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
