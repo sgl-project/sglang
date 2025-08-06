@@ -275,6 +275,9 @@ class ServerArgs:
     enable_pdmux: bool = False
     sm_group_num: int = 3
 
+    # For tool server
+    tool_server: Optional[str] = None
+
     # Deprecated arguments
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
@@ -462,7 +465,21 @@ class ServerArgs:
         model_arch = self.get_hf_config().architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
             self.attention_backend = "triton"
-            self.enable_triton_kernel_moe = True
+
+            # Check if FlashInfer MXFP4 MoE is enabled
+            from sglang.srt.utils import get_bool_env_var
+
+            USE_FLASHINFER_MXFP4_MOE = get_bool_env_var(
+                "SGLANG_USE_FLASHINFER_MXFP4_MOE", "false"
+            )
+            USE_FLASHINFER_MXFP4_BF16_MOE = get_bool_env_var(
+                "SGLANG_USE_FLASHINFER_MXFP4_BF16_MOE", "false"
+            )
+
+            # Only enable Triton kernel MoE if FlashInfer is not enabled
+            if not (USE_FLASHINFER_MXFP4_MOE or USE_FLASHINFER_MXFP4_BF16_MOE):
+                self.enable_triton_kernel_moe = True
+
             self.disable_hybrid_swa_memory = True
 
             quantization_config = getattr(
@@ -1932,6 +1949,14 @@ class ServerArgs:
             "--weight-loader-disable-mmap",
             action="store_true",
             help="Disable mmap while loading weight using safetensors.",
+        )
+
+        # For tool server
+        parser.add_argument(
+            "--tool-server",
+            type=str,
+            default=None,
+            help="Either 'demo' or a comma-separated list of tool server urls to use for the model. If not specified, no tool server will be used.",
         )
 
         # Deprecated arguments
