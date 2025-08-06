@@ -12,6 +12,7 @@ from sglang.srt.utils import get_cpu_ids_by_node, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -77,7 +78,7 @@ class TestIntelAMXAttnBackend(CustomTestCase):
             kill_process_tree(process.pid)
 
     def test_torch_compile_cpu(self):
-        model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        model = DEFAULT_MODEL_NAME_FOR_TEST
         base_url = DEFAULT_URL_FOR_TEST
         cpu_ids_by_node = get_cpu_ids_by_node()
         n_numa_node = len(cpu_ids_by_node)
@@ -101,6 +102,7 @@ class TestIntelAMXAttnBackend(CustomTestCase):
                 "--tp",
                 f"{n_numa_node}",
             ],
+            env=env,
         )
 
         try:
@@ -113,7 +115,7 @@ class TestIntelAMXAttnBackend(CustomTestCase):
             )
 
             metrics = run_eval(args)
-            self.assertGreater(metrics["score"], 0.5)
+            self.assertGreater(metrics["score"], 0.65)
         finally:
             kill_process_tree(process.pid)
 
