@@ -102,10 +102,8 @@ pub trait Bootstrap: Send + Sync {
                 BootstrapRoom::Batch(
                     (0..batch_size)
                         .map(|_| {
-                            // Combine multiple sources of randomness for better distribution
-                            let r1 = rand::random::<u64>();
-                            let r2 = rand::random::<u64>();
-                            r1.wrapping_add(r2.rotate_left(32))
+                            // Generate a value in the range [0, 2^63 - 1] to match Python's random.randint(0, 2**63 - 1)
+                            rand::random::<u64>() & (i64::MAX as u64)
                         })
                         .collect(),
                 ),
@@ -114,12 +112,10 @@ pub trait Bootstrap: Send + Sync {
             self.set_bootstrap_info(
                 BootstrapHost::Single(hostname),
                 BootstrapPort::Single(bootstrap_port),
-                BootstrapRoom::Single({
-                    // Use high-quality random number for single requests too
-                    let r1 = rand::random::<u64>();
-                    let r2 = rand::random::<u64>();
-                    r1.wrapping_add(r2.rotate_left(32))
-                }),
+                BootstrapRoom::Single(
+                    // Generate a value in the range [0, 2^63 - 1] to match Python's random.randint(0, 2**63 - 1)
+                    rand::random::<u64>() & (i64::MAX as u64),
+                ),
             );
         }
         Ok(())
@@ -279,13 +275,14 @@ impl Bootstrap for CompletionRequest {
 #[cfg(test)]
 mod bootstrap_tests {
     use super::*;
+    use crate::core::BasicWorker;
     use crate::openai_api_types::StringOrArray;
 
-    #[test]
-    fn test_completion_batch_size_with_array_prompt() {
-        let req = CompletionRequest {
-            model: "test".to_string(),
-            prompt: StringOrArray::Array(vec!["prompt1".to_string(), "prompt2".to_string()]),
+    /// Create a default CompletionRequest for testing with minimal fields set
+    fn default_completion_request() -> CompletionRequest {
+        CompletionRequest {
+            model: String::new(),
+            prompt: StringOrArray::String(String::new()),
             n: None,
             other: serde_json::Map::new(),
             suffix: None,
@@ -303,6 +300,31 @@ mod bootstrap_tests {
             logit_bias: None,
             user: None,
             seed: None,
+            // SGLang Extensions
+            top_k: None,
+            min_p: None,
+            min_tokens: None,
+            repetition_penalty: None,
+            regex: None,
+            ebnf: None,
+            json_schema: None,
+            stop_token_ids: None,
+            no_stop_trim: false,
+            ignore_eos: false,
+            skip_special_tokens: true,
+            // SGLang Extensions
+            lora_path: None,
+            session_params: None,
+            return_hidden_states: false,
+        }
+    }
+
+    #[test]
+    fn test_completion_batch_size_with_array_prompt() {
+        let req = CompletionRequest {
+            model: "test".to_string(),
+            prompt: StringOrArray::Array(vec!["prompt1".to_string(), "prompt2".to_string()]),
+            ..default_completion_request()
         };
 
         // Should return batch size for array prompt
@@ -314,23 +336,7 @@ mod bootstrap_tests {
         let req = CompletionRequest {
             model: "test".to_string(),
             prompt: StringOrArray::String("single prompt".to_string()),
-            n: None,
-            other: serde_json::Map::new(),
-            suffix: None,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            stream: false,
-            stream_options: None,
-            logprobs: None,
-            echo: false,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            best_of: None,
-            logit_bias: None,
-            user: None,
-            seed: None,
+            ..default_completion_request()
         };
 
         // Should return None for single prompt
@@ -343,22 +349,7 @@ mod bootstrap_tests {
             model: "test".to_string(),
             prompt: StringOrArray::String("single prompt".to_string()),
             n: Some(3),
-            other: serde_json::Map::new(),
-            suffix: None,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            stream: false,
-            stream_options: None,
-            logprobs: None,
-            echo: false,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            best_of: None,
-            logit_bias: None,
-            user: None,
-            seed: None,
+            ..default_completion_request()
         };
 
         // Should return None for single string prompt, even with n > 1
@@ -371,23 +362,7 @@ mod bootstrap_tests {
         let mut req = CompletionRequest {
             model: "test".to_string(),
             prompt: StringOrArray::Array(vec!["prompt1".to_string(), "prompt2".to_string()]),
-            n: None,
-            other: serde_json::Map::new(),
-            suffix: None,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            stream: false,
-            stream_options: None,
-            logprobs: None,
-            echo: false,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            best_of: None,
-            logit_bias: None,
-            user: None,
-            seed: None,
+            ..default_completion_request()
         };
 
         // Set bootstrap info - should always use single values
@@ -421,23 +396,7 @@ mod bootstrap_tests {
         let mut req = CompletionRequest {
             model: "test".to_string(),
             prompt: StringOrArray::Array(vec!["prompt1".to_string(), "prompt2".to_string()]),
-            n: None,
-            other: serde_json::Map::new(),
-            suffix: None,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            stream: false,
-            stream_options: None,
-            logprobs: None,
-            echo: false,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            best_of: None,
-            logit_bias: None,
-            user: None,
-            seed: None,
+            ..default_completion_request()
         };
 
         // Set bootstrap info with arrays
@@ -464,5 +423,63 @@ mod bootstrap_tests {
         assert_eq!(rooms.len(), 2);
         assert_eq!(rooms[0].as_u64().unwrap(), 12345);
         assert_eq!(rooms[1].as_u64().unwrap(), 67890);
+    }
+
+    #[test]
+    fn test_bootstrap_room_range() {
+        // Test that bootstrap_room values are within the expected range [0, 2^63 - 1]
+        let worker = BasicWorker::new(
+            "http://test:8000".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: Some(8080),
+            },
+        );
+
+        // Test single request
+        let mut single_req = GenerateReqInput {
+            text: Some(InputText::Single("test".to_string())),
+            input_ids: None,
+            stream: false,
+            bootstrap_host: None,
+            bootstrap_port: None,
+            bootstrap_room: None,
+            other: Value::Object(serde_json::Map::new()),
+        };
+
+        for _ in 0..200000 {
+            single_req.add_bootstrap_info(&worker).unwrap();
+            if let Some(BootstrapRoom::Single(room)) = single_req.bootstrap_room {
+                // Verify the room value is within signed 64-bit range
+                assert!(room <= i64::MAX as u64, "Room {} exceeds i64::MAX", room);
+            } else {
+                panic!("Expected single bootstrap room");
+            }
+        }
+
+        // Test batch request
+        let mut batch_req = GenerateReqInput {
+            text: Some(InputText::Batch(vec![
+                "test1".to_string(),
+                "test2".to_string(),
+            ])),
+            input_ids: None,
+            stream: false,
+            bootstrap_host: None,
+            bootstrap_port: None,
+            bootstrap_room: None,
+            other: Value::Object(serde_json::Map::new()),
+        };
+
+        for _ in 0..200000 {
+            batch_req.add_bootstrap_info(&worker).unwrap();
+            if let Some(BootstrapRoom::Batch(rooms)) = &batch_req.bootstrap_room {
+                for room in rooms {
+                    // Verify each room value is within signed 64-bit range
+                    assert!(*room <= i64::MAX as u64, "Room {} exceeds i64::MAX", room);
+                }
+            } else {
+                panic!("Expected batch bootstrap rooms");
+            }
+        }
     }
 }

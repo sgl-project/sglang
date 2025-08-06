@@ -72,6 +72,7 @@ class TestCase:
     max_new_tokens: int = 32
     disable_cuda_graph: bool = False
     lora_extra_vocab_size: Optional[int] = None
+    max_loaded_loras: Optional[int] = None
 
 
 def create_batch_data(adapters: Union[str, list]) -> List[tuple[str, str]]:
@@ -599,7 +600,49 @@ EMBEDDING_TESTS = [
         ],
     ),
 ]
-ALL_TESTS = BASIC_TESTS + TARGET_MODULE_TESTS + MAX_LORA_RANK_TESTS + EMBEDDING_TESTS
+
+MAX_LOADED_LORAS_TESTS = [
+    TestCase(
+        description="Test max_loaded_loras limit",
+        base="meta-llama/Llama-3.1-8B-Instruct",
+        max_loras_per_batch=2,
+        max_loaded_loras=2,
+        all_adapters=[
+            "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+            "pbevan11/llama-3.1-8b-ocr-correction",
+        ],
+        initial_adapters=["philschmid/code-llama-3-1-8b-text-to-sql-lora"],
+        op_sequence=[
+            Operation(
+                type=OperationType.LOAD,
+                data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="pbevan11/llama-3.1-8b-ocr-correction",
+                expected_error="Maximum number of loaded LoRA adapters",
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="pbevan11/llama-3.1-8b-ocr-correction",
+            ),
+        ],
+    ),
+]
+
+
+ALL_TESTS = (
+    BASIC_TESTS
+    + TARGET_MODULE_TESTS
+    + MAX_LORA_RANK_TESTS
+    + MAX_LOADED_LORAS_TESTS
+    + EMBEDDING_TESTS
+)
 
 
 class LoRAUpdateTestSessionMode(Enum):
@@ -619,6 +662,7 @@ class LoRAUpdateTestSessionBase:
         model_path: str,
         lora_paths: list[str],
         max_loras_per_batch: int,
+        max_loaded_loras: Optional[int] = None,
         max_lora_rank: Optional[int],
         enable_lora: Optional[bool] = None,
         lora_target_modules: Optional[List[str]] = None,
@@ -633,6 +677,7 @@ class LoRAUpdateTestSessionBase:
         self.max_lora_rank = max_lora_rank
         self.lora_target_modules = lora_target_modules
         self.max_loras_per_batch = max_loras_per_batch
+        self.max_loaded_loras = max_loaded_loras
         self.lora_backend = lora_backend
         self.disable_cuda_graph = disable_cuda_graph
         self.cuda_graph_max_bs = cuda_graph_max_bs
@@ -696,6 +741,7 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
             torch_dtype=torch.float16,
             mem_fraction_static=MEM_FRACTION_STATIC,
             max_loras_per_batch=self.max_loras_per_batch,
+            max_loaded_loras=self.max_loaded_loras,
             disable_cuda_graph=self.disable_cuda_graph,
             cuda_graph_max_bs=self.cuda_graph_max_bs,
             disable_radix_cache=True,
@@ -816,6 +862,8 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
             other_args.extend(["--max-lora-rank", str(self.max_lora_rank)])
         if self.lora_target_modules is not None:
             other_args.extend(["--lora-target-modules"] + self.lora_target_modules)
+        if self.max_loaded_loras is not None:
+            other_args.extend(["--max-loaded-loras", str(self.max_loaded_loras)])
 
         # launch external server
         self.handle = popen_launch_server(
@@ -940,9 +988,10 @@ class TestLoRADynamicUpdate(CustomTestCase):
         mode: LoRAUpdateTestSessionMode,
         base: str,
         initial_adapters: List[str],
-        max_loras_per_batch: int,
         op_sequence: List[Operation],
+        max_loras_per_batch: int,
         lora_extra_vocab_size: Optional[int] = 0,
+        max_loaded_loras: Optional[int] = None,
         enable_lora: Optional[bool] = None,
         max_lora_rank: Optional[int] = None,
         lora_target_modules: Optional[List[str]] = None,
@@ -961,6 +1010,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
             model_path=base,
             lora_paths=initial_adapters,
             max_loras_per_batch=max_loras_per_batch,
+            max_loaded_loras=max_loaded_loras,
             max_lora_rank=max_lora_rank,
             lora_target_modules=lora_target_modules,
             lora_extra_vocab_size=lora_extra_vocab_size,
@@ -1018,6 +1068,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
                 enable_lora=test_case.enable_lora,
                 base=test_case.base,
                 max_loras_per_batch=test_case.max_loras_per_batch,
+                max_loaded_loras=test_case.max_loaded_loras,
                 op_sequence=test_case.op_sequence,
                 max_new_tokens=test_case.max_new_tokens,
                 max_lora_rank=test_case.max_lora_rank,
@@ -1032,6 +1083,12 @@ class TestLoRADynamicUpdate(CustomTestCase):
                 for x in test_case.op_sequence
                 if x.type == OperationType.FORWARD and x.expected_error is None
             ]
+
+            if not forward_ops:
+                print(
+                    f"No forward operations found in test case {case_idx}. Skipping static pass."
+                )
+                continue
 
             print("=" * 100)
             print(f"\n--- Running static pass with {len(forward_ops)} operations ---")

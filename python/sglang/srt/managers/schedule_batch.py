@@ -85,10 +85,10 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_dp_attention",
     "enable_two_batch_overlap",
     "enable_dp_lm_head",
-    "enable_deepep_moe",
+    "moe_a2a_backend",
     "deepep_mode",
-    "enable_ep_moe",
-    "enable_flashinfer_moe",
+    "enable_flashinfer_cutlass_moe",
+    "enable_flashinfer_trtllm_moe",
     "enable_flashinfer_allreduce_fusion",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
@@ -107,6 +107,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "weight_loader_disable_mmap",
     "enable_triton_kernel_moe",
     "enable_multimodal",
+    "enable_symm_mem",
+    "quantization",
 ]
 
 # Put some global args for easy access
@@ -421,7 +423,7 @@ class Req:
         token_ids_logprob: List[int] = None,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
-        lora_path: Optional[str] = None,
+        lora_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         token_type_ids: List[int] = None,
         session_id: Optional[str] = None,
@@ -465,7 +467,7 @@ class Req:
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
-        self.lora_path = lora_path
+        self.lora_id = lora_id
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -915,8 +917,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            assert isinstance(tree_cache, SWARadixCache) or isinstance(
-                tree_cache, SWAChunkCache
+            assert (
+                tree_cache is None
+                or isinstance(tree_cache, SWARadixCache)
+                or isinstance(tree_cache, SWAChunkCache)
             ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid = True
 
@@ -1689,16 +1693,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
+        if self.forward_mode.is_decode_or_idle():
+            attention_backend_str = global_server_args_dict["decode_attention_backend"]
+        else:
+            attention_backend_str = global_server_args_dict["prefill_attention_backend"]
         # Create seq_lens_cpu when needed
         if (
-            global_server_args_dict["attention_backend"] == "fa3"
+            attention_backend_str == "fa3"
             or (
                 global_server_args_dict["use_mla_backend"]
-                and global_server_args_dict["attention_backend"] == "flashinfer"
+                and attention_backend_str == "flashinfer"
             )
-            or global_server_args_dict["attention_backend"] == "flashmla"
-            or global_server_args_dict["attention_backend"] == "cutlass_mla"
-            or global_server_args_dict["attention_backend"] == "ascend"
+            or attention_backend_str == "flashmla"
+            or attention_backend_str == "cutlass_mla"
+            or attention_backend_str == "ascend"
+            or attention_backend_str == "trtllm_mha"
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
             seq_lens_cpu = (
@@ -1744,7 +1753,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             encoder_lens=self.encoder_lens,
             encoder_lens_cpu=self.encoder_lens_cpu,
             encoder_out_cache_loc=self.encoder_out_cache_loc,
-            lora_paths=[req.lora_path for req in self.reqs],
+            lora_ids=[req.lora_id for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
             token_type_ids=self.token_type_ids,
@@ -1885,7 +1894,7 @@ class ModelWorkerBatch:
     encoder_out_cache_loc: Optional[torch.Tensor]
 
     # For LoRA
-    lora_paths: Optional[List[str]]
+    lora_ids: Optional[List[str]]
 
     # Sampling info
     sampling_info: SamplingBatchInfo

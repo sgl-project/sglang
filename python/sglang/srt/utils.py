@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import builtins
 import ctypes
 import dataclasses
@@ -43,7 +44,7 @@ import traceback
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
-from enum import Enum
+from dataclasses import dataclass
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -84,11 +85,15 @@ from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager
+from typing_extensions import Literal
+
+from sglang.srt.metrics.func_timer import enable_func_timer
 
 logger = logging.getLogger(__name__)
 
 show_time_cost = False
 time_infos = {}
+
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
@@ -733,9 +738,18 @@ def load_audio(
     return audio
 
 
+@dataclass
+class ImageData:
+    url: str
+    detail: Optional[Literal["auto", "low", "high"]] = "auto"
+
+
 def load_image(
-    image_file: Union[Image.Image, str, bytes],
+    image_file: Union[Image.Image, str, ImageData, bytes],
 ) -> tuple[Image.Image, tuple[int, int]]:
+    if isinstance(image_file, ImageData):
+        image_file = image_file.url
+
     image = image_size = None
     if isinstance(image_file, Image.Image):
         image = image_file
@@ -759,7 +773,7 @@ def load_image(
     elif isinstance(image_file, str):
         image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     else:
-        raise ValueError(f"Invalid image: {image}")
+        raise ValueError(f"Invalid image: {image_file}")
 
     return image, image_size
 
@@ -2049,7 +2063,7 @@ def rank0_log(msg: str):
         logger.info(msg)
 
 
-def launch_dummy_health_check_server(host, port):
+def launch_dummy_health_check_server(host, port, enable_metrics):
     import asyncio
 
     import uvicorn
@@ -2066,6 +2080,11 @@ def launch_dummy_health_check_server(host, port):
     async def health_generate():
         """Check the health of the http server."""
         return Response(status_code=200)
+
+    # Add prometheus middleware
+    if enable_metrics:
+        add_prometheus_middleware(app)
+        enable_func_timer()
 
     config = uvicorn.Config(
         app,
@@ -2197,27 +2216,6 @@ def flatten_nested_list(nested_list):
         return [nested_list]
 
 
-class DeepEPMode(Enum):
-    normal = "normal"
-    low_latency = "low_latency"
-    auto = "auto"
-
-    def enable_normal(self):
-        return self in [DeepEPMode.normal, DeepEPMode.auto]
-
-    def enable_low_latency(self):
-        return self in [DeepEPMode.low_latency, DeepEPMode.auto]
-
-    def resolve(self, is_extend_in_batch: bool):
-        if self != DeepEPMode.auto:
-            return self
-
-        if is_extend_in_batch:
-            return DeepEPMode.normal
-        else:
-            return DeepEPMode.low_latency
-
-
 def is_non_idle_and_non_empty(forward_mode, hidden_states):
     return (
         (forward_mode is not None)
@@ -2335,6 +2333,8 @@ def is_fa3_default_architecture(hf_config):
         "Gemma3ForConditionalGeneration",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
+        "Glm4MoeForCausalLM",
+        "Step3VLForConditionalGeneration",
     }
     return architectures[0] in default_archs
 
@@ -2404,7 +2404,7 @@ def require_mlp_tp_gather(server_args):
             return True
         elif not server_args.enable_dp_lm_head:
             return True
-        elif not server_args.enable_deepep_moe:
+        elif server_args.moe_a2a_backend is None:
             return True
         else:
             return (
@@ -2420,7 +2420,7 @@ def require_attn_tp_gather(server_args):
     Check if the input of attention is scattered.
     """
     assert server_args.moe_dense_tp_size in [1, None]
-    if server_args.enable_deepep_moe or server_args.moe_dense_tp_size == 1:
+    if server_args.moe_a2a_backend is not None or server_args.moe_dense_tp_size == 1:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
@@ -2843,6 +2843,17 @@ def parse_module_path(module_path, function_name, create_dummy):
     return final_module, None
 
 
+def mxfp_supported():
+    """
+    Returns whether the current platform supports MX types.
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx95"])
+    else:
+        return False
+
+
 # LoRA-related constants and utilities
 SUPPORTED_LORA_TARGET_MODULES = [
     "q_proj",
@@ -2855,3 +2866,89 @@ SUPPORTED_LORA_TARGET_MODULES = [
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
+
+
+class ConcurrentCounter:
+    """
+    An asynchronous counter for managing concurrent tasks that need
+    coordinated increments, decrements, and waiting until the count reaches zero.
+
+    This class is useful for scenarios like tracking the number of in-flight tasks
+    and waiting for them to complete.
+    """
+
+    def __init__(self, initial: int = 0):
+        """
+        Initialize the counter with an optional initial value.
+
+        Args:
+            initial (int): The initial value of the counter. Default is 0.
+        """
+        self._count = initial
+        self._condition = asyncio.Condition()
+
+    def value(self) -> int:
+        """
+        Return the current value of the counter.
+
+        Note:
+            This method is not synchronized. It may return a stale value
+            if other coroutines are concurrently modifying the counter.
+
+        Returns:
+            int: The current counter value.
+        """
+        return self._count
+
+    def __repr__(self) -> str:
+        """Return an informative string representation of the counter."""
+        return f"<ConcurrentCounter value={self.value()}>"
+
+    async def increment(self, n: int = 1, notify_all: bool = True):
+        """
+        Atomically increment the counter by a given amount and notify all waiters.
+
+        Args:
+            n (int): The amount to increment the counter by. Default is 1.
+            notify_all (bool): Whether to notify all waiters after incrementing. Default is True.
+        """
+        async with self._condition:
+            self._count += n
+            if notify_all:
+                self._condition.notify_all()
+
+    async def decrement(self, n: int = 1, notify_all: bool = True):
+        """
+        Atomically decrement the counter by a given amount and notify all waiters.
+
+        Args:
+            n (int): The amount to decrement the counter by. Default is 1.
+            notify_all (bool): Whether to notify all waiters after decrementing. Default is True.
+        """
+        async with self._condition:
+            self._count -= n
+            if notify_all:
+                self._condition.notify_all()
+
+    async def wait_for(self, condition: Callable[[int], bool]):
+        """
+        Asynchronously wait until the counter satisfies a given condition.
+
+        This suspends the calling coroutine without blocking the thread, allowing
+        other tasks to run while waiting. When the condition is met, the coroutine resumes.
+
+        Args:
+            condition (Callable[[int], bool]): A function that takes the current counter value
+                and returns True when the condition is satisfied.
+        """
+        async with self._condition:
+            await self._condition.wait_for(lambda: condition(self._count))
+
+    async def wait_for_zero(self):
+        """
+        Asynchronously wait until the counter reaches zero.
+
+        This suspends the calling coroutine without blocking the thread, allowing
+        other tasks to run while waiting. When the counter becomes zero, the coroutine resumes.
+        """
+        self.wait_for(lambda count: count == 0)

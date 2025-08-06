@@ -32,7 +32,7 @@ class BaseReasoningFormatDetector:
         One-time parsing: Detects and parses reasoning sections in the provided text.
         Returns both reasoning content and normal text separately.
         """
-        in_reasoning = self._in_reasoning or text.startswith(self.think_start_token)
+        in_reasoning = self._in_reasoning or self.think_start_token in text
 
         if not in_reasoning:
             return StreamingParseResult(normal_text=text)
@@ -105,7 +105,7 @@ class BaseReasoningFormatDetector:
         # If we're not in a reasoning block return as normal text
         if not self._in_reasoning:
             self._buffer = ""
-            return StreamingParseResult(normal_text=new_text)
+            return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult()
 
@@ -231,7 +231,9 @@ class ReasoningParser:
         "deepseek-r1": DeepSeekR1Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3ThinkingDetector,
+        "glm45": Qwen3Detector,
         "kimi": KimiDetector,
+        "step3": DeepSeekR1Detector,
     }
 
     def __init__(self, model_type: Optional[str] = None, stream_reasoning: bool = True):
