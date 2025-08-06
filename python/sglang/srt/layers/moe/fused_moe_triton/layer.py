@@ -1063,10 +1063,15 @@ class FlashInferFP4MoE(FusedMoE):
             gemm1_weights_scale=self.gemm1_scales_fp4_shuffled.data.view(
                 torch.float8_e4m3fn
             ),
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
             gemm2_weights=self.gemm2_weights_fp4_shuffled.data,
             gemm2_weights_scale=self.gemm2_scales_fp4_shuffled.data.view(
                 torch.float8_e4m3fn
             ),
+            gemm2_bias=None,
             output1_scale_scalar=self.g1_scale_c.data,
             output1_scale_gate_scalar=self.g1_alphas.data,
             output2_scale_scalar=self.g2_alphas.data,
