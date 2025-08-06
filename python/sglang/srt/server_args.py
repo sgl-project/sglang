@@ -174,9 +174,9 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Optional[Literal["deepep"]] = None
-    moe_grouped_gemm_backend: Optional[
-        Literal["triton", "triton_kernel", "flashinfer_trtllm", "flashinfer_cutlass"]
-    ] = None
+    moe_grouped_gemm_backend: Literal[
+        "triton", "triton_kernel", "flashinfer_trtllm", "flashinfer_cutlass"
+    ] = "triton"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0

@@ -13,8 +13,8 @@ DEEPEP_MODE: Optional[DeepEPMode] = None
 
 def initialize_moe_runner(
     moe_a2a_backend: Optional[str],
-    moe_grouped_gemm_backend: Optional[str],
-    deepep_mode: Optional[str],
+    moe_grouped_gemm_backend: str,
+    deepep_mode: str,
 ):
     global MOE_A2A_BACKEND
     global MOE_GROUPED_GEMM_BACKEND
