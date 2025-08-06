@@ -608,7 +608,7 @@ class DeepseekV2MoE(nn.Module):
                 torch.distributed.broadcast(
                     torch.zeros_like(
                         expert_location_dispatch_info.partial_logical_to_all_physical_map
-                    ).to(device=hidden_states.device, dtype=torch.int8),
+                    ).to(device=hidden_states.device),
                     src=0,
                     group=get_world_group().device_group,
                 )
@@ -691,7 +691,7 @@ class DeepseekV2MoE(nn.Module):
                 torch.distributed.broadcast(
                     torch.zeros_like(
                         expert_location_dispatch_info.partial_logical_to_all_physical_map
-                    ).to(device=hidden_states.device, dtype=torch.int8),
+                    ).to(device=hidden_states.device),
                     src=0,
                     group=get_world_group().device_group,
                 )

@@ -63,8 +63,7 @@ def run_lp_solver(
         log2phy_prob = np.full_like(log2phy, fill_value=0, dtype=float)
         mask = log2phy != -1
         log2phy_prob[mask] = np.take(phy_prob, log2phy[mask])
-        log2phy_prob = (torch.from_numpy(log2phy_prob) * 100).to(torch.int8)
-        return log2phy_prob
+        return torch.from_numpy(log2phy_prob)
     else:
         # Fall back to random dispatch
         # copy log2phy
@@ -72,7 +71,7 @@ def run_lp_solver(
         # replace -1 with 0, all other values to 1
         log2phy_prob[log2phy_prob == -1] = 0
         log2phy_prob[log2phy_prob != -1] = 1
-        return log2phy_prob.to(torch.int8)
+        return log2phy_prob
 
 
 def count_logical_expert_tokens(
@@ -173,7 +172,6 @@ def get_log2phy_prob(
         log2phy_prob = torch.empty_like(
             expert_location_dispatch_info.partial_logical_to_all_physical_map,
             device=device,
-            dtype=torch.int8,
         )
 
     # Step 4: Broadcast to all ranks

@@ -149,7 +149,6 @@ def _topk_ids_logical_to_physical_dynamic(
     topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
-    topk_ids = torch.ones_like(topk_ids, device=device)
     return topk_ids
 
 
@@ -211,5 +210,4 @@ def _topk_ids_logical_to_physical_probability(
     topk_ids = log2phy_map[topk_ids, chosen_dispatch_index]
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
-    topk_ids = torch.ones_like(topk_ids, device=device)
     return topk_ids
