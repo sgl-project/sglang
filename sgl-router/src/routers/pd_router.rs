@@ -1,7 +1,6 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
 
-use super::bootstrap_injector::inject_bootstrap_fields;
 use super::pd_types::{api_path, PDRouterError};
 use crate::config::types::RetryConfig;
 use crate::core::{HealthChecker, Worker, WorkerFactory, WorkerLoadGuard};
@@ -315,17 +314,6 @@ impl PDRouter {
             .into_response()
     }
 
-    // Helper to handle bootstrap injection errors
-    fn handle_bootstrap_error(error: impl std::fmt::Display) -> Response {
-        error!("Failed to add bootstrap info error={}", error);
-        RouterMetrics::record_pd_error("bootstrap_injection");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Bootstrap injection failed: {}", error),
-        )
-            .into_response()
-    }
-
     // Helper to handle serialization errors
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
         error!("Failed to serialize request error={}", error);
@@ -334,6 +322,48 @@ impl PDRouter {
             "Failed to serialize request",
         )
             .into_response()
+    }
+
+    // Helper to determine batch size from a GenerateRequest
+    fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
+        // Check prompt array
+        if let Some(prompt) = &req.prompt {
+            if let crate::openai_api_types::StringOrArray::Array(arr) = prompt {
+                if !arr.is_empty() {
+                    return Some(arr.len());
+                }
+            }
+        }
+        // Check text array
+        if let Some(text) = &req.text {
+            if text.contains("[") && text.contains("]") {
+                // This is a simplified check - in reality we'd need to parse JSON
+                return None; // For now, fall back to non-batch
+            }
+        }
+        None
+    }
+
+    // Helper to determine batch size from a ChatCompletionRequest
+    fn get_chat_batch_size(req: &ChatCompletionRequest) -> Option<usize> {
+        // Check 'n' parameter for multiple responses
+        if let Some(n) = req.n {
+            if n > 1 {
+                return Some(n as usize);
+            }
+        }
+        None
+    }
+
+    // Helper to determine batch size from a CompletionRequest
+    fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
+        // Check prompt array
+        if let crate::openai_api_types::StringOrArray::Array(arr) = &req.prompt {
+            if !arr.is_empty() {
+                return Some(arr.len());
+            }
+        }
+        None
     }
 
     // Execute the dual dispatch to prefill and decode servers (no retry for performance)
@@ -481,30 +511,6 @@ impl PDRouter {
                         response
                     } else {
                         // No logprob merging needed (restored from .bak)
-
-                        // True streaming discard for HTTP handshake completion
-                        // Use a separate thread to avoid blocking the main runtime
-                        if let Ok(prefill_res) = prefill_result {
-                            let prefill_stream = prefill_res.bytes_stream();
-
-                            // Spawn a separate OS thread to handle prefill consumption
-                            std::thread::spawn(move || {
-                                // Create a separate single-threaded runtime for this task
-                                let rt = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()
-                                    .unwrap();
-
-                                // Block on consuming the stream in this isolated runtime
-                                rt.block_on(async move {
-                                    let mut stream = prefill_stream;
-                                    while let Some(_chunk) = stream.next().await {
-                                        // Discard chunks - just consuming to complete handshake
-                                    }
-                                });
-                            });
-                        }
-
                         let stream = res.bytes_stream();
                         let decode_url = decode.url().to_string();
                         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -549,27 +555,6 @@ impl PDRouter {
                                 self.merge_logprobs(prefill_result, decode_body, status)
                                     .await
                             } else {
-                                // True streaming discard for HTTP handshake completion (non-streaming case)
-                                if let Ok(prefill_res) = prefill_result {
-                                    let prefill_stream = prefill_res.bytes_stream();
-
-                                    // Spawn a separate OS thread to handle prefill consumption
-                                    std::thread::spawn(move || {
-                                        // Create a separate single-threaded runtime for this task
-                                        let rt = tokio::runtime::Builder::new_current_thread()
-                                            .enable_all()
-                                            .build()
-                                            .unwrap();
-
-                                        // Block on consuming the stream in this isolated runtime
-                                        rt.block_on(async move {
-                                            let mut stream = prefill_stream;
-                                            while let Some(_chunk) = stream.next().await {
-                                                // Discard chunks - just consuming to complete handshake
-                                            }
-                                        });
-                                    });
-                                }
                                 (status, decode_body).into_response()
                             }
                         }
@@ -1325,12 +1310,6 @@ impl RouterTrait for PDRouter {
     ) -> Response {
         let start = Instant::now();
 
-        // Convert directly to JSON to preserve all fields automatically
-        let mut json = match serde_json::to_value(body) {
-            Ok(json) => json,
-            Err(e) => return Self::handle_serialization_error(e),
-        };
-
         // Extract flags for routing logic
         let is_stream = body.stream;
         let return_logprob = body.return_logprob;
@@ -1356,10 +1335,41 @@ impl RouterTrait for PDRouter {
             decode.url()
         );
 
-        // Inject bootstrap fields directly into JSON
-        if let Err(e) = inject_bootstrap_fields(&mut json, prefill.as_ref()) {
-            return Self::handle_bootstrap_error(e);
-        }
+        // Get bootstrap port from prefill worker
+        let bootstrap_port = match prefill.worker_type() {
+            crate::core::WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+            _ => None,
+        };
+        let hostname = super::pd_types::get_hostname(prefill.url());
+
+        // Create optimized request with bootstrap fields
+        let json = if let Some(batch_size) = Self::get_generate_batch_size(body) {
+            // Batch request
+            let request_with_bootstrap = super::pd_types::BatchRequestWithBootstrap {
+                original: body,
+                bootstrap_host: vec![hostname; batch_size],
+                bootstrap_port: vec![bootstrap_port; batch_size],
+                bootstrap_room: (0..batch_size)
+                    .map(|_| super::pd_types::generate_room_id())
+                    .collect(),
+            };
+            match serde_json::to_value(&request_with_bootstrap) {
+                Ok(json) => json,
+                Err(e) => return Self::handle_serialization_error(e),
+            }
+        } else {
+            // Single request
+            let request_with_bootstrap = super::pd_types::RequestWithBootstrap {
+                original: body,
+                bootstrap_host: hostname,
+                bootstrap_port,
+                bootstrap_room: super::pd_types::generate_room_id(),
+            };
+            match serde_json::to_value(&request_with_bootstrap) {
+                Ok(json) => json,
+                Err(e) => return Self::handle_serialization_error(e),
+            }
+        };
 
         // Execute dual dispatch
         self.execute_dual_dispatch(
@@ -1381,12 +1391,6 @@ impl RouterTrait for PDRouter {
         body: &ChatCompletionRequest,
     ) -> Response {
         let start = Instant::now();
-
-        // Convert directly to JSON to preserve all fields automatically
-        let mut json = match serde_json::to_value(body) {
-            Ok(json) => json,
-            Err(e) => return Self::handle_serialization_error(e),
-        };
 
         // Extract flags for routing logic
         let is_stream = body.stream;
@@ -1417,10 +1421,41 @@ impl RouterTrait for PDRouter {
             decode.url()
         );
 
-        // Inject bootstrap fields directly into JSON
-        if let Err(e) = inject_bootstrap_fields(&mut json, prefill.as_ref()) {
-            return Self::handle_bootstrap_error(e);
-        }
+        // Get bootstrap port from prefill worker
+        let bootstrap_port = match prefill.worker_type() {
+            crate::core::WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+            _ => None,
+        };
+        let hostname = super::pd_types::get_hostname(prefill.url());
+
+        // Create optimized request with bootstrap fields
+        let json = if let Some(batch_size) = Self::get_chat_batch_size(body) {
+            // Batch request (n > 1)
+            let request_with_bootstrap = super::pd_types::BatchRequestWithBootstrap {
+                original: body,
+                bootstrap_host: vec![hostname; batch_size],
+                bootstrap_port: vec![bootstrap_port; batch_size],
+                bootstrap_room: (0..batch_size)
+                    .map(|_| super::pd_types::generate_room_id())
+                    .collect(),
+            };
+            match serde_json::to_value(&request_with_bootstrap) {
+                Ok(json) => json,
+                Err(e) => return Self::handle_serialization_error(e),
+            }
+        } else {
+            // Single request
+            let request_with_bootstrap = super::pd_types::RequestWithBootstrap {
+                original: body,
+                bootstrap_host: hostname,
+                bootstrap_port,
+                bootstrap_room: super::pd_types::generate_room_id(),
+            };
+            match serde_json::to_value(&request_with_bootstrap) {
+                Ok(json) => json,
+                Err(e) => return Self::handle_serialization_error(e),
+            }
+        };
 
         // Execute dual dispatch
         self.execute_dual_dispatch(
@@ -1442,12 +1477,6 @@ impl RouterTrait for PDRouter {
         body: &CompletionRequest,
     ) -> Response {
         let start = Instant::now();
-
-        // Convert directly to JSON to preserve all fields automatically
-        let mut json = match serde_json::to_value(body) {
-            Ok(json) => json,
-            Err(e) => return Self::handle_serialization_error(e),
-        };
 
         // Extract flags for routing logic
         let is_stream = body.stream;
@@ -1472,10 +1501,41 @@ impl RouterTrait for PDRouter {
             decode.url()
         );
 
-        // Inject bootstrap fields directly into JSON
-        if let Err(e) = inject_bootstrap_fields(&mut json, prefill.as_ref()) {
-            return Self::handle_bootstrap_error(e);
-        }
+        // Get bootstrap port from prefill worker
+        let bootstrap_port = match prefill.worker_type() {
+            crate::core::WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+            _ => None,
+        };
+        let hostname = super::pd_types::get_hostname(prefill.url());
+
+        // Create optimized request with bootstrap fields
+        let json = if let Some(batch_size) = Self::get_completion_batch_size(body) {
+            // Batch request
+            let request_with_bootstrap = super::pd_types::BatchRequestWithBootstrap {
+                original: body,
+                bootstrap_host: vec![hostname; batch_size],
+                bootstrap_port: vec![bootstrap_port; batch_size],
+                bootstrap_room: (0..batch_size)
+                    .map(|_| super::pd_types::generate_room_id())
+                    .collect(),
+            };
+            match serde_json::to_value(&request_with_bootstrap) {
+                Ok(json) => json,
+                Err(e) => return Self::handle_serialization_error(e),
+            }
+        } else {
+            // Single request
+            let request_with_bootstrap = super::pd_types::RequestWithBootstrap {
+                original: body,
+                bootstrap_host: hostname,
+                bootstrap_port,
+                bootstrap_room: super::pd_types::generate_room_id(),
+            };
+            match serde_json::to_value(&request_with_bootstrap) {
+                Ok(json) => json,
+                Err(e) => return Self::handle_serialization_error(e),
+            }
+        };
 
         // Execute dual dispatch
         self.execute_dual_dispatch(
@@ -2127,159 +2187,5 @@ mod tests {
         // Check final state
         let workers = router.prefill_workers.read().unwrap();
         assert_eq!(workers.len(), 5);
-    }
-
-    #[tokio::test]
-    async fn test_simplified_routing_preserves_sglang_fields() {
-        use crate::openai_api_types::GenerateRequest;
-        use crate::routers::bootstrap_injector::inject_bootstrap_fields;
-
-        // Create a test worker
-        let worker = BasicWorker::new(
-            "http://test-server:8000".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: Some(5678),
-            },
-        );
-
-        // Create a GenerateRequest with SGLang extensions
-        let mut session_params = std::collections::HashMap::new();
-        session_params.insert("test_key".to_string(), serde_json::json!("test_value"));
-
-        let request = GenerateRequest {
-            text: Some("Test prompt".to_string()),
-            stream: false,
-            return_logprob: true,
-            // SGLang extensions
-            lora_path: Some(crate::openai_api_types::LoRAPath::Single(Some(
-                "test.bin".to_string(),
-            ))),
-            session_params: Some(session_params.clone()),
-            return_hidden_states: true,
-            rid: Some("test-request-id".to_string()),
-            // Other fields default to None/false
-            prompt: None,
-            input_ids: None,
-            parameters: None,
-            sampling_params: None,
-        };
-
-        // Convert to JSON (simulating the simplified routing path)
-        let mut json = serde_json::to_value(&request).unwrap();
-
-        // Inject bootstrap fields
-        let result = inject_bootstrap_fields(&mut json, &worker);
-        assert!(result.is_ok());
-
-        // Verify all SGLang fields are preserved
-        assert_eq!(json["text"], serde_json::json!("Test prompt"));
-        assert_eq!(json["stream"], serde_json::json!(false));
-        assert_eq!(json["return_logprob"], serde_json::json!(true));
-        assert_eq!(json["lora_path"], serde_json::json!("test.bin")); // LoRAPath::Single serializes as just the inner value
-        assert_eq!(
-            json["session_params"],
-            serde_json::to_value(&session_params).unwrap()
-        );
-        assert_eq!(json["return_hidden_states"], serde_json::json!(true));
-        assert_eq!(json["rid"], serde_json::json!("test-request-id"));
-
-        // Verify bootstrap fields were added
-        assert_eq!(json["bootstrap_host"], serde_json::json!("test-server"));
-        assert_eq!(json["bootstrap_port"], serde_json::json!(5678));
-        assert!(json["bootstrap_room"].is_number());
-    }
-
-    #[tokio::test]
-    async fn test_simplified_routing_chat_completion() {
-        use crate::openai_api_types::{ChatCompletionRequest, ChatMessage, UserMessageContent};
-        use crate::routers::bootstrap_injector::inject_bootstrap_fields;
-
-        // Create a test worker
-        let worker = BasicWorker::new(
-            "http://chat-server:8000".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: Some(9999),
-            },
-        );
-
-        // Create a ChatCompletionRequest with SGLang extensions
-        let request = ChatCompletionRequest {
-            model: "gpt-4".to_string(),
-            messages: vec![ChatMessage::User {
-                role: "user".to_string(),
-                content: UserMessageContent::Text("Hello world!".to_string()),
-                name: None,
-            }],
-            stream: false,
-            n: Some(2), // This should create batch bootstrap
-            // SGLang extensions
-            top_k: Some(50),
-            separate_reasoning: false,
-            stream_reasoning: true,
-            // Set all other fields to defaults
-            temperature: None,
-            top_p: None,
-            stream_options: None,
-            stop: None,
-            max_tokens: None,
-            max_completion_tokens: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            logit_bias: None,
-            user: None,
-            seed: None,
-            logprobs: false,
-            top_logprobs: None,
-            response_format: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            functions: None,
-            function_call: None,
-            min_p: None,
-            min_tokens: None,
-            repetition_penalty: None,
-            regex: None,
-            ebnf: None,
-            stop_token_ids: None,
-            no_stop_trim: false,
-            ignore_eos: false,
-            continue_final_message: false,
-            skip_special_tokens: true,
-            lora_path: None,
-            session_params: None,
-            return_hidden_states: false,
-        };
-
-        // Convert to JSON (simulating the simplified routing path)
-        let mut json = serde_json::to_value(&request).unwrap();
-
-        // Inject bootstrap fields
-        let result = inject_bootstrap_fields(&mut json, &worker);
-        assert!(result.is_ok());
-
-        // Verify original fields preserved
-        assert_eq!(json["model"], serde_json::json!("gpt-4"));
-        assert_eq!(json["stream"], serde_json::json!(false));
-        assert_eq!(json["n"], serde_json::json!(2));
-        assert_eq!(json["top_k"], serde_json::json!(50));
-        assert_eq!(json["separate_reasoning"], serde_json::json!(false));
-        assert_eq!(json["stream_reasoning"], serde_json::json!(true));
-
-        // Verify batch bootstrap fields for n=2
-        let bootstrap_hosts = json["bootstrap_host"].as_array().unwrap();
-        assert_eq!(bootstrap_hosts.len(), 2);
-        assert_eq!(bootstrap_hosts[0], serde_json::json!("chat-server"));
-        assert_eq!(bootstrap_hosts[1], serde_json::json!("chat-server"));
-
-        let bootstrap_ports = json["bootstrap_port"].as_array().unwrap();
-        assert_eq!(bootstrap_ports.len(), 2);
-        assert_eq!(bootstrap_ports[0], serde_json::json!(9999));
-        assert_eq!(bootstrap_ports[1], serde_json::json!(9999));
-
-        let bootstrap_rooms = json["bootstrap_room"].as_array().unwrap();
-        assert_eq!(bootstrap_rooms.len(), 2);
-        // Rooms should be different (randomness)
-        assert_ne!(bootstrap_rooms[0], bootstrap_rooms[1]);
     }
 }
