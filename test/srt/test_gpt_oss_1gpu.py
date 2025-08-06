@@ -9,7 +9,11 @@ class TestGptOss1Gpu(BaseTestGptOss):
             model_variant="20b",
             quantization="mxfp4",
             # TODO
-            expected_score=0.50,
+            expected_score_of_reasoning_effort={
+                "low": 0.50,
+                "medium": 0.50,
+                "high": 0.50,
+            },
         )
 
     def test_mxfp4_120b(self):
@@ -17,7 +21,11 @@ class TestGptOss1Gpu(BaseTestGptOss):
             model_variant="120b",
             quantization="mxfp4",
             # TODO
-            expected_score=0.50,
+            expected_score_of_reasoning_effort={
+                "low": 0.50,
+                "medium": 0.50,
+                "high": 0.50,
+            },
         )
 
     def test_bf16_20b(self):
@@ -25,7 +33,11 @@ class TestGptOss1Gpu(BaseTestGptOss):
             model_variant="20b",
             quantization="bf16",
             # TODO
-            expected_score=0.50,
+            expected_score_of_reasoning_effort={
+                "low": 0.50,
+                "medium": 0.50,
+                "high": 0.50,
+            },
         )
 
 

@@ -9,7 +9,11 @@ class TestGptOss4Gpu(BaseTestGptOss):
             model_variant="120b",
             quantization="bf16",
             # TODO
-            expected_score=0.50,
+            expected_score_of_reasoning_effort={
+                "low": 0.50,
+                "medium": 0.50,
+                "high": 0.50,
+            },
         )
 
 
