@@ -18,7 +18,7 @@ class BaseTestGptOss(CustomTestCase):
         model_variant: Literal["20b", "120b"],
         quantization: Literal["mxfp4", "bf16"],
         expected_score: float,
-        other_args: List[str],
+        other_args: List[str] = [],
     ):
         model = {
             ("20b", "bf16"): "lmsys/gpt-oss-20b-bf16",
@@ -61,6 +61,7 @@ class BaseTestGptOss(CustomTestCase):
             )
 
             metrics = run_eval(args)
+            print(f"Evaluation Result: {model=} {metrics}")
             self.assertGreaterEqual(metrics["score"], expected_score)
         finally:
             kill_process_tree(process.pid)
