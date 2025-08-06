@@ -165,15 +165,16 @@ class DetokenizerManager:
             )
             surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
 
+        force_show = os.getenv('SRT_FORCE_SPECIAL_TOKENS', '0') == '1'
         # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
         surr_texts = self.tokenizer.batch_decode(
             surr_ids,
-            skip_special_tokens=recv_obj.skip_special_tokens[0],
+            skip_special_tokens=recv_obj.skip_special_tokens[0] and not force_show,
             spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
         )
         read_texts = self.tokenizer.batch_decode(
             read_ids,
-            skip_special_tokens=recv_obj.skip_special_tokens[0],
+            skip_special_tokens=recv_obj.skip_special_tokens[0] and not force_show,
             spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
         )
 
