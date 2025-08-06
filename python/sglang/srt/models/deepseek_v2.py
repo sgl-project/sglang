@@ -145,6 +145,31 @@ _is_sm100_supported = is_cuda() and is_sm100_supported()
 
 logger = logging.getLogger(__name__)
 
+def _awq_dequantize(qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor):
+    if qweight.is_cuda:
+        from vllm import _custom_ops as ops
+
+        # on CPU, this is not available
+        return ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
+
+    # qweight: (K, N / 8), int32
+    # qzeros: (K / group_size, N / 8), int32
+    # scales: (K / group_size, N), bfloat16
+
+    # https://github.com/casper-hansen/AutoAWQ/blob/23d584c2/awq/modules/triton/gemm.py#L73-L86
+    bitshifts = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], dtype=torch.int32) * 4
+    qweight_unpacked = (qweight.unsqueeze(-1) >> bitshifts) & 0xF
+    qweight_unpacked = qweight_unpacked.flatten(-2)  # (K, N)
+
+    qzeros_unpacked = (qzeros.unsqueeze(-1) >> bitshifts) & 0xF
+    qzeros_unpacked = qzeros_unpacked.flatten(-2)  # (K / group_size, N)
+
+    num_groups = qzeros.shape[0]
+    qweight_unpacked = qweight_unpacked.unflatten(0, (num_groups, -1))
+    qweight = qweight_unpacked - qzeros_unpacked.unsqueeze(1)
+    weight = qweight.float() * scales.unsqueeze(1).float()
+    weight = weight.flatten(0, 1).to(scales.dtype)
+    return weight
 
 class AttnForwardMethod(IntEnum):
     # Use multi-head attention
@@ -374,6 +399,7 @@ class DeepseekV2MoE(nn.Module):
                 not is_packed_weight
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
             )
+            self.shared_experts_is_packed_weight = is_packed_weight
             if self.shared_experts_is_fp8:
                 assert (
                     self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
@@ -472,7 +498,7 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
-        ):
+        ) and not self.shared_experts_is_packed_weight:
             return self.forward_cpu(hidden_states, can_fuse_mlp_allreduce)
 
         shared_output = self._forward_shared_experts(hidden_states)
@@ -927,6 +953,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
             in {"awq", "awq_marlin", "moe_wna16"}
         )
+        self.is_packed_weight = is_packed_weight
         self.use_min_latency_fused_a_gemm = (
             has_fused_proj
             and not is_packed_weight
@@ -981,7 +1008,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 if hasattr(self, "fused_qkv_a_proj_with_mqa") and use_intel_amx_backend(
                     self
-                ):
+                ) and not self.is_packed_weight:
                     return AttnForwardMethod.MLA_FUSED_ROPE_CPU
                 else:
                     return AttnForwardMethod.MLA
@@ -1186,7 +1213,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         zero_allocator: BumpAllocator,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
+        q_len = hidden_states.shape[0]
+        q_input = hidden_states.new_empty(
+            q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
+        )
         if self.q_lora_rank is not None:
             if hidden_states.shape[0] <= 16 and self.use_min_latency_fused_a_gemm:
                 fused_qkv_a_proj_out = dsv3_fused_a_gemm(
@@ -1254,8 +1284,19 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
             )
         else:
-            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
-
+            # print(q_nope.transpose(0, 1).shape)
+            # print(self.w_kc.shape)
+            # q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+    
+            q_nope_out = q_input[..., : self.kv_lora_rank].transpose_(0, 1)
+            torch.ops.sgl_kernel.bmm_cpu(q_nope_out, q_nope.transpose(0, 1), self.w_kc, True, None)
+        # torch.ops.sgl_kernel.bmm_cpu(
+        #     attn_bmm_output,
+        #     attn_output.transpose(0, 1),
+        #     self.w_vc,
+        #     True,  # is_vnni
+        #     None,  # scale
+        # )
         q_nope_out = q_nope_out.transpose(0, 1)
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
@@ -1318,18 +1359,31 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
-            attn_bmm_output = torch.empty(
-                (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
-                dtype=attn_output.dtype,
-                device=attn_output.device,
-            )
-            torch.bmm(
+            # attn_bmm_output = torch.empty(
+            #     (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
+            #     dtype=attn_output.dtype,
+            #     device=attn_output.device,
+            # )
+            # torch.bmm(
+            #     attn_output.transpose(0, 1),
+            #     self.w_vc,
+            #     out=attn_bmm_output.view(
+            #         -1, self.num_local_heads, self.v_head_dim
+            #     ).transpose(0, 1),
+            # )
+            B = self.w_vc.size(0)
+            N = self.w_vc.size(1)
+            M = attn_output.size(0)
+            output = torch.empty([M, int(B * N)], dtype=attn_output.dtype)
+            attn_bmm_output_ = output.view([M, B, N]).transpose_(0, 1)
+            torch.ops.sgl_kernel.bmm_cpu(
+                attn_bmm_output_,
                 attn_output.transpose(0, 1),
                 self.w_vc,
-                out=attn_bmm_output.view(
-                    -1, self.num_local_heads, self.v_head_dim
-                ).transpose(0, 1),
+                True,  # is_vnni
+                None,  # scale
             )
+            attn_bmm_output = output
         output, _ = self.o_proj(attn_bmm_output)
 
         return output
@@ -2178,13 +2232,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                         self_attn.kv_b_proj.qzeros,
                     ).T
                 else:
-                    w = awq_dequantize(
+                    w = _awq_dequantize(
                         self_attn.kv_b_proj.qweight,
                         self_attn.kv_b_proj.scales,
                         self_attn.kv_b_proj.qzeros,
-                        0,
-                        0,
-                        0,
                     ).T
             else:
                 w = self_attn.kv_b_proj.weight
@@ -2271,13 +2322,20 @@ class DeepseekV2ForCausalLM(nn.Module):
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+            # w_kc, w_vc = w.unflatten(
+            #     0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+            # ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+            # w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+            # w_vc = w_vc.contiguous().transpose(1, 2)
+            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
             if not use_deep_gemm_bmm:
-                self_attn.w_kc = bind_or_assign(
-                    self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                )
-                self_attn.w_vc = bind_or_assign(
-                    self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
-                )
+                # self_attn.w_kc = bind_or_assign(
+                #     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                # )
+                # self_attn.w_vc = bind_or_assign(
+                #     self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+                # )
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None
