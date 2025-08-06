@@ -61,10 +61,15 @@ class RMSNorm(CustomOp):
         self,
         hidden_size: int,
         eps: float = 1e-6,
+        var_hidden_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self.hidden_size = hidden_size
+        self.variance_size_override = (
+            None if var_hidden_size == hidden_size else var_hidden_size
+        )
         if _use_aiter:
             self._forward_method = self.forward_aiter
 
@@ -73,6 +78,8 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.variance_size_override is not None:
+            return self.forward_native(x, residual)
         if residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
@@ -138,7 +145,25 @@ class RMSNorm(CustomOp):
             x = x + residual.to(torch.float32)
             residual = x.to(orig_dtype)
 
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        hidden_size = x.shape[-1]
+        if hidden_size != self.hidden_size:
+            raise ValueError(
+                "Expected hidden_size to be "
+                f"{self.hidden_size}, but found: {hidden_size}"
+            )
+
+        if self.variance_size_override is None:
+            x_var = x
+        else:
+            if hidden_size < self.variance_size_override:
+                raise ValueError(
+                    "Expected hidden_size to be at least "
+                    f"{self.variance_size_override}, but found: {hidden_size}"
+                )
+
+            x_var = x[..., : self.variance_size_override]
+
+        variance = x_var.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         x = (x * self.weight).to(orig_dtype)
         if residual is None:
