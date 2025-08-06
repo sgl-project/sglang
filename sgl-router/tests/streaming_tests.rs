@@ -4,7 +4,7 @@ use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
-use sglang_router_rs::config::{PolicyConfig, RouterConfig, RoutingMode};
+use sglang_router_rs::config::{PolicyConfig, RetryConfig, RouterConfig, RoutingMode};
 use sglang_router_rs::routers::{RouterFactory, RouterTrait};
 use std::sync::Arc;
 
@@ -36,6 +36,7 @@ impl TestContext {
             request_id_headers: None,
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
         };
 
         let mut workers = Vec::new();
