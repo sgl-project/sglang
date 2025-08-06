@@ -68,7 +68,6 @@ def patch_model(
             yield torch.compile(
                 torch.no_grad()(model.forward),
                 dynamic=False,
-                fullgraph=True,
             )
         else:
             yield model.forward
@@ -83,8 +82,9 @@ def set_torch_compile_config():
 
     torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
     torch._inductor.config.freezing = True
+    torch._dynamo.config.accumulated_cache_size_limit = 1024
     if hasattr(torch._dynamo.config, "cache_size_limit"):
-        torch._dynamo.config.cache_size_limit = 64
+        torch._dynamo.config.cache_size_limit = 1024
     monkey_patch_torch_compile()
 
 
@@ -241,7 +241,6 @@ def register_fake_ops():
     def _(mat1, mat2, scales1, scales2, bias, out_dtype, is_vnni):
         M = mat1.shape[0]
         N = mat2.shape[0]
-        k = mat1.shape[1]
         out = mat1.new_empty(M, N, dtype=out_dtype)
         return out
 
@@ -249,7 +248,6 @@ def register_fake_ops():
     def _(
         hidden_states,
         gating_output,
-        correction_bias,
         topk,
         renormalize,
         num_expert_group,
