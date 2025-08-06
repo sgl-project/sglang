@@ -1444,8 +1444,9 @@ class Scheduler(
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
-            # Merge the new batch into the running batch
-            if not self.last_batch.is_empty():
+            # Merge the new batch into the running batch.
+            # For prefill-only batch, we can avoid going through decoding step.
+            if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
@@ -1466,13 +1467,8 @@ class Scheduler(
             # Run prefill first if possible
             ret = new_batch
         else:
-            # For prefill-only requests, decoding is not needed.
-            # Reset the current decode batch to an empty placeholder.
-            if self.running_batch.is_prefill_only:
-                self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
-                ret = None
             # Run decode
-            elif not self.running_batch.is_empty():
+            if not self.running_batch.is_empty():
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
