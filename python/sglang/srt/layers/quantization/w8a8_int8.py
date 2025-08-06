@@ -24,7 +24,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.linear import RowParallelLinear, UnquantizedLinearMethod
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
@@ -578,6 +577,9 @@ class NPU_W8A8LinearMethodImpl:
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # To prevent import loops
+        from sglang.srt.layers.linear import RowParallelLinear
+
         original_dtype = x.dtype
         if original_dtype != torch.int8:
             x = torch_npu.npu_quantize(
@@ -661,6 +663,9 @@ class NPU_W8A8LinearMethodMTImpl:
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # To prevent import loops
+        from sglang.srt.layers.linear import RowParallelLinear
+
         original_dtype = x.dtype
         if original_dtype != torch.int8:
             x = quant_per_tensor(x, layer.input_scale, layer.input_offset)
