@@ -32,7 +32,7 @@ rm -rf /usr/local/lib/python3.10/dist-packages/flashinfer*
 rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
 
 # Install the main package
-pip install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/test/${CU_VERSION} --break-system-packages
+pip install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} --break-system-packages
 
 # Show current packages
 pip list
