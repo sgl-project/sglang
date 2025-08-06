@@ -1766,6 +1766,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             launch_done=self.launch_done,
+            finished_requests_ids=copy.deepcopy(global_scheduler_batch_dict["finished_requests_ids"]),
+            request_ids_to_seq_ids=copy.deepcopy(global_scheduler_batch_dict["request_ids_to_seq_ids"])
         )
 
     def copy(self):
@@ -1908,6 +1910,9 @@ class ModelWorkerBatch:
     # Overlap event
     launch_done: Optional[threading.Event] = None
 
+    # (yizhang) Mamba related
+    finished_requests_ids: Optional[Set] = None
+    request_ids_to_seq_ids: Optional[Dict] = None
 
 @triton.jit
 def write_req_to_token_pool_triton(

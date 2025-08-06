@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union, Set
 
 import torch
 import triton
@@ -309,6 +309,10 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # For Mamba Cache
+    finished_requests_ids: Optional[Set] = None
+    request_ids_to_seq_ids: Optional[Dict] = None
+
     @classmethod
     def init_new(
         cls,
@@ -349,6 +353,8 @@ class ForwardBatch:
             input_embeds=batch.input_embeds,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            finished_requests_ids=batch.finished_requests_ids,
+            request_ids_to_seq_ids=batch.request_ids_to_seq_ids,
         )
         device = model_runner.device
 

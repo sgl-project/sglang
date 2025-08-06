@@ -59,10 +59,8 @@ class MambaCacheManager:
         """
         if "seqlen_agnostic_capture_inputs" not in kwargs:
             # We get here only on Prefill/Eager mode runs
-            request_ids_to_seq_ids = global_scheduler_batch_dict["request_ids_to_seq_ids"]
-            finished_requests_ids = list(global_scheduler_batch_dict["finished_requests_ids"])
-            # request_ids_to_seq_ids = kwargs["request_ids_to_seq_ids"]
-            # finished_requests_ids = kwargs["finished_requests_ids"]
+            request_ids_to_seq_ids = kwargs["request_ids_to_seq_ids"]
+            finished_requests_ids = list(kwargs["finished_requests_ids"])
 
             self._release_finished_requests(finished_requests_ids)
             state_indices = self._prepare_current_run_mamba_cache(
@@ -88,11 +86,12 @@ class MambaCacheManager:
         """
         Copy the relevant state_indices into the CUDA graph input buffer 
         """
-        # assert all(
-        #     key in kwargs
-        #     for key in ["request_ids_to_seq_ids", "finished_requests_ids"])
-        finished_requests_ids = global_scheduler_batch_dict["finished_requests_ids"]
-        request_ids_to_seq_ids = global_scheduler_batch_dict["request_ids_to_seq_ids"]
+        assert all(
+            key in kwargs
+            for key in ["request_ids_to_seq_ids", "finished_requests_ids"])
+        finished_requests_ids = kwargs["finished_requests_ids"]
+        request_ids_to_seq_ids = kwargs["request_ids_to_seq_ids"]
+
         assert "seqlen_agnostic_capture_inputs" in input_buffers
         _, input_state_indices_buffer = input_buffers[
             "seqlen_agnostic_capture_inputs"]

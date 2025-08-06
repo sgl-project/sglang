@@ -672,6 +672,8 @@ class CudaGraphRunner:
                 kwargs["seqlen_agnostic_capture_inputs"] = (
                     self.mamba_cache_dict[bs]["seqlen_agnostic_capture_inputs"]
                 )
+                kwargs["request_ids_to_seq_ids"] = forward_batch.request_ids_to_seq_ids
+                kwargs["finished_requests_ids"] = forward_batch.finished_requests_ids
             logits_output_or_pp_proxy_tensors = forward(
                 input_ids,
                 forward_batch.positions,
@@ -830,7 +832,13 @@ class CudaGraphRunner:
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         if self.model_runner.is_hybrid_gdn and "seqlen_agnostic_capture_inputs" in self.mamba_cache_dict[self.bs]:
-            self.model_runner.model.copy_inputs_before_cuda_graphs(self.mamba_cache_dict[self.bs])
+            self.model_runner.model.copy_inputs_before_cuda_graphs(
+                self.mamba_cache_dict[self.bs],
+                **{
+                    "request_ids_to_seq_ids": forward_batch.request_ids_to_seq_ids,
+                    "finished_requests_ids": forward_batch.finished_requests_ids,
+                }
+            )
             extend_start_loc = self.model_runner.model.prepare_extend_start_loc(forward_batch)
             self.extend_start_loc[self.bs][:extend_start_loc.size(0)].copy_(extend_start_loc)
             forward_batch.extend_start_loc = self.extend_start_loc[self.bs]

@@ -1715,9 +1715,11 @@ class ModelRunner:
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
+        kwargs = {}
         if self.is_hybrid_gdn:
             forward_batch.extend_start_loc = self.model.prepare_extend_start_loc(forward_batch)
-        kwargs = {}
+            kwargs["request_ids_to_seq_ids"] = forward_batch.request_ids_to_seq_ids
+            kwargs["finished_requests_ids"] = forward_batch.finished_requests_ids
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
         return self.model.forward(
@@ -1745,6 +1747,8 @@ class ModelRunner:
             kwargs["get_embedding"] = True
         if self.is_hybrid_gdn:
             forward_batch.extend_start_loc = self.model.prepare_extend_start_loc(forward_batch)
+            kwargs["request_ids_to_seq_ids"] = forward_batch.request_ids_to_seq_ids
+            kwargs["finished_requests_ids"] = forward_batch.finished_requests_ids
         return self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
