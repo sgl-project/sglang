@@ -1186,10 +1186,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     layer.w2_blockscale_swizzled.view(torch.int32),
                     layer.g2_alphas,
                 ],
-                ep_size=layer.ep_size,
-                ep_rank=layer.ep_rank,
-                tp_size=layer.tp_size,
-                tp_rank=layer.tp_rank,
+                ep_size=layer.moe_ep_size,
+                ep_rank=layer.moe_ep_rank,
+                tp_size=layer.moe_tp_size,
+                tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
             )[0]
             if routed_scaling_factor is not None:

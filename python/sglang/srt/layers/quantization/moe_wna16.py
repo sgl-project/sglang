@@ -486,16 +486,16 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 )
 
             if "w13_qzeros" in weight_name:
-                tensor = loaded_weight.view(layer.tp_size, -1, loaded_weight.size(1))[
-                    tp_rank
-                ]
+                tensor = loaded_weight.view(
+                    layer.moe_tp_size, -1, loaded_weight.size(1)
+                )[tp_rank]
                 if shard_id == "w1":
                     param.data[expert_id, : shard_size // 2] = tensor
                 else:
                     param.data[expert_id, shard_size // 2 :] = tensor
             elif "w2_qzeros" in weight_name:
                 param.data[expert_id] = loaded_weight.view(
-                    loaded_weight.size(0), layer.tp_size, -1
+                    loaded_weight.size(0), layer.moe_tp_size, -1
                 )[:, tp_rank]
             else:
                 weight_loader(param, loaded_weight, weight_name, shard_id, expert_id)

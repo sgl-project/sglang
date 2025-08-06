@@ -128,7 +128,6 @@ class FusedMoE(torch.nn.Module):
         params_dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
-        tp_size: Optional[int] = None,
         prefix: str = "",
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
