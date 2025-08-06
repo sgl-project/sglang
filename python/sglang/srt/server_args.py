@@ -473,7 +473,7 @@ class ServerArgs:
             ):
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
-            
+
         if self.attention_backend == "dual_chunk_flash_attn":
             logger.warning(
                 "Mixed chunk is disabled because of using dual chunk flash attention backend"
