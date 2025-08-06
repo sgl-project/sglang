@@ -112,10 +112,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         metadata = TRTLLMMHAMetadata()
 
         # Get sequence information
-        metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+        metadata.cache_seqlens_int32 = seq_lens[:bs].to(torch.int32)
 
         # Precompute maximum sequence length
-        metadata.max_seq_len_k = seq_lens.max().item()
+        metadata.max_seq_len_k = seq_lens[:bs].max().item()
 
         # Precompute page table
         metadata.page_table = self.decode_cuda_graph_metadata["page_table"][:bs, :]
