@@ -281,6 +281,8 @@ class ServerArgs:
     # Deprecated arguments
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
+    
+    disable_harmony: bool = False
 
     def __post_init__(self):
         # Check deprecated arguments
@@ -1181,7 +1183,7 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=[
+            choices=[  # TODO: use FunctionCallParser.DetectorMap.keys()
                 "qwen25",
                 "mistral",
                 "llama3",
@@ -1191,6 +1193,7 @@ class ServerArgs:
                 "qwen3_coder",
                 "glm45",
                 "step3",
+                "gpt-oss",
             ],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'.",
@@ -1936,6 +1939,11 @@ class ServerArgs:
             "--enable-deepep-moe",
             action="store_true",
             help="(Deprecated) Enabling DeepEP MoE implementation for EP MoE.",
+        )
+        parser.add_argument(
+            "--disable-harmony",
+            action="store_true",
+            help="Whether to disable openai-harmony for gpt-oss model. If set will not use harmony for gpt-oss model",
         )
 
     @classmethod

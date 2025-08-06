@@ -57,13 +57,13 @@ class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
     def __init__(
-        self, tokenizer_manager: TokenizerManager, template_manager: TemplateManager
+        self, tokenizer_manager: TokenizerManager, template_manager: TemplateManager, disable_harmony: Optional[bool] = False,
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
         self.use_harmony = (
             self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
-        )
+        ) and not disable_harmony
 
         if self.use_harmony:
             from sglang.srt.function_call.harmony_tool_parser import (
@@ -251,6 +251,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 tokenize=True,
                 add_generation_prompt=True,
                 tools=tools,
+                reasoning_effort=request.reasoning_effort,
+                builtin_tools=[],
                 **(
                     request.chat_template_kwargs if request.chat_template_kwargs else {}
                 ),
