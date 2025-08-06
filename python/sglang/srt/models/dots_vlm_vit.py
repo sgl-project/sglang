@@ -17,32 +17,6 @@ from sglang.srt.utils import add_prefix
 logger = logging.getLogger(__name__)
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb_vision(
-    tensor: torch.Tensor, freqs: torch.Tensor
-) -> torch.Tensor:
-    orig_dtype = tensor.dtype
-    tensor = tensor.float()
-
-    cos = freqs.cos()
-    sin = freqs.sin()
-
-    cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
-    sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
-
-    output = (tensor * cos) + (rotate_half(tensor) * sin)
-
-    output = output.to(orig_dtype)
-
-    return output
-
-
 class VisionRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
@@ -56,7 +30,6 @@ class VisionRotaryEmbedding(nn.Module):
         freqs = torch.outer(seq, self.inv_freq)
         return freqs
 
-
 class PatchMerger(nn.Module):
     def __init__(
         self,
@@ -65,6 +38,7 @@ class PatchMerger(nn.Module):
         spatial_merge_size: int = 2,
         pre_norm="layernorm",
         init_merger_std=None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
@@ -96,95 +70,6 @@ class PatchMerger(nn.Module):
         return x
 
 
-class VisionFlashAttention2(nn.Module):
-    def __init__(self, config, dim: int, num_heads: int = 16, bias=True) -> None:
-        super().__init__()
-        self.num_heads = num_heads
-        self.qkv = nn.Linear(dim, dim * 3, bias=bias)
-        self.proj = nn.Linear(dim, dim, bias=bias)
-        self.config = config
-        self.is_causal = config.is_causal
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary_pos_emb: torch.Tensor = None,
-    ) -> torch.Tensor:
-        seq_length = hidden_states.shape[0]
-        q, k, v = (
-            self.qkv(hidden_states)
-            .reshape(seq_length, 3, self.num_heads, -1)
-            .permute(1, 0, 2, 3)
-            .unbind(0)
-        )  # 'shd'
-        q = apply_rotary_pos_emb_vision(q.unsqueeze(0), rotary_pos_emb).squeeze(0)
-        k = apply_rotary_pos_emb_vision(k.unsqueeze(0), rotary_pos_emb).squeeze(0)
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-        attn_output = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-            causal=self.is_causal,
-        ).reshape(seq_length, -1)
-        attn_output = self.proj(attn_output)
-
-        return attn_output
-
-
-class VisionSdpaAttention(nn.Module):
-    def __init__(self, config, dim: int, num_heads: int = 16, bias=True) -> None:
-        super().__init__()
-        self.num_heads = num_heads
-        self.qkv = nn.Linear(dim, dim * 3, bias=bias)
-        self.proj = nn.Linear(dim, dim, bias=bias)
-        self.config = config
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary_pos_emb: torch.Tensor = None,
-    ) -> torch.Tensor:
-        seq_length = hidden_states.shape[0]
-        q, k, v = (
-            self.qkv(hidden_states)
-            .reshape(seq_length, 3, self.num_heads, -1)
-            .permute(1, 0, 2, 3)
-            .unbind(0)
-        )
-
-        q = apply_rotary_pos_emb_vision(q.unsqueeze(0), rotary_pos_emb).squeeze(0)
-        k = apply_rotary_pos_emb_vision(k.unsqueeze(0), rotary_pos_emb).squeeze(0)
-
-        attention_mask = torch.zeros(
-            [1, seq_length, seq_length], device=q.device, dtype=torch.bool
-        )
-        for i in range(1, len(cu_seqlens)):
-            attention_mask[
-                ...,
-                cu_seqlens[i - 1] : cu_seqlens[i],
-                cu_seqlens[i - 1] : cu_seqlens[i],
-            ] = True
-
-        q = q.transpose(0, 1)
-        k = k.transpose(0, 1)
-        v = v.transpose(0, 1)
-
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v, attention_mask, dropout_p=0.0
-        )
-        attn_output = attn_output.transpose(0, 1)
-        attn_output = attn_output.reshape(seq_length, -1)
-
-        attn_output = self.proj(attn_output)
-        return attn_output
-
-
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -203,7 +88,7 @@ class RMSNorm(nn.Module):
 
 
 class DotsSwiGLUFFN(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, quant_config: Optional[QuantizationConfig] = None):
         super().__init__()
         hidden_features = config.intermediate_size
         in_features = config.embed_dim
@@ -220,7 +105,7 @@ class DotsSwiGLUFFN(nn.Module):
 
 
 class DotsPatchEmbed(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, quant_config: Optional[QuantizationConfig] = None):
         super().__init__()
         self.num_channels = config.num_channels
         self.patch_size = config.patch_size
@@ -249,13 +134,13 @@ class DotsPatchEmbed(nn.Module):
 
 
 class DotsViTPreprocessor(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, quant_config: Optional[QuantizationConfig] = None):
         super().__init__()
         self.patch_h = config.patch_size
         self.patch_w = config.patch_size
         self.embed_dim = config.embed_dim
         self.config = config
-        self.patchifier = DotsPatchEmbed(config)
+        self.patchifier = DotsPatchEmbed(config, quant_config)
 
     def forward(self, x: torch.Tensor, grid_thw=None) -> torch.Tensor:
         tokens = self.patchifier(x, grid_thw)
@@ -291,7 +176,7 @@ class DotsVisionBlock(nn.Module):
             proj_bias=config.use_bias,
         )
         self.norm1 = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
-        self.mlp = DotsSwiGLUFFN(config)
+        self.mlp = DotsSwiGLUFFN(config, quant_config)
         self.norm2 = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
 
     def forward(self, hidden_states, cu_seqlens, rotary_pos_emb) -> torch.Tensor:
@@ -315,7 +200,7 @@ class DotsVisionTransformer(PreTrainedModel):
         self._update_vision_config()
         self.spatial_merge_size = config.spatial_merge_size
 
-        self.patch_embed = DotsViTPreprocessor(config)
+        self.patch_embed = DotsViTPreprocessor(config, quant_config)
         self._init_weights(self.patch_embed.patchifier.proj)
 
         head_dim = config.embed_dim // config.num_attention_heads
@@ -340,6 +225,7 @@ class DotsVisionTransformer(PreTrainedModel):
             context_dim=config.embed_dim,
             spatial_merge_size=config.spatial_merge_size,
             init_merger_std=self.config.init_merger_std,
+            quant_config=quant_config,
         )
 
         self.gradient_checkpointing = False
