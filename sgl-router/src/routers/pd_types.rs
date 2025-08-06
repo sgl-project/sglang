@@ -278,11 +278,11 @@ mod bootstrap_tests {
     use crate::core::BasicWorker;
     use crate::openai_api_types::StringOrArray;
 
-    #[test]
-    fn test_completion_batch_size_with_array_prompt() {
-        let req = CompletionRequest {
-            model: "test".to_string(),
-            prompt: StringOrArray::Array(vec!["prompt1".to_string(), "prompt2".to_string()]),
+    /// Create a default CompletionRequest for testing with minimal fields set
+    fn default_completion_request() -> CompletionRequest {
+        CompletionRequest {
+            model: String::new(),
+            prompt: StringOrArray::String(String::new()),
             n: None,
             other: serde_json::Map::new(),
             suffix: None,
@@ -300,6 +300,31 @@ mod bootstrap_tests {
             logit_bias: None,
             user: None,
             seed: None,
+            // SGLang Extensions
+            top_k: None,
+            min_p: None,
+            min_tokens: None,
+            repetition_penalty: None,
+            regex: None,
+            ebnf: None,
+            json_schema: None,
+            stop_token_ids: None,
+            no_stop_trim: false,
+            ignore_eos: false,
+            skip_special_tokens: true,
+            // SGLang Extensions
+            lora_path: None,
+            session_params: None,
+            return_hidden_states: false,
+        }
+    }
+
+    #[test]
+    fn test_completion_batch_size_with_array_prompt() {
+        let req = CompletionRequest {
+            model: "test".to_string(),
+            prompt: StringOrArray::Array(vec!["prompt1".to_string(), "prompt2".to_string()]),
+            ..default_completion_request()
         };
 
         // Should return batch size for array prompt
@@ -311,23 +336,7 @@ mod bootstrap_tests {
         let req = CompletionRequest {
             model: "test".to_string(),
             prompt: StringOrArray::String("single prompt".to_string()),
-            n: None,
-            other: serde_json::Map::new(),
-            suffix: None,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            stream: false,
-            stream_options: None,
-            logprobs: None,
-            echo: false,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            best_of: None,
-            logit_bias: None,
-            user: None,
-            seed: None,
+            ..default_completion_request()
         };
 
         // Should return None for single prompt
@@ -340,22 +349,7 @@ mod bootstrap_tests {
             model: "test".to_string(),
             prompt: StringOrArray::String("single prompt".to_string()),
             n: Some(3),
-            other: serde_json::Map::new(),
-            suffix: None,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            stream: false,
-            stream_options: None,
-            logprobs: None,
-            echo: false,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            best_of: None,
-            logit_bias: None,
-            user: None,
-            seed: None,
+            ..default_completion_request()
         };
 
         // Should return None for single string prompt, even with n > 1
@@ -368,23 +362,7 @@ mod bootstrap_tests {
         let mut req = CompletionRequest {
             model: "test".to_string(),
             prompt: StringOrArray::Array(vec!["prompt1".to_string(), "prompt2".to_string()]),
-            n: None,
-            other: serde_json::Map::new(),
-            suffix: None,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            stream: false,
-            stream_options: None,
-            logprobs: None,
-            echo: false,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            best_of: None,
-            logit_bias: None,
-            user: None,
-            seed: None,
+            ..default_completion_request()
         };
 
         // Set bootstrap info - should always use single values
@@ -418,23 +396,7 @@ mod bootstrap_tests {
         let mut req = CompletionRequest {
             model: "test".to_string(),
             prompt: StringOrArray::Array(vec!["prompt1".to_string(), "prompt2".to_string()]),
-            n: None,
-            other: serde_json::Map::new(),
-            suffix: None,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            stream: false,
-            stream_options: None,
-            logprobs: None,
-            echo: false,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            best_of: None,
-            logit_bias: None,
-            user: None,
-            seed: None,
+            ..default_completion_request()
         };
 
         // Set bootstrap info with arrays

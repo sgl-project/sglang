@@ -51,7 +51,6 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
-from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -109,6 +108,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_triton_kernel_moe",
     "enable_multimodal",
     "enable_symm_mem",
+    "quantization",
 ]
 
 # Put some global args for easy access
@@ -917,8 +917,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            assert isinstance(tree_cache, SWARadixCache) or isinstance(
-                tree_cache, SWAChunkCache
+            assert (
+                tree_cache is None
+                or isinstance(tree_cache, SWARadixCache)
+                or isinstance(tree_cache, SWAChunkCache)
             ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid = True
 
@@ -1705,6 +1707,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             or attention_backend_str == "flashmla"
             or attention_backend_str == "cutlass_mla"
             or attention_backend_str == "ascend"
+            or attention_backend_str == "trtllm_mha"
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
             seq_lens_cpu = (

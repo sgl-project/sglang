@@ -50,6 +50,7 @@ impl RouterFactory {
             ctx.router_config.worker_startup_check_interval_secs,
             ctx.router_config.dp_aware,
             ctx.router_config.api_key.clone(),
+            ctx.router_config.retry.clone(),
         )?;
 
         Ok(Box::new(router))
@@ -79,6 +80,7 @@ impl RouterFactory {
             ctx.client.clone(),
             ctx.router_config.worker_startup_timeout_secs,
             ctx.router_config.worker_startup_check_interval_secs,
+            ctx.router_config.retry.clone(),
         )?;
 
         Ok(Box::new(router))

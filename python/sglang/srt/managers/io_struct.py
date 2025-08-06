@@ -26,6 +26,7 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils import ImageData
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -45,7 +46,7 @@ class SessionParams:
 
 # Type definitions for multimodal input data
 # Individual data item types for each modality
-ImageDataInputItem = Union[Image, str, Dict]
+ImageDataInputItem = Union[Image, str, ImageData, Dict]
 AudioDataInputItem = Union[str, Dict]
 VideoDataInputItem = Union[str, Dict]
 # Union type for any multimodal data item
