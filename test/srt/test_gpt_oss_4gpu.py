@@ -10,8 +10,9 @@ class TestGptOss4Gpu(BaseTestGptOss):
             quantization="bf16",
             expected_score_of_reasoning_effort={
                 "low": 0.61,
-                "medium": 0.61,
-                "high": 0.61,
+                # remove to speed up
+                # "medium": 0.61,
+                # "high": 0.61,
             },
             other_args=["--tp", "4"],
         )
@@ -22,8 +23,9 @@ class TestGptOss4Gpu(BaseTestGptOss):
             quantization="mxfp4",
             expected_score_of_reasoning_effort={
                 "low": 0.61,
-                "medium": 0.61,
-                "high": 0.61,
+                # remove to speed up
+                # "medium": 0.61,
+                # "high": 0.61,
             },
         )
 

@@ -65,11 +65,9 @@ class BaseTestGptOss(CustomTestCase):
                             dict(
                                 model=model,
                                 reasoning_effort=reasoning_effort,
-                                expected_score=expected_score_of_reasoning_effort[
-                                    reasoning_effort
-                                ],
+                                expected_score=expected_score,
                             )
-                            for reasoning_effort in ["low", "medium", "high"]
+                            for reasoning_effort, expected_score in expected_score_of_reasoning_effort.items()
                         ],
                     )
                 )
