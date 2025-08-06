@@ -25,6 +25,8 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_moe_expert_parallel_rank,
+    get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_rank,
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -108,11 +110,15 @@ class GptOssSparseMoeBlock(nn.Module):
         experts_type = get_moe_impl_class()
         extra_kwargs = {}
         if experts_type.__name__ == "FusedMoE":
+            quant_config_name = (
+                quant_config.get_name() if quant_config is not None else None
+            )
             extra_kwargs = {
                 "enable_flashinfer_cutlass_moe": global_server_args_dict[
                     "enable_flashinfer_cutlass_moe"
                 ],
-                "use_weight_loader_fused": True,  # for moe gate_up_proj and down_proj and their bias loading
+                # for moe gate_up_proj and down_proj and their bias loading
+                "use_weight_loader_fused": quant_config_name != "mxfp4",
             }
         self.experts = experts_type(
             num_experts=config.num_local_experts
@@ -350,7 +356,6 @@ class GptOssDecoderLayer(nn.Module):
             head_dim=head_dim,
             rms_norm_eps=rms_norm_eps,
             attention_bias=attention_bias,
-            quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
             sliding_window_size=self.sliding_window_size,
             layer_type=config.layer_types[layer_id],
@@ -538,7 +543,7 @@ class GptOssForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
-            quant_config=quant_config,
+            # quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
             use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
         )
@@ -652,11 +657,188 @@ class GptOssForCausalLM(nn.Module):
 
         return weight_mapping
 
+    # TODO beautify code
     def load_weights(
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
         is_nextn: bool = False,
         weight_name_mapping: dict = None,
+    ):
+        quant_config_name = (
+            self.quant_config.get_name() if self.quant_config is not None else None
+        )
+        if quant_config_name != "mxfp4":
+            self._load_normal_weights(
+                weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
+            )
+        else:
+            self._load_weights_mxfp4(
+                weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
+            )
+
+    def _load_weights_mxfp4(self, weights, is_nextn, weight_name_mapping):
+        mxfp4_weights = []
+        normal_weights = []
+
+        for name, weight in weights:
+            if (
+                ".experts" in name
+                and self.quant_config is not None
+                and self.quant_config.get_name() == "mxfp4"
+            ):
+                mxfp4_weights.append((name, weight))
+            else:
+                normal_weights.append((name, weight))
+
+        mxfp4_loaded_params = self._load_mxfp4_experts_weights(mxfp4_weights)
+        self._load_normal_weights(
+            normal_weights,
+            is_nextn=is_nextn,
+            weight_name_mapping=weight_name_mapping,
+            other_loaded_param_names=mxfp4_loaded_params,
+        )
+
+    def _load_mxfp4_experts_weights(self, weights):
+
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+        mxfp4_block = 32
+
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+        intermediate_size = self.config.intermediate_size
+        intermediate_size_block = intermediate_size // mxfp4_block
+        per_rank_intermediate_size_block = intermediate_size_block // tp_size
+        per_rank_intermediate_size = per_rank_intermediate_size_block * mxfp4_block
+
+        # Calculate common slicing bounds for current rank
+        tp_rank_start = tp_rank * per_rank_intermediate_size
+        tp_rank_end = min((tp_rank + 1) * per_rank_intermediate_size, intermediate_size)
+
+        # Attention heads per rank
+        heads_per_rank = self.config.num_attention_heads // tp_size
+        head_start = tp_rank * heads_per_rank
+
+        num_experts = self.config.num_local_experts
+
+        for name, weight in weights:
+            weight = weight.cuda()
+
+            if "gate_up_proj_blocks" in name:
+                # Handle MLP gate and up projection weights
+                new_name = name.replace("gate_up_proj_blocks", "w13_weight")
+
+                # flat weight from (E, 2 * N, block_size, entry_per_block)
+                # to (E, 2 * N, -1), shouldn't trigger copy for contiguous
+                weight = weight.view(
+                    num_experts, 2 * intermediate_size, -1
+                ).contiguous()
+
+                narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end, ...]
+
+                param = params_dict[new_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(
+                    param,
+                    narrow_weight,
+                    weight_name=new_name,
+                    shard_id=None,
+                    expert_id=None,
+                )
+                loaded_params.add(new_name)
+
+            elif "down_proj_blocks" in name:
+                # Handle MLP down projection weights
+                new_name = name.replace("down_proj_blocks", "w2_weight")
+                # same flatten here, but since 2 mx4 value are packed in 1
+                # uint8, divide by 2
+                weight = weight.view(
+                    num_experts, -1, intermediate_size // 2
+                ).contiguous()
+                narrow_weight = weight[..., tp_rank_start // 2 : tp_rank_end // 2]
+
+                param = params_dict[new_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(
+                    param,
+                    narrow_weight,
+                    weight_name=new_name,
+                    shard_id=None,
+                    expert_id=None,
+                )
+                loaded_params.add(new_name)
+
+            elif "gate_up_proj_scales" in name:
+                # Handle MLP gate and up projection weights scale
+                new_name = name.replace("gate_up_proj_scales", "w13_weight_scale")
+                narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end, ...]
+
+                param = params_dict[new_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(
+                    param,
+                    narrow_weight,
+                    weight_name=new_name,
+                    shard_id=None,
+                    expert_id=None,
+                )
+                loaded_params.add(new_name)
+
+            elif "down_proj_scales" in name:
+                # Handle MLP down projection weights
+                new_name = name.replace("down_proj_scales", "w2_weight_scale")
+                narrow_weight = weight[
+                    ..., tp_rank_start // mxfp4_block : tp_rank_end // mxfp4_block
+                ]
+
+                param = params_dict[new_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(
+                    param,
+                    narrow_weight,
+                    weight_name=new_name,
+                    shard_id=None,
+                    expert_id=None,
+                )
+                loaded_params.add(new_name)
+            elif "gate_up_proj_bias" in name:
+                # Handle MLP gate and up projection biases
+                new_name = name.replace("gate_up_proj_bias", "w13_weight_bias")
+
+                narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end]
+
+                param = params_dict[new_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(
+                    param,
+                    narrow_weight,
+                    weight_name=new_name,
+                    shard_id=None,
+                    expert_id=None,
+                )
+                loaded_params.add(new_name)
+
+            elif "down_proj_bias" in name:
+                if get_moe_tensor_parallel_rank() != 0:
+                    weight = torch.zeros_like(weight)
+
+                # Handle MLP down projection bias
+                new_name = name.replace("down_proj_bias", "w2_weight_bias")
+                param = params_dict[new_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(
+                    param, weight, weight_name=new_name, shard_id=None, expert_id=None
+                )
+                loaded_params.add(new_name)
+
+        return loaded_params
+
+    def _load_normal_weights(
+        self,
+        weights,
+        is_nextn: bool,
+        weight_name_mapping: dict,
+        other_loaded_param_names=[],
     ):
         tp_rank = get_tensor_model_parallel_rank()
         if is_nextn:
@@ -725,15 +907,33 @@ class GptOssForCausalLM(nn.Module):
             ("qkv_proj", "v_proj", "v"),
         ]
 
-        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping_fused(
-            ckpt_gate_up_proj_name="gate_up_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_gate_up_proj_bias_name="gate_up_proj_bias",
-            ckpt_down_proj_bias_name="down_proj_bias",
-        )
+        if self.quant_config is not None and (self.quant_config.get_name() == "mxfp4"):
+            expert_params_mapping = (
+                get_moe_impl_class().make_expert_params_mapping_fused_mxfp4(
+                    ckpt_gate_up_proj_name="gate_up_proj_blocks",
+                    ckpt_down_proj_name="down_proj_blocks",
+                    ckpt_gate_up_proj_bias_name="gate_up_proj_bias",
+                    ckpt_down_proj_bias_name="down_proj_bias",
+                    ckpt_gate_up_proj_scale_name="gate_up_proj_scales",
+                    ckpt_down_proj_scale_name="down_proj_scales",
+                )
+            )
+        else:
+            expert_params_mapping = (
+                get_moe_impl_class().make_expert_params_mapping_fused(
+                    ckpt_gate_up_proj_name="gate_up_proj",
+                    ckpt_down_proj_name="down_proj",
+                    ckpt_gate_up_proj_bias_name="gate_up_proj_bias",
+                    ckpt_down_proj_bias_name="down_proj_bias",
+                )
+            )
 
         params_dict = dict(self.named_parameters())
         params_checker = {k: False for k, v in params_dict.items()}
+
+        for other_loaded_param_name in other_loaded_param_names:
+            params_checker[other_loaded_param_name] = True
+
         for name, loaded_weight in weights:
             loaded_weight = _WeightCreator.maybe_materialize(loaded_weight)
 
