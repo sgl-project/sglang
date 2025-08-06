@@ -23,20 +23,12 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
     from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
 
-_is_cuda = is_cuda()
-_is_npu = is_npu()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu = is_cpu()
-_is_hip = is_hip()
-
-if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_hip):
-    from vllm import _custom_ops as vllm_ops
-    from vllm._custom_ops import scaled_fp8_quant
 
 try:
     import vllm
@@ -198,7 +190,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading(self, layer: FusedMoE) -> None:
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
         if self.static_input_scales:
@@ -255,7 +247,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             assert layer.w13_weight_scale is not None
             shard_size = layer.intermediate_size_per_partition
             max_w13_scales = layer.w13_weight_scale.max(dim=1).values
-            for expert_id in range(layer.local_num_experts):
+            for expert_id in range(layer.num_local_experts):
                 start = 0
                 for shard_id in range(2):
                     dq_weight = per_tensor_dequantize(
@@ -567,6 +559,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 torch.empty((num_experts, 0), dtype=torch.int32, device=device),
                 requires_grad=False,
             )
+
+        from vllm import _custom_ops as vllm_ops
 
         marlin_w13_qweight = vllm_ops.gptq_marlin_moe_repack(
             layer.w13_weight_packed,

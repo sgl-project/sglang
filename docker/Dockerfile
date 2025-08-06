@@ -8,6 +8,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
     NVSHMEM_DIR=/sgl-workspace/nvshmem/install
+# Add GKE default lib and bin locations.
+ENV PATH="${PATH}:/usr/local/nvidia/bin" \
+    LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+
+RUN apt update && apt install wget -y && apt install software-properties-common -y \
+ && add-apt-repository ppa:deadsnakes/ppa -y \
+ && apt install python3.12-full -y \
+ && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
+ && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
+ && update-alternatives --set python3 /usr/bin/python3.12 \
+ && wget https://bootstrap.pypa.io/get-pip.py \
+ && python3 get-pip.py
 
 # Set timezone and install all packages
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
@@ -58,9 +70,9 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+ && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
  && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
-      python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps ; \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.2.6.post1/sgl_kernel-0.2.6.post1+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.2.9/sgl_kernel-0.2.9+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
     fi
 
 # Build and install NVSHMEM + DeepEP
@@ -86,7 +98,7 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
     datamodel_code_generator \
-    mooncake_transfer_engine==0.3.4.post2 \
+    mooncake-transfer-engine==0.3.5 \
     pre-commit \
     pytest \
     black \

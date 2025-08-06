@@ -60,6 +60,7 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.layers.quantization import (
     deep_gemm_wrapper,
     monkey_patch_isinstance_for_vllm_base_layer,
@@ -110,7 +111,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
-    is_cuda,
     is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
@@ -159,6 +159,8 @@ class ModelRunner:
         gpu_id: int,
         tp_rank: int,
         tp_size: int,
+        moe_ep_rank: int,
+        moe_ep_size: int,
         pp_rank: int,
         pp_size: int,
         nccl_port: int,
@@ -177,6 +179,8 @@ class ModelRunner:
             logger.addFilter(RankZeroFilter(tp_rank == 0))
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.moe_ep_rank = moe_ep_rank
+        self.moe_ep_size = moe_ep_size
         self.dp_size = server_args.dp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
@@ -214,6 +218,10 @@ class ModelRunner:
                 # TODO it is indeed not a "server args"
                 "use_mla_backend": self.use_mla_backend,
                 "speculative_algorithm": self.spec_algorithm,
+            }
+            | {
+                "moe_a2a_backend": MoeA2ABackend(server_args.moe_a2a_backend),
+                "deepep_mode": DeepEPMode(server_args.deepep_mode),
             }
         )
 
@@ -277,6 +285,7 @@ class ModelRunner:
         self.sampler = Sampler()
         self.load_model()
 
+        # Check if the model is using hybrid SWA
         if (
             not self.server_args.disable_hybrid_swa_memory
             and self.sliding_window_size is not None
@@ -286,11 +295,21 @@ class ModelRunner:
             if architectures and not any("Llama4" in arch for arch in architectures):
                 self.is_hybrid = self.model_config.is_hybrid = True
 
-        self.start_layer = getattr(self.model, "start_layer", 0)
-        self.end_layer = getattr(
-            self.model, "end_layer", self.model_config.num_hidden_layers
+        # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
+        # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
+        # determine the number of layers.
+        model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None
+        model_num_layers = (
+            self.model_config.num_nextn_predict_layers
+            if self.is_draft_worker and model_has_mtp_layers
+            else self.model_config.num_hidden_layers
         )
+        self.start_layer = getattr(self.model, "start_layer", 0)
+        self.end_layer = getattr(self.model, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
+        assert (not model_has_mtp_layers) or (
+            self.num_effective_layers == model_num_layers
+        ), "PP is not compatible with MTP models."
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
@@ -426,6 +445,7 @@ class ModelRunner:
                     "triton",
                     "flashmla",
                     "cutlass_mla",
+                    "trtllm_mla",
                     "ascend",
                 ]:
                     logger.info(
@@ -543,6 +563,7 @@ class ModelRunner:
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
+                expert_model_parallel_size=self.moe_ep_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
             )
             initialize_dp_attention(
@@ -660,7 +681,7 @@ class ModelRunner:
             self.sliding_window_size = self.model.get_attention_sliding_window_size()
         elif self.model_config.attention_chunk_size is not None:
             self.sliding_window_size = self.model_config.attention_chunk_size
-            print(
+            logger.info(
                 f"Setting sliding_window_size to be attention_chunk_size: {self.sliding_window_size}"
             )
 
@@ -1012,8 +1033,11 @@ class ModelRunner:
                 try:
                     layers = self.model.language_model.model.layers
                 except:
-                    self.is_hybrid = False
-                    return
+                    try:
+                        layers = self.model.language_model.layers
+                    except:
+                        self.is_hybrid = False
+                        return
 
             for layer in layers:
                 if (
@@ -1179,11 +1203,7 @@ class ModelRunner:
                 dtype=self.kv_cache_dtype,
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                layer_num=(
-                    self.model_config.num_hidden_layers
-                    if not self.is_draft_worker
-                    else self.model_config.hf_config.num_nextn_predict_layers
-                ),  # PP is not compatible with mla backend
+                layer_num=self.num_effective_layers,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
@@ -1196,11 +1216,7 @@ class ModelRunner:
                 dtype=self.kv_cache_dtype,
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                layer_num=(
-                    self.model_config.num_hidden_layers
-                    if not self.is_draft_worker
-                    else self.model_config.hf_config.num_nextn_predict_layers
-                ),  # PP is not compatible with mla backend
+                layer_num=self.num_effective_layers,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
@@ -1309,9 +1325,58 @@ class ModelRunner:
         else:
             self.attn_backend = self._get_attention_backend()
 
-    # TODO unify with 6338
     def _get_attention_backend(self):
-        if self.server_args.attention_backend == "flashinfer":
+        """Init attention kernel backend."""
+        self.decode_attention_backend_str = (
+            self.server_args.decode_attention_backend
+            if self.server_args.decode_attention_backend
+            else self.server_args.attention_backend
+        )
+        self.prefill_attention_backend_str = (
+            self.server_args.prefill_attention_backend
+            if self.server_args.prefill_attention_backend
+            else self.server_args.attention_backend
+        )
+        if self.decode_attention_backend_str != self.prefill_attention_backend_str:
+            assert (
+                self.server_args.speculative_algorithm is None
+            ), "Currently HybridAttentionBackend does not support speculative decoding."
+            from sglang.srt.layers.attention.hybrid_attn_backend import (
+                HybridAttnBackend,
+            )
+
+            attn_backend = HybridAttnBackend(
+                decode_backend=self._get_attention_backend_from_str(
+                    self.decode_attention_backend_str
+                ),
+                prefill_backend=self._get_attention_backend_from_str(
+                    self.prefill_attention_backend_str
+                ),
+            )
+            logger.info(
+                f"Using hybrid attention backend for decode and prefill: "
+                f"decode_backend={self.decode_attention_backend_str}, "
+                f"prefill_backend={self.prefill_attention_backend_str}."
+            )
+            logger.warning(
+                f"Warning: Attention backend specified by --attention-backend or default backend might be overridden."
+                f"The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
+            )
+        else:
+            attn_backend = self._get_attention_backend_from_str(
+                self.server_args.attention_backend
+            )
+
+        global_server_args_dict.update(
+            {
+                "decode_attention_backend": self.decode_attention_backend_str,
+                "prefill_attention_backend": self.prefill_attention_backend_str,
+            }
+        )
+        return attn_backend
+
+    def _get_attention_backend_from_str(self, backend_str: str):
+        if backend_str == "flashinfer":
             if not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (
                     FlashInferAttnBackend,
@@ -1319,7 +1384,11 @@ class ModelRunner:
 
                 # Init streams
                 if self.server_args.speculative_algorithm == "EAGLE":
-                    self.plan_stream_for_flashinfer = torch.cuda.Stream()
+                    if (
+                        not hasattr(self, "plan_stream_for_flashinfer")
+                        or not self.plan_stream_for_flashinfer
+                    ):
+                        self.plan_stream_for_flashinfer = torch.cuda.Stream()
                 return FlashInferAttnBackend(self)
             else:
                 from sglang.srt.layers.attention.flashinfer_mla_backend import (
@@ -1327,15 +1396,15 @@ class ModelRunner:
                 )
 
                 return FlashInferMLAAttnBackend(self)
-        elif self.server_args.attention_backend == "aiter":
+        elif backend_str == "aiter":
             from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
             return AiterAttnBackend(self)
-        elif self.server_args.attention_backend == "ascend":
+        elif backend_str == "ascend":
             from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
 
             return AscendAttnBackend(self)
-        elif self.server_args.attention_backend == "triton":
+        elif backend_str == "triton":
             assert not self.model_config.is_encoder_decoder, (
                 "Cross attention is not supported in the triton attention backend. "
                 "Please use `--attention-backend flashinfer`."
@@ -1350,17 +1419,17 @@ class ModelRunner:
                 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
                 return TritonAttnBackend(self)
-        elif self.server_args.attention_backend == "torch_native":
+        elif backend_str == "torch_native":
             from sglang.srt.layers.attention.torch_native_backend import (
                 TorchNativeAttnBackend,
             )
 
             return TorchNativeAttnBackend(self)
-        elif self.server_args.attention_backend == "flashmla":
+        elif backend_str == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
             return FlashMLABackend(self)
-        elif self.server_args.attention_backend == "fa3":
+        elif backend_str == "fa3":
             assert (
                 torch.cuda.get_device_capability()[0] == 8 and not self.use_mla_backend
             ) or torch.cuda.get_device_capability()[0] == 9, (
@@ -1372,12 +1441,29 @@ class ModelRunner:
             )
 
             return FlashAttentionBackend(self)
-        elif self.server_args.attention_backend == "cutlass_mla":
+        elif backend_str == "cutlass_mla":
             from sglang.srt.layers.attention.cutlass_mla_backend import (
                 CutlassMLABackend,
             )
 
             return CutlassMLABackend(self)
+        elif self.server_args.attention_backend == "trtllm_mla":
+            if not self.use_mla_backend:
+                raise ValueError("trtllm_mla backend can only be used with MLA models.")
+            from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+
+            return TRTLLMMLABackend(self)
+        elif self.server_args.attention_backend == "trtllm_mha":
+            if self.use_mla_backend:
+                raise ValueError(
+                    "trtllm_mha backend can only be used with non-MLA models."
+                )
+            from sglang.srt.layers.attention.trtllm_mha_backend import (
+                TRTLLMHAAttnBackend,
+            )
+
+            return TRTLLMHAAttnBackend(self)
+
         elif self.server_args.attention_backend == "intel_amx":
             from sglang.srt.layers.attention.intel_amx_backend import (
                 IntelAMXAttnBackend,
@@ -1386,9 +1472,7 @@ class ModelRunner:
             logger.info(f"Intel AMX attention backend is enabled.")
             return IntelAMXAttnBackend(self)
         else:
-            raise ValueError(
-                f"Invalid attention backend: {self.server_args.attention_backend}"
-            )
+            raise ValueError(f"Invalid attention backend: {backend_str}")
 
     def init_double_sparsity_channel_config(self, selected_channel):
         selected_channel = "." + selected_channel + "_proj"
@@ -1466,15 +1550,22 @@ class ModelRunner:
         tensor_parallel(self.model, device_mesh)
 
     def forward_decode(
-        self, forward_batch: ForwardBatch, pp_proxy_tensors=None
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool = False,
+        pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
-        self.attn_backend.init_forward_metadata(forward_batch)
+        if not skip_attn_backend_init:
+            self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
         return self.model.forward(
-            forward_batch.input_ids, forward_batch.positions, forward_batch, **kwargs
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            **kwargs,
         )
 
     def forward_extend(
@@ -1580,8 +1671,18 @@ class ModelRunner:
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-        elif forward_batch.forward_mode.is_decode():
-            ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+            return ret, can_run_cuda_graph
+
+        # For MLP sync
+        if forward_batch.global_num_tokens_cpu is not None:
+            forward_batch.prepare_mlp_sync_batch(self)
+
+        if forward_batch.forward_mode.is_decode():
+            ret = self.forward_decode(
+                forward_batch,
+                skip_attn_backend_init=skip_attn_backend_init,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
         elif forward_batch.forward_mode.is_extend():
             ret = self.forward_extend(
                 forward_batch,
@@ -1598,6 +1699,9 @@ class ModelRunner:
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+
+        if forward_batch.global_num_tokens_cpu is not None:
+            forward_batch.post_forward_mlp_sync_batch(ret)
 
         return ret, can_run_cuda_graph
 
