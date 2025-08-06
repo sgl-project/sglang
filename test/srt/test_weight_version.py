@@ -186,7 +186,7 @@ class TestWeightVersion(CustomTestCase):
             response.json()["metadata"]["weight_version"], "final_version_3.0"
         )
 
-        print("✅ All weight_version functionality tests passed!")
+        print("All weight_version functionality tests passed!")
 
     def test_update_weight_version_with_weight_updates(self):
         """Test that weight_version can be updated along with weight updates using real model data."""
@@ -220,7 +220,7 @@ class TestWeightVersion(CustomTestCase):
             version_response.json()["weight_version"], "disk_update_v2.0.0"
         )
 
-        print("✅ Weight update with weight_version test completed!")
+        print("Weight update with weight_version test completed!")
 
 
 if __name__ == "__main__":
