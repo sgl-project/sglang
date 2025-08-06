@@ -57,11 +57,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # MHA-specific dimensions
         self.max_context_len = model_runner.model_config.context_len
-        self.sliding_window_size = (
-            model_runner.sliding_window_size
-            if model_runner.sliding_window_size is not None
-            else -1  # -1 indicates full attention
-        )
         self.hidden_size = config.hidden_size
 
         # Runtime parameters
@@ -220,7 +215,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
-        # print(f"decode by trtllm_mha")
         cache_loc = forward_batch.out_cache_loc
         if save_kv_cache and k is not None:
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -263,7 +257,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             max_seq_len=self.forward_metadata.max_seq_len_k,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
-            window_left=self.sliding_window_size,
+            window_left=layer.sliding_window_size,
             # TODO: add attention_sink operation or nvfp4 scale factor if needed
             sinks=attention_sink,
         )
@@ -323,7 +317,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             batch_size=forward_batch.batch_size,
             cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
             cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
-            window_left=self.sliding_window_size,
+            window_left=layer.sliding_window_size,
             # TODO: add attention_sink operation or nvfp4 scale factor if needed
             sinks=attention_sink,
         )

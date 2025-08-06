@@ -441,7 +441,11 @@ class ServerArgs:
                     "trtllm_mla backend does not support speculative decoding yet."
                 )
 
-        if self.attention_backend == "trtllm_mha":
+        if (
+            self.attention_backend == "trtllm_mha"
+            or self.decode_attention_backend == "trtllm_mha"
+            or self.prefill_attention_backend == "trtllm_mha"
+        ):
             if not is_sm100_supported():
                 raise ValueError(
                     "TRTLLM MHA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
@@ -459,13 +463,12 @@ class ServerArgs:
                 )
         model_arch = self.get_hf_config().architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
-            # self.prefill_attention_backend = "triton"
-            # self.decode_attention_backend = "trtllm_mha"
-            self.prefill_attention_backend = "trtllm_mha"
-            self.decode_attention_backend = "triton"
-            # if self.attention_backend is None:
-            #     self.attention_backend = "triton"
-            # assert self.attention_backend == "trtllm_mha" or self.attention_backend == "triton"
+            if self.attention_backend is None:
+                self.attention_backend = "triton"
+            assert (
+                self.attention_backend == "trtllm_mha"
+                or self.attention_backend == "triton"
+            )
             self.enable_triton_kernel_moe = True
 
         # Set page size
