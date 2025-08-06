@@ -6,7 +6,7 @@ from sgl_kernel import scaled_fp4_quant
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 
 if torch.cuda.get_device_capability() < (10, 0):
     pytest.skip(
@@ -159,11 +159,12 @@ def test_cutlass_fp4_moe_no_graph(
 
     score = torch.randn((m, e), device="cuda", dtype=dtype)
 
-    topk_weights, topk_ids, _ = select_experts(
+    topk_output = select_experts(
         hidden_states=a,
         router_logits=score,
-        top_k=topk,
+        topk_config=TopKConfig(top_k=topk),
     )
+    topk_weights, topk_ids, _ = topk_output
 
     a1_gs = torch.ones((e,), device="cuda", dtype=torch.float32)
     a2_gs = torch.ones((e,), device="cuda", dtype=torch.float32)

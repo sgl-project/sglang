@@ -6,7 +6,7 @@ import torch
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_fp8,
@@ -501,8 +501,7 @@ class TestW8A8BlockFP8FusedMoE(CustomTestCase):
             topk_output = select_experts(
                 hidden_states=a,
                 router_logits=score,
-                top_k=topk,
-                renormalize=False,
+                topk_config=TopKConfig(top_k=topk, renormalize=False),
             )
             out = fused_moe(
                 a,

@@ -6,7 +6,7 @@ from tqdm import tqdm
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.utils import is_hip
@@ -136,7 +136,7 @@ class TestFusedMOE(CustomTestCase):
             topk_output = select_experts(
                 hidden_states=a,
                 router_logits=score,
-                top_k=topk,
+                topk_config=TopKConfig(top_k=topk),
             )
 
             sglang_output = fused_moe(
@@ -174,7 +174,7 @@ class TestFusedMOE(CustomTestCase):
             topk_output = select_experts(
                 hidden_states=a,
                 router_logits=score,
-                top_k=topk,
+                topk_config=TopKConfig(top_k=topk),
             )
 
             triton_output = fused_moe(a, w1, w2, topk_output)

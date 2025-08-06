@@ -84,10 +84,10 @@ if _is_npu:
 @dataclass
 class TopKConfig:
     top_k: int
-    use_grouped_topk: bool
-    topk_group: Optional[int]
-    num_expert_group: Optional[int]
-    renormalize: bool
+    use_grouped_topk: bool = False
+    topk_group: int = 0
+    num_expert_group: int = 0
+    renormalize: bool = True
     num_fused_shared_experts: int = 0
     custom_routing_function: Optional[Callable] = None
     correction_bias: Optional[torch.Tensor] = None
@@ -179,8 +179,8 @@ class TopK(CustomOp):
         top_k: int,
         *,
         use_grouped_topk: bool = False,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
+        topk_group: int = 0,
+        num_expert_group: int = 0,
         renormalize: bool = True,
         num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
