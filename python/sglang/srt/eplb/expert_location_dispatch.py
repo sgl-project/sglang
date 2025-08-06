@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 import numpy as np
-import nvtx
 import torch
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
@@ -173,7 +172,6 @@ def _topk_ids_logical_to_physical_probability(
     Returns:
         Physical expert IDs with same shape as topk_ids
     """
-    # nvtx.push_range("topk_ids_logical_to_physical_probability", color="green")
     topk_ids_original_shape = topk_ids.shape
     device = topk_ids.device
     topk_ids = topk_ids.flatten()
@@ -213,6 +211,5 @@ def _topk_ids_logical_to_physical_probability(
     topk_ids = log2phy_map[topk_ids, chosen_dispatch_index]
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
-    # nvtx.pop_range()
     topk_ids = torch.ones_like(topk_ids, device=device)
     return topk_ids
