@@ -1,5 +1,4 @@
 import pyarrow.parquet as pq
-import pandas as pd
 import sys
 
 def convert_parquet_to_json(input_file,output_file):
