@@ -424,12 +424,3 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-b200 --auto-partition-id 0 --auto-partition-size 1
-
-      # for debug
-      - if: ${{ failure() }}
-        uses: mxschmitt/action-tmate@v3
-        with:
-          detached: true
-      - if: ${{ failure() }}
-        name: Sleep forever
-        run: sleep 1000000
