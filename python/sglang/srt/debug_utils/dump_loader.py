@@ -1,11 +1,10 @@
-import torch
 import functools
 import os
-from typing import Dict, Any
+from pathlib import Path
+from typing import Any, Dict
 
 import polars as pl
-
-from pathlib import Path
+import torch
 
 
 class DumpLoader:
@@ -29,12 +28,16 @@ class DumpLoader:
         forward_pass_id = dumper._forward_pass_id
         conditions = dict(name=name, forward_pass_id=forward_pass_id, **kwargs)
         row = find_row(self._df, conditions=conditions)
-        assert row is not None, f"DumpLoader cannot find row given query {name=} {kwargs=} {self._directory=}"
+        assert (
+            row is not None
+        ), f"DumpLoader cannot find row given query {name=} {kwargs=} {self._directory=}"
 
         path = self._directory / row["filename"]
         output = torch.load(path, weights_only=False)
 
-        print(f"[DumpLoader] load from {path=} (query: {name=} {kwargs=}, output: {type(output)})")
+        print(
+            f"[DumpLoader] load from {path=} (query: {name=} {kwargs=}, output: {type(output)})"
+        )
         return output
 
 
@@ -65,10 +68,15 @@ def read_meta(directory):
 
 
 def find_row(df, conditions: Dict[str, Any]):
-    df_sub = df.filter(functools.reduce(
-        lambda a, b: a & b,
-        [pl.col(col) == _cast_to_polars_dtype(conditions[col], df.schema[col]) for col in conditions.keys()],
-    ))
+    df_sub = df.filter(
+        functools.reduce(
+            lambda a, b: a & b,
+            [
+                pl.col(col) == _cast_to_polars_dtype(conditions[col], df.schema[col])
+                for col in conditions.keys()
+            ],
+        )
+    )
     assert len(df_sub) <= 1
     return df_sub.to_dicts()[0] if len(df_sub) > 0 else None
 

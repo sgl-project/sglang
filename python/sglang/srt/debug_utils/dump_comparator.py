@@ -5,7 +5,7 @@ from pathlib import Path
 import polars as pl
 import torch
 
-from sglang.srt.debug_utils.dump_loader import read_meta, find_row
+from sglang.srt.debug_utils.dump_loader import find_row, read_meta
 from sglang.srt.debug_utils.dumper import get_truncated_value
 
 
@@ -31,13 +31,15 @@ def main(args):
         row_baseline = find_row(
             df_baseline,
             conditions=dict(
-                forward_pass_id=row["forward_pass_id"] - args.start_id + args.baseline_start_id,
+                forward_pass_id=row["forward_pass_id"]
+                - args.start_id
+                + args.baseline_start_id,
                 **{
                     k: v
                     for k, v in row.items()
                     if k not in ["forward_pass_id", "dump_index", "filename"]
                 },
-            )
+            ),
         )
 
         if row_baseline is None:
@@ -49,7 +51,9 @@ def main(args):
 
         path_baseline = Path(args.baseline_path) / row_baseline["filename"]
         print(f"Check: target={str(path_target)} baseline={str(path_baseline)}")
-        check_tensor_pair(path_baseline=path_baseline, path_target=path_target, name=row["name"])
+        check_tensor_pair(
+            path_baseline=path_baseline, path_target=path_target, name=row["name"]
+        )
         print()
 
 
@@ -87,7 +91,9 @@ def check_tensor_pair(path_baseline, path_target, name=""):
     ):
         value_baseline = fn(x_baseline).item()
         value_target = fn(x_target).item()
-        print(f"[{name}] {value_baseline :.4f} vs {value_target:.4f} (diff: {value_target - value_baseline:.4f})")
+        print(
+            f"[{name}] {value_baseline :.4f} vs {value_target:.4f} (diff: {value_target - value_baseline:.4f})"
+        )
 
     if x_baseline.shape != x_target.shape:
         print(f"⚠️ Shape mismatch")
@@ -120,7 +126,9 @@ def check_tensor_pair(path_baseline, path_target, name=""):
 def _try_unify_shape(x: torch.Tensor, target_shape):
     x_shape = x.shape
     num_dim_to_remove = len(x_shape) - len(target_shape)
-    if (x_shape[num_dim_to_remove:] == target_shape) and all(val == 1 for val in x_shape[:num_dim_to_remove]):
+    if (x_shape[num_dim_to_remove:] == target_shape) and all(
+        val == 1 for val in x_shape[:num_dim_to_remove]
+    ):
         out = functools.reduce(lambda a, _: a.squeeze(0), range(num_dim_to_remove), x)
         print(f"Unify shape: {x_shape} -> {out.shape} (to match {target_shape})")
         return out
@@ -144,18 +152,30 @@ def _comparison_preprocessor(x_baseline, x_target, name):
     # if name in ["attn_core_out"]:
     #     import einops
     #     x_baseline = einops.rearrange(x_baseline, '1 num_token num_head head_dim -> num_token (num_head head_dim)')
-    if name in ["attn_q_raw", "attn_k_raw", "attn_v_raw", "attn_q_rotated", "attn_k_rotated"]:
+    if name in [
+        "attn_q_raw",
+        "attn_k_raw",
+        "attn_v_raw",
+        "attn_q_rotated",
+        "attn_k_rotated",
+    ]:
         import einops
+
         # print("HACK: only use first 1/4 heads")
         # _, num_head, _, _ = x_baseline.shape
         # x_baseline = x_baseline[:, :num_head//4, :, :]
-        x_baseline = einops.rearrange(x_baseline, '1 num_head num_token head_dim -> num_token (num_head head_dim)')
+        x_baseline = einops.rearrange(
+            x_baseline, "1 num_head num_token head_dim -> num_token (num_head head_dim)"
+        )
     if name in ["attn_core_output"]:
         import einops
+
         # print("HACK: only use first 1/4 heads")
         # _, _, num_head, _ = x_baseline.shape
         # x_baseline = x_baseline[:, :, :num_head//4, :]
-        x_baseline = einops.rearrange(x_baseline, '1 num_token num_head head_dim -> num_token (num_head head_dim)')
+        x_baseline = einops.rearrange(
+            x_baseline, "1 num_token num_head head_dim -> num_token (num_head head_dim)"
+        )
 
     # can insert arbitrary adhoc postprocessing logic here
     return x_baseline, x_target
