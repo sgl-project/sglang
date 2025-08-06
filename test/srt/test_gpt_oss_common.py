@@ -19,7 +19,8 @@ class BaseTestGptOss(CustomTestCase):
         self,
         model_variant: Literal["20b", "120b"],
         quantization: Literal["mxfp4", "bf16"],
-        **kwargs,
+        expected_score_of_reasoning_effort: Dict[str, float],
+        other_args: List[str] = [],
     ):
         model = {
             ("20b", "bf16"): "lmsys/gpt-oss-20b-bf16",
@@ -27,7 +28,15 @@ class BaseTestGptOss(CustomTestCase):
             ("20b", "mxfp4"): "openai/gpt-oss-20b",
             ("120b", "mxfp4"): "openai/gpt-oss-120b",
         }[(model_variant, quantization)]
-        self._run_test_raw(model=model, **kwargs)
+
+        if model_variant == "20b":
+            other_args += ["--cuda-graph-max-bs", "600"]
+
+        self._run_test_raw(
+            model=model,
+            expected_score_of_reasoning_effort=expected_score_of_reasoning_effort,
+            other_args=other_args,
+        )
 
     def _run_test_raw(
         self,
