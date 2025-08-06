@@ -6,9 +6,9 @@ from packaging import version as pkg_version
 
 from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend, MoeGroupedGemmBackend
 
-MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
-MOE_GROUPED_GEMM_BACKEND: Optional[MoeGroupedGemmBackend] = None
-DEEPEP_MODE: Optional[DeepEPMode] = None
+MOE_A2A_BACKEND: MoeA2ABackend = MoeA2ABackend(None)
+MOE_GROUPED_GEMM_BACKEND: MoeGroupedGemmBackend = MoeGroupedGemmBackend("triton")
+DEEPEP_MODE: DeepEPMode = DeepEPMode("auto")
 
 
 def initialize_moe_runner(
@@ -26,19 +26,14 @@ def initialize_moe_runner(
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
-    assert MOE_A2A_BACKEND is not None, "MOE_A2A_BACKEND is not initialized"
     return MOE_A2A_BACKEND
 
 
 def get_moe_grouped_gemm_backend() -> MoeGroupedGemmBackend:
-    assert (
-        MOE_GROUPED_GEMM_BACKEND is not None
-    ), "MOE_GROUPED_GEMM_BACKEND is not initialized"
     return MOE_GROUPED_GEMM_BACKEND
 
 
 def get_deepep_mode() -> DeepEPMode:
-    assert DEEPEP_MODE is not None, "DEEPEP_MODE is not initialized"
     return DEEPEP_MODE
 
 
