@@ -235,7 +235,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.num_experts = num_experts
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8
-
         mxfp4_block = 32
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
@@ -249,6 +248,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             intermediate_size_per_partition_after_pad = round_up(intermediate_size, 64)
 
         self.intermediate_size = intermediate_size_per_partition_after_pad
+
         self.hidden_size = hidden_size
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(

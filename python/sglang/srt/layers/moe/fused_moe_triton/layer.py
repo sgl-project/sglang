@@ -410,10 +410,6 @@ class FusedMoE(torch.nn.Module):
             if not is_bias and not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
-                # if shard_size * tp_rank + shard_size > loaded_weight.shape[shard_dim]:
-                #     raise ValueError(
-                #         f"Shard size {shard_size} at rank {tp_rank} exceeds loaded_weight dimension {loaded_weight.shape[shard_dim]}"
-                #     )
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )
@@ -723,7 +719,6 @@ class FusedMoE(torch.nn.Module):
         tp_rank = self.moe_tp_rank
 
         if self.quant_config is not None and self.quant_config.get_name() == "mxfp4":
-            # print(f"weight_name: {weight_name}, shard_id: {shard_id}, loaded_weight.shape: {loaded_weight.shape}, param.data.shape: {param.data.shape}")
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
                 param.data[:, :dim1].copy_(loaded_weight)
