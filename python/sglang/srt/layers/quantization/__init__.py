@@ -47,7 +47,7 @@ from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
-from sglang.srt.utils import mxfp_supported
+from sglang.srt.utils import is_cuda, is_hip, mxfp_supported
 
 is_mxfp_supported = mxfp_supported()
 if is_mxfp_supported:
@@ -66,6 +66,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
 )
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
 from sglang.srt.layers.quantization.utils import get_linear_quant_method
@@ -90,7 +91,16 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
 }
-if is_mxfp_supported:
+
+
+if is_cuda():
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "quark": Mxfp4Config,
+            "mxfp4": Mxfp4Config,
+        }
+    )
+elif is_mxfp_supported and is_hip():
     BASE_QUANTIZATION_METHODS.update(
         {
             "quark": MxFp4Config,
