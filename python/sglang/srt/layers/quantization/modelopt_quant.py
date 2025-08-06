@@ -35,6 +35,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import is_cuda, next_power_of_2
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.topk import TopKOutput
 
 if is_cuda():
@@ -1145,7 +1146,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def apply(
         self,
-        layer: torch.nn.Module,
+        layer: FusedMoE,
         x: torch.Tensor,
         topk_output: TopKOutput,
         *,
@@ -1154,10 +1155,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
-        ep_rank: Optional[int] = None,
-        ep_size: Optional[int] = None,
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
     ) -> torch.Tensor:
         assert activation == "silu", "Only SiLU activation is supported."
 
@@ -1190,10 +1187,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     layer.w2_blockscale_swizzled.view(torch.int32),
                     layer.g2_alphas,
                 ],
-                ep_size=ep_size,
-                ep_rank=ep_rank,
-                tp_size=tp_size,
-                tp_rank=tp_rank,
+                ep_size=layer.ep_size,
+                ep_rank=layer.ep_rank,
+                tp_size=layer.tp_size,
+                tp_rank=layer.tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
             )[0]
             if routed_scaling_factor is not None:

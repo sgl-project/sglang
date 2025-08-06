@@ -786,17 +786,6 @@ class FusedMoE(torch.nn.Module):
                 activation=self.activation,
                 apply_router_weight_on_input=self.apply_router_weight_on_input,
                 routed_scaling_factor=self.routed_scaling_factor,
-                **(
-                    dict(
-                        tp_rank=self.moe_tp_rank,
-                        tp_size=self.moe_tp_size,
-                        ep_rank=self.moe_ep_rank,
-                        ep_size=self.moe_ep_size,
-                    )
-                    if self.quant_method.__class__.__name__
-                    == "ModelOptNvFp4FusedMoEMethod"
-                    else {}
-                ),
                 **kwargs,
             )
             sm.tag(final_hidden_states)
