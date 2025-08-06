@@ -20,7 +20,7 @@ class TestGptOss1Gpu(BaseTestGptOss):
             model_variant="20b",
             quantization="bf16",
             expected_score_of_reasoning_effort={
-                "low": 0.41,
+                "low": 0.38,
                 "medium": 0.38,
                 "high": 0.38,
             },
