@@ -272,6 +272,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     activation=activation,
                     activation_alpha=activation_alpha,
                     swiglu_limit=swiglu_limit,
+                    w1_pcg=None,
+                    w2_pcg=None,
                 )
             else:
                 return self.triton_kernel_moe_forward(
