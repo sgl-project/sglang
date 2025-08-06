@@ -17,7 +17,7 @@ if [ "$MODE_BLACKWELL" != "1" ]; then
 fi
 
 # Clean up existing installations
-pip uninstall -y flashinfer flashinfer_python sgl-kernel sglang vllm || true
+pip uninstall -y flashinfer flashinfer_python sgl-kernel sglang vllm --break-system-packages || true
 pip cache purge || true
 rm -rf /root/.cache/flashinfer
 rm -rf /usr/local/lib/python3.10/dist-packages/flashinfer*
