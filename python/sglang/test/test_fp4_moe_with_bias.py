@@ -21,7 +21,6 @@ kE2M1ToFloat = torch.tensor(
 FLOAT8_E4M3_MAX = 448.0
 FLOAT4_E2M1_MAX = 6.0
 
-
 def convert_swizzled_to_linear(a_sf_swizzled: torch.Tensor, m, k, block_size):
     m_tiles = (m + 128 - 1) // 128
     f = block_size * 4
@@ -121,6 +120,7 @@ def test_cutlass_fp4_moe_with_bias_no_graph(
     torch.manual_seed(7)
     a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
     w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
+    # Create properly aligned bias tensors
     b1 = torch.randn((e, 2 * n), device="cuda", dtype=dtype) / 10
     quant_blocksize = 16
     round_up = lambda x, y: (x + y - 1) // y * y
@@ -131,6 +131,7 @@ def test_cutlass_fp4_moe_with_bias_no_graph(
     )
 
     w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
+    # Create properly aligned bias tensors
     b2 = torch.randn((e, k), device="cuda", dtype=dtype) / 10
     sf_w2_k = round_up(k, 128)
     sf_w2_n = round_up(n // quant_blocksize, 4)
@@ -250,4 +251,5 @@ def test_cutlass_fp4_moe_with_bias_no_graph(
 
 
 if __name__ == "__main__":
+    # m, n, k, e, topk, dtype
     test_cutlass_fp4_moe_with_bias_no_graph(224, 384, 1024, 256, 8, torch.bfloat16)
