@@ -7,15 +7,14 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use reqwest::Client;
 use std::fmt::Debug;
 
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 
+pub mod bootstrap_injector;
 pub mod factory;
 pub mod pd_router;
 pub mod pd_types;
-pub mod request_adapter;
 pub mod router;
 
 pub use factory::RouterFactory;
@@ -46,32 +45,27 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     fn as_any(&self) -> &dyn std::any::Any;
 
     /// Route a health check request
-    async fn health(&self, client: &Client, req: Request<Body>) -> Response;
+    async fn health(&self, req: Request<Body>) -> Response;
 
     /// Route a health generate request
-    async fn health_generate(&self, client: &Client, req: Request<Body>) -> Response;
+    async fn health_generate(&self, req: Request<Body>) -> Response;
 
     /// Get server information
-    async fn get_server_info(&self, client: &Client, req: Request<Body>) -> Response;
+    async fn get_server_info(&self, req: Request<Body>) -> Response;
 
     /// Get available models
-    async fn get_models(&self, client: &Client, req: Request<Body>) -> Response;
+    async fn get_models(&self, req: Request<Body>) -> Response;
 
     /// Get model information
-    async fn get_model_info(&self, client: &Client, req: Request<Body>) -> Response;
+    async fn get_model_info(&self, req: Request<Body>) -> Response;
 
     /// Route a generate request
-    async fn route_generate(
-        &self,
-        client: &Client,
-        headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
-    ) -> Response;
+    async fn route_generate(&self, headers: Option<&HeaderMap>, body: &GenerateRequest)
+        -> Response;
 
     /// Route a chat completion request
     async fn route_chat(
         &self,
-        client: &Client,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
     ) -> Response;
@@ -79,16 +73,15 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     /// Route a completion request
     async fn route_completion(
         &self,
-        client: &Client,
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
     ) -> Response;
 
     /// Flush cache on all workers
-    async fn flush_cache(&self, client: &Client) -> Response;
+    async fn flush_cache(&self) -> Response;
 
     /// Get worker loads (for monitoring)
-    async fn get_worker_loads(&self, client: &Client) -> Response;
+    async fn get_worker_loads(&self) -> Response;
 
     /// Get router type name
     fn router_type(&self) -> &'static str;

@@ -1,41 +1,24 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
-from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
-    gelu_and_mul_triton_kernel,
-    grouped_gemm_triton,
     moe_ep_deepgemm_preprocess,
     post_reorder_triton_kernel,
-    pre_reorder_triton_kernel,
-    pre_reorder_triton_kernel_for_cutlass_moe,
-    run_cutlass_moe_ep_preproess,
-    run_moe_ep_preproess,
     silu_and_mul_masked_post_quant_fwd,
-    silu_and_mul_triton_kernel,
     tma_align_input_scale,
 )
-from sglang.srt.layers.moe.fused_moe_triton.layer import (
-    FlashInferFusedMoE,
-    FusedMoE,
-    should_use_flashinfer_trtllm_moe,
-)
+from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
 from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.utils import DeepEPMode, should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.quantization import deep_gemm_wrapper
-from sglang.srt.layers.quantization.base_config import (
-    QuantizationConfig,
-    QuantizeMethodBase,
-)
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import (
     Fp8Config,
     Fp8MoEMethod,
@@ -44,23 +27,13 @@ from sglang.srt.layers.quantization.fp8 import (
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     sglang_per_token_group_quant_fp8,
-    sglang_per_token_quant_fp8,
 )
-from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import (
-    DeepEPMode,
-    ceil_div,
-    dispose_tensor,
-    get_bool_env_var,
-    is_hip,
-    is_npu,
-)
+from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.ep_moe.token_dispatcher import (
+    from sglang.srt.layers.moe.token_dispatcher import (
         DeepEPLLOutput,
         DeepEPNormalOutput,
         DispatchOutput,
@@ -70,7 +43,6 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
 
 if not (_is_npu or _is_hip):
     from sgl_kernel import silu_and_mul
@@ -119,7 +91,6 @@ class EPMoE(FusedMoE):
             activation=activation,
             # apply_router_weight_on_input=apply_router_weight_on_input,
             routed_scaling_factor=routed_scaling_factor,
-            enable_ep_moe=True,
         )
 
         self.start_expert_id = self.moe_ep_rank * self.num_local_experts
@@ -304,6 +275,8 @@ class EPMoE(FusedMoE):
             m_max * self.start_expert_id,
             BLOCK_SIZE=512,
         )
+        if self.routed_scaling_factor is not None:
+            output *= self.routed_scaling_factor
         return output
 
 
@@ -328,7 +301,7 @@ class DeepEPMoE(EPMoE):
         prefix: str = "",
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
-        deepep_mode: DeepEPMode = DeepEPMode.auto,
+        deepep_mode: DeepEPMode = DeepEPMode.AUTO,
     ):
         super().__init__(
             num_experts=num_experts,
@@ -348,7 +321,6 @@ class DeepEPMoE(EPMoE):
 
         # TODO: move to the beginning of the file
         from sglang.srt.distributed.parallel_state import get_tp_group
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
         from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 
         self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
@@ -701,72 +673,29 @@ class DeepEPMoE(EPMoE):
         return down_output
 
 
-class FlashInferEPMoE(EPMoE):
-    def __init__(self, *args, **kwargs):
-        renormalize = kwargs.pop("renormalize", True)
-        num_fused_shared_experts = kwargs.pop("num_fused_shared_experts", 0)
-        use_grouped_topk = kwargs.pop("use_grouped_topk", False)
-        num_expert_group = kwargs.pop("num_expert_group", None)
-        topk_group = kwargs.pop("topk_group", None)
-        correction_bias = kwargs.pop("correction_bias", None)
-        super().__init__(*args, **kwargs)
-        self.renormalize = renormalize
-        self.num_fused_shared_experts = num_fused_shared_experts
-        self.use_grouped_topk = use_grouped_topk
-        if self.use_grouped_topk:
-            assert num_expert_group is not None and topk_group is not None
-        self.num_expert_group = num_expert_group
-        self.topk_group = topk_group
-        self.correction_bias = correction_bias
-        self.use_flashinfer_trtllm_moe = should_use_flashinfer_trtllm_moe()
-
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        assert self.use_flashinfer_trtllm_moe
-        assert (
-            self.activation == "silu"
-        ), "Only silu is supported for flashinfer blockscale fp8 moe"
-        assert (
-            self.renormalize
-        ), "Renormalize is required for flashinfer blockscale fp8 moe"
-        assert (
-            self.num_fused_shared_experts == 0
-        ), "Fused shared experts are not supported for flashinfer blockscale fp8 moe"
-        a_q, a_sf = sglang_per_token_group_quant_fp8(hidden_states, self.block_shape[1])
-        # NOTE: scales of hidden states have to be transposed!
-        a_sf_t = a_sf.t().contiguous()
-        from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
-
-        return trtllm_fp8_block_scale_moe(
-            routing_logits=router_logits.to(torch.float32),
-            routing_bias=self.correction_bias.to(hidden_states.dtype),
-            hidden_states=a_q,
-            hidden_states_scale=a_sf_t,
-            gemm1_weights=self.w13_weight,
-            gemm1_weights_scale=self.w13_weight_scale_inv,
-            gemm2_weights=self.w2_weight,
-            gemm2_weights_scale=self.w2_weight_scale_inv,
-            num_experts=self.num_experts,
-            top_k=self.top_k,
-            n_group=self.num_expert_group,
-            topk_group=self.topk_group,
-            intermediate_size=self.w2_weight.shape[2],
-            local_expert_offset=self.start_expert_id,
-            local_num_experts=self.num_local_experts,
-            routed_scaling_factor=self.routed_scaling_factor,
-            tile_tokens_dim=get_tile_tokens_dim(
-                hidden_states.shape[0], self.top_k, self.num_experts
-            ),
-            routing_method_type=2,  # DeepSeek-styled routing method
-            use_shuffled_weight=False,
-        )
-
-
 def get_moe_impl_class():
-    if global_server_args_dict["enable_deepep_moe"]:
+    if global_server_args_dict["moe_a2a_backend"].is_deepep():
         return DeepEPMoE
+
+    # NEW: Direct FP4 detection (bypasses EP requirements)
+    # Check for FP4 quantization with TRTLLM flag, regardless of EP
+    if global_server_args_dict.get("enable_flashinfer_trtllm_moe", False):
+        try:
+            # Check the quantization argument directly
+            quantization = global_server_args_dict.get("quantization")
+            if quantization == "modelopt_fp4":
+                from sglang.srt.layers.moe.fused_moe_triton.layer import (
+                    FlashInferFP4MoE,
+                )
+
+                return FlashInferFP4MoE
+        except:
+            pass
+
+    if should_use_flashinfer_trtllm_moe():
+        return FlashInferFusedMoE
     if global_server_args_dict["enable_flashinfer_cutlass_moe"]:
-        # Must come before EPMoE because FusedMoE also supports enable_ep_moe
         return FusedMoE
-    if global_server_args_dict["enable_ep_moe"]:
-        return FlashInferEPMoE if should_use_flashinfer_trtllm_moe() else EPMoE
-    return FlashInferFusedMoE if should_use_flashinfer_trtllm_moe() else FusedMoE
+    if get_moe_expert_parallel_world_size() > 1:
+        return EPMoE
+    return FusedMoE
