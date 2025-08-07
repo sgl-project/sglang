@@ -43,6 +43,14 @@ def fused_moe_forward_native(
     expert_outs = torch.einsum("tao, taio -> tai", (x1 * x3), w2_weights)
     return torch.einsum("tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype))
 
+def moe_gptoss(x, alpha: float = 1.702, limit: float = 7.0):
+    x_glu, x_linear = x[..., ::2], x[..., 1::2]
+    # Clamp the input values
+    x_glu = x_glu.clamp(min=None, max=limit)
+    x_linear = x_linear.clamp(min=-limit, max=limit)
+    out_glu = x_glu * torch.sigmoid(alpha * x_glu)
+    # Note we add an extra bias of 1 to the linear layer
+    return out_glu * (x_linear + 1)
 
 def moe_forward_native(
     layer: torch.nn.Module,
@@ -54,6 +62,8 @@ def moe_forward_native(
     inplace: bool = True,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    activation_alpha: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
 
     if apply_router_weight_on_input:
@@ -88,11 +98,13 @@ def moe_forward_native(
         tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
 
         layer_w13_weight = layer.w13_weight[i]
+        layer_w13_weight_bias = layer.w13_weight_bias[i]
+        layer_w2_weight_bias = layer.w2_weight_bias[i]
         layer_w2_weight = layer.w2_weight[i]
 
-        gate_up = F.linear(tokens_for_this_expert, layer_w13_weight)
-        gate_up = act(gate_up)
-        expert_out = F.linear(gate_up, layer_w2_weight)
+        gate_up = F.linear(tokens_for_this_expert, layer_w13_weight, bias=layer_w13_weight_bias.to(torch.bfloat16))
+        gate_up = moe_gptoss(gate_up, activation_alpha, swiglu_limit)
+        expert_out = F.linear(gate_up, layer_w2_weight, bias=layer_w2_weight_bias.to(torch.bfloat16))
         outputs.append(expert_out)
         start_idx = end_idx
 
