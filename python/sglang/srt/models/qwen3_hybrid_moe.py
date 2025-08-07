@@ -60,7 +60,7 @@ from sglang.srt.layers.attention.mamba.ops.causal_conv1d import (
 
 from fla.ops.gated_delta_rule import (
     chunk_gated_delta_rule, 
-    fused_recurrent_gated_delta_rule,
+    fused_recurrent_gated_delta_rule_update,
 )
 
 logger = logging.getLogger(__name__)
@@ -228,8 +228,6 @@ class Qwen3GatedDeltaNet(nn.Module):
         if cache_params is None:
             raise ValueError("cache_params cannot be None")
 
-        recurrent_state = cache_params.ssm_state[cache_params.state_indices_tensor]
-
         projected_states, _ = self.in_proj(hidden_states)
         query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states,)
         query, key, value = map(lambda x: rearrange(x, 'l p d -> l (p d)'), (query, key, value))
@@ -290,6 +288,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         g, beta = map(lambda x: rearrange(x, 'l  d -> 1 l d'), (g, beta))
         
         if has_prefill:
+            recurrent_state = cache_params.ssm_state[cache_params.state_indices_tensor]
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 q=query,
                 k=key,
@@ -302,24 +301,27 @@ class Qwen3GatedDeltaNet(nn.Module):
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
+
+            if recurrent_state is not None and cache_params is not None:
+                last_recurrent_state = last_recurrent_state.to(torch.bfloat16, copy=False)
+                cache_params.ssm_state[cache_params.state_indices_tensor] = last_recurrent_state
         else:
-            core_attn_out, last_recurrent_state = fused_recurrent_gated_delta_rule(
+            indices = cache_params.state_indices_tensor
+            mask = (indices == -1)
+            indices[mask] = cache_params.ssm_state.shape[0] - 1
+
+            core_attn_out = fused_recurrent_gated_delta_rule_update(
                 q=query,
                 k=key,
                 v=value,
                 g=g,
                 beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=recurrent_state is not None,
+                initial_state_source=cache_params.ssm_state,
+                initial_state_indices=indices,
                 cu_seqlens=forward_batch.extend_start_loc,
                 # head_first=False,
                 use_qk_l2norm_in_kernel=True
             )
-
-        # Init cache
-        if recurrent_state is not None and cache_params is not None:
-            last_recurrent_state = last_recurrent_state.to(torch.bfloat16, copy=False)
-            cache_params.ssm_state[cache_params.state_indices_tensor] = last_recurrent_state
 
         if self.share_norm:
             z_shape_og = z.shape
@@ -720,7 +722,6 @@ class Qwen3HybridMoeModel(nn.Module):
         # proper continuous batching computation including
         # chunked prefill
 
-        # TODO(cao1zhg)
         seq_idx = None
         if forward_batch.forward_mode.is_prefill() > 0:
             seq_idx = torch.zeros_like(input_ids, dtype=torch.int32)
@@ -871,6 +872,7 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         self.mamba_cache = MambaCacheManager(
             self.lm_head.weight.dtype, num_mamba_layers,
             conv_state_shape, temporal_state_shape)
+        logger.info(f"{self.lm_head.weight.dtype=}")
 
     def prepare_extend_start_loc(self, forward_batch: ForwardBatch):
         # extend_start_loc shape is batch_size, while hybrid attention need batch_size + 1
