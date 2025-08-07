@@ -14,6 +14,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -35,10 +37,6 @@ from sglang.srt.utils import (
     is_hip,
     next_power_of_2,
 )
-
-if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
