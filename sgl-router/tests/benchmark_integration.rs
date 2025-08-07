@@ -9,7 +9,6 @@ use sglang_router_rs::openai_api_types::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
     SamplingParams, StringOrArray, UserMessageContent,
 };
-use sglang_router_rs::routers::bootstrap_injector::inject_bootstrap_fields;
 
 /// Create a default GenerateRequest for benchmarks with minimal fields set
 fn default_generate_request() -> GenerateRequest {
@@ -209,63 +208,6 @@ fn test_benchmark_serialization_roundtrip() {
 }
 
 #[test]
-fn test_benchmark_bootstrap_injection() {
-    // Test that bootstrap injection works for benchmark types (replaces PD request adaptation)
-
-    let generate_req = GenerateRequest {
-        text: Some("Test prompt".to_string()),
-        ..default_generate_request()
-    };
-
-    let chat_req = ChatCompletionRequest {
-        model: "test-model".to_string(),
-        messages: vec![ChatMessage::User {
-            role: "user".to_string(),
-            content: UserMessageContent::Text("Test message".to_string()),
-            name: None,
-        }],
-        max_tokens: Some(150),
-        max_completion_tokens: Some(150),
-        temperature: Some(0.7),
-        top_p: Some(1.0),
-        n: Some(1),
-        presence_penalty: Some(0.0),
-        frequency_penalty: Some(0.0),
-        parallel_tool_calls: Some(true),
-        ..default_chat_completion_request()
-    };
-
-    let completion_req = CompletionRequest {
-        model: "test-model".to_string(),
-        prompt: StringOrArray::String("Test prompt".to_string()),
-        max_tokens: Some(50),
-        temperature: Some(0.8),
-        top_p: Some(1.0),
-        n: Some(1),
-        presence_penalty: Some(0.0),
-        frequency_penalty: Some(0.0),
-        best_of: Some(1),
-        ..default_completion_request()
-    };
-
-    let worker = create_test_worker();
-
-    // Test bootstrap injection (should not panic)
-    let mut generate_json = to_value(&generate_req).unwrap();
-    let mut chat_json = to_value(&chat_req).unwrap();
-    let mut completion_json = to_value(&completion_req).unwrap();
-
-    assert!(inject_bootstrap_fields(&mut generate_json, &worker).is_ok());
-    assert!(inject_bootstrap_fields(&mut chat_json, &worker).is_ok());
-    assert!(inject_bootstrap_fields(&mut completion_json, &worker).is_ok());
-
-    // Verify bootstrap fields were added
-    assert!(generate_json.get("bootstrap_host").is_some());
-    assert!(generate_json.get("bootstrap_port").is_some());
-    assert!(generate_json.get("bootstrap_room").is_some());
-}
-
-#[test]
 fn test_benchmark_direct_json_routing() {
     // Test direct JSON routing functionality for benchmark types (replaces regular routing)
 
@@ -282,48 +224,4 @@ fn test_benchmark_direct_json_routing() {
     // Verify conversions work
     assert!(!json_string.is_empty());
     assert!(!bytes.is_empty());
-}
-
-#[test]
-fn test_benchmark_performance_baseline() {
-    // Basic performance sanity check - ensure operations complete quickly
-    use std::time::Instant;
-
-    let generate_req = GenerateRequest {
-        text: Some("Short test prompt".to_string()),
-        ..default_generate_request()
-    };
-
-    // Test the actual simplified pipeline: to_value + bootstrap injection
-    let start = Instant::now();
-    let worker = create_test_worker();
-
-    // This mirrors the actual router pipeline
-    let mut json = to_value(&generate_req).unwrap();
-    let _ = inject_bootstrap_fields(&mut json, &worker);
-
-    let total_duration = start.elapsed();
-    assert!(
-        total_duration.as_millis() < 5,
-        "Simplified pipeline took too long: {:?} (should be faster than old adapter approach)",
-        total_duration
-    );
-
-    // Individual components should also be fast
-    let start = Instant::now();
-    let _json = to_value(&generate_req).unwrap();
-    let to_value_duration = start.elapsed();
-
-    let start = Instant::now();
-    let mut json = to_value(&generate_req).unwrap();
-    let _ = inject_bootstrap_fields(&mut json, &worker);
-    let inject_duration = start.elapsed();
-
-    // Bootstrap injection should be faster than the JSON conversion
-    assert!(
-        inject_duration <= to_value_duration * 3,
-        "Bootstrap injection ({:?}) should not be much slower than JSON conversion ({:?})",
-        inject_duration,
-        to_value_duration
-    );
 }
