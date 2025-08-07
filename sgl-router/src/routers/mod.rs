@@ -11,10 +11,10 @@ use std::fmt::Debug;
 
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 
+pub mod bootstrap_injector;
 pub mod factory;
 pub mod pd_router;
 pub mod pd_types;
-pub mod request_adapter;
 pub mod router;
 
 pub use factory::RouterFactory;
