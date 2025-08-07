@@ -502,6 +502,20 @@ class ServerArgs:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
 
+        if self.attention_backend == "dual_chunk_flash_attn":
+            logger.warning(
+                "Mixed chunk is disabled because of using dual chunk flash attention backend"
+            )
+            logger.warning(
+                "Radix cache is disabled because of using dual chunk flash attention backend"
+            )
+            logger.warning(
+                "Cuda graph is disabled because of using dual chunk flash attention backend"
+            )
+            self.enable_mixed_chunk = False
+            self.disable_cuda_graph = True
+            self.disable_radix_cache = True
+
         # Set page size
         if self.page_size is None:
             self.page_size = 1
@@ -1337,6 +1351,7 @@ class ServerArgs:
                 "triton",
                 "trtllm_mla",
                 "trtllm_mha",
+                "dual_chunk_flash_attn",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
