@@ -148,7 +148,9 @@ class TopK(CustomOp):
         self.custom_routing_function = custom_routing_function
         self.correction_bias = correction_bias
         self.routed_scaling_factor = routed_scaling_factor
-        self.apply_routed_scaling_factor_on_output = apply_routed_scaling_factor_on_output
+        self.apply_routed_scaling_factor_on_output = (
+            apply_routed_scaling_factor_on_output
+        )
 
         self.use_triton_kernels = global_server_args_dict["enable_triton_kernel_moe"]
 
