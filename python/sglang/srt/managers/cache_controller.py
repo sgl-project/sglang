@@ -555,13 +555,20 @@ class HiCacheController:
                 break
             completed_tokens = operation.completed_tokens
             for i in range(len(page_hashes)):
+                if page_data[i] is None:
+                    logger.warning(
+                        f"Prefetch operation {operation.request_id} failed to retrieve page {page_hashes[i]}."
+                    )
+                    break
                 self.mem_pool_host.set_from_flat_data_page(
                     operation.host_indices[completed_tokens],
                     page_data[i],
                 )
                 completed_tokens += self.page_size
-            if not operation.increment(self.page_size * len(page_hashes)):
+            if not operation.increment(completed_tokens - operation.completed_tokens):
                 # operation terminated by controller
+                break
+            if any(p is None for p in page_data):
                 break
         # release pre-allocated memory
         self.mem_pool_host.free(
