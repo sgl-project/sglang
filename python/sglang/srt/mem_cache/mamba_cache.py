@@ -9,6 +9,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PAD_SLOT_ID = -1
 
+import triton
+import triton.language as tl
+
 @dataclass
 class MambaCacheParams:
     conv_state: torch.Tensor = torch.Tensor()
@@ -35,12 +38,11 @@ class MambaCacheManager:
         # Determine max batch size to set size of MambaCache
         max_batch_size = global_server_args_dict["max_running_requests"]
 
-        # TODO(cao1zhg): cuda graph padding
-        conv_state = torch.empty(size=(num_mamba_layers, max_batch_size) +
+        conv_state = torch.empty(size=(num_mamba_layers, max_batch_size + 1) +
                                  conv_state_shape,
                                  dtype=dtype,
                                  device="cuda")
-        temporal_state = torch.empty(size=(num_mamba_layers, max_batch_size) +
+        temporal_state = torch.empty(size=(num_mamba_layers, max_batch_size + 1) +
                                      temporal_state_shape,
                                      dtype=dtype,
                                      device="cuda")

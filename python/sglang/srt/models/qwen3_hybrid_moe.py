@@ -228,9 +228,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         if cache_params is None:
             raise ValueError("cache_params cannot be None")
 
-        state_indices_tensor = cache_params.state_indices_tensor
-        conv_state = cache_params.conv_state[state_indices_tensor].contiguous()
-        recurrent_state = cache_params.ssm_state[state_indices_tensor].contiguous()
+        recurrent_state = cache_params.ssm_state[cache_params.state_indices_tensor]
 
         projected_states, _ = self.in_proj(hidden_states)
         query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states,)
@@ -320,8 +318,8 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         # Init cache
         if recurrent_state is not None and cache_params is not None:
-            # cache_params.recurrent_states[self.layer_id].copy_(last_recurrent_state)
-            cache_params.ssm_state[state_indices_tensor] = last_recurrent_state.bfloat16()
+            last_recurrent_state = last_recurrent_state.to(torch.bfloat16, copy=False)
+            cache_params.ssm_state[cache_params.state_indices_tensor] = last_recurrent_state
 
         if self.share_norm:
             z_shape_og = z.shape
