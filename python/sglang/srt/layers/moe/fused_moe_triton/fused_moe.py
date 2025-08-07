@@ -1568,9 +1568,7 @@ def fused_moe(
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_output: StandardTopKOutput,
-    inplace: bool = False,
-    activation: str = "silu",
-    apply_router_weight_on_input: bool = False,
+    moe_runner_config: MoeRunnerConfig = MoeRunnerConfig(),
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -1583,8 +1581,6 @@ def fused_moe(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
-    no_combine: bool = False,
-    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -1595,8 +1591,7 @@ def fused_moe(
     - w1 (torch.Tensor): The first set of expert weights.
     - w2 (torch.Tensor): The second set of expert weights.
     - topk_output (StandardTopKOutput): The top-k output of the experts.
-    - inplace (bool): If True, perform the operation in-place.
-        Defaults to False.
+    - moe_runner_config (MoeRunnerConfig): The configuration for the MoE runner.
     - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner
         products for w1 and w2. Defaults to False.
     - use_int8_w8a8 (bool): If True, use int8 arithmetic to compute the inner
@@ -1626,9 +1621,7 @@ def fused_moe(
         w1,
         w2,
         topk_output,
-        inplace=inplace,
-        activation=activation,
-        apply_router_weight_on_input=apply_router_weight_on_input,
+        moe_runner_config=moe_runner_config,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
@@ -1641,6 +1634,4 @@ def fused_moe(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
-        no_combine=no_combine,
-        routed_scaling_factor=routed_scaling_factor,
     )

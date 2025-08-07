@@ -11,6 +11,7 @@ import triton
 from ray.experimental.tqdm_ray import tqdm
 from transformers import AutoConfig
 
+from sglang.srt.layers.moe.fused_moe_triton import override_config
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe,
     get_config_dtype_str,
@@ -18,6 +19,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     get_default_config,
     get_moe_configs,
 )
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.utils import is_hip
 
@@ -131,7 +133,9 @@ def benchmark_config(
         topk_output.router_logits.copy_(new_topk_output.router_logits)
 
     def run():
-        from sglang.srt.layers.moe.fused_moe_triton import override_config
+        moe_runner_config = MoeRunnerConfig(
+            inplace=True,
+        )
 
         with override_config(config):
             fused_moe(
@@ -139,7 +143,7 @@ def benchmark_config(
                 w1,
                 w2,
                 topk_output,
-                inplace=True,
+                moe_runner_config=moe_runner_config,
                 use_fp8_w8a8=use_fp8_w8a8,
                 use_int8_w8a8=use_int8_w8a8,
                 use_int8_w8a16=use_int8_w8a16,

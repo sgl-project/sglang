@@ -719,7 +719,7 @@ def select_experts(
     *,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-) -> TopKOutput:
+) -> StandardTopKOutput:
 
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
