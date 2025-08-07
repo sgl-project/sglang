@@ -40,6 +40,34 @@ pub fn get_hostname(url: &str) -> String {
     url.split(':').next().unwrap_or("localhost").to_string()
 }
 
+use serde::Serialize;
+
+// Optimized bootstrap wrapper for single requests
+#[derive(Serialize)]
+pub struct RequestWithBootstrap<'a, T: Serialize> {
+    #[serde(flatten)]
+    pub original: &'a T,
+    pub bootstrap_host: String,
+    pub bootstrap_port: Option<u16>,
+    pub bootstrap_room: u64,
+}
+
+// Optimized bootstrap wrapper for batch requests
+#[derive(Serialize)]
+pub struct BatchRequestWithBootstrap<'a, T: Serialize> {
+    #[serde(flatten)]
+    pub original: &'a T,
+    pub bootstrap_host: Vec<String>,
+    pub bootstrap_port: Vec<Option<u16>>,
+    pub bootstrap_room: Vec<u64>,
+}
+
+// Helper to generate bootstrap room ID
+pub fn generate_room_id() -> u64 {
+    // Generate a value in the range [0, 2^63 - 1] to match Python's random.randint(0, 2**63 - 1)
+    rand::random::<u64>() & (i64::MAX as u64)
+}
+
 // PD-specific routing policies
 #[derive(Debug, Clone, PartialEq)]
 pub enum PDSelectionPolicy {

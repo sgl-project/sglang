@@ -1082,6 +1082,8 @@ class LoadLoRAAdapterReqInput:
     lora_name: str
     # The path of loading.
     lora_path: str
+    # Whether to pin the LoRA adapter in memory.
+    pinned: bool = False
     # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
     lora_id: Optional[str] = None
 
@@ -1090,6 +1092,7 @@ class LoadLoRAAdapterReqInput:
             lora_id=self.lora_id,
             lora_name=self.lora_name,
             lora_path=self.lora_path,
+            pinned=self.pinned,
         )
 
 
