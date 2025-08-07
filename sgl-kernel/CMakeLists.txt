@@ -50,15 +50,6 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-cutlass)
 
-# DeepGEMM
-# if("${CUDA_VERSION}" VERSION_EQUAL "12.8")
-#   set(DeepGEMM_REPO "https://github.com/sgl-project/DeepGEMM")
-#   set(DeepGEMM_TAG "blackwell")
-# else()
-#   set(DeepGEMM_REPO "https://github.com/deepseek-ai/DeepGEMM")
-#   set(DeepGEMM_TAG "391755ada0ffefa9a6a52b6f14dcaf22d1a463e0")
-# endif()
-
 FetchContent_Declare(
     repo-fmt
     GIT_REPOSITORY https://github.com/fmtlib/fmt
