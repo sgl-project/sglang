@@ -445,7 +445,11 @@ class ServerArgs:
                     "trtllm_mla backend does not support speculative decoding yet."
                 )
 
-        if self.attention_backend == "trtllm_mha":
+        if (
+            self.attention_backend == "trtllm_mha"
+            or self.decode_attention_backend == "trtllm_mha"
+            or self.prefill_attention_backend == "trtllm_mha"
+        ):
             if not is_sm100_supported():
                 raise ValueError(
                     "TRTLLM MHA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
@@ -459,11 +463,18 @@ class ServerArgs:
 
             if self.speculative_algorithm is not None:
                 raise ValueError(
-                    "trtllm_mla backend does not support speculative decoding yet."
+                    "trtllm_mha backend does not support speculative decoding yet."
                 )
+
         model_arch = self.get_hf_config().architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
-            self.attention_backend = "triton"
+            if self.attention_backend is None:
+                # default is triton, but we could have trtllm_mha as an option
+                self.attention_backend = "triton"
+            assert (
+                self.attention_backend == "trtllm_mha"
+                or self.attention_backend == "triton"
+            )
 
             # Check if FlashInfer MXFP4 MoE is enabled
             from sglang.srt.utils import get_bool_env_var
@@ -490,6 +501,20 @@ class ServerArgs:
             ):
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
+
+        if self.attention_backend == "dual_chunk_flash_attn":
+            logger.warning(
+                "Mixed chunk is disabled because of using dual chunk flash attention backend"
+            )
+            logger.warning(
+                "Radix cache is disabled because of using dual chunk flash attention backend"
+            )
+            logger.warning(
+                "Cuda graph is disabled because of using dual chunk flash attention backend"
+            )
+            self.enable_mixed_chunk = False
+            self.disable_cuda_graph = True
+            self.disable_radix_cache = True
 
         # Set page size
         if self.page_size is None:
@@ -1326,6 +1351,7 @@ class ServerArgs:
                 "triton",
                 "trtllm_mla",
                 "trtllm_mha",
+                "dual_chunk_flash_attn",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
@@ -2056,21 +2082,23 @@ class ServerArgs:
 
         if self.enable_lora:
             # Normalize lora_paths to a dictionary if it is a list.
+            # TODO (lifuhuang): support specifying pinned adapters in server_args.
             if isinstance(self.lora_paths, list):
                 lora_paths = self.lora_paths
                 self.lora_paths = {}
                 for lora_path in lora_paths:
                     if "=" in lora_path:
                         name, path = lora_path.split("=", 1)
-                        self.lora_paths[name] = LoRARef(lora_name=name, lora_path=path)
+                        self.lora_paths[name] = LoRARef(
+                            lora_name=name, lora_path=path, pinned=False
+                        )
                     else:
                         self.lora_paths[lora_path] = LoRARef(
-                            lora_name=lora_path,
-                            lora_path=lora_path,
+                            lora_name=lora_path, lora_path=lora_path, pinned=False
                         )
             elif isinstance(self.lora_paths, dict):
                 self.lora_paths = {
-                    k: LoRARef(lora_name=k, lora_path=v)
+                    k: LoRARef(lora_name=k, lora_path=v, pinned=False)
                     for k, v in self.lora_paths.items()
                 }
             elif self.lora_paths is None:
