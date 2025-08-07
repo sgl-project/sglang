@@ -16,6 +16,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     direct_register_custom_op,
@@ -28,6 +29,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 
+_is_sm100_supported = is_cuda() and is_sm100_supported()
 has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
 
 
@@ -244,13 +246,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
-        if self.use_flashinfer:
-            intermediate_size_per_partition_after_pad = round_up(intermediate_size, 256)
-            hidden_size = round_up(hidden_size, 256)
-        elif is_hip():
-            intermediate_size_per_partition_after_pad = round_up(intermediate_size, 128)
-        else:
-            intermediate_size_per_partition_after_pad = round_up(intermediate_size, 64)
+        intermediate_size_per_partition_after_pad = intermediate_size
+        if _is_sm100_supported:
+            if self.use_flashinfer:
+                intermediate_size_per_partition_after_pad = round_up(
+                    intermediate_size, 256
+                )
+                hidden_size = round_up(hidden_size, 256)
+            else:
+                intermediate_size_per_partition_after_pad = round_up(
+                    intermediate_size, 64
+                )
 
         self.intermediate_size = intermediate_size_per_partition_after_pad
 
