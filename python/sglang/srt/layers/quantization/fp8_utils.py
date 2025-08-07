@@ -222,7 +222,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 ) -> torch.Tensor:
     assert input_scale is None
 
-    output_dtype = x[2] if isinstance(x, tuple) else x.dtype
+    output_dtype = input[2] if isinstance(input, tuple) else input.dtype
     dtype_supported = output_dtype == torch.bfloat16
 
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
