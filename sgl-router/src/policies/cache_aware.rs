@@ -230,6 +230,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         "cache_aware"
     }
 
+    fn needs_request_text(&self) -> bool {
+        true // Cache-aware policy needs request text for cache affinity
+    }
+
     fn on_request_complete(&self, worker_url: &str, success: bool) {
         // Could track success rates per worker for more intelligent routing
         if !success {
