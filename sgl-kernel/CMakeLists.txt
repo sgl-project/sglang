@@ -74,7 +74,7 @@ FetchContent_Populate(repo-deepgemm)
 FetchContent_Declare(
     repo-triton
     GIT_REPOSITORY "https://github.com/triton-lang/triton"
-    GIT_TAG        8f9f695ea8fde23a0c7c88e4ab256634ca27789f
+    GIT_TAG        663e04e8e3ebed7ee3230a1a7320142689795106
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-triton)
