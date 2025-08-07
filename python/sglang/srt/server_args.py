@@ -463,8 +463,9 @@ class ServerArgs:
 
             if self.speculative_algorithm is not None:
                 raise ValueError(
-                    "trtllm_mla backend does not support speculative decoding yet."
+                    "trtllm_mha backend does not support speculative decoding yet."
                 )
+
         model_arch = self.get_hf_config().architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
             if self.attention_backend is None:

@@ -1460,7 +1460,7 @@ class ModelRunner:
 
             return TRTLLMHAAttnBackend(self)
 
-        elif self.server_args.attention_backend == "intel_amx":
+        elif backend_str == "intel_amx":
             from sglang.srt.layers.attention.intel_amx_backend import (
                 IntelAMXAttnBackend,
             )
