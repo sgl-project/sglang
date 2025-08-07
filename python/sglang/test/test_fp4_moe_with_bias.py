@@ -3,7 +3,7 @@ import pytest
 import torch
 from sgl_kernel import scaled_fp4_quant
 
-from sglang.srt.layers.activation import SiluAndMul
+from triton_kernels.swiglu import swiglu, PrecisionConfig
 from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4_with_bias
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.topk import select_experts
@@ -90,12 +90,12 @@ MNK_FACTORS = [
 
 
 # Reference implementation of torch_moe
-def torch_moe(a, w1, w2, b1, b2, score, topk, expert_map):
+def torch_moe(a, w1, w2, b1, b2, score, topk, expert_map, activation_alpha, swiglu_limit):
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
     out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
-    score = torch.softmax(score, dim=-1, dtype=torch.float32)
     topk_weight, topk_ids = torch.topk(score, topk)
+    topk_weight = torch.softmax(topk_weight, dim=-1, dtype=torch.float32)
     topk_weight = topk_weight.view(-1)
     topk_ids = topk_ids.view(-1)
     if expert_map is not None:
@@ -103,7 +103,7 @@ def torch_moe(a, w1, w2, b1, b2, score, topk, expert_map):
     for i in range(w1.shape[0]):
         mask = topk_ids == i
         if mask.sum():
-            out[mask] = SiluAndMul()(a[mask] @ w1[i].transpose(0, 1) + b1[i])@ w2[i].transpose(0, 1) + b2[i]
+            out[mask] = swiglu(a[mask] @ w1[i].transpose(0, 1) + b1[i], activation_alpha, PrecisionConfig(limit=swiglu_limit)) @ w2[i].transpose(0, 1) + b2[i]
     return (
         out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
     ).sum(dim=1)
@@ -159,12 +159,11 @@ def test_cutlass_fp4_moe_with_bias_no_graph(
 
     score = torch.randn((m, e), device="cuda", dtype=dtype)
 
-    topk_weights, topk_ids = select_experts(
+    topk_weights, topk_ids, _ = select_experts(
         hidden_states=a,
         router_logits=score,
         top_k=topk,
-        use_grouped_topk=False,
-        renormalize=False,
+        renormalize=True,
     )
 
     a1_gs = torch.ones((e,), device="cuda", dtype=torch.float32)
@@ -203,6 +202,9 @@ def test_cutlass_fp4_moe_with_bias_no_graph(
         topk_ids=topk_ids,
         params=params,
         apply_router_weight_on_input=False,
+        activation_type="swiglu",
+        activation_alpha=1.702,
+        swiglu_limit=7,
     )
 
     # Reference check:
@@ -241,7 +243,7 @@ def test_cutlass_fp4_moe_with_bias_no_graph(
             block_size=quant_blocksize,
         )
 
-    torch_output = torch_moe(a_in_dtype, w1_d, w2_d, score, topk, None)
+    torch_output = torch_moe(a_in_dtype, w1_d, w2_d, b1, b2, score, topk, None, 1.702, 7)
 
     torch.testing.assert_close(torch_output, cutlass_output, atol=1e-1, rtol=1e-1)
     print("test_cutlass_fp4_moe_with_bias_no_graph passed")

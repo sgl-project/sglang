@@ -402,6 +402,8 @@ def cutlass_moe_fp4_with_bias(
     params: CutlassMoEParams,
     apply_router_weight_on_input: bool = False,
     activation_type: str = "silu",
+    activation_alpha: Optional[float] = None,
+    swiglu_limit: Optional[int] = None,
 ):
     """
     MoE implementation for FP4 Inputs
@@ -501,9 +503,9 @@ def cutlass_moe_fp4_with_bias(
         num_topk,
         expert_map=a_map,
     )
-    print(params.to_gemm1_args().keys())
-    print(params.to_gemm1_args()["c_strides"])
-    print(params.to_gemm1_args()["problem_sizes"])
+    # print(params.to_gemm1_args().keys())
+    # print(params.to_gemm1_args()["c_strides"])
+    # print(params.to_gemm1_args()["problem_sizes"])
     gemm1_args = params.to_gemm1_args()
     gemm1_args["bias_strides"] = torch.zeros_like(gemm1_args["c_strides"])
     gemm1_args["bias"] = bias1
@@ -515,7 +517,7 @@ def cutlass_moe_fp4_with_bias(
         w1_alphas,
         out_dtype,
         device,
-        gemm1_args # params.to_gemm1_args(),
+        gemm1_args
     )
     del rep_a_fp4, rep_a_blockscale
 
@@ -530,6 +532,11 @@ def cutlass_moe_fp4_with_bias(
         gelu_and_mul(c1, intermediate)
     elif activation_type == "gelu_tanh":
         gelu_tanh_and_mul(c1, intermediate)
+    elif activation_type == "swiglu":
+        from triton_kernels.swiglu import swiglu, PrecisionConfig
+        precision_config = PrecisionConfig(limit=swiglu_limit)
+        intermediate = swiglu(c1, activation_alpha, precision_config)
+
     else:
         raise ValueError(f"Unsupported activation type in cutlass_moe_fp4: {activation_type}")
 
@@ -552,7 +559,7 @@ def cutlass_moe_fp4_with_bias(
         w2_alphas,
         out_dtype,
         device,
-        params.to_gemm2_args(),
+        gemm2_args,
     )
     del int_fp4, int_blockscale
     c2 = shuffle_rows(c2, c_map, (m_a * num_topk, params.hidden_size))
