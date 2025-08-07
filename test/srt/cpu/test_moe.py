@@ -20,6 +20,7 @@ from utils import (
     precision,
     scaled_weight,
     torch_naive_fused_moe,
+    torch_naive_fused_moe_gptoss,
     torch_w8a8_per_column_fused_moe,
 )
 
@@ -57,6 +58,10 @@ def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
         None,
         None,
         None,
+        None,
+        None,
+        None,
+        None,
         prepack,
     )
 
@@ -76,6 +81,49 @@ class TestFusedExperts(CustomTestCase):
         torch_output = torch_naive_fused_moe(a, w1, w2, score, topk, renormalize)
         fused_output = fused_moe(a, w1, w2, score, topk, renormalize, prepack)
 
+        atol = rtol = precision[torch_output.dtype]
+        torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)
+
+    @parametrize(m=[1, 32], n=[128, 64], k=[128, 64], e=[4], topk=[2], renormalize=[False])
+    def test_bf16_moe_bias(self, m, n, k, e, topk, renormalize):
+        dtype = torch.bfloat16
+
+        a = torch.randn((m, k), device="cpu", dtype=dtype) / 10
+        w1 = torch.randn((e, 2 * n, k), device="cpu", dtype=dtype) / 10
+        w1_b = torch.randn((e, 2 * n), device="cpu", dtype=dtype) / 10
+        w2 = torch.randn((e, k, n), device="cpu", dtype=dtype) / 10
+        w2_b = torch.randn((e, k), device="cpu", dtype=dtype) / 10
+        score = torch.randn((m, e), device="cpu", dtype=dtype)
+        score = torch.softmax(score, dim=-1, dtype=torch.float32)
+        topk_weight, topk_ids = torch.topk(score, topk)
+        alpha = 1.702
+        limit = 7.0
+        torch_output = torch_naive_fused_moe_gptoss(
+            a, w1, w2, w1_b, w2_b, topk_weight, topk_ids, renormalize, alpha, limit, e
+        )
+        packed_w1 = kernel.convert_weight_packed(w1)
+        packed_w2 = kernel.convert_weight_packed(w2)
+        fused_output = torch.ops.sgl_kernel.fused_experts_cpu(
+            a,
+            packed_w1,
+            packed_w2,
+            topk_weight,
+            topk_ids.to(torch.int),
+            False,  # inplace # See [Note] inplace should be False in fused_experts.
+            False,  # use_int8_w8a8
+            False,  # use_fp8_w8a16
+            False,  # use_mxfp4
+            None,  # w1_scale
+            None,  # w2_scale
+            None,  # block_size
+            None,  # a1_scale
+            None,  # a2_scale
+            w1_b.to(torch.bfloat16),
+            w2_b.to(torch.bfloat16),
+            alpha,
+            limit,
+            True,  # is_vnni
+        )
         atol = rtol = precision[torch_output.dtype]
         torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)
 
@@ -128,6 +176,10 @@ class TestFusedExperts(CustomTestCase):
             False,
             w1_s,
             w2_s,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -187,6 +239,10 @@ class TestFusedExperts(CustomTestCase):
             w1s,
             w2s,
             [BLOCK_N, BLOCK_K],
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             True,
