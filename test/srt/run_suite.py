@@ -122,6 +122,7 @@ suites = {
         TestFile("test_torch_compile_moe.py", 172),
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
+        TestFile("models/test_vlm_models.py", 437),
         TestFile("openai_server/basic/test_openai_embedding.py", 141),
         TestFile("openai_server/features/test_enable_thinking.py", 70),
         TestFile("openai_server/features/test_reasoning_content.py", 89),
@@ -150,6 +151,7 @@ suites = {
         TestFile("test_update_weights_from_disk.py", 114),
         TestFile("test_vertex_endpoint.py", 31),
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
+        TestFile("test_vlm_input_format.py", 300),
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_rope_rocm.py", 3),
         TestFile("test_awq_dequant.py", 2),
