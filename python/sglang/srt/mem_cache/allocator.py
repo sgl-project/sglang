@@ -268,7 +268,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_attn_allocator.clear()
         self.full_attn_allocator.clear()
         self.full_to_swa_index_mapping.fill_(0)
-        self.is_in_free_group = False
+        self.is_not_in_free_group = True
         self.free_group = []
 
 
@@ -310,10 +310,7 @@ def alloc_extend_kernel(
 
     # Return value
     if pid == tl.num_programs(0) - 1:
-        merged_value = (sum_num_new_pages.to(tl.int64)) << 32 | sum_extend_lens.to(
-            tl.int64
-        )
-        tl.store(ret_values, merged_value)
+        tl.store(ret_values, sum_num_new_pages)
 
     # Part 1: fill the old partial page
     last_loc = tl.load(last_loc_ptr + pid)
@@ -490,8 +487,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        merged_value = self.ret_values.item()
-        num_new_pages = merged_value >> 32
+        num_new_pages = self.ret_values.item()
         if num_new_pages > len(self.free_pages):
             return None
 
