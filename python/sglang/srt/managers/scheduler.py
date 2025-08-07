@@ -553,6 +553,7 @@ class Scheduler(
             else:
                 self.tokenizer = get_tokenizer(
                     server_args.tokenizer_path,
+                    model_max_length=self.model_config.context_len,
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
