@@ -814,7 +814,7 @@ def sample_burstgpt_requests(
     apply_chat_template: bool = True,
 ) -> List[DatasetRow]:
 
-    if not is_file_valid_json(dataset_path) and dataset_path == "":
+    if not dataset_path:
         dataset_path = download_and_cache_file(BURSTGPT_URL)
 
     df = pd.read_csv(dataset_path)
