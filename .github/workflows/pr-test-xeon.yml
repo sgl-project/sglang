@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-test:
+  build-sglang-image:
     if: github.event_name == 'pull_request'
     runs-on: sglang-pvc
     strategy:
@@ -27,10 +27,16 @@ jobs:
 
           docker build . -f docker/Dockerfile.xeon  -t sglang_xeon --no-cache
 
+  env-prepare:
+    if: always()
+    needs: [build-sglang-image]
+    runs-on: sglang-pvc
+    steps:
       - name: Run container
         run: |
           docker run -dt \
             -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
+            -v ${HF_HOME}:/root/.cache/huggingface \
             --name ci_sglang_xeon \
             sglang_xeon
 
@@ -43,6 +49,11 @@ jobs:
           docker exec -w /sglang-checkout/ ci_sglang_xeon bash -c "pip install -e "python[all_cpu]""
           docker exec ci_sglang_xeon bash -c "python3 -m pip install pytest expecttest"
 
+  sglang-xeon-test:
+    if: always()
+    needs: [env-prepare]
+    runs-on: sglang-pvc
+    steps:
       - name: Check AMX Support
         id: check_amx
         timeout-minutes: 5
@@ -52,22 +63,29 @@ jobs:
         continue-on-error: true
 
       - name: Run UT Cases
+        id: run_ut_cases
         if: steps.check_amx.outcome == 'success'
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           docker exec -w /sglang-checkout/ ci_sglang_xeon \
             bash -c "cd ./test/srt && python3 run_suite.py --suite per-commit-cpu"
 
+      - name: Force fail if any step failed
+        if: always() && (steps.check_amx.outcome == 'failure' || steps.run_ut_cases.outcome == 'failure')
+        run: |
+          echo "At least one step failed, failing the job..."
+          exit 1
+
+  finish:
+    if: always()
+    needs: [build-sglang-image, env-prepare, sglang-xeon-test]
+    runs-on: sglang-pvc
+    steps:
       - name: Cleanup container
         if: always()
         run: |
           docker rm -f ci_sglang_xeon || true
 
-  finish:
-    if: always()
-    needs: [build-test]
-    runs-on: ubuntu-24.04
-    steps:
       - name: Check all dependent job statuses
         run: |
           results=(${{ join(needs.*.result, ' ') }})
