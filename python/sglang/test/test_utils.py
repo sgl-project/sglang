@@ -104,15 +104,6 @@ def is_in_amd_ci():
     return get_bool_env_var("SGLANG_AMD_CI")
 
 
-def _use_cached_default_models(model_repo: str):
-    cache_dir = os.getenv("DEFAULT_MODEL_CACHE_DIR")
-    if cache_dir and model_repo:
-        model_path = os.path.join(cache_dir, model_repo)
-        if os.path.isdir(model_path):
-            return os.path.abspath(model_path)
-    return ""
-
-
 if is_in_ci():
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
         5000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
@@ -452,11 +443,6 @@ def _get_default_models():
             else:
                 default_models.add(value.strip())
     return json.dumps(list(default_models))
-
-
-def try_cached_model(model_repo: str):
-    model_dir = _use_cached_default_models(model_repo)
-    return model_dir if model_dir else model_repo
 
 
 def popen_launch_server(

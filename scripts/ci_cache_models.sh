@@ -8,24 +8,12 @@ if [ ${#models[@]} -eq 0 ]; then
     exit 1
 fi
 
-cache_dir="${DEFAULT_MODEL_CACHE_DIR:-}"
-
-if [ -z "$cache_dir" ]; then
-    echo "DEFAULT_MODEL_CACHE_DIR environment variable is not set."
-    exit 1
-fi
-
 failed_models=()
 for model in "${models[@]}"; do
-    local_model_dir="$cache_dir/$model"
-    echo "Caching model: $model to $local_model_dir"
-    mkdir -p "$local_model_dir"
+    echo "Caching model: $model to ${HF_HOME:-~/.cache/huggingface}"
 
-    if ! huggingface-cli download "$model" \
-        --local-dir "$local_model_dir" \
-        --local-dir-use-symlinks False 2>/dev/null; then
+    if ! huggingface-cli download "$model" 2>/dev/null; then
         echo "WARNING: Failed to cache model: $model"
-        rm -rf "$local_model_dir"
         failed_models+=("$model")
         continue
     fi
