@@ -186,8 +186,10 @@ def triton_kernel_fused_experts(
 def triton_kernel_moe_with_bias_forward(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
+    w1_pcg,
     b1: torch.Tensor,
     w2: torch.Tensor,
+    w2_pcg,
     b2: torch.Tensor,
     topk_output: TopKOutput,
     inplace: bool = False,
@@ -209,13 +211,15 @@ def triton_kernel_moe_with_bias_forward(
 
     return triton_kernel_fused_experts_with_bias(
         hidden_states,
-        w1,
-        b1,
-        w2,
-        b2,
-        routing_data,
-        gather_idx,
-        scatter_idx,
+        w1=w1,
+        w1_pcg=w1_pcg,
+        b1=b1,
+        w2=w2,
+        w2_pcg=w2_pcg,
+        b2=b2,
+        routing_data=routing_data,
+        gather_indx=gather_idx,
+        scatter_indx=scatter_idx,
         inplace=inplace,
         activation=activation,
         use_fp8_w8a8=use_fp8_w8a8,
@@ -235,8 +239,10 @@ def triton_kernel_moe_with_bias_forward(
 def triton_kernel_fused_experts_with_bias(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
+    w1_pcg,
     b1: torch.Tensor,
     w2: torch.Tensor,
+    w2_pcg,
     b2: torch.Tensor,
     routing_data: RoutingData,
     gather_indx: GatherIndx,
@@ -267,8 +273,10 @@ def triton_kernel_fused_experts_with_bias(
 
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
-    assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
-    assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
+    for w in (w1, w2):
+        # TODO assert bf16 or mxfp4
+        # assert (w.dtype == torch.bfloat16) or check-is-mxfp4, f"w must be bfloat16 or mxfp4 {w1.dtype=}"
+        pass
 
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
@@ -287,13 +295,15 @@ def triton_kernel_fused_experts_with_bias(
     if global_num_experts == -1:
         global_num_experts = E
 
-    device = "cuda"
-    optg = dict()
-    w1, w1_flex = quantize(w1, "bf16", device, **optg)
-    w1_pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w1_flex))
+    # TODO maybe completely remove this branch
+    if w1.dtype == torch.bfloat16:
+        device = "cuda"
+        optg = dict()
+        w1, w1_flex = quantize(w1, "bf16", device, **optg)
+        w1_pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w1_flex))
 
-    w2, w2_flex = quantize(w2, "bf16", device, **optg)
-    w2_pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex))
+        w2, w2_flex = quantize(w2, "bf16", device, **optg)
+        w2_pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex))
 
     act = FusedActivation(
         FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")),
