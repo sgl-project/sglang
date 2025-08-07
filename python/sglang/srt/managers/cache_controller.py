@@ -554,41 +554,43 @@ class HiCacheController:
                 )
                 break
             completed_tokens = operation.completed_tokens
-            if operation.increment(self.page_size * len(page_hashes)):
-                for i in range(len(page_hashes)):
-                    self.mem_pool_host.set_from_flat_data_page(
-                        operation.host_indices[completed_tokens],
-                        page_data[i],
-                    )
-                    completed_tokens += self.page_size
-            else:
-                # operation terminated by controller, release pre-allocated memory
-                self.mem_pool_host.free(
-                    operation.host_indices[operation.completed_tokens :]
+            for i in range(len(page_hashes)):
+                self.mem_pool_host.set_from_flat_data_page(
+                    operation.host_indices[completed_tokens],
+                    page_data[i],
                 )
+                completed_tokens += self.page_size
+            if not operation.increment(self.page_size * len(page_hashes)):
+                # operation terminated by controller
                 break
+        # release pre-allocated memory
+        self.mem_pool_host.free(
+            operation.host_indices[operation.completed_tokens :]
+        )
 
     # Get in one batch
     def mooncake_page_transfer(self, operation):
         completed_tokens = 0
-        key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
-            operation.hash_value, operation.host_indices
-        )
-        get_result = self.storage_backend.batch_get(
-            key_strs, buffer_ptrs, buffer_sizes
-        )
-        if get_result is None:
-            logger.warning(
-                f"Prefetch operation {operation.request_id} failed to call "
-                f"MooncakeStore.batch_get: invalid parameters."
+        # If operation is done, early return
+        if not operation.is_done():
+            key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
+                operation.hash_value, operation.host_indices
             )
-        elif len(get_result) == sum(1 for v in get_result if v > 0):
-            # If all keys are retrieved successfully, mark them as success,
-            # otherwise mark all of them as failed.
-            # TODO: After the Page First PR, we can just mark successful pages to success.
-            completed_tokens = len(operation.hash_value) * self.page_size
-        if completed_tokens > 0:
-            operation.increment(completed_tokens)
+            get_result = self.storage_backend.batch_get(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
+            if get_result is None:
+                logger.warning(
+                    f"Prefetch operation {operation.request_id} failed to call "
+                    f"MooncakeStore.batch_get: invalid parameters."
+                )
+            elif len(get_result) == sum(1 for v in get_result if v > 0):
+                # If all keys are retrieved successfully, mark them as success,
+                # otherwise mark all of them as failed.
+                # TODO: After the Page First PR, we can just mark successful pages to success.
+                completed_tokens = len(operation.hash_value) * self.page_size
+            if completed_tokens > 0:
+                operation.increment(completed_tokens)
         if operation.completed_tokens < len(operation.hash_value) * self.page_size:
             # Operation terminated by controller, or retrieve data failed or
             # partially failed. Release pre-allocated memory.
