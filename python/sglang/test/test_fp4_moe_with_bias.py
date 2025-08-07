@@ -250,4 +250,4 @@ def test_cutlass_fp4_moe_with_bias_no_graph(
 
 
 if __name__ == "__main__":
-    test_cutlass_fp4_moe_with_bias_no_graph(224, 384, 1024, 256, 8, torch.half)
+    test_cutlass_fp4_moe_with_bias_no_graph(224, 384, 1024, 256, 8, torch.bfloat16)

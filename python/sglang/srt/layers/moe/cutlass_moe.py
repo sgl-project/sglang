@@ -520,6 +520,7 @@ def cutlass_moe_fp4_with_bias(
         gemm1_args
     )
     del rep_a_fp4, rep_a_blockscale
+    print(c1[0, 0])
 
     # hidden size dimension is split to one halfpytho sized tensor.
     intermediate = torch.empty(
