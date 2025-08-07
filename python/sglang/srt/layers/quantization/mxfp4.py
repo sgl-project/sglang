@@ -3,22 +3,20 @@
 
 from __future__ import annotations
 
-import importlib
+import importlib.util
 import logging
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
 
-# from vllm.model_executor.layers.fused_moe import (
-#     FusedMoE, FusedMoEActivationFormat, FusedMoEConfig, FusedMoEMethodBase,
-#     FusedMoEPermuteExpertsUnpermute, FusedMoEPrepareAndFinalize)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
@@ -32,11 +30,6 @@ from sglang.srt.utils import (
 
 has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
 
-# Environment variables for FlashInfer MXFP4 MoE backend
-USE_FLASHINFER_MXFP4_MOE = get_bool_env_var("SGLANG_USE_FLASHINFER_MXFP4_MOE", "false")
-USE_FLASHINFER_MXFP4_BF16_MOE = get_bool_env_var(
-    "SGLANG_USE_FLASHINFER_MXFP4_BF16_MOE", "false"
-)
 
 if is_flashinfer_available():
     # from flashinfer.fused_moe import cutlass_fused_moe
@@ -193,7 +186,12 @@ class Mxfp4Config(QuantizationConfig):
             ):
                 return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
-            return Mxfp4MoEMethod(use_triton_kernels=True, with_bias=True)
+            use_flashinfer = global_server_args_dict.get(
+                "enable_flashinfer_mxfp4_moe", False
+            )
+            return Mxfp4MoEMethod(
+                use_triton_kernels=True, with_bias=True, use_flashinfer=use_flashinfer
+            )
         else:
             raise NotImplementedError("Mxfp4 attention layer is not implemented")
         return None
@@ -204,11 +202,18 @@ class Mxfp4Config(QuantizationConfig):
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
 
-    def __init__(self, use_triton_kernels: bool = True, with_bias: bool = True):
+    def __init__(
+        self,
+        use_triton_kernels: bool = True,
+        with_bias: bool = True,
+        use_flashinfer: bool = False,
+    ):
         super().__init__()
         self.topk_indices_dtype = None
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = with_bias
+        self.use_flashinfer = use_flashinfer
+
         self.triton_kernel_moe_forward = None
         self.triton_kernel_moe_with_bias_forward = None
         if torch.cuda.is_available() and has_triton_kernels:
@@ -239,7 +244,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
-        if USE_FLASHINFER_MXFP4_MOE or USE_FLASHINFER_MXFP4_BF16_MOE:
+        if self.use_flashinfer:
             intermediate_size_per_partition_after_pad = round_up(intermediate_size, 256)
             hidden_size = round_up(hidden_size, 256)
         elif is_hip():
@@ -319,7 +324,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
-        if USE_FLASHINFER_MXFP4_MOE or USE_FLASHINFER_MXFP4_BF16_MOE:
+        if self.use_flashinfer:
             logger.info(
                 "Shuffling MoE weights for FlashInfer, it might take a while..."
             )
@@ -544,20 +549,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         activation_alpha: Optional[float] = None,
         swiglu_limit: Optional[float] = None,
     ) -> torch.Tensor:
-        if USE_FLASHINFER_MXFP4_MOE or USE_FLASHINFER_MXFP4_BF16_MOE:
-            # When USE_FLASHINFER_MXFP4_BF16_MOE is enabled, we don't need to quantize the input,
-            # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
-            # which can theoretically improve performance
-            if USE_FLASHINFER_MXFP4_BF16_MOE:
-                assert x.dtype == torch.bfloat16
-                x_quant = x
-                x_scale = None
-            else:
-                x_quant, x_scale = mxfp8_quantize(x, False)  # to mxfp8
-                x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+        if self.use_flashinfer:
+            # Based on profiling results, we need to quantize x to mxfp8 here to achieve better performance
+            x_quant, x_scale = mxfp8_quantize(x, False)  # to mxfp8
+            x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
 
-            topk_weights, topk_ids, router_logits = topk_output
-            top_k = topk_weights.shape[-1]
+            top_k, router_logits = topk_output
 
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
