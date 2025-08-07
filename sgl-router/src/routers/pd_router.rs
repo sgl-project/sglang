@@ -1,7 +1,6 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
-use super::pd_types::{api_path, Bootstrap, GenerateReqInput, PDRouterError};
-use super::request_adapter::ToPdRequest;
+use super::pd_types::{api_path, PDRouterError};
 use crate::config::types::RetryConfig;
 use crate::core::{HealthChecker, Worker, WorkerFactory, WorkerLoadGuard};
 use crate::metrics::RouterMetrics;
@@ -314,17 +313,6 @@ impl PDRouter {
             .into_response()
     }
 
-    // Helper to handle bootstrap injection errors
-    fn handle_bootstrap_error(error: impl std::fmt::Display) -> Response {
-        error!("Failed to add bootstrap info error={}", error);
-        RouterMetrics::record_pd_error("bootstrap_injection");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Bootstrap injection failed: {}", error),
-        )
-            .into_response()
-    }
-
     // Helper to handle serialization errors
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
         error!("Failed to serialize request error={}", error);
@@ -333,6 +321,48 @@ impl PDRouter {
             "Failed to serialize request",
         )
             .into_response()
+    }
+
+    // Helper to determine batch size from a GenerateRequest
+    fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
+        // Check prompt array
+        if let Some(prompt) = &req.prompt {
+            if let crate::openai_api_types::StringOrArray::Array(arr) = prompt {
+                if !arr.is_empty() {
+                    return Some(arr.len());
+                }
+            }
+        }
+        // Check text array
+        if let Some(text) = &req.text {
+            if text.contains("[") && text.contains("]") {
+                // This is a simplified check - in reality we'd need to parse JSON
+                return None; // For now, fall back to non-batch
+            }
+        }
+        None
+    }
+
+    // Helper to determine batch size from a ChatCompletionRequest
+    fn get_chat_batch_size(req: &ChatCompletionRequest) -> Option<usize> {
+        // Check 'n' parameter for multiple responses
+        if let Some(n) = req.n {
+            if n > 1 {
+                return Some(n as usize);
+            }
+        }
+        None
+    }
+
+    // Helper to determine batch size from a CompletionRequest
+    fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
+        // Check prompt array
+        if let crate::openai_api_types::StringOrArray::Array(arr) = &req.prompt {
+            if !arr.is_empty() {
+                return Some(arr.len());
+            }
+        }
+        None
     }
 
     // Execute the dual dispatch to prefill and decode servers
@@ -1295,20 +1325,17 @@ impl RouterTrait for PDRouter {
         body: &GenerateRequest,
     ) -> Response {
         let start = Instant::now();
-        let mut pd_req = body.clone().to_pd_request();
 
-        // Get stream flag and return_logprob flag before moving the request
-        let is_stream = pd_req.stream;
-        let return_logprob = pd_req
-            .other
-            .get("return_logprob")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        // Extract flags for routing logic
+        let is_stream = body.stream;
+        let return_logprob = body.return_logprob;
 
-        // Extract text for cache-aware routing from the typed request
-        let request_text = pd_req.text.as_ref().and_then(|t| match t {
-            super::pd_types::InputText::Single(s) => Some(s.as_str()),
-            super::pd_types::InputText::Batch(v) => v.first().map(|s| s.as_str()),
+        // Extract text for cache-aware routing
+        let request_text = body.text.as_deref().or_else(|| {
+            body.prompt.as_ref().and_then(|p| match p {
+                crate::openai_api_types::StringOrArray::String(s) => Some(s.as_str()),
+                crate::openai_api_types::StringOrArray::Array(v) => v.first().map(|s| s.as_str()),
+            })
         });
 
         // Select servers
@@ -1324,20 +1351,46 @@ impl RouterTrait for PDRouter {
             decode.url()
         );
 
-        // Add bootstrap info using the trait method
-        if let Err(e) = pd_req.add_bootstrap_info(prefill.as_ref()) {
-            return Self::handle_bootstrap_error(e);
-        }
-        // Convert to JSON after bootstrap injection
-        let json_with_bootstrap = match serde_json::to_value(&pd_req) {
-            Ok(json) => json,
-            Err(e) => return Self::handle_serialization_error(e),
+        // Get bootstrap port from prefill worker
+        let bootstrap_port = match prefill.worker_type() {
+            crate::core::WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+            _ => None,
+        };
+        let hostname = super::pd_types::get_hostname(prefill.url());
+
+        // Create optimized request with bootstrap fields
+        let json = if let Some(batch_size) = Self::get_generate_batch_size(body) {
+            // Batch request
+            let request_with_bootstrap = super::pd_types::BatchRequestWithBootstrap {
+                original: body,
+                bootstrap_host: vec![hostname; batch_size],
+                bootstrap_port: vec![bootstrap_port; batch_size],
+                bootstrap_room: (0..batch_size)
+                    .map(|_| super::pd_types::generate_room_id())
+                    .collect(),
+            };
+            match serde_json::to_value(&request_with_bootstrap) {
+                Ok(json) => json,
+                Err(e) => return Self::handle_serialization_error(e),
+            }
+        } else {
+            // Single request
+            let request_with_bootstrap = super::pd_types::RequestWithBootstrap {
+                original: body,
+                bootstrap_host: hostname,
+                bootstrap_port,
+                bootstrap_room: super::pd_types::generate_room_id(),
+            };
+            match serde_json::to_value(&request_with_bootstrap) {
+                Ok(json) => json,
+                Err(e) => return Self::handle_serialization_error(e),
+            }
         };
 
         // Execute dual dispatch
         self.execute_dual_dispatch(
             headers,
-            json_with_bootstrap,
+            json,
             "/generate",
             prefill.as_ref(),
             decode.as_ref(),
@@ -1355,21 +1408,21 @@ impl RouterTrait for PDRouter {
     ) -> Response {
         let start = Instant::now();
 
-        // Convert OpenAI format to PD format
-        let mut pd_req = body.clone().to_pd_request();
-
-        // Get stream flag and return_logprob flag before moving the request
-        let is_stream = pd_req.stream;
+        // Extract flags for routing logic
+        let is_stream = body.stream;
         let return_logprob = body.logprobs;
 
         // Extract text for cache-aware routing from chat messages
-        let request_text = pd_req
-            .other
-            .get("messages")
-            .and_then(|messages| messages.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|msg| msg.get("content"))
-            .and_then(|content| content.as_str());
+        let request_text = body.messages.first().and_then(|msg| match msg {
+            crate::openai_api_types::ChatMessage::User { content, .. } => {
+                match content {
+                    crate::openai_api_types::UserMessageContent::Text(text) => Some(text.as_str()),
+                    crate::openai_api_types::UserMessageContent::Parts(_) => None, // Skip complex content
+                }
+            }
+            crate::openai_api_types::ChatMessage::System { content, .. } => Some(content.as_str()),
+            _ => None,
+        });
 
         // Select servers
         let (prefill, decode) = match self.select_pd_pair(request_text).await {
@@ -1384,20 +1437,46 @@ impl RouterTrait for PDRouter {
             decode.url()
         );
 
-        if let Err(e) = pd_req.add_bootstrap_info(prefill.as_ref()) {
-            return Self::handle_bootstrap_error(e);
-        }
+        // Get bootstrap port from prefill worker
+        let bootstrap_port = match prefill.worker_type() {
+            crate::core::WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+            _ => None,
+        };
+        let hostname = super::pd_types::get_hostname(prefill.url());
 
-        // Convert to JSON after bootstrap injection
-        let json_with_bootstrap = match serde_json::to_value(&pd_req) {
-            Ok(json) => json,
-            Err(e) => return Self::handle_serialization_error(e),
+        // Create optimized request with bootstrap fields
+        let json = if let Some(batch_size) = Self::get_chat_batch_size(body) {
+            // Batch request (n > 1)
+            let request_with_bootstrap = super::pd_types::BatchRequestWithBootstrap {
+                original: body,
+                bootstrap_host: vec![hostname; batch_size],
+                bootstrap_port: vec![bootstrap_port; batch_size],
+                bootstrap_room: (0..batch_size)
+                    .map(|_| super::pd_types::generate_room_id())
+                    .collect(),
+            };
+            match serde_json::to_value(&request_with_bootstrap) {
+                Ok(json) => json,
+                Err(e) => return Self::handle_serialization_error(e),
+            }
+        } else {
+            // Single request
+            let request_with_bootstrap = super::pd_types::RequestWithBootstrap {
+                original: body,
+                bootstrap_host: hostname,
+                bootstrap_port,
+                bootstrap_room: super::pd_types::generate_room_id(),
+            };
+            match serde_json::to_value(&request_with_bootstrap) {
+                Ok(json) => json,
+                Err(e) => return Self::handle_serialization_error(e),
+            }
         };
 
         // Execute dual dispatch
         self.execute_dual_dispatch(
             headers,
-            json_with_bootstrap,
+            json,
             "/v1/chat/completions",
             prefill.as_ref(),
             decode.as_ref(),
@@ -1415,13 +1494,14 @@ impl RouterTrait for PDRouter {
     ) -> Response {
         let start = Instant::now();
 
-        let return_logprob = body.logprobs.map(|x| x > 1).unwrap_or(false);
+        // Extract flags for routing logic
         let is_stream = body.stream;
+        let return_logprob = body.logprobs.is_some();
 
-        // Extract text for cache-aware routing from the typed request
+        // Extract text for cache-aware routing
         let request_text = match &body.prompt {
             crate::openai_api_types::StringOrArray::String(s) => Some(s.as_str()),
-            crate::openai_api_types::StringOrArray::Array(arr) => arr.first().map(|s| s.as_str()),
+            crate::openai_api_types::StringOrArray::Array(v) => v.first().map(|s| s.as_str()),
         };
 
         // Select servers
@@ -1437,20 +1517,46 @@ impl RouterTrait for PDRouter {
             decode.url()
         );
 
-        if let Err(e) = body.clone().add_bootstrap_info(prefill.as_ref()) {
-            return Self::handle_bootstrap_error(e);
-        }
+        // Get bootstrap port from prefill worker
+        let bootstrap_port = match prefill.worker_type() {
+            crate::core::WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+            _ => None,
+        };
+        let hostname = super::pd_types::get_hostname(prefill.url());
 
-        // Convert to JSON after bootstrap injection
-        let json_with_bootstrap = match serde_json::to_value(&body) {
-            Ok(json) => json,
-            Err(e) => return Self::handle_serialization_error(e),
+        // Create optimized request with bootstrap fields
+        let json = if let Some(batch_size) = Self::get_completion_batch_size(body) {
+            // Batch request
+            let request_with_bootstrap = super::pd_types::BatchRequestWithBootstrap {
+                original: body,
+                bootstrap_host: vec![hostname; batch_size],
+                bootstrap_port: vec![bootstrap_port; batch_size],
+                bootstrap_room: (0..batch_size)
+                    .map(|_| super::pd_types::generate_room_id())
+                    .collect(),
+            };
+            match serde_json::to_value(&request_with_bootstrap) {
+                Ok(json) => json,
+                Err(e) => return Self::handle_serialization_error(e),
+            }
+        } else {
+            // Single request
+            let request_with_bootstrap = super::pd_types::RequestWithBootstrap {
+                original: body,
+                bootstrap_host: hostname,
+                bootstrap_port,
+                bootstrap_room: super::pd_types::generate_room_id(),
+            };
+            match serde_json::to_value(&request_with_bootstrap) {
+                Ok(json) => json,
+                Err(e) => return Self::handle_serialization_error(e),
+            }
         };
 
         // Execute dual dispatch
         self.execute_dual_dispatch(
             headers,
-            json_with_bootstrap,
+            json,
             "/v1/completions",
             prefill.as_ref(),
             decode.as_ref(),
@@ -1675,7 +1781,6 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
     use crate::policies::{CacheAwarePolicy, RandomPolicy};
-    use crate::routers::pd_types::SingleOrBatch;
 
     fn create_test_pd_router() -> PDRouter {
         let prefill_policy = Arc::new(RandomPolicy::new());
@@ -1923,88 +2028,11 @@ mod tests {
     }
 
     // ============= Bootstrap Injection Tests =============
+    // Note: These tests are commented out as we've moved to the optimized bootstrap injection
+    // approach that doesn't use the Bootstrap trait on GenerateReqInput anymore.
 
-    #[test]
-    fn test_bootstrap_injection_with_existing_fields() {
-        let mut req = GenerateReqInput {
-            text: Some(SingleOrBatch::Single("Test".to_string())),
-            input_ids: None,
-            stream: false,
-            bootstrap_host: Some(SingleOrBatch::Single("existing-host".to_string())),
-            bootstrap_port: Some(SingleOrBatch::Single(Some(9999))),
-            bootstrap_room: Some(SingleOrBatch::Single(12345)),
-            other: Value::Object(serde_json::Map::new()),
-        };
-
-        let prefill_worker = create_test_worker(
-            "http://new-host:8000".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: Some(8080),
-            },
-            true,
-        );
-
-        // Bootstrap info is added regardless of existing fields
-        let result = req.add_bootstrap_info(prefill_worker.as_ref());
-        assert!(result.is_ok());
-
-        // Bootstrap info should be updated with new values
-        assert_eq!(
-            req.bootstrap_host,
-            Some(SingleOrBatch::Single("new-host".to_string()))
-        );
-        assert_eq!(req.bootstrap_port, Some(SingleOrBatch::Single(Some(8080))));
-        // Room should be regenerated (different from original)
-        if let Some(SingleOrBatch::Single(room)) = req.bootstrap_room {
-            assert_ne!(room, 12345);
-        } else {
-            panic!("Expected single room ID");
-        }
-    }
-
-    #[test]
-    fn test_bootstrap_room_generation() {
-        let mut req1 = GenerateReqInput {
-            text: Some(SingleOrBatch::Single("Test".to_string())),
-            input_ids: None,
-            stream: false,
-            bootstrap_host: None,
-            bootstrap_port: None,
-            bootstrap_room: None,
-            other: Value::Object(serde_json::Map::new()),
-        };
-
-        let mut req2 = GenerateReqInput {
-            text: Some(SingleOrBatch::Single("Test".to_string())),
-            input_ids: None,
-            stream: false,
-            bootstrap_host: None,
-            bootstrap_port: None,
-            bootstrap_room: None,
-            other: Value::Object(serde_json::Map::new()),
-        };
-
-        let prefill_worker = create_test_worker(
-            "http://host:8000".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: Some(8080),
-            },
-            true,
-        );
-
-        // Add bootstrap info to both requests
-        let _ = req1.add_bootstrap_info(prefill_worker.as_ref());
-        let _ = req2.add_bootstrap_info(prefill_worker.as_ref());
-
-        // Room IDs should be different
-        if let (Some(SingleOrBatch::Single(room1)), Some(SingleOrBatch::Single(room2))) =
-            (req1.bootstrap_room, req2.bootstrap_room)
-        {
-            assert_ne!(room1, room2, "Room IDs should be unique");
-        } else {
-            panic!("Expected single room IDs");
-        }
-    }
+    // TODO: Add new tests for the optimized bootstrap injection approach using
+    // RequestWithBootstrap and BatchRequestWithBootstrap wrappers
 
     // ============= Worker Selection Tests =============
 
