@@ -353,9 +353,7 @@ void run_fp4_blockwise_scaled_group_mm_with_bias(
       fusion_args.alpha_ptr_array = reinterpret_cast<float**>(alpha_ptrs.data_ptr());
       fusion_args.dAlpha = {_0{}, _0{}, 1};
 
-      fusion_args.beta_ptr_array = nullptr;
-      fusion_args.beta = 1;
-      fusion_args.dBeta = {_0{}, _0{}, 0};
+      fusion_args.beta = 1.f;
     
       // Gemm Arguments
       typename GemmKernel::Arguments args{
@@ -372,14 +370,14 @@ void run_fp4_blockwise_scaled_group_mm_with_bias(
       const cudaStream_t stream = at::cuda::getCurrentCUDAStream(a.get_device());
     
       auto can_implement_status = gemm_op.can_implement(args);
-      TORCH_CHECK(can_implement_status == cutlass::Status::kSuccess, "Failed to implement GEMM");
+      TORCH_CHECK(can_implement_status == cutlass::Status::kSuccess, "Failed to implement GEMM, error: ", cutlassGetStatusString(can_implement_status));
     
       // Run the GEMM
-      auto status = gemm_op.initialize(args, workspace.data_ptr());
-      TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to initialize GEMM");
+      auto initialize_status = gemm_op.initialize(args, workspace.data_ptr());
+      TORCH_CHECK(initialize_status == cutlass::Status::kSuccess, "Failed to initialize GEMM, error: ", cutlassGetStatusString(initialize_status));
     
-      status = gemm_op.run(args, workspace.data_ptr(), stream);
-      TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM");
+      auto run_status = gemm_op.run(args, workspace.data_ptr(), stream);
+      TORCH_CHECK(run_status == cutlass::Status::kSuccess, "Failed to run GEMM, error: ", cutlassGetStatusString(run_status));
 }
 
 #define CHECK_TYPE(x, st, m) TORCH_CHECK(x.scalar_type() == st, ": Inconsistency of Tensor type:", m)
