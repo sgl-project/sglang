@@ -139,18 +139,6 @@ class TestFusedMOE(CustomTestCase):
                 topk_config=TopKConfig(top_k=topk, renormalize=False),
             )
 
-            sglang_output = fused_moe(
-                a,
-                w1,
-                w2,
-                topk_output,
-                use_fp8_w8a8=True,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                a1_scale=a1_scale,
-                a2_scale=a2_scale,
-            )
-
             torch_output = self.torch_naive_moe(
                 a,
                 w1,
@@ -161,6 +149,18 @@ class TestFusedMOE(CustomTestCase):
                 w2_scale,
                 a1_scale,
                 a2_scale,
+            )
+
+            sglang_output = fused_moe(
+                a,
+                w1,
+                w2,
+                topk_output,
+                use_fp8_w8a8=True,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
             )
             torch.testing.assert_close(
                 sglang_output, torch_output, rtol=rtol, atol=atol

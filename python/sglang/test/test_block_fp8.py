@@ -498,6 +498,9 @@ class TestW8A8BlockFP8FusedMoE(CustomTestCase):
         score = torch.randn((M, E), dtype=dtype)
 
         with torch.inference_mode():
+            ref_out = torch_w8a8_block_fp8_moe(
+                a, w1, w2, w1_s, w2_s, score, topk, block_size
+            )
             topk_output = select_experts(
                 hidden_states=a,
                 router_logits=score,
@@ -512,9 +515,6 @@ class TestW8A8BlockFP8FusedMoE(CustomTestCase):
                 w1_scale=w1_s,
                 w2_scale=w2_s,
                 block_shape=block_size,
-            )
-            ref_out = torch_w8a8_block_fp8_moe(
-                a, w1, w2, w1_s, w2_s, score, topk, block_size
             )
 
         self.assertTrue(
