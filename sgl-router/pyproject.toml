@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang-router"
-version = "0.1.8"
+version = "0.1.9"
 description = "High-performance Rust-based load balancer for SGLang with multiple routing algorithms and prefill-decode disaggregation support"
 authors = [{name = "Byron Hsu", email = "byronhsu1230@gmail.com"}]
 requires-python = ">=3.8"
