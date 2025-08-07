@@ -340,6 +340,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 None,  # block_size
                 None,  # a1_scale
                 None,  # a2_scale
+                layer.w13_weight_bias,
+                layer.w2_weight_bias,
+                layer.gemm1_alpha,
+                self.gemm1_clamp_limit,
                 True,  # is_vnni
             )
             return StandardCombineInput(hidden_states=output)
