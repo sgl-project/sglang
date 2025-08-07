@@ -2053,6 +2053,9 @@ class ServerArgs:
             self.chunked_prefill_size % self.page_size == 0
         ), "chunked_prefill_size must be divisible by page_size"
 
+        # Check multi tokenizer
+        assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
+
     def check_lora_server_args(self):
         assert (
             self.max_loras_per_batch > 0
