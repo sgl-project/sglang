@@ -377,41 +377,69 @@ impl PDRouter {
         None
     }
 
-    // Helper to create request with bootstrap fields
-    fn create_request_with_bootstrap<T: serde::Serialize>(
-        request: &T,
+    // Helper to inject bootstrap fields into an existing JSON request value
+    fn inject_bootstrap_into_value(
+        mut original: Value,
         prefill_worker: &dyn Worker,
         batch_size: Option<usize>,
-    ) -> Result<serde_json::Value, serde_json::Error> {
-        // Get bootstrap port from prefill worker
+    ) -> Result<Value, String> {
         let bootstrap_port = match prefill_worker.worker_type() {
             crate::core::WorkerType::Prefill { bootstrap_port } => bootstrap_port,
             _ => None,
         };
         let hostname = super::pd_types::get_hostname(prefill_worker.url());
 
-        // Create optimized request with bootstrap fields
-        if let Some(batch_size) = batch_size {
-            // Batch request
-            let request_with_bootstrap = super::pd_types::BatchRequestWithBootstrap {
-                original: request,
-                bootstrap_host: vec![hostname; batch_size],
-                bootstrap_port: vec![bootstrap_port; batch_size],
-                bootstrap_room: (0..batch_size)
-                    .map(|_| super::pd_types::generate_room_id())
-                    .collect(),
-            };
-            serde_json::to_value(&request_with_bootstrap)
+        let obj = original
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+
+        if let Some(n) = batch_size {
+            let mut hosts = Vec::with_capacity(n);
+            let mut ports = Vec::with_capacity(n);
+            let mut rooms = Vec::with_capacity(n);
+            for _ in 0..n {
+                hosts.push(hostname.clone());
+                ports.push(bootstrap_port);
+                rooms.push(super::pd_types::generate_room_id());
+            }
+            obj.insert(
+                "bootstrap_host".to_string(),
+                Value::Array(hosts.into_iter().map(serde_json::Value::from).collect()),
+            );
+            obj.insert(
+                "bootstrap_port".to_string(),
+                Value::Array(
+                    ports
+                        .into_iter()
+                        .map(|p| match p {
+                            Some(v) => serde_json::Value::from(v),
+                            None => Value::Null,
+                        })
+                        .collect(),
+                ),
+            );
+            obj.insert(
+                "bootstrap_room".to_string(),
+                Value::Array(rooms.into_iter().map(serde_json::Value::from).collect()),
+            );
         } else {
-            // Single request
-            let request_with_bootstrap = super::pd_types::RequestWithBootstrap {
-                original: request,
-                bootstrap_host: hostname,
-                bootstrap_port,
-                bootstrap_room: super::pd_types::generate_room_id(),
-            };
-            serde_json::to_value(&request_with_bootstrap)
+            obj.insert(
+                "bootstrap_host".to_string(),
+                serde_json::Value::from(hostname),
+            );
+            obj.insert(
+                "bootstrap_port".to_string(),
+                match bootstrap_port {
+                    Some(v) => serde_json::Value::from(v),
+                    None => Value::Null,
+                },
+            );
+            obj.insert(
+                "bootstrap_room".to_string(),
+                serde_json::Value::from(super::pd_types::generate_room_id()),
+            );
         }
+        Ok(original)
     }
 
     // Execute the dual dispatch to prefill and decode servers
@@ -430,8 +458,14 @@ impl PDRouter {
         let _guard = WorkerLoadGuard::new_multi(vec![prefill, decode]);
 
         // Build decode request with shared client
-        let decode_request =
-            self.build_request_with_headers(decode.url(), route, &json_request, headers);
+        let decode_request = self.build_post_with_headers(
+            &self.client,
+            decode.url(),
+            route,
+            &json_request,
+            headers,
+            false,
+        );
 
         // Send both requests concurrently
         debug!(
@@ -442,8 +476,14 @@ impl PDRouter {
 
         if return_logprob {
             // Build prefill request with shared client when we need response body
-            let prefill_request =
-                self.build_request_with_headers(prefill.url(), route, &json_request, headers);
+            let prefill_request = self.build_post_with_headers(
+                &self.client,
+                prefill.url(),
+                route,
+                &json_request,
+                headers,
+                false,
+            );
             // When we need logprobs, wait for both responses
             let (prefill_result, decode_result) =
                 tokio::join!(prefill_request.send(), decode_request.send());
@@ -539,8 +579,14 @@ impl PDRouter {
             // Send both requests concurrently but don't wait for prefill
             // Use dedicated prefill client with Connection: close
             let prefill_future = self
-                .build_prefill_request_with_headers(prefill.url(), route, &json_request, headers)
-                .header("Connection", "close")
+                .build_post_with_headers(
+                    &self.prefill_client,
+                    prefill.url(),
+                    route,
+                    &json_request,
+                    headers,
+                    true,
+                )
                 .send();
             let decode_future = decode_request.send();
 
@@ -893,56 +939,34 @@ impl PDRouter {
         Ok((prefill_status, prefill_body))
     }
 
-    // Helper to build a request with headers copied from the original request
-    fn build_request_with_headers(
+    fn build_post_with_headers(
         &self,
+        client: &reqwest::Client,
         url: &str,
         route: &str,
-        json_request: &Value,
+        json_request: &serde_json::Value,
         headers: Option<&HeaderMap>,
+        connection_close: bool,
     ) -> reqwest::RequestBuilder {
-        let mut request = self.client.post(api_path(url, route)).json(json_request);
-
-        // Copy headers from original request (excluding content-type and content-length which are set by .json())
+        let mut request = client.post(api_path(url, route)).json(json_request);
+        if connection_close {
+            request = request.header("Connection", "close");
+        }
         if let Some(headers) = headers {
             for (name, value) in headers.iter() {
-                let name_str = name.as_str();
-                if name_str != "content-type" && name_str != "content-length" {
-                    // Skip headers with non-ASCII values
-                    if value.to_str().is_ok() {
-                        request = request.header(name, value);
+                let name_lc = name.as_str().to_ascii_lowercase();
+                // Whitelist important end-to-end headers, skip hop-by-hop
+                let forward = matches!(
+                    name_lc.as_str(),
+                    "authorization" | "x-request-id" | "x-correlation-id"
+                ) || name_lc.starts_with("x-request-id-");
+                if forward {
+                    if let Ok(val) = value.to_str() {
+                        request = request.header(name, val);
                     }
                 }
             }
         }
-
-        request
-    }
-
-    // Helper to build a prefill request using the dedicated prefill client
-    fn build_prefill_request_with_headers(
-        &self,
-        url: &str,
-        route: &str,
-        json_request: &Value,
-        headers: Option<&HeaderMap>,
-    ) -> reqwest::RequestBuilder {
-        let mut request = self
-            .prefill_client
-            .post(api_path(url, route))
-            .json(json_request);
-
-        if let Some(headers) = headers {
-            for (name, value) in headers.iter() {
-                let name_str = name.as_str();
-                if name_str != "content-type" && name_str != "content-length" {
-                    if value.to_str().is_ok() {
-                        request = request.header(name, value);
-                    }
-                }
-            }
-        }
-
         request
     }
 
@@ -1150,11 +1174,12 @@ impl RouterTrait for PDRouter {
 
         // Test prefill server's health_generate
         let prefill_url = format!("{}/health_generate", prefill.url());
-        let prefill_result = self.client.get(&prefill_url).send().await;
-
-        // Test decode server's health_generate
-        let decode_url = format!("{}/health_generate", decode.url());
-        let decode_result = self.client.get(&decode_url).send().await;
+        let (prefill_result, decode_result) = tokio::join!(
+            self.client.get(&prefill_url).send(),
+            self.client
+                .get(&format!("{}/health_generate", decode.url()))
+                .send()
+        );
 
         // Check results
         let mut errors = Vec::new();
@@ -1440,10 +1465,13 @@ impl RouterTrait for PDRouter {
             decode.url()
         );
 
-        // Create optimized request with bootstrap fields
         let batch_size = Self::get_generate_batch_size(body);
-        let json = match Self::create_request_with_bootstrap(body, prefill.as_ref(), batch_size) {
-            Ok(json) => json,
+        let original = match serde_json::to_value(body) {
+            Ok(v) => v,
+            Err(e) => return Self::handle_serialization_error(e),
+        };
+        let json = match Self::inject_bootstrap_into_value(original, prefill.as_ref(), batch_size) {
+            Ok(v) => v,
             Err(e) => return Self::handle_serialization_error(e),
         };
 
@@ -1505,10 +1533,13 @@ impl RouterTrait for PDRouter {
             decode.url()
         );
 
-        // Create optimized request with bootstrap fields
         let batch_size = Self::get_chat_batch_size(body);
-        let json = match Self::create_request_with_bootstrap(body, prefill.as_ref(), batch_size) {
-            Ok(json) => json,
+        let original = match serde_json::to_value(body) {
+            Ok(v) => v,
+            Err(e) => return Self::handle_serialization_error(e),
+        };
+        let json = match Self::inject_bootstrap_into_value(original, prefill.as_ref(), batch_size) {
+            Ok(v) => v,
             Err(e) => return Self::handle_serialization_error(e),
         };
 
@@ -1560,10 +1591,13 @@ impl RouterTrait for PDRouter {
             decode.url()
         );
 
-        // Create optimized request with bootstrap fields
         let batch_size = Self::get_completion_batch_size(body);
-        let json = match Self::create_request_with_bootstrap(body, prefill.as_ref(), batch_size) {
-            Ok(json) => json,
+        let original = match serde_json::to_value(body) {
+            Ok(v) => v,
+            Err(e) => return Self::handle_serialization_error(e),
+        };
+        let json = match Self::inject_bootstrap_into_value(original, prefill.as_ref(), batch_size) {
+            Ok(v) => v,
             Err(e) => return Self::handle_serialization_error(e),
         };
 
