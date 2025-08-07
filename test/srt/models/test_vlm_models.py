@@ -19,11 +19,12 @@ from sglang.test.test_utils import (
 
 # VLM models for testing
 MODELS = [
-    # SimpleNamespace(model="google/gemma-3-27b-it", mmmu_accuracy=0.45), # FIXME: disable due to CUDA illegal memory access error, maybe caused by swa
+    SimpleNamespace(model="google/gemma-3-27b-it", mmmu_accuracy=0.45),
     SimpleNamespace(
         model="Qwen/Qwen2.5-VL-3B-Instruct",
         mmmu_accuracy=0.4,
     ),
+    SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),
 ]
 
 
