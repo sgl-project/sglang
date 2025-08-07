@@ -248,6 +248,7 @@ class ServerArgs:
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
     enable_triton_kernel_moe: bool = False
+    enable_flashinfer_mxfp4_moe: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -476,18 +477,10 @@ class ServerArgs:
                 or self.attention_backend == "triton"
             )
 
-            # Check if FlashInfer MXFP4 MoE is enabled
-            from sglang.srt.utils import get_bool_env_var
-
-            USE_FLASHINFER_MXFP4_MOE = get_bool_env_var(
-                "SGLANG_USE_FLASHINFER_MXFP4_MOE", "false"
-            )
-            USE_FLASHINFER_MXFP4_BF16_MOE = get_bool_env_var(
-                "SGLANG_USE_FLASHINFER_MXFP4_BF16_MOE", "false"
-            )
-
-            # Only enable Triton kernel MoE if FlashInfer is not enabled
-            if not (USE_FLASHINFER_MXFP4_MOE or USE_FLASHINFER_MXFP4_BF16_MOE):
+            if is_sm100_supported():
+                self.enable_flashinfer_mxfp4_moe = True
+                self.enable_triton_kernel_moe = False
+            else:
                 self.enable_triton_kernel_moe = True
 
             self.disable_hybrid_swa_memory = True
@@ -501,6 +494,20 @@ class ServerArgs:
             ):
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
+
+        if self.attention_backend == "dual_chunk_flash_attn":
+            logger.warning(
+                "Mixed chunk is disabled because of using dual chunk flash attention backend"
+            )
+            logger.warning(
+                "Radix cache is disabled because of using dual chunk flash attention backend"
+            )
+            logger.warning(
+                "Cuda graph is disabled because of using dual chunk flash attention backend"
+            )
+            self.enable_mixed_chunk = False
+            self.disable_cuda_graph = True
+            self.disable_radix_cache = True
 
         # Set page size
         if self.page_size is None:
@@ -1337,6 +1344,7 @@ class ServerArgs:
                 "triton",
                 "trtllm_mla",
                 "trtllm_mha",
+                "dual_chunk_flash_attn",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
@@ -1831,6 +1839,11 @@ class ServerArgs:
             action="store_true",
             help="Use triton moe grouped gemm kernel.",
         )
+        parser.add_argument(
+            "--enable-flashinfer-mxfp4-moe",
+            action="store_true",
+            help="Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
+        )
 
         # Debug tensor dumps
         parser.add_argument(
@@ -2022,6 +2035,8 @@ class ServerArgs:
 
         if model_arch in [
             "Gemma2ForCausalLM",
+            "Gemma3ForCausalLM",
+            "Gemma3ForConditionalGeneration",
             "Gemma3nForCausalLM",
             "Gemma3nForConditionalGeneration",
         ]:
@@ -2067,21 +2082,23 @@ class ServerArgs:
 
         if self.enable_lora:
             # Normalize lora_paths to a dictionary if it is a list.
+            # TODO (lifuhuang): support specifying pinned adapters in server_args.
             if isinstance(self.lora_paths, list):
                 lora_paths = self.lora_paths
                 self.lora_paths = {}
                 for lora_path in lora_paths:
                     if "=" in lora_path:
                         name, path = lora_path.split("=", 1)
-                        self.lora_paths[name] = LoRARef(lora_name=name, lora_path=path)
+                        self.lora_paths[name] = LoRARef(
+                            lora_name=name, lora_path=path, pinned=False
+                        )
                     else:
                         self.lora_paths[lora_path] = LoRARef(
-                            lora_name=lora_path,
-                            lora_path=lora_path,
+                            lora_name=lora_path, lora_path=lora_path, pinned=False
                         )
             elif isinstance(self.lora_paths, dict):
                 self.lora_paths = {
-                    k: LoRARef(lora_name=k, lora_path=v)
+                    k: LoRARef(lora_name=k, lora_path=v, pinned=False)
                     for k, v in self.lora_paths.items()
                 }
             elif self.lora_paths is None:
