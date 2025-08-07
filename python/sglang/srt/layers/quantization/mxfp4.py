@@ -240,21 +240,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
         if USE_FLASHINFER_MXFP4_MOE or USE_FLASHINFER_MXFP4_BF16_MOE:
-            intermediate_size_per_partition_after_pad = round_up(intermediate_size, 256)
+            intermediate_size = round_up(intermediate_size, 256)
             hidden_size = round_up(hidden_size, 256)
-        elif is_hip():
-            intermediate_size_per_partition_after_pad = round_up(intermediate_size, 128)
-        else:
-            intermediate_size_per_partition_after_pad = round_up(intermediate_size, 64)
-
-        self.intermediate_size = intermediate_size_per_partition_after_pad
+            
+        self.intermediate_size = intermediate_size
 
         self.hidden_size = hidden_size
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.zeros(
                 num_experts,
-                2 * intermediate_size_per_partition_after_pad,
+                2 * intermediate_size,
                 hidden_size // 2,
                 dtype=weight_dtype,
             ),
@@ -266,7 +262,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
                 num_experts,
-                2 * intermediate_size_per_partition_after_pad,
+                2 * intermediate_size,
                 hidden_size // mxfp4_block,
                 dtype=scale_dtype,
             ),
@@ -278,7 +274,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w13_weight_bias = torch.nn.Parameter(
             torch.zeros(
                 num_experts,
-                2 * intermediate_size_per_partition_after_pad,
+                2 * intermediate_size,
                 dtype=torch.bfloat16,
             ),
             requires_grad=False,
@@ -291,7 +287,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             torch.zeros(
                 num_experts,
                 hidden_size,
-                intermediate_size_per_partition_after_pad // 2,
+                intermediate_size // 2,
                 dtype=weight_dtype,
             ),
             requires_grad=False,
@@ -303,7 +299,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             torch.zeros(
                 num_experts,
                 hidden_size,
-                intermediate_size_per_partition_after_pad // mxfp4_block,
+                intermediate_size // mxfp4_block,
                 dtype=scale_dtype,
             ),
             requires_grad=False,
