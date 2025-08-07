@@ -412,37 +412,8 @@ impl PDRouter {
                         Err(error_response) => return error_response,
                     }
                 } else {
-                    // When we don't need logprobs, spawn a separate thread to consume prefill response
-                    if let Ok(prefill_res) = prefill_result {
-                        debug!("Spawning separate thread to consume prefill response");
-                        std::thread::spawn(move || {
-                            // Create a new single-threaded runtime just for this task
-                            let rt = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .unwrap();
-
-                            rt.block_on(async move {
-                                // Consume the response
-                                match prefill_res.bytes().await {
-                                    Ok(_) => debug!(
-                                        "Prefill response consumed successfully in background"
-                                    ),
-                                    Err(e) => warn!(
-                                        "Error consuming prefill response in background: {}",
-                                        e
-                                    ),
-                                }
-                            });
-                        });
-                    } else if let Err(e) = prefill_result {
-                        // Log prefill error but don't fail the request since decode succeeded
-                        warn!(
-                            "Prefill request failed but continuing with decode response: {}",
-                            e
-                        );
-                        RouterMetrics::record_pd_prefill_error(prefill.url());
-                    }
+                    // Skip prefill processing entirely when we don't need logprobs
+                    debug!("Skipping prefill response processing (return_logprob=false)");
                     None
                 };
 
