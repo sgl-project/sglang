@@ -130,7 +130,7 @@ class TestW8A8FP8FusedMoE(CustomTestCase):
             topk_output = select_experts(
                 hidden_states=a,
                 router_logits=score,
-                topk_config=TopKConfig(top_k=topk),
+                topk_config=TopKConfig(top_k=topk, renormalize=False),
             )
             out = fused_moe(
                 a,

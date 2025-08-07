@@ -136,7 +136,7 @@ class TestFusedMOE(CustomTestCase):
             topk_output = select_experts(
                 hidden_states=a,
                 router_logits=score,
-                topk_config=TopKConfig(top_k=topk),
+                topk_config=TopKConfig(top_k=topk, renormalize=False),
             )
 
             sglang_output = fused_moe(
@@ -174,7 +174,7 @@ class TestFusedMOE(CustomTestCase):
             topk_output = select_experts(
                 hidden_states=a,
                 router_logits=score,
-                topk_config=TopKConfig(top_k=topk),
+                topk_config=TopKConfig(top_k=topk, renormalize=False),
             )
 
             triton_output = fused_moe(a, w1, w2, topk_output)
