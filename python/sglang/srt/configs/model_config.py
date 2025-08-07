@@ -27,6 +27,7 @@ from sglang.srt.hf_transformers_utils import (
     get_context_length,
     get_generation_config,
     get_hf_text_config,
+    get_sparse_attention_config,
 )
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
@@ -112,6 +113,7 @@ class ModelConfig:
             mm_disabled_models = [
                 "Gemma3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
+                "Step3VLForConditionalGeneration",
             ]
             if self.hf_config.architectures[0] in mm_disabled_models:
                 enable_multimodal = False
@@ -126,6 +128,9 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
         ):
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+
+        if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
+            self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
@@ -258,10 +263,16 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
+        self.num_nextn_predict_layers = getattr(
+            self.hf_text_config, "num_nextn_predict_layers", None
+        )
         self.vocab_size = self.hf_text_config.vocab_size
 
         # Verify quantization
         self._verify_quantization()
+
+        # Verify dual-chunk attention config
+        self._verify_dual_chunk_attention_config()
 
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
@@ -289,6 +300,13 @@ class ModelConfig:
             model_impl=server_args.model_impl,
             **kwargs,
         )
+
+    def get_total_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
+    def get_num_attention_heads(self, tensor_parallel_size) -> int:
+        total_num_attention_heads = self.num_attention_heads
+        return max(1, total_num_attention_heads // tensor_parallel_size)
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
@@ -329,6 +347,8 @@ class ModelConfig:
             "num_key_value_heads",
             # For ChatGLM:
             "multi_query_group_num",
+            # For Step3
+            "num_attention_groups",
         ]
         for attr in attributes:
             num_kv_heads = getattr(self.hf_text_config, attr, None)
@@ -392,6 +412,8 @@ class ModelConfig:
             "fbgemm_fp8",
             "w8a8_fp8",
             "petit_nvfp4",
+            "quark",
+            "mxfp4",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -473,9 +495,26 @@ class ModelConfig:
                     self.quantization,
                 )
 
+    def _verify_dual_chunk_attention_config(self) -> None:
+        if hasattr(self.hf_config, "dual_chunk_attention_config"):
+            # Try loading the sparse attention config
+            sparse_attn_config = get_sparse_attention_config(self.model_path)
+            if not sparse_attn_config:
+                return
+            self.hf_config.dual_chunk_attention_config["sparse_attention_config"] = (
+                sparse_attn_config
+            )
+            if (
+                "sparse_attention_enabled"
+                not in self.hf_config.dual_chunk_attention_config
+            ):
+                self.hf_config.dual_chunk_attention_config[
+                    "sparse_attention_enabled"
+                ] = True
+
     def get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
-        if eos_ids:
+        if eos_ids is not None:
             # it can be either int or list of int
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
         if eos_ids is None:
@@ -635,8 +674,10 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
+    "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
+    "Step3VLForConditionalGeneration",
 ]
 
 
