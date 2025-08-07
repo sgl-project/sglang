@@ -155,8 +155,8 @@ class TestDisaggregationMooncakeDecodeLargerTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGLANG_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGLANG_ENABLE_JIT_DEEPGEMM"] = "false"
+        cls._exit_stack = ExitStack()
+        cls._exit_stack.enter_context(envs.SGLANG_ENABLE_JIT_DEEPGEMM.override(False))
 
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
@@ -255,10 +255,7 @@ class TestDisaggregationMooncakeDecodeLargerTP(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         # Restore JIT DeepGEMM environment variable
-        if cls.original_jit_deepgemm is not None:
-            os.environ["SGLANG_ENABLE_JIT_DEEPGEMM"] = cls.original_jit_deepgemm
-        else:
-            os.environ.pop("SGLANG_ENABLE_JIT_DEEPGEMM", None)
+        cls._exit_stack.close()
 
         for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
             if process:

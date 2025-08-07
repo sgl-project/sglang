@@ -7,12 +7,13 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from tqdm.contrib.concurrent import thread_map
 
+from sglang.environ import envs
 from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
     DEEPGEMM_BLACKWELL,
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var, get_int_env_var
+from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -24,18 +25,14 @@ if ENABLE_JIT_DEEPGEMM and not DEEPGEMM_BLACKWELL:
 
 
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
-_ENABLE_JIT_DEEPGEMM_PRECOMPILE = get_bool_env_var(
-    "SGLANG_JIT_DEEPGEMM_PRECOMPILE", "true"
-)
+_ENABLE_JIT_DEEPGEMM_PRECOMPILE = envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.value
 _DO_COMPILE_ALL = True
 _IS_FIRST_RANK_ON_NODE = get_bool_env_var("SGLANG_IS_FIRST_RANK_ON_NODE", "true")
-_COMPILE_WORKERS = get_int_env_var("SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS", 4)
-_IN_PRECOMPILE_STAGE = get_bool_env_var("SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE", "false")
+_COMPILE_WORKERS = envs.SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS.value
+_IN_PRECOMPILE_STAGE = envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.value
 
 # Force redirect deep_gemm cache_dir
-os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
-    "SGLANG_DG_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "deep_gemm")
-)
+os.environ["DG_JIT_CACHE_DIR"] = envs.SGLANG_DG_CACHE_DIR.value
 
 # Refer to https://github.com/deepseek-ai/DeepGEMM/commit/d75b218b7b8f4a5dd5406ac87905039ead3ae42f
 # NVRTC may have performance loss with some cases.
@@ -52,7 +49,10 @@ if ENABLE_JIT_DEEPGEMM:
             "and may have performance loss with some cases."
         )
         _USE_NVRTC_DEFAULT = "1"
-os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGLANG_DG_USE_NVRTC", _USE_NVRTC_DEFAULT)
+
+os.environ["DG_JIT_USE_NVRTC"] = envs.SGLANG_DG_USE_NVRTC.get_set_value_or(
+    _USE_NVRTC_DEFAULT
+)
 
 
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):

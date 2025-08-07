@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.environ import envs
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
@@ -2214,7 +2215,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         if (
                             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                             and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
-                            and get_bool_env_var("SGLANG_USE_DEEPGEMM_BMM", "false")
+                            and envs.SGLANG_USE_DEEPGEMM_BMM.value
                         ):
                             block_scale = weight_scale
                             use_deep_gemm_bmm = True

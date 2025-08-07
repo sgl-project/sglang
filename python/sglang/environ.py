@@ -36,6 +36,14 @@ class EnvField:
             )
             return self.default
 
+    def is_set(self):
+        # NOTE: If None is manually set, it is considered as set.
+        return self.name in os.environ or self._set_to_none
+
+    def get_set_value_or(self, or_value: Any):
+        # NOTE: Ugly usage, but only way to get custom default value.
+        return self.get() if self.is_set() else or_value
+
     def set(self, value: Any):
         if value is None:
             self._set_to_none = True
@@ -149,6 +157,12 @@ class Envs:
 
     # DeepGemm
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
+    SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
+    SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)
+    SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
+    SGLANG_DG_USE_NVRTC = EnvBool(False)
+    SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
 
     SGLANG_MOE_PADDING = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
