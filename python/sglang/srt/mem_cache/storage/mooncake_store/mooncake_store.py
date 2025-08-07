@@ -13,7 +13,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
-DEFAULT_LOCAL_BUFFER_SIZE = 128 * 1024 * 1024  # 128 MB
+DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +56,8 @@ class MooncakeStoreConfig:
             global_segment_size=config.get(
                 "global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE
             ),
-            local_buffer_size=config.get(
-                "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
-            ),
+            # Zero copy interface does not need local buffer
+            local_buffer_size= DEFAULT_LOCAL_BUFFER_SIZE,
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", "auto"),
             master_server_address=config.get("master_server_address"),
@@ -81,9 +80,8 @@ class MooncakeStoreConfig:
             global_segment_size=int(
                 os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
-            local_buffer_size=int(
-                os.getenv("MOONCAKE_LOCAL_BUFFER_SIZE", DEFAULT_LOCAL_BUFFER_SIZE)
-            ),
+            # Zero copy interface does not need local buffer
+            local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
             protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
             device_name=os.getenv("MOONCAKE_DEVICE", "auto"),
             master_server_address=os.getenv("MOONCAKE_MASTER"),

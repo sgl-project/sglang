@@ -60,7 +60,6 @@ Start the SGLang server with Mooncake enabled. Mooncake configuration can be pro
 ```bash
 MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
 MOONCAKE_GLOBAL_SEGMENT_SIZE=4294967296 \
-MOONCAKE_LOCAL_BUFFER_SIZE=134217728 \
 MOONCAKE_PROTOCOL="rdma" \
 MOONCAKE_DEVICE="erdma_0,erdma_1" \
 MOONCAKE_MASTER=127.0.0.1:50051 \
