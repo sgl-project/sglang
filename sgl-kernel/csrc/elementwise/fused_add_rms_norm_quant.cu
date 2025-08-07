@@ -4,12 +4,12 @@
 #include <cuda_runtime.h>
 #include <torch/all.h>
 
-#include <flashinfer/vec_dtypes.cuh>
-#include <iostream>
-
 #include "utils.h"
 
+// RMS stage performs better with lower block size while quant
+// stage is much better with higher ones due to extesive syncing
 #define RMS_BLOCK_SIZE 256
+#define QUANT_BLOCK_SIZE 1024
 #define PACK_SIZE 16
 
 // like std::array, but aligned
@@ -51,25 +51,27 @@ __global__ void fused_add_rms_norm_quant_kernel(
   float acc = 0.f;
   __shared__ float reduction[RMS_BLOCK_SIZE / 32];
 
-  for (int idx = tx; idx < d; idx += blockDim.x) {
-    P x = reinterpret_cast<P*>(input + row * stride)[idx];
-    P r = reinterpret_cast<P*>(residual + row * r_stride)[idx];
+  if (threadIdx.x < RMS_BLOCK_SIZE) {
+    for (int idx = tx; idx < d; idx += RMS_BLOCK_SIZE) {
+      P x = reinterpret_cast<P*>(input + row * stride)[idx];
+      P r = reinterpret_cast<P*>(residual + row * r_stride)[idx];
 
-    for (int i = 0; i < P::size; i++) {
-      x.data[i] += r.data[i];
-      acc += (float)x.data[i] * (float)x.data[i];
+      for (int i = 0; i < P::size; i++) {
+        x.data[i] += r.data[i];
+        acc += (float)x.data[i] * (float)x.data[i];
+      }
+      reinterpret_cast<P*>(residual + row * r_stride)[idx] = x;
     }
-    reinterpret_cast<P*>(residual + row * r_stride)[idx] = x;
-  }
 
-  acc += __shfl_xor_sync(0xffffffff, acc, 16, 32);
-  acc += __shfl_xor_sync(0xffffffff, acc, 8, 32);
-  acc += __shfl_xor_sync(0xffffffff, acc, 4, 32);
-  acc += __shfl_xor_sync(0xffffffff, acc, 2, 32);
-  acc += __shfl_xor_sync(0xffffffff, acc, 1, 32);
+    acc += __shfl_xor_sync(0xffffffff, acc, 16, 32);
+    acc += __shfl_xor_sync(0xffffffff, acc, 8, 32);
+    acc += __shfl_xor_sync(0xffffffff, acc, 4, 32);
+    acc += __shfl_xor_sync(0xffffffff, acc, 2, 32);
+    acc += __shfl_xor_sync(0xffffffff, acc, 1, 32);
 
-  if (tx % 32 == 0) {
-    reduction[warp_id] = acc;
+    if (tx % 32 == 0) {
+      reduction[warp_id] = acc;
+    }
   }
 
   __syncthreads();
@@ -91,7 +93,7 @@ __global__ void fused_add_rms_norm_quant_kernel(
   acc = reduction[0];
   using O = array_t<DST_DTYPE, P::size>;
 
-  for (int idx = tx; idx < d; idx += blockDim.x) {
+  for (int idx = tx; idx < d; idx += QUANT_BLOCK_SIZE) {
     float local_absmax = quant_eps;
     P x = reinterpret_cast<P*>(residual + row * r_stride)[idx];
     P w = reinterpret_cast<P*>(weight)[idx];
@@ -135,7 +137,8 @@ __global__ void fused_add_rms_norm_quant_kernel(
       q = fminf(fmaxf(q, fp8_min), fp8_max);
       out.data[i] = DST_DTYPE(q);
     }
-    __stcg(&reinterpret_cast<int2*>(output_q)[row * d + idx], *reinterpret_cast<int2*>(&out));
+    using store_t = std::conditional_t<sizeof(scalar_t) == 2, int2, int>;
+    __stcg(&reinterpret_cast<store_t*>(output_q)[row * d + idx], *reinterpret_cast<store_t*>(&out));
   }
 }
 
@@ -159,7 +162,7 @@ void sgl_fused_add_rmsnorm_quant(
   const unsigned int scale_stride = output_s.stride(1);
 
   dim3 grid(rows);
-  dim3 block(RMS_BLOCK_SIZE);
+  dim3 block(QUANT_BLOCK_SIZE);
 
   cudaLaunchAttribute attributes[1];
   attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
