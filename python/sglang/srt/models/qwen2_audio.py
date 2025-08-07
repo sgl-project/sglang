@@ -118,7 +118,7 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # Extract audio features from input items
-        input_features = torch.cat([item.audio_features for item in items], dim=0).type(
+        input_features = torch.cat([item.feature for item in items], dim=0).type(
             self.audio_tower.dtype
         )
 

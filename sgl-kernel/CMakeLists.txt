@@ -45,7 +45,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        f115c3f85467d5d9619119d1dbeb9c03c3d73864
+    GIT_TAG        664c4f7b3ed1959414905025728eef5568209479
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -54,9 +54,12 @@ FetchContent_Populate(repo-cutlass)
 if("${CUDA_VERSION}" VERSION_EQUAL "12.8")
   set(DeepGEMM_REPO "https://github.com/sgl-project/DeepGEMM")
   set(DeepGEMM_TAG "blackwell")
+elseif("${CUDA_VERSION}" VERSION_EQUAL "12.9")
+  set(DeepGEMM_REPO "https://github.com/sgl-project/DeepGEMM")
+  set(DeepGEMM_TAG "blackwell")
 else()
   set(DeepGEMM_REPO "https://github.com/deepseek-ai/DeepGEMM")
-  set(DeepGEMM_TAG "8dfa3298274bfe6b242f6f8a3e6f3eff2707dd9f")
+  set(DeepGEMM_TAG "391755ada0ffefa9a6a52b6f14dcaf22d1a463e0")
 endif()
 
 FetchContent_Declare(
@@ -66,6 +69,16 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
+
+# Triton
+FetchContent_Declare(
+    repo-triton
+    GIT_REPOSITORY "https://github.com/triton-lang/triton"
+    GIT_TAG        8f9f695ea8fde23a0c7c88e4ab256634ca27789f
+    GIT_SHALLOW    OFF
+)
+FetchContent_Populate(repo-triton)
+
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
@@ -222,7 +235,9 @@ set(SOURCES
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
     "csrc/gemm/dsv3_fused_a_gemm.cu"
-    "csrc/gemm/dsv3_router_gemm.cu"
+    "csrc/gemm/dsv3_router_gemm_bf16_out.cu"
+    "csrc/gemm/dsv3_router_gemm_entry.cu"
+    "csrc/gemm/dsv3_router_gemm_float_out.cu"
     "csrc/gemm/fp8_blockwise_gemm_kernel.cu"
     "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"
@@ -246,6 +261,7 @@ set(SOURCES
     "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/packbit.cu"
+    "csrc/spatial/greenctx_stream.cu"
     "csrc/speculative/speculative_sampling.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
     "csrc/kvcacheio/transfer.cu"
@@ -410,3 +426,9 @@ install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
 
 install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
         DESTINATION "deep_gemm/include/cutlass")
+
+# triton_kernels
+install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"
+        DESTINATION "triton_kernels"
+        PATTERN ".git*" EXCLUDE
+        PATTERN "__pycache__" EXCLUDE)
