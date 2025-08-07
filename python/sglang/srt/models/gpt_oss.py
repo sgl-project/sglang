@@ -63,7 +63,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, get_bool_env_var, make_layers
 
 
 class GptOssConfig(PretrainedConfig):
@@ -74,6 +74,11 @@ class GptOssConfig(PretrainedConfig):
 
 
 logger = logging.getLogger(__name__)
+
+USE_FLASHINFER_MXFP4_MOE = get_bool_env_var("SGLANG_USE_FLASHINFER_MXFP4_MOE", "false")
+USE_FLASHINFER_MXFP4_BF16_MOE = get_bool_env_var(
+    "SGLANG_USE_FLASHINFER_MXFP4_BF16_MOE", "false"
+)
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -102,10 +107,13 @@ class GptOssSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_local_experts}."
             )
 
-        self.topk = TopK(
-            top_k=config.num_experts_per_tok,
-            renormalize=True,
-        )
+        if USE_FLASHINFER_MXFP4_MOE or USE_FLASHINFER_MXFP4_BF16_MOE:
+            self.topk = None
+        else:
+            self.topk = TopK(
+                top_k=config.num_experts_per_tok,
+                renormalize=True,
+            )
 
         experts_type = get_moe_impl_class()
         extra_kwargs = {}
@@ -176,7 +184,7 @@ class GptOssSparseMoeBlock(nn.Module):
         if self.topk is not None:
             kwargs["topk_output"] = self.topk(hidden_states, router_logits)
         else:
-            kwargs["router_logits"] = router_logits
+            kwargs["topk_output"] = (self.topk, router_logits)
         final_hidden_states = self.experts(**kwargs)
 
         if self.tp_size > 1:
