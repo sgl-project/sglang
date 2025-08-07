@@ -13,14 +13,13 @@ fi
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
 
-if ! command -v git >/dev/null 2>&1; then
-    apt update
-    apt install -y git
+if [ "$MODE_BLACKWELL" = "1" ]; then
+    apt-get install -y git libnuma-dev
 fi
 
 # Update pip
 if [ "$MODE_BLACKWELL" != "1" ]; then
-    pip install --upgrade pip --break-system-packages
+    pip install --upgrade pip
 fi
 
 # Clean up existing installations
@@ -32,7 +31,13 @@ rm -rf /usr/local/lib/python3.10/dist-packages/flashinfer*
 rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
 
 # Install the main package
-pip install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/test/${CU_VERSION} --break-system-packages
+pip install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} --break-system-packages
+
+if [ "$MODE_BLACKWELL" = "1" ]; then
+    # TODO auto determine sgl-kernel version
+    SGL_KERNEL_VERSION=0.3.2
+    pip3 install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}-cp39-abi3-manylinux2014_x86_64.whl --break-system-packages
+fi
 
 # Show current packages
 pip list
