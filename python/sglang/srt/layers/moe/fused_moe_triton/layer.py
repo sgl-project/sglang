@@ -38,6 +38,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     next_power_of_2,
+    round_up,
 )
 
 if is_flashinfer_available():
@@ -146,7 +147,6 @@ class FusedMoE(torch.nn.Module):
 
         self.layer_id = layer_id
         self.top_k = top_k
-        self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_fused_shared_experts = num_fused_shared_experts
         self.expert_map_cpu = None
@@ -206,6 +206,16 @@ class FusedMoE(torch.nn.Module):
         assert self.quant_method is not None
 
         self.quant_config = quant_config
+        self.use_enable_flashinfer_mxfp4_moe = global_server_args_dict.get(
+            "enable_flashinfer_mxfp4_moe", False
+        )
+        if (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "mxfp4"
+            and self.use_enable_flashinfer_mxfp4_moe
+        ):
+            hidden_size = round_up(hidden_size, 256)
+        self.hidden_size = hidden_size
         self.quant_method.create_weights(
             layer=self,
             num_experts=self.num_local_experts,
@@ -784,6 +794,14 @@ class FusedMoE(torch.nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: StandardTopKOutput):
+        origin_hidden_states_dim = hidden_states.shape[-1]
+        if self.hidden_size != origin_hidden_states_dim:
+            hidden_states = torch.nn.functional.pad(
+                hidden_states,
+                (0, self.hidden_size - origin_hidden_states_dim),
+                mode="constant",
+                value=0.0,
+            )
         assert self.quant_method is not None
 
         if self.moe_ep_size > 1 and not self.enable_flashinfer_cutlass_moe:
@@ -829,7 +847,7 @@ class FusedMoE(torch.nn.Module):
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        return final_hidden_states
+        return final_hidden_states[..., :origin_hidden_states_dim].contiguous()
 
     @classmethod
     def make_expert_params_mapping(
@@ -1063,10 +1081,15 @@ class FlashInferFP4MoE(FusedMoE):
             gemm1_weights_scale=self.gemm1_scales_fp4_shuffled.data.view(
                 torch.float8_e4m3fn
             ),
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
             gemm2_weights=self.gemm2_weights_fp4_shuffled.data,
             gemm2_weights_scale=self.gemm2_scales_fp4_shuffled.data.view(
                 torch.float8_e4m3fn
             ),
+            gemm2_bias=None,
             output1_scale_scalar=self.g1_scale_c.data,
             output1_scale_gate_scalar=self.g1_alphas.data,
             output2_scale_scalar=self.g2_alphas.data,
