@@ -97,7 +97,7 @@ class EvalArgs:
             "--response-answer-regex",
             type=str,
             default=EvalArgs.response_answer_regex,
-            help="Specific regex to capture the answer from the respone string",
+            help="Specific regex to capture the answer from the response, string",
         )
         parser.add_argument(
             "--lora-path",
