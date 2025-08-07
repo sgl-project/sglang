@@ -1,14 +1,13 @@
 use super::{WorkerError, WorkerResult};
 use async_trait::async_trait;
 use futures;
-use once_cell::sync::Lazy;
 use serde_json;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 // Shared HTTP client for worker operations (health checks, server info, etc.)
-static WORKER_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30)) // Default timeout, overridden per request
         .build()
