@@ -1,7 +1,7 @@
 import logging
 from typing import List, Optional
 
-from sglang.srt.utils import get_bool_env_var, get_free_port
+from sglang.srt.utils import get_bool_env_var, get_free_port, maybe_wrap_ipv6_address
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,9 @@ class MooncakeTransferEngine:
             hostname=self.hostname,
             device_name=self.ib_device,
         )
-        self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
+        self.session_id = (
+            f"{maybe_wrap_ipv6_address(self.hostname)}:{self.engine.get_rpc_port()}"
+        )
 
     def register(self, ptr, length):
         try:

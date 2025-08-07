@@ -84,7 +84,6 @@ class TestLoRA(CustomTestCase):
         torch.use_deterministic_algorithms(True)
 
     def _run_lora_multiple_batch_on_model_cases(self, model_cases: List[LoRAModelCase]):
-
         for model_case in model_cases:
             for torch_dtype in TORCH_DTYPES:
                 max_new_tokens = 32

@@ -497,7 +497,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
@@ -508,9 +508,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
-        pixel_values = torch.cat(
-            [getattr(item, "pixel_values_videos") for item in items], dim=0
-        ).type(self.visual.dtype)
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
+            self.visual.dtype
+        )
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()

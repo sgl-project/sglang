@@ -53,7 +53,7 @@ class ModelConfig:
         trust_remote_code: bool = True,
         revision: Optional[str] = None,
         context_length: Optional[int] = None,
-        model_override_args: Optional[str] = None,
+        model_override_args: str = "{}",
         is_embedding: Optional[bool] = None,
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
@@ -61,13 +61,13 @@ class ModelConfig:
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
-        impl: Union[str, ModelImpl] = ModelImpl.AUTO,
+        model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
     ) -> None:
 
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
-        self.impl = impl
+        self.model_impl = model_impl
 
         # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
@@ -112,6 +112,7 @@ class ModelConfig:
             mm_disabled_models = [
                 "Gemma3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
+                "Step3VLForConditionalGeneration",
             ]
             if self.hf_config.architectures[0] in mm_disabled_models:
                 enable_multimodal = False
@@ -126,6 +127,9 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
         ):
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+
+        if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
+            self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
@@ -258,6 +262,9 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
+        self.num_nextn_predict_layers = getattr(
+            self.hf_text_config, "num_nextn_predict_layers", None
+        )
         self.vocab_size = self.hf_text_config.vocab_size
 
         # Verify quantization
@@ -286,7 +293,7 @@ class ModelConfig:
             dtype=server_args.dtype,
             quantization=server_args.quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
-            impl=server_args.impl,
+            model_impl=server_args.model_impl,
             **kwargs,
         )
 
@@ -329,6 +336,8 @@ class ModelConfig:
             "num_key_value_heads",
             # For ChatGLM:
             "multi_query_group_num",
+            # For Step3
+            "num_attention_groups",
         ]
         for attr in attributes:
             num_kv_heads = getattr(self.hf_text_config, attr, None)
@@ -391,6 +400,9 @@ class ModelConfig:
             "compressed-tensors",
             "fbgemm_fp8",
             "w8a8_fp8",
+            "petit_nvfp4",
+            "quark",
+            "mxfp4",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -408,9 +420,11 @@ class ModelConfig:
             "moe_wna16",
             "qoq",
             "w4afp8",
+            "petit_nvfp4",
         ]
         compatible_quantization_methods = {
             "modelopt_fp4": ["modelopt"],
+            "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
@@ -472,7 +486,7 @@ class ModelConfig:
 
     def get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
-        if eos_ids:
+        if eos_ids is not None:
             # it can be either int or list of int
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
         if eos_ids is None:
@@ -632,8 +646,10 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
+    "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
+    "Step3VLForConditionalGeneration",
 ]
 
 
