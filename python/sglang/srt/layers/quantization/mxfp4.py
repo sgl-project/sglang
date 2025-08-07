@@ -551,12 +551,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         swiglu_limit: Optional[float] = None,
     ) -> torch.Tensor:
         if self.use_flashinfer:
-            # When USE_FLASHINFER_MXFP4_BF16_MOE is enabled, we don't need to quantize the input,
-            # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
-            # which can theoretically improve performance
-            assert x.dtype == torch.bfloat16
-            x_quant = x
-            x_scale = None
+            # Based on profiling results, we need to quantize x to mxfp8 here to achieve better performance
+            x_quant, x_scale = mxfp8_quantize(x, False)  # to mxfp8
+            x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
 
             topk_weights, topk_ids, router_logits = topk_output
             top_k = topk_weights.shape[-1]
