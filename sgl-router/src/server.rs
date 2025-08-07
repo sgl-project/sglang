@@ -269,7 +269,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let client = Client::builder()
         .pool_idle_timeout(Some(Duration::from_secs(50)))
-        .pool_max_idle_per_host(100) // Increase from default of 1 to allow more concurrent connections
+        .pool_max_idle_per_host(500) // Increase to 500 connections per host
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect_timeout(Duration::from_secs(10)) // Separate connection timeout
         .tcp_nodelay(true)

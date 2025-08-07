@@ -59,6 +59,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
 
+    /// Check if this policy needs request text for routing decisions
+    fn needs_request_text(&self) -> bool {
+        false // Default: most policies don't need request text
+    }
+
     /// Update worker load information
     ///
     /// This is called periodically with current load information for load-aware policies.
