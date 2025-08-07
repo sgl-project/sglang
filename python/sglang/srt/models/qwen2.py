@@ -99,7 +99,7 @@ class Qwen2MLP(nn.Module):
             max_M=1000, N=8192, K=3696,
             input_dtype=torch.bfloat16,
             output_dtype=torch.bfloat16,
-            local_world_size=8, persistent=True, copy_to_local=False,
+            local_world_size=8, persistent=False, copy_to_local=True,
             use_ll_kernel=False, NUM_COMM_SMS=2)
 
     def forward(self, x):
