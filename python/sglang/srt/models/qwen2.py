@@ -94,10 +94,25 @@ class Qwen2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
+        self.gemm_ar = GemmARLayer(
+            tp_group=ps._TP_GLOO,
+            max_M=1000, N=8192, K=3696,
+            input_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+            local_world_size=8, persistent=True, copy_to_local=False,
+            use_ll_kernel=False, NUM_COMM_SMS=2)
+
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        if get_int_env_var('TP_OVERLAP', 0) == 1:
+            output_parallel = F.linear(x, self.down_proj.weight, self.down_proj.bias)
+            x = ps.get_tp_group().all_reduce(output_parallel)
+        elif get_int_env_var('TP_OVERLAP', 0) == 2:
+            x = self.gemm_ar.forward(x, self.down_proj.weight, self.down_proj.bias)
+        else:
+            x, _ = self.down_proj(x)
+
         return x
 
 
