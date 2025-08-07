@@ -209,7 +209,7 @@ class MooncakeStore(HiCacheStorage):
         keys: List[str],
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
-    ) -> torch.Tensor | None:
+    ) -> List[int] | None:
         assert len(keys) == len(target_location) == len(target_sizes)
         if len(keys) == 0:
             return
@@ -249,9 +249,5 @@ class MooncakeStore(HiCacheStorage):
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
-    ) -> None:
-        try:
-            self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
-        except TypeError as err:
-            logger.error("Failed to get value from Mooncake Store: %s", err)
-            raise TypeError("Mooncake Store Get Type Error.") from err
+    ) -> List[int]:
+        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)

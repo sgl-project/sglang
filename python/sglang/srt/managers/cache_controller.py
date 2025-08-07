@@ -539,6 +539,7 @@ class HiCacheController:
         operation.mark_done()
         return operation.completed_tokens, operation.hash_value
 
+    # Get batch by batch
     def generic_page_transfer(self, operation, batch_size=8):
         for i in range(0, len(operation.hash_value), batch_size):
             page_hashes = operation.hash_value[i : i + batch_size]
@@ -567,12 +568,32 @@ class HiCacheController:
                 )
                 break
 
+    # Get in one batch
     def mooncake_page_transfer(self, operation):
+        completed_tokens = 0
         key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
             operation.hash_value, operation.host_indices
         )
-        self.storage_backend.batch_get(key_strs, buffer_ptrs, buffer_sizes)
-        operation.increment(len(operation.hash_value) * self.page_size)
+        get_result = self.storage_backend.batch_get(
+            key_strs, buffer_ptrs, buffer_sizes
+        )
+        if get_result is None:
+            logger.warning(
+                f"Prefetch operation {operation.request_id} failed to call "
+                f"MooncakeStore.batch_get: invalid parameters."
+            )
+        elif len(get_result) == sum(1 for v in get_result if v > 0):
+            # If all keys are retrieved successfully, mark them as success,
+            # otherwise mark all of them as failed.
+            # TODO: After the Page First PR, we can just mark successful pages to success.
+            completed_tokens = len(operation.hash_value) * self.page_size
+        if completed_tokens > 0:
+            operation.increment(completed_tokens)
+        if completed_tokens < len(operation.hash_value) * self.page_size:
+            # operation terminated by controller, release pre-allocated memory
+            self.mem_pool_host.free(
+                operation.host_indices[completed_tokens :]
+            )
 
     def is_mooncake_backend(self):
         return self.storage_backend_type == "mooncake"
@@ -673,6 +694,7 @@ class HiCacheController:
                     )
                     storage_hit_count = storage_hit_count_tensor.item()
 
+                print(f"prefetch_thread_func: storage_hit_count {storage_hit_count}, self.prefetch_threshold {self.prefetch_threshold}")
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
@@ -731,7 +753,7 @@ class HiCacheController:
             success = self.storage_backend.exists(operation.hash_value)
             if success is None:
                 # The input hash_value is invalid, skip backup
-                logger.warning(f"Failed to call mooncake_store.exists.")
+                logger.warning(f"Failed to call MooncakeStore.exists: invalid parameters.")
                 pass
             else:
                 set_op_indices = []
