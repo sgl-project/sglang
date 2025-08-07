@@ -33,6 +33,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_hip,
     is_npu,
     set_weight_attrs,
 )
@@ -42,9 +43,12 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_hip = is_hip()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+elif _is_hip:
+    from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
 
 if is_npu():
     import torch_npu
@@ -110,13 +114,28 @@ class NewGELU(CustomOp):
         return self.forward_native(x)
 
 
+class ReLU2(nn.Module):
+    """
+    Applies the squared Rectified Linear Unit function.
+    y = max(0, x)^2
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(x)
+        return x * x
+
+
 class QuickGELU(CustomOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(1.702 * x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO(zhyncs): Implement the CUDA kernel for QuickGELU in sgl-kernel
         return self.forward_native(x)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        gelu_quick(x, out)
+        return out
 
 
 class ScaledActivation(nn.Module):
@@ -165,6 +184,7 @@ _ACTIVATION_REGISTRY = {
     "gelu": nn.GELU(),
     "gelu_pytorch_tanh": nn.GELU(approximate="tanh"),
     "gelu_new": NewGELU(),
+    "relu2": ReLU2(),
 }
 
 
@@ -210,8 +230,8 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
         return nn.Identity()
 
 
-if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
+if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_hip):
     logger.info(
-        "sgl-kernel is not available on Non-NV platforms or Non-AMX CPUs. Fallback to other kernel libraries."
+        "sgl-kernel is not available on Non-NV, Non-AMD platforms or Non-AMX CPUs. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul

@@ -64,11 +64,13 @@ class TestCase:
     base: str
     max_loras_per_batch: int
     all_adapters: List[str]
-    initial_adapters: List[str]
     op_sequence: List[Operation]
+    initial_adapters: Optional[List[str]] = None
+    enable_lora: Optional[bool] = None
     max_lora_rank: Optional[int] = None
     lora_target_modules: Optional[List] = None
     max_new_tokens: int = 32
+    max_loaded_loras: Optional[int] = None
 
 
 def create_batch_data(adapters: Union[str, list]) -> List[tuple[str, str]]:
@@ -172,35 +174,40 @@ BASIC_TESTS = [
         ],
     ),
     TestCase(
-        description="dynamic lora update with evictions",
+        description="dynamic lora update without initial lora_paths",
         base="meta-llama/Llama-3.1-8B-Instruct",
-        max_loras_per_batch=1,
+        enable_lora=True,
+        max_lora_rank=256,
+        lora_target_modules=["all"],
+        max_loras_per_batch=4,
         all_adapters=[
             "philschmid/code-llama-3-1-8b-text-to-sql-lora",
             "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
             "pbevan11/llama-3.1-8b-ocr-correction",
         ],
-        initial_adapters=["philschmid/code-llama-3-1-8b-text-to-sql-lora"],
         op_sequence=[
             Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("philschmid/code-llama-3-1-8b-text-to-sql-lora"),
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
             ),
             Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
-                ),
-                expected_error="not loaded",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
-                expected_error="not loaded",
+                type=OperationType.LOAD,
+                data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
             ),
             Operation(
                 type=OperationType.LOAD,
                 data="pbevan11/llama-3.1-8b-ocr-correction",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                        "pbevan11/llama-3.1-8b-ocr-correction",
+                        None,
+                    ]
+                ),
             ),
             Operation(
                 type=OperationType.UNLOAD,
@@ -213,43 +220,14 @@ BASIC_TESTS = [
             ),
             Operation(
                 type=OperationType.FORWARD,
-                data=create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
                 data=create_batch_data(
-                    "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
+                    [
+                        None,
+                        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                        "pbevan11/llama-3.1-8b-ocr-correction",
+                        None,
+                    ]
                 ),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("philschmid/code-llama-3-1-8b-text-to-sql-lora"),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
-                ),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("philschmid/code-llama-3-1-8b-text-to-sql-lora"),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
             ),
         ],
     ),
@@ -371,7 +349,7 @@ TARGET_MODULE_TESTS = [
             Operation(
                 type=OperationType.LOAD,
                 data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
-                expected_error="updating LoRA shapes",
+                expected_error="incompatible",
             ),
             Operation(
                 type=OperationType.FORWARD,
@@ -431,7 +409,7 @@ MAX_LORA_RANK_TESTS = [
             Operation(
                 type=OperationType.LOAD,
                 data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                expected_error="updating LoRA shapes",
+                expected_error="incompatible",
             ),
             Operation(
                 type=OperationType.FORWARD,
@@ -470,7 +448,7 @@ MAX_LORA_RANK_TESTS = [
             Operation(
                 type=OperationType.LOAD,
                 data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                expected_error="updating LoRA shapes",
+                expected_error="incompatible",
             ),
             Operation(
                 type=OperationType.FORWARD,
@@ -500,7 +478,169 @@ MAX_LORA_RANK_TESTS = [
         ],
     ),
 ]
-ALL_TESTS = BASIC_TESTS + TARGET_MODULE_TESTS + MAX_LORA_RANK_TESTS
+MAX_LOADED_LORAS_TESTS = [
+    TestCase(
+        description="Test max_loaded_loras limit",
+        base="meta-llama/Llama-3.1-8B-Instruct",
+        max_loras_per_batch=2,
+        max_loaded_loras=2,
+        all_adapters=[
+            "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+            "pbevan11/llama-3.1-8b-ocr-correction",
+        ],
+        initial_adapters=["philschmid/code-llama-3-1-8b-text-to-sql-lora"],
+        op_sequence=[
+            Operation(
+                type=OperationType.LOAD,
+                data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="pbevan11/llama-3.1-8b-ocr-correction",
+                expected_error="Maximum number of loaded LoRA adapters",
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="pbevan11/llama-3.1-8b-ocr-correction",
+            ),
+        ],
+    ),
+]
+EVICTION_TESTS = [
+    TestCase(
+        description="dynamic lora update with evictions",
+        base="meta-llama/Llama-3.1-8B-Instruct",
+        max_loras_per_batch=2,
+        all_adapters=[
+            "lora1=philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            "lora2=Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+            "lora3=pbevan11/llama-3.1-8b-ocr-correction",
+        ],
+        enable_lora=True,
+        max_lora_rank=256,
+        lora_target_modules=["all"],
+        op_sequence=[
+            Operation(
+                type=OperationType.LOAD,
+                data={
+                    "lora_name": "lora1",
+                    "lora_path": "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                    "pinned": True,
+                },
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data={
+                    "lora_name": "lora2",
+                    "lora_path": "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                    "pinned": True,
+                },
+                expected_error="starvation",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data={
+                    "lora_name": "lora2",
+                    "lora_path": "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                    "pinned": False,
+                },
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data={
+                    "lora_name": "lora3",
+                    "lora_path": "pbevan11/llama-3.1-8b-ocr-correction",
+                    "pinned": False,
+                },
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="lora1",
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="lora3",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data={
+                    "lora_name": "lora3",
+                    "lora_path": "pbevan11/llama-3.1-8b-ocr-correction",
+                    "pinned": True,
+                },
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data={
+                    "lora_name": "lora1",
+                    "lora_path": "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                    "pinned": True,
+                },
+                expected_error="starvation",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data={
+                    "lora_name": "lora1",
+                    "lora_path": "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                    "pinned": False,
+                },
+            ),
+            # pinned: lora3
+            # unpinned: lora1, lora2
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        "lora1",
+                        "lora2",
+                    ]
+                ),
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        "lora1",
+                        "lora3",
+                    ]
+                ),
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        "lora1",
+                        "lora2",
+                    ]
+                ),
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        "lora1",
+                        "lora2",
+                        None,
+                    ]
+                ),
+            ),
+        ],
+    ),
+]
+
+ALL_TESTS = (
+    BASIC_TESTS
+    + TARGET_MODULE_TESTS
+    + MAX_LORA_RANK_TESTS
+    + MAX_LOADED_LORAS_TESTS
+    + EVICTION_TESTS
+)
 
 
 class LoRAUpdateTestSessionMode(Enum):
@@ -520,7 +660,9 @@ class LoRAUpdateTestSessionBase:
         model_path: str,
         lora_paths: list[str],
         max_loras_per_batch: int,
+        max_loaded_loras: Optional[int] = None,
         max_lora_rank: Optional[int],
+        enable_lora: Optional[bool] = None,
         lora_target_modules: Optional[List[str]] = None,
         lora_backend: str = "triton",
         disable_cuda_graph: bool = False,
@@ -532,11 +674,13 @@ class LoRAUpdateTestSessionBase:
         self.max_lora_rank = max_lora_rank
         self.lora_target_modules = lora_target_modules
         self.max_loras_per_batch = max_loras_per_batch
+        self.max_loaded_loras = max_loaded_loras
         self.lora_backend = lora_backend
         self.disable_cuda_graph = disable_cuda_graph
         self.cuda_graph_max_bs = cuda_graph_max_bs
+        self.enable_lora = enable_lora
 
-        self.expected_adapters = set(lora_paths)
+        self.expected_adapters = set(lora_paths or [])
         self.handle = None  # Will be set in __enter__
 
     def __enter__(self):
@@ -593,9 +737,11 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
             torch_dtype=torch.float16,
             mem_fraction_static=MEM_FRACTION_STATIC,
             max_loras_per_batch=self.max_loras_per_batch,
+            max_loaded_loras=self.max_loaded_loras,
             disable_cuda_graph=self.disable_cuda_graph,
             cuda_graph_max_bs=self.cuda_graph_max_bs,
             disable_radix_cache=True,
+            enable_lora=self.enable_lora,
         )
         self.handle.__enter__()
         return self
@@ -612,6 +758,7 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
         lora_name: str,
         lora_path: Optional[str] = None,
         expected_error: Optional[str] = None,
+        pinned: bool = False,
     ):
         """
         Load a LoRA adapter by name and path.
@@ -622,17 +769,31 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
         response = self.handle.load_lora_adapter(
             lora_name=lora_name,
             lora_path=lora_path,
+            pinned=pinned,
         )
         if expected_error:
-            self.testcase.assertFalse(response.success)
-            self.testcase.assertIn(expected_error, response.error_message)
+            self.testcase.assertFalse(
+                response.success, f"Expected failure for {lora_name}, but got success."
+            )
+            self.testcase.assertIn(
+                expected_error,
+                response.error_message,
+                f"Expected error message to contain '{expected_error}', but got '{response.error_message}'",
+            )
             print(f"Received error as expected: {response.error_message}")
         else:
             self.expected_adapters.add(lora_name)
-            self.testcase.assertTrue(response.success)
+            self.testcase.assertTrue(
+                response.success,
+                f"Failed to load LoRA adapter {lora_name}: {response.error_message}",
+            )
             loaded_adapters = set(response.loaded_adapters)
             print(f"loaded_adapters: {loaded_adapters}")
-            self.testcase.assertEqual(loaded_adapters, self.expected_adapters)
+            self.testcase.assertEqual(
+                loaded_adapters,
+                self.expected_adapters,
+                f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
+            )
 
     def unload_lora_adapter(self, lora_name: str):
         """
@@ -643,11 +804,18 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
         response = self.handle.unload_lora_adapter(
             lora_name=lora_name,
         )
-        self.testcase.assertTrue(response.success)
+        self.testcase.assertTrue(
+            response.success,
+            f"Failed to unload LoRA adapter {lora_name}: {response.error_message}",
+        )
         loaded_adapters = set(response.loaded_adapters)
 
         print(f"loaded_adapters: {loaded_adapters}")
-        self.testcase.assertEqual(loaded_adapters, self.expected_adapters)
+        self.testcase.assertEqual(
+            loaded_adapters,
+            self.expected_adapters,
+            f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
+        )
 
     def forward(
         self,
@@ -668,13 +836,21 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
         except ValueError as e:
             if expected_error:
                 error_message = str(e)
-                self.testcase.assertIn(expected_error, error_message)
+                self.testcase.assertIn(
+                    expected_error,
+                    error_message,
+                    f"Expected error message to contain '{expected_error}', but got '{error_message}'",
+                )
                 print(f"Received error as expected: {error_message}")
                 return error_message
 
             raise e
 
-        self.testcase.assertEqual(len(response.output_strs), len(prompts))
+        self.testcase.assertEqual(
+            len(response.output_strs),
+            len(prompts),
+            f"Expected {len(prompts)} outputs, but got {len(response.output_strs)}",
+        )
         output = response.output_strs
         print(f"output_strs: {output}")
 
@@ -690,8 +866,6 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
         other_args = [
             "--cuda-graph-max-bs",
             str(self.cuda_graph_max_bs),
-            "--lora-paths",
-            *self.lora_paths,
             "--max-loras-per-batch",
             str(self.max_loras_per_batch),
             "--lora-backend",
@@ -704,12 +878,18 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
             "--mem-fraction-static",
             str(MEM_FRACTION_STATIC),
         ]
+        if self.enable_lora:
+            other_args.append("--enable-lora")
+        if self.lora_paths:
+            other_args.extend(["--lora-paths"] + self.lora_paths)
         if self.disable_cuda_graph:
             other_args.append("--disable-cuda-graph")
         if self.max_lora_rank is not None:
             other_args.extend(["--max-lora-rank", str(self.max_lora_rank)])
         if self.lora_target_modules is not None:
             other_args.extend(["--lora-target-modules"] + self.lora_target_modules)
+        if self.max_loaded_loras is not None:
+            other_args.extend(["--max-loaded-loras", str(self.max_loaded_loras)])
 
         # launch external server
         self.handle = popen_launch_server(
@@ -731,6 +911,7 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
         lora_name: str,
         lora_path: Optional[str] = None,
         expected_error: Optional[str] = None,
+        pinned: bool = False,
     ):
         """
         Load a LoRA adapter by name and path.
@@ -740,18 +921,32 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
 
         response = requests.post(
             DEFAULT_URL_FOR_TEST + "/load_lora_adapter",
-            json={"lora_name": lora_name, "lora_path": lora_path},
+            json={"lora_name": lora_name, "lora_path": lora_path, "pinned": pinned},
         )
         if expected_error:
-            self.testcase.assertEqual(response.status_code, 400)
-            self.testcase.assertIn(expected_error, response.text)
+            self.testcase.assertEqual(
+                response.status_code,
+                400,
+                f"Expected error for {lora_name}, but got success.",
+            )
+            self.testcase.assertIn(
+                expected_error,
+                response.text,
+                f"Expected error message to contain '{expected_error}', but got '{response.text}'",
+            )
             print(f"Received error as expected: {response.text}")
         else:
             self.expected_adapters.add(lora_name)
-            self.testcase.assertTrue(response.ok)
+            self.testcase.assertTrue(
+                response.ok, f"Failed to load LoRA adapter {lora_name}: {response.text}"
+            )
             loaded_adapters = set(response.json()["loaded_adapters"])
             print(f"loaded_adapters: {loaded_adapters}")
-            self.testcase.assertEqual(loaded_adapters, self.expected_adapters)
+            self.testcase.assertEqual(
+                loaded_adapters,
+                self.expected_adapters,
+                f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
+            )
 
     def unload_lora_adapter(self, lora_name: str):
         """
@@ -763,11 +958,17 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
             DEFAULT_URL_FOR_TEST + "/unload_lora_adapter",
             json={"lora_name": lora_name},
         )
-        self.testcase.assertTrue(response.ok)
+        self.testcase.assertTrue(
+            response.ok, f"Failed to unload LoRA adapter {lora_name}: {response.text}"
+        )
         loaded_adapters = set(response.json()["loaded_adapters"])
 
         print(f"loaded_adapters: {loaded_adapters}")
-        self.testcase.assertEqual(loaded_adapters, self.expected_adapters)
+        self.testcase.assertEqual(
+            loaded_adapters,
+            self.expected_adapters,
+            f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
+        )
 
     def forward(
         self,
@@ -792,15 +993,29 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
             },
         )
         if expected_error:
-            self.testcase.assertEqual(response.status_code, 400)
-            self.testcase.assertIn(expected_error, response.text)
+            self.testcase.assertEqual(
+                response.status_code,
+                400,
+                f"Expected error for forward pass, but got success: {response.text}",
+            )
+            self.testcase.assertIn(
+                expected_error,
+                response.text,
+                f"Expected error message to contain '{expected_error}', but got '{response.text}'",
+            )
             output = response.text
             print(f"Received error as expected: {response.text}")
             return output
         else:
-            self.testcase.assertTrue(response.ok)
+            self.testcase.assertTrue(
+                response.ok, f"Failed to generate text: {response.text}"
+            )
             output = [r["text"] for r in response.json()]
-            self.testcase.assertEqual(len(output), len(prompts))
+            self.testcase.assertEqual(
+                len(output),
+                len(prompts),
+                f"Expected {len(prompts)} outputs, but got {len(output)}",
+            )
             print(f"output_strs: {output}")
             return output
 
@@ -834,8 +1049,10 @@ class TestLoRADynamicUpdate(CustomTestCase):
         mode: LoRAUpdateTestSessionMode,
         base: str,
         initial_adapters: List[str],
-        max_loras_per_batch: int,
         op_sequence: List[Operation],
+        max_loras_per_batch: int,
+        max_loaded_loras: Optional[int] = None,
+        enable_lora: Optional[bool] = None,
         max_lora_rank: Optional[int] = None,
         lora_target_modules: Optional[List[str]] = None,
         max_new_tokens: int = 32,
@@ -852,8 +1069,10 @@ class TestLoRADynamicUpdate(CustomTestCase):
             model_path=base,
             lora_paths=initial_adapters,
             max_loras_per_batch=max_loras_per_batch,
+            max_loaded_loras=max_loaded_loras,
             max_lora_rank=max_lora_rank,
             lora_target_modules=lora_target_modules,
+            enable_lora=enable_lora,
         ) as session:
             for op in op_sequence:
                 op_type = op.type
@@ -864,10 +1083,18 @@ class TestLoRADynamicUpdate(CustomTestCase):
                     f"Running operation: {op_type} --- data: {data} --- mode: {mode} ---"
                 )
                 if op_type == OperationType.LOAD:
+                    if isinstance(data, str):
+                        adapter_info = {
+                            "lora_name": data,
+                            "lora_path": data,
+                            "pinned": False,
+                        }
+                    else:
+                        adapter_info = data
+
                     result = session.load_lora_adapter(
-                        lora_name=data,
-                        lora_path=data,
                         expected_error=expected_error,
+                        **adapter_info,
                     )
                 elif op_type == OperationType.UNLOAD:
                     result = session.unload_lora_adapter(
@@ -903,8 +1130,10 @@ class TestLoRADynamicUpdate(CustomTestCase):
             dynamic_output = self._run_operation_sequence(
                 mode=mode,
                 initial_adapters=test_case.initial_adapters,
+                enable_lora=test_case.enable_lora,
                 base=test_case.base,
                 max_loras_per_batch=test_case.max_loras_per_batch,
+                max_loaded_loras=test_case.max_loaded_loras,
                 op_sequence=test_case.op_sequence,
                 max_new_tokens=test_case.max_new_tokens,
                 max_lora_rank=test_case.max_lora_rank,
@@ -918,11 +1147,18 @@ class TestLoRADynamicUpdate(CustomTestCase):
                 if x.type == OperationType.FORWARD and x.expected_error is None
             ]
 
+            if not forward_ops:
+                print(
+                    f"No forward operations found in test case {case_idx}. Skipping static pass."
+                )
+                continue
+
             print("=" * 100)
             print(f"\n--- Running static pass with {len(forward_ops)} operations ---")
             static_output = self._run_operation_sequence(
                 mode=mode,
                 initial_adapters=test_case.all_adapters,
+                enable_lora=test_case.enable_lora,
                 base=test_case.base,
                 max_loras_per_batch=test_case.max_loras_per_batch,
                 op_sequence=forward_ops,

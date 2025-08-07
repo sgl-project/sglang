@@ -40,6 +40,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -86,6 +87,7 @@ class Llama4MoE(nn.Module):
     def __init__(
         self,
         config: Llama4TextConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -103,14 +105,18 @@ class Llama4MoE(nn.Module):
             prefix=add_prefix("router", prefix),
         )
 
+        self.topk = TopK(
+            top_k=self.top_k,
+            renormalize=False,
+            custom_routing_function=Llama4MoE.custom_routing_function,
+        )
+
         self.experts = FusedMoE(
             num_experts=config.num_local_experts,
-            top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
-            custom_routing_function=Llama4MoE.custom_routing_function,
             intermediate_size=intermediate_size_moe,
+            layer_id=layer_id,
             reduce_results=False,
-            renormalize=False,
             quant_config=quant_config,
             apply_router_weight_on_input=True,
             prefix=add_prefix("experts", prefix),
@@ -147,10 +153,8 @@ class Llama4MoE(nn.Module):
         # router_scores: [num_tokens, num_experts]
         router_logits, _ = self.router(hidden_states)
         shared_out = self.shared_expert(hidden_states)
-        routed_out = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
+        topk_output = self.topk(hidden_states, router_logits)
+        routed_out = self.experts(hidden_states, topk_output)
         return shared_out, routed_out
 
     def _forward_core_shared_routed_overlap(self, hidden_states):
@@ -163,10 +167,8 @@ class Llama4MoE(nn.Module):
         with self.device_module.stream(alt_stream):
             # router_scores: [num_tokens, num_experts]
             router_logits, _ = self.router(hidden_states)
-            routed_out = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-            )
+            topk_output = self.topk(hidden_states, router_logits)
+            routed_out = self.experts(hidden_states, topk_output)
         self.device_module.current_stream().wait_stream(alt_stream)
 
         return shared_out, routed_out
@@ -239,13 +241,22 @@ class Llama4Attention(nn.Module):
             if self.use_qk_norm
             else None
         )
+
+        qkv_quant_config = quant_config
+        o_quant_config = quant_config
+        if quant_config and hasattr(quant_config, "ignore") and quant_config.ignore:
+            if add_prefix("q_proj", prefix) in quant_config.ignore:
+                qkv_quant_config = None
+            if add_prefix("o_proj", prefix) in quant_config.ignore:
+                o_quant_config = None
+
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
             head_size=self.head_dim,
             total_num_heads=self.total_num_heads,
             total_num_kv_heads=self.total_num_kv_heads,
             bias=bias,
-            quant_config=quant_config,
+            quant_config=qkv_quant_config,
             prefix=add_prefix("qkv_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -255,7 +266,7 @@ class Llama4Attention(nn.Module):
             input_size=self.total_num_heads * self.head_dim,
             output_size=hidden_size,
             bias=bias_o_proj,
-            quant_config=quant_config,
+            quant_config=o_quant_config,
             prefix=add_prefix("o_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -373,6 +384,7 @@ class Llama4DecoderLayer(nn.Module):
         if is_moe_layer:
             self.feed_forward = Llama4MoE(
                 config=config,
+                layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("feed_forward", prefix),
             )
@@ -403,6 +415,8 @@ class Llama4DecoderLayer(nn.Module):
         )
 
     def _is_moe_layer(self, layer_id: int) -> bool:
+        if self.config.interleave_moe_layer_step == 0:
+            return self.config.num_local_experts > 0
         return (layer_id + 1) % self.config.interleave_moe_layer_step == 0
 
     def forward(

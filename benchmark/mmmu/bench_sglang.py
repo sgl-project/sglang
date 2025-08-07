@@ -125,7 +125,6 @@ async def eval_mmmu(args) -> None:
     client = openai.AsyncOpenAI(
         api_key="sk", base_url=f"http://127.0.0.1:{args.port}/v1"
     )
-    semaphore = asyncio.Semaphore(args.concurrency)
     start = time.perf_counter()
     base_url = f"http://127.0.0.1:{args.port}"
 
@@ -139,16 +138,26 @@ async def eval_mmmu(args) -> None:
 
         samples = samples[: args.profile_number]
 
-    tasks = [
-        process_sample_with_semaphore(
-            semaphore, client, sample, sampling_params, lora_path
-        )
-        for sample in samples
-    ]
+    if args.concurrency == 1:
+        # For concurrency == 1, run in sequential mode to ensure consistent order
+        # this is mainly for profiling
+        for sample in tqdm(samples):
+            _, response = await process_sample(
+                client, sample, sampling_params, lora_path
+            )
+            process_result(response, sample, answer_dict, out_samples)
+    else:
+        semaphore = asyncio.Semaphore(args.concurrency)
+        tasks = [
+            process_sample_with_semaphore(
+                semaphore, client, sample, sampling_params, lora_path
+            )
+            for sample in samples
+        ]
 
-    for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
-        sample, response = await coro
-        process_result(response, sample, answer_dict, out_samples)
+        for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
+            sample, response = await coro
+            process_result(response, sample, answer_dict, out_samples)
 
     if args.profile:
         print("Stopping profiler...")

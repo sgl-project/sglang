@@ -138,6 +138,7 @@ class BenchArgs:
 def load_model(server_args, port_args, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
+    moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
     model_runner = ModelRunner(
@@ -146,6 +147,8 @@ def load_model(server_args, port_args, tp_rank):
         gpu_id=tp_rank,
         tp_rank=tp_rank,
         tp_size=server_args.tp_size,
+        moe_ep_rank=moe_ep_rank,
+        moe_ep_size=server_args.ep_size,
         pp_rank=0,
         pp_size=1,
         nccl_port=port_args.nccl_port,
@@ -271,12 +274,13 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             batch,
             dp_size=model_runner.server_args.dp_size,
             attn_tp_size=1,
-            tp_cpu_group=model_runner.tp_group.cpu_group,
+            tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             speculative_num_draft_tokens=None,
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
+            disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
         )
 
 

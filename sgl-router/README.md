@@ -54,11 +54,34 @@ pip install -e .
 ```bash
 # Build Rust components
 cargo build
+```
 
+#### Launch Router with Worker URLs in regular mode
+```bash
 # Launch router with worker URLs
 python -m sglang_router.launch_router \
     --worker-urls http://worker1:8000 http://worker2:8000
 ```
+
+#### Launch Router with Worker URLs in prefill-decode mode
+```bash
+# Note that the prefill and decode URLs must be provided in the following format:
+# http://<ip>:<port> for  decode nodes
+# http://<ip>:<port> bootstrap-port for  prefill nodes, where bootstrap-port is optional
+# Launch router with worker URLs
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://127.0.0.1:30001 9001 \
+    --prefill http://127.0.0.2:30002 9002 \
+    --prefill http://127.0.0.3:30003 9003 \
+    --prefill http://127.0.0.4:30004 9004 \
+    --decode http://127.0.0.5:30005 \
+    --decode http://127.0.0.6:30006 \
+    --decode http://127.0.0.7:30007 \
+    --host 0.0.0.0 \
+    --port 8080
+````
 
 ## Configuration
 
@@ -93,6 +116,19 @@ python -m sglang_router.launch_router \
     --prometheus-port 9000
 ```
 
+### Request ID Tracking
+
+Track requests across distributed systems with configurable headers:
+
+```bash
+# Use custom request ID headers
+python -m sglang_router.launch_router \
+    --worker-urls http://localhost:8080 \
+    --request-id-headers x-trace-id x-request-id
+```
+
+Default headers: `x-request-id`, `x-correlation-id`, `x-trace-id`, `request-id`
+
 ## Advanced Features
 
 ### Kubernetes Service Discovery
@@ -116,6 +152,16 @@ For disaggregated prefill/decode routing:
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
+    --service-discovery \
+    --prefill-selector app=sglang component=prefill \
+    --decode-selector app=sglang component=decode \
+    --service-discovery-namespace sglang-system
+
+# With separate routing policies:
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --prefill-policy cache_aware \
+    --decode-policy power_of_two \
     --service-discovery \
     --prefill-selector app=sglang component=prefill \
     --decode-selector app=sglang component=decode \
@@ -226,7 +272,9 @@ python -m sglang_router.launch_router \
 - `--decode`: Initial decode server URL
 - `--prefill-selector`: Label selector for prefill pods
 - `--decode-selector`: Label selector for decode pods
-- `--policy`: Routing policy (`cache_aware`, `random`, `power_of_two`)
+- `--policy`: Routing policy (`cache_aware`, `random`, `power_of_two`, `round_robin`)
+- `--prefill-policy`: Separate routing policy for prefill nodes (optional, overrides `--policy` for prefill)
+- `--decode-policy`: Separate routing policy for decode nodes (optional, overrides `--policy` for decode)
 
 ## Development
 
