@@ -43,7 +43,7 @@ def fused_moe_forward_native(
     expert_outs = torch.einsum("tao, taio -> tai", (x1 * x3), w2_weights)
     return torch.einsum("tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype))
 
-def moe_gptoss(x, alpha: float = 1.702, limit: float = 7.0):
+def moe_gptoss_act(x, alpha: float = 1.702, limit: float = 7.0):
     x_glu, x_linear = x[..., ::2], x[..., 1::2]
     # Clamp the input values
     x_glu = x_glu.clamp(min=None, max=limit)
@@ -103,7 +103,7 @@ def moe_forward_native(
         layer_w2_weight = layer.w2_weight[i]
 
         gate_up = F.linear(tokens_for_this_expert, layer_w13_weight, bias=layer_w13_weight_bias.to(torch.bfloat16))
-        gate_up = moe_gptoss(gate_up, activation_alpha, swiglu_limit)
+        gate_up = moe_gptoss_act(gate_up, activation_alpha, swiglu_limit)
         expert_out = F.linear(gate_up, layer_w2_weight, bias=layer_w2_weight_bias.to(torch.bfloat16))
         outputs.append(expert_out)
         start_idx = end_idx
