@@ -346,8 +346,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
+        activation_alpha: Optional[float] = None,
+        swiglu_limit: Optional[float] = None,
     ) -> torch.Tensor:
-        assert activation == "silu", f"activation = {activation} is not supported."
+        # assert activation == "silu", f"activation = {activation} is not supported."
 
         if use_intel_amx_backend(layer) and not apply_router_weight_on_input:
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
@@ -373,6 +375,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 None,  # block_size
                 None,  # a1_scale
                 None,  # a2_scale
+                layer.w13_weight_bias,
+                layer.w2_weight_bias,
+                activation_alpha,
+                swiglu_limit,
                 True,  # is_vnni
             )
         else:
