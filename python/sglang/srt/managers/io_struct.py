@@ -26,6 +26,7 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils import ImageData
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -45,7 +46,7 @@ class SessionParams:
 
 # Type definitions for multimodal input data
 # Individual data item types for each modality
-ImageDataInputItem = Union[Image, str, Dict]
+ImageDataInputItem = Union[Image, str, ImageData, Dict]
 AudioDataInputItem = Union[str, Dict]
 VideoDataInputItem = Union[str, Dict]
 # Union type for any multimodal data item
@@ -101,8 +102,10 @@ class GenerateReqInput:
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
-    # The path to the LoRA
+    # The path to the LoRA adaptors
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # The uid of LoRA adaptors, should be initialized by tokenizer manager
+    lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
@@ -122,6 +125,9 @@ class GenerateReqInput:
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+
+    # For background responses (OpenAI responses API)
+    background: bool = False
 
     def contains_mm_input(self) -> bool:
         return (
@@ -500,7 +506,7 @@ class TokenizedGenerateReqInput:
     stream: bool
 
     # LoRA related
-    lora_path: Optional[str] = None  # None means just use the base model
+    lora_id: Optional[str] = None  # None means just use the base model
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
@@ -522,6 +528,9 @@ class TokenizedGenerateReqInput:
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+
+    # For dp balance
+    dp_balance_id: int = -1
 
 
 @dataclass
@@ -553,6 +562,9 @@ class EmbeddingReqInput:
     modalities: Optional[List[str]] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
+
+    # For background responses (OpenAI responses API)
+    background: bool = False
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -648,6 +660,8 @@ class TokenizedEmbeddingReqInput:
     token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
+    # For dp balance
+    dp_balance_id: int = -1
 
 
 @dataclass
@@ -1068,6 +1082,8 @@ class LoadLoRAAdapterReqInput:
     lora_name: str
     # The path of loading.
     lora_path: str
+    # Whether to pin the LoRA adapter in memory.
+    pinned: bool = False
     # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
     lora_id: Optional[str] = None
 
@@ -1076,6 +1092,7 @@ class LoadLoRAAdapterReqInput:
             lora_id=self.lora_id,
             lora_name=self.lora_name,
             lora_path=self.lora_path,
+            pinned=self.pinned,
         )
 
 
@@ -1097,7 +1114,7 @@ class UnloadLoRAAdapterReqInput:
 class LoRAUpdateResult:
     success: bool
     error_message: Optional[str] = None
-    loaded_adapters: Dict[str, LoRARef] = field(default_factory=dict)
+    loaded_adapters: Optional[Dict[str, LoRARef]] = None
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
