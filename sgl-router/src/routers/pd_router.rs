@@ -461,24 +461,8 @@ impl PDRouter {
             let prefill_future = prefill_request.send();
             let decode_future = decode_request.send();
 
-            // Consume prefill response with lower priority
-            tokio::task::spawn_blocking(move || {
-                // Use a separate thread to avoid competing with async runtime
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-
-                rt.block_on(async move {
-                    if let Ok(response) = prefill_future.await {
-                        // Consume slowly to minimize resource competition
-                        let mut stream = response.bytes_stream();
-                        while let Some(_chunk) = stream.next().await {
-                            // Small delay to reduce resource usage
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
-                    }
-                });
+            tokio::spawn(async move {
+                let _ = prefill_future.await;
             });
 
             // Wait only for decode response
