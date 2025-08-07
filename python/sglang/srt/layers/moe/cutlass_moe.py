@@ -385,58 +385,6 @@ def cutlass_moe_fp4(
         c2 = c2 * topk_weights.view(m_a, num_topk, 1).to(out_dtype)
     return c2.sum(dim=1).to(out_dtype)
 
-def ensure_aligned_tensor(tensor, alignment_bytes=128):
-    """
-    Ensure a tensor is aligned to the specified number of bytes.
-    If not aligned, create a new aligned tensor and copy the data.
-    """
-    if tensor.data_ptr() % alignment_bytes == 0:
-        return tensor
-    
-    # Create a new tensor with proper alignment using torch.empty
-    # We need to allocate extra space to ensure alignment
-    element_size = tensor.element_size()
-    total_elements = tensor.numel()
-    
-    # Calculate how much extra space we need
-    current_offset = tensor.data_ptr() % alignment_bytes
-    if current_offset == 0:
-        return tensor
-    
-    # Allocate a larger tensor and find the aligned position
-    extra_elements = alignment_bytes // element_size
-    total_size = total_elements + extra_elements
-    
-    # Create a new tensor with proper alignment
-    aligned_tensor = torch.empty(
-        total_size,
-        dtype=tensor.dtype,
-        device=tensor.device
-    )
-    
-    # Find the aligned offset within the allocated tensor
-    aligned_offset = (aligned_tensor.data_ptr() + alignment_bytes - 1) // alignment_bytes * alignment_bytes
-    aligned_offset_elements = (aligned_offset - aligned_tensor.data_ptr()) // element_size
-    
-    # Ensure we have enough space
-    if aligned_offset_elements + total_elements > total_size:
-        # If not enough space, allocate more
-        total_size = aligned_offset_elements + total_elements + extra_elements
-        aligned_tensor = torch.empty(
-            total_size,
-            dtype=tensor.dtype,
-            device=tensor.device
-        )
-        aligned_offset = (aligned_tensor.data_ptr() + alignment_bytes - 1) // alignment_bytes * alignment_bytes
-        aligned_offset_elements = (aligned_offset - aligned_tensor.data_ptr()) // element_size
-    
-    # Copy the original tensor data to the aligned position
-    aligned_slice = aligned_tensor[aligned_offset_elements:aligned_offset_elements + total_elements]
-    aligned_slice.copy_(tensor.flatten())
-    
-    # Return the aligned slice with the original shape
-    return aligned_slice.view_as(tensor)
-
 def cutlass_moe_fp4_with_bias(
     a: torch.Tensor,
     a1_gscale: torch.Tensor,
@@ -561,8 +509,7 @@ def cutlass_moe_fp4_with_bias(
     gemm1_args = params.to_gemm1_args()
     gemm1_args["bias_strides"] = torch.zeros_like(gemm1_args["c_strides"])
     # Ensure bias1 is properly aligned for TMA operations
-    bias1_aligned = ensure_aligned_tensor(bias1, alignment_bytes=128)
-    gemm1_args["bias"] = bias1_aligned
+    gemm1_args["bias"] = bias1
     c1 = cutlass_fp4_group_mm_with_bias(
         rep_a_fp4,
         w1_fp4,
@@ -605,8 +552,7 @@ def cutlass_moe_fp4_with_bias(
     )
     gemm2_args = params.to_gemm2_args()
     # Ensure bias2 is properly aligned for TMA operations
-    bias2_aligned = ensure_aligned_tensor(bias2, alignment_bytes=128)
-    gemm2_args["bias"] = bias2_aligned
+    gemm2_args["bias"] = bias2
     gemm2_args["bias_strides"] = torch.zeros_like(gemm2_args["c_strides"])
     c2 = cutlass_fp4_group_mm_with_bias(
         int_fp4,
