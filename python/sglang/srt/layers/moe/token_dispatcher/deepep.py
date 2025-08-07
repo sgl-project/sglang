@@ -5,15 +5,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.moe import DeepEPMode, get_deepep_config, is_tbo_enabled
 from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
     BaseDispatcher,
     BaseDispatcherConfig,
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization import deep_gemm_wrapper
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, load_json_config
 
 try:
@@ -146,7 +145,7 @@ class DeepEPBuffer:
         ).multi_processor_count
         if (
             (deepep_mode != DeepEPMode.LOW_LATENCY)
-            and not global_server_args_dict["enable_two_batch_overlap"]
+            and not is_tbo_enabled()
             and (DeepEPConfig.get_instance().num_sms < total_num_sms // 2)
         ):
             logger.warning(
@@ -191,7 +190,7 @@ class DeepEPConfig(BaseDispatcherConfig):
     _instance = None
 
     def __init__(self):
-        config_str = global_server_args_dict["deepep_config"]
+        config_str = get_deepep_config()
         if config_str:
             config_parsed = load_json_config(config_str)
             if torch.distributed.get_rank() == 0:

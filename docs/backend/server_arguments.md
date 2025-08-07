@@ -217,7 +217,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--moe-runner-backend` | Select the runner backend for MoE. | 'triton' |
 | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | auto |
 | `--ep-num-redundant-experts` | Allocate this number of redundant experts in expert parallel. | 0 |
-| `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in expert parallel. | None |
+| `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in EPLB. | None |
 | `--init-expert-location` | Initial location of EP experts. | trivial |
 | `--enable-eplb` | Enable EPLB algorithm. | False |
 | `--eplb-algorithm` | Chosen EPLB algorithm. | auto |

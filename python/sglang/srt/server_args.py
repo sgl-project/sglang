@@ -1460,16 +1460,6 @@ class ServerArgs:
             help="Choose the runner backend for MoE.",
         )
         parser.add_argument(
-            "--enable-flashinfer-cutlass-moe",
-            action="store_true",
-            help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
-        )
-        parser.add_argument(
-            "--enable-flashinfer-trtllm-moe",
-            action="store_true",
-            help="Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP",
-        )
-        parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
@@ -1828,11 +1818,6 @@ class ServerArgs:
             action="store_true",
             help="Enable returning hidden states with responses.",
         )
-        parser.add_argument(
-            "--enable-triton-kernel-moe",
-            action="store_true",
-            help="Use triton moe grouped gemm kernel.",
-        )
 
         # Debug tensor dumps
         parser.add_argument(
@@ -1956,6 +1941,21 @@ class ServerArgs:
             "--enable-deepep-moe",
             action="store_true",
             help="(Deprecated) Enabling DeepEP MoE implementation for EP MoE.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-cutlass-moe",
+            action="store_true",
+            help="(Deprecated) Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-trtllm-moe",
+            action="store_true",
+            help="(Deprecated) Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP",
+        )
+        parser.add_argument(
+            "--enable-triton-kernel-moe",
+            action="store_true",
+            help="(Deprecated) Use triton moe grouped gemm kernel.",
         )
 
     @classmethod

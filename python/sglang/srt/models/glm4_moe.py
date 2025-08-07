@@ -75,10 +75,7 @@ from sglang.srt.models.deepseek_v2 import (
     DeepseekV2Model,
     DeepseekV2MoE,
 )
-from sglang.srt.two_batch_overlap import (
-    MaybeTboDeepEPDispatcher,
-    model_forward_maybe_tbo,
-)
+from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,

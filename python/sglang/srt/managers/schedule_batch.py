@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.layers.moe import is_tbo_enabled
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -83,13 +84,10 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "disable_chunked_prefix_cache",
     "disable_radix_cache",
     "enable_dp_attention",
-    "enable_two_batch_overlap",
-    "tbo_token_distribution_threshold",
     "enable_dp_lm_head",
     "enable_flashinfer_allreduce_fusion",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
-    "deepep_config",
     "ep_num_redundant_experts",
     "enable_nan_detection",
     "flashinfer_mla_disable_ragged",
@@ -1704,7 +1702,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             or attention_backend_str == "cutlass_mla"
             or attention_backend_str == "ascend"
             or attention_backend_str == "trtllm_mha"
-            or global_server_args_dict["enable_two_batch_overlap"]
+            or is_tbo_enabled()
         ):
             seq_lens_cpu = (
                 seq_lens_cpu_cache

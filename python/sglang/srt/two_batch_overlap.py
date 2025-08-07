@@ -14,8 +14,12 @@ from sglang.srt.layers.communicator import (
     CommunicateSummableTensorPairFn,
     ScatterMode,
 )
+from sglang.srt.layers.moe import (
+    DeepEPMode,
+    get_tbo_token_distribution_threshold,
+    is_tbo_enabled,
+)
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import (
@@ -81,7 +85,7 @@ def _is_two_chunk_split_enabled(extend_lens: Sequence[int]) -> bool:
     vanilla_split_seq_index = _split_array_by_balanced_sum(extend_lens)
     left_sum = sum(extend_lens[:vanilla_split_seq_index])
     overall_sum = sum(extend_lens)
-    threshold = global_server_args_dict["tbo_token_distribution_threshold"]
+    threshold = get_tbo_token_distribution_threshold()
     assert threshold <= 0.5, f"{threshold=}"
     return left_sum < overall_sum * threshold or left_sum > overall_sum * (
         1 - threshold
@@ -297,7 +301,7 @@ class TboCudaGraphRunnerPlugin:
         self._tbo_children_num_token_non_padded = torch.zeros((2,), dtype=torch.int32)
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
-        if not global_server_args_dict["enable_two_batch_overlap"]:
+        if not is_tbo_enabled():
             return
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=batch.forward_mode, spec_info=batch.spec_info
@@ -950,9 +954,7 @@ def _model_forward_tbo_merge_outputs(output_a, output_b):
 
 class MaybeTboDeepEPDispatcher:
     def __init__(self, **kwargs):
-        num_inner_dispatchers = (
-            2 if global_server_args_dict["enable_two_batch_overlap"] else 1
-        )
+        num_inner_dispatchers = 2 if is_tbo_enabled() else 1
         self._inners = [
             DeepEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
         ]
