@@ -3,16 +3,13 @@
 
 from __future__ import annotations
 
-import importlib
+import importlib.util
 import logging
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
 
-# from vllm.model_executor.layers.fused_moe import (
-#     FusedMoE, FusedMoEActivationFormat, FusedMoEConfig, FusedMoEMethodBase,
-#     FusedMoEPermuteExpertsUnpermute, FusedMoEPrepareAndFinalize)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -555,8 +552,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             x_quant, x_scale = mxfp8_quantize(x, False)  # to mxfp8
             x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
 
-            topk_weights, topk_ids, router_logits = topk_output
-            top_k = topk_weights.shape[-1]
+            top_k, router_logits = topk_output
 
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
