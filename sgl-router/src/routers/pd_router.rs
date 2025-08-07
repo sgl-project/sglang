@@ -464,13 +464,13 @@ impl PDRouter {
 
             tokio::spawn(async move {
                 if let Ok(response) = prefill_future.await {
-                    // Fully consume the response to maintain HTTP compliance
-                    // Use bytes_stream() and discard chunks immediately to minimize memory usage
-                    let mut stream = response.bytes_stream();
-                    while let Some(chunk) = stream.next().await {
-                        // Just discard each chunk immediately
-                        drop(chunk);
-                    }
+                    // Consume with a short timeout to free connection quickly
+                    let consume_future = async {
+                        let _ = response.bytes().await;
+                    };
+
+                    // Give it 100ms to consume, then abandon
+                    let _ = tokio::time::timeout(Duration::from_millis(100), consume_future).await;
                 }
             });
 
