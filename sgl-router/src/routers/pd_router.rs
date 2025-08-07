@@ -459,23 +459,18 @@ impl PDRouter {
             // When we don't need logprobs, only wait for decode response
             // Send both requests concurrently but don't wait for prefill
             // Add headers to minimize response size when we don't need the body
-            let prefill_future = prefill_request
-                .header("Connection", "close")
-                .header("X-Skip-Response-Body", "true") // Custom header for prefill server
-                .send();
+            let prefill_future = prefill_request.header("Connection", "close").send();
             let decode_future = decode_request.send();
 
             tokio::spawn(async move {
                 if let Ok(response) = prefill_future.await {
-                    // Consume with a short timeout to free connection quickly
-                    let consume_future = async {
-                        let _ = response.bytes().await;
-                    };
-
-                    // Give it 100ms to consume, then abandon
-                    let _ =
-                        tokio::time::timeout(std::time::Duration::from_millis(100), consume_future)
-                            .await;
+                    // Fully consume the response to maintain HTTP compliance
+                    // Use bytes_stream() and discard chunks immediately to minimize memory usage
+                    let mut stream = response.bytes_stream();
+                    while let Some(chunk) = stream.next().await {
+                        // Just discard each chunk immediately
+                        drop(chunk);
+                    }
                 }
             });
 
