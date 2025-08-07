@@ -18,7 +18,6 @@ use axum::{
     Json,
 };
 use futures_util::StreamExt;
-use rand::Rng;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -1339,7 +1338,7 @@ impl RouterTrait for PDRouter {
         }
 
         // Convert to JSON after bootstrap injection
-        let json_with_bootstrap = match serde_json::to_value(&body) {
+        let json_with_bootstrap = match serde_json::to_value(&pd_req) {
             Ok(json) => json,
             Err(e) => return Self::handle_serialization_error(e),
         };
