@@ -139,7 +139,7 @@ class RMSNorm(CustomOp):
                     self.scale_ue8m0,
                     rms_eps=self.variance_epsilon,
                 )
-                return (q, s), residual
+                return (q, s, x.dtype), residual
             fused_rmsnorm_quant(
                 x,
                 q,
@@ -152,7 +152,7 @@ class RMSNorm(CustomOp):
                 self.scale_ue8m0,
                 rms_eps=self.variance_epsilon,
             )
-            return (q, s)
+            return (q, s, x.dtype)
         else:
             if residual is not None:
                 fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
