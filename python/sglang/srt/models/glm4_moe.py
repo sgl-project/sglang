@@ -160,7 +160,7 @@ class Glm4MoeMLP(nn.Module):
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x, can_fuse_mlp_allreduce=can_fuse_mlp_allreduce)
+        x, _ = self.down_proj(x, skip_all_reduce=can_fuse_mlp_allreduce)
         return x
 
 
