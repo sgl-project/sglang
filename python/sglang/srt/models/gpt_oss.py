@@ -1002,7 +1002,13 @@ class GptOssForCausalLM(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                         if "sinks" in name:
+                            tp_size = get_tensor_model_parallel_world_size()
+                            full_shard_size = param.numel() * tp_size
                             start = tp_rank * param.numel()
+                            if full_shard_size > loaded_weight.size(0) and start >= loaded_weight.size(0):
+                                pad_size = start + param.numel() - loaded_weight.size(0)
+                                pad_tensor = torch.zeros(pad_size).to(loaded_weight.dtype)
+                                loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=0).to(loaded_weight.dtype)
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )
