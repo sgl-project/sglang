@@ -27,7 +27,14 @@ class TestGptOss4Gpu(BaseTestGptOss):
                 # "medium": 0.61,
                 # "high": 0.61,
             },
-            other_args=["--tp", "4", "--cuda-graph-max-bs", "200", "--mem-fraction-static", "0.93"],
+            other_args=[
+                "--tp",
+                "4",
+                "--cuda-graph-max-bs",
+                "200",
+                "--mem-fraction-static",
+                "0.93",
+            ],
         )
 
 
