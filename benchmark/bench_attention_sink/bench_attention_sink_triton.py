@@ -51,12 +51,11 @@ def benchmark_decode(B, S, H_Q, H_KV, D):
     v_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device="cuda")
 
     o = torch.zeros(B, H_Q, D_V, dtype=dtype, device="cuda")
-    o_grouped = torch.zeros(B, H_Q, D_V, dtype=dtype, device="cuda")
 
     b_seq_len = torch.full((B,), seq_len, device="cuda")
 
     kv_indptr = torch.zeros((B + 1,), dtype=torch.int32, device="cuda")
-    kv_indptr[1 : B + 1] = torch.cumsum(b_seq_len[:B], dim=0)
+    kv_indptr[1 : B + 1] = torch.cumsum(b_seq_len, dim=0)
     kv_indices = torch.arange(total_tokens, device="cuda")
 
     attn_logits1 = torch.empty(
@@ -170,7 +169,10 @@ def benchmark_extend(B, S, H_Q, H_KV, D):
     kv_indices = torch.arange(0, total_prefix_tokens, device=device).to(torch.int32)
 
     sm_scale = 1.0 / (D**0.5)
-    sliding_window = 128  # From GPT-OSS config
+    # sliding_window = 128  # From GPT-OSS config, skip for now
+    sliding_window = -1
+
+    sink = torch.randn(H_Q, device=device, dtype=torch.float32)
 
     # warmup
     for _ in range(5):
@@ -214,6 +216,7 @@ def benchmark_extend(B, S, H_Q, H_KV, D):
             max_len_extend=extend_len,
             sm_scale=sm_scale,
             sliding_window_size=sliding_window,
+            sinks=sink,
         )
     end_event.record()
     end_event.synchronize()
@@ -221,9 +224,7 @@ def benchmark_extend(B, S, H_Q, H_KV, D):
     ms = start_event.elapsed_time(end_event) / run_step
 
     # FLOPS calculation: each attention operation requires 2 multiplications per element
-    total_flops = (
-        2 * total_extend_tokens * H_Q * (total_prefix_tokens + total_extend_tokens) * D
-    )
+    total_flops = 2 * total_extend_tokens * H_Q * (prefill_len + extend_len) * D
     tflops = lambda ms: total_flops * 1e-12 / (ms * 1e-3)  # convert to TFLOPS
     return tflops(ms)
 
