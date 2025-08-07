@@ -177,7 +177,7 @@ class MooncakeStore(HiCacheStorage):
         value: Optional[Any] = None,
         target_location: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
-    ) -> bool:
+    ) -> List[int] | None:
         assert len(keys) == len(target_location) == len(target_sizes)
         if len(keys) == 0:
             return
@@ -186,7 +186,7 @@ class MooncakeStore(HiCacheStorage):
             if keys[i] is None or target_location[i] is None or target_sizes[i] is None:
                 return
 
-        self._put_batch_zero_copy_impl(keys, target_location, target_sizes)
+        return self._put_batch_zero_copy_impl(keys, target_location, target_sizes)
 
     def get(
         self,
@@ -220,7 +220,7 @@ class MooncakeStore(HiCacheStorage):
 
         return self._get_batch_zero_copy_impl(keys, target_location, target_sizes)
 
-    def exists(self, keys) -> bool | dict:
+    def exists(self, keys) -> list[int] | None:
         _keys = []
         local_rank = torch.cuda.current_device()
         for key in keys:
@@ -229,8 +229,7 @@ class MooncakeStore(HiCacheStorage):
             # Since mooncake store is stored in layer by layer,
             # only the first layer is checked here.
             _keys.append(f"{key}_{local_rank}_k")
-        result = {k: v for k, v in zip(keys, self.store.batch_is_exist(_keys))}
-        return result
+        return self.store.batch_is_exist(_keys)
 
     def delete(self, key) -> None:
         raise (NotImplementedError)
@@ -245,12 +244,8 @@ class MooncakeStore(HiCacheStorage):
 
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
-    ) -> None:
-        try:
-            self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
-        except TypeError as err:
-            logger.error("Failed to put value to Mooncake Store: %s", err)
-            raise TypeError("Mooncake Store Put Type Error.") from err
+    ) -> List[int]:
+        return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
