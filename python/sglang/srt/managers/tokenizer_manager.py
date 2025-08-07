@@ -790,13 +790,14 @@ class TokenizerManager:
 
                     if (
                         finish_reason.get("type") == "abort"
-                        and finish_reason.get("status_code")
-                        == HTTPStatus.SERVICE_UNAVAILABLE
+                        and (finish_reason.get("status_code") == HTTPStatus.SERVICE_UNAVAILABLE
+                            or finish_reason.get("status_code") == HTTPStatus.INTERNAL_SERVER_ERROR)
                     ):
                         # This is an abort request initiated by scheduler.
                         # Delete the key to prevent resending abort request to the scheduler and
                         # to ensure aborted request state is cleaned up.
-                        del self.rid_to_state[state.obj.rid]
+                        if state.obj.rid in self.rid_to_state:
+                            del self.rid_to_state[state.obj.rid]
                         raise fastapi.HTTPException(
                             status_code=finish_reason["status_code"],
                             detail=finish_reason["message"],
