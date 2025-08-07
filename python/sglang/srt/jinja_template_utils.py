@@ -103,7 +103,9 @@ def detect_jinja_template_content_format(chat_template: str) -> str:
                 return "openai"  # Found content iteration → openai format
 
             # Also check for patterns like: {%- for item in msg.content -%} or {%- for item in m.content -%}
-            if _is_var_or_elems_access(loop_iter, "msg", "content") or _is_var_or_elems_access(loop_iter, "m", "content"):
+            if _is_var_or_elems_access(
+                loop_iter, "msg", "content"
+            ) or _is_var_or_elems_access(loop_iter, "m", "content"):
                 return "openai"  # Found content iteration → openai format (glm4v)
 
         return "string"  # No content loops found → string format

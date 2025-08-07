@@ -157,7 +157,7 @@ class Glm4vPatchMerger(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("proj", prefix),
-            gather_output=True
+            gather_output=True,
         )
         self.post_projection_norm = nn.LayerNorm(self.hidden_size)
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -524,11 +524,17 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         # reshape video_grid_thw -> [b, 3] -> [1, h, w] * frames
         temp_frames_hw = []
         for t, h, w in video_grid_thw:
-            repeated_row = torch.tensor([1, h.item(), w.item()]).unsqueeze(0).repeat(t, 1)
+            repeated_row = (
+                torch.tensor([1, h.item(), w.item()]).unsqueeze(0).repeat(t, 1)
+            )
             temp_frames_hw.append(repeated_row)
         flattened_video_grid_thw = torch.cat(temp_frames_hw, dim=0)
-        video_embeds = self.visual(pixel_values_videos, grid_thw=flattened_video_grid_thw)
-        split_sizes = (video_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+        video_embeds = self.visual(
+            pixel_values_videos, grid_thw=flattened_video_grid_thw
+        )
+        split_sizes = (
+            video_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
+        ).tolist()
         video_embeds = torch.split(video_embeds, split_sizes)
         return torch.cat(video_embeds)
 

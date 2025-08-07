@@ -521,6 +521,7 @@ register_chat_template(
     )
 )
 
+
 @register_chat_template_matching_function
 def match_deepseek(model_path: str):
     if re.search(r"deepseek-(v3|r1)", model_path, re.IGNORECASE) and not re.search(

@@ -300,6 +300,7 @@ class TestVILAServer(TestOpenAIVisionServer):
         )
         cls.base_url += "/v1"
 
+
 class TestGLM41VServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
@@ -310,16 +311,13 @@ class TestGLM41VServer(TestOpenAIVisionServer):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.68"
-            ],
+            other_args=["--trust-remote-code", "--mem-fraction-static", "0.68"],
         )
         cls.base_url += "/v1"
 
     def test_video_chat_completion(self):
         self._test_video_chat_completion()
+
 
 if __name__ == "__main__":
     del TestOpenAIVisionServer

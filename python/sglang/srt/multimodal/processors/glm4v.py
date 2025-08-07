@@ -48,7 +48,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             image_token_id=self.IM_TOKEN_ID,
             video_token=self.VIDEO_TOKEN,
             # Note: For GLM4v videos, it uses the video token before tokenization but uses image token after tokenization
-            video_token_id=self.IM_TOKEN_ID
+            video_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
 
     # adapted from https://github.com/huggingface/transformers/blob/369c99d0cea403b77bd0aef818527106453fd9fc/src/transformers/video_utils.py#L312
@@ -98,7 +98,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         video_metadata = None
 
         if base_output.videos:
-            videos_processed = [ 
+            videos_processed = [
                 await self.preprocess_video(video) for video in base_output.videos
             ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
