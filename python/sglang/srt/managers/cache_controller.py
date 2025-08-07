@@ -647,18 +647,18 @@ class HiCacheController:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
 
-        storage_hit_count = 0
+        storage_query_count = 0
         remaining_tokens = len(tokens_to_fetch)
         hash_value = []
         while remaining_tokens >= self.page_size:
             last_hash = self.get_hash_str(
                 tokens_to_fetch[
-                    storage_hit_count : storage_hit_count + self.page_size
+                    storage_query_count : storage_query_count + self.page_size
                 ],
                 last_hash,
             )
             hash_value.append(last_hash)
-            storage_hit_count += self.page_size
+            storage_query_count += self.page_size
             remaining_tokens -= self.page_size
         # deferring to batch exists
         exist_result = self.storage_backend.exists(hash_value)
@@ -673,7 +673,7 @@ class HiCacheController:
                 else:
                     break
             storage_hit_count = consecutive_hits * self.page_size
-        return hash_value[:storage_hit_count], storage_hit_count
+        return hash_value[:storage_hit_count // self.page_size], storage_hit_count
 
     def prefetch_thread_func(self):
         """
