@@ -235,7 +235,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         )
 
     if isinstance(input, tuple):
-        q_input, x_scale = input
+        q_input, x_scale, _ = input
         output_shape = [*q_input.shape[:-1], weight.shape[0]]
     else:
         input_2d = input.view(-1, input.shape[-1])
