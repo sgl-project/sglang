@@ -33,6 +33,7 @@ jobs:
           pip install "vllm==0.10.0"
           pip install "bitsandbytes>=0.44.0"
           pip3 install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126
+          pip3 install -e python[openai]
 
       - name: Run VLLM dependency tests
         timeout-minutes: 60
