@@ -7,12 +7,14 @@ on:
       - "python/**"
       - "scripts/**"
       - "test/**"
+      - .github/workflows/vllm-dependency-test.yml
   pull_request:
     branches: [ main ]
     paths:
       - "python/**"
       - "scripts/**"
       - "test/**"
+      - .github/workflows/vllm-dependency-test.yml
 
 concurrency:
   group: vllm-dependency-test-${{ github.ref }}
