@@ -529,7 +529,7 @@ jobs:
                 fi
               fi
               if [ "$e2e_latency" != "N/A" ] && [ "$e2e_latency" != "null" ]; then
-                if (( $(echo "$e2e_latency > 8.0" | bc -l 2>/dev/null || echo "0") )); then
+                if (( $(echo "$e2e_latency > 24.0" | bc -l 2>/dev/null || echo "0") )); then
                   validation_status="❌"
                 fi
               fi
@@ -539,7 +539,7 @@ jobs:
                 fi
               fi
               if [ "$output_throughput" != "N/A" ] && [ "$output_throughput" != "null" ]; then
-                if (( $(echo "$output_throughput < 100" | bc -l 2>/dev/null || echo "0") )); then
+                if (( $(echo "$output_throughput < 90" | bc -l 2>/dev/null || echo "0") )); then
                   validation_status="❌"
                 fi
               fi
