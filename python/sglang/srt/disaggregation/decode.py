@@ -592,7 +592,7 @@ class DecodeTransferQueue:
                 # unlock the kv cache or it will have memory leak
                 self.tree_cache.cache_finished_req(decode_req.req)
                 indices_to_remove.add(i)
-                if self.scheduler.metrics_collector is not None:
+                if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
