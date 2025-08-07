@@ -67,7 +67,7 @@ class TestRMSNormQuant(CustomTestCase):
     SCALE_TMA_ALIGNED = [False, True]
     GROUP_SIZE = [32, 64, 128, 256]
     SCALE_UE8M0 = [False, True]
-    SEEDS = [0]
+    SEEDS = [42]
 
     @classmethod
     def setUpClass(cls):
@@ -112,9 +112,10 @@ class TestRMSNormQuant(CustomTestCase):
             ref_out = layer.forward_native(x, residual)
             out = layer(x, residual)
         quant_atol = 5e-1
+        quant_rtol = 1e-3
 
         if add_residual:
-            (q, s), res = out
+            (q, s, _), res = out
             ref_rms, ref_res = ref_out
             ref_q, ref_s = sglang_per_token_group_quant_fp8(
                 ref_rms,
@@ -137,11 +138,11 @@ class TestRMSNormQuant(CustomTestCase):
             ref_dequant = ref_q.to(dtype) * ref_s
 
             self.assertTrue(
-                torch.allclose(dequant, ref_dequant, atol=quant_atol, rtol=1e-3)
+                torch.allclose(dequant, ref_dequant, atol=quant_atol, rtol=quant_rtol)
             )
             self.assertTrue(torch.allclose(res, ref_res, atol=1e-2, rtol=1e-2))
         else:
-            q, s = out
+            q, s, _ = out
             ref_rms = ref_out
             ref_q, ref_s = sglang_per_token_group_quant_fp8(
                 ref_rms,
@@ -166,7 +167,7 @@ class TestRMSNormQuant(CustomTestCase):
             ref_dequant = ref_q.to(dtype) * ref_s
 
             self.assertTrue(
-                torch.allclose(dequant, ref_dequant, atol=quant_atol, rtol=1e-3)
+                torch.allclose(dequant, ref_dequant, atol=quant_atol, rtol=quant_rtol)
             )
 
     def test_rms_norm(self):

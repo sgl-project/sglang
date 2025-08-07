@@ -38,7 +38,6 @@ __global__ void rms_norm_quant_kernel(
     const float fp8_max,
     const unsigned int stride,
     const unsigned int s_stride,
-    const unsigned int s_rows,
     const unsigned int d,
     const unsigned int rows) {
   DST_DTYPE* output_q = reinterpret_cast<DST_DTYPE*>(output_q_v);
@@ -147,7 +146,6 @@ void sgl_fused_rmsnorm_quant(
   const unsigned int rows = input.size(-2);
   const unsigned int stride = input.stride(-2);
   const unsigned int scale_stride = output_s.stride(1);
-  const unsigned int scale_rows = output_s.size(1);
 
   dim3 grid(rows);
   dim3 block(RMS_BLOCK_SIZE);
@@ -184,7 +182,6 @@ void sgl_fused_rmsnorm_quant(
             (float)fp8_max,                                           \
             stride,                                                   \
             scale_stride,                                             \
-            scale_rows,                                               \
             packed_d,                                                 \
             rows);                                                    \
       } else {                                                        \
@@ -203,7 +200,6 @@ void sgl_fused_rmsnorm_quant(
             (float)fp8_max,                                           \
             stride,                                                   \
             scale_stride,                                             \
-            scale_rows,                                               \
             packed_d,                                                 \
             rows);                                                    \
       }                                                               \
@@ -224,7 +220,6 @@ void sgl_fused_rmsnorm_quant(
           (float)fp8_max,                                             \
           stride,                                                     \
           scale_stride,                                               \
-          scale_rows,                                                 \
           packed_d,                                                   \
           rows);                                                      \
     }                                                                 \
