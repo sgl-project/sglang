@@ -257,15 +257,17 @@ class MooncakeKVManager(BaseKVManager):
         )
 
     def register_buffer_to_engine(self):
-        for kv_data_ptr, kv_data_len in zip(
-            self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
-        ):
-            self.engine.register(kv_data_ptr, kv_data_len)
+        # Batch register KV data buffers
+        if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
+            self.engine.batch_register(
+                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
+            )
 
-        for aux_data_ptr, aux_data_len in zip(
-            self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
-        ):
-            self.engine.register(aux_data_ptr, aux_data_len)
+        # Batch register auxiliary data buffers
+        if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
+            self.engine.batch_register(
+                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
+            )
 
     @cache
     def _connect(self, endpoint: str, is_ipv6: bool = False):
