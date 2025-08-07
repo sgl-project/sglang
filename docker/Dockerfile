@@ -80,7 +80,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
 
 # Download source files
 RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    git clone https://github.com/fzyzcjy/DeepEP.git && \
+    git clone https://github.com/deepseek-ai/DeepEP.git && \
     cd DeepEP && git checkout ${DEEPEP_COMMIT} && cd .. && \
     tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
     mv nvshmem_src nvshmem && \
