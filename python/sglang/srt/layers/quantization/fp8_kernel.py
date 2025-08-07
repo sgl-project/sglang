@@ -1408,7 +1408,7 @@ def per_group_transpose(
 
     grid = lambda META: (
         num_experts,
-        triton.cdiv(m // num_experts, META["BLOCK_SIZE_M"]),
+        triton.cdiv((m + num_experts - 1) // num_experts, META["BLOCK_SIZE_M"]),
         triton.cdiv(k, META["BLOCK_SIZE_K"]),
     )
     _per_group_transpose[grid](
