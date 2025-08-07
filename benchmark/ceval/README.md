@@ -7,7 +7,7 @@ git lfs clone https://huggingface.co/datasets/ceval/ceval-exam
 
 ### Benchmark sglang
 ```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+python -m sglang.launch_server --model-path ramblingpolymath/Qwen3-32B-W8A8 --port 30000
 ```
 
 ```

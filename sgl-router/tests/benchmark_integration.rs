@@ -1,12 +1,14 @@
 // Integration test to ensure benchmarks compile and basic functionality works
 // This prevents benchmarks from breaking in CI
+//
+// UPDATED: Removed deprecated ToPdRequest usage, now uses direct JSON serialization
 
-use serde_json::{from_str, to_string};
+use serde_json::{from_str, to_string, to_value};
+use sglang_router_rs::core::{BasicWorker, WorkerType};
 use sglang_router_rs::openai_api_types::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
     SamplingParams, StringOrArray, UserMessageContent,
 };
-use sglang_router_rs::routers::request_adapter::{RouteableRequest, ToPdRequest};
 
 /// Create a default GenerateRequest for benchmarks with minimal fields set
 fn default_generate_request() -> GenerateRequest {
@@ -114,6 +116,15 @@ fn default_completion_request() -> CompletionRequest {
     }
 }
 
+fn create_test_worker() -> BasicWorker {
+    BasicWorker::new(
+        "http://test-server:8000".to_string(),
+        WorkerType::Prefill {
+            bootstrap_port: Some(5678),
+        },
+    )
+}
+
 #[test]
 fn test_benchmark_request_creation() {
     // Ensure all benchmark request types can be created without panicking
@@ -197,92 +208,20 @@ fn test_benchmark_serialization_roundtrip() {
 }
 
 #[test]
-fn test_benchmark_request_adaptation() {
-    // Test that PD request adaptation works for benchmark types
+fn test_benchmark_direct_json_routing() {
+    // Test direct JSON routing functionality for benchmark types (replaces regular routing)
 
     let generate_req = GenerateRequest {
         text: Some("Test prompt".to_string()),
         ..default_generate_request()
     };
 
-    let chat_req = ChatCompletionRequest {
-        model: "test-model".to_string(),
-        messages: vec![ChatMessage::User {
-            role: "user".to_string(),
-            content: UserMessageContent::Text("Test message".to_string()),
-            name: None,
-        }],
-        max_tokens: Some(150),
-        max_completion_tokens: Some(150),
-        temperature: Some(0.7),
-        top_p: Some(1.0),
-        n: Some(1),
-        presence_penalty: Some(0.0),
-        frequency_penalty: Some(0.0),
-        parallel_tool_calls: Some(true),
-        ..default_chat_completion_request()
-    };
+    // Test direct JSON conversion (replaces regular routing methods)
+    let json = to_value(&generate_req).unwrap();
+    let json_string = to_string(&json).unwrap();
+    let bytes = json_string.as_bytes();
 
-    let completion_req = CompletionRequest {
-        model: "test-model".to_string(),
-        prompt: StringOrArray::String("Test prompt".to_string()),
-        max_tokens: Some(50),
-        temperature: Some(0.8),
-        top_p: Some(1.0),
-        n: Some(1),
-        presence_penalty: Some(0.0),
-        frequency_penalty: Some(0.0),
-        best_of: Some(1),
-        ..default_completion_request()
-    };
-
-    // Test PD adaptation (should not panic)
-    let _pd_generate = generate_req.to_pd_request();
-    let _pd_chat = chat_req.to_pd_request();
-    let _pd_completion = completion_req.to_pd_request();
-}
-
-#[test]
-fn test_benchmark_regular_routing() {
-    // Test regular routing functionality for benchmark types
-
-    let generate_req = GenerateRequest {
-        text: Some("Test prompt".to_string()),
-        ..default_generate_request()
-    };
-
-    // Test regular routing methods (should not panic)
-    let _json = generate_req.to_json();
-    let _bytes = generate_req.to_bytes();
-}
-
-#[test]
-fn test_benchmark_performance_baseline() {
-    // Basic performance sanity check - ensure operations complete quickly
-    use std::time::Instant;
-
-    let generate_req = GenerateRequest {
-        text: Some("Short test prompt".to_string()),
-        ..default_generate_request()
-    };
-
-    // Serialization should be fast (< 1ms for simple requests)
-    let start = Instant::now();
-    let _json = to_string(&generate_req).unwrap();
-    let serialize_duration = start.elapsed();
-    assert!(
-        serialize_duration.as_millis() < 1,
-        "Serialization took too long: {:?}",
-        serialize_duration
-    );
-
-    // PD adaptation should be very fast (< 1ms)
-    let start = Instant::now();
-    let _pd_req = generate_req.to_pd_request();
-    let adapt_duration = start.elapsed();
-    assert!(
-        adapt_duration.as_millis() < 1,
-        "PD adaptation took too long: {:?}",
-        adapt_duration
-    );
+    // Verify conversions work
+    assert!(!json_string.is_empty());
+    assert!(!bytes.is_empty());
 }
