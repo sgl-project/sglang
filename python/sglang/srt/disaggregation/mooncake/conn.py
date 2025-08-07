@@ -214,7 +214,6 @@ class MooncakeKVManager(BaseKVManager):
             self.enable_custom_mem_pool = get_bool_env_var(
                 "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
             )
-            self.engine.set_enable_custom_mem_pool(self.enable_custom_mem_pool)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.heartbeat_failures = {}
             self.session_pool = defaultdict(requests.Session)

@@ -1,8 +1,6 @@
 import logging
 from typing import List, Optional
 
-import torch
-
 from sglang.srt.utils import get_bool_env_var, get_free_port, maybe_wrap_ipv6_address
 
 logger = logging.getLogger(__name__)
@@ -24,7 +22,13 @@ class MooncakeTransferEngine:
         self.hostname = hostname
         self.gpu_id = gpu_id
         self.ib_device = ib_device
-        self.enable_custom_mem_pool = False
+        self.enable_custom_mem_pool = get_bool_env_var(
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
+        )
+
+        if self.enable_custom_mem_pool:
+            # Lazy import: need to call torch.cuda.synchronize() for nvlink transport
+            import torch
 
         self.initialize(
             hostname=self.hostname,
@@ -33,9 +37,6 @@ class MooncakeTransferEngine:
         self.session_id = (
             f"{maybe_wrap_ipv6_address(self.hostname)}:{self.engine.get_rpc_port()}"
         )
-
-    def set_enable_custom_mem_pool(self, enable_custom_mem_pool: bool):
-        self.enable_custom_mem_pool = enable_custom_mem_pool
 
     def register(self, ptr, length):
         try:
