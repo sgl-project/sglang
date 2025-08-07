@@ -460,7 +460,10 @@ impl PDRouter {
             // Fire prefill request but don't wait
             let prefill_future = prefill_request.send();
             tokio::spawn(async move {
-                let _ = prefill_future.await;
+                // Must consume response to free connection
+                if let Ok(response) = prefill_future.await {
+                    let _ = response.bytes().await;
+                }
             });
 
             // Wait only for decode response
