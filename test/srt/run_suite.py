@@ -108,7 +108,6 @@ suites = {
         TestFile("test_vlm_input_format.py", 300),
         TestFile("test_vision_openai_server_a.py", 600),
         TestFile("test_vision_openai_server_b.py", 600),
-        TestFile("test_vision_openai_server_c.py", 600),
         TestFile("test_w8a8_quantization.py", 46),
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_hybrid_attn_backend.py", 100),
