@@ -32,7 +32,7 @@ try:
         mha_batch_prefill_func,
         paged_attention_ragged,
     )
-    from aiter.mla import mla_prefill_fwd, mla_decode_fwd
+    from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 except ImportError:
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
