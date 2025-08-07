@@ -102,10 +102,13 @@ class GptOssSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_local_experts}."
             )
 
-        self.topk = TopK(
-            top_k=config.num_experts_per_tok,
-            renormalize=True,
-        )
+        if global_server_args_dict["flashinfer_mxfp4_moe"]:
+            self.topk = None
+        else:
+            self.topk = TopK(
+                top_k=config.num_experts_per_tok,
+                renormalize=True,
+            )
 
         experts_type = get_moe_impl_class()
         extra_kwargs = {}
@@ -176,7 +179,7 @@ class GptOssSparseMoeBlock(nn.Module):
         if self.topk is not None:
             kwargs["topk_output"] = self.topk(hidden_states, router_logits)
         else:
-            kwargs["router_logits"] = router_logits
+            kwargs["topk_output"] = (self.topk, router_logits)
         final_hidden_states = self.experts(**kwargs)
 
         if self.tp_size > 1:
