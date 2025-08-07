@@ -457,17 +457,20 @@ impl PDRouter {
             }
         } else {
             // When we don't need logprobs, only wait for decode response
-            // Fire prefill request but don't wait
+            // Send both requests concurrently
             let prefill_future = prefill_request.send();
+            let decode_future = decode_request.send();
+            
+            // Spawn task to consume prefill response
             tokio::spawn(async move {
                 // Must consume response to free connection
                 if let Ok(response) = prefill_future.await {
                     let _ = response.bytes().await;
                 }
             });
-
+            
             // Wait only for decode response
-            let decode_result = decode_request.send().await;
+            let decode_result = decode_future.await;
             debug!("Received decode response");
 
             // Update metrics
