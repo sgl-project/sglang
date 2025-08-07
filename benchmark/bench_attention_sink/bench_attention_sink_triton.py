@@ -192,6 +192,7 @@ def benchmark_extend(B, S, H_Q, H_KV, D):
             max_len_extend=extend_len,
             sm_scale=sm_scale,
             sliding_window_size=sliding_window,
+            sinks=sink,
         )
 
     # benchmark
@@ -224,7 +225,7 @@ def benchmark_extend(B, S, H_Q, H_KV, D):
     ms = start_event.elapsed_time(end_event) / run_step
 
     # FLOPS calculation: each attention operation requires 2 multiplications per element
-    total_flops = 2 * total_extend_tokens * H_Q * (prefill_len + extend_len) * D
+    total_flops = 2 * total_extend_tokens * H_Q * (prefill_len + extend_len / 2) * D
     tflops = lambda ms: total_flops * 1e-12 / (ms * 1e-3)  # convert to TFLOPS
     return tflops(ms)
 
