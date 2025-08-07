@@ -24,6 +24,7 @@ class MooncakeTransferEngine:
         self.hostname = hostname
         self.gpu_id = gpu_id
         self.ib_device = ib_device
+        self.enable_custom_mem_pool = False
 
         self.initialize(
             hostname=self.hostname,
@@ -32,6 +33,9 @@ class MooncakeTransferEngine:
         self.session_id = (
             f"{maybe_wrap_ipv6_address(self.hostname)}:{self.engine.get_rpc_port()}"
         )
+
+    def set_enable_custom_mem_pool(self, enable_custom_mem_pool: bool):
+        self.enable_custom_mem_pool = enable_custom_mem_pool
 
     def register(self, ptr, length):
         try:
@@ -88,7 +92,9 @@ class MooncakeTransferEngine:
             ret = self.engine.transfer_sync_write(
                 session_id, buffer, peer_buffer_address, length
             )
-            torch.cuda.synchronize()  # Ensure the transfer is complete before proceeding
+            # Synchronize CUDA if using nvlink transport
+            if self.enable_custom_mem_pool:
+                torch.cuda.synchronize()  # Ensure the transfer is complete before proceeding
         except Exception:
             # Mark transfer request as failed
             ret = -1
@@ -116,7 +122,9 @@ class MooncakeTransferEngine:
             ret = self.engine.batch_transfer_sync_write(
                 session_id, buffers, peer_buffer_addresses, lengths
             )
-            torch.cuda.synchronize()  # Ensure the transfer is complete before proceeding
+            # Synchronize CUDA if using nvlink transport
+            if self.enable_custom_mem_pool:
+                torch.cuda.synchronize()  # Ensure the transfer is complete before proceeding
         except Exception:
             ret = -1
             # Inform user to upgrade mooncake-transfer-engine >= 0.3.4.post2
