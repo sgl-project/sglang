@@ -369,15 +369,6 @@ class Engine(EngineBase):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.tokenizer_manager.stop_profile())
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
-        """Abort a specific request or all requests.
-
-        Args:
-            rid: The request ID to abort. If empty and abort_all is False, no action is taken.
-            abort_all: If True, abort all running requests regardless of rid.
-        """
-        self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
-
     def start_expert_distribution_record(self):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(
@@ -538,6 +529,17 @@ class Engine(EngineBase):
         return loop.run_until_complete(
             self.tokenizer_manager.resume_memory_occupation(obj, None)
         )
+
+    def abort_request(self, rid: str = "", abort_all: bool = False):
+        """Abort a specific request or all requests.
+
+        Args:
+            rid: The request ID to abort. If empty and abort_all is False, no action is taken.
+            abort_all: If True, abort all running requests regardless of rid.
+        """
+        obj = AbortReq(rid=rid, abort_all=abort_all)
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(self.tokenizer_manager.abort_request(obj, None))
 
     """
     Execute an RPC call on all scheduler processes.
