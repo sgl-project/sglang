@@ -69,8 +69,10 @@ PYTORCH_VERSION=2.6.0
 TORCHVISION_VERSION=0.21.0
 pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
 
-PTA_VERSION=2.6.0
-pip install torch_npu==$PTA_VERSION
+PTA_VERSION="v7.1.0.1-pytorch2.6.0"
+PTA_NAME="torch_npu-2.6.0.post1-cp311-cp311-manylinux_2_28_aarch64.whl"
+PTA_URL="https://gitee.com/ascend/pytorch/releases/download/${PTA_VERSION}/${PTA_WHL_NAME}"
+wget -O "${PTA_NAME}" "${PTA_URL}" && pip install "./${PTA_NAME}"
 ```
 
 #### vLLM
@@ -80,7 +82,7 @@ vLLM is still a major prerequisite on Ascend NPU. Because of `torch==2.6.0` limi
 ```shell
 VLLM_TAG=v0.8.5
 git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG
-(cd vllm && VLLM_TARGET_DEVICE="empty" ${PIP_INSTALL} -v -e .)
+(cd vllm && VLLM_TARGET_DEVICE="empty" pip install -v -e .)
 ```
 
 #### Triton on Ascend
