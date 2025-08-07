@@ -29,6 +29,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
@@ -78,6 +79,7 @@ class Grok1MoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        layer_id: int,
         num_experts: int,
         top_k: int,
         hidden_size: int,
@@ -116,7 +118,7 @@ class Grok1MoE(nn.Module):
         )
 
         kwargs = {}
-        if global_server_args_dict["enable_ep_moe"]:
+        if get_moe_expert_parallel_world_size() > 1:
             MoEImpl = EPMoE
         else:
             MoEImpl = FusedMoE
@@ -128,6 +130,7 @@ class Grok1MoE(nn.Module):
         self.experts = MoEImpl(
             num_experts=num_experts,
             top_k=top_k,
+            layer_id=layer_id,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             params_dtype=params_dtype,
@@ -331,6 +334,7 @@ class Grok1DecoderLayer(nn.Module):
         )
         self.block_sparse_moe = Grok1MoE(
             config=config,
+            layer_id=layer_id,
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
@@ -613,8 +617,7 @@ class Grok1ForCausalLM(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
-        expert_params_mapping = MoEImpl.make_expert_params_mapping(
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",

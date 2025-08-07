@@ -153,7 +153,7 @@ class LoRAMemoryPool:
         self,
         cur_uids: Set[Optional[str]],
         lora_adapters: Dict[str, LoRAAdapter],
-        lora_modules: Dict[int, Dict[str, BaseLayerWithLoRA]],
+        lora_modules: List[Dict[str, BaseLayerWithLoRA]],
     ):
         def get_available_buffer_slot():
             for buffer_id in range(self.max_loras_per_batch):
@@ -186,7 +186,7 @@ class LoRAMemoryPool:
         uid: str,
         buffer_id: int,
         lora_adapter: LoRAAdapter,
-        lora_modules: Dict[int, Dict[str, BaseLayerWithLoRA]],
+        lora_modules: List[Dict[str, BaseLayerWithLoRA]],
     ):
         def load_lora_weight_tensor(
             buffer_view: torch.Tensor, weight: Optional[torch.Tensor]

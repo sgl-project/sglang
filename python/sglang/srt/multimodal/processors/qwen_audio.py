@@ -11,8 +11,8 @@ from sglang.srt.multimodal.processors.base_processor import (
 class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
     models = [Qwen2AudioForConditionalGeneration]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.AUDIO_TOKEN = "<|audio_bos|><|AUDIO|><|audio_eos|>"
         self.AUDIO_TOKEN_REGEX = re.compile(
             r"<\|audio_bos\|>(?:<\|AUDIO\|>)+<\|audio_eos\|>"
