@@ -825,7 +825,6 @@ class UpdateWeightsFromDistributedReqInput:
     rids: Optional[Union[List[str], str]] = None
 
 
-
 @dataclass
 class UpdateWeightsFromDistributedReqOutput:
     success: bool
@@ -943,9 +942,9 @@ class AbortReq:
 
     finished_reason: Optional[Dict[str, Any]] = None
 
-
     def __post_init__(self):
         self.rids = self.rid
+
 
 @dataclass
 class GetInternalStateReq:
@@ -1154,6 +1153,7 @@ class LoRAUpdateResult:
     loaded_adapters: Optional[Dict[str, LoRARef]] = None
     rids: Optional[Union[List[str], str]] = None
 
+
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
 
 
@@ -1171,4 +1171,3 @@ class BlockReqType(Enum):
 @dataclass
 class BlockReqInput:
     type: BlockReqType
-

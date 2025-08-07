@@ -206,6 +206,35 @@ def get_main_process_id() -> int:
     """Get the main process ID"""
     return multiprocessing.current_process()._parent_pid
 
+
+def write_data_for_multi_tokenizer(
+    port_args: PortArgs, server_args: ServerArgs, scheduler_info: Dict
+):
+    # get main process ID
+    main_pid = get_main_process_id()
+    current_pid = os.getpid()
+    logger.info(f"main process ID: {main_pid}, current process ID: {current_pid}")
+
+    # Write port_args to shared memory
+    port_args_shm = write_to_shared_memory(
+        serialize_port_args(port_args), f"port_args_{os.getpid()}"
+    )
+    # Write server_args to shared memory
+    server_args_shm = write_to_shared_memory(
+        serialize_server_args(server_args), f"server_args_{os.getpid()}"
+    )
+    # Write scheduler_info to shared memory
+    scheduler_info_shm = write_to_shared_memory(
+        serialize_scheduler_info(scheduler_info), f"scheduler_info_{os.getpid()}"
+    )
+
+    port_args_shm.close()
+    server_args_shm.close()
+    scheduler_info_shm.close()
+
+    return port_args_shm, server_args_shm, scheduler_info_shm
+
+
 def init_multi_tokenizer() -> ServerArgs:
     """Read args information from shm and init tokenizer manager for current process"""
     pid = os.getpid()
@@ -215,10 +244,7 @@ def init_multi_tokenizer() -> ServerArgs:
     # Read port_args, server_args, and scheduler_info from shared memory
     port_args_data = read_from_shared_memory(f"port_args_{main_pid}")
     server_args_data = read_from_shared_memory(f"server_args_{main_pid}")
-    scheduler_info_data = read_from_shared_memory(
-        f"scheduler_info_{main_pid}"
-
-    )
+    scheduler_info_data = read_from_shared_memory(f"scheduler_info_{main_pid}")
     port_args = deserialize_port_args(port_args_data)
     server_args = deserialize_server_args(server_args_data)
     scheduler_info = deserialize_scheduler_info(scheduler_info_data)
@@ -237,7 +263,7 @@ def init_multi_tokenizer() -> ServerArgs:
         completion_template=server_args.completion_template,
     )
     # register multi tokenizer
-    tokenizer_manager.register_to_main_tokenizer_manager()  
+    tokenizer_manager.register_to_main_tokenizer_manager()
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     set_global_state(
@@ -248,6 +274,7 @@ def init_multi_tokenizer() -> ServerArgs:
         )
     )
     return server_args
+
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
@@ -324,7 +351,7 @@ async def lifespan(fast_api_app: FastAPI):
     warmup_thread = getattr(fast_api_app, "warmup_thread", None)
     if warmup_thread is not None:
         warmup_thread.start()
-    
+
     try:
         yield
     finally:
@@ -353,6 +380,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # Function to setup all middlewares for multi-process compatibility
 def setup_middlewares():
     """Setup all middlewares for both single and multi-process modes"""
@@ -371,6 +399,7 @@ def setup_middlewares():
         add_prometheus_middleware(app)
         enable_func_timer()
         logger.info(f"Worker {worker_pid} added prometheus middleware")
+
 
 # Call setup function at module level for multi-process compatibility
 setup_middlewares()
@@ -1173,29 +1202,32 @@ def launch_server(
         )
     )
     if server_args.tokenizer_worker_num > 1:
-        # get main process ID
-        main_pid = get_main_process_id()
-        current_pid = os.getpid()
-        logger.info(f"main process ID: {main_pid}, current process ID: {current_pid}")
+        # Set environment variables for middlewares in main process
+        if server_args.api_key:
+            os.environ["SGLANG_API_KEY"] = server_args.api_key
+            logger.info("Main process set SGLANG_API_KEY")
 
-        # Write port_args to shared memory
-        port_args_shm = write_to_shared_memory(
-            serialize_port_args(port_args), f"port_args_{os.getpid()}"
-        )
-        # Write server_args to shared memory
-        server_args_shm = write_to_shared_memory(
-            serialize_server_args(server_args), f"server_args_{os.getpid()}"
-        )
-        # Write scheduler_info to shared memory
-        scheduler_info_shm = write_to_shared_memory(
-            serialize_scheduler_info(scheduler_info), f"scheduler_info_{os.getpid()}"
-        )
+        if server_args.enable_metrics:
+            os.environ["SGLANG_ENABLE_METRICS"] = "true"
+            logger.info("Main process set SGLANG_ENABLE_METRICS=true")
 
-        port_args_shm.close()
-        server_args_shm.close()
-        scheduler_info_shm.close()
-        # template_manager_shm.close()
+        port_args_shm, server_args_shm, scheduler_info_shm = (
+            write_data_for_multi_tokenizer(
+                port_args,
+                server_args,
+                scheduler_info,
+            )
+        )
     else:
+        # Add api key authorization
+        if server_args.api_key:
+            add_api_key_middleware(app, server_args.api_key)
+
+        # Add prometheus middleware
+        if server_args.enable_metrics:
+            add_prometheus_middleware(app)
+            enable_func_timer()
+
         # Send a warmup request - we will create the thread launch it
         # in the lifespan after all other warmups have fired.
         warmup_thread = threading.Thread(
@@ -1208,23 +1240,6 @@ def launch_server(
         )
         app.warmup_thread = warmup_thread
 
-    if server_args.tokenizer_worker_num > 1:
-        # Set environment variables for middlewares in main process
-        if server_args.api_key:
-            os.environ["SGLANG_API_KEY"] = server_args.api_key
-            logger.info("Main process set SGLANG_API_KEY")
-
-        if server_args.enable_metrics:
-            os.environ["SGLANG_ENABLE_METRICS"] = "true"
-            logger.info("Main process set SGLANG_ENABLE_METRICS=true")
-    else:
-        if server_args.api_key:
-            add_api_key_middleware(app,server_args.api_key)
-
-        if server_args.enable_metrics:
-            add_prometheus_middleware(app)
-            enable_func_timer()
-
     try:
         # Update logging configs
         set_uvicorn_logging_configs()
@@ -1232,6 +1247,7 @@ def launch_server(
         # Listen for HTTP requests
         if server_args.tokenizer_worker_num > 1:
             from uvicorn.config import LOGGING_CONFIG
+
             LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
                 "handlers": ["default"],
                 "level": "INFO",

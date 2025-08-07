@@ -89,6 +89,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateResult,
+    MultiTokenizerRegisterReq,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -113,7 +114,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    MultiTokenizerRegisterReq,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -125,10 +125,10 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
     get_bool_env_var,
+    get_origin_rid,
+    get_workerids_from_rids,
     get_zmq_socket,
     kill_process_tree,
-    get_workerids_from_rids,
-    get_origin_rid,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -176,6 +176,7 @@ class ReqState:
 
 _global_tokenizer_worker_num = 1
 
+
 class TokenizerManager:
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -196,10 +197,10 @@ class TokenizerManager:
             else None
         )
         self.crash_dump_folder = server_args.crash_dump_folder
-        
+
         self.is_main = is_main
         self.worker_id = os.getpid()
-        
+
         # Read model args
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
@@ -524,7 +525,6 @@ class TokenizerManager:
 
         async with self._is_updating_cond:
             await self._is_updating_cond.wait_for(lambda: not self._is_updating)
-
 
         if self.server_args.tokenizer_worker_num > 1:
             # Modify rid, add worker_id
@@ -1570,22 +1570,20 @@ class TokenizerManager:
                 self._result_dispatcher(recv_obj)
 
             self.last_receive_tstamp = time.time()
-    
-    def init_tokenizer_mapping(self,recv_obj: MultiTokenizerRegisterReq):
+
+    def init_tokenizer_mapping(self, recv_obj: MultiTokenizerRegisterReq):
         """init tokenizer mapping from register request"""
         if isinstance(recv_obj.rids, list):
             worker_ids = get_workerids_from_rids(recv_obj.rids)
         else:
             raise RuntimeError(f"tokenizer_worker_num > 1, recv_obj.rids must be list")
-        
-        for worker_id in worker_ids:   
+
+        for worker_id in worker_ids:
             ipc_name = recv_obj.ipc_name
             worker_id_int = int(worker_id)
-            
+
             if worker_id_int not in self.tokenizer_mapping:
-                socket = get_zmq_socket(
-                    self._zmq_context, zmq.PUSH, ipc_name, False
-                )
+                socket = get_zmq_socket(self._zmq_context, zmq.PUSH, ipc_name, False)
                 self.tokenizer_mapping[worker_id_int] = socket
                 logger.info(
                     f"Main Tokenizer Manager Created ZMQ socket for worker {worker_id} with ipc_name {ipc_name}"
@@ -1605,11 +1603,11 @@ class TokenizerManager:
 
         if not hasattr(self, "tokenizer_mapping"):
             self.tokenizer_mapping = {}
-        
+
         # Create ZMQ context if needed
         if not hasattr(self, "_zmq_context"):
             self._zmq_context = zmq.Context()
-        
+
         # Distribute result to each worker
         for i, worker_id in enumerate(worker_ids):
             if worker_id not in self.tokenizer_mapping:
@@ -1624,12 +1622,17 @@ class TokenizerManager:
             else:
                 if isinstance(recv_obj, MultiTokenizerRegisterReq):
                     continue
-            
-            if not isinstance(recv_obj, (BatchStrOut,
-                        BatchEmbeddingOut,
-                        BatchTokenIDOut,
-                        BatchMultimodalOut,)):
-                    # Send to worker
+
+            if not isinstance(
+                recv_obj,
+                (
+                    BatchStrOut,
+                    BatchEmbeddingOut,
+                    BatchTokenIDOut,
+                    BatchMultimodalOut,
+                ),
+            ):
+                # Send to worker
                 self.tokenizer_mapping[worker_id].send_pyobj(recv_obj)
             else:
                 if isinstance(recv_obj, BatchTokenIDOut):
@@ -1785,7 +1788,7 @@ class TokenizerManager:
                             else None
                         ),
                     )
-                elif isinstance(recv_obj,BatchStrOut):
+                elif isinstance(recv_obj, BatchStrOut):
                     new_recv_obj = BatchStrOut(
                         [recv_obj.rids[i]],
                         (
@@ -1889,29 +1892,30 @@ class TokenizerManager:
                             else None
                         ),
                     )
-                elif isinstance(recv_obj,BatchMultimodalOut):
+                elif isinstance(recv_obj, BatchMultimodalOut):
                     new_recv_obj = BatchMultimodalOut(
                         [recv_obj.rids[i]],
                         (
                             [recv_obj.finished_reasons[i]]
-                            if len(recv_obj.finished_reasons) > i else None
+                            if len(recv_obj.finished_reasons) > i
+                            else None
                         ),
-                        (
-                            [recv_obj.outputs[i]]
-                            if len(recv_obj.outputs) > i else None
-                        ),
+                        ([recv_obj.outputs[i]] if len(recv_obj.outputs) > i else None),
                         (
                             [recv_obj.prompt_tokens[i]]
-                            if len(recv_obj.prompt_tokens) > i else None
+                            if len(recv_obj.prompt_tokens) > i
+                            else None
                         ),
                         (
                             [recv_obj.completion_tokens[i]]
-                            if len(recv_obj.completion_tokens) > i else None
+                            if len(recv_obj.completion_tokens) > i
+                            else None
                         ),
                         (
                             [recv_obj.cached_tokens[i]]
-                            if len(recv_obj.cached_tokens) > i else None
-                        )
+                            if len(recv_obj.cached_tokens) > i
+                            else None
+                        ),
                     )
                 try:
                     self.tokenizer_mapping[worker_id].send_pyobj(new_recv_obj)
@@ -1927,7 +1931,7 @@ class TokenizerManager:
         req.ipc_name = self.tokenizer_ipc_name
         self.send_to_scheduler.send_pyobj(req)
         time.sleep(5)
-     
+
     def _handle_batch_output(
         self,
         recv_obj: Union[
@@ -2485,10 +2489,14 @@ class _Communicator(Generic[T]):
         global _global_tokenizer_worker_num
         if _global_tokenizer_worker_num > 1:
             # If rids is a string and not empty, remove the prefix
-            if hasattr(recv_obj, 'rids') and isinstance(recv_obj.rids, str) and recv_obj.rids:
+            if (
+                hasattr(recv_obj, "rids")
+                and isinstance(recv_obj.rids, str)
+                and recv_obj.rids
+            ):
                 recv_obj.rids = get_origin_rid(recv_obj.rids)
             # If rids is a list, remove prefix from each element
-            elif hasattr(recv_obj, 'rids') and isinstance(recv_obj.rids, list):
+            elif hasattr(recv_obj, "rids") and isinstance(recv_obj.rids, list):
                 recv_obj.rids = [get_origin_rid(rid) for rid in recv_obj.rids]
 
         self._result_values.append(recv_obj)

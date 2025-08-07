@@ -79,6 +79,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    MultiTokenizerRegisterReq,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -97,7 +98,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
-    MultiTokenizerRegisterReq,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
@@ -2399,7 +2399,7 @@ class Scheduler(
     def register_multi_tokenizer(self, recv_req: MultiTokenizerRegisterReq):
         self.send_to_detokenizer.send_pyobj(recv_req)
         return recv_req
-    
+
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time
         if t is not None and t <= 0:
@@ -2555,8 +2555,6 @@ def run_scheduler_process(
                 "max_req_input_len": scheduler.max_req_input_len,
             }
         )
-
-
 
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:

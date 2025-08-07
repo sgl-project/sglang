@@ -36,9 +36,9 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
+    get_workerids_from_rids,
     get_zmq_socket,
     kill_itself_when_parent_died,
-    get_workerids_from_rids,
 )
 from sglang.utils import (
     TypeBasedDispatcher,
@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 # For more details, see: https://github.com/sgl-project/sglang/issues/2812
 # Use power of 2 values for better memory allocation.
 DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 << 16))
+
 
 @dataclasses.dataclass
 class DecodeStatus:
@@ -118,11 +119,13 @@ class DetokenizerManager:
                     if isinstance(recv_obj.rids, list):
                         worker_ids = get_workerids_from_rids(recv_obj.rids)
                     else:
-                        raise RuntimeError(f"tokenizer_worker_num > 1, recv_obj.rids must be list")
-                    
+                        raise RuntimeError(
+                            f"tokenizer_worker_num > 1, recv_obj.rids must be list"
+                        )
+
                     if not hasattr(self, "tokenizer_mapping"):
                         self.tokenizer_mapping = {}
-                    
+
                     # Create ZMQ context if needed
                     if not hasattr(self, "_zmq_context"):
                         self._zmq_context = zmq.Context()
@@ -142,7 +145,7 @@ class DetokenizerManager:
                         else:
                             if isinstance(recv_obj, MultiTokenizerRegisterReq):
                                 continue
-                        
+
                         # Create a new output object based on the type
                         if isinstance(output, BatchEmbeddingOut):
                             new_output = BatchEmbeddingOut(
@@ -167,8 +170,7 @@ class DetokenizerManager:
                                 ),
                                 output_ids=(
                                     [output.output_ids[i]]
-                                    if output.output_ids
-                                    and len(output.output_ids) > i
+                                    if output.output_ids and len(output.output_ids) > i
                                     else None
                                 ),
                                 prompt_tokens=(
@@ -278,15 +280,15 @@ class DetokenizerManager:
                 logger.error(f"Error in detokenizer event loop: {e}")
                 raise e
 
-    def init_tokenizer_mapping(self,recv_obj: MultiTokenizerRegisterReq, worker_id: str):
+    def init_tokenizer_mapping(
+        self, recv_obj: MultiTokenizerRegisterReq, worker_id: str
+    ):
         """init tokenizer mapping from register request"""
         ipc_name = recv_obj.ipc_name
         worker_id_int = int(worker_id)
 
         if worker_id_int not in self.tokenizer_mapping:
-            socket = get_zmq_socket(
-                self._zmq_context, zmq.PUSH, ipc_name, False
-            )
+            socket = get_zmq_socket(self._zmq_context, zmq.PUSH, ipc_name, False)
             self.tokenizer_mapping[worker_id_int] = socket
             logger.info(
                 f"Detokenizer Manager Created ZMQ socket for worker {worker_id} with ipc_name {ipc_name}"
