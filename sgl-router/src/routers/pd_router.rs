@@ -38,6 +38,8 @@ pub struct PDRouter {
     pub worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub client: Client,
+    // Dedicated client for prefill fire-and-forget (non-logprob) requests
+    pub prefill_client: Client,
     pub retry_config: RetryConfig,
     _prefill_health_checker: Option<HealthChecker>,
     _decode_health_checker: Option<HealthChecker>,
@@ -255,6 +257,15 @@ impl PDRouter {
         let decode_health_checker =
             crate::core::start_health_checker(Arc::clone(&decode_workers), interval_secs);
 
+        // Build a dedicated prefill client for fire-and-forget semantics
+        let prefill_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .http1_only()
+            .connect_timeout(Duration::from_millis(300))
+            .timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|e| format!("Failed to build prefill client: {}", e))?;
+
         Ok(PDRouter {
             prefill_workers,
             decode_workers,
@@ -267,6 +278,7 @@ impl PDRouter {
             worker_loads,
             load_monitor_handle,
             client,
+            prefill_client,
             retry_config,
             _prefill_health_checker: Some(prefill_health_checker),
             _decode_health_checker: Some(decode_health_checker),
@@ -417,10 +429,7 @@ impl PDRouter {
         // Update load tracking for both workers
         let _guard = WorkerLoadGuard::new_multi(vec![prefill, decode]);
 
-        // Build requests with headers
-        let prefill_request =
-            self.build_request_with_headers(prefill.url(), route, &json_request, headers);
-
+        // Build decode request with shared client
         let decode_request =
             self.build_request_with_headers(decode.url(), route, &json_request, headers);
 
@@ -432,6 +441,9 @@ impl PDRouter {
         );
 
         if return_logprob {
+            // Build prefill request with shared client when we need response body
+            let prefill_request =
+                self.build_request_with_headers(prefill.url(), route, &json_request, headers);
             // When we need logprobs, wait for both responses
             let (prefill_result, decode_result) =
                 tokio::join!(prefill_request.send(), decode_request.send());
@@ -525,19 +537,21 @@ impl PDRouter {
         } else {
             // When we don't need logprobs, only wait for decode response
             // Send both requests concurrently but don't wait for prefill
-            // Add headers to minimize response size when we don't need the body
-            let prefill_future = prefill_request.header("Connection", "close").send();
+            // Use dedicated prefill client with Connection: close
+            let prefill_future = self
+                .build_prefill_request_with_headers(prefill.url(), route, &json_request, headers)
+                .header("Connection", "close")
+                .send();
             let decode_future = decode_request.send();
 
             tokio::spawn(async move {
                 if let Ok(response) = prefill_future.await {
-                    // Consume with a short timeout to free connection quickly
-                    let consume_future = async {
-                        let _ = response.bytes().await;
-                    };
-
-                    // Give it 100ms to consume, then abandon
-                    let _ = tokio::time::timeout(Duration::from_millis(100), consume_future).await;
+                    // Consume at most one small chunk with a very short timeout to advance flow control
+                    let _ = tokio::time::timeout(Duration::from_millis(20), async {
+                        let mut s = response.bytes_stream();
+                        let _ = s.next().await;
+                    })
+                    .await;
                 }
             });
 
@@ -895,6 +909,33 @@ impl PDRouter {
                 let name_str = name.as_str();
                 if name_str != "content-type" && name_str != "content-length" {
                     // Skip headers with non-ASCII values
+                    if value.to_str().is_ok() {
+                        request = request.header(name, value);
+                    }
+                }
+            }
+        }
+
+        request
+    }
+
+    // Helper to build a prefill request using the dedicated prefill client
+    fn build_prefill_request_with_headers(
+        &self,
+        url: &str,
+        route: &str,
+        json_request: &Value,
+        headers: Option<&HeaderMap>,
+    ) -> reqwest::RequestBuilder {
+        let mut request = self
+            .prefill_client
+            .post(api_path(url, route))
+            .json(json_request);
+
+        if let Some(headers) = headers {
+            for (name, value) in headers.iter() {
+                let name_str = name.as_str();
+                if name_str != "content-type" && name_str != "content-length" {
                     if value.to_str().is_ok() {
                         request = request.header(name, value);
                     }
@@ -1771,6 +1812,7 @@ mod tests {
             worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
             load_monitor_handle: None,
             client: Client::new(),
+            prefill_client: Client::new(),
             retry_config: RetryConfig::default(),
             _prefill_health_checker: None,
             _decode_health_checker: None,
