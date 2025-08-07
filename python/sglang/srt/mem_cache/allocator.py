@@ -43,12 +43,14 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         dtype: torch.dtype,
         device: str,
         kvcache: KVCache,
+        need_sort: bool,
     ):
         self.size = size
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
         self._kvcache = kvcache
+        self.need_sort = need_sort
 
         self.free_pages = None
         self.release_pages = None
@@ -120,8 +122,15 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """An allocator managing the indices to kv cache data."""
 
-    def __init__(self, size: int, dtype: torch.dtype, device: str, kvcache: KVCache):
-        super().__init__(size, 1, dtype, device, kvcache)
+    def __init__(
+        self,
+        size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: KVCache,
+        need_sort: bool,
+    ):
+        super().__init__(size, 1, dtype, device, kvcache, need_sort)
         self.clear()
 
     def clear(self):
@@ -138,7 +147,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return len(self.free_pages) + len(self.release_pages)
 
     def alloc(self, need_size: int):
-        if need_size > len(self.free_pages):
+        if self.need_sort and need_size > len(self.free_pages):
             self.merge_and_sort_free()
         if need_size > len(self.free_pages):
             return None
@@ -152,7 +161,10 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
-            self.release_pages = torch.cat((self.release_pages, free_index))
+            if self.need_sort:
+                self.release_pages = torch.cat((self.release_pages, free_index))
+            else:
+                self.free_pages = torch.cat((self.free_pages, free_index))
         else:
             self.free_group.append(free_index)
 
@@ -173,8 +185,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         dtype: torch.dtype,
         device: str,
         kvcache: SWAKVPool,
+        need_sort: bool,
     ):
-        super().__init__(size, 1, dtype, device, kvcache)
+        super().__init__(size, 1, dtype, device, kvcache, need_sort)
         assert isinstance(kvcache, SWAKVPool)
         self._size_full = size
         self._size_swa = size_swa
@@ -183,12 +196,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             dtype,
             device,
             kvcache.full_kv_pool,
+            need_sort,
         )
         self.swa_attn_allocator = TokenToKVPoolAllocator(
             size_swa,
             dtype,
             device,
             kvcache.swa_kv_pool,
+            need_sort,
         )
         self.full_to_swa_index_mapping = torch.empty(
             size + size_swa + 1,
@@ -421,8 +436,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         dtype: torch.dtype,
         device: str,
         kvcache: KVCache,
+        need_sort: bool,
     ):
-        super().__init__(size, page_size, dtype, device, kvcache)
+        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self.ret_values = torch.empty((), dtype=torch.int64, device=self.device)
@@ -436,7 +452,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             ), "The allocation size should be page-aligned"
 
         num_pages = need_size // self.page_size
-        if num_pages > len(self.free_pages):
+        if self.need_sort and num_pages > len(self.free_pages):
             self.merge_and_sort_free()
         if num_pages > len(self.free_pages):
             return None
@@ -464,7 +480,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
 
         bs = len(prefix_lens)
-        if self.estimated_num_new_pages(bs, extend_num_tokens) > len(self.free_pages):
+        if self.need_sort and self.estimated_num_new_pages(bs, extend_num_tokens) > len(
+            self.free_pages
+        ):
             self.merge_and_sort_free()
 
         out_indices = torch.empty(
@@ -504,7 +522,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
 
         bs = len(seq_lens)
-        if self.estimated_num_new_pages(bs, 1) > len(self.free_pages):
+        if self.need_sort and self.estimated_num_new_pages(bs, 1) > len(
+            self.free_pages
+        ):
             self.merge_and_sort_free()
 
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
@@ -534,7 +554,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)
-            self.release_pages = torch.cat((free_page_indices, self.release_pages))
+            if self.need_sort:
+                self.release_pages = torch.cat((free_page_indices, self.release_pages))
+            else:
+                self.free_pages = torch.cat((free_page_indices, self.free_pages))
         else:
             self.free_group.append(free_index)
 
@@ -641,8 +664,9 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         dtype: torch.dtype,
         device: str,
         kvcache: KVCache,
+        need_sort: bool,
     ):
-        super().__init__(size, page_size, dtype, device, kvcache)
+        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.ret_values = torch.empty((), dtype=torch.int32, device=self.device)
 
     def alloc_extend(
@@ -658,7 +682,9 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             )
 
         bs = len(prefix_lens)
-        if self.estimated_num_new_pages(bs, extend_num_tokens) > len(self.free_pages):
+        if self.need_sort and self.estimated_num_new_pages(bs, extend_num_tokens) > len(
+            self.free_pages
+        ):
             self.merge_and_sort_free()
 
         out_indices = torch.empty(
@@ -696,7 +722,9 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             )
 
         bs = len(seq_lens)
-        if self.estimated_num_new_pages(bs, 1) > len(self.free_pages):
+        if self.need_sort and self.estimated_num_new_pages(bs, 1) > len(
+            self.free_pages
+        ):
             self.merge_and_sort_free()
 
         out_indices = torch.empty((bs,), dtype=torch.int32, device=self.device)
