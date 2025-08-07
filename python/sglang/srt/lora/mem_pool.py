@@ -1,3 +1,4 @@
+import logging
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -7,6 +8,7 @@ from sglang.srt.hf_transformers_utils import AutoConfig
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.utils import (
     ROW_PARALLELISM_LINEAR_LORA_NAMES,
     LoRAType,
@@ -15,6 +17,28 @@ from sglang.srt.lora.utils import (
     get_stacked_multiply,
     get_weight_name,
 )
+
+logger = logging.getLogger(__name__)
+
+
+class EmptySlot:
+    """
+    Singleton class to represent an empty slot in the memory pool.
+    This is used to improve readability by not using special str as a placeholder.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self):
+        return "|EMPTY|"
+
+    def __new__(cls):
+        if not hasattr(cls, "_instance"):
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+
+EMPTY_SLOT = EmptySlot()
 
 
 class LoRAMemoryPool:
@@ -54,9 +78,11 @@ class LoRAMemoryPool:
         self.uid_to_buffer_id: Dict[Optional[str], int] = {}
 
         # Buffer idx -> lora uid in memory pool
-        # All uids are initialized as empty strings for empty buffer slots
+        # All uids are initialized as `EmptySlot` for empty buffer slots
         # Here we don't initialize to None since None is a valid uid
-        self.buffer_id_to_uid: List[Optional[str]] = [""] * self.max_loras_per_batch
+        self.buffer_id_to_uid: List[Union[str, None, EmptySlot]] = [
+            EMPTY_SLOT
+        ] * self.max_loras_per_batch
 
         self.init_buffers(base_model)
 
@@ -154,17 +180,29 @@ class LoRAMemoryPool:
         cur_uids: Set[Optional[str]],
         lora_adapters: Dict[str, LoRAAdapter],
         lora_modules: List[Dict[str, BaseLayerWithLoRA]],
+        lora_refs: Dict[str, LoRARef],
     ):
         def get_available_buffer_slot():
             for buffer_id in range(self.max_loras_per_batch):
                 # Prioritize empty slots
-                if self.buffer_id_to_uid[buffer_id] == "":
+                if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
                     return buffer_id
 
             for buffer_id in range(self.max_loras_per_batch):
+                uid = self.buffer_id_to_uid[buffer_id]
+
                 # Evict unneeded lora
-                if self.buffer_id_to_uid[buffer_id] not in cur_uids:
-                    self.uid_to_buffer_id.pop(self.buffer_id_to_uid[buffer_id])
+                if uid not in cur_uids:
+                    # Skip pinned LoRAs
+                    # TODO (lifuhuang): we might consider supporting pinning base model (uid == None) in the future.
+                    if uid is not None:
+                        lora_ref = lora_refs.get(uid)
+                        if lora_ref is not None and lora_ref.pinned:
+                            continue
+
+                    self.uid_to_buffer_id.pop(uid)
+                    logger.debug(f"Evicting LoRA {uid} from buffer slot {buffer_id}.")
+                    self.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
                     return buffer_id
 
             raise ValueError(
