@@ -28,9 +28,9 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
-import pandas as pd
 import aiohttp
 import numpy as np
+import pandas as pd
 import requests
 from tqdm.asyncio import tqdm
 from transformers import (
@@ -826,17 +826,16 @@ def sample_burstgpt_requests(
     if num_requests <= len(gpt4_df):
         gpt4_df = gpt4_df.sample(n=num_requests, random_state=random_seed)
     else:
-        gpt4_df = gpt4_df.sample(n=num_requests,
-                                 random_state=random_seed,
-                                 replace=True)
+        gpt4_df = gpt4_df.sample(n=num_requests, random_state=random_seed, replace=True)
     # Convert the dataframe to a list of tuples
     dataset = gpt4_df.values.tolist()
     input_requests = []
     for i in range(num_requests):
         input_len = int(dataset[i][2])
         output_len = int(dataset[i][3])
-        prompt = tokenizer.decode([(i + j) % tokenizer.vocab_size
-                                   for j in range(input_len)])
+        prompt = tokenizer.decode(
+            [(i + j) % tokenizer.vocab_size for j in range(input_len)]
+        )
 
         if prompt_suffix:
             prompt = (
@@ -1890,7 +1889,14 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "mmmu", "burstgpt"],
+        choices=[
+            "sharegpt",
+            "random",
+            "random-ids",
+            "generated-shared-prefix",
+            "mmmu",
+            "burstgpt",
+        ],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
