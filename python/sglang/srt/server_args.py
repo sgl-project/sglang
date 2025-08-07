@@ -229,6 +229,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
+    tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     torchao_config: str = ""
@@ -247,6 +248,7 @@ class ServerArgs:
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
     enable_triton_kernel_moe: bool = False
+    enable_flashinfer_mxfp4_moe: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -272,6 +274,9 @@ class ServerArgs:
     # For PD-Multiplexing
     enable_pdmux: bool = False
     sm_group_num: int = 3
+
+    # For tool server
+    tool_server: Optional[str] = None
 
     # Deprecated arguments
     enable_ep_moe: bool = False
@@ -441,7 +446,11 @@ class ServerArgs:
                     "trtllm_mla backend does not support speculative decoding yet."
                 )
 
-        if self.attention_backend == "trtllm_mha":
+        if (
+            self.attention_backend == "trtllm_mha"
+            or self.decode_attention_backend == "trtllm_mha"
+            or self.prefill_attention_backend == "trtllm_mha"
+        ):
             if not is_sm100_supported():
                 raise ValueError(
                     "TRTLLM MHA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
@@ -455,12 +464,50 @@ class ServerArgs:
 
             if self.speculative_algorithm is not None:
                 raise ValueError(
-                    "trtllm_mla backend does not support speculative decoding yet."
+                    "trtllm_mha backend does not support speculative decoding yet."
                 )
+
         model_arch = self.get_hf_config().architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
-            self.attention_backend = "triton"
-            self.enable_triton_kernel_moe = True
+            if self.attention_backend is None:
+                # default is triton, but we could have trtllm_mha as an option
+                self.attention_backend = "triton"
+            assert (
+                self.attention_backend == "trtllm_mha"
+                or self.attention_backend == "triton"
+            )
+
+            if is_sm100_supported():
+                self.enable_flashinfer_mxfp4_moe = True
+                self.enable_triton_kernel_moe = False
+            else:
+                self.enable_triton_kernel_moe = True
+
+            self.disable_hybrid_swa_memory = True
+
+            quantization_config = getattr(
+                self.get_hf_config(), "quantization_config", None
+            )
+            if (
+                quantization_config is not None
+                and quantization_config.get("quant_method") == "mxfp4"
+            ):
+                # use bf16 for mxfp4 triton kernels
+                self.dtype = "bfloat16"
+
+        if self.attention_backend == "dual_chunk_flash_attn":
+            logger.warning(
+                "Mixed chunk is disabled because of using dual chunk flash attention backend"
+            )
+            logger.warning(
+                "Radix cache is disabled because of using dual chunk flash attention backend"
+            )
+            logger.warning(
+                "Cuda graph is disabled because of using dual chunk flash attention backend"
+            )
+            self.enable_mixed_chunk = False
+            self.disable_cuda_graph = True
+            self.disable_radix_cache = True
 
         # Set page size
         if self.page_size is None:
@@ -1297,6 +1344,7 @@ class ServerArgs:
                 "triton",
                 "trtllm_mla",
                 "trtllm_mha",
+                "dual_chunk_flash_attn",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
@@ -1689,6 +1737,12 @@ class ServerArgs:
             help="Enabling two micro batches to overlap.",
         )
         parser.add_argument(
+            "--tbo-token-distribution-threshold",
+            type=float,
+            default=ServerArgs.tbo_token_distribution_threshold,
+            help="The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap.",
+        )
+        parser.add_argument(
             "--enable-torch-compile",
             action="store_true",
             help="Optimize the model with torch.compile. Experimental feature.",
@@ -1784,6 +1838,11 @@ class ServerArgs:
             "--enable-triton-kernel-moe",
             action="store_true",
             help="Use triton moe grouped gemm kernel.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-mxfp4-moe",
+            action="store_true",
+            help="Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
         )
 
         # Debug tensor dumps
@@ -1898,6 +1957,14 @@ class ServerArgs:
             help="Disable mmap while loading weight using safetensors.",
         )
 
+        # For tool server
+        parser.add_argument(
+            "--tool-server",
+            type=str,
+            default=None,
+            help="Either 'demo' or a comma-separated list of tool server urls to use for the model. If not specified, no tool server will be used.",
+        )
+
         # Deprecated arguments
         parser.add_argument(
             "--enable-ep-moe",
@@ -1968,6 +2035,8 @@ class ServerArgs:
 
         if model_arch in [
             "Gemma2ForCausalLM",
+            "Gemma3ForCausalLM",
+            "Gemma3ForConditionalGeneration",
             "Gemma3nForCausalLM",
             "Gemma3nForConditionalGeneration",
         ]:
@@ -2013,21 +2082,23 @@ class ServerArgs:
 
         if self.enable_lora:
             # Normalize lora_paths to a dictionary if it is a list.
+            # TODO (lifuhuang): support specifying pinned adapters in server_args.
             if isinstance(self.lora_paths, list):
                 lora_paths = self.lora_paths
                 self.lora_paths = {}
                 for lora_path in lora_paths:
                     if "=" in lora_path:
                         name, path = lora_path.split("=", 1)
-                        self.lora_paths[name] = LoRARef(lora_name=name, lora_path=path)
+                        self.lora_paths[name] = LoRARef(
+                            lora_name=name, lora_path=path, pinned=False
+                        )
                     else:
                         self.lora_paths[lora_path] = LoRARef(
-                            lora_name=lora_path,
-                            lora_path=lora_path,
+                            lora_name=lora_path, lora_path=lora_path, pinned=False
                         )
             elif isinstance(self.lora_paths, dict):
                 self.lora_paths = {
-                    k: LoRARef(lora_name=k, lora_path=v)
+                    k: LoRARef(lora_name=k, lora_path=v, pinned=False)
                     for k, v in self.lora_paths.items()
                 }
             elif self.lora_paths is None:
