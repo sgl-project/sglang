@@ -363,108 +363,177 @@ impl PDRouter {
             prefill.url(),
             decode.url()
         );
-        let (prefill_result, decode_result) =
-            tokio::join!(prefill_request.send(), decode_request.send());
-        debug!("Received responses from both servers");
 
-        // Update metrics
-        let duration = start_time.elapsed();
-        RouterMetrics::record_pd_request_duration(route, duration);
-        RouterMetrics::record_pd_request(route);
-        RouterMetrics::record_pd_prefill_request(prefill.url());
-        RouterMetrics::record_pd_decode_request(decode.url());
+        if return_logprob {
+            // When we need logprobs, wait for both responses
+            let (prefill_result, decode_result) =
+                tokio::join!(prefill_request.send(), decode_request.send());
+            debug!("Received responses from both servers");
 
-        // Process decode response FIRST
-        debug!("Processing decode response");
-        let decode_response = match decode_result {
-            Ok(res) => {
-                let status = StatusCode::from_u16(res.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                debug!("Decode response status: {}", status);
+            // Update metrics
+            let duration = start_time.elapsed();
+            RouterMetrics::record_pd_request_duration(route, duration);
+            RouterMetrics::record_pd_request(route);
+            RouterMetrics::record_pd_prefill_request(prefill.url());
+            RouterMetrics::record_pd_decode_request(decode.url());
 
-                if !status.is_success() {
-                    RouterMetrics::record_pd_decode_error(decode.url());
-                    error!(
-                        "Decode server returned error status decode_url={} status={}",
-                        decode.url(),
-                        status
-                    );
+            // Process decode response with prefill for logprobs
+            debug!("Processing decode response with logprobs");
+            match decode_result {
+                Ok(res) => {
+                    let status = StatusCode::from_u16(res.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    debug!("Decode response status: {}", status);
 
-                    // Return the error response from decode server
-                    match res.bytes().await {
-                        Ok(error_body) => {
-                            return (status, error_body).into_response();
-                        }
-                        Err(e) => {
-                            return (status, format!("Decode server error: {}", e)).into_response();
+                    if !status.is_success() {
+                        RouterMetrics::record_pd_decode_error(decode.url());
+                        error!(
+                            "Decode server returned error status decode_url={} status={}",
+                            decode.url(),
+                            status
+                        );
+
+                        // Return the error response from decode server
+                        match res.bytes().await {
+                            Ok(error_body) => {
+                                return (status, error_body).into_response();
+                            }
+                            Err(e) => {
+                                return (status, format!("Decode server error: {}", e))
+                                    .into_response();
+                            }
                         }
                     }
-                }
 
-                // Process prefill response based on whether we need logprobs
-                let prefill_body = if return_logprob {
-                    // When we need logprobs, process prefill response inline
-                    match self
+                    // Process prefill response for logprobs
+                    let prefill_body = match self
                         .process_prefill_response(prefill_result, prefill.url(), return_logprob)
                         .await
                     {
                         Ok((_, body)) => body,
                         Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Skip prefill processing entirely when we don't need logprobs
-                    debug!("Skipping prefill response processing (return_logprob=false)");
-                    None
-                };
+                    };
 
-                if is_stream {
-                    // Streaming response
-                    let prefill_logprobs = if return_logprob {
-                        prefill_body
+                    if is_stream {
+                        // Streaming response with logprobs
+                        let prefill_logprobs = prefill_body
                             .as_ref()
                             .and_then(|body| serde_json::from_slice::<Value>(body).ok())
                             .and_then(|json| {
                                 json.pointer("/meta_info/input_token_logprobs").cloned()
-                            })
-                    } else {
-                        None
-                    };
+                            });
 
-                    let decode_url = if !return_logprob {
-                        Some(decode.url().to_string())
+                        Self::create_streaming_response(
+                            res.bytes_stream(),
+                            status,
+                            prefill_logprobs,
+                            return_logprob,
+                            None,
+                        )
                     } else {
-                        None
-                    };
-
-                    Self::create_streaming_response(
-                        res.bytes_stream(),
-                        status,
-                        prefill_logprobs,
-                        return_logprob,
-                        decode_url,
-                    )
-                } else {
-                    // Non-streaming response - use helper
-                    self.process_non_streaming_response(res, status, return_logprob, prefill_body)
+                        // Non-streaming response with logprobs
+                        self.process_non_streaming_response(
+                            res,
+                            status,
+                            return_logprob,
+                            prefill_body,
+                        )
                         .await
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        decode_url = %decode.url(),
+                        error = %e,
+                        "Decode request failed"
+                    );
+                    RouterMetrics::record_pd_decode_error(decode.url());
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Decode server error: {}", e),
+                    )
+                        .into_response()
                 }
             }
-            Err(e) => {
-                error!(
-                    decode_url = %decode.url(),
-                    error = %e,
-                    "Decode request failed"
-                );
-                RouterMetrics::record_pd_decode_error(decode.url());
-                (
-                    StatusCode::BAD_GATEWAY,
-                    format!("Decode server error: {}", e),
-                )
-                    .into_response()
-            }
-        };
+        } else {
+            // When we don't need logprobs, only wait for decode response
+            // Fire prefill request but don't wait
+            let prefill_future = prefill_request.send();
+            tokio::spawn(async move {
+                let _ = prefill_future.await;
+            });
 
-        decode_response
+            // Wait only for decode response
+            let decode_result = decode_request.send().await;
+            debug!("Received decode response");
+
+            // Update metrics
+            let duration = start_time.elapsed();
+            RouterMetrics::record_pd_request_duration(route, duration);
+            RouterMetrics::record_pd_request(route);
+            RouterMetrics::record_pd_prefill_request(prefill.url());
+            RouterMetrics::record_pd_decode_request(decode.url());
+
+            // Process decode response immediately
+            debug!("Processing decode response (no logprobs)");
+            match decode_result {
+                Ok(res) => {
+                    let status = StatusCode::from_u16(res.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    debug!("Decode response status: {}", status);
+
+                    if !status.is_success() {
+                        RouterMetrics::record_pd_decode_error(decode.url());
+                        error!(
+                            "Decode server returned error status decode_url={} status={}",
+                            decode.url(),
+                            status
+                        );
+
+                        // Return the error response from decode server
+                        match res.bytes().await {
+                            Ok(error_body) => (status, error_body).into_response(),
+                            Err(e) => {
+                                (status, format!("Decode server error: {}", e)).into_response()
+                            }
+                        }
+                    } else if is_stream {
+                        // Streaming response without logprobs - direct passthrough
+                        let decode_url = decode.url().to_string();
+                        Self::create_streaming_response(
+                            res.bytes_stream(),
+                            status,
+                            None,
+                            false,
+                            Some(decode_url),
+                        )
+                    } else {
+                        // Non-streaming response without logprobs - direct passthrough like fast version
+                        match res.bytes().await {
+                            Ok(decode_body) => (status, decode_body).into_response(),
+                            Err(e) => {
+                                error!("Failed to read decode response: {}", e);
+                                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response")
+                                    .into_response()
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        decode_url = %decode.url(),
+                        error = %e,
+                        "Decode request failed"
+                    );
+                    RouterMetrics::record_pd_decode_error(decode.url());
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Decode server error: {}", e),
+                    )
+                        .into_response()
+                }
+            }
+        }
     }
 
     // Select a pair of prefill and decode servers
