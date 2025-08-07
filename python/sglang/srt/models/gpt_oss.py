@@ -63,7 +63,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, get_bool_env_var, make_layers
+from sglang.srt.utils import add_prefix, make_layers
 
 
 class GptOssConfig(PretrainedConfig):
@@ -74,11 +74,6 @@ class GptOssConfig(PretrainedConfig):
 
 
 logger = logging.getLogger(__name__)
-
-USE_FLASHINFER_MXFP4_MOE = get_bool_env_var("SGLANG_USE_FLASHINFER_MXFP4_MOE", "false")
-USE_FLASHINFER_MXFP4_BF16_MOE = get_bool_env_var(
-    "SGLANG_USE_FLASHINFER_MXFP4_BF16_MOE", "false"
-)
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -107,7 +102,7 @@ class GptOssSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_local_experts}."
             )
 
-        if USE_FLASHINFER_MXFP4_MOE or USE_FLASHINFER_MXFP4_BF16_MOE:
+        if global_server_args_dict["flashinfer_mxfp4_moe"]:
             self.topk = None
         else:
             self.topk = TopK(
