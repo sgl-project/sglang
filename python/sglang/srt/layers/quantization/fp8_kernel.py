@@ -1375,6 +1375,8 @@ def _per_group_transpose(
     curr_expert_offset = tl.load(expert_offsets + expert_id)
     next_expert_offset = tl.load(expert_offsets + expert_id + 1)
     num_tokens_of_expert = next_expert_offset - curr_expert_offset
+    tl.multiple_of(curr_expert_offset, M_ALIGNMENT)
+    tl.multiple_of(next_expert_offset, M_ALIGNMENT)
 
     data_start_ptr = data_ptr + curr_expert_offset * k
     trans_data_start_ptr = trans_data_ptr + curr_expert_offset * k
