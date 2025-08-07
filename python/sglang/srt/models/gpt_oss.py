@@ -110,6 +110,7 @@ class GptOssSparseMoeBlock(nn.Module):
                 renormalize=True,
             )
 
+        self.top_k = config.num_experts_per_tok
         experts_type = get_moe_impl_class()
         extra_kwargs = {}
         if experts_type.__name__ == "FusedMoE":
@@ -179,7 +180,7 @@ class GptOssSparseMoeBlock(nn.Module):
         if self.topk is not None:
             kwargs["topk_output"] = self.topk(hidden_states, router_logits)
         else:
-            kwargs["topk_output"] = (self.topk, router_logits)
+            kwargs["topk_output"] = (self.top_k, router_logits)
         final_hidden_states = self.experts(**kwargs)
 
         if self.tp_size > 1:
