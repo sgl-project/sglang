@@ -750,7 +750,11 @@ class TokenizerManager:
             try:
                 await asyncio.wait_for(state.event.wait(), timeout=4)
             except asyncio.TimeoutError:
-                if request is not None and await request.is_disconnected():
+                if (
+                    request is not None
+                    and not obj.background
+                    and await request.is_disconnected()
+                ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
                     self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
@@ -805,7 +809,11 @@ class TokenizerManager:
             if obj.stream:
                 yield out
             else:
-                if request is not None and await request.is_disconnected():
+                if (
+                    request is not None
+                    and not obj.background
+                    and await request.is_disconnected()
+                ):
                     # Abort the request for disconnected requests (non-streaming, running)
                     self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
@@ -1121,6 +1129,7 @@ class TokenizerManager:
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
                     lora_path=obj.lora_path,
+                    pinned=obj.pinned,
                 )
 
                 # Trigger the actual loading operation at the backend processes.
@@ -1178,7 +1187,7 @@ class TokenizerManager:
 
                 return result
         except ValueError as e:
-            return UnloadLoRAAdapterReqOutput(success=False, rror_message=str(e))
+            return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
 
     async def get_weights_by_name(
         self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
@@ -1548,8 +1557,17 @@ class TokenizerManager:
 
             if isinstance(recv_obj, BatchStrOut):
                 state.text += recv_obj.output_strs[i]
+                if state.obj.stream:
+                    state.output_ids.extend(recv_obj.output_ids[i])
+                    output_token_ids = state.output_ids[state.last_output_offset :]
+                    state.last_output_offset = len(state.output_ids)
+                else:
+                    state.output_ids.extend(recv_obj.output_ids[i])
+                    output_token_ids = state.output_ids.copy()
+
                 out_dict = {
                     "text": state.text,
+                    "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
             elif isinstance(recv_obj, BatchTokenIDOut):
