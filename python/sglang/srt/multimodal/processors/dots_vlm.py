@@ -10,9 +10,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.processors.qwen_vl import (
-    smart_resize,
-)
+from sglang.srt.multimodal.processors.qwen_vl import smart_resize
 
 
 class DotsVLMImageProcessor(BaseMultimodalProcessor):

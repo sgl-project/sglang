@@ -125,26 +125,14 @@ class DotsVLMForCausalLM(nn.Module):
         """Pad input_ids with multimodal tokens"""
         # Get image token ID for padding pattern
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        mm_inputs.im_token_id = self.image_token_id
         padded_input_ids = pattern.pad_input_tokens(input_ids, mm_inputs)
         return padded_input_ids
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        """Extract image features from multimodal data items"""
-        if any(item.precomputed_embeddings is not None for item in items):
-            # If features are precomputed, just concatenate them
-            if not all(item.precomputed_embeddings is not None for item in items):
-                raise NotImplementedError(
-                    "MM inputs where only some items are precomputed."
-                )
-            return torch.concat(
-                [torch.tensor(item.precomputed_embeddings) for item in items]
-            )
-
         # Extract pixel values and grid information (following reference pattern)
-        pixel_values = torch.cat(
-            [torch.tensor(item.feature) for item in items], dim=0
-        ).type(self.vision_tower.dtype)
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
+            self.vision_tower.dtype
+        )
         image_grid_thw = torch.concat(
             [item.image_grid_thw for item in items], dim=0
         ).to(self.vision_tower.device)
