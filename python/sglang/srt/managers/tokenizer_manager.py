@@ -788,9 +788,11 @@ class TokenizerManager:
                     ):
                         raise ValueError(finish_reason["message"])
 
-                    if (
-                        finish_reason.get("type") == "abort"
-                        and finish_reason.get("status_code") in (HTTPStatus.SERVICE_UNAVAILABLE, HTTPStatus.INTERNAL_SERVER_ERROR)
+                    if finish_reason.get("type") == "abort" and finish_reason.get(
+                        "status_code"
+                    ) in (
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
                     ):
                         # This is an abort request initiated by scheduler.
                         # Delete the key to prevent resending abort request to the scheduler and
