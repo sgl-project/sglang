@@ -589,10 +589,11 @@ class HiCacheController:
             completed_tokens = len(operation.hash_value) * self.page_size
         if completed_tokens > 0:
             operation.increment(completed_tokens)
-        if completed_tokens < len(operation.hash_value) * self.page_size:
-            # operation terminated by controller, release pre-allocated memory
+        if operation.completed_tokens < len(operation.hash_value) * self.page_size:
+            # Operation terminated by controller, or retrieve data failed or
+            # partially failed. Release pre-allocated memory.
             self.mem_pool_host.free(
-                operation.host_indices[completed_tokens :]
+                operation.host_indices[operation.completed_tokens :]
             )
 
     def is_mooncake_backend(self):
@@ -694,7 +695,6 @@ class HiCacheController:
                     )
                     storage_hit_count = storage_hit_count_tensor.item()
 
-                print(f"prefetch_thread_func: storage_hit_count {storage_hit_count}, self.prefetch_threshold {self.prefetch_threshold}")
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
