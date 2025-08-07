@@ -319,5 +319,36 @@ class TestEAGLEDraftExtendFlashinferMLA(TestEAGLEDraftExtend):
         cls.accept_len_threshold = 1.85
 
 
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
+class TestEAGLEDraftExtendExplicitDraftFlashinfer(TestEAGLEDraftExtend):
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-draft-model-path",
+                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                "--speculative-num-steps",
+                1,
+                "--speculative-eagle-topk",
+                1,
+                "--speculative-num-draft-tokens",
+                2,
+                "--max-running-requests",
+                4,
+                "--attention-backend",
+                "fa3",
+                "--draft-attention-backend",
+                "flashinfer",
+            ],
+        )
+        cls.accept_len_threshold = 1.5
+
+
 if __name__ == "__main__":
     unittest.main()
