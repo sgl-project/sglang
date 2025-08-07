@@ -176,8 +176,8 @@ class LoRAManager:
         if incompatible:
             raise ValueError(
                 f"LoRA adapter {lora_ref.lora_name} with rank {lora_config.r} and lora extra vocab size {lora_config.lora_extra_vocab_size}is incompatible with the current LoRA memory pool configuration. "
-                "Please ensure that the LoRA adapter's rank is within the configured `--max_lora_rank` and that the target modules are "
-                "included in `--enable_lora_modules`."
+                "Please ensure that the LoRA adapter's rank is within the configured `--max_lora_rank`, that the target modules are "
+                "included in `--enable_lora_modules` and that the LoRA adapter's extra vocabulary size is within the configured `--lora-extra-vocab-size`."
             )
 
     def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateResult:
@@ -346,6 +346,7 @@ class LoRAManager:
                         ),
                     )
         # call set_lora_info for embeddings
+        new_embeddings_buffer = None
         for module_name, module in self.lora_embeddings_modules.items():
             if self.lora_extra_vocab_size > 0:
                 new_embeddings_buffer = self.memory_pool.get_embedding_tensor(
@@ -452,6 +453,11 @@ class LoRAManager:
         )
         lora_adapter.initialize_weights()
         self.loras[lora_ref.lora_id] = lora_adapter
+        assert lora_adapter.config.extra_vocab_size <= self.lora_extra_vocab_size, (
+            f"LoRA adapter {lora_ref.lora_id} has extra_vocab_size {lora_adapter.config.extra_vocab_size}, "
+            f"but the current server has `--lora-extra-vocab-size` set to {self.lora_extra_vocab_size}, "
+            f"please set `--lora-extra-vocab-size` to maximum of extra vocabulary size can be present in the LoRA adapters when starting the server."
+        )
 
         # Additional checks for flashinfer backend
         # FIXME remove the restrictions after supporting multi-rank for flashinfer backend
