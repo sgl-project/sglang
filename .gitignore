@@ -235,3 +235,7 @@ compile_commands.json
 Cargo.lock
 
 lmms-eval
+
+# profiling
+*.nsys-rep
+*.ncu-rep

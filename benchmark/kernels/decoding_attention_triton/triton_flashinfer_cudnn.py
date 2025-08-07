@@ -128,7 +128,7 @@ def decode_attention_flashinfer(dtype, head_num_q, head_num_kv):
             )
 
             flashinfer_decode_wrapper.end_forward()
-            flashinfer_decode_wrapper.begin_forward(
+            flashinfer_decode_wrapper.plan(
                 kv_indptr,
                 kv_indices,
                 kv_last_page_len,
