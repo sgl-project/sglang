@@ -135,6 +135,19 @@ class ReLU2(nn.Module):
         x = F.relu(x)
         return x * x
 
+class SwiGLU(CustomOp):
+    def forward_native(self, x: torch.Tensor, alpha: float = 1.702, pair_wise: bool = True) -> torch.Tensor:
+        # reference implementation
+        if not pair_wise:
+            x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+        else:
+            x_glu, x_linear = x[..., ::2], x[..., 1::2]
+        out_glu = x_glu * torch.sigmoid(alpha * x_glu)
+        return out_glu * (x_linear + 1) # Note that here add an extra bias of 1 to the linear layer
+
+    def forward_cuda(self, x: torch.Tensor, alpha: float = 1.702, pair_wise: bool = True) -> torch.Tensor:
+        # TODO: Implement the CUDA kernel for SwiGLU in sgl-kernel
+        return self.forward_native(x, alpha, pair_wise)
 
 class QuickGELU(CustomOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:

@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_remote_url,
     is_valid_ipv6_address,
     nullable_str,
+    cpu_has_amx_support,
 )
 
 logger = logging.getLogger(__name__)
@@ -402,7 +403,7 @@ class ServerArgs:
                 "flashinfer" if is_flashinfer_available() else "pytorch"
             )
 
-        if self.attention_backend == "torch_native":
+        if self.attention_backend in ["torch_native", "torch_native_sink"]:
             logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"
             )
@@ -466,9 +467,16 @@ class ServerArgs:
                 )
         model_arch = self.get_hf_config().architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
-            self.attention_backend = "triton"
-            self.enable_triton_kernel_moe = True
-            self.disable_hybrid_swa_memory = True
+            if self.device == "cpu":
+                if self.attention_backend is None:
+                    if cpu_has_amx_support():
+                        self.attention_backend = "intel_amx"
+                    else:
+                        self.attention_backend = "torch_native_sink"
+            else:
+                self.attention_backend = "triton"
+                self.enable_triton_kernel_moe = True
+                self.disable_hybrid_swa_memory = True
 
             quantization_config = getattr(
                 self.get_hf_config(), "quantization_config", None
@@ -1311,6 +1319,7 @@ class ServerArgs:
                 "flashmla",
                 "intel_amx",
                 "torch_native",
+                "torch_native_sink",
                 "ascend",
                 "triton",
                 "trtllm_mla",
