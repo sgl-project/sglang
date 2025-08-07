@@ -513,17 +513,22 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         return torch.cat(image_embeds)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = torch.cat(
+        pixel_values_videos = torch.cat(
             [item.feature.squeeze(0) for item in items], dim=0
         ).type(self.visual.dtype)
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
-        # For multi-image, pixel_values is [num_of_images, L, C] shape
-        # assert pixel_values.dim() == 2, pixel_values.dim()
+        # For multi-video, pixel_values_videos is [num_of_videos, L, C] shape
+        # assert pixel_values_videos.dim() == 2, pixel_values_videos.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
-        video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
-        split_sizes = (
-            video_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
-        ).tolist()
+
+        # reshape video_grid_thw -> [b, 3] -> [1, h, w] * frames
+        temp_frames_hw = []
+        for t, h, w in video_grid_thw:
+            repeated_row = torch.tensor([1, h.item(), w.item()]).unsqueeze(0).repeat(t, 1)
+            temp_frames_hw.append(repeated_row)
+        flattened_video_grid_thw = torch.cat(temp_frames_hw, dim=0)
+        video_embeds = self.visual(pixel_values_videos, grid_thw=flattened_video_grid_thw)
+        split_sizes = (video_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         video_embeds = torch.split(video_embeds, split_sizes)
         return torch.cat(video_embeds)
 
