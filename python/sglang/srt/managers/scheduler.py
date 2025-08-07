@@ -32,6 +32,7 @@ import setproctitle
 import torch
 import zmq
 from torch.distributed import barrier
+import torch_npu
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
@@ -2498,8 +2499,11 @@ def run_scheduler_process(
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    q,
     balance_meta: Optional[DPBalanceMeta] = None,
 ):
+    sender_pid = torch_npu._C._get_ipc_pid()
+    q.put(sender_pid)
     # Generate the prefix
     prefix = ""
     if dp_rank is not None:

@@ -2,7 +2,8 @@
 
 import re
 from typing import Callable, List, Optional, Union
-
+from vllm.platforms import current_platform
+import vllm_ascend.patch.worker.patch_common.patch_utils  # noqa: F401
 from sglang.global_config import global_config
 from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.choices import ChoicesSamplingMethod, token_length_normalized

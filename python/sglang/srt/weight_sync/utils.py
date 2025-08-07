@@ -35,7 +35,7 @@ async def update_weights(
     infer_tp_rank = device_mesh[device_mesh_key].get_local_rank()
     from sglang.srt.patch_torch import monkey_patch_torch_reductions
 
-    monkey_patch_torch_reductions()
+    # monkey_patch_torch_reductions()
 
     # [
     #   (name0, ipc_tensor0_tp0),

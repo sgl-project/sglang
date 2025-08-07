@@ -137,6 +137,8 @@ class TpModelWorkerClient:
 
     def forward_thread_func(self):
         try:
+            current_device = torch.npu.current_device()
+            torch.npu.set_device(current_device)
             with torch.get_device_module(self.device).stream(self.forward_stream):
                 self.forward_thread_func_()
         except Exception:

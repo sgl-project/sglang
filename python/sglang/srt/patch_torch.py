@@ -52,7 +52,7 @@ def _rebuild_cuda_tensor_modified(*args):
 
 
 def _device_to_uuid(device: int) -> str:
-    return str(torch.cuda.get_device_properties(device).uuid)
+    return str(torch.npu.get_device_properties(device).uuid)
 
 
 def _device_from_maybe_uuid(device_maybe_uuid: Union[int, str]) -> int:

@@ -76,6 +76,7 @@ from sglang.srt.utils import (
     set_ulimit,
 )
 from sglang.version import __version__
+from multiprocessing import Queue
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -120,7 +121,7 @@ class Engine(EngineBase):
         logger.info(f"{server_args=}")
 
         # Launch subprocesses
-        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
+        tokenizer_manager, template_manager, scheduler_info, result_pid = _launch_subprocesses(
             server_args=server_args,
             port_args=self.port_args,
         )
@@ -128,6 +129,7 @@ class Engine(EngineBase):
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self.scheduler_info = scheduler_info
+        self.result_pid = result_pid
 
         context = zmq.Context(2)
         self.send_to_rpc = get_zmq_socket(
@@ -712,6 +714,8 @@ def _launch_subprocesses(
             pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group + 1),
         )
 
+        q = Queue()
+        result_pid = []
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
                 reader, writer = mp.Pipe(duplex=False)
@@ -732,12 +736,15 @@ def _launch_subprocesses(
                         pp_rank,
                         None,
                         writer,
+                        q,
                         None,
                     ),
                 )
 
                 with memory_saver_adapter.configure_subprocess():
                     proc.start()
+                pid = q.get()
+                result_pid.append(pid)
                 scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
     else:
@@ -818,4 +825,4 @@ def _launch_subprocesses(
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
-    return tokenizer_manager, template_manager, scheduler_info
+    return tokenizer_manager, template_manager, scheduler_info, result_pid
