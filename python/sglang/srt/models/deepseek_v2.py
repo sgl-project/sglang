@@ -83,8 +83,7 @@ from sglang.srt.layers.quantization.int8_utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope, get_rope_wrapper
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.utils import is_sm100_supported
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id, is_sm100_supported
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -2046,7 +2045,10 @@ class DeepseekV2Model(nn.Module):
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
         if forward_batch.can_run_tbo:
-            if self.first_k_dense_replace > normal_start_layer and self.first_k_dense_replace < normal_end_layer:
+            if (
+                self.first_k_dense_replace > normal_start_layer
+                and self.first_k_dense_replace < normal_end_layer
+            ):
                 normal_end_layer = self.first_k_dense_replace
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
@@ -2060,7 +2062,7 @@ class DeepseekV2Model(nn.Module):
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
-                layers=self.layers[normal_end_layer:self.end_layer],
+                layers=self.layers[normal_end_layer : self.end_layer],
                 enable_tbo=True,
                 positions=positions,
                 forward_batch=forward_batch,
@@ -2183,7 +2185,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors)
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+        )
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
@@ -2191,7 +2195,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             )
         else:
             return hidden_states
-    
+
     @property
     def start_layer(self):
         return self.model.start_layer

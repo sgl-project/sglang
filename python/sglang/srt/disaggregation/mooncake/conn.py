@@ -782,9 +782,7 @@ class MooncakeKVManager(BaseKVManager):
                         arrived_response_num = len(
                             self.prefill_response_tracker[bootstrap_room]
                         )
-                        if (
-                            arrived_response_num == expected_response_num
-                        ):
+                        if arrived_response_num == expected_response_num:
                             self.update_status(bootstrap_room, KVPoll.Success)
                 elif status == KVPoll.Failed:
                     self.record_failure(
