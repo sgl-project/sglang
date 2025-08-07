@@ -5,7 +5,9 @@ import torch
 import triton
 
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
-    decode_attention_fwd, # not used in gpt oss
+    decode_attention_fwd,  # not used in gpt oss
+)
+from sglang.srt.layers.attention.triton_ops.decode_attention import (
     decode_attention_fwd_grouped,
 )
 from sglang.srt.layers.attention.triton_ops.extend_attention import extend_attention_fwd
@@ -14,6 +16,7 @@ from sglang.srt.layers.attention.triton_ops.extend_attention import extend_atten
 head_num = 64
 head_dim = 64
 head_kv_num = 8
+
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -115,7 +118,7 @@ def benchmark_decode(B, S, H_Q, H_KV, D):
     end_event.synchronize()
     torch.cuda.synchronize()
     ms = start_event.elapsed_time(end_event) / run_step
-    tflops = lambda ms: (2 * B * S * H_Q * H_KV * D) * 1e-9 / ms  # must be causal
+    tflops = lambda ms: (2 * B * S * H_Q * D) * 1e-9 / ms  # must be causal
     return tflops(ms)
 
 
