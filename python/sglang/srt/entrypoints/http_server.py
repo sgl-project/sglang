@@ -206,188 +206,130 @@ def get_main_process_id() -> int:
     """Get the main process ID"""
     return multiprocessing.current_process()._parent_pid
 
+def init_multi_tokenizer() -> ServerArgs:
+    """Read args information from shm and init tokenizer manager for current process"""
+    pid = os.getpid()
+    main_pid = get_main_process_id()
+    logger.info(f"current worker_id: {pid}, main processID: {main_pid}")
+
+    # Read port_args, server_args, and scheduler_info from shared memory
+    port_args_data = read_from_shared_memory(f"port_args_{main_pid}")
+    server_args_data = read_from_shared_memory(f"server_args_{main_pid}")
+    scheduler_info_data = read_from_shared_memory(
+        f"scheduler_info_{main_pid}"
+
+    )
+    port_args = deserialize_port_args(port_args_data)
+    server_args = deserialize_server_args(server_args_data)
+    scheduler_info = deserialize_scheduler_info(scheduler_info_data)
+
+    port_args.tokenizer_ipc_name = (
+        f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+    )
+
+    # Launch tokenizer process
+    tokenizer_manager = TokenizerManager(server_args, port_args, False)
+    template_manager = TemplateManager()
+    template_manager.initialize_templates(
+        tokenizer_manager=tokenizer_manager,
+        model_path=server_args.model_path,
+        chat_template=server_args.chat_template,
+        completion_template=server_args.completion_template,
+    )
+    # register multi tokenizer
+    tokenizer_manager.register_to_main_tokenizer_manager()  
+
+    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    set_global_state(
+        _GlobalState(
+            tokenizer_manager=tokenizer_manager,
+            template_manager=template_manager,
+            scheduler_info=scheduler_info,
+        )
+    )
+    return server_args
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
     server_args = getattr(fast_api_app, "server_args", None)
-    if server_args is not None:
-        # Initialize OpenAI serving handlers
-        fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
-            _global_state.tokenizer_manager, _global_state.template_manager
-        )
-        fast_api_app.state.openai_serving_chat = OpenAIServingChat(
-            _global_state.tokenizer_manager, _global_state.template_manager
-        )
-        fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
-            _global_state.tokenizer_manager, _global_state.template_manager
-        )
-        fast_api_app.state.openai_serving_score = OpenAIServingScore(
-            _global_state.tokenizer_manager
-        )
-        fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
-            _global_state.tokenizer_manager
-        )
-        
-        server_args: ServerArgs = fast_api_app.server_args
-
-        tool_server = None
-        if server_args.tool_server == "demo":
-            from sglang.srt.entrypoints.openai.tool_server import DemoToolServer
-
-            tool_server = DemoToolServer()
-        elif server_args.tool_server:
-            from sglang.srt.entrypoints.openai.tool_server import MCPToolServer
-
-            tool_server = MCPToolServer()
-            await tool_server.add_tool_server(server_args.tool_server)
-
-        try:
-            from sglang.srt.entrypoints.openai.serving_responses import (
-                OpenAIServingResponses,
-            )
-
-            fast_api_app.state.openai_serving_responses = OpenAIServingResponses(
-                _global_state.tokenizer_manager,
-                _global_state.template_manager,
-                enable_prompt_tokens_details=True,
-                enable_force_include_usage=True,
-                tool_server=tool_server,
-            )
-        except Exception as e:
-            # print stack trace
-            import traceback
-
-            traceback.print_exc()
-            logger.warning(f"Can not initialize OpenAIServingResponses, error: {e}")
-
-        if server_args.warmups is not None:
-            await execute_warmups(
-                server_args.disaggregation_mode,
-                server_args.warmups.split(","),
-                _global_state.tokenizer_manager,
-            )
-            logger.info("Warmup ended")
-
-        warmup_thread = getattr(fast_api_app, "warmup_thread", None)
-        if warmup_thread is not None:
-            warmup_thread.start()
-    else:
-        pid = os.getpid()
-        main_pid = get_main_process_id()
-        logger.info(f"current worker_id: {pid}, main processID: {main_pid}")
-
-        # Read port_args, server_args, and scheduler_info from shared memory
-        port_args_data = read_from_shared_memory(f"port_args_{main_pid}")
-        server_args_data = read_from_shared_memory(f"server_args_{main_pid}")
-        scheduler_info_data = read_from_shared_memory(
-            f"scheduler_info_{main_pid}"
-
-        )
-        port_args = deserialize_port_args(port_args_data)
-        server_args = deserialize_server_args(server_args_data)
-        scheduler_info = deserialize_scheduler_info(scheduler_info_data)
-
-        port_args.tokenizer_ipc_name = (
-            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-        )
-
-
-        # Launch tokenizer process
-        tokenizer_manager = TokenizerManager(server_args, port_args, False)
-        template_manager = TemplateManager()
-        template_manager.initialize_templates(
-            tokenizer_manager=tokenizer_manager,
-            model_path=server_args.model_path,
-            chat_template=server_args.chat_template,
-            completion_template=server_args.completion_template,
-        )
-        # register multi tokenizer
-        tokenizer_manager.register_to_main_tokenizer_manager()  
-
-        tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
-        set_global_state(
-            _GlobalState(
-                tokenizer_manager=tokenizer_manager,
-                template_manager=template_manager,
-                scheduler_info=scheduler_info,
-            )
-        )
-        # Initialize OpenAI serving handlers
-        fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
-            _global_state.tokenizer_manager, _global_state.template_manager
-        )
-        fast_api_app.state.openai_serving_chat = OpenAIServingChat(
-            _global_state.tokenizer_manager, _global_state.template_manager
-        )
-        fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
-            _global_state.tokenizer_manager, _global_state.template_manager
-        )
-        fast_api_app.state.openai_serving_score = OpenAIServingScore(
-            _global_state.tokenizer_manager
-        )
-        fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
-            _global_state.tokenizer_manager
-        )
-
-        server_args: ServerArgs = fast_api_app.server_args
-
-        tool_server = None
-        if server_args.tool_server == "demo":
-            from sglang.srt.entrypoints.openai.tool_server import DemoToolServer
-
-            tool_server = DemoToolServer()
-        elif server_args.tool_server:
-            from sglang.srt.entrypoints.openai.tool_server import MCPToolServer
-
-            tool_server = MCPToolServer()
-            await tool_server.add_tool_server(server_args.tool_server)
-
-        try:
-            from sglang.srt.entrypoints.openai.serving_responses import (
-                OpenAIServingResponses,
-            )
-
-            fast_api_app.state.openai_serving_responses = OpenAIServingResponses(
-                _global_state.tokenizer_manager,
-                _global_state.template_manager,
-                enable_prompt_tokens_details=True,
-                enable_force_include_usage=True,
-                tool_server=tool_server,
-            )
-        except Exception as e:
-            # print stack trace
-            import traceback
-
-            traceback.print_exc()
-            logger.warning(f"Can not initialize OpenAIServingResponses, error: {e}")
-
-        if server_args.warmups is not None:
-            await execute_warmups(
-                server_args.disaggregation_mode,
-                server_args.warmups.split(","),
-                _global_state.tokenizer_manager,
-            )
-            logger.info("Warmup ended")
-
-        logger.info("warmup_thread start")
-
-        # Create a warmup thread for each worker
-        warmup_thread = threading.Thread(
+    if server_args is None:
+        # for multi-tokenizer
+        fast_api_app.server_args = init_multi_tokenizer()
+        fast_api_app.warmup_thread = threading.Thread(
             target=_wait_and_warmup,
             args=(
-                server_args,
+                fast_api_app.server_args,
                 None,  # pipe_finish_writer not needed in worker
                 None,  # launch_callback not needed in worker
             ),
         )
-        logger.info(f"warmup_thread start warmup_thread={warmup_thread}")
-        warmup_thread.start()
 
-        logger.info(f"worker {pid} started")
+    # Initialize OpenAI serving handlers
+    fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
+    fast_api_app.state.openai_serving_chat = OpenAIServingChat(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
+    fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
+    fast_api_app.state.openai_serving_score = OpenAIServingScore(
+        _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
+        _global_state.tokenizer_manager
+    )
+
+    server_args: ServerArgs = fast_api_app.server_args
+
+    tool_server = None
+    if server_args.tool_server == "demo":
+        from sglang.srt.entrypoints.openai.tool_server import DemoToolServer
+
+        tool_server = DemoToolServer()
+    elif server_args.tool_server:
+        from sglang.srt.entrypoints.openai.tool_server import MCPToolServer
+
+        tool_server = MCPToolServer()
+        await tool_server.add_tool_server(server_args.tool_server)
+
+    try:
+        from sglang.srt.entrypoints.openai.serving_responses import (
+            OpenAIServingResponses,
+        )
+
+        fast_api_app.state.openai_serving_responses = OpenAIServingResponses(
+            _global_state.tokenizer_manager,
+            _global_state.template_manager,
+            enable_prompt_tokens_details=True,
+            enable_force_include_usage=True,
+            tool_server=tool_server,
+        )
+    except Exception as e:
+        # print stack trace
+        import traceback
+
+        traceback.print_exc()
+        logger.warning(f"Can not initialize OpenAIServingResponses, error: {e}")
+
+    if server_args.warmups is not None:
+        await execute_warmups(
+            server_args.disaggregation_mode,
+            server_args.warmups.split(","),
+            _global_state.tokenizer_manager,
+        )
+        logger.info("Warmup ended")
+
+    warmup_thread = getattr(fast_api_app, "warmup_thread", None)
+    if warmup_thread is not None:
+        warmup_thread.start()
+    
     try:
         yield
     finally:
         if server_args.tokenizer_worker_num > 1:
+            pid = os.getpid()
             logger.info(f"worker {pid} ending")
             # Clean up shared memory
             try:
