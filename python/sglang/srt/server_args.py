@@ -2037,6 +2037,8 @@ class ServerArgs:
 
         if model_arch in [
             "Gemma2ForCausalLM",
+            "Gemma3ForCausalLM",
+            "Gemma3ForConditionalGeneration",
             "Gemma3nForCausalLM",
             "Gemma3nForConditionalGeneration",
         ]:
