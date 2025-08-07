@@ -492,12 +492,13 @@ class Engine(EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
-    def load_lora_adapter(self, lora_name: str, lora_path: str):
+    def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
         """Load a new LoRA adapter without re-launching the engine."""
 
         obj = LoadLoRAAdapterReqInput(
             lora_name=lora_name,
             lora_path=lora_path,
+            pinned=pinned,
         )
 
         loop = asyncio.get_event_loop()
