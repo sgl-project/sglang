@@ -336,110 +336,8 @@ impl PDRouter {
             .into_response()
     }
 
-    // Execute the dual dispatch to prefill and decode servers with retry logic
+    // Execute the dual dispatch to prefill and decode servers
     async fn execute_dual_dispatch(
-        &self,
-        headers: Option<&HeaderMap>,
-        json_request: Value,
-        route: &str,
-        prefill: &dyn Worker,
-        decode: &dyn Worker,
-        is_stream: bool,
-        return_logprob: bool,
-        start_time: Instant,
-    ) -> Response {
-        for attempt in 0..self.retry_config.max_retries {
-            if attempt > 0 {
-                // Calculate backoff with exponential growth and jitter
-                let base_backoff = self.retry_config.initial_backoff_ms as f64
-                    * self
-                        .retry_config
-                        .backoff_multiplier
-                        .powf((attempt - 1) as f32) as f64;
-                let backoff_ms = base_backoff.min(self.retry_config.max_backoff_ms as f64) as u64;
-
-                // Add jitter to prevent thundering herd
-                let jitter = {
-                    let mut rng = rand::thread_rng();
-                    rng.gen_range(0..backoff_ms / 2)
-                };
-                let total_backoff = Duration::from_millis(backoff_ms + jitter);
-
-                info!(
-                    "Retrying request (attempt {}/{}) after {:?} backoff",
-                    attempt + 1,
-                    self.retry_config.max_retries,
-                    total_backoff
-                );
-
-                tokio::time::sleep(total_backoff).await;
-            }
-
-            debug!(
-                "Executing request attempt {}/{}",
-                attempt + 1,
-                self.retry_config.max_retries
-            );
-            let result = self
-                .execute_dual_dispatch_inner(
-                    headers,
-                    json_request.clone(),
-                    route,
-                    prefill,
-                    decode,
-                    is_stream,
-                    return_logprob,
-                    start_time,
-                )
-                .await;
-
-            // Check if we should retry based on the response status
-            let status = result.status();
-            debug!(
-                "Request attempt {} returned status: {}",
-                attempt + 1,
-                status
-            );
-
-            // Don't retry client errors (4xx) or successful responses
-            if status.is_client_error() || status.is_success() {
-                debug!(
-                    "Returning response with status {} (no retry needed)",
-                    status
-                );
-                return result;
-            }
-
-            // Check if this is the last attempt
-            if attempt == self.retry_config.max_retries - 1 {
-                warn!("Final attempt failed with status {}", status);
-                return result;
-            }
-
-            // Log retry decision for retryable errors
-            if status.is_server_error()
-                || status == StatusCode::BAD_GATEWAY
-                || status == StatusCode::GATEWAY_TIMEOUT
-            {
-                warn!(
-                    "Retryable error status: {} on attempt {}/{}. Will retry.",
-                    status,
-                    attempt + 1,
-                    self.retry_config.max_retries
-                );
-            } else {
-                // Don't retry other statuses
-                debug!("Status {} is not retryable, returning response", status);
-                return result;
-            }
-        }
-
-        // This should never be reached due to the loop logic, but just in case
-        unreachable!("Retry loop completed without returning")
-    }
-
-    // Inner implementation of dual dispatch (extracted for retry logic)
-    async fn execute_dual_dispatch_inner(
         &self,
         headers: Option<&HeaderMap>,
         json_request: Value,
@@ -477,18 +375,9 @@ impl PDRouter {
         RouterMetrics::record_pd_prefill_request(prefill.url());
         RouterMetrics::record_pd_decode_request(decode.url());
 
-        // Process prefill response
-        let (_prefill_status, prefill_body) = match self
-            .process_prefill_response(prefill_result, prefill.url(), return_logprob)
-            .await
-        {
-            Ok(result) => result,
-            Err(error_response) => return error_response,
-        };
-
-        // Process decode response
+        // Process decode response FIRST
         debug!("Processing decode response");
-        match decode_result {
+        let decode_response = match decode_result {
             Ok(res) => {
                 let status = StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -512,6 +401,51 @@ impl PDRouter {
                         }
                     }
                 }
+
+                // Process prefill response based on whether we need logprobs
+                let prefill_body = if return_logprob {
+                    // When we need logprobs, process prefill response inline
+                    match self
+                        .process_prefill_response(prefill_result, prefill.url(), return_logprob)
+                        .await
+                    {
+                        Ok((_, body)) => body,
+                        Err(error_response) => return error_response,
+                    }
+                } else {
+                    // When we don't need logprobs, spawn a separate thread to consume prefill response
+                    if let Ok(prefill_res) = prefill_result {
+                        debug!("Spawning separate thread to consume prefill response");
+                        std::thread::spawn(move || {
+                            // Create a new single-threaded runtime just for this task
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .unwrap();
+
+                            rt.block_on(async move {
+                                // Consume the response
+                                match prefill_res.bytes().await {
+                                    Ok(_) => debug!(
+                                        "Prefill response consumed successfully in background"
+                                    ),
+                                    Err(e) => warn!(
+                                        "Error consuming prefill response in background: {}",
+                                        e
+                                    ),
+                                }
+                            });
+                        });
+                    } else if let Err(e) = prefill_result {
+                        // Log prefill error but don't fail the request since decode succeeded
+                        warn!(
+                            "Prefill request failed but continuing with decode response: {}",
+                            e
+                        );
+                        RouterMetrics::record_pd_prefill_error(prefill.url());
+                    }
+                    None
+                };
 
                 if is_stream {
                     // Streaming response
@@ -558,7 +492,9 @@ impl PDRouter {
                 )
                     .into_response()
             }
-        }
+        };
+
+        decode_response
     }
 
     // Select a pair of prefill and decode servers
