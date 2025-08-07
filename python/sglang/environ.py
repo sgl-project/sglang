@@ -1,4 +1,5 @@
 import os
+import subprocess
 import warnings
 from contextlib import ExitStack, contextmanager
 from typing import Any
@@ -172,7 +173,32 @@ def _convert_SGL_to_SGLANG():
 
 _convert_SGL_to_SGLANG()
 
-if __name__ == "__main__":
+
+def example_with_exit_stack():
+    # Use this style of context manager in unit test
+    exit_stack = ExitStack()
+    exit_stack.enter_context(envs.SGLANG_TEST_RETRACT.override(False))
+    assert envs.SGLANG_TEST_RETRACT.value is False
+    exit_stack.close()
+    assert envs.SGLANG_TEST_RETRACT.value is None
+
+
+def example_with_subprocess():
+    command = ["python", "-c", "import os; print(os.getenv('SGLANG_TEST_RETRACT'))"]
+    with envs.SGLANG_TEST_RETRACT.override(True):
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        process.wait()
+        output = process.stdout.read().decode("utf-8").strip()
+        assert output == "True"
+
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output = process.stdout.read().decode("utf-8").strip()
+    assert output == "None"
+
+
+def examples():
     # Example usage for envs
     envs.SGLANG_TEST_RETRACT.clear()
     assert envs.SGLANG_TEST_RETRACT.value is False
@@ -194,9 +220,9 @@ if __name__ == "__main__":
 
     assert envs.SGLANG_TEST_RETRACT.value is None
 
-    # Use this style of context manager in unit test
-    exit_stack = ExitStack()
-    exit_stack.enter_context(envs.SGLANG_TEST_RETRACT.override(False))
-    assert envs.SGLANG_TEST_RETRACT.value is False
-    exit_stack.close()
-    assert envs.SGLANG_TEST_RETRACT.value is None
+    example_with_exit_stack()
+    example_with_subprocess()
+
+
+if __name__ == "__main__":
+    examples()
