@@ -18,7 +18,8 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.ep_moe.layer import EPMoE, TopKOutput
+    from sglang.srt.layers.moe.ep_moe.layer import EPMoE
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -275,7 +276,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         self,
         layer: EPMoE,
         hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
+        topk_output: StandardTopKOutput,
         **kwargs,
     ) -> torch.Tensor:
 

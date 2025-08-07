@@ -79,6 +79,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 
@@ -985,12 +986,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 
@@ -999,7 +995,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             topk_weights, topk_ids, _ = topk_output
             x, topk_weights = apply_topk_weights_cpu(
-                apply_router_weight_on_input, topk_weights, x
+                moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
 
             return torch.ops.sgl_kernel.fused_experts_cpu(
@@ -1024,8 +1020,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer,
                 x,
                 topk_output,
-                activation,
-                no_combine,
+                moe_runner_config.activation,
+                moe_runner_config.no_combine,
             )
             if ret is not None:
                 return ret
@@ -1063,8 +1059,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_fp8_blockscale=True,
             )
             # TODO: Fuse into select_experts
-            if routed_scaling_factor is not None:
-                output *= routed_scaling_factor
+            if moe_runner_config.routed_scaling_factor is not None:
+                output *= moe_runner_config.routed_scaling_factor
             return output
         # Expert fusion with FP8 quantization
         return fused_experts(
@@ -1072,9 +1068,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight,
             layer.w2_weight,
             topk_output=topk_output,
-            inplace=inplace and not no_combine,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
+            moe_runner_config=moe_runner_config,
             use_fp8_w8a8=True,
             w1_scale=(
                 layer.w13_weight_scale_inv
@@ -1087,8 +1081,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
         )
 
     def apply_with_router_logits(
@@ -1096,10 +1088,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
+
+        activation = moe_runner_config.activation
+        routed_scaling_factor = moe_runner_config.routed_scaling_factor
 
         from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
 

@@ -1,10 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
-import datetime
-import glob
 import logging
-import os
-import sys
 from enum import Enum
 from typing import List, Optional, Tuple
 
@@ -23,6 +19,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe import (
+    MoeRunnerConfig,
     get_moe_runner_backend,
     should_use_flashinfer_trtllm_moe,
 )
@@ -153,9 +150,15 @@ class FusedMoE(torch.nn.Module):
         self.expert_map_cpu = None
         self.expert_map_gpu = None
 
-        # For activation
-        self.activation_alpha = activation_alpha
-        self.swiglu_limit = swiglu_limit
+        self.moe_runner_config = MoeRunnerConfig(
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            inplace=inplace,
+            no_combine=no_combine,
+            routed_scaling_factor=routed_scaling_factor,
+            activation_alpha=activation_alpha,
+            swiglu_limit=swiglu_limit,
+        )
 
         enable_flashinfer_cutlass_moe = get_moe_runner_backend().is_flashinfer_cutlass()
 
@@ -186,15 +189,10 @@ class FusedMoE(torch.nn.Module):
                 * self.num_local_experts
             ] = torch.arange(0, self.num_local_experts, dtype=torch.int32, device="cpu")
 
-        self.routed_scaling_factor = routed_scaling_factor
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
         self.reduce_results = reduce_results
-        self.activation = activation
-        self.apply_router_weight_on_input = apply_router_weight_on_input
         self.use_presharded_weights = use_presharded_weights
-        self.inplace = inplace
-        self.no_combine = no_combine
 
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
         if quant_config is None:
@@ -809,29 +807,23 @@ class FusedMoE(torch.nn.Module):
                 # If we are in EP mode, we need to move the expert map to GPU.
                 self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
 
-        if self.expert_map_gpu is not None and TopKOutputChecker.format_is_standard(
-            topk_output
-        ):
-            topk_output = topk_output._replace(
-                topk_ids=self.expert_map_gpu[topk_output.topk_ids]
-            )
+        if self.expert_map_gpu is not None:
+            if TopKOutputChecker.format_is_standard(topk_output):
+                topk_output = topk_output._replace(
+                    topk_ids=self.expert_map_gpu[topk_output.topk_ids]
+                )
+            else:
+                # TODO(ch-wan): support non-standard topk output
+                pass
 
         # Matrix multiply.
         with use_symmetric_memory(get_tp_group()) as sm:
-            kwargs = {}
-            if self.activation_alpha is not None:
-                kwargs["activation_alpha"] = self.activation_alpha
-            if self.swiglu_limit is not None:
-                kwargs["swiglu_limit"] = self.swiglu_limit
 
             final_hidden_states = self.quant_method.apply(
                 layer=self,
                 x=hidden_states,
                 topk_output=topk_output,
-                activation=self.activation,
-                apply_router_weight_on_input=self.apply_router_weight_on_input,
-                routed_scaling_factor=self.routed_scaling_factor,
-                **kwargs,
+                moe_runner_config=self.moe_runner_config,
             )
             sm.tag(final_hidden_states)
 
@@ -958,8 +950,7 @@ class FlashInferFusedMoE(FusedMoE):
             layer=self,
             x=hidden_states,
             topk_output=topk_output,
-            activation=self.activation,
-            routed_scaling_factor=self.routed_scaling_factor,
+            moe_runner_config=self.moe_runner_config,
         )
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
@@ -1048,7 +1039,7 @@ class FlashInferFP4MoE(FusedMoE):
             intermediate_size=self.intermediate_size_per_partition,
             local_expert_offset=self.moe_ep_rank * self.num_local_experts,
             local_num_experts=self.num_local_experts,
-            routed_scaling_factor=self.routed_scaling_factor,
+            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
             tile_tokens_dim=_get_tile_tokens_dim(
                 hidden_states.shape[0], topk_config.top_k, self.num_local_experts
             ),

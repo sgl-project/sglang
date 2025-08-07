@@ -35,6 +35,7 @@ from sglang.srt.utils import is_cuda, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
 if is_cuda():
@@ -427,12 +428,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 
@@ -441,15 +437,13 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight,
             layer.w2_weight,
             topk_output=topk_output,
-            inplace=inplace,
-            activation=activation,
+            moe_runner_config=moe_runner_config,
             use_fp8_w8a8=True,
             per_channel_quant=False,  # ModelOpt uses per-tensor quantization
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
-            no_combine=no_combine,
         )
 
 
@@ -1148,14 +1142,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer: FusedMoE,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
-        assert activation == "silu", "Only SiLU activation is supported."
+        assert (
+            moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
 
         # Check if this is a FlashInferFP4MoE layer that should handle its own forward
         if hasattr(layer, "gemm1_weights_fp4_shuffled"):
@@ -1164,7 +1155,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if self.enable_flashinfer_cutlass_moe:
             assert (
-                not apply_router_weight_on_input
+                not moe_runner_config.apply_router_weight_on_input
             ), "apply_router_weight_on_input is not supported for Flashinfer"
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
@@ -1192,8 +1183,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
             )[0]
-            if routed_scaling_factor is not None:
-                output *= routed_scaling_factor
+            if moe_runner_config.routed_scaling_factor is not None:
+                output *= moe_runner_config.routed_scaling_factor
             return output
 
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
@@ -1212,8 +1203,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             params=layer.cutlass_moe_params,
-            apply_router_weight_on_input=apply_router_weight_on_input,
+            apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
         ).to(x.dtype)
-        if routed_scaling_factor is not None:
-            output *= routed_scaling_factor
+        if moe_runner_config.routed_scaling_factor is not None:
+            output *= moe_runner_config.routed_scaling_factor
         return output

@@ -6,13 +6,12 @@ import functools
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -34,6 +33,10 @@ from sglang.srt.utils import (
     is_hip,
     next_power_of_2,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -1156,10 +1159,8 @@ def fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_output: TopKOutput,
-    inplace: bool = False,
-    activation: str = "silu",
-    apply_router_weight_on_input: bool = False,
+    topk_output: StandardTopKOutput,
+    moe_runner_config: MoeRunnerConfig,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -1172,20 +1173,18 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
-    no_combine: bool = False,
-    routed_scaling_factor: Optional[float] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
-    if inplace:
-        assert not no_combine, "no combine + inplace makes no sense"
+    if moe_runner_config.inplace:
+        assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
         torch.ops.sglang.inplace_fused_experts(
             hidden_states,
             w1,
             w2,
             topk_weights,
             topk_ids,
-            activation,
-            apply_router_weight_on_input,
+            moe_runner_config.activation,
+            moe_runner_config.apply_router_weight_on_input,
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
@@ -1198,7 +1197,7 @@ def fused_experts(
             a1_scale,
             a2_scale,
             block_shape,
-            routed_scaling_factor,
+            moe_runner_config.routed_scaling_factor,
         )
         return hidden_states
     else:
@@ -1208,8 +1207,8 @@ def fused_experts(
             w2,
             topk_weights,
             topk_ids,
-            activation,
-            apply_router_weight_on_input,
+            moe_runner_config.activation,
+            moe_runner_config.apply_router_weight_on_input,
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
@@ -1222,8 +1221,8 @@ def fused_experts(
             a1_scale,
             a2_scale,
             block_shape,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
+            no_combine=moe_runner_config.no_combine,
+            routed_scaling_factor=moe_runner_config.routed_scaling_factor,
         )
 
 
@@ -1566,7 +1565,7 @@ def fused_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_output: TopKOutput,
+    topk_output: StandardTopKOutput,
     inplace: bool = False,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
@@ -1593,7 +1592,7 @@ def fused_moe(
     - hidden_states (torch.Tensor): The input tensor to the MoE layer.
     - w1 (torch.Tensor): The first set of expert weights.
     - w2 (torch.Tensor): The second set of expert weights.
-    - topk_output (TopKOutput): The top-k output of the experts.
+    - topk_output (StandardTopKOutput): The top-k output of the experts.
     - inplace (bool): If True, perform the operation in-place.
         Defaults to False.
     - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner

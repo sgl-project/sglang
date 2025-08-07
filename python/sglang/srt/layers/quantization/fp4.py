@@ -41,6 +41,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
 logger = logging.getLogger(__name__)
@@ -352,12 +353,7 @@ class W4A4MXFp4MoEDynamicMethod(MxFp4MoEMethod):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         topk_weights, topk_ids, _ = topk_output
 
@@ -371,7 +367,9 @@ class W4A4MXFp4MoEDynamicMethod(MxFp4MoEMethod):
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             activation=(
-                ActivationType.Silu if activation == "silu" else ActivationType.Gelu
+                ActivationType.Silu
+                if moe_runner_config.activation == "silu"
+                else ActivationType.Gelu
             ),
             doweight_stage1=False,
         )
@@ -485,12 +483,7 @@ class W4A4MXFp4MoEStaticMethod(MxFp4MoEMethod):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         topk_weights, topk_ids, _ = topk_output
 
@@ -504,7 +497,9 @@ class W4A4MXFp4MoEStaticMethod(MxFp4MoEMethod):
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             activation=(
-                ActivationType.Silu if activation == "silu" else ActivationType.Gelu
+                ActivationType.Silu
+                if moe_runner_config.activation == "silu"
+                else ActivationType.Gelu
             ),
             doweight_stage1=False,
         )

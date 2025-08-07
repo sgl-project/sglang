@@ -47,6 +47,7 @@ if is_flashinfer_available():
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
 OCP_MX_BLOCK_SIZE = 32
@@ -531,14 +532,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
-        activation_alpha: Optional[float] = None,
-        swiglu_limit: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         if USE_FLASHINFER_MXFP4_MOE or USE_FLASHINFER_MXFP4_BF16_MOE:
             # When USE_FLASHINFER_MXFP4_BF16_MOE is enabled, we don't need to quantize the input,
@@ -600,9 +594,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     b1=layer.w13_weight_bias,
                     b2=layer.w2_weight_bias,
                     topk_output=topk_output,
-                    activation=activation,
-                    activation_alpha=activation_alpha,
-                    swiglu_limit=swiglu_limit,
+                    moe_runner_config=moe_runner_config,
                 )
             else:
                 return self.triton_kernel_moe_forward(
@@ -610,6 +602,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     w1=layer.w13_weight,
                     w2=layer.w2_weight,
                     topk_output=topk_output,
+                    moe_runner_config=moe_runner_config,
                 )
         else:
             raise NotImplementedError()

@@ -18,6 +18,7 @@ from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
 from triton_kernels.swiglu import swiglu_fn
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
 
@@ -55,8 +56,7 @@ def triton_kernel_moe_forward(
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_output: TopKOutput,
-    inplace: bool = False,
-    activation: str = "silu",
+    moe_runner_config: MoeRunnerConfig,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     per_channel_quant: bool = False,
@@ -82,8 +82,8 @@ def triton_kernel_moe_forward(
         routing_data,
         gather_idx,
         scatter_idx,
-        inplace=inplace,
-        activation=activation,
+        inplace=moe_runner_config.inplace,
+        activation=moe_runner_config.activation,
         apply_router_weight_on_input=apply_router_weight_on_input,
         use_fp8_w8a8=use_fp8_w8a8,
         per_channel_quant=per_channel_quant,
@@ -195,8 +195,7 @@ def triton_kernel_moe_with_bias_forward(
     w2_pcg,
     b2: torch.Tensor,
     topk_output: TopKOutput,
-    inplace: bool = False,
-    activation: str = "silu",
+    moe_runner_config: MoeRunnerConfig,
     use_fp8_w8a8: bool = False,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
@@ -206,8 +205,6 @@ def triton_kernel_moe_with_bias_forward(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
-    activation_alpha: Optional[float] = None,
-    swiglu_limit: Optional[int] = None,
 ) -> torch.Tensor:
     assert topk_output.format.is_triton_kernel()
     routing_data, gather_idx, scatter_idx = topk_output
@@ -223,8 +220,8 @@ def triton_kernel_moe_with_bias_forward(
         routing_data=routing_data,
         gather_indx=gather_idx,
         scatter_indx=scatter_idx,
-        inplace=inplace,
-        activation=activation,
+        inplace=moe_runner_config.inplace,
+        activation=moe_runner_config.activation,
         use_fp8_w8a8=use_fp8_w8a8,
         per_channel_quant=per_channel_quant,
         global_num_experts=global_num_experts,
@@ -234,8 +231,8 @@ def triton_kernel_moe_with_bias_forward(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
-        activation_alpha=activation_alpha,
-        swiglu_limit=swiglu_limit,
+        activation_alpha=moe_runner_config.activation_alpha,
+        swiglu_limit=moe_runner_config.swiglu_limit,
     )
 
 
@@ -262,9 +259,8 @@ def triton_kernel_fused_experts_with_bias(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     activation_alpha: Optional[float] = None,
-    swiglu_limit: Optional[int] = None,
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
-    # print(f"here in triton moe with bias", b1.shape, b1.dtype, b2.shape, b2.dtype)
     assert use_fp8_w8a8 == False, "use_fp8_w8a8 is not supported"
     assert per_channel_quant == False, "per_channel_quant is not supported"
     assert expert_map == None, "expert_map is not supported"

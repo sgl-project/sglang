@@ -139,7 +139,8 @@ class EPMoE(FusedMoE):
         )
 
         assert self.quant_method is not None
-        assert self.activation == "silu"
+        assert self.moe_runner_config.activation == "silu"
+
         hidden_states_shape = hidden_states.shape
         hidden_states_dtype = hidden_states.dtype
         hidden_states_device = hidden_states.device
@@ -274,8 +275,8 @@ class EPMoE(FusedMoE):
             m_max * self.start_expert_id,
             BLOCK_SIZE=512,
         )
-        if self.routed_scaling_factor is not None:
-            output *= self.routed_scaling_factor
+        if self.moe_runner_config.routed_scaling_factor is not None:
+            output *= self.moe_runner_config.routed_scaling_factor
         return output
 
 
@@ -460,7 +461,7 @@ class DeepEPMoE(EPMoE):
             quant_type=QuantType.per_128x128,
             activation=(
                 ActivationType.Silu
-                if self.activation == "silu"
+                if self.moe_runner_config.activation == "silu"
                 else ActivationType.Gelu
             ),
             expert_mask=self.expert_mask,
@@ -475,7 +476,7 @@ class DeepEPMoE(EPMoE):
         )
         hidden_states_fp8, hidden_states_scale = hidden_states_fp8
         assert self.quant_method is not None
-        assert self.activation == "silu"
+        assert self.moe_runner_config.activation == "silu"
         if num_recv_tokens_per_expert is None:
             return hidden_states_fp8.bfloat16()
         all_tokens = sum(num_recv_tokens_per_expert)
@@ -596,7 +597,7 @@ class DeepEPMoE(EPMoE):
     ):
         hidden_states_fp8, _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
-        assert self.activation == "silu"
+        assert self.moe_runner_config.activation == "silu"
 
         # GroupGemm-0
         num_groups, m, k = hidden_states_fp8[0].size()
