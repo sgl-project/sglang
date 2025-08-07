@@ -30,11 +30,11 @@ head_kv_num = 8
             ("cyan", "-"),
         ],
         ylabel="TFLOPS",
-        plot_name="attention-sink-triton",
+        plot_name="attention-sink-triton-decode",
         args={},
     )
 )
-def benchmark(B, S, H_Q, H_KV, D):
+def benchmark_decode(B, S, H_Q, H_KV, D):
     D_V = D
     dtype = torch.bfloat16
     seq_len = S
@@ -120,7 +120,7 @@ def benchmark(B, S, H_Q, H_KV, D):
 
 
 if __name__ == "__main__":
-    benchmark.run(
+    benchmark_decode.run(
         print_data=True,
         show_plots=True,
         save_path="attention-sink-triton",
