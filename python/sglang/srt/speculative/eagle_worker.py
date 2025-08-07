@@ -258,7 +258,7 @@ class EAGLEWorker(TpModelWorker):
             )
         else:
             raise ValueError(
-                f"EAGLE is not supported in attention backend {self.server_args.draft_attention_backend}"
+                f"EAGLE is not supported in attention backend {draft_attention_backend}"
             )
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
