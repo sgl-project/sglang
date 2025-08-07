@@ -107,7 +107,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "num_reserved_decode_tokens",
     "weight_loader_disable_mmap",
     "enable_triton_kernel_moe",
-    "flashinfer_mxfp4_moe",
+    "enable_flashinfer_mxfp4_moe",
     "enable_multimodal",
     "enable_symm_mem",
     "quantization",

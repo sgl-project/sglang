@@ -186,7 +186,7 @@ class Mxfp4Config(QuantizationConfig):
             ):
                 return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
-            use_flashinfer = global_server_args_dict.get("flashinfer_mxfp4_moe", False)
+            use_flashinfer = global_server_args_dict.get("enable_flashinfer_mxfp4_moe", False)
             return Mxfp4MoEMethod(
                 use_triton_kernels=True, with_bias=True, use_flashinfer=use_flashinfer
             )

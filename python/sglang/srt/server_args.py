@@ -248,7 +248,7 @@ class ServerArgs:
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
     enable_triton_kernel_moe: bool = False
-    flashinfer_mxfp4_moe: bool = False
+    enable_flashinfer_mxfp4_moe: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -478,7 +478,7 @@ class ServerArgs:
             )
 
             if is_sm100_supported():
-                self.flashinfer_mxfp4_moe = True
+                self.enable_flashinfer_mxfp4_moe = True
                 self.enable_triton_kernel_moe = False
             else:
                 self.enable_triton_kernel_moe = True
@@ -1840,7 +1840,7 @@ class ServerArgs:
             help="Use triton moe grouped gemm kernel.",
         )
         parser.add_argument(
-            "--flashinfer-mxfp4-moe",
+            "--enable-flashinfer-mxfp4-moe",
             action="store_true",
             help="Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
         )
