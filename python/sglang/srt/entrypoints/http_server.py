@@ -210,6 +210,7 @@ def get_main_process_id() -> int:
 def write_data_for_multi_tokenizer(
     port_args: PortArgs, server_args: ServerArgs, scheduler_info: Dict
 ):
+    """Write args information to share memory for multi-tokenizer"""
     # get main process ID
     main_pid = get_main_process_id()
     current_pid = os.getpid()
@@ -217,15 +218,15 @@ def write_data_for_multi_tokenizer(
 
     # Write port_args to shared memory
     port_args_shm = write_to_shared_memory(
-        serialize_port_args(port_args), f"port_args_{os.getpid()}"
+        serialize_port_args(port_args), f"port_args_{current_pid}"
     )
     # Write server_args to shared memory
     server_args_shm = write_to_shared_memory(
-        serialize_server_args(server_args), f"server_args_{os.getpid()}"
+        serialize_server_args(server_args), f"server_args_{current_pid}"
     )
     # Write scheduler_info to shared memory
     scheduler_info_shm = write_to_shared_memory(
-        serialize_scheduler_info(scheduler_info), f"scheduler_info_{os.getpid()}"
+        serialize_scheduler_info(scheduler_info), f"scheduler_info_{current_pid}"
     )
 
     port_args_shm.close()
@@ -357,14 +358,9 @@ async def lifespan(fast_api_app: FastAPI):
     finally:
         if server_args.tokenizer_worker_num > 1:
             pid = os.getpid()
-            logger.info(f"worker {pid} ending")
-            # Clean up shared memory
-            try:
-                if "warmup_thread" in locals() and warmup_thread.is_alive():
-                    warmup_thread.join()
-            except Exception as e:
-                logger.error(f"Error when cleaning up shared memory: {e}")
-            logger.info(f"worker {pid} ended")
+            logger.info(f"uvicorn worker {pid} ending...")
+            warmup_thread.join()
+            logger.info(f"uvicorn {pid} ended")
 
 
 # Fast API
