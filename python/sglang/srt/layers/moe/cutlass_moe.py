@@ -506,12 +506,13 @@ def cutlass_moe_fp4_with_bias(
     )
     # print(params.to_gemm1_args().keys())
     # print(params.to_gemm1_args()["c_strides"])
-    # print(params.to_gemm1_args()["problem_sizes"])
-    gemm1_args = params.to_gemm1_args()
-    gemm1_args["bias_strides"] = torch.zeros_like(gemm1_args["c_strides"])
+    problem_sizes1_temp = params.to_gemm1_args()["problem_sizes"].transpose(0, 1)[0]
+    repeated_bias1 = torch.repeat_interleave(bias1, problem_sizes1_temp, dim=0)
+    # gemm1_args = params.to_gemm1_args()
+    # gemm1_args["bias_strides"] = torch.zeros_like(gemm1_args["c_strides"])
+    # gemm1_args["bias"] = bias1
     # gemm1_args["bias_strides"] = gemm1_args["c_strides"].clone()
-    gemm1_args["bias"] = bias1
-    c1 = cutlass_fp4_group_mm_with_bias(
+    c1 = cutlass_fp4_group_mm(
         rep_a_fp4,
         w1_fp4,
         rep_a_blockscale,
@@ -519,10 +520,10 @@ def cutlass_moe_fp4_with_bias(
         w1_alphas,
         out_dtype,
         device,
-        gemm1_args,
+        params.to_gemm1_args(),
     )
     del rep_a_fp4, rep_a_blockscale
-    print(c1[0, 0])
+    c1 = c1 + repeated_bias1
 
     # hidden size dimension is split to one halfpytho sized tensor.
     intermediate = torch.empty(
@@ -553,11 +554,13 @@ def cutlass_moe_fp4_with_bias(
         params.blockscale_offsets,
         num_topk,
     )
-    gemm2_args = params.to_gemm2_args()
-    gemm2_args["bias"] = bias2
-    gemm2_args["bias_strides"] = torch.zeros_like(gemm2_args["c_strides"])
+    # gemm2_args = params.to_gemm2_args()
+    # gemm2_args["bias"] = bias2
+    # gemm2_args["bias_strides"] = torch.zeros_like(gemm2_args["c_strides"])
     # gemm2_args["bias_strides"] = gemm2_args["c_strides"].clone()
-    c2 = cutlass_fp4_group_mm_with_bias(
+    problem_sizes2_temp = params.to_gemm2_args()["problem_sizes"].transpose(0, 1)[0]
+    repeated_bias2 = torch.repeat_interleave(bias2, problem_sizes2_temp, dim=0)
+    c2 = cutlass_fp4_group_mm(
         int_fp4,
         w2_fp4,
         int_blockscale,
@@ -565,9 +568,10 @@ def cutlass_moe_fp4_with_bias(
         w2_alphas,
         out_dtype,
         device,
-        gemm2_args,
+        params.to_gemm2_args(),
     )
     del int_fp4, int_blockscale
+    c2 = c2 + repeated_bias2
     c2 = shuffle_rows(c2, c_map, (m_a * num_topk, params.hidden_size))
     c2 = c2.view(m_a, num_topk, params.hidden_size)
     if not apply_router_weight_on_input:
