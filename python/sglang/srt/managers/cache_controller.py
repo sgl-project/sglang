@@ -630,7 +630,9 @@ class HiCacheController:
                     continue
 
                 storage_hit_count = 0
-                if (operation.host_indices is not None) and self.prefetch_rate_limit_check():
+                if (
+                    operation.host_indices is not None
+                ) and self.prefetch_rate_limit_check():
                     last_hash = operation.last_hash
                     tokens_to_fetch = operation.token_ids
 
