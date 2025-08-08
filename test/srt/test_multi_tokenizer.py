@@ -1,6 +1,9 @@
+import inspect
 import unittest
+from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
 
+import sglang.srt.managers.io_struct as io_struct
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -8,16 +11,14 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    popen_launch_server,
-    write_github_step_summary,
-    is_in_ci,
-    get_benchmark_args,
-    run_benchmark,
     auto_config_device,
+    get_benchmark_args,
+    is_in_ci,
+    popen_launch_server,
+    run_benchmark,
+    write_github_step_summary,
 )
-import sglang.srt.managers.io_struct as io_struct
-import inspect
-from dataclasses import is_dataclass, fields
+
 
 class TestMultiTokenizer(CustomTestCase):
     # from test_hicache.py
@@ -51,7 +52,7 @@ class TestMultiTokenizer(CustomTestCase):
         )
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.65)
-    
+
     def test_all_io_struct(self):
         print("check all req types in io_struct.py")
         result = []
@@ -62,11 +63,13 @@ class TestMultiTokenizer(CustomTestCase):
                     continue
                 result.append(name)
         print(f"WARNING:Some Request types in io_struct.py have no rids: {result}")
-        print("If a special request type can't work, check the rids field which is needed for multi-tokenizer.")
+        print(
+            "If a special request type can't work, check the rids field which is needed for multi-tokenizer."
+        )
 
     def test_multi_tokenizer_ttft(self):
         # from test_bench_serving.py run_bench_serving
-        args=get_benchmark_args(
+        args = get_benchmark_args(
             base_url=self.base_url,
             dataset_name="random",
             dataset_path="",
