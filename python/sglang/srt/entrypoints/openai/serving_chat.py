@@ -271,6 +271,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 tokenize=True,
                 add_generation_prompt=True,
                 tools=tools,
+                reasoning_effort=request.reasoning_effort,
+                builtin_tools=[],
                 **(
                     request.chat_template_kwargs if request.chat_template_kwargs else {}
                 ),
