@@ -319,6 +319,7 @@ def fused_moe_kernel(
     # Pointers to matrices
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     a_scale_ptr,
     b_scale_ptr,
@@ -340,6 +341,8 @@ def fused_moe_kernel(
     stride_be,
     stride_bk,
     stride_bn,
+    stride_bias_e,
+    stride_bias_n,
     stride_cm,
     stride_cn,
     stride_asm,
@@ -449,6 +452,10 @@ def fused_moe_kernel(
         + off_experts * stride_be
         + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
     )
+    if bias_ptr is not None:
+        bias = tl.load(
+            bias_ptr + off_experts * stride_bias_e + offs_bn[None, :] * stride_bias_n
+        )
     if use_int8_w8a16:
         b_scale_ptrs = (
             b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
@@ -526,18 +533,20 @@ def fused_moe_kernel(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
+    if use_int8_w8a16:
+        accumulator *= b_scale
+    elif use_fp8_w8a8 or use_int8_w8a8:
+        if group_k == 0 or group_n == 0:
+            accumulator *= a_scale * b_scale
+
+    if bias_ptr is not None:
+        accumulator += bias
+
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
-        accumulator = accumulator * moe_weight[:, None]
-    if use_int8_w8a16:
-        accumulator = (accumulator * b_scale).to(compute_type)
-    elif use_fp8_w8a8 or use_int8_w8a8:
-        if group_k > 0 and group_n > 0:
-            accumulator = accumulator.to(compute_type)
-        else:
-            accumulator = (accumulator * a_scale * b_scale).to(compute_type)
-    else:
-        accumulator = accumulator.to(compute_type)
+        accumulator *= moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -622,6 +631,7 @@ def moe_align_block_size(
 def invoke_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
+    bias: Optional[torch.Tensor],
     C: torch.Tensor,
     A_scale: Optional[torch.Tensor],
     B_scale: Optional[torch.Tensor],
@@ -711,6 +721,7 @@ def invoke_fused_moe_kernel(
     ):
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
+        assert bias is None
         fused_moe_kernel_gptq_awq[grid](
             A,
             B,
@@ -754,6 +765,7 @@ def invoke_fused_moe_kernel(
         fused_moe_kernel[grid](
             A,
             B,
+            bias,
             C,
             A_scale,
             B_scale,
@@ -770,6 +782,8 @@ def invoke_fused_moe_kernel(
             B.stride(0),
             B.stride(2),
             B.stride(1),
+            bias.stride(0) if bias is not None else 0,
+            bias.stride(1) if bias is not None else 0,
             C.stride(1),
             C.stride(2),
             A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
@@ -994,6 +1008,8 @@ def inplace_fused_experts(
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    b1: Optional[torch.Tensor] = None,
+    b2: Optional[torch.Tensor] = None,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
@@ -1009,6 +1025,8 @@ def inplace_fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     routed_scaling_factor: Optional[float] = None,
+    activation_alpha: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -1016,6 +1034,8 @@ def inplace_fused_experts(
         w2,
         topk_weights,
         topk_ids,
+        b1,
+        b2,
         True,
         activation,
         apply_router_weight_on_input,
@@ -1033,6 +1053,8 @@ def inplace_fused_experts(
         block_shape,
         False,
         routed_scaling_factor,
+        activation_alpha,
+        swiglu_limit,
     )
 
 
@@ -1042,6 +1064,8 @@ def inplace_fused_experts_fake(
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    b1: Optional[torch.Tensor] = None,
+    b2: Optional[torch.Tensor] = None,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
@@ -1057,6 +1081,8 @@ def inplace_fused_experts_fake(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     routed_scaling_factor: Optional[float] = None,
+    activation_alpha: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
 ) -> None:
     pass
 
@@ -1075,6 +1101,8 @@ def outplace_fused_experts(
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    b1: Optional[torch.Tensor] = None,
+    b2: Optional[torch.Tensor] = None,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
@@ -1091,6 +1119,8 @@ def outplace_fused_experts(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    activation_alpha: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -1098,6 +1128,8 @@ def outplace_fused_experts(
         w2,
         topk_weights,
         topk_ids,
+        b1,
+        b2,
         False,
         activation,
         apply_router_weight_on_input,
@@ -1115,6 +1147,8 @@ def outplace_fused_experts(
         block_shape,
         no_combine=no_combine,
         routed_scaling_factor=routed_scaling_factor,
+        activation_alpha=activation_alpha,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -1124,6 +1158,8 @@ def outplace_fused_experts_fake(
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    b1: Optional[torch.Tensor] = None,
+    b2: Optional[torch.Tensor] = None,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
@@ -1140,6 +1176,8 @@ def outplace_fused_experts_fake(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    activation_alpha: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -1157,6 +1195,8 @@ def fused_experts(
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_output: TopKOutput,
+    b1: Optional[torch.Tensor] = None,
+    b2: Optional[torch.Tensor] = None,
     inplace: bool = False,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
@@ -1174,6 +1214,8 @@ def fused_experts(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    activation_alpha: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
     if inplace:
@@ -1184,6 +1226,8 @@ def fused_experts(
             w2,
             topk_weights,
             topk_ids,
+            b1,
+            b2,
             activation,
             apply_router_weight_on_input,
             use_fp8_w8a8,
@@ -1199,6 +1243,8 @@ def fused_experts(
             a2_scale,
             block_shape,
             routed_scaling_factor,
+            activation_alpha,
+            swiglu_limit,
         )
         return hidden_states
     else:
@@ -1208,6 +1254,8 @@ def fused_experts(
             w2,
             topk_weights,
             topk_ids,
+            b1,
+            b2,
             activation,
             apply_router_weight_on_input,
             use_fp8_w8a8,
@@ -1224,6 +1272,8 @@ def fused_experts(
             block_shape,
             no_combine=no_combine,
             routed_scaling_factor=routed_scaling_factor,
+            activation_alpha=activation_alpha,
+            swiglu_limit=swiglu_limit,
         )
 
 
@@ -1319,12 +1369,22 @@ def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
     out.mul_(routed_scaling_factor)
 
 
+@torch.compile
+def swiglu_with_alpha_and_limit(x, alpha, limit):
+    gate, up = x[..., ::2], x[..., 1::2]
+    gate = gate.clamp(min=None, max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    return gate * torch.sigmoid(gate * alpha) * (up + 1)
+
+
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    b1: Optional[torch.Tensor] = None,
+    b2: Optional[torch.Tensor] = None,
     inplace: bool = False,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
@@ -1342,6 +1402,8 @@ def fused_experts_impl(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    activation_alpha: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -1353,7 +1415,7 @@ def fused_experts_impl(
     else:
         assert (
             hidden_states.shape[1] == w1.shape[2] - padded_size
-        ), "Hidden size mismatch"
+        ), f"Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -1449,6 +1511,7 @@ def fused_experts_impl(
         invoke_fused_moe_kernel(
             curr_hidden_states,
             w1,
+            b1,
             intermediate_cache1,
             a1_scale,
             w1_scale,
@@ -1470,13 +1533,24 @@ def fused_experts_impl(
             block_shape=block_shape,
         )
         if activation == "silu":
-            if _is_cuda:
+            if activation_alpha is not None:
+                assert swiglu_limit is not None
+                intermediate_cache2 = swiglu_with_alpha_and_limit(
+                    intermediate_cache1.view(-1, N),
+                    activation_alpha,
+                    swiglu_limit,
+                )
+            elif _is_cuda:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
                 vllm_ops.silu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
                 )
         elif activation == "gelu":
+            assert (
+                activation_alpha is None
+            ), "activation_alpha is not supported for gelu"
+            assert swiglu_limit is None, "swiglu_limit is not supported for gelu"
             if _is_cuda:
                 gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
@@ -1489,6 +1563,7 @@ def fused_experts_impl(
         invoke_fused_moe_kernel(
             intermediate_cache2,
             w2,
+            b2,
             (
                 intermediate_cache3
                 if not no_combine and topk_ids.shape[1] != 1
@@ -1567,6 +1642,8 @@ def fused_moe(
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_output: TopKOutput,
+    b1: Optional[torch.Tensor] = None,
+    b2: Optional[torch.Tensor] = None,
     inplace: bool = False,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
@@ -1584,6 +1661,8 @@ def fused_moe(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    activation_alpha: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -1594,6 +1673,8 @@ def fused_moe(
     - w1 (torch.Tensor): The first set of expert weights.
     - w2 (torch.Tensor): The second set of expert weights.
     - topk_output (TopKOutput): The top-k output of the experts.
+    - b1 (Optional[torch.Tensor]): Optional bias for w1.
+    - b2 (Optional[torch.Tensor]): Optional bias for w2.
     - inplace (bool): If True, perform the operation in-place.
         Defaults to False.
     - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner
@@ -1615,6 +1696,10 @@ def fused_moe(
         a2.
     - block_shape: (Optional[List[int]]): Optional block size for block-wise
         quantization.
+    - activation_alpha (Optional[float]): Optional alpha for the activation
+        function.
+    - swiglu_limit (Optional[float]): Optional limit for the swiglu activation
+        function.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
@@ -1625,6 +1710,8 @@ def fused_moe(
         w1,
         w2,
         topk_output,
+        b1=b1,
+        b2=b2,
         inplace=inplace,
         activation=activation,
         apply_router_weight_on_input=apply_router_weight_on_input,
@@ -1642,4 +1729,6 @@ def fused_moe(
         block_shape=block_shape,
         no_combine=no_combine,
         routed_scaling_factor=routed_scaling_factor,
+        activation_alpha=activation_alpha,
+        swiglu_limit=swiglu_limit,
     )

@@ -76,6 +76,9 @@ class EPMoE(FusedMoE):
         prefix: str = "",
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
+        activation_alpha: Optional[float] = None,
+        swiglu_limit: Optional[float] = None,
+        with_bias: bool = False,
     ):
         super().__init__(
             num_experts=num_experts,
@@ -91,6 +94,9 @@ class EPMoE(FusedMoE):
             activation=activation,
             # apply_router_weight_on_input=apply_router_weight_on_input,
             routed_scaling_factor=routed_scaling_factor,
+            activation_alpha=activation_alpha,
+            swiglu_limit=swiglu_limit,
+            with_bias=with_bias,
         )
 
         self.start_expert_id = self.moe_ep_rank * self.num_local_experts
