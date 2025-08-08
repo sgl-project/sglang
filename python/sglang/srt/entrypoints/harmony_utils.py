@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import datetime
 import json
+import logging
 from collections.abc import Iterable
 from typing import Literal, Optional, Union
 
@@ -27,6 +28,7 @@ from openai_harmony import (
     Conversation,
     DeveloperContent,
     HarmonyEncodingName,
+    HarmonyError,
     Message,
     ReasoningEffort,
     Role,
@@ -364,22 +366,28 @@ def parse_remaining_state(parser: StreamableParser):
 
 
 def parse_output_into_messages(token_ids: Iterable[int]):
+    logger = logging.getLogger(__name__)
     parser = get_streamable_parser_for_assistant()
+    
     for token_id in token_ids:
         try:
             parser.process(token_id)
-        except Exception as e:
-            # Log the error but continue processing
-            print(f"Warning: Error processing token {token_id} in harmony parser: {e}")
-            # For unexpected token errors, try to reset and continue
+        except HarmonyError as e:
+            logger.warning(
+                "Error processing token %d in harmony parser: %s", token_id, e
+            )
+            # For unexpected token errors while expecting start token, reset parser and retry
             if "Unexpected token" in str(e) and "while expecting start token" in str(e):
                 parser = get_streamable_parser_for_assistant()
                 try:
                     parser.process(token_id)
-                except Exception:
-                    # If still fails, skip this token
-                    continue
-            else:
-                # For other errors, skip the token
-                continue
+                except HarmonyError:
+                    # If still fails after reset, skip this token
+                    logger.debug("Token %d failed even after parser reset, skipping", token_id)
+        except Exception as e:
+            # Catch any other unexpected errors
+            logger.error(
+                "Unexpected error processing token %d in harmony parser: %s", token_id, e
+            )
+    
     return parser
