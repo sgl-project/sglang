@@ -305,17 +305,23 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         Args:
             q_nope: Query no-position-encoding component [seq_len, num_heads, kv_lora_rank]
+                - expected dtype: torch.bfloat16
             q_rope: Query RoPE component [seq_len, num_heads, qk_rope_head_dim]
+                - expected dtype: torch.bfloat16
             k_nope: Key no-position-encoding component [seq_len, num_heads, kv_lora_rank]
+                - expected dtype: torch.bfloat16
             k_rope: Key RoPE component [seq_len, num_heads, qk_rope_head_dim]
+                - expected dtype: torch.bfloat16
             forward_batch: Forward batch containing position information
             cos_sin_cache: Precomputed cosine/sine cache for RoPE
+                - expected dtype: matches q_/k_ input dtype (torch.bfloat16)
             is_neox: Whether to use NeoX-style RoPE (interleaved) or GPT-style (half rotation)
+
         Returns:
-            tuple: (merged_q_out, k_nope_out, k_rope_out) all quantized to FP8
-                - merged_q_out: Merged query tensor [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim]
-                - k_nope_out: Quantized key nope component
-                - k_rope_out: Quantized key rope component with RoPE applied
+            tuple: (merged_q_out, k_nope_out, k_rope_out) quantized to FP8
+                - merged_q_out: [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim], dtype=torch.float8_e4m3fn
+                - k_nope_out:   [seq_len, num_heads, kv_lora_rank], dtype=torch.float8_e4m3fn
+                - k_rope_out:   [seq_len, num_heads, qk_rope_head_dim], dtype=torch.float8_e4m3fn
         """
         attn_dtype = torch.float8_e4m3fn
         q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
