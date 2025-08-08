@@ -120,6 +120,7 @@ from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
 from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
+from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
@@ -474,6 +475,7 @@ class Scheduler(
         )
         self.init_profier()
 
+        self.recv_skipper = SchedulerRecvSkipper.maybe_create(server_args)
         self.input_blocker = (
             SchedulerInputBlocker(noop=self.attn_tp_rank != 0)
             if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
@@ -946,6 +948,14 @@ class Scheduler(
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+
+        if self.recv_skipper is not None:
+            last_forward_mode = (
+                self.last_batch.forward_mode if self.last_batch is not None else None
+            )
+            if not self.recv_skipper.handle(last_forward_mode):
+                return []
+
         if self.pp_rank == 0:
             if self.attn_tp_rank == 0:
                 recv_reqs = []
