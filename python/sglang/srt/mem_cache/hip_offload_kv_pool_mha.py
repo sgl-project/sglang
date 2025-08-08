@@ -34,8 +34,16 @@ class MHATokenToHiPOffloadKVPool(KVCache):
         chunked_attention_size: int = 0,
         irope_offset: int = 0,
         irope_interval: int = 0,
+        enable_memory_saver: bool = False,
     ):
-        super().__init__()
+        super().__init__(
+            size=max_token_size,
+            page_size=1,
+            dtype=dtype,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+        )
         self.size = max_token_size
         self.dtype = dtype
         self.device = device
