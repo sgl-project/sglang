@@ -1,4 +1,5 @@
 use super::{CircuitBreaker, CircuitBreakerConfig, WorkerError, WorkerResult};
+use crate::metrics::RouterMetrics;
 use async_trait::async_trait;
 use futures;
 use serde_json;
@@ -259,6 +260,7 @@ impl Worker for BasicWorker {
 
     fn set_healthy(&self, healthy: bool) {
         self.healthy.store(healthy, Ordering::Release);
+        RouterMetrics::set_worker_health(self.url(), healthy);
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
