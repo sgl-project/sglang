@@ -43,6 +43,37 @@ DEFAULT_CONFIG = {
     "layer_id": 0,
 }
 
+ROPE_BASE = 10000
+ROPE_SCALING_CONFIG = {
+    "beta_fast": 32,
+    "beta_slow": 1,
+    "factor": 40,
+    "mscale": 1.0,
+    "mscale_all_dim": 1.0,
+    "original_max_position_embeddings": 4096,
+    "type": "yarn",
+    "rope_type": "deepseek_yarn",
+}
+
+
+def build_rotary_emb(config, device=None):
+    from sglang.srt.layers.rotary_embedding import get_rope_wrapper
+
+    dev = device or config["device"]
+    rope_scaling = config.get("rope_scaling", ROPE_SCALING_CONFIG)
+    rotary = get_rope_wrapper(
+        head_size=config["qk_rope_head_dim"],
+        rotary_dim=config["qk_rope_head_dim"],
+        max_position=config["context_len"],
+        base=ROPE_BASE,
+        rope_scaling=rope_scaling,
+        is_neox_style=False,
+        device=dev,
+    )
+    rotary.cos_sin_cache = rotary.cos_sin_cache.to(dev)
+    return rotary
+
+
 # Centralized test cases for different test scenarios
 TEST_CASES = {
     "basic_functionality": [
@@ -69,15 +100,15 @@ TEST_CASES = {
             "page_size": 32,
             "description": "Single FP16 vs reference",
         },
-        # {
-        #     "name": "single_fp8",
-        #     "batch_size": 1,
-        #     "max_seq_len": 64,
-        #     "page_size": 64,
-        #     "kv_cache_dtype": torch.float8_e4m3fn,
-        #     "tolerance": 1e-1,
-        #     "description": "Single FP8 vs reference",
-        # },
+        {
+            "name": "single_fp8",
+            "batch_size": 1,
+            "max_seq_len": 64,
+            "page_size": 64,
+            "tolerance": 1e-1,
+            "kv_cache_dtype": torch.float8_e4m3fn,
+            "description": "Single FP8 vs reference",
+        },
         {
             "name": "batch_fp16",
             "batch_size": 32,
@@ -85,15 +116,15 @@ TEST_CASES = {
             "page_size": 32,
             "description": "Batch FP16 vs reference",
         },
-        # {
-        #     "name": "batch_fp8",
-        #     "batch_size": 32,
-        #     "max_seq_len": 64,
-        #     "page_size": 64,
-        #     "tolerance": 1e-1,
-        #     "kv_cache_dtype": torch.float8_e4m3fn,
-        #     "description": "Batch FP8 vs reference",
-        # },
+        {
+            "name": "batch_fp8",
+            "batch_size": 32,
+            "max_seq_len": 64,
+            "page_size": 64,
+            "tolerance": 1e-1,
+            "kv_cache_dtype": torch.float8_e4m3fn,
+            "description": "Batch FP8 vs reference",
+        },
     ],
     "page_size_consistency": [
         # Only 32 and 64 supported for now in flashinfer TRTLLM-GEN MLA kernel
@@ -311,18 +342,6 @@ class TestTRTLLMMLA(CustomTestCase):
             layer,
         )
 
-    def _create_cos_sin_cache(self, batch_size, config):
-        """Create cosine/sine cache for RoPE operations."""
-        device = config["device"]
-        qk_rope_head_dim = config["qk_rope_head_dim"]
-        
-        # Create a simple cosine/sine cache for testing
-        # In real usage, this would be precomputed based on position embeddings
-        cos_sin_cache = torch.randn(
-            (batch_size, qk_rope_head_dim // 2, 2), dtype=torch.float32, device=device
-        )
-        return cos_sin_cache
-
     def _create_qkv_tensors(self, batch_size, config, dtype_override=None):
         """Create Q, K, V random tensors for given batch size with separate MLA components.
 
@@ -330,7 +349,7 @@ class TestTRTLLMMLA(CustomTestCase):
             batch_size: Batch size.
             config: Configuration dict with model dims and device.
             dtype_override: Optional torch dtype to override config["dtype"].
-            
+
         Returns:
             Tuple of (q_nope, q_rope, k_nope, k_rope, v, cos_sin_cache)
         """
@@ -348,8 +367,8 @@ class TestTRTLLMMLA(CustomTestCase):
             dtype=config["dtype"],
             device=device,
         )
-        
-        # Create separate nope and rope components for K  
+
+        # Create separate nope and rope components for K
         k_nope = torch.randn(
             (batch_size, config["num_kv_heads"], config["kv_lora_rank"]),
             dtype=config["dtype"],
@@ -360,18 +379,15 @@ class TestTRTLLMMLA(CustomTestCase):
             dtype=config["dtype"],
             device=device,
         )
-        
+
         # V tensor (unchanged)
         v = torch.randn(
             (batch_size, config["num_kv_heads"], config["v_head_dim"]),
             dtype=config["dtype"],
             device=device,
         )
-        
-        # Create cosine/sine cache for RoPE
-        cos_sin_cache = self._create_cos_sin_cache(batch_size, config)        
-        
-        return q_nope, q_rope, k_nope, k_rope, v, cos_sin_cache
+
+        return q_nope, q_rope, k_nope, k_rope, v
 
     def _create_forward_batch(
         self, batch_size, seq_lens, backend, model_runner, config
@@ -390,10 +406,10 @@ class TestTRTLLMMLA(CustomTestCase):
         )
         fb.req_to_token_pool = model_runner.req_to_token_pool
         fb.token_to_kv_pool = model_runner.token_to_kv_pool
-        
+
         # Add position information for RoPE
         fb.positions = torch.arange(batch_size, device=config["device"])
-        
+
         return fb
 
     def _populate_kv_cache(self, batch_size, seq_lens, model_runners, layer, config):
@@ -429,24 +445,6 @@ class TestTRTLLMMLA(CustomTestCase):
                         cache_k_nope.squeeze(0),
                         cache_k_rope.squeeze(0),
                     )
-
-    def _apply_rope_to_tensors(self, q_rope, k_rope, positions, config):
-        """Apply RoPE transformation to q_rope and k_rope tensors."""
-        from sglang.srt.layers.rotary_embedding import get_rope_wrapper
-        
-        # Create a rotary embedding instance (similar to DeepseekV2AttentionMLA)
-        rotary_emb = get_rope_wrapper(
-            head_size=config["qk_rope_head_dim"],
-            rotary_dim=config["qk_rope_head_dim"],
-            max_position=config["context_len"],
-            base=10000,  # Default rope_theta
-            is_neox_style=False,  # Same as DeepseekV2
-            device=config["device"],
-        )
-        
-        rotary_emb.cos_sin_cache = rotary_emb.cos_sin_cache.to(config["device"])
-        q_rope_applied, k_rope_applied = rotary_emb(positions, q_rope, k_rope)
-        return q_rope_applied, k_rope_applied
 
     def test_basic_functionality(self):
         """Test basic functionality with minimal setup."""
@@ -494,12 +492,13 @@ class TestTRTLLMMLA(CustomTestCase):
 
                 # Create Q, K, V tensors with separate MLA components
                 torch.manual_seed(config["seed_qkv"])
-                q_nope, q_rope, k_nope, k_rope, v, cos_sin_cache = self._create_qkv_tensors(batch_size, config)
+                q_nope, q_rope, k_nope, k_rope, v = self._create_qkv_tensors(
+                    batch_size, config
+                )
 
                 # Run forward decode with separate MLA components
                 output = trtllm_backend.forward_decode(
-                    q_nope, k_nope, v, layer, fb, 
-                    q_rope=q_rope, k_rope=k_rope, cos_sin_cache=cos_sin_cache
+                    q_nope, k_nope, v, layer, fb, q_rope=q_rope, k_rope=k_rope
                 )
 
                 # Basic checks
@@ -523,7 +522,7 @@ class TestTRTLLMMLA(CustomTestCase):
                 config = self._merge_config(test_case)
                 batch_size = config["batch_size"]
                 max_seq_len = config["max_seq_len"]
-                use_fp8 = (config["kv_cache_dtype"] == torch.float8_e4m3fn)
+                use_fp8 = config["kv_cache_dtype"] == torch.float8_e4m3fn
 
                 # Create components
                 (
@@ -573,29 +572,61 @@ class TestTRTLLMMLA(CustomTestCase):
                 # Create Q, K, V tensors for current decode step
                 torch.manual_seed(config["seed_qkv"])
 
-                q_nope_ref, q_rope_ref, k_nope_ref, k_rope_ref, v_ref, cos_sin_cache = self._create_qkv_tensors(batch_size, config)
-                q_nope_trt, q_rope_trt, k_nope_trt, k_rope_trt, v_trt = q_nope_ref.clone(), q_rope_ref.clone(), k_nope_ref.clone(), k_rope_ref.clone(), v_ref.clone()
+                q_nope_ref, q_rope_ref, k_nope_ref, k_rope_ref, v_ref = (
+                    self._create_qkv_tensors(batch_size, config)
+                )
+                q_nope_trt, q_rope_trt, k_nope_trt, k_rope_trt, v_trt = (
+                    q_nope_ref.clone(),
+                    q_rope_ref.clone(),
+                    k_nope_ref.clone(),
+                    k_rope_ref.clone(),
+                    v_ref.clone(),
+                )
                 tolerance = config["tolerance"]
-                
-                if use_fp8:
-                    # apply rope to q_rope_ref and k_rope_ref
-                    q_rope_ref, k_rope_ref = self._apply_rope_to_tensors(q_rope_ref, k_rope_ref, fb_reference.positions, config)
-                    # tolerance = test_case.get("tolerance", 5e-2)
- 
 
-                print("reference_backend ", reference_backend.data_type)
-                print("trtllm_backend ", trtllm_backend.data_type)
-                
+                extra_args = {}
+                if use_fp8:
+                    # TRT kernel applies RoPE + FP8 quantization internally
+                    # pre-apply RoPE on the reference (FlashInfer) path here so
+                    # both paths share the same rope params/cache while keeping
+                    # the TRT path unrotated.
+                    rotary_emb = build_rotary_emb(config)
+                    q_rope_ref, k_rope_ref = rotary_emb(
+                        fb_reference.positions, q_rope_ref, k_rope_ref
+                    )
+                    extra_args = {
+                        "cos_sin_cache": rotary_emb.cos_sin_cache,
+                        "is_neox": rotary_emb.is_neox_style,
+                    }
+
+                    dtype = q_rope_ref.dtype
+                    q_rope_ref = q_rope_ref.to(torch.float8_e4m3fn).to(dtype)
+                    q_nope_ref = q_nope_ref.to(torch.float8_e4m3fn).to(dtype)
+                    k_rope_ref = k_rope_ref.to(torch.float8_e4m3fn).to(dtype)
+                    k_nope_ref = k_nope_ref.to(torch.float8_e4m3fn).to(dtype)
+                    # v_ref = v_ref.to(torch.float8_e4m3fn).to(dtype)
+
                 # Run forward decode on both backends
                 out_trtllm = trtllm_backend.forward_decode(
-                    q_nope_trt, k_nope_trt, v_trt, layer, fb_trtllm,
-                    q_rope=q_rope_trt, k_rope=k_rope_trt, cos_sin_cache=cos_sin_cache
+                    q_nope_trt,
+                    k_nope_trt,
+                    v_trt,
+                    layer,
+                    fb_trtllm,
+                    q_rope=q_rope_trt,
+                    k_rope=k_rope_trt,
+                    **extra_args,
                 )
 
                 # Reference backend should also take separate components, not concatenated
                 out_reference = reference_backend.forward_decode(
-                    q_nope_ref, k_nope_ref, v_ref, layer, fb_reference,
-                    q_rope=q_rope_ref, k_rope=k_rope_ref
+                    q_nope_ref,
+                    k_nope_ref,
+                    v_ref,
+                    layer,
+                    fb_reference,
+                    q_rope=q_rope_ref,
+                    k_rope=k_rope_ref,
                 )
 
                 # Compare outputs
@@ -647,12 +678,13 @@ class TestTRTLLMMLA(CustomTestCase):
 
                 # Create Q, K, V tensors with separate MLA components
                 torch.manual_seed(config["seed_qkv"])
-                q_nope, q_rope, k_nope, k_rope, v, cos_sin_cache = self._create_qkv_tensors(batch_size, config)
+                q_nope, q_rope, k_nope, k_rope, v = self._create_qkv_tensors(
+                    batch_size, config
+                )
 
                 # Run forward decode with separate MLA components
                 output = backend.forward_decode(
-                    q_nope, k_nope, v, layer, fb,
-                    q_rope=q_rope, k_rope=k_rope, cos_sin_cache=cos_sin_cache
+                    q_nope, k_nope, v, layer, fb, q_rope=q_rope, k_rope=k_rope
                 )
 
                 expected_shape = (
@@ -708,7 +740,11 @@ class TestTRTLLMMLA(CustomTestCase):
                     device=config["device"],
                 )
                 q_rope = torch.randn(
-                    (batch_size, config["num_attention_heads"], config["qk_rope_head_dim"]),
+                    (
+                        batch_size,
+                        config["num_attention_heads"],
+                        config["qk_rope_head_dim"],
+                    ),
                     dtype=config["dtype"],
                     device=config["device"],
                 )
@@ -718,12 +754,10 @@ class TestTRTLLMMLA(CustomTestCase):
                     device=config["device"],
                 )
                 v = None  # Test with None v
-                cos_sin_cache = self._create_cos_sin_cache(batch_size, config)
 
                 # Run forward decode
                 output = backend.forward_decode(
-                    q_nope, k_nope, v, layer, fb,
-                    q_rope=q_rope, k_rope=k_rope, cos_sin_cache=cos_sin_cache
+                    q_nope, k_nope, v, layer, fb, q_rope=q_rope, k_rope=k_rope
                 )
 
                 # Shape and sanity checks

@@ -1275,10 +1275,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_nope_out = q_nope_out.transpose(0, 1)
 
         if not (
-            self.current_attention_backend == "trtllm_mla" and 
-            forward_batch.forward_mode.is_decode_or_idle() and 
-            forward_batch.attn_backend.data_type == torch.float8_e4m3fn
-            ):
+            self.current_attention_backend == "trtllm_mla"
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
+        ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
@@ -1294,13 +1294,22 @@ class DeepseekV2AttentionMLA(nn.Module):
         ):
             extra_args = {}
             if (
-                self.current_attention_backend == "trtllm_mla" and 
-                forward_batch.forward_mode.is_decode_or_idle() and 
-                forward_batch.attn_backend.data_type == torch.float8_e4m3fn
+                self.current_attention_backend == "trtllm_mla"
+                and forward_batch.forward_mode.is_decode_or_idle()
+                and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
             ):
-                extra_args = {"cos_sin_cache": self.rotary_emb.cos_sin_cache}
+                extra_args = {
+                    "cos_sin_cache": self.rotary_emb.cos_sin_cache,
+                    "is_neox": self.rotary_emb.is_neox_style,
+                }
             attn_output = self.attn_mqa(
-                q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe, **extra_args
+                q_nope_out,
+                k_nope,
+                k_nope,
+                forward_batch,
+                q_rope=q_pe,
+                k_rope=k_pe,
+                **extra_args,
             )
         else:
             q = torch.cat([q_nope_out, q_pe], dim=-1)
@@ -1765,6 +1774,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
+
 
 class DeepseekV2DecoderLayer(nn.Module):
 

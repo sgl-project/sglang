@@ -288,28 +288,29 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         forward_batch.decode_trtllm_mla_metadata = self.forward_metadata
 
     def quantize_and_rope_for_fp8(
-        self, 
-        q_nope: torch.Tensor, 
-        q_rope: torch.Tensor, 
-        k_nope: torch.Tensor, 
-        k_rope: torch.Tensor, 
-        forward_batch: ForwardBatch, 
-        cos_sin_cache: torch.Tensor
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        forward_batch: ForwardBatch,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Quantize and apply RoPE for FP8 attention path.
-        
+
         This function handles the FP8 quantization and RoPE application for MLA attention.
         It takes separate query/key nope and rope components, applies RoPE to the rope parts,
         quantizes all components to FP8, and merges the query components into a single tensor.
-        
+
         Args:
             q_nope: Query no-position-encoding component [seq_len, num_heads, kv_lora_rank]
-            q_rope: Query RoPE component [seq_len, num_heads, qk_rope_head_dim]  
+            q_rope: Query RoPE component [seq_len, num_heads, qk_rope_head_dim]
             k_nope: Key no-position-encoding component [seq_len, num_heads, kv_lora_rank]
             k_rope: Key RoPE component [seq_len, num_heads, qk_rope_head_dim]
             forward_batch: Forward batch containing position information
             cos_sin_cache: Precomputed cosine/sine cache for RoPE
-            
+            is_neox: Whether to use NeoX-style RoPE (interleaved) or GPT-style (half rotation)
         Returns:
             tuple: (merged_q_out, k_nope_out, k_rope_out) all quantized to FP8
                 - merged_q_out: Merged query tensor [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim]
@@ -318,7 +319,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """
         attn_dtype = torch.float8_e4m3fn
         q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
-        
+
         # Allocate output tensors with FP8 dtype
         # Query output will contain merged nope + rope components
         q_out = q_rope.new_empty(
@@ -344,7 +345,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             k_nope=k_nope,
             cos_sin_cache=cos_sin_cache,
             pos_ids=forward_batch.positions,
-            is_neox=False,  # Use standard RoPE (not NeoX variant)
+            is_neox=is_neox,
             quantize_dtype=attn_dtype,
             # Output tensor slicing: q_out contains [nope_part, rope_part]
             q_rope_out=q_out[..., self.kv_lora_rank :],  # RoPE part goes to end
@@ -360,41 +361,54 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def forward_decode(
         self,
-        q: torch.Tensor, # q_nope
-        k: torch.Tensor, # k_nope
-        v: torch.Tensor, # not used in this backend
+        q: torch.Tensor,  # q_nope
+        k: torch.Tensor,  # k_nope
+        v: torch.Tensor,  # not used in this backend
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         cos_sin_cache: Optional[torch.Tensor] = None,
+        is_neox: Optional[bool] = False,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MLA kernel."""
-        merge_query = (q_rope is not None)
+        merge_query = q_rope is not None
         if self.data_type == torch.float8_e4m3fn:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
-            assert all(x is not None for x in [q_rope, k_rope, cos_sin_cache])
-            q, k, k_rope = self.quantize_and_rope_for_fp8(q, q_rope, k.squeeze(1), k_rope.squeeze(1), forward_batch, cos_sin_cache)
+            assert all(
+                x is not None for x in [q_rope, k_rope, cos_sin_cache]
+            ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
+            q, k, k_rope = self.quantize_and_rope_for_fp8(
+                q,
+                q_rope,
+                k.squeeze(1),
+                k_rope.squeeze(1),
+                forward_batch,
+                cos_sin_cache,
+                is_neox,
+            )
             merge_query = False
-        
+
         # Save KV cache if requested
         if save_kv_cache:
-            assert k is not None and k_rope is not None
+            assert (
+                k is not None and k_rope is not None
+            ), "For populating trtllm_mla both k_nope and k_rope should be not None."
             forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
 
         # Prepare query tensor inline
-        if merge_query: 
+        if merge_query:
             # For FP16 path, we merge the query and rope parts into a single tensor
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
             query = torch.cat([q_nope, q_rope_reshaped], dim=-1)
-        else: 
+        else:
             # For FP8 path, we already have the query and rope parts merged because of the quantize_and_rope_for_fp8 function
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
