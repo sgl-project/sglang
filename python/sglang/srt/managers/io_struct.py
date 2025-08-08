@@ -126,6 +126,9 @@ class GenerateReqInput:
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+    # For background responses (OpenAI responses API)
+    background: bool = False
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -559,6 +562,9 @@ class EmbeddingReqInput:
     modalities: Optional[List[str]] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
+
+    # For background responses (OpenAI responses API)
+    background: bool = False
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -1076,6 +1082,8 @@ class LoadLoRAAdapterReqInput:
     lora_name: str
     # The path of loading.
     lora_path: str
+    # Whether to pin the LoRA adapter in memory.
+    pinned: bool = False
     # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
     lora_id: Optional[str] = None
 
@@ -1084,6 +1092,7 @@ class LoadLoRAAdapterReqInput:
             lora_id=self.lora_id,
             lora_name=self.lora_name,
             lora_path=self.lora_path,
+            pinned=self.pinned,
         )
 
 

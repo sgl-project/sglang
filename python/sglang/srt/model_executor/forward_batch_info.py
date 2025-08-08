@@ -180,6 +180,9 @@ class ForwardBatch:
     # The sum of all sequence lengths
     seq_lens_sum: int
 
+    # The original sequence length without being chunked. Qwen-1M related.
+    orig_seq_lens: Optional[torch.Tensor] = None
+
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
 
@@ -321,6 +324,7 @@ class ForwardBatch:
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
+            orig_seq_lens=batch.orig_seq_lens,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
@@ -420,16 +424,12 @@ class ForwardBatch:
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
-            if support_triton(model_runner.server_args.attention_backend):
-                positions, ret.extend_start_loc = compute_position_triton(
-                    ret.extend_prefix_lens,
-                    ret.extend_seq_lens,
-                    ret.extend_num_tokens,
-                )
-            else:
-                positions, ret.extend_start_loc = compute_position_torch(
-                    ret.extend_prefix_lens, ret.extend_seq_lens
-                )
+            positions, ret.extend_start_loc = compute_position(
+                model_runner.server_args.attention_backend,
+                ret.extend_prefix_lens,
+                ret.extend_seq_lens,
+                ret.extend_num_tokens,
+            )
             if ret.positions is None:
                 ret.positions = positions
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
@@ -632,8 +632,10 @@ class ForwardBatch:
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
-            # when DP gather mode is all gather, we will use all_gather_into_tensor to gather hidden states,
-            # where transferred tokens should be padded to the same length.
+            # when DP gather mode is all gather, we will use
+            # all_gather_into_tensor to gather hidden states, where transferred
+            # tokens should be padded to the same length. We will also use
+            # reduce-scatter instead of all-reduce after MLP.
             max_num_tokens = max(global_num_tokens)
             global_num_tokens = [max_num_tokens] * sync_group_size
             buffer_len = max_num_tokens * sync_group_size
@@ -880,6 +882,25 @@ class PPProxyTensors:
 
     def __repr__(self) -> str:
         return f"PPProxyTensors(tensors={self.tensors})"
+
+
+def compute_position(
+    attn_backend: str,
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_seq_lens_sum: int,
+):
+    if support_triton(attn_backend):
+        positions, extend_start_loc = compute_position_triton(
+            extend_prefix_lens,
+            extend_seq_lens,
+            extend_seq_lens_sum,
+        )
+    else:
+        positions, extend_start_loc = compute_position_torch(
+            extend_prefix_lens, extend_seq_lens
+        )
+    return positions, extend_start_loc
 
 
 def compute_position_triton(
