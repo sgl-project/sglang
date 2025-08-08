@@ -1186,10 +1186,19 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    port_args = PortArgs.init_new(server_args)
-    tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
-        server_args=server_args, port_args=port_args
-    )
+    if server_args.tokenizer_worker_num > 1:
+        port_args = PortArgs.init_new(server_args)
+        port_args.tokenizer_worker_ipc_name = (
+            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        )
+        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
+            server_args=server_args, port_args=port_args
+        )
+    else:
+        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
+            server_args=server_args,
+        )
+
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
@@ -1197,6 +1206,7 @@ def launch_server(
             scheduler_info=scheduler_info,
         )
     )
+
     if server_args.tokenizer_worker_num > 1:
         # Set environment variables for middlewares in main process
         if server_args.api_key:
