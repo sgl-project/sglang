@@ -630,7 +630,7 @@ class HiCacheController:
                     continue
 
                 storage_hit_count = 0
-                if self.prefetch_rate_limit_check():
+                if self.prefetch_rate_limit_check() or operation.host_indices is None:
                     last_hash = operation.last_hash
                     tokens_to_fetch = operation.token_ids
 
@@ -674,7 +674,8 @@ class HiCacheController:
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
-                    self.mem_pool_host.free(operation.host_indices)
+                    if operation.host_indices is not None:
+                        self.mem_pool_host.free(operation.host_indices)
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
