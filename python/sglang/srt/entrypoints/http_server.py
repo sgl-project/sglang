@@ -576,7 +576,7 @@ async def update_weights_from_distributed(
 
 @app.post("/convert_pd_role")
 async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
-    """Update model parameter from distributed online."""
+    """Convert the role of the current PD server."""
     success, message, bootstrap_port = (
         await _global_state.tokenizer_manager.convert_pd_role(obj)
     )

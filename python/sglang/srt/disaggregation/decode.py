@@ -708,9 +708,10 @@ class SchedulerDisaggregationDecodeMixin:
 
             self.last_batch = batch
         
-        # Flush the disaggregation resources
-        self.flush_decode_resources()
-        del self.stop_decode_event
+        if self.server_args.enable_pd_convert:
+            # Flush the disaggregation resources
+            self.flush_decode_resources()
+            del self.stop_decode_event
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
@@ -788,12 +789,13 @@ class SchedulerDisaggregationDecodeMixin:
             self.last_batch_in_queue = last_batch_in_queue
         
         # Flush the disaggregation resources
-        if "tmp_batch" in locals():
-            del tmp_batch
-        if "tmp_result" in locals():
-            del tmp_result
-        self.flush_decode_resources()
-        del self.stop_decode_event
+        if self.server_args.enable_pd_convert:
+            if "tmp_batch" in locals():
+                del tmp_batch
+            if "tmp_result" in locals():
+                del tmp_result
+            self.flush_decode_resources()
+            del self.stop_decode_event
 
     def _prepare_idle_batch_and_run(self: Scheduler, batch, delay_process=False):
         batch = self.prepare_mlp_sync_batch(batch)

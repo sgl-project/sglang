@@ -1263,6 +1263,9 @@ class TokenizerManager:
         return [res.internal_state for res in responses]
 
     async def convert_pd_role(self, obj:ConvertDisaggregationRoleReqInput) -> Tuple[bool, str]:
+        if not self.server_args.enable_pd_convert:
+            return False, "PD role conversion is not enabled.", None
+
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # start a bootstarp server first
             kv_bootstrap_server_class = get_kv_class(

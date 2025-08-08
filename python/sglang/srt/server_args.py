@@ -264,6 +264,7 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
+    enable_pd_convert: bool = False
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
@@ -1840,6 +1841,11 @@ class ServerArgs:
             default=None,
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
+        parser.add_argument(
+            "--enable-pd-convert",
+            action="store_true",
+            help="Enable convert pd role when server is running (for disaggregation only).",
+        )
 
         # Custom weight loader
         parser.add_argument(
@@ -1955,6 +1961,11 @@ class ServerArgs:
         assert (
             self.chunked_prefill_size % self.page_size == 0
         ), "chunked_prefill_size must be divisible by page_size"
+        
+        # check pd disaggregation args
+        assert (
+            (self.enable_pd_convert and self.disaggregation_mode != "null") or self.disaggregation_mode == "null"
+        ), "enable_pd_convert should be set only when disaggregation_mode is not null"
 
     def check_lora_server_args(self):
         assert (

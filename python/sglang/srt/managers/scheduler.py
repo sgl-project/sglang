@@ -2548,6 +2548,27 @@ def is_health_check_generate_req(recv_req):
 def is_work_request(recv_req):
     return isinstance(recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
 
+def start_scheduler_event_loop(scheduler: Scheduler,server_args: ServerArgs):
+    disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
+
+    if disaggregation_mode == DisaggregationMode.NULL:
+        if server_args.pp_size > 1:
+            scheduler.event_loop_pp()
+        elif scheduler.enable_overlap:
+            scheduler.event_loop_overlap()
+        else:
+            scheduler.event_loop_normal()
+    elif disaggregation_mode == DisaggregationMode.PREFILL:
+        if scheduler.enable_overlap:
+            scheduler.event_loop_overlap_disagg_prefill()
+        else:
+            scheduler.event_loop_normal_disagg_prefill()
+
+    elif disaggregation_mode == DisaggregationMode.DECODE:
+        if scheduler.enable_overlap:
+            scheduler.event_loop_overlap_disagg_decode()
+        else:
+            scheduler.event_loop_normal_disagg_decode()
 
 def run_scheduler_process(
     server_args: ServerArgs,
@@ -2608,27 +2629,12 @@ def run_scheduler_process(
                 "max_req_input_len": scheduler.max_req_input_len,
             }
         )
-        while True:
-            disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
-
-            if disaggregation_mode == DisaggregationMode.NULL:
-                if server_args.pp_size > 1:
-                    scheduler.event_loop_pp()
-                elif scheduler.enable_overlap:
-                    scheduler.event_loop_overlap()
-                else:
-                    scheduler.event_loop_normal()
-            elif disaggregation_mode == DisaggregationMode.PREFILL:
-                if scheduler.enable_overlap:
-                    scheduler.event_loop_overlap_disagg_prefill()
-                else:
-                    scheduler.event_loop_normal_disagg_prefill()
-
-            elif disaggregation_mode == DisaggregationMode.DECODE:
-                if scheduler.enable_overlap:
-                    scheduler.event_loop_overlap_disagg_decode()
-                else:
-                    scheduler.event_loop_normal_disagg_decode()
+        if server_args.enable_pd_convert:
+            start_scheduler_event_loop(scheduler,server_args)
+        else:
+            while True:
+                start_scheduler_event_loop(scheduler,server_args)
+            
 
     except Exception:
         traceback = get_exception_traceback()
