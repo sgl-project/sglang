@@ -311,7 +311,13 @@ class TestGLM41VServer(TestOpenAIVisionServer):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--trust-remote-code", "--mem-fraction-static", "0.68"],
+            other_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.68",
+                "--cuda-graph-max-bs",
+                "4",
+            ],
         )
         cls.base_url += "/v1"
 

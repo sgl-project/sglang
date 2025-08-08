@@ -1195,8 +1195,6 @@ class MRotaryEmbedding(RotaryEmbedding):
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Get mrope input positions and delta value for GLM4V."""
-        # device = input_ids.device
-        # input_ids = input_ids.tolist()
         image_token_id = hf_config.image_token_id
         video_start_token_id = hf_config.video_start_token_id
         video_end_token_id = hf_config.video_end_token_id

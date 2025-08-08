@@ -89,7 +89,6 @@ class Glm4vVisionBlock(Qwen2_5_VisionBlock):
             num_heads=config.num_heads,
             hidden_act=config.hidden_act,
             norm_layer=norm_layer,
-            attn_implementation="sdpa",
             quant_config=quant_config,
             prefix=prefix,
         )
