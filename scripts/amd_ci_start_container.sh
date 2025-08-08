@@ -27,9 +27,7 @@ fi
 
 echo "Using SGLang version: $SGLANG_VERSION"
 
-# Default base tags (can be overridden by command line arguments)
-DEFAULT_MI30X_BASE_TAG="v0.4.10.post2-rocm630-mi30x"
-DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-rocm700-mi35x"
+ 
 
 # Parse command line arguments
 MI30X_BASE_TAG="$DEFAULT_MI30X_BASE_TAG"
