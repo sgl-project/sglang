@@ -1,8 +1,8 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
 use super::pd_types::{api_path, PDRouterError};
-use crate::config::types::RetryConfig;
-use crate::core::{HealthChecker, Worker, WorkerFactory, WorkerLoadGuard};
+use crate::config::types::{CircuitBreakerConfig as ConfigCircuitBreakerConfig, RetryConfig};
+use crate::core::{CircuitBreakerConfig, HealthChecker, Worker, WorkerFactory, WorkerLoadGuard};
 use crate::metrics::RouterMetrics;
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::policies::LoadBalancingPolicy;
@@ -41,6 +41,7 @@ pub struct PDRouter {
     // Dedicated client for prefill fire-and-forget (non-logprob) requests
     pub prefill_client: Client,
     pub retry_config: RetryConfig,
+    pub circuit_breaker_config: CircuitBreakerConfig,
     _prefill_health_checker: Option<HealthChecker>,
     _decode_health_checker: Option<HealthChecker>,
 }
@@ -68,8 +69,12 @@ impl PDRouter {
         // Wait for the new server to be healthy
         self.wait_for_server_health(&url).await?;
 
-        // Create Worker for the new prefill server
-        let worker = WorkerFactory::create_prefill(url.clone(), bootstrap_port);
+        // Create Worker for the new prefill server with circuit breaker configuration
+        let worker = WorkerFactory::create_prefill_with_config(
+            url.clone(),
+            bootstrap_port,
+            self.circuit_breaker_config.clone(),
+        );
 
         // Add to prefill workers list
         let mut workers = self
@@ -99,8 +104,11 @@ impl PDRouter {
         // Wait for the new server to be healthy
         self.wait_for_server_health(&url).await?;
 
-        // Create Worker for the new decode server
-        let worker = WorkerFactory::create_decode(url.clone());
+        // Create Worker for the new decode server with circuit breaker configuration
+        let worker = WorkerFactory::create_decode_with_config(
+            url.clone(),
+            self.circuit_breaker_config.clone(),
+        );
 
         // Add to decode workers list
         let mut workers = self
@@ -189,16 +197,31 @@ impl PDRouter {
         timeout_secs: u64,
         interval_secs: u64,
         retry_config: RetryConfig,
+        circuit_breaker_config: ConfigCircuitBreakerConfig,
     ) -> Result<Self, String> {
+        // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
+        let core_cb_config = CircuitBreakerConfig {
+            failure_threshold: circuit_breaker_config.failure_threshold,
+            success_threshold: circuit_breaker_config.success_threshold,
+            timeout_duration: std::time::Duration::from_secs(
+                circuit_breaker_config.timeout_duration_secs,
+            ),
+            window_duration: std::time::Duration::from_secs(
+                circuit_breaker_config.window_duration_secs,
+            ),
+        };
+
         // Convert URLs to Worker trait objects
         let prefill_workers: Vec<Box<dyn Worker>> = prefill_urls
             .into_iter()
-            .map(|(url, port)| WorkerFactory::create_prefill(url, port))
+            .map(|(url, port)| {
+                WorkerFactory::create_prefill_with_config(url, port, core_cb_config.clone())
+            })
             .collect();
 
         let decode_workers: Vec<Box<dyn Worker>> = decode_urls
             .into_iter()
-            .map(WorkerFactory::create_decode)
+            .map(|url| WorkerFactory::create_decode_with_config(url, core_cb_config.clone()))
             .collect();
 
         // Wait for PD workers to be healthy (skip if empty - for service discovery mode)
@@ -280,6 +303,7 @@ impl PDRouter {
             client,
             prefill_client,
             retry_config,
+            circuit_breaker_config: core_cb_config,
             _prefill_health_checker: Some(prefill_health_checker),
             _decode_health_checker: Some(decode_health_checker),
         })
@@ -1848,6 +1872,7 @@ mod tests {
             client: Client::new(),
             prefill_client: Client::new(),
             retry_config: RetryConfig::default(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
             _prefill_health_checker: None,
             _decode_health_checker: None,
         }

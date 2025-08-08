@@ -1,5 +1,5 @@
-use crate::config::types::RetryConfig;
-use crate::core::{HealthChecker, Worker, WorkerFactory};
+use crate::config::types::{CircuitBreakerConfig as ConfigCircuitBreakerConfig, RetryConfig};
+use crate::core::{CircuitBreakerConfig, HealthChecker, Worker, WorkerFactory};
 use crate::metrics::RouterMetrics;
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::policies::LoadBalancingPolicy;
@@ -42,6 +42,7 @@ pub struct Router {
     dp_aware: bool,
     api_key: Option<String>,
     retry_config: RetryConfig,
+    circuit_breaker_config: CircuitBreakerConfig,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     _health_checker: Option<HealthChecker>,
@@ -58,6 +59,7 @@ impl Router {
         dp_aware: bool,
         api_key: Option<String>,
         retry_config: RetryConfig,
+        circuit_breaker_config: ConfigCircuitBreakerConfig,
     ) -> Result<Self, String> {
         // Update active workers gauge
         RouterMetrics::set_active_workers(worker_urls.len());
@@ -75,10 +77,24 @@ impl Router {
             worker_urls
         };
 
+        // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
+        let core_cb_config = CircuitBreakerConfig {
+            failure_threshold: circuit_breaker_config.failure_threshold,
+            success_threshold: circuit_breaker_config.success_threshold,
+            timeout_duration: std::time::Duration::from_secs(
+                circuit_breaker_config.timeout_duration_secs,
+            ),
+            window_duration: std::time::Duration::from_secs(
+                circuit_breaker_config.window_duration_secs,
+            ),
+        };
+
         // Create Worker trait objects from URLs
         let workers: Vec<Box<dyn Worker>> = worker_urls
             .iter()
-            .map(|url| WorkerFactory::create_regular(url.clone()))
+            .map(|url| {
+                WorkerFactory::create_regular_with_config(url.clone(), core_cb_config.clone())
+            })
             .collect();
 
         // Initialize policy with workers if needed (e.g., for cache-aware)
@@ -125,6 +141,7 @@ impl Router {
             dp_aware,
             api_key,
             retry_config,
+            circuit_breaker_config: core_cb_config,
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
             _health_checker: Some(health_checker),
@@ -752,7 +769,10 @@ impl Router {
                                     continue;
                                 }
                                 info!("Added worker: {}", dp_url);
-                                let new_worker = WorkerFactory::create_regular(dp_url.to_string());
+                                let new_worker = WorkerFactory::create_regular_with_config(
+                                    dp_url.to_string(),
+                                    self.circuit_breaker_config.clone(),
+                                );
                                 workers_guard.push(new_worker);
                                 worker_added = true;
                             }
@@ -764,7 +784,10 @@ impl Router {
                                 return Err(format!("Worker {} already exists", worker_url));
                             }
                             info!("Added worker: {}", worker_url);
-                            let new_worker = WorkerFactory::create_regular(worker_url.to_string());
+                            let new_worker = WorkerFactory::create_regular_with_config(
+                                worker_url.to_string(),
+                                self.circuit_breaker_config.clone(),
+                            );
                             workers_guard.push(new_worker);
                         }
 
@@ -1223,6 +1246,7 @@ mod tests {
             api_key: None,
             client: Client::new(),
             retry_config: RetryConfig::default(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             _health_checker: None,
