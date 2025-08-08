@@ -950,7 +950,9 @@ class Scheduler(
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
 
         if self.recv_skipper is not None:
-            last_forward_mode = self.last_batch.forward_mode if self.last_batch is not None else None
+            last_forward_mode = (
+                self.last_batch.forward_mode if self.last_batch is not None else None
+            )
             if not self.recv_skipper.handle(last_forward_mode):
                 return []
 
