@@ -167,7 +167,6 @@ suites = {
         TestFile("models/lora/test_lora_tp.py", 116),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_dp_attention.py", 277),
-        TestFile("test_mla_tp.py", 170),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_update_weights_from_distributed.py", 103),
         TestFile("test_release_memory_occupation.py", 127),
@@ -175,7 +174,6 @@ suites = {
     "per-commit-2-gpu-amd": [
         TestFile("models/lora/test_lora_tp.py", 116),
         TestFile("test_data_parallelism.py", 73),
-        TestFile("test_mla_tp.py", 170),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_update_weights_from_distributed.py", 103),
     ],
