@@ -946,6 +946,17 @@ class Scheduler(
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+
+        ####################################
+        if not hasattr(self, "recv_requests_count"):
+            self.recv_requests_count = 0
+        self.recv_requests_count += 1
+
+        interval = 50
+        if self.recv_requests_count % interval != 0:
+            return []
+        ####################################
+
         if self.pp_rank == 0:
             if self.attn_tp_rank == 0:
                 recv_reqs = []
