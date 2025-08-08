@@ -54,8 +54,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
-from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 from sglang.srt.models.llama import LlamaConfig, LlamaForCausalLM
+from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 from sglang.srt.utils import add_prefix, flatten_nested_list
 
 RawImageType = Union[Image.Image, torch.Tensor]
@@ -773,6 +773,7 @@ class MiniCPMV2_6(MiniCPMBaseModel):
         pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
 
         return pattern.pad_input_tokens(input_ids, image_inputs)
+
 
 class MiniCPMV4_0(MiniCPMBaseModel):
     packed_modules_mapping = {

@@ -165,7 +165,7 @@ class TestMinicpmv2_6Server(TestOpenAIVisionServer):
 class TestMinicpmv4Server(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
-        cls.model = "openbmb/MiniCPM-V-4.0"
+        cls.model = "openbmb/MiniCPM-V-4"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
