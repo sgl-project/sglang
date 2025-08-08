@@ -34,6 +34,6 @@ exclude = [
 cmake.build-type = "Release"
 minimum-version = "build-system.requires"
 
-wheel.py-api = "cp39"
+wheel.py-api = "cp310"
 wheel.license-files = []
 wheel.packages = ["python/sgl_kernel"]
