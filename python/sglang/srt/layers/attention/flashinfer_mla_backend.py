@@ -41,8 +41,6 @@ if is_flashinfer_available():
         BatchMLAPagedAttentionWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
     )
-# import logging
-# logger = logging.getLogger(__name__)
 
 @dataclass
 class DecodeMetadata:
@@ -75,10 +73,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
         self.page_size = model_runner.page_size
-        self.kv_cache_dim = (
-            model_runner.model_config.kv_lora_rank 
-            + model_runner.model_config.qk_rope_head_dim
-        )
+      
         # Allocate buffers
         global global_workspace_buffer
         if global_workspace_buffer is None:
