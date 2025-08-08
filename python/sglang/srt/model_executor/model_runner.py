@@ -500,6 +500,13 @@ class ModelRunner:
             if self.model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
 
+        # set default max_running_requests if context_len is large
+        if self.model_config.context_len > 800000:
+            server_args.max_running_requests = 64
+            logger.warning(
+                f"Automatically set --max-running-requests to {server_args.max_running_requests} if --context-length > 800K."
+            )
+
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
 
@@ -952,7 +959,9 @@ class ModelRunner:
 
         return result
 
-    def profile_max_num_token(self, total_gpu_memory: int):
+    def profile_max_num_token(
+        self, total_gpu_memory: int, max_num_reqs: Optional[int] = None
+    ):
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -986,7 +995,16 @@ class ModelRunner:
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
-        max_num_token = int(rest_memory * (1 << 30) // cell_size)
+        if max_num_reqs is None:
+            max_num_reqs = 4096
+        rest_memory_reqtotokenpool = (
+            torch._utils._element_size(torch.int32)
+            * (max_num_reqs + 1)
+            * (self.model_config.context_len + 4)
+        )
+        max_num_token = int(
+            (rest_memory * (1 << 30) - rest_memory_reqtotokenpool) // cell_size
+        )
         return max_num_token
 
     def set_num_token_hybrid(self):
@@ -1094,7 +1112,9 @@ class ModelRunner:
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
 
-        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        self.max_total_num_tokens = self.profile_max_num_token(
+            total_gpu_memory, max_num_reqs
+        )
 
         if max_num_reqs is None:
             max_num_reqs = min(
