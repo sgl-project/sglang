@@ -517,7 +517,30 @@ class OpenAIServingChat(OpenAIServingBase):
 
                     new_token_ids = content["output_ids"]
                     for token_id in new_token_ids:
-                        harmony_parser.process(token_id)
+                        try:
+                            harmony_parser.process(token_id)
+                        except Exception as e:
+                            # Log the error with detailed information
+                            logger.warning(
+                                f"Harmony parser error for token {token_id} at index {index}: {e}. "
+                                f"Parser state - current_channel: {getattr(harmony_parser, 'current_channel', 'unknown')}, "
+                                f"current_role: {getattr(harmony_parser, 'current_role', 'unknown')}"
+                            )
+                            
+                            # Handle specific harmony errors
+                            if "Unexpected token" in str(e) and "while expecting start token" in str(e):
+                                logger.info(f"Reinitializing harmony parser for index {index} due to token sequence error")
+                                # Reset parser state and try to continue
+                                harmony_parsers[index] = get_streamable_parser_for_assistant()
+                                try:
+                                    harmony_parsers[index].process(token_id)
+                                except Exception as retry_e:
+                                    logger.error(f"Failed to process token {token_id} even after parser reset: {retry_e}")
+                                    # Skip this token and continue
+                                    continue
+                            else:
+                                # For other errors, skip the token but don't reset parser
+                                continue                            
 
                     is_final = harmony_parser.current_channel == "final"
                     is_analysis = harmony_parser.current_channel == "analysis"
