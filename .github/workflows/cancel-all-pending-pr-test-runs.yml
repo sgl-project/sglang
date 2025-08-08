@@ -1,4 +1,4 @@
-name: Cancel Pending PR Test Runs
+name: Cancel All Pending PR Test Runs
 
 on:
   workflow_dispatch: # Manual trigger
