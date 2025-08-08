@@ -1,3 +1,4 @@
+#include <ATen/Dispatch.h>
 #include <ATen/core/TensorBody.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/Exception.h>
@@ -23,7 +24,6 @@ __global__ void store_kv_cache_256x1(
     const size_t kv_cache_stride,
     const size_t kv_input_stride,
     const size_t num_items) {
-  static_assert(std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>, "out_loc must be int32 or int64 type");
   const auto idx = blockIdx.x * blockDim.x + threadIdx.x;
   const auto warp_id = idx / 32;
   const auto lane_id = idx % 32;
@@ -51,8 +51,6 @@ __global__ void store_kv_cache_128x2(
     const size_t kv_cache_stride,
     const size_t kv_input_stride,
     const size_t num_items) {
-  static_assert(std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>, "out_loc must be int32 or int64 type");
-
   const auto idx = blockIdx.x * blockDim.x + threadIdx.x;
   const auto warp_id = idx / 32;
   const auto lane_id = idx % 32;
@@ -102,65 +100,42 @@ auto store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, 
   const auto num_blocks = (length + num_warps - 1) / num_warps;
   const auto stream = at::cuda::getCurrentCUDAStream();
 
-  if (size_bytes % 256 == 0) {
-    const auto items_per_warp = size_bytes / 256;
-    if (out_loc.dtype() == at::kInt) {
-      store_kv_cache_256x1<<<num_blocks, num_threads, 0, stream>>>(
-          k_cache_ptr,
-          v_cache_ptr,
-          out_loc.data_ptr<int32_t>(),
-          length,
-          k_ptr,
-          v_ptr,
-          kv_cache_stride,
-          kv_input_stride,
-          items_per_warp);
-    } else if (out_loc.dtype() == at::kLong) {
-      store_kv_cache_256x1<<<num_blocks, num_threads, 0, stream>>>(
-          k_cache_ptr,
-          v_cache_ptr,
-          out_loc.data_ptr<int64_t>(),
-          length,
-          k_ptr,
-          v_ptr,
-          kv_cache_stride,
-          kv_input_stride,
-          items_per_warp);
+  AT_DISPATCH_INTEGRAL_TYPES(out_loc.scalar_type(), "store_kv_cache", [&] {
+    if constexpr (!std::is_same_v<scalar_t, int32_t> && !std::is_same_v<scalar_t, int64_t>) {
+      // do not instantiate the kernel if out_loc is not int32 or int64
+      TORCH_CHECK(false, "out_loc must be of type int32 or int64, got: ", out_loc.scalar_type());
     } else {
-      TORCH_CHECK(false, "out_loc must be a 1D tensor of int32 or int64 type");
+      if (size_bytes % 256 == 0) {
+        const auto items_per_warp = size_bytes / 256;
+        store_kv_cache_256x1<<<num_blocks, num_threads, 0, stream>>>(
+            k_cache_ptr,
+            v_cache_ptr,
+            out_loc.data_ptr<scalar_t>(),
+            length,
+            k_ptr,
+            v_ptr,
+            kv_cache_stride,
+            kv_input_stride,
+            items_per_warp);
+      } else if (size_bytes % 128 == 0) {
+        const auto items_per_warp = size_bytes / 128;
+        store_kv_cache_128x2<<<num_blocks, num_threads, 0, stream>>>(
+            k_cache_ptr,
+            v_cache_ptr,
+            out_loc.data_ptr<scalar_t>(),
+            length,
+            k_ptr,
+            v_ptr,
+            kv_cache_stride,
+            kv_input_stride,
+            items_per_warp);
+      } else {
+        TORCH_CHECK(
+            false,
+            "The last dimension size bytes of k and v must be"
+            " divisible by 128 at least, got: ",
+            size_bytes);
+      }
     }
-  } else if (size_bytes % 128 == 0) {
-    const auto items_per_warp = size_bytes / 128;
-    if (out_loc.dtype() == at::kInt) {
-      store_kv_cache_128x2<<<num_blocks, num_threads, 0, stream>>>(
-          k_cache_ptr,
-          v_cache_ptr,
-          out_loc.data_ptr<int32_t>(),
-          length,
-          k_ptr,
-          v_ptr,
-          kv_cache_stride,
-          kv_input_stride,
-          items_per_warp);
-    } else if (out_loc.dtype() == at::kLong) {
-      store_kv_cache_128x2<<<num_blocks, num_threads, 0, stream>>>(
-          k_cache_ptr,
-          v_cache_ptr,
-          out_loc.data_ptr<int64_t>(),
-          length,
-          k_ptr,
-          v_ptr,
-          kv_cache_stride,
-          kv_input_stride,
-          items_per_warp);
-    } else {
-      TORCH_CHECK(false, "out_loc must be a 1D tensor of int32 or int64 type");
-    }
-  } else {
-    TORCH_CHECK(
-        false,
-        "The last dimension size bytes of k and v must be"
-        " divisible by 128 at least, got: ",
-        size_bytes);
-  }
+  });
 }
