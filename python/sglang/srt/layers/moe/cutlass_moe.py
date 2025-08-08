@@ -385,6 +385,7 @@ def cutlass_moe_fp4(
         c2 = c2 * topk_weights.view(m_a, num_topk, 1).to(out_dtype)
     return c2.sum(dim=1).to(out_dtype)
 
+
 def cutlass_moe_fp4_with_bias(
     a: torch.Tensor,
     a1_gscale: torch.Tensor,
@@ -508,7 +509,7 @@ def cutlass_moe_fp4_with_bias(
     # print(params.to_gemm1_args()["problem_sizes"])
     gemm1_args = params.to_gemm1_args()
     gemm1_args["bias_strides"] = torch.zeros_like(gemm1_args["c_strides"])
-    # Ensure bias1 is properly aligned for TMA operations
+    # gemm1_args["bias_strides"] = gemm1_args["c_strides"].clone()
     gemm1_args["bias"] = bias1
     c1 = cutlass_fp4_group_mm_with_bias(
         rep_a_fp4,
@@ -518,7 +519,7 @@ def cutlass_moe_fp4_with_bias(
         w1_alphas,
         out_dtype,
         device,
-        gemm1_args
+        gemm1_args,
     )
     del rep_a_fp4, rep_a_blockscale
     print(c1[0, 0])
@@ -535,13 +536,15 @@ def cutlass_moe_fp4_with_bias(
     elif activation_type == "gelu_tanh":
         gelu_tanh_and_mul(c1, intermediate)
     elif activation_type == "swiglu":
-        from triton_kernels.swiglu import swiglu, PrecisionConfig
+        from triton_kernels.swiglu import PrecisionConfig, swiglu
+
         precision_config = PrecisionConfig(limit=swiglu_limit)
         intermediate = swiglu(c1, activation_alpha, precision_config)
 
     else:
-        raise ValueError(f"Unsupported activation type in cutlass_moe_fp4: {activation_type}")
-
+        raise ValueError(
+            f"Unsupported activation type in cutlass_moe_fp4: {activation_type}"
+        )
 
     int_fp4, int_blockscale = scaled_fp4_experts_quant(
         intermediate,
@@ -551,9 +554,9 @@ def cutlass_moe_fp4_with_bias(
         num_topk,
     )
     gemm2_args = params.to_gemm2_args()
-    # Ensure bias2 is properly aligned for TMA operations
     gemm2_args["bias"] = bias2
     gemm2_args["bias_strides"] = torch.zeros_like(gemm2_args["c_strides"])
+    # gemm2_args["bias_strides"] = gemm2_args["c_strides"].clone()
     c2 = cutlass_fp4_group_mm_with_bias(
         int_fp4,
         w2_fp4,

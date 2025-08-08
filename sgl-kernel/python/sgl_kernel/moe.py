@@ -253,6 +253,7 @@ def cutlass_fp4_group_mm(
     )
     return c.to(dtype=out_dtype)
 
+
 def cutlass_fp4_group_mm_with_bias(
     a_fp4,
     b_fp4,
@@ -297,6 +298,6 @@ def cutlass_fp4_group_mm_with_bias(
         params["bias_strides"],
         params["problem_sizes"],
         params["expert_offsets"],
-        params["blockscale_offsets"]
+        params["blockscale_offsets"],
     )
     return c.to(dtype=out_dtype)
