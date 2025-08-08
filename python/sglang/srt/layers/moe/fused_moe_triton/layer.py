@@ -809,7 +809,9 @@ class FusedMoE(torch.nn.Module):
                 # If we are in EP mode, we need to move the expert map to GPU.
                 self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
 
-        if self.expert_map_gpu is not None:
+        if self.expert_map_gpu is not None and isinstance(
+            topk_output, StandardTopKOutput
+        ):
             topk_output = topk_output._replace(
                 topk_ids=self.expert_map_gpu[topk_output.topk_ids]
             )

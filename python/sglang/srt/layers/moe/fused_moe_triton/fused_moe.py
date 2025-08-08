@@ -1369,6 +1369,14 @@ def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
     out.mul_(routed_scaling_factor)
 
 
+@torch.compile
+def swiglu_with_alpha_and_limit(x, alpha, limit):
+    gate, up = x[..., ::2], x[..., 1::2]
+    gate = gate.clamp(min=None, max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    return gate * torch.sigmoid(gate * alpha) * (up + 1)
+
+
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1407,7 +1415,7 @@ def fused_experts_impl(
     else:
         assert (
             hidden_states.shape[1] == w1.shape[2] - padded_size
-        ), f"Hidden size mismatch, hidden_states.shape={hidden_states.shape}, w1.shape={w1.shape}, padded_size={padded_size}"
+        ), f"Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -1527,14 +1535,11 @@ def fused_experts_impl(
         if activation == "silu":
             if activation_alpha is not None:
                 assert swiglu_limit is not None
-                gate_up = intermediate_cache1.view(-1, N)
-                gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-                gate = gate.clamp(min=None, max=swiglu_limit)
-                up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-                intermediate_cache2 = (
-                    gate * torch.sigmoid(gate * activation_alpha) * (up + 1)
+                intermediate_cache2 = swiglu_with_alpha_and_limit(
+                    intermediate_cache1.view(-1, N),
+                    activation_alpha,
+                    swiglu_limit,
                 )
-                del gate, up
             elif _is_cuda:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
