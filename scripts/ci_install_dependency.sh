@@ -36,7 +36,7 @@ pip install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/
 if [ "$MODE_BLACKWELL" = "1" ]; then
     # TODO auto determine sgl-kernel version
     SGL_KERNEL_VERSION=0.3.2
-    pip3 install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}-cp39-abi3-manylinux2014_x86_64.whl --break-system-packages
+    pip3 install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu128-cp39-abi3-manylinux2014_x86_64.whl --break-system-packages --force-reinstall
 fi
 
 # Show current packages

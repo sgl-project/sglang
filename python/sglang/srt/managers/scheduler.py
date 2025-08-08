@@ -750,6 +750,7 @@ class Scheduler(
                 pp_size=self.pp_size,
                 transfer_backend=self.transfer_backend,
             )
+
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
