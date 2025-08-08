@@ -508,6 +508,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 (last_loc + 2) % self.page_size == seq_lens % self.page_size
             )
 
+        # TODO remove the gpu branch if the cpu branch is always faster
         if seq_lens.shape[0] <= 16:
             estimated_num_new_pages = sum(
                 (seq_len + self.page_size - 1) // self.page_size
