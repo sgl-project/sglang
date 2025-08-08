@@ -1714,6 +1714,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             or attention_backend_str == "cutlass_mla"
             or attention_backend_str == "ascend"
             or attention_backend_str == "trtllm_mha"
+            or attention_backend_str == "aiter"
             or is_tbo_enabled()
         ):
             seq_lens_cpu = (
