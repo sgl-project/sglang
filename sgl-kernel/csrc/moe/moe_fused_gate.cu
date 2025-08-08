@@ -666,9 +666,25 @@ std::vector<at::Tensor> moe_fused_gate(
 
   if (num_expert_group == 1 && num_experts > 128) {
     auto gate = (1.0f / (1.0f + (-input).exp())) + bias;
-    auto topk_result = gate.topk(topk, 1, true, true);
-    output.copy_(std::get<0>(topk_result));
-    indices.copy_(std::get<1>(topk_result));
+    
+    int64_t topk_excluding_shared = topk - num_fused_shared_experts;
+    auto topk_result = gate.topk(topk_excluding_shared, 1, true, true);
+    
+    output.narrow(1, 0, topk_excluding_shared).copy_(std::get<0>(topk_result));
+    indices.narrow(1, 0, topk_excluding_shared).copy_(std::get<1>(topk_result));
+    
+    if (num_fused_shared_experts > 0) {
+        auto output_sum = std::get<0>(topk_result).sum(1);
+        for (int64_t i = 0; i < num_fused_shared_experts; ++i) {
+            indices.select(1, topk_excluding_shared + i).fill_(num_experts + i);
+            output.select(1, topk_excluding_shared + i).copy_(
+                output_sum / static_cast<float>(routed_scaling_factor));
+        }
+    }
+    
+    auto row_sums = output.sum(1, true);
+    output.div_(row_sums);
+    
     return {output, indices};
   }
   // Compute grid dimensions based on runtime value for num_expert_group.
