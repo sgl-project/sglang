@@ -34,6 +34,11 @@ python3 -m sglang.launch_server --model-path zai-org/GLM-4.1V-9B-Thinking --reas
 python3 bench_sglang.py --response-answer-regex "<\|begin_of_box\|>(.*)<\|end_of_box\|>" --concurrency 64
 ```
 
+You can use `--extra-request-body` to specify additional OpenAI request parameters. E.g.,
+```
+python3 bench_sglang.py --extra_request_body '{"max_new_tokens": 128, "temperature": 0.01}'
+```
+
 ### Evaluate hf
 
 ```
