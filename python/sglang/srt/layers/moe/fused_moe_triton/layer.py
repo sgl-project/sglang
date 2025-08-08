@@ -28,6 +28,8 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
@@ -940,6 +942,16 @@ class FusedMoE(torch.nn.Module):
             for expert_id in range(num_experts)
             for shard_id in ["w1", "w2", "w3"]
         ]
+
+    def should_fuse_routed_scaling_factor_in_topk(self):
+        if isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod):
+            return True
+        if (
+            isinstance(self.quant_method, Fp8MoEMethod)
+            and self.quant_method.should_use_cutlass_fused_experts_fp8()
+        ):
+            return True
+        return False
 
 
 class FlashInferFusedMoE(FusedMoE):

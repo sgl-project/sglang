@@ -977,6 +977,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             torch.cuda.empty_cache()
 
+    def should_use_cutlass_fused_experts_fp8(self):
+        return (
+            get_bool_env_var("SGLANG_CUTLASS_MOE")
+            and self.cutlass_fp8_supported
+            and self.block_quant
+            and (is_sm100_supported() or is_sm90_supported())
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1027,12 +1035,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if ret is not None:
                 return ret
 
-        if (
-            get_bool_env_var("SGLANG_CUTLASS_MOE")
-            and self.cutlass_fp8_supported
-            and self.block_quant
-            and (is_sm100_supported() or is_sm90_supported())
-        ):
+        if self.should_use_cutlass_fused_experts_fp8():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             topk_weights, topk_ids, _ = topk_output

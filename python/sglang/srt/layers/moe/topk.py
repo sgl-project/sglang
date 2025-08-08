@@ -580,6 +580,7 @@ def biased_grouped_topk_gpu(
             topk,
             num_fused_shared_experts,
             routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
         )
         # TODO merge into kernel
         if (expert_location_dispatch_info is not None) or (
