@@ -14,6 +14,7 @@ ARG GPU_ARCH=gfx950
 FROM $BASE_IMAGE_942 AS gfx942
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV AITER_COMMIT="v0.1.4"
 
@@ -23,7 +24,9 @@ FROM $BASE_IMAGE_950 AS gfx950
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_AITER_ALL="1"
+ENV BUILD_LLVM="1"
 ENV AITER_COMMIT="v0.1.4"
+ENV HIP_CLANG_PATH="/sgl-workspace/llvm-project/build/bin/"
 
 # ===============================
 # Chosen arch and args
@@ -42,6 +45,10 @@ ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 
+ARG LLVM_REPO="https://github.com/jrbyrnes/llvm-project.git"
+ARG LLVM_BRANCH="MainOpSelV2"
+ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
+
 USER root
 
 # Install some basic utilities
@@ -51,6 +58,20 @@ RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which
 WORKDIR /sgl-workspace
 
 # -----------------------
+# llvm
+RUN if [ "$BUILD_LLVM" = "1" ]; then \
+     git clone ${LLVM_REPO} -b ${LLVM_BRANCH} \
+     && cd llvm-project \
+     && git checkout ${LLVM_COMMIT} \
+     && mkdir build \
+     && cd build \
+     && cmake -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=1 -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86" -DLLVM_ENABLE_PROJECTS="clang;lld;" -DLLVM_ENABLE_RUNTIMES="compiler-rt" ../llvm \
+     && make -j32; \
+    fi
+
+# -----------------------
+
+# -----------------------
 # AITER
 RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
@@ -58,7 +79,9 @@ RUN git clone ${AITER_REPO} \
  && git checkout ${AITER_COMMIT} \
  && git submodule update --init --recursive
 RUN cd aiter \
-     && if [ "$BUILD_AITER_ALL" = "1" ]; then \
+     && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
+          HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
+        elif [ "$BUILD_AITER_ALL" = "1" ]; then \
           PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
         else \
           GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
