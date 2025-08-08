@@ -240,6 +240,6 @@ class KimiK2Detector(BaseFormatDetector):
             sequence_start_token=self.bot_token,
             sequence_end_token=self.eot_token,
             tool_call_separator="",
-            call_rule_fmt='"<|tool_call_begin|>functions.{name}:"[0-9]+"<|tool_call_argument_begin|>"{arguments_rule}"<|tool_call_end|>"',
+            call_rule_fmt='"<|tool_call_begin|>functions.{name}:" [0-9]+ "<|tool_call_argument_begin|>" {arguments_rule} "<|tool_call_end|>"',
             function_format="json",
         )
