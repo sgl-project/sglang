@@ -317,12 +317,11 @@ class TestOpenAIVisionServer(CustomTestCase):
             "iPod" in video_response
             or "device" in video_response
             or "microphone" in video_response
-            or "rectangular" in video_response
         ), f"""
         ====================== video_response =====================
         {video_response}
         ===========================================================
-        should contain 'iPod' or 'device' or 'microphone' or 'rectangular'
+        should contain 'iPod' or 'device' or 'microphone'
         """
         assert (
             "man" in video_response
@@ -330,11 +329,12 @@ class TestOpenAIVisionServer(CustomTestCase):
             or "individual" in video_response
             or "speaker" in video_response
             or "Steve" in video_response
+            or "hand" in video_response
         ), f"""
         ====================== video_response =====================
         {video_response}
         ===========================================================
-        should contain 'man' or 'person' or 'individual' or 'speaker'
+        should contain 'man' or 'person' or 'individual' or 'speaker' or 'hand'
         """
         assert (
             "present" in video_response

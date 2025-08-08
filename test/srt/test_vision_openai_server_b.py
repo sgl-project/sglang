@@ -317,6 +317,8 @@ class TestGLM41VServer(TestOpenAIVisionServer):
                 "0.68",
                 "--cuda-graph-max-bs",
                 "4",
+                "--reasoning-parser",
+                "glm45",
             ],
         )
         cls.base_url += "/v1"
