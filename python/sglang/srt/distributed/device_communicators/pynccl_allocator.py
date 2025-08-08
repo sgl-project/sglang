@@ -75,7 +75,12 @@ class use_symmetric_memory:
         disabled: bool = False,
         disable_war: bool = False,
     ):
-        if not is_symmetric_memory_enabled():
+        self.disabled = (
+            disabled
+            or not is_symmetric_memory_enabled()
+            or group_coordinator.world_size == 1
+        )
+        if self.disabled:
             self.group_coordinator = None
             self._mem_pool_ctx = None
             self.is_graph_capture = None
@@ -87,11 +92,10 @@ class use_symmetric_memory:
             self.is_graph_capture = torch.cuda.is_current_stream_capturing()
             self.device = torch.cuda.current_device()
             self.pre_2_8_0 = version.parse(torch.__version__) < version.parse("2.8.0")
-        self.disabled = disabled
         self.disable_war = disable_war
 
     def __enter__(self):
-        if not is_symmetric_memory_enabled() or self.disabled:
+        if self.disabled:
             return self
         assert (
             self.group_coordinator.pynccl_comm is not None
@@ -114,13 +118,13 @@ class use_symmetric_memory:
         return self
 
     def tag(self, tensor: torch.Tensor):
-        if not is_symmetric_memory_enabled() or self.disabled:
+        if self.disabled:
             return
         global _registered_tensor_addrs
         _registered_tensor_addrs.add(tensor.untyped_storage().data_ptr())
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not is_symmetric_memory_enabled() or self.disabled:
+        if self.disabled:
             return
         global _registered_base_addrs
         self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)

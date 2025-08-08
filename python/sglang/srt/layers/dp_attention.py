@@ -360,7 +360,7 @@ def dp_scatter(
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
-    if get_attention_dp_size() == 1:
+    if get_attention_tp_size() == 1:
         get_tp_group().reduce_scatter_tensor(output, input)
     else:
         scattered_local_tokens = input.tensor_split(
