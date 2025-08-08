@@ -216,6 +216,8 @@ class ServerArgs:
     disable_radix_cache: bool = False
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
+    enable_prefill_cuda_graph: bool = False
+    cuda_graph_prefill_max_seqlen: Optional[int] = None
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
@@ -477,6 +479,10 @@ class ServerArgs:
                 raise ValueError(
                     "trtllm_mha backend does not support speculative decoding yet."
                 )
+
+        if self.enable_prefill_cuda_graph == True:
+            self.disable_radix_cache = True
+            self.attention_backend = "flashinfer"
 
         if self.attention_backend == "dual_chunk_flash_attn":
             logger.warning(
@@ -1644,6 +1650,16 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="Set the list of batch sizes for cuda graph.",
+        )
+        parser.add_argument(
+            "--enable-prefill-cuda-graph",
+            action="store_true",
+            help="Enable cuda graph for prefill.",
+        )
+        parser.add_argument(
+            "--cuda-graph-prefill-max-seqlen",
+            type=int,
+            help="Set the prefill seqlen eql range(32, cuda_graph_prefill_max_seqlen, 32) for cuda graph.",
         )
         parser.add_argument(
             "--disable-cuda-graph",
