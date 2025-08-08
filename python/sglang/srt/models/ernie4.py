@@ -77,12 +77,6 @@ class Ernie4Moe(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.moe_num_shared_experts = getattr(config, "moe_num_shared_experts", 0)
 
-        if self.tp_size > config.moe_num_experts:
-            raise ValueError(
-                f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.moe_num_experts}."
-            )
-
         if config.hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {config.hidden_act}. "
