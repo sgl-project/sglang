@@ -37,6 +37,7 @@ from sglang.srt.utils import (
     is_hip,
     is_port_available,
     is_remote_url,
+    is_triton_kernels_available,
     is_valid_ipv6_address,
     nullable_str,
 )
@@ -249,6 +250,7 @@ class ServerArgs:
     enable_return_hidden_states: bool = False
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
+    scheduler_recv_interval: int = 1
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -476,22 +478,34 @@ class ServerArgs:
                 self.attention_backend == "trtllm_mha"
                 or self.attention_backend == "triton"
             )
-
-            if is_sm100_supported():
-                self.enable_flashinfer_mxfp4_moe = True
-                self.enable_triton_kernel_moe = False
-            else:
-                self.enable_triton_kernel_moe = True
-
-            self.disable_hybrid_swa_memory = True
-
             quantization_config = getattr(
                 self.get_hf_config(), "quantization_config", None
             )
-            if (
+            is_mxfp4_quant_format = (
                 quantization_config is not None
                 and quantization_config.get("quant_method") == "mxfp4"
-            ):
+            )
+
+            if is_sm100_supported() and is_mxfp4_quant_format:
+                self.enable_flashinfer_mxfp4_moe = True
+                self.enable_triton_kernel_moe = False
+                logger.info(
+                    "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
+                )
+            else:
+                if self.enable_triton_kernel_moe:
+                    assert (
+                        self.ep_size == 1
+                    ), "Triton kernel MoE is only supported when ep_size == 1"
+                if not self.enable_triton_kernel_moe and self.ep_size == 1:
+                    self.enable_triton_kernel_moe = True
+                    logger.info(
+                        "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
+                    )
+
+            self.disable_hybrid_swa_memory = True
+
+            if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
 
@@ -1843,6 +1857,12 @@ class ServerArgs:
             "--enable-flashinfer-mxfp4-moe",
             action="store_true",
             help="Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
+        )
+        parser.add_argument(
+            "--scheduler-recv-interval",
+            type=int,
+            default=ServerArgs.scheduler_recv_interval,
+            help="The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this.",
         )
 
         # Debug tensor dumps
