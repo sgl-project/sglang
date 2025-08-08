@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import numpy
 import torch
+from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
@@ -19,7 +20,6 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
 )
-from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
 from sglang.srt.layers.quantization.utils import pack_cols, unpack_cols
 from sglang.srt.utils import get_device_capability
 

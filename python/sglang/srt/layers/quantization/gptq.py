@@ -6,6 +6,7 @@ from fractions import Fraction
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 import torch
+from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
@@ -36,7 +37,6 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_zero_points,
     verify_marlin_supported,
 )
-from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
 from sglang.srt.layers.quantization.utils import (
     get_linear_quant_method,
     replace_parameter,

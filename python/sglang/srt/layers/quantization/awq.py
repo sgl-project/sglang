@@ -6,6 +6,7 @@ import warnings
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import torch
+from sgl_kernel.scalar_type import scalar_types
 
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
@@ -29,7 +30,6 @@ from sglang.srt.layers.quantization.marlin_utils import (
     verify_marlin_supported,
     verify_marlin_supports_shape,
 )
-from sglang.srt.layers.quantization.scalar_type import scalar_types
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import replace_parameter
 
