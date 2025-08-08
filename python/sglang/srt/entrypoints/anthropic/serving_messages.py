@@ -56,7 +56,7 @@ class AnthropicServingMessages(ABC):
     def __init__(
         self, tokenizer_manager: TokenizerManager, template_manager: TemplateManager
     ):
-        super().__init__(tokenizer_manager)
+        self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
 
     def _request_id_prefix(self) -> str:
