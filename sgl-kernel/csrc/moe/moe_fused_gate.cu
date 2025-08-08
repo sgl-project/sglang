@@ -76,22 +76,28 @@ __device__ void process_shared_experts_and_rescale(
     double routed_scaling_factor,
     float* output_ptr,
     int32_t* indices_ptr,
-    Params params) {
+    Params params,
+    int64_t num_rows) {
+  if (thread_row >= num_rows) {
+    return;
+  }
   // Process shared experts
   if (thread_group_idx == 0 && num_fused_shared_experts > 0) {
     int64_t last_idx = topk * thread_row + topk_excluding_share_expert_fusion;
-    int64_t expert_offset = 0;
-    indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
 
-    // Set the weight to the sum of all weights divided by routed_scaling_factor
-    output_ptr[last_idx] = output_sum / routed_scaling_factor;
+    if (last_idx < topk * num_rows) {
+      int64_t expert_offset = 0;
+      indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
+      output_ptr[last_idx] = output_sum / routed_scaling_factor;
 
-    if (num_fused_shared_experts > 1) {
-      for (int i = 1; i < num_fused_shared_experts; ++i) {
-        ++last_idx;
-        ++expert_offset;
-        indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
-        output_ptr[last_idx] = output_sum / routed_scaling_factor;
+      if (num_fused_shared_experts > 1) {
+        for (int i = 1; i < num_fused_shared_experts; ++i) {
+          ++last_idx;
+          if (last_idx >= topk * num_rows) break;
+          ++expert_offset;
+          indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
+          output_ptr[last_idx] = output_sum / routed_scaling_factor;
+        }
       }
     }
   }
@@ -102,7 +108,9 @@ __device__ void process_shared_experts_and_rescale(
 #pragma unroll
     for (int ii = 0; ii < topk; ++ii) {
       int64_t const idx = topk * thread_row + ii;
-      output_ptr[idx] = output_ptr[idx] / output_sum;
+      if (idx < topk * num_rows) {
+        output_ptr[idx] = output_ptr[idx] / output_sum;
+      }
     }
   }
 }
@@ -123,21 +131,9 @@ __device__ void moe_fused_gate_impl(
   int tidx = threadIdx.x;
   int64_t thread_row =
       blockIdx.x * params.ROWS_PER_CTA + threadIdx.y * params.ROWS_PER_WARP + tidx / params.THREADS_PER_ROW;
-  // QQ NOTE: Ensure thread_row is within bounds
-  if (params.THREADS_PER_ROW == 1) {
-    // Special case for THREADS_PER_ROW == 1, where each thread processes a single row
-    bool valid_thread = thread_row < num_rows;
-    unsigned mask = __ballot_sync(0xFFFFFFFF, valid_thread);
-    if (mask == 0) {
-      // If no threads are valid, exit early
-      return;
-    }
-    // If valid, continue with the processing
-  } else {
-    // 其他情况保持原来的逻辑
-    if (thread_row >= num_rows) {
-      return;
-    }
+  if (thread_row >= num_rows) {
+    // 确保所有无效线程在任何情况下都退出
+    return;
   }
 
   // Calculate topk_excluding_share_expert_fusion from topk
@@ -480,8 +476,9 @@ __device__ void moe_fused_gate_impl(
     int thread_to_clear_in_group = expert / params.VPT;
     int64_t idx = topk * thread_row + k_idx;
 
-    if (thread_group_idx == thread_to_clear_in_group) {
+    if (thread_group_idx == thread_to_clear_in_group && idx < topk * num_rows) {
       int expert_to_clear_in_thread = expert % params.VPT;
+      indices_ptr[idx] = static_cast<int32_t>(expert);
 
       if (params.VPT <= 32) {
         // Small VPT: Clear and store directly
@@ -532,7 +529,8 @@ __device__ void moe_fused_gate_impl(
       routed_scaling_factor,
       output_ptr,
       indices_ptr,
-      params);
+      params,
+      num_rows);
 }
 
 //------------------------------------------------------------------------------
