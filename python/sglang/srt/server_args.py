@@ -51,6 +51,7 @@ class ServerArgs:
     model_path: str
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
+    tokenizer_worker_num: int = 1
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -729,6 +730,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.tokenizer_path,
             help="The path of the tokenizer.",
+        )
+        parser.add_argument(
+            "--tokenizer-worker-num",
+            type=int,
+            default=ServerArgs.tokenizer_worker_num,
+            help="The worker num of the tokenizer manager.",
         )
         parser.add_argument(
             "--tokenizer-mode",
@@ -2081,6 +2088,9 @@ class ServerArgs:
             self.chunked_prefill_size % self.page_size == 0
         ), "chunked_prefill_size must be divisible by page_size"
 
+        # Check multi tokenizer
+        assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
+
     def check_lora_server_args(self):
         assert (
             self.max_loras_per_batch > 0
@@ -2246,6 +2256,9 @@ class PortArgs:
     # The ipc filename for Scheduler to send metrics
     metrics_ipc_name: str
 
+    # The ipc filename for Tokenizer and worker tokenizer
+    tokenizer_worker_ipc_name: Optional[str]
+
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
         if server_args.nccl_port is None:
@@ -2269,6 +2282,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                tokenizer_worker_ipc_name=None,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -2302,6 +2316,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
+                tokenizer_worker_ipc_name=None,
             )
 
 
