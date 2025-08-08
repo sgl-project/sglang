@@ -38,6 +38,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.dp_attention import (
     DPPaddingMode,
     get_attention_dp_rank,
@@ -179,6 +180,9 @@ class ForwardBatch:
     # The sum of all sequence lengths
     seq_lens_sum: int
 
+    # The original sequence length without being chunked. Qwen-1M related.
+    orig_seq_lens: Optional[torch.Tensor] = None
+
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
 
@@ -188,6 +192,7 @@ class ForwardBatch:
     token_ids_logprobs: Optional[List[List[int]]] = None
 
     # For logits and logprobs post processing
+    next_token_logits_buffer: torch.Tensor = None
     temp_scaled_logprobs: bool = False
     temperature: torch.Tensor = None
     top_p_normalized_logprobs: bool = False
@@ -246,7 +251,7 @@ class ForwardBatch:
     encoder_out_cache_loc: Optional[torch.Tensor] = None
 
     # For LoRA
-    lora_paths: Optional[List[str]] = None
+    lora_ids: Optional[List[str]] = None
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
@@ -319,13 +324,14 @@ class ForwardBatch:
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
+            orig_seq_lens=batch.orig_seq_lens,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             is_extend_in_batch=batch.is_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
-            lora_paths=batch.lora_paths,
+            lora_ids=batch.lora_ids,
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
@@ -418,16 +424,12 @@ class ForwardBatch:
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
-            if support_triton(model_runner.server_args.attention_backend):
-                positions, ret.extend_start_loc = compute_position_triton(
-                    ret.extend_prefix_lens,
-                    ret.extend_seq_lens,
-                    ret.extend_num_tokens,
-                )
-            else:
-                positions, ret.extend_start_loc = compute_position_torch(
-                    ret.extend_prefix_lens, ret.extend_seq_lens
-                )
+            positions, ret.extend_start_loc = compute_position(
+                model_runner.server_args.attention_backend,
+                ret.extend_prefix_lens,
+                ret.extend_seq_lens,
+                ret.extend_num_tokens,
+            )
             if ret.positions is None:
                 ret.positions = positions
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
@@ -630,8 +632,10 @@ class ForwardBatch:
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
-            # when DP gather mode is all gather, we will use all_gather_into_tensor to gather hidden states,
-            # where transferred tokens should be padded to the same length.
+            # when DP gather mode is all gather, we will use
+            # all_gather_into_tensor to gather hidden states, where transferred
+            # tokens should be padded to the same length. We will also use
+            # reduce-scatter instead of all-reduce after MLP.
             max_num_tokens = max(global_num_tokens)
             global_num_tokens = [max_num_tokens] * sync_group_size
             buffer_len = max_num_tokens * sync_group_size
@@ -644,11 +648,16 @@ class ForwardBatch:
             device=model_runner.device,
         )
 
-        bs = self.batch_size
         if len(global_num_tokens) > 1:
             num_tokens = global_num_tokens[get_attention_dp_rank()]
         else:
             num_tokens = global_num_tokens[0]
+
+        if self.forward_mode.is_decode():
+            setattr(self, "raw_bs", self.batch_size)
+            self.batch_size = num_tokens
+
+        bs = self.batch_size
 
         # padding
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
@@ -656,6 +665,9 @@ class ForwardBatch:
 
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+        )
+        self.seq_lens_sum = self.seq_lens_sum + seq_len_fill_value * (
+            bs - self.seq_lens.shape[0]
         )
         self.seq_lens = self._pad_tensor_to_size(
             self.seq_lens, bs, value=seq_len_fill_value
@@ -700,7 +712,7 @@ class ForwardBatch:
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
 
-        bs = self.batch_size
+        bs = getattr(self, "raw_bs", self.batch_size)
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
@@ -839,7 +851,7 @@ class ForwardBatch:
 
 
 def enable_num_token_non_padded(server_args):
-    return server_args.enable_ep_moe or server_args.enable_deepep_moe
+    return get_moe_expert_parallel_world_size() > 1
 
 
 class PPProxyTensors:
@@ -870,6 +882,25 @@ class PPProxyTensors:
 
     def __repr__(self) -> str:
         return f"PPProxyTensors(tensors={self.tensors})"
+
+
+def compute_position(
+    attn_backend: str,
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_seq_lens_sum: int,
+):
+    if support_triton(attn_backend):
+        positions, extend_start_loc = compute_position_triton(
+            extend_prefix_lens,
+            extend_seq_lens,
+            extend_seq_lens_sum,
+        )
+    else:
+        positions, extend_start_loc = compute_position_torch(
+            extend_prefix_lens, extend_seq_lens
+        )
+    return positions, extend_start_loc
 
 
 def compute_position_triton(

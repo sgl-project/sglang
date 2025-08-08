@@ -249,7 +249,7 @@ class TestLaunchServer(unittest.TestCase):
         )
         self.other_process.append(worker_process)
 
-        # 2. use /add_worker api to add it the the router. It will be used by router after it is healthy
+        # 2. use /add_worker api to add it to the router. It will be used by the router after it is healthy
         with requests.Session() as session:
             response = session.post(f"{self.base_url}/add_worker?url={worker_url}")
             print(f"status code: {response.status_code}, response: {response.text}")
@@ -304,7 +304,7 @@ class TestLaunchServer(unittest.TestCase):
         )
         self.other_process.append(worker_process)
 
-        # 2. use /add_worker api to add it the the router. It will be used by router after it is healthy
+        # 2. use /add_worker api to add it to the router. It will be used by the router after it is healthy
         with requests.Session() as session:
             response = session.post(f"{self.base_url}/add_worker?url={worker_url}")
             print(f"status code: {response.status_code}, response: {response.text}")
@@ -340,7 +340,7 @@ class TestLaunchServer(unittest.TestCase):
 
     def test_4_payload_size(self):
         print("Running test_4_payload_size...")
-        # Start router with 3MB limit
+        # Start router with 1MB limit
         self.process = popen_launch_router(
             self.model,
             self.base_url,
@@ -398,7 +398,7 @@ class TestLaunchServer(unittest.TestCase):
             api_key="correct_api_key",
         )
 
-        # # Test case 1: request without api key should fail
+        # Test case 1: request without api key should fail
         with requests.Session() as session:
             response = session.post(
                 f"{self.base_url}/generate",

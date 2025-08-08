@@ -21,6 +21,7 @@ and code completion templates, eliminating global state and improving modularity
 import json
 import logging
 import os
+import re
 from typing import Optional
 
 from sglang.srt.code_completion_parser import (
@@ -54,6 +55,7 @@ class TemplateManager:
         self._chat_template_name: Optional[str] = None
         self._completion_template_name: Optional[str] = None
         self._jinja_template_content_format: Optional[str] = "openai"
+        self._force_reasoning: bool = False
 
     @property
     def chat_template_name(self) -> Optional[str]:
@@ -70,6 +72,31 @@ class TemplateManager:
         """Get the detected template content format ('string' or 'openai' or None)."""
         return self._jinja_template_content_format
 
+    @property
+    def force_reasoning(self) -> bool:
+        """
+        Check if the current chat template enforces reasoning/thinking.
+
+        Returns:
+            True if the template contains reasoning patterns like <think> tags
+        """
+        return self._force_reasoning
+
+    def _detect_reasoning_pattern(self, template: str) -> bool:
+        """
+        Detect if the chat template contains reasoning/thinking patterns.
+        """
+        if template is None:
+            return False
+
+        force_reasoning_pattern = r"<\|im_start\|>assistant\\n<think>\\n"
+        has_reasoning = re.search(force_reasoning_pattern, template) is not None
+
+        if has_reasoning:
+            logger.info("Detected the force reasoning pattern in chat template.")
+
+        return has_reasoning
+
     def load_chat_template(
         self, tokenizer_manager, chat_template_arg: Optional[str], model_path: str
     ) -> None:
@@ -84,26 +111,34 @@ class TemplateManager:
         if chat_template_arg:
             self._load_explicit_chat_template(tokenizer_manager, chat_template_arg)
         else:
-            # Try HuggingFace template first
-            hf_template = self._resolve_hf_chat_template(tokenizer_manager)
-            if hf_template:
-                self._jinja_template_content_format = (
-                    detect_jinja_template_content_format(hf_template)
-                )
-                logger.info(
-                    f"Using default HuggingFace chat template with detected content format: {self._jinja_template_content_format}"
-                )
-                return
-
-            # Fallback to SGLang template guessing
+            # Guess chat template from model path
             self.guess_chat_template_from_model_path(model_path)
 
-            # Set default format if no template was found
+            # If no pre-defined template was found, fallback to HuggingFace template
             if self._chat_template_name is None:
-                self._jinja_template_content_format = "string"
-                logger.info(
-                    "No chat template found, defaulting to 'string' content format"
-                )
+                # Try HuggingFace template first
+                hf_template = self._resolve_hf_chat_template(tokenizer_manager)
+                if hf_template:
+                    # override the chat template
+                    if tokenizer_manager.tokenizer:
+                        tokenizer_manager.tokenizer.chat_template = hf_template
+                    self._jinja_template_content_format = (
+                        detect_jinja_template_content_format(hf_template)
+                    )
+                    logger.info(
+                        f"Using default HuggingFace chat template with detected content format: {self._jinja_template_content_format}"
+                    )
+                    return
+
+            # Default to string content format if no template was found
+            self._jinja_template_content_format = "string"
+            logger.info("No chat template found, defaulting to 'string' content format")
+
+        # Detect reasoning pattern from chat template
+        if tokenizer_manager.tokenizer:
+            self._force_reasoning = self._detect_reasoning_pattern(
+                tokenizer_manager.tokenizer.chat_template
+            )
 
     def _load_explicit_chat_template(
         self, tokenizer_manager, chat_template_arg: str
@@ -257,13 +292,15 @@ class TemplateManager:
 
         Returns the chat template string if found, None otherwise.
         """
-        tokenizer = tokenizer_manager.tokenizer
-
-        # Try to get AutoTokenizer chat template
         try:
-            return tokenizer.get_chat_template()
+            if processor := tokenizer_manager.processor:
+                if hasattr(processor, "chat_template") and processor.chat_template:
+                    return processor.chat_template
+            if tokenizer := tokenizer_manager.tokenizer:
+                if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+                    return tokenizer.chat_template
         except Exception as e:
-            logger.debug(f"Error getting chat template via get_chat_template(): {e}")
+            logger.debug(f"Error getting chat template: {e}")
 
         logger.debug("No HuggingFace chat template found")
         return None
