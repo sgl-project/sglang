@@ -271,7 +271,7 @@ jobs:
   #     github.event.pull_request.draft == false
   #   strategy:
   #     matrix:
-  #       runner: [linux-mi3025-gpu-8-test]
+  #       runner: [linux-mi325-gpu-8-test]
   #   runs-on: ${{matrix.runner}}
   #   steps:
   #     - name: Checkout code
