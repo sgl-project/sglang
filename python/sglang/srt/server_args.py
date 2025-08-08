@@ -1065,7 +1065,7 @@ class ServerArgs:
         parser.add_argument(
             "--log-requests-level",
             type=int,
-            default=0,
+            default=ServerArgs.log_requests_level,
             help="0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial input/output. 3: Log every input/output.",
             choices=[0, 1, 2, 3],
         )
