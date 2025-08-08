@@ -249,6 +249,7 @@ class ServerArgs:
     enable_return_hidden_states: bool = False
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
+    scheduler_recv_interval: int = 1
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -487,8 +488,14 @@ class ServerArgs:
             if is_sm100_supported() and is_mxfp4_quant_format:
                 self.enable_flashinfer_mxfp4_moe = True
                 self.enable_triton_kernel_moe = False
+                logger.info(
+                    "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
+                )
             else:
                 self.enable_triton_kernel_moe = True
+                logger.info(
+                    "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
+                )
 
             self.disable_hybrid_swa_memory = True
 
@@ -1844,6 +1851,12 @@ class ServerArgs:
             "--enable-flashinfer-mxfp4-moe",
             action="store_true",
             help="Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
+        )
+        parser.add_argument(
+            "--scheduler-recv-interval",
+            type=int,
+            default=ServerArgs.scheduler_recv_interval,
+            help="The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this.",
         )
 
         # Debug tensor dumps
