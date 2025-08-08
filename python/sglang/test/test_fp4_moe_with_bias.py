@@ -76,16 +76,16 @@ def break_fp4_bytes(a, dtype):
 
 
 MNK_FACTORS = [
-    # (2, 1024, 1024),
-    # (2, 1024, 1536),
+    (2, 1024, 1024),
+    (2, 1024, 1536),
     (2, 3072, 1024),
-    # (2, 3072, 1536),
-    # (64, 1024, 1024),
-    # (64, 1024, 1536),
-    # (64, 3072, 1024),
-    # (64, 2048, 1024),
-    # (224, 1024, 1024),
-    # (224, 1024, 1536),
+    (2, 3072, 1536),
+    (64, 1024, 1024),
+    (64, 1024, 1536),
+    (64, 3072, 1024),
+    (64, 2048, 1024),
+    (224, 1024, 1024),
+    (224, 1024, 1536),
 ]
 
 
@@ -156,8 +156,8 @@ def test_cutlass_fp4_moe_with_bias_no_graph(
     w2_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
 
     for expert in range(e):
-        w1_amax = torch.abs(w1[expert]).max().to(torch.float32)
-        w2_amax = torch.abs(w2[expert]).max().to(torch.float32)
+        w1_amax = torch.abs(w1).max().to(torch.float32)
+        w2_amax = torch.abs(w2).max().to(torch.float32)
         w1_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
         w2_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
 
