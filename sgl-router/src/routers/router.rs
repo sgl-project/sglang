@@ -1,3 +1,4 @@
+use crate::config::types::RetryConfig;
 use crate::core::{HealthChecker, Worker, WorkerFactory};
 use crate::metrics::RouterMetrics;
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
@@ -11,6 +12,7 @@ use axum::{
     Json,
 };
 use futures_util::StreamExt;
+use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -39,6 +41,7 @@ pub struct Router {
     interval_secs: u64,
     dp_aware: bool,
     api_key: Option<String>,
+    retry_config: RetryConfig,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     _health_checker: Option<HealthChecker>,
@@ -54,6 +57,7 @@ impl Router {
         interval_secs: u64,
         dp_aware: bool,
         api_key: Option<String>,
+        retry_config: RetryConfig,
     ) -> Result<Self, String> {
         // Update active workers gauge
         RouterMetrics::set_active_workers(worker_urls.len());
@@ -120,6 +124,7 @@ impl Router {
             interval_secs,
             dp_aware,
             api_key,
+            retry_config,
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
             _health_checker: Some(health_checker),
@@ -141,6 +146,12 @@ impl Router {
         timeout_secs: u64,
         interval_secs: u64,
     ) -> Result<(), String> {
+        if worker_urls.is_empty() {
+            return Err(
+                "Timeout waiting for workers to become healthy: no workers provided".to_string(),
+            );
+        }
+
         let start_time = std::time::Instant::now();
         let sync_client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
@@ -365,11 +376,13 @@ impl Router {
     ) -> Response {
         // Handle retries like the original implementation
         let start = Instant::now();
-        const MAX_REQUEST_RETRIES: u32 = 3;
-        const MAX_TOTAL_RETRIES: u32 = 6;
+        // Use retry config for per-worker retries
+        let max_request_retries = self.retry_config.max_retries;
+        // Total retries across all workers (2x to allow trying multiple workers)
+        let max_total_retries = self.retry_config.max_retries * 2;
         let mut total_retries = 0;
 
-        while total_retries < MAX_TOTAL_RETRIES {
+        while total_retries < max_total_retries {
             // Extract routing text directly from typed request
             let text = typed_req.extract_text_for_routing();
             let is_stream = typed_req.is_stream();
@@ -379,7 +392,7 @@ impl Router {
             let mut request_retries = 0;
 
             // Try the same worker multiple times
-            while request_retries < MAX_REQUEST_RETRIES {
+            while request_retries < max_request_retries {
                 if total_retries >= 1 {
                     info!("Retrying request after {} failed attempts", total_retries);
                     RouterMetrics::record_retry(route);
@@ -429,13 +442,13 @@ impl Router {
                     route,
                     worker_url,
                     request_retries + 1,
-                    MAX_REQUEST_RETRIES
+                    max_request_retries
                 );
 
                 request_retries += 1;
                 total_retries += 1;
 
-                if request_retries == MAX_REQUEST_RETRIES {
+                if request_retries == max_request_retries {
                     warn!(
                         "Removing failed worker after typed request failures worker_url={}",
                         worker_url
@@ -1003,7 +1016,6 @@ impl Router {
 }
 
 use async_trait::async_trait;
-use reqwest::Client;
 
 #[async_trait]
 impl WorkerManagement for Router {
@@ -1210,6 +1222,7 @@ mod tests {
             dp_aware: false,
             api_key: None,
             client: Client::new(),
+            retry_config: RetryConfig::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             _health_checker: None,
@@ -1237,8 +1250,10 @@ mod tests {
 
     #[test]
     fn test_wait_for_healthy_workers_empty_list() {
+        // Empty list will timeout as there are no workers to check
         let result = Router::wait_for_healthy_workers(&[], 1, 1);
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Timeout"));
     }
 
     #[test]
