@@ -571,9 +571,12 @@ class GroupCoordinator:
         input: torch.Tensor,
     ) -> torch.Tensor:
         pynccl_comm = self.pynccl_comm
-        out_symmetric_memory = self.is_symmetric_memory_tensor(output)
         if pynccl_comm is not None and (
-            not pynccl_comm.disabled or out_symmetric_memory
+            not pynccl_comm.disabled
+            or (
+                self.is_symmetric_memory_tensor(output)
+                and self.is_symmetric_memory_tensor(input)
+            )
         ):
             with pynccl_comm.change_state(
                 enable=True, stream=torch.cuda.current_stream()
@@ -596,9 +599,12 @@ class GroupCoordinator:
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         pynccl_comm = self.pynccl_comm
-        out_symmetric_memory = self.is_symmetric_memory_tensor(output)
         if pynccl_comm is not None and (
-            not pynccl_comm.disabled or out_symmetric_memory
+            not pynccl_comm.disabled
+            or (
+                self.is_symmetric_memory_tensor(output)
+                and self.is_symmetric_memory_tensor(input)
+            )
         ):
             with pynccl_comm.change_state(
                 enable=True, stream=torch.cuda.current_stream()

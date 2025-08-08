@@ -476,9 +476,7 @@ class DeepseekV2MoE(nn.Module):
                     disable_symmetric_memory,
                 )
         else:
-            return self.forward_deepep(
-                hidden_states, forward_batch, disable_symmetric_memory
-            )
+            return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal_dual_stream(
         self,
@@ -623,15 +621,12 @@ class DeepseekV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        disable_symmetric_memory: bool = False,
     ) -> torch.Tensor:
         shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            shared_output = self._forward_shared_experts(
-                hidden_states, disable_symmetric_memory
-            )
+            shared_output = self._forward_shared_experts(hidden_states)
             topk_weights, topk_idx, _ = self.topk(
                 hidden_states,
                 router_logits,
