@@ -98,9 +98,6 @@ if _is_hip and (_use_aiter or _use_hip_int4):
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
-if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_hip):
-    from vllm._custom_ops import scaled_fp8_quant
-
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
