@@ -226,6 +226,22 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner,
                 skip_prefill=False,
             )
+        elif self.server_args.attention_backend == "aiter":
+            from sglang.srt.layers.attention.aiter_backend import (
+                AiterAttnBackend,
+                AiterMultiStepDraftBackend,
+            )
+
+            self.draft_attn_backend = AiterMultiStepDraftBackend(
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            self.draft_extend_attn_backend = AiterAttnBackend(
+                self.draft_model_runner,
+                skip_prefill=False,
+            )
+            self.has_prefill_wrapper_verify = False
         elif self.server_args.attention_backend == "fa3":
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
