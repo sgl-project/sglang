@@ -17,11 +17,12 @@ import copy
 import json
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 import uuid
+from abc import ABC
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 import orjson
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.conversation import generate_chat_conv
@@ -49,7 +50,7 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
-class AnthropicServingMessages(OpenAIServingBase):
+class AnthropicServingMessages(ABC):
     """Handler for Anthropic Messages API requests"""
 
     def __init__(
@@ -60,90 +61,6 @@ class AnthropicServingMessages(OpenAIServingBase):
 
     def _request_id_prefix(self) -> str:
         return "msg_"
-
-    def _convert_anthropic_to_openai_messages(
-        self,
-        anthropic_messages: List[AnthropicMessage],
-        system_prompt: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """Convert Anthropic message format to OpenAI format"""
-        openai_messages = []
-
-        # Add system message if provided
-        if system_prompt:
-            openai_messages.append({"role": "system", "content": system_prompt})
-
-        for msg in anthropic_messages:
-            openai_msg = {"role": msg.role}
-
-            if isinstance(msg.content, str):
-                openai_msg["content"] = msg.content
-            else:
-                # Handle complex content blocks
-                content_parts = []
-                tool_calls = []
-
-                for block in msg.content:
-                    if block.type == "text" and block.text:
-                        content_parts.append({"type": "text", "text": block.text})
-                    elif block.type == "image" and block.source:
-                        content_parts.append(
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": block.source.get("data", "")},
-                            }
-                        )
-                    elif block.type == "tool_use":
-                        # Convert tool use to function call format
-                        tool_call = {
-                            "id": block.id or f"call_{int(time.time())}",
-                            "type": "function",
-                            "function": {
-                                "name": block.name,
-                                "arguments": json.dumps(block.input or {}),
-                            },
-                        }
-                        tool_calls.append(tool_call)
-                    elif block.type == "tool_result":
-                        # For tool results, we need to create a tool message
-                        # This will be handled separately as a tool response message
-                        if msg.role == "user":
-                            # Tool result from user should be converted to tool message
-                            openai_messages.append(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": block.id,
-                                    "content": str(block.content)
-                                    if block.content
-                                    else "",
-                                }
-                            )
-                        else:
-                            # Assistant tool result becomes regular text
-                            content_parts.append(
-                                {
-                                    "type": "text",
-                                    "text": f"Tool result: {str(block.content) if block.content else ''}",
-                                }
-                            )
-
-                # Add tool calls to the message if any
-                if tool_calls:
-                    openai_msg["tool_calls"] = tool_calls
-
-                # Add content parts if any
-                if content_parts:
-                    if len(content_parts) == 1 and content_parts[0]["type"] == "text":
-                        openai_msg["content"] = content_parts[0]["text"]
-                    else:
-                        openai_msg["content"] = content_parts
-                elif not tool_calls:
-                    # If no content and no tool calls, add empty content
-                    openai_msg["content"] = ""
-
-            openai_messages.append(openai_msg)
-
-        return openai_messages
 
     def _convert_to_internal_request(
         self, request: AnthropicMessagesRequest
@@ -444,17 +361,17 @@ class AnthropicServingMessages(OpenAIServingBase):
         """Create streaming event"""
         return AnthropicStreamEvent(type=event_type, **kwargs)
 
-    async def _generate_stream_response(
+    async def _handle_streaming_request(
         self,
         internal_request: GenerateReqInput,
         anthropic_request: AnthropicMessagesRequest,
-        request_id: str,
         raw_request: Request,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming response in Anthropic format"""
 
+        request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
+
         # State tracking for streaming
-        is_firsts = {}
         stream_buffers = {}
 
         # Send message_start event
@@ -534,12 +451,72 @@ class AnthropicServingMessages(OpenAIServingBase):
         )
         yield f"event: message_stop\ndata: {orjson.dumps(stop_message_event.model_dump()).decode()}\n\n"
 
+    async def _handle_non_streaming_request(
+        self,
+        internal_request: GenerateReqInput,
+        anthropic_request: AnthropicMessagesRequest,
+        raw_request: Request,
+    ) -> AnthropicMessagesResponse:
+
+        request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
+
+        # Generate single response
+        response_generator = self.tokenizer_manager.generate_request(
+            internal_request, raw_request
+        )
+
+        full_response = await response_generator.__anext__()
+
+        content = full_response.get("text", "")
+        meta_info = full_response.get("meta_info", {})
+        input_tokens = meta_info.get("prompt_tokens", 0)
+        output_tokens = meta_info.get("completion_tokens", 0)
+
+        # Check if response contains function calls
+        content_blocks = []
+
+        # Look for function calls in the response
+        if "function_calls" in full_response or "tool_calls" in full_response:
+            tool_calls = full_response.get("function_calls") or full_response.get(
+                "tool_calls", []
+            )
+            if tool_calls:
+                # Convert function calls to Anthropic tool_use blocks
+                tool_blocks = self._convert_function_calls_to_anthropic(tool_calls)
+                content_blocks.extend(tool_blocks)
+
+                # Set stop reason to tool_use
+                stop_reason = "tool_use"
+            else:
+                # Regular text response
+                content_blocks = [self._create_anthropic_content_block(content)]
+                stop_reason = "end_turn"
+        else:
+            # Regular text response
+            content_blocks = [self._create_anthropic_content_block(content)]
+            stop_reason = "end_turn"
+
+        # Check for other stop reasons
+        if meta_info.get("finish_reason") == "length":
+            stop_reason = "max_tokens"
+        elif meta_info.get("finish_reason") == "stop":
+            stop_reason = "stop_sequence"
+
+        response = AnthropicMessagesResponse(
+            id=request_id,
+            content=content_blocks,
+            model=anthropic_request.model,
+            stop_reason=stop_reason,
+            usage=AnthropicUsage(
+                input_tokens=input_tokens, output_tokens=output_tokens
+            ),
+        )
+        return response
+
     async def handle_request(
         self, request: AnthropicMessagesRequest, raw_request: Request
     ) -> Union[AnthropicMessagesResponse, StreamingResponse, ORJSONResponse]:
         """Handle Anthropic Messages API request"""
-
-        request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
 
         try:
             # Convert to internal format
@@ -547,8 +524,8 @@ class AnthropicServingMessages(OpenAIServingBase):
 
             if request.stream:
                 # Return streaming response
-                stream_generator = self._generate_stream_response(
-                    internal_request, request, request_id, raw_request
+                stream_generator = self._handle_streaming_request(
+                    internal_request, request, raw_request
                 )
                 return StreamingResponse(
                     stream_generator,
@@ -556,74 +533,17 @@ class AnthropicServingMessages(OpenAIServingBase):
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                 )
             else:
-                # Generate single response
-                response_generator = self.tokenizer_manager.generate_request(
-                    internal_request, raw_request
+                return self._handle_non_streaming_request(
+                    internal_request, request, raw_request
                 )
-
-                full_response = await response_generator.__anext__()
-
-                content = full_response.get("text", "")
-                meta_info = full_response.get("meta_info", {})
-                input_tokens = meta_info.get("prompt_tokens", 0)
-                output_tokens = meta_info.get("completion_tokens", 0)
-
-                # Check if response contains function calls
-                content_blocks = []
-
-                # Look for function calls in the response
-                if "function_calls" in full_response or "tool_calls" in full_response:
-                    tool_calls = full_response.get(
-                        "function_calls"
-                    ) or full_response.get("tool_calls", [])
-                    if tool_calls:
-                        # Convert function calls to Anthropic tool_use blocks
-                        tool_blocks = self._convert_function_calls_to_anthropic(
-                            tool_calls
-                        )
-                        content_blocks.extend(tool_blocks)
-
-                        # Set stop reason to tool_use
-                        stop_reason = "tool_use"
-                    else:
-                        # Regular text response
-                        content_blocks = [self._create_anthropic_content_block(content)]
-                        stop_reason = "end_turn"
-                else:
-                    # Regular text response
-                    content_blocks = [self._create_anthropic_content_block(content)]
-                    stop_reason = "end_turn"
-
-                # Check for other stop reasons
-                if meta_info.get("finish_reason") == "length":
-                    stop_reason = "max_tokens"
-                elif meta_info.get("finish_reason") == "stop":
-                    stop_reason = "stop_sequence"
-
-                response = AnthropicMessagesResponse(
-                    id=request_id,
-                    content=content_blocks,
-                    model=request.model,
-                    stop_reason=stop_reason,
-                    usage=AnthropicUsage(
-                        input_tokens=input_tokens, output_tokens=output_tokens
-                    ),
-                )
-
-                return response
-
-        except ValueError as e:
-            logger.error(f"Validation error: {e}")
-            error_response = AnthropicErrorResponse(
-                error=AnthropicError(type="invalid_request_error", message=str(e))
+        except HTTPException as e:
+            return self.create_error_response(
+                message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
-            return ORJSONResponse(status_code=400, content=error_response.model_dump())
-
         except Exception as e:
-            logger.error(f"Internal error: {get_exception_traceback()}")
-            error_response = AnthropicErrorResponse(
-                error=AnthropicError(
-                    type="internal_server_error", message="Internal server error"
-                )
+            logger.exception(f"Error in request: {e}")
+            return self.create_error_response(
+                message=f"Internal server error: {str(e)}",
+                err_type="InternalServerError",
+                status_code=500,
             )
-            return ORJSONResponse(status_code=500, content=error_response.model_dump())
