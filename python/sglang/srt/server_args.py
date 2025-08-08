@@ -479,7 +479,10 @@ class ServerArgs:
             quantization_config = getattr(
                 self.get_hf_config(), "quantization_config", None
             )
-            is_mxfp4_quant_format = quantization_config is not None and quantization_config.get("quant_method") == "mxfp4"
+            is_mxfp4_quant_format = (
+                quantization_config is not None
+                and quantization_config.get("quant_method") == "mxfp4"
+            )
 
             if is_sm100_supported() and is_mxfp4_quant_format:
                 self.enable_flashinfer_mxfp4_moe = True
@@ -488,7 +491,7 @@ class ServerArgs:
                 self.enable_triton_kernel_moe = True
 
             self.disable_hybrid_swa_memory = True
-            
+
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
