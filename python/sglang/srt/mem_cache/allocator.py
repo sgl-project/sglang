@@ -508,17 +508,16 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 (last_loc + 2) % self.page_size == seq_lens % self.page_size
             )
 
-        # HACK rm
-        # estimated_num_new_pages = (
-        #     (
-        #         (seq_lens + self.page_size - 1) // self.page_size
-        #         - (seq_lens - 1 + self.page_size - 1) // self.page_size
-        #     )
-        #     .sum()
-        #     .item()
-        # )
-        # if estimated_num_new_pages > len(self.free_pages):
-        #     self.merge_and_sort_free()
+        estimated_num_new_pages = (
+            (
+                (seq_lens + self.page_size - 1) // self.page_size
+                - (seq_lens - 1 + self.page_size - 1) // self.page_size
+            )
+            .sum()
+            .item()
+        )
+        if estimated_num_new_pages > len(self.free_pages):
+            self.merge_and_sort_free()
 
         bs = len(seq_lens)
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
