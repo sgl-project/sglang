@@ -181,6 +181,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             // Increment processed counter
             workers[min_load_idx].increment_processed();
             RouterMetrics::record_processed_request(workers[min_load_idx].url());
+            RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
 
             return Some(min_load_idx);
         }
