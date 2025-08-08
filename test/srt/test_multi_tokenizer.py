@@ -88,7 +88,7 @@ class TestMultiTokenizer(CustomTestCase):
         res = run_benchmark(args)
         if is_in_ci():
             write_github_step_summary(
-                f"### test_online_latency_default\n"
+                f"### test_multi_tokenizer_ttft\n"
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
             )
             self.assertLess(res["median_e2e_latency_ms"], 11000)
