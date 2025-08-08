@@ -206,13 +206,13 @@ class FusedMoE(torch.nn.Module):
         assert self.quant_method is not None
 
         self.quant_config = quant_config
+        self.use_enable_flashinfer_mxfp4_moe = global_server_args_dict.get(
+            "enable_flashinfer_mxfp4_moe", False
+        )
         if (
             self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
-            and (
-                get_bool_env_var("SGLANG_USE_FLASHINFER_MXFP4_MOE")
-                or get_bool_env_var("SGLANG_USE_FLASHINFER_MXFP4_BF16_MOE")
-            )
+            and self.use_enable_flashinfer_mxfp4_moe
         ):
             hidden_size = round_up(hidden_size, 256)
         self.hidden_size = hidden_size
