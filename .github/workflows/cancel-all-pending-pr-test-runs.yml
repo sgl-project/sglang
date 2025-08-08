@@ -1,32 +1,31 @@
 name: Cancel All Pending PR Test Runs
 
 on:
-  workflow_dispatch: # Manual trigger
+  workflow_dispatch:
+
+permissions:
+  actions: write   # Needed to cancel runs
+  contents: read   # Needed to read repo info
 
 jobs:
   cancel-pending:
     runs-on: ubuntu-latest
     steps:
       - name: Install GitHub CLI
-        run: apt-get install -y gh jq
-
-      - name: Authenticate GitHub CLI
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh auth login --with-token <<< "$GH_TOKEN"
+        run: sudo apt-get install -y gh jq
 
       - name: Cancel all pending/waiting pr-test.yml runs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          # Get all pending or waiting runs of pr-test.yml across all branches
           gh run list \
+            --repo "$REPO" \
             --workflow pr-test.yml \
-            --json databaseId,status,conclusion \
+            --json databaseId,status \
             --limit 1000 \
             | jq -r '.[] | select(.status=="queued" or .status=="in_progress") | .databaseId' \
             | while read run_id; do
                 echo "Cancelling run ID: $run_id"
-                gh run cancel "$run_id"
+                gh run cancel "$run_id" --repo "$REPO"
               done
