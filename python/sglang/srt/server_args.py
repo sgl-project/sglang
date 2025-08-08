@@ -1303,54 +1303,40 @@ class ServerArgs:
         )
 
         # Kernel backend
+        ATTN_BACKENDS = [
+            "aiter",
+            "cutlass_mla",
+            "fa3",
+            "flashinfer",
+            "flashmla",
+            "intel_amx",
+            "torch_native",
+            "ascend",
+            "triton",
+            "trtllm_mla",
+            "trtllm_mha",
+            "dual_chunk_flash_attn",
+        ]
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=[
-                "aiter",
-                "cutlass_mla",
-                "fa3",
-                "flashinfer",
-                "flashmla",
-                "intel_amx",
-                "torch_native",
-                "ascend",
-                "triton",
-                "trtllm_mla",
-                "trtllm_mha",
-                "dual_chunk_flash_attn",
-            ],
+            choices=ATTN_BACKENDS,
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
         parser.add_argument(
-            "--decode-attention-backend",
-            type=str,
-            choices=[
-                "flashinfer",
-                "triton",
-                "torch_native",
-                "fa3",
-                "flashmla",
-                "cutlass_mla",
-            ],
-            default=ServerArgs.decode_attention_backend,
-            help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
-        )
-
-        parser.add_argument(
             "--prefill-attention-backend",
             type=str,
-            choices=[
-                "flashinfer",
-                "triton",
-                "torch_native",
-                "fa3",
-                "flashmla",
-                "cutlass_mla",
-            ],
+            choices=ATTN_BACKENDS,
             default=ServerArgs.prefill_attention_backend,
             help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
+        )
+        parser.add_argument(
+            "--decode-attention-backend",
+            type=str,
+            choices=ATTN_BACKENDS,
+            default=ServerArgs.decode_attention_backend,
+            help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
         )
         parser.add_argument(
             "--sampling-backend",
