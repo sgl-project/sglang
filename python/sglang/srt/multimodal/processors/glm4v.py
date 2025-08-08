@@ -6,7 +6,7 @@ from transformers.video_utils import VideoMetadata
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
-from sglang.srt.models.glm4v_moe import Glm4v_moeForConditionalGeneration
+from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -17,7 +17,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
-    models = [Glm4vForConditionalGeneration, Glm4v_moeForConditionalGeneration]
+    models = [Glm4vForConditionalGeneration, Glm4vMoeForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)

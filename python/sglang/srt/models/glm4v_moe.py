@@ -4,7 +4,7 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers.models.glm4v_moe.configuration_glm4v_moe import Glm4v_moeConfig
+from transformers.models.glm4v_moe.configuration_glm4v_moe import Glm4vMoeConfig
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
@@ -37,10 +37,10 @@ logger = logging.getLogger(__name__)
 cached_get_processor = lru_cache(get_processor)
 
 
-class Glm4v_moeForConditionalGeneration(Glm4vForConditionalGeneration):
+class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
     def __init__(
         self,
-        config: Glm4v_moeConfig,
+        config: Glm4vMoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -397,4 +397,4 @@ class Glm4v_moeForConditionalGeneration(Glm4vForConditionalGeneration):
                         weight_loader(param, loaded_weight)
 
 
-EntryClass = [Glm4v_moeForConditionalGeneration]
+EntryClass = [Glm4vMoeForConditionalGeneration]
