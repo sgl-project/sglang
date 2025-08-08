@@ -5,13 +5,15 @@ from sglang.srt.server_args import ServerArgs
 class SchedulerRecvSkipper:
     @staticmethod
     def maybe_create(server_args: ServerArgs):
-        return TODO
+        if server_args.scheduler_recv_interval <= 1:
+            return None
+        return SchedulerRecvSkipper(server_args)
 
     def __init__(self, server_args: ServerArgs):
         # Can be supported if needed, but may need e.g. `global_forward_mode`
         assert not server_args.enable_dp_attention
         self._counter = 0
-        self._threshold = TODO
+        self._threshold = server_args.scheduler_recv_interval
 
     def handle(self, last_forward_mode: ForwardMode):
         should_recv = False
