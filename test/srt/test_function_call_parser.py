@@ -497,6 +497,17 @@ class TestEBNFGeneration(unittest.TestCase):
                     },
                 ),
             ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="empty_param_func",
+                    description="Function with empty parameters",
+                    parameters={
+                        "properties": {},
+                        "required": [],
+                    },
+                ),
+            ),
         ]
 
         self.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
@@ -640,6 +651,11 @@ class TestEBNFGeneration(unittest.TestCase):
             '"<arg_key>query</arg_key>" "\\n" "<arg_value>" xml_text "</arg_value>"',
             ebnf,
         )
+        self.assertIn(
+            '"empty_param_func" "\\n" ( arguments_empty_param_func "\\n" )?', ebnf
+        )
+        self.assertIn('arguments_empty_param_func ::= ""', ebnf)
+
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
             ctx = self.grammar_compiler.compile_grammar(ebnf)
