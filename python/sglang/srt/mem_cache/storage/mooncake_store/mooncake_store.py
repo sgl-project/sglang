@@ -13,7 +13,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
-DEFAULT_LOCAL_BUFFER_SIZE = 128 * 1024 * 1024  # 128 MB
+DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +56,8 @@ class MooncakeStoreConfig:
             global_segment_size=config.get(
                 "global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE
             ),
-            local_buffer_size=config.get(
-                "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
-            ),
+            # Zero copy interface does not need local buffer
+            local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", "auto"),
             master_server_address=config.get("master_server_address"),
@@ -81,9 +80,8 @@ class MooncakeStoreConfig:
             global_segment_size=int(
                 os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
-            local_buffer_size=int(
-                os.getenv("MOONCAKE_LOCAL_BUFFER_SIZE", DEFAULT_LOCAL_BUFFER_SIZE)
-            ),
+            # Zero copy interface does not need local buffer
+            local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
             protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
             device_name=os.getenv("MOONCAKE_DEVICE", "auto"),
             master_server_address=os.getenv("MOONCAKE_MASTER"),
@@ -138,12 +136,10 @@ class MooncakeStore(HiCacheStorage):
 
     def warmup(self):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
-        # 10 MB
-        warmup_value = bytes(10 * 1024 * 1024)
-        self.store.put(warmup_key, warmup_value)
+        warmup_value = bytes(4 * 1024)  # 4 KB
+        assert self.store.put(warmup_key, warmup_value) == 0
         assert self.store.is_exist(warmup_key) == 1
-        self.store.get(warmup_key)
-        self.store.remove(warmup_key)
+        assert self.store.get(warmup_key) == warmup_value
 
     def register_buffer(self, buffer: torch.Tensor) -> None:
         try:
@@ -179,7 +175,7 @@ class MooncakeStore(HiCacheStorage):
         value: Optional[Any] = None,
         target_location: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
-    ) -> bool:
+    ) -> List[int] | None:
         assert len(keys) == len(target_location) == len(target_sizes)
         if len(keys) == 0:
             return
@@ -188,7 +184,7 @@ class MooncakeStore(HiCacheStorage):
             if keys[i] is None or target_location[i] is None or target_sizes[i] is None:
                 return
 
-        self._put_batch_zero_copy_impl(keys, target_location, target_sizes)
+        return self._put_batch_zero_copy_impl(keys, target_location, target_sizes)
 
     def get(
         self,
@@ -211,7 +207,7 @@ class MooncakeStore(HiCacheStorage):
         keys: List[str],
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
-    ) -> torch.Tensor | None:
+    ) -> List[int] | None:
         assert len(keys) == len(target_location) == len(target_sizes)
         if len(keys) == 0:
             return
@@ -222,7 +218,7 @@ class MooncakeStore(HiCacheStorage):
 
         return self._get_batch_zero_copy_impl(keys, target_location, target_sizes)
 
-    def exists(self, keys) -> bool | dict:
+    def exists(self, keys) -> list[int] | None:
         _keys = []
         local_rank = torch.cuda.current_device()
         for key in keys:
@@ -231,8 +227,7 @@ class MooncakeStore(HiCacheStorage):
             # Since mooncake store is stored in layer by layer,
             # only the first layer is checked here.
             _keys.append(f"{key}_{local_rank}_k")
-        result = {k: v for k, v in zip(keys, self.store.batch_is_exist(_keys))}
-        return result
+        return self.store.batch_is_exist(_keys)
 
     def delete(self, key) -> None:
         raise (NotImplementedError)
@@ -247,18 +242,10 @@ class MooncakeStore(HiCacheStorage):
 
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
-    ) -> None:
-        try:
-            self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
-        except TypeError as err:
-            logger.error("Failed to put value to Mooncake Store: %s", err)
-            raise TypeError("Mooncake Store Put Type Error.") from err
+    ) -> List[int]:
+        return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
-    ) -> None:
-        try:
-            self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
-        except TypeError as err:
-            logger.error("Failed to get value from Mooncake Store: %s", err)
-            raise TypeError("Mooncake Store Get Type Error.") from err
+    ) -> List[int]:
+        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
