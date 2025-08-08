@@ -316,7 +316,7 @@ class EBNFComposer:
 
             combined_args = "".join(rule_parts)
             arguments_rule = args_template.format(arg_rules=combined_args)
-            if len(arguments_rule) == 0:
+            arguments_rule = arguments_rule or '""'
                 arguments_rule = '""'
 
             # Add the function call rule and its arguments rule
