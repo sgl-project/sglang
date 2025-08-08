@@ -630,12 +630,12 @@ class TestEBNFGeneration(unittest.TestCase):
         self.assertIsNotNone(ebnf)
         # Check that the EBNF contains expected patterns for XML format
         self.assertIn('"<tool_call>" function_call "</tool_call>"', ebnf)
-        self.assertIn('"get_weather" "\\n" arguments_get_weather', ebnf)
+        self.assertIn('"get_weather" ( "\\n" arguments_get_weather )?', ebnf)
         self.assertIn(
             '"<arg_key>location</arg_key>" "\\n" "<arg_value>" xml_text "</arg_value>" ( "\\n" ( "<arg_key>unit</arg_key>" "\\n" "<arg_value>" ("celsius" | "fahrenheit") "</arg_value>" ) )?',
             ebnf,
         )
-        self.assertIn('"search" "\\n" arguments_search', ebnf)
+        self.assertIn('"search" ( "\\n" arguments_search )?', ebnf)
         self.assertIn(
             '"<arg_key>query</arg_key>" "\\n" "<arg_value>" xml_text "</arg_value>"',
             ebnf,
