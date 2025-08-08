@@ -58,6 +58,11 @@ class MooncakeTransferEngine:
         except Exception:
             # Mark batch register as failed
             ret_value = -1
+            if not hasattr(self.engine, "batch_register_memory"):
+                raise RuntimeError(
+                    "Mooncake's batch register requires a newer version of mooncake-transfer-engine. "
+                    "Please upgrade Mooncake."
+                )
 
         if ret_value != 0:
             logger.debug("Mooncake batch memory registration failed.")
