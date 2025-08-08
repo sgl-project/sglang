@@ -508,14 +508,21 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 (last_loc + 2) % self.page_size == seq_lens % self.page_size
             )
 
-        estimated_num_new_pages = (
-            (
-                (seq_lens + self.page_size - 1) // self.page_size
-                - (seq_lens - 1 + self.page_size - 1) // self.page_size
+        if seq_lens.shape[0] <= 16:
+            estimated_num_new_pages = sum(
+                (seq_len + self.page_size - 1) // self.page_size
+                - (seq_len - 1 + self.page_size - 1) // self.page_size
+                for seq_len in seq_lens.cpu().tolist()
             )
-            .sum()
-            .item()
-        )
+        else:
+            estimated_num_new_pages = (
+                (
+                    (seq_lens + self.page_size - 1) // self.page_size
+                    - (seq_lens - 1 + self.page_size - 1) // self.page_size
+                )
+                .sum()
+                .item()
+            )
         if estimated_num_new_pages > len(self.free_pages):
             self.merge_and_sort_free()
 
