@@ -17,17 +17,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-cu128-aarch64:
+  build-cu129-aarch64:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: sgl-kernel-release-node
+    runs-on: sgl-kernel-release-node-arm
     strategy:
       matrix:
-        python-version: ['3.9']
-        cuda-version: ['12.8']
+        python-version: ["3.10"]
+        cuda-version: ["12.9"]
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
+          submodules: "recursive"
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -47,7 +47,7 @@ jobs:
           path: sgl-kernel/dist/*
 
   release:
-    needs: build-cu128-aarch64
+    needs: build-cu129-aarch64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -84,7 +84,7 @@ jobs:
           WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
 
       - name: Update wheel index
-        run: python3 scripts/update_kernel_whl_index.py --cuda 128
+        run: python3 scripts/update_kernel_whl_index.py --cuda 129
 
       - name: Push wheel index
         run: |
