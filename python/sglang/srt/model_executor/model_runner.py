@@ -1439,6 +1439,7 @@ class ModelRunner:
                     chunked_attention_size=attention_chunk_size,
                     irope_offset=irope_offset,
                     irope_interval=irope_interval,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
                 )
             else:
                 self.token_to_kv_pool = MHATokenToHiPOffloadKVPool(
@@ -1453,6 +1454,7 @@ class ModelRunner:
                     layer_num=self.model_config.num_hidden_layers,
                     device=torch.device(self.gpu_id),
                     hip_config=self.server_args.hip_attention_config,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
                 )
         else:
             if self.is_hybrid:
