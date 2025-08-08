@@ -12,6 +12,7 @@ import triton.language as tl
 
 from sglang.srt.distributed import (
     GroupCoordinator,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
@@ -263,9 +264,10 @@ def _dp_gather_via_all_reduce(
     assert global_tokens.is_contiguous()
 
     if local_tokens.shape[0] > 0 and (is_partial or get_attention_tp_rank() == 0):
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between global_tokens and local_tokens not allowed"
+        if local_tokens.untyped_storage() is global_tokens.untyped_storage():
+            # dp_gather is an in-place operation and requires input and output tensors to not be aliased.
+            # so we create a separate buffer if they share the same storage.
+            global_tokens = torch.empty_like(global_tokens)
 
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
@@ -346,13 +348,25 @@ def dp_scatter(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between local_tokens and global_tokens not allowed"
+        if local_tokens.untyped_storage() is global_tokens.untyped_storage():
+            # dp_scatter is an in-place operation and requires input and output tensors to not be aliased.
+            # so we create a separate buffer if they share the same storage.
+            local_tokens = torch.empty_like(local_tokens)
 
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
+
+
+def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
+    if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+        get_tp_group().reduce_scatter_tensor(output, input)
+    else:
+        scattered_local_tokens = input.tensor_split(
+            get_tensor_model_parallel_world_size()
+        )[get_tensor_model_parallel_rank()]
+        get_tp_group().reduce_scatter_tensor(scattered_local_tokens, input)
+        get_attention_tp_group().all_gather_into_tensor(output, scattered_local_tokens)
 
 
 def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
