@@ -24,10 +24,10 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    log_info_on_rank0,
     next_power_of_2,
     round_up,
     set_weight_attrs,
-    log_info_on_rank0
 )
 
 _is_sm100_supported = is_cuda() and is_sm100_supported()
@@ -331,7 +331,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer):
         if self.use_flashinfer:
-            log_info_on_rank0(logger, "Shuffling MoE weights for FlashInfer MXFP4 moe kernel, it might take a while...")
+            log_info_on_rank0(
+                logger,
+                "Shuffling MoE weights for FlashInfer MXFP4 moe kernel, it might take a while...",
+            )
             layer.gemm1_alpha = Parameter(
                 torch.tensor([1.702] * self.num_experts, dtype=torch.float32).cuda(),
                 requires_grad=False,
