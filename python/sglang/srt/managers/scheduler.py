@@ -473,6 +473,7 @@ class Scheduler(
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
+        self.offload_tags = set()
         self.init_profier()
 
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(server_args)
@@ -618,6 +619,7 @@ class Scheduler(
                     ),
                     hicache_mem_layout=server_args.hicache_mem_layout,
                     hicache_storage_backend=server_args.hicache_storage_backend,
+                    hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -1039,7 +1041,9 @@ class Scheduler(
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
-                self.chunked_req is not None or not self.running_batch.is_empty()
+                self.chunked_req is not None
+                or not self.running_batch.is_empty()
+                or len(self.offload_tags) > 0
             ):
                 self.return_health_check_ct += 1
                 continue
@@ -1569,7 +1573,10 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                self.tree_cache.check_prefetch_progress(req.rid)
+                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                if not prefetch_done:
+                    # skip staging requests that are ongoing prefetch
+                    continue
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
