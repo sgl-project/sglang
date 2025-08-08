@@ -532,7 +532,7 @@ class AnthropicServingMessages(ABC):
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                 )
             else:
-                return self._handle_non_streaming_request(
+                return await self._handle_non_streaming_request(
                     internal_request, request, raw_request
                 )
         except HTTPException as e:
